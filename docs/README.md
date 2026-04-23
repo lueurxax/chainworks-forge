@@ -27,8 +27,8 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
-- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence
-- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries
+- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, and startup recovery progress
+- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, and write serialization
 
 ### Agents, skills, and MCP
 
@@ -38,7 +38,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### ACP transport and sessions
 
-- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection
+- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, and capacity management
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 
@@ -60,11 +60,11 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Operator experience
 
-- [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline and contracts
-- [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
-- [reference/live-workflow-map.md](reference/live-workflow-map.md) — Workflow topology and agent-activity surface
-- [reference/artifact-content-rendering.md](reference/artifact-content-rendering.md) — Unified read-only markdown/JSON rendering
-- [reference/provider-platform.md](reference/provider-platform.md) — Multi-provider/settings/diagnostics baseline
+- [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
+- [reference/run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
+- [reference/live-workflow-map.md](live-workflow-map.md) — Workflow topology and agent-activity surface
+- [reference/artifact-content-rendering.md](artifact-content-rendering.md) — Unified read-only markdown/JSON rendering
+- [reference/provider-platform.md](provider-platform.md) — Multi-provider/settings/diagnostics baseline and capacity caps
 - [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — Archive/restore lifecycle for ideas
 - [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — UI readability, accessibility, shared status semantics
 - [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — Forge token lane, brand assets, visual rollout

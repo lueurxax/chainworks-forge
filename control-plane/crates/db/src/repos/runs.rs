@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::ids::{IdeaId, RunId};
 use domain::run::{Run, RunStatus};
+
+use crate::pool::begin_immediate_with_retry;
 
 const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, workspace_root,
              artifact_root, started_at, completed_at, cancellation_requested_at,
@@ -15,6 +17,13 @@ const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, w
              drift_detected_at, drift_details_json, chainworks_meta_root"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
+    let mut tx = begin_immediate_with_retry(pool, "runs.insert").await?;
+    insert_tx(&mut tx, run).await?;
+    tx.commit().await.context("commit insert run")?;
+    Ok(())
+}
+
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
     let id = run.id.to_string();
     let idea_id = run.idea_id.to_string();
     let status = run.status.to_string();
@@ -69,7 +78,7 @@ pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     .bind(run.drift_detected_at.map(|t| t.to_rfc3339()))
     .bind(&run.drift_details_json)
     .bind(&run.chainworks_meta_root)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert run")?;
     Ok(())
@@ -81,6 +90,18 @@ pub async fn find_by_id(pool: &SqlitePool, id: RunId) -> Result<Option<Run>> {
     let row = sqlx::query(&query)
         .bind(id_str)
         .fetch_optional(pool)
+        .await
+        .context("find run by id")?;
+
+    row.map(|r| parse_run_row(&r)).transpose()
+}
+
+pub async fn find_by_id_tx(tx: &mut Transaction<'_, Sqlite>, id: RunId) -> Result<Option<Run>> {
+    let id_str = id.to_string();
+    let query = format!("SELECT {SELECT_COLS} FROM runs WHERE id = ?1");
+    let row = sqlx::query(&query)
+        .bind(id_str)
+        .fetch_optional(&mut **tx)
         .await
         .context("find run by id")?;
 
@@ -166,9 +187,36 @@ pub async fn update_drift_detection(
     Ok(())
 }
 
+pub async fn update_drift_detection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: RunId,
+    detected_at: DateTime<Utc>,
+    details_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE runs SET drift_detected_at = ?1, drift_details_json = ?2 WHERE id = ?3"#)
+        .bind(detected_at.to_rfc3339())
+        .bind(details_json)
+        .bind(id.to_string())
+        .execute(&mut **tx)
+        .await
+        .context("update run drift detection")?;
+    Ok(())
+}
+
 /// Transition a run into the Cancelling state with a cancellation timestamp.
 pub async fn mark_cancelling(
     pool: &SqlitePool,
+    id: RunId,
+    requested_at: DateTime<Utc>,
+) -> Result<()> {
+    let mut tx = begin_immediate_with_retry(pool, "runs.mark_cancelling").await?;
+    mark_cancelling_tx(&mut tx, id, requested_at).await?;
+    tx.commit().await.context("commit mark run cancelling")?;
+    Ok(())
+}
+
+pub async fn mark_cancelling_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     id: RunId,
     requested_at: DateTime<Utc>,
 ) -> Result<()> {
@@ -178,7 +226,7 @@ pub async fn mark_cancelling(
         .bind(status)
         .bind(requested_at.to_rfc3339())
         .bind(id_str)
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .context("mark run cancelling")?;
     Ok(())
@@ -203,10 +251,24 @@ pub async fn update_cancellation_settlement_log(
     id: RunId,
     settlement_log: &str,
 ) -> Result<()> {
+    let mut tx =
+        begin_immediate_with_retry(pool, "runs.update_cancellation_settlement_log").await?;
+    update_cancellation_settlement_log_tx(&mut tx, id, settlement_log).await?;
+    tx.commit()
+        .await
+        .context("commit update cancellation settlement log")?;
+    Ok(())
+}
+
+pub async fn update_cancellation_settlement_log_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: RunId,
+    settlement_log: &str,
+) -> Result<()> {
     sqlx::query(r#"UPDATE runs SET cancellation_settlement_log = ?1 WHERE id = ?2"#)
         .bind(settlement_log)
         .bind(id.to_string())
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .context("update cancellation settlement log")?;
     Ok(())

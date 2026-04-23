@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::release::{
     connect::ConnectPublishService,
@@ -19,7 +18,7 @@ use crate::release::{
 use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    artifacts, ideas, projections, sessions, stages, validation, work_items,
+    artifacts, ideas, projections, scheduler, sessions, stages, validation, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind};
 use domain::agent::{
@@ -34,6 +33,7 @@ use domain::artifact_contracts::{
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::ids::RunId;
+use domain::provider::ProviderFamily;
 use domain::run::DeliveryConfiguration;
 use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
@@ -44,6 +44,7 @@ use crate::contracts::{
 };
 use crate::event_bus::EventSender;
 use crate::failure_classifier::{classify_observation, observation_from_acp_error_message};
+use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
 use crate::orchestrator::Orchestrator;
 use crate::recovery::RecoveryService;
 use crate::session::fingerprint::{
@@ -53,6 +54,8 @@ use crate::session::policy::{
     ensure_policy, ensure_policy_tx, SessionPolicyDecision, SessionPolicyInput,
 };
 use crate::work_queue::WorkQueue;
+
+pub use domain::provider::InvokeAgentCapacityConfig;
 
 pub struct BackgroundExecutor {
     pool: SqlitePool,
@@ -98,13 +101,6 @@ pub struct ClaimedInvokeAgent {
     pub artifact_claim_key: ArtifactSourceGenerationClaimKey,
 }
 
-#[derive(Clone, Debug)]
-pub struct InvokeAgentCapacityConfig {
-    pub max_active_total: usize,
-    pub max_active_per_run: usize,
-    pub provider_caps: HashMap<String, usize>,
-}
-
 #[derive(Debug)]
 struct InvokeAgentCapacitySnapshot {
     active_total: i64,
@@ -115,31 +111,10 @@ struct InvokeAgentCapacitySnapshot {
 
 const INVOKE_AGENT_CANDIDATE_SCAN_LIMIT: i64 = 32;
 
-impl Default for InvokeAgentCapacityConfig {
-    fn default() -> Self {
-        let provider_caps = HashMap::from([
-            ("gemini".to_string(), env_usize("CHAINWORKS_MAX_GEMINI", 4)),
-            ("codex".to_string(), env_usize("CHAINWORKS_MAX_CODEX", 3)),
-            ("claude".to_string(), env_usize("CHAINWORKS_MAX_CLAUDE", 8)),
-            ("auggie".to_string(), env_usize("CHAINWORKS_MAX_AUGGIE", 1)),
-            ("junie".to_string(), env_usize("CHAINWORKS_MAX_JUNIE", 1)),
-        ]);
-        Self {
-            max_active_total: env_usize("CHAINWORKS_MAX_ACTIVE_INVOKE_AGENT_TOTAL", 20),
-            max_active_per_run: env_usize(
-                "CHAINWORKS_MAX_ACTIVE_INVOKE_AGENT_PER_RUN",
-                env_usize("CHAINWORKS_MAX_REVIEW_FANOUTS", 4),
-            ),
-            provider_caps,
-        }
-    }
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(default)
+fn scheduler_capacity_config(
+    capacity: &InvokeAgentCapacityConfig,
+) -> domain::provider::InvokeAgentCapacityConfig {
+    capacity.clone()
 }
 
 pub async fn claim_next_invoke_agent_with_start(
@@ -194,20 +169,20 @@ async fn claim_next_invoke_agent_with_start_inner(
 
         match invoke_agent_capacity_available_tx(&mut tx, capacity, run_id, provider).await? {
             Ok(snapshot) => {
-                if backpressured > 0 {
-                    debug!(
-                        skipped_backpressured_items = backpressured,
-                        item_id = %pending_item.id,
-                        provider = %provider,
-                        active_total = snapshot.active_total,
-                        active_provider = snapshot.active_provider,
-                        active_run = snapshot.active_run,
-                        provider_cap = snapshot.provider_cap.map(|cap| cap as i64),
-                        "InvokeAgent claim skipped backpressured candidates and selected eligible work"
-                    );
-                }
-                selected = Some((pending_item, payload));
-                break;
+                let service_state =
+                    scheduler::get_service_state_tx(&mut tx, "run", &run_id.to_string()).await?;
+                let candidate = (
+                    pending_item,
+                    payload,
+                    snapshot,
+                    service_state.and_then(|state| state.last_served_at),
+                );
+                selected = match selected {
+                    Some(current) if eligible_candidate_precedes(&current, &candidate) => {
+                        Some(current)
+                    }
+                    _ => Some(candidate),
+                };
             }
             Err(reason) => {
                 backpressured += 1;
@@ -222,11 +197,24 @@ async fn claim_next_invoke_agent_with_start_inner(
         }
     }
 
-    let Some((pending_item, payload)) = selected else {
+    let Some((pending_item, payload, snapshot, _last_served_at)) = selected else {
         tx.commit().await?;
         db::pool::log_write_transaction("executor.claim_start_invoke_agent.empty", tx_started);
         return Ok(None);
     };
+    if backpressured > 0 {
+        let provider = payload["provider"].as_str().unwrap_or("unknown");
+        debug!(
+            skipped_backpressured_items = backpressured,
+            item_id = %pending_item.id,
+            provider = %provider,
+            active_total = snapshot.active_total,
+            active_provider = snapshot.active_provider,
+            active_run = snapshot.active_run,
+            provider_cap = snapshot.provider_cap.map(|cap| cap as i64),
+            "InvokeAgent claim skipped backpressured candidates and selected eligible work"
+        );
+    }
 
     if payload
         .pointer("/p058_claimed/agent_execution_id")
@@ -253,6 +241,16 @@ async fn claim_next_invoke_agent_with_start_inner(
             .and_then(|value| serde_json::from_value(value).map_err(anyhow::Error::from))?;
         let claimed_item =
             work_items::mark_claimed_running_tx(&mut tx, &pending_item.id, now).await?;
+        record_scheduler_service_state_tx(&mut tx, run_id, &claimed_item.id, now).await?;
+        let scheduler_capacity = scheduler_capacity_config(capacity);
+        scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &scheduler_capacity,
+            chrono::Utc::now(),
+            "executor.claim_start_invoke_agent.preclaimed",
+            0,
+        )
+        .await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.claim_start_invoke_agent.preclaimed", tx_started);
         return Ok(Some(ClaimedInvokeAgent {
@@ -275,6 +273,15 @@ async fn claim_next_invoke_agent_with_start_inner(
                 now,
             )
             .await?;
+            let scheduler_capacity = scheduler_capacity_config(capacity);
+            scheduler::refresh_queue_summaries_for_notification_tx(
+                &mut tx,
+                &scheduler_capacity,
+                chrono::Utc::now(),
+                "executor.claim_start_invoke_agent.sessionless_rejected",
+                0,
+            )
+            .await?;
             tx.commit().await?;
             db::pool::log_write_transaction(
                 "executor.claim_start_invoke_agent.sessionless_rejected",
@@ -293,12 +300,22 @@ async fn claim_next_invoke_agent_with_start_inner(
         let agent_execution_id = domain::ids::AgentExecutionId::new();
         let claimed_item =
             work_items::mark_claimed_running_tx(&mut tx, &pending_item.id, now).await?;
+        record_scheduler_service_state_tx(&mut tx, run_id, &claimed_item.id, now).await?;
         let artifact_claim_key = ArtifactSourceGenerationClaimKey {
             run_id,
             stage_execution_id,
             agent_execution_id,
             source_work_item_id: claimed_item.id.clone(),
         };
+        let scheduler_capacity = scheduler_capacity_config(capacity);
+        scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &scheduler_capacity,
+            chrono::Utc::now(),
+            "executor.claim_start_invoke_agent.sessionless",
+            0,
+        )
+        .await?;
         tx.commit().await?;
         db::pool::log_write_transaction(
             "executor.claim_start_invoke_agent.sessionless",
@@ -431,6 +448,7 @@ async fn claim_next_invoke_agent_with_start_inner(
     let policy_decision = ensure_policy_tx(&mut tx, policy_input).await?;
     let mut claimed_item =
         work_items::mark_claimed_running_tx(&mut tx, &pending_item.id, now).await?;
+    record_scheduler_service_state_tx(&mut tx, run_id, &claimed_item.id, now).await?;
 
     let agent_execution_id = domain::ids::AgentExecutionId::new();
     let mcp_resolution = crate::mcp::resolve_mcp_servers(
@@ -532,6 +550,16 @@ async fn claim_next_invoke_agent_with_start_inner(
     work_items::update_payload_json_tx(&mut tx, &claimed_item.id, &claimed_item.payload_json)
         .await?;
 
+    let scheduler_capacity = scheduler_capacity_config(capacity);
+    scheduler::refresh_queue_summaries_for_notification_tx(
+        &mut tx,
+        &scheduler_capacity,
+        chrono::Utc::now(),
+        "executor.claim_start_invoke_agent",
+        0,
+    )
+    .await?;
+
     tx.commit().await?;
     db::pool::log_write_transaction("executor.claim_start_invoke_agent", tx_started);
 
@@ -545,6 +573,56 @@ async fn claim_next_invoke_agent_with_start_inner(
         session_generation_id: policy_decision.generation.id,
         artifact_claim_key,
     }))
+}
+
+fn eligible_candidate_precedes(
+    current: &(
+        WorkItem,
+        serde_json::Value,
+        InvokeAgentCapacitySnapshot,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ),
+    candidate: &(
+        WorkItem,
+        serde_json::Value,
+        InvokeAgentCapacitySnapshot,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ),
+) -> bool {
+    match (current.3.as_ref(), candidate.3.as_ref()) {
+        (None, Some(_)) => return true,
+        (Some(_), None) => return false,
+        (Some(current_last_served), Some(candidate_last_served))
+            if current_last_served != candidate_last_served =>
+        {
+            return current_last_served < candidate_last_served;
+        }
+        _ => {}
+    }
+
+    if current.0.scheduled_at != candidate.0.scheduled_at {
+        return current.0.scheduled_at < candidate.0.scheduled_at;
+    }
+    current.0.id <= candidate.0.id
+}
+
+async fn record_scheduler_service_state_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    work_item_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    scheduler::upsert_service_state_tx(
+        tx,
+        &scheduler::SchedulerServiceState {
+            scope: "run".into(),
+            scope_id: run_id.to_string(),
+            last_served_at: Some(now),
+            last_claimed_work_item_id: Some(work_item_id.to_string()),
+            updated_at: now,
+        },
+    )
+    .await
 }
 
 pub async fn has_capacity_eligible_pending_invoke_agent_for_start(
@@ -593,20 +671,21 @@ async fn invoke_agent_capacity_available(
     .bind(&running_status)
     .fetch_one(pool)
     .await?;
-    if active_total >= capacity.max_active_total as i64 {
+    if active_total >= capacity.global_active_agent_executions as i64 {
         return Ok(Err("global_capacity"));
     }
 
+    let provider_family = ProviderFamily::resolve(provider)?;
     let active_provider: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)
            FROM agent_executions
-           WHERE status = ?1 AND provider = ?2"#,
+           WHERE status = ?1 AND provider_family = ?2"#,
     )
     .bind(&running_status)
-    .bind(provider)
+    .bind(provider_family.as_str())
     .fetch_one(pool)
     .await?;
-    let provider_cap = capacity.provider_caps.get(provider).copied();
+    let provider_cap = capacity.provider_caps.get(&provider_family).copied();
     if let Some(provider_cap) = provider_cap {
         if active_provider >= provider_cap as i64 {
             return Ok(Err("provider_capacity"));
@@ -623,7 +702,7 @@ async fn invoke_agent_capacity_available(
     .bind(run_id.to_string())
     .fetch_one(pool)
     .await?;
-    if active_run >= capacity.max_active_per_run as i64 {
+    if active_run >= capacity.per_run_active_agent_executions as i64 {
         return Ok(Err("run_capacity"));
     }
 
@@ -650,20 +729,21 @@ async fn invoke_agent_capacity_available_tx(
     .bind(&running_status)
     .fetch_one(&mut **tx)
     .await?;
-    if active_total >= capacity.max_active_total as i64 {
+    if active_total >= capacity.global_active_agent_executions as i64 {
         return Ok(Err("global_capacity"));
     }
 
+    let provider_family = ProviderFamily::resolve(provider)?;
     let active_provider: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)
            FROM agent_executions
-           WHERE status = ?1 AND provider = ?2"#,
+           WHERE status = ?1 AND provider_family = ?2"#,
     )
     .bind(&running_status)
-    .bind(provider)
+    .bind(provider_family.as_str())
     .fetch_one(&mut **tx)
     .await?;
-    let provider_cap = capacity.provider_caps.get(provider).copied();
+    let provider_cap = capacity.provider_caps.get(&provider_family).copied();
     if let Some(provider_cap) = provider_cap {
         if active_provider >= provider_cap as i64 {
             return Ok(Err("provider_capacity"));
@@ -680,7 +760,7 @@ async fn invoke_agent_capacity_available_tx(
     .bind(run_id.to_string())
     .fetch_one(&mut **tx)
     .await?;
-    if active_run >= capacity.max_active_per_run as i64 {
+    if active_run >= capacity.per_run_active_agent_executions as i64 {
         return Ok(Err("run_capacity"));
     }
 
@@ -1292,6 +1372,10 @@ fn build_steward_agent_prompt(
     parts.join("\n\n")
 }
 
+fn error_chain_message(error: &Error) -> String {
+    format!("{error:#}")
+}
+
 impl BackgroundExecutor {
     pub fn new(
         pool: SqlitePool,
@@ -1300,6 +1384,24 @@ impl BackgroundExecutor {
         acp: Arc<AcpRuntimeManager>,
         events: EventSender,
     ) -> Self {
+        Self::new_with_capacity(
+            pool,
+            work_queue,
+            orchestrator,
+            acp,
+            events,
+            InvokeAgentCapacityConfig::default(),
+        )
+    }
+
+    pub fn new_with_capacity(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        orchestrator: Arc<Orchestrator>,
+        acp: Arc<AcpRuntimeManager>,
+        events: EventSender,
+        invoke_agent_capacity: InvokeAgentCapacityConfig,
+    ) -> Self {
         Self {
             pool,
             work_queue,
@@ -1307,7 +1409,7 @@ impl BackgroundExecutor {
             acp,
             events,
             steward_runtime_inputs: None,
-            invoke_agent_capacity: Arc::new(InvokeAgentCapacityConfig::default()),
+            invoke_agent_capacity: Arc::new(invoke_agent_capacity),
         }
     }
 
@@ -1319,6 +1421,26 @@ impl BackgroundExecutor {
         events: EventSender,
         steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
     ) -> Self {
+        Self::new_with_steward_runtime_inputs_and_capacity(
+            pool,
+            work_queue,
+            orchestrator,
+            acp,
+            events,
+            steward_runtime_inputs,
+            InvokeAgentCapacityConfig::default(),
+        )
+    }
+
+    pub fn new_with_steward_runtime_inputs_and_capacity(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        orchestrator: Arc<Orchestrator>,
+        acp: Arc<AcpRuntimeManager>,
+        events: EventSender,
+        steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
+        invoke_agent_capacity: InvokeAgentCapacityConfig,
+    ) -> Self {
         Self {
             pool,
             work_queue,
@@ -1326,15 +1448,86 @@ impl BackgroundExecutor {
             acp,
             events,
             steward_runtime_inputs: Some(steward_runtime_inputs),
-            invoke_agent_capacity: Arc::new(InvokeAgentCapacityConfig::default()),
+            invoke_agent_capacity: Arc::new(invoke_agent_capacity),
         }
     }
 
     /// Start the background loop. Returns a JoinHandle.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let housekeeping_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            housekeeping_executor
+                .run_generated_state_housekeeping_loop()
+                .await;
+        });
+
         tokio::spawn(async move {
             self.run_loop().await;
         })
+    }
+
+    async fn run_generated_state_housekeeping_loop(self: Arc<Self>) {
+        let config = GeneratedStateHousekeepingConfig::from_env();
+        if !config.enabled {
+            info!("Generated-state housekeeping disabled");
+            return;
+        }
+
+        info!(
+            interval_secs = config.interval.as_secs(),
+            min_age_secs = config.min_age.as_secs(),
+            "Generated-state housekeeping loop started"
+        );
+
+        loop {
+            if let Err(error) = GeneratedStateHousekeeper::run_once(&self.pool, &config).await {
+                warn!(error = %error, "Generated-state housekeeping failed");
+            }
+            sleep(config.interval).await;
+        }
+    }
+
+    async fn mark_agent_execution_failed_if_running(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        item_id: &str,
+        error_message: &str,
+    ) {
+        match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
+            Ok(Some(execution)) if execution.status == AgentStatus::Running => {
+                if let Err(update_error) = agent_executions::update_completed(
+                    &self.pool,
+                    agent_execution_id,
+                    AgentStatus::Failed,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    error!(
+                        item_id = %item_id,
+                        agent_execution_id = %agent_execution_id,
+                        error = %update_error,
+                        "Failed to close running agent execution after InvokeAgent work item failure"
+                    );
+                } else {
+                    warn!(
+                        item_id = %item_id,
+                        agent_execution_id = %agent_execution_id,
+                        failure = %error_message,
+                        "Closed stale running agent execution after InvokeAgent work item failure"
+                    );
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(find_error) => {
+                error!(
+                    item_id = %item_id,
+                    agent_execution_id = %agent_execution_id,
+                    error = %find_error,
+                    "Failed to inspect agent execution after InvokeAgent work item failure"
+                );
+            }
+        }
     }
 
     /// Claim and process the next pending work item. Returns `Ok(true)` if an
@@ -1347,8 +1540,11 @@ impl BackgroundExecutor {
         )
         .await?
         {
+            self.refresh_scheduler_projection_for_invoke_capacity()
+                .await?;
             let item_id = claimed.work_item_id.clone();
             let run_id = Some(claimed.run_id);
+            let agent_execution_id = claimed.agent_execution_id;
             if claimed.session_generation_id.is_empty() {
                 let payload: serde_json::Value =
                     serde_json::from_str(&claimed.work_item.payload_json)?;
@@ -1358,12 +1554,14 @@ impl BackgroundExecutor {
                     && is_first_party_acp_provider(provider)
                     && self.acp.get_adapter(provider).is_none()
                 {
-                    self.work_queue
-                        .fail(
-                            &item_id,
-                            "InvokeAgent payload missing session_reuse_scope; P058 claim/start requires session ownership",
-                        )
-                        .await?;
+                    let error_message = "InvokeAgent payload missing session_reuse_scope; P058 claim/start requires session ownership";
+                    self.mark_agent_execution_failed_if_running(
+                        agent_execution_id,
+                        &item_id,
+                        error_message,
+                    )
+                    .await;
+                    self.work_queue.fail(&item_id, error_message).await?;
                     return Ok(false);
                 }
             }
@@ -1374,13 +1572,22 @@ impl BackgroundExecutor {
                     return Ok(true);
                 }
                 Err(e) => {
-                    self.work_queue.fail(&item_id, &e.to_string()).await?;
+                    let error_message = error_chain_message(&e);
+                    self.mark_agent_execution_failed_if_running(
+                        agent_execution_id,
+                        &item_id,
+                        &error_message,
+                    )
+                    .await;
+                    self.work_queue.fail(&item_id, &error_message).await?;
                     self.enqueue_advance_after_invoke_failure(&item_id, run_id)
                         .await;
                     return Err(e);
                 }
             }
         }
+
+        self.refresh_scheduler_projection_if_needed().await?;
 
         match self.work_queue.claim_next().await? {
             Some(item) => {
@@ -1394,7 +1601,8 @@ impl BackgroundExecutor {
                         Ok(true)
                     }
                     Err(e) => {
-                        self.work_queue.fail(&item_id, &e.to_string()).await?;
+                        let error_message = error_chain_message(&e);
+                        self.work_queue.fail(&item_id, &error_message).await?;
                         if matches!(kind, WorkItemKind::InvokeAgent) {
                             self.enqueue_advance_after_invoke_failure(&item_id, run_id)
                                 .await;
@@ -1417,8 +1625,15 @@ impl BackgroundExecutor {
             .await
             {
                 Ok(Some(claimed)) => {
+                    if let Err(e) = self
+                        .refresh_scheduler_projection_for_invoke_capacity()
+                        .await
+                    {
+                        error!(error = %e, "Failed to refresh scheduler projection after InvokeAgent claim");
+                    }
                     let item_id = claimed.work_item_id.clone();
                     let run_id = Some(claimed.run_id);
+                    let agent_execution_id = claimed.agent_execution_id;
                     info!(item_id = %item_id, kind = %WorkItemKind::InvokeAgent, "Processing claimed InvokeAgent work item");
                     let executor = Arc::clone(self);
                     tokio::spawn(async move {
@@ -1429,9 +1644,17 @@ impl BackgroundExecutor {
                                 }
                             }
                             Err(e) => {
-                                error!(item_id = %item_id, kind = %WorkItemKind::InvokeAgent, error = %e, "Work item failed");
+                                let error_message = error_chain_message(&e);
+                                error!(item_id = %item_id, kind = %WorkItemKind::InvokeAgent, error = %error_message, "Work item failed");
+                                executor
+                                    .mark_agent_execution_failed_if_running(
+                                        agent_execution_id,
+                                        &item_id,
+                                        &error_message,
+                                    )
+                                    .await;
                                 if let Err(e2) =
-                                    executor.work_queue.fail(&item_id, &e.to_string()).await
+                                    executor.work_queue.fail(&item_id, &error_message).await
                                 {
                                     error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                 }
@@ -1443,7 +1666,11 @@ impl BackgroundExecutor {
                     });
                     continue;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if let Err(e) = self.refresh_scheduler_projection_if_needed().await {
+                        error!(error = %e, "Failed to refresh scheduler projection after InvokeAgent backpressure scan");
+                    }
+                }
                 Err(e) => {
                     error!(error = %e, "Error claiming InvokeAgent work item");
                     sleep(Duration::from_millis(500)).await;
@@ -1471,9 +1698,10 @@ impl BackgroundExecutor {
                                     }
                                 }
                                 Err(e) => {
-                                    error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
+                                    let error_message = error_chain_message(&e);
+                                    error!(item_id = %item_id, kind = %kind, error = %error_message, "Work item failed");
                                     if let Err(e2) =
-                                        executor.work_queue.fail(&item_id, &e.to_string()).await
+                                        executor.work_queue.fail(&item_id, &error_message).await
                                     {
                                         error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                     }
@@ -1491,9 +1719,10 @@ impl BackgroundExecutor {
                                 }
                             }
                             Err(e) => {
-                                error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
+                                let error_message = error_chain_message(&e);
+                                error!(item_id = %item_id, kind = %kind, error = %error_message, "Work item failed");
                                 if let Err(e2) =
-                                    self.work_queue.fail(&item_id, &e.to_string()).await
+                                    self.work_queue.fail(&item_id, &error_message).await
                                 {
                                     error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                 }
@@ -1512,12 +1741,37 @@ impl BackgroundExecutor {
         }
     }
 
+    async fn refresh_scheduler_projection_for_invoke_capacity(&self) -> Result<()> {
+        let capacity = scheduler_capacity_config(&self.invoke_agent_capacity);
+        self.work_queue
+            .refresh_scheduler_projection_with_capacity(&capacity)
+            .await
+    }
+
+    async fn refresh_scheduler_projection_if_needed(&self) -> Result<()> {
+        let has_pending_invoke =
+            !work_items::select_pending_invoke_agents_for_start(&self.pool, chrono::Utc::now(), 1)
+                .await?
+                .is_empty();
+        let latest_state = scheduler::latest_health_snapshot(&self.pool)
+            .await?
+            .map(|snapshot| snapshot.sustained_backpressure_state)
+            .unwrap_or_else(|| "clear".to_string());
+
+        if has_pending_invoke || latest_state != "clear" {
+            self.refresh_scheduler_projection_for_invoke_capacity()
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn process_item(&self, item: WorkItem) -> Result<()> {
         match item.kind {
             WorkItemKind::AdvanceRun => {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::InvokeAgent => {
@@ -2321,19 +2575,17 @@ impl BackgroundExecutor {
                 if let Some(artifact) = transcript_artifact {
                     persisted_artifacts.push(artifact);
                 }
-                persisted_artifacts.extend(
-                    self.persist_declared_output_artifacts(
-                        &declared_outputs,
-                        run_id,
-                        &stage_id,
-                        &agent_id,
-                        &provider,
-                        model.clone(),
-                        completed_at,
-                        &mut persisted_paths,
-                    )
-                    .await?,
-                );
+                let declared_artifacts = self.prepare_declared_output_artifacts(
+                    &declared_outputs,
+                    run_id,
+                    &stage_id,
+                    &agent_id,
+                    &provider,
+                    model.clone(),
+                    completed_at,
+                    &mut persisted_paths,
+                )?;
+                persisted_artifacts.extend(declared_artifacts.clone());
 
                 let undeclared_artifacts = self
                     .persist_undeclared_envelope_artifacts(
@@ -2374,6 +2626,7 @@ impl BackgroundExecutor {
                     .import_declared_contract_outputs(
                         &declared_outputs,
                         &persisted_artifacts,
+                        &declared_artifacts,
                         stage_execution_id,
                         agent_exec_id,
                         &item.id,
@@ -2438,13 +2691,6 @@ impl BackgroundExecutor {
                     completed_at,
                 )
                 .await?;
-                if agent_exec.session_generation_id.is_some() {
-                    db::repos::artifact_contracts::close_source_generation_claim(
-                        &self.pool,
-                        &artifact_claim_key,
-                    )
-                    .await?;
-                }
 
                 if final_agent_status == AgentStatus::Failed {
                     crate::recovery::persist_failed_stage_recovery_snapshot(
@@ -2556,10 +2802,11 @@ impl BackgroundExecutor {
             }
 
             WorkItemKind::StartupRepair => {
-                let recovery = RecoveryService::new(
+                let recovery = RecoveryService::new_with_capacity(
                     self.pool.clone(),
                     self.work_queue.clone(),
                     self.events.clone(),
+                    (*self.invoke_agent_capacity).clone(),
                 );
                 recovery.run_startup_repair().await?;
             }
@@ -2568,12 +2815,14 @@ impl BackgroundExecutor {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::SettleStage => {
                 let run_id = self.extract_run_id(&item)?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::RebuildProjection => {
@@ -3085,7 +3334,7 @@ impl BackgroundExecutor {
         Ok(())
     }
 
-    async fn persist_declared_output_artifacts(
+    fn prepare_declared_output_artifacts(
         &self,
         declared_outputs: &[DeclaredOutput],
         run_id: RunId,
@@ -3099,26 +3348,23 @@ impl BackgroundExecutor {
         let mut artifacts_out = Vec::new();
         for declared in declared_outputs {
             let default_contract_id = format!("{}.output", provider);
-            if let Some(artifact) = self
-                .persist_artifact_if_present(
-                    &declared.target_path,
-                    run_id,
-                    stage_id,
-                    agent_id,
-                    declared_machine_artifact_name(declared),
-                    declared
-                        .schema
-                        .as_ref()
-                        .map(|schema| schema.contract_id.as_str())
-                        .unwrap_or(default_contract_id.as_str()),
-                    artifact_format_for_machine_output(declared.schema.as_ref()),
-                    provider,
-                    model.clone(),
-                    None,
-                    created_at,
-                )
-                .await?
-            {
+            if let Some(artifact) = self.prepare_artifact_if_present(
+                &declared.target_path,
+                run_id,
+                stage_id,
+                agent_id,
+                declared_machine_artifact_name(declared),
+                declared
+                    .schema
+                    .as_ref()
+                    .map(|schema| schema.contract_id.as_str())
+                    .unwrap_or(default_contract_id.as_str()),
+                artifact_format_for_machine_output(declared.schema.as_ref()),
+                provider,
+                model.clone(),
+                None,
+                created_at,
+            )? {
                 persisted_paths.insert(declared.target_path.clone());
                 artifacts_out.push(artifact);
             }
@@ -3128,22 +3374,19 @@ impl BackgroundExecutor {
                 declared.companion_path.as_deref(),
                 declared.schema.as_ref(),
             ) {
-                if let Some(artifact) = self
-                    .persist_artifact_if_present(
-                        companion_path,
-                        run_id,
-                        stage_id,
-                        agent_id,
-                        companion_name,
-                        &schema.contract_id,
-                        artifact_format_for_companion_output(schema),
-                        provider,
-                        model.clone(),
-                        None,
-                        created_at,
-                    )
-                    .await?
-                {
+                if let Some(artifact) = self.prepare_artifact_if_present(
+                    companion_path,
+                    run_id,
+                    stage_id,
+                    agent_id,
+                    companion_name,
+                    &schema.contract_id,
+                    artifact_format_for_companion_output(schema),
+                    provider,
+                    model.clone(),
+                    None,
+                    created_at,
+                )? {
                     persisted_paths.insert(companion_path.to_string());
                     artifacts_out.push(artifact);
                 }
@@ -3156,6 +3399,7 @@ impl BackgroundExecutor {
         &self,
         declared_outputs: &[DeclaredOutput],
         persisted_artifacts: &[Artifact],
+        declared_artifacts_to_insert: &[Artifact],
         stage_execution_id: domain::ids::StageExecutionId,
         agent_exec_id: domain::ids::AgentExecutionId,
         work_item_id: &str,
@@ -3313,6 +3557,9 @@ impl BackgroundExecutor {
         let mut tx =
             db::pool::begin_immediate_with_retry(&self.pool, "executor.import_declared_outputs")
                 .await?;
+        for artifact in declared_artifacts_to_insert {
+            artifacts::insert_tx(&mut tx, artifact).await?;
+        }
         let mut projection_dirty = false;
         for prepared_import in prepared_imports {
             let decision = match prepared_import {
@@ -3349,8 +3596,22 @@ impl BackgroundExecutor {
             }
         }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
+        if session_generation_id.is_some() {
+            artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key)
+                .await?;
+        }
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
+        for artifact in declared_artifacts_to_insert {
+            self.persist_implementation_self_assessment_summary_if_applicable(artifact)
+                .await?;
+            let _ = self
+                .events
+                .send(domain::events::DomainEvent::ArtifactCreated {
+                    run_id: artifact.run_id,
+                    artifact_id: artifact.id,
+                });
+        }
         if projection_dirty {
             artifact_contracts::export_projection_files(&self.pool, artifact_claim_key.run_id)
                 .await?;
@@ -3572,6 +3833,48 @@ impl BackgroundExecutor {
         report_kind: Option<&str>,
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<domain::artifact::Artifact>> {
+        let Some(artifact) = self.prepare_artifact_if_present(
+            path,
+            run_id,
+            stage_id,
+            agent_id,
+            name,
+            contract_id,
+            format,
+            provider,
+            model,
+            report_kind,
+            created_at,
+        )?
+        else {
+            return Ok(None);
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        self.persist_implementation_self_assessment_summary_if_applicable(&artifact)
+            .await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id,
+                artifact_id: artifact.id,
+            });
+        Ok(Some(artifact))
+    }
+
+    fn prepare_artifact_if_present(
+        &self,
+        path: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        name: &str,
+        contract_id: &str,
+        format: ArtifactFormat,
+        provider: &str,
+        model: Option<String>,
+        report_kind: Option<&str>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<domain::artifact::Artifact>> {
         let artifact_path = std::path::Path::new(path);
         if !artifact_path.is_file() {
             return Ok(None);
@@ -3595,15 +3898,6 @@ impl BackgroundExecutor {
             report_kind: report_kind.map(str::to_string),
             report_version: None,
         };
-        artifacts::insert(&self.pool, &artifact).await?;
-        self.persist_implementation_self_assessment_summary_if_applicable(&artifact)
-            .await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id,
-                artifact_id: artifact.id,
-            });
         Ok(Some(artifact))
     }
 

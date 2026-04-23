@@ -935,9 +935,13 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 ```
 
 ### ACP-only runtime proof
-
 ```bash
 ./scripts/test-gate.sh proposal-033
+```
+
+### Scheduler and backpressure proof
+```bash
+./scripts/test-gate.sh proposal-061
 ```
 
 ### Before sign-off
@@ -1080,3 +1084,49 @@ Important:
 - `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
 - the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
+
+### `proposal-061|p061`
+
+SQLite write serialization and executor backpressure gate.
+
+Scope:
+
+- `InvokeAgentCapacityConfig` defaults and provider alias normalization
+- Capacity accounting for global, provider, and per-run caps
+- Capacity-aware claim/start leaves blocked work pending and does not create agent_executions
+- Fair scheduler selection via `scheduler_service_state` durable least-recently-served state
+- Hot-index-backed pending InvokeAgent scans and active-count queries with EXPLAIN/query-plan assertions
+- ApproveStage, RetryStage, and CancelRun p95 command latency below 2 seconds under 20 active fake agents
+- Retry/Startup-repair transaction boundaries, atomic supersession, and requeue through capacity gates
+- Projection freshness, zero-count cleanup, all-blocked scan updates, and stale readback markers for scheduler summaries
+- GraphQL and MCP parity for `schedulerHealthSummary` and queue summaries
+- Sustained-backpressure subscription/MCP notification fire and clear behavior
+- Simulated host sleep/wake and network migration classification, process cleanup, jittered retry under caps, and quota exemption
+- DB contention instrumentation in runtime health logs and projections
+- Generated-state housekeeping safety for active/blocked run outputs, managed worktree targets, source files, run artifacts, SQLite database files, stale ACP homes, and unmanaged worktrees
+
+Use when:
+
+- changing scheduler capacity, fairness, or backpressure logic
+- changing SQLite transaction boundaries or write coordination for operator commands
+- changing host-interruption detection, classification, or recovery
+- changing scheduler-health or queue-summary readback surfaces
+
+Host policy:
+
+- local Rust toolchain required
+- no live provider account, Xcode, simulator, daemon process, UI target, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-061
+```
+
+Important:
+
+- `p061` is accepted as an alias
+- the gate asserts p95 command latency under load; ensure the local host is not under extreme unrelated CPU pressure
+- query-plan assertions prove that scheduler scans do not regress to full table scans at fixture scale
+- host-interruption retries must be exempt from provider quota retry budget
+- the gate fails closed if capacity gates, fair selection, p95 latency, atomic supersession, projection parity, backpressure notifications, or host-interruption classification evidence is missing

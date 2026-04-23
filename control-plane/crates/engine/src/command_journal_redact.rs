@@ -292,6 +292,7 @@ mod tests {
             run_id,
             stage_id: "state_7".into(),
             consume_quota_budget_now: true,
+            agent_execution_id: None,
         });
         let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         let redacted = round_trip(&cmd);
@@ -381,6 +382,7 @@ mod tests {
                 run_id: RunId::new(),
                 stage_id: "s".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             Command::CancelRun(CancelRunCmd {
                 run_id: RunId::new(),

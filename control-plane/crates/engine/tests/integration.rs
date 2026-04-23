@@ -790,6 +790,7 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
                 run_id,
                 stage_id: "flaky_stage".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -823,6 +824,18 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
         new_stage.status,
         StageStatus::Pending,
         "new stage execution must start as Pending"
+    );
+
+    let updated_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated_run.status,
+        RunStatus::Running,
+        "stage retry must resume a blocked/failed run"
+    );
+    assert_eq!(
+        updated_run.current_state.as_deref(),
+        Some("flaky_stage"),
+        "stage retry must make the requested stage the active workflow state"
     );
 }
 
@@ -859,6 +872,7 @@ async fn test_retry_stage_targets_latest_matching_attempt() {
                 run_id,
                 stage_id: "flaky_stage".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -910,6 +924,7 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
                 run_id,
                 stage_id: "blocked_stage".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -928,6 +943,318 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
         .find(|s| s.stage_id == "blocked_stage" && s.attempt_number == 2)
         .expect("blocked completed current stage retry must create a new attempt");
     assert_eq!(new_stage.status, StageStatus::Pending);
+}
+
+#[tokio::test]
+async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attempt() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("review".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Completed);
+    old_stage.stage_id = "review".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_lead = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_lead.agent_id = "lead_orchestrator".into();
+    failed_lead.completed_at = Some(Utc::now());
+    let failed_lead_id = failed_lead.id;
+    agent_executions::insert(&pool, &failed_lead).await.unwrap();
+
+    let source_work_item_id = format!("p058-invoke:{old_stage_exec_id}:4");
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "task_name": "aggregate_proposal_reviews",
+                "agent_id": "lead_orchestrator",
+                "provider": "claude",
+                "model": "opus",
+                "task_index": 4,
+                "total_tasks": 5,
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "orchestration_loop",
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_lead_id.to_string(),
+                    "artifact_claim_key": {
+                        "run_id": run_id.to_string(),
+                        "stage_execution_id": old_stage_exec_id.to_string(),
+                        "agent_execution_id": failed_lead_id.to_string(),
+                        "source_work_item_id": source_work_item_id
+                    },
+                    "session_policy_decision": {}
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("review".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "review".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(failed_lead_id),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let old = stages::find_by_id(&pool, old_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.status, StageStatus::Skipped);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let retry_stage = all_stages
+        .iter()
+        .find(|stage| stage.stage_id == "review" && stage.attempt_number == 2)
+        .expect("targeted retry stage should be created");
+    assert_eq!(retry_stage.status, StageStatus::Running);
+    assert_eq!(
+        retry_stage.retry_reason.as_deref(),
+        Some("operator_targeted_retry:lead_orchestrator")
+    );
+
+    let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(run.status, RunStatus::Running);
+
+    let retry_invokes: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(retry_invokes.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+    assert_eq!(
+        payload["stage_execution_id"],
+        serde_json::json!(retry_stage.id.to_string())
+    );
+    assert!(payload.get("p058_claimed").is_none());
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_agent_execution_id"),
+        Some(&serde_json::json!(failed_lead_id.to_string()))
+    );
+}
+
+#[tokio::test]
+async fn test_retry_stage_with_dead_target_generation_falls_back_to_stage_retry() {
+    use acp::AcpRuntimeManager;
+
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("review".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Completed);
+    old_stage.stage_id = "review".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_lead = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_lead.agent_id = "lead_orchestrator".into();
+    failed_lead.completed_at = Some(Utc::now());
+    failed_lead.session_generation_id = Some("dead-generation".into());
+    let failed_lead_id = failed_lead.id;
+    agent_executions::insert(&pool, &failed_lead).await.unwrap();
+
+    let source_work_item_id = format!("p058-invoke:{old_stage_exec_id}:4");
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "task_name": "aggregate_proposal_reviews",
+                "agent_id": "lead_orchestrator",
+                "provider": "claude",
+                "model": "opus",
+                "task_index": 4,
+                "total_tasks": 5,
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_lead_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("review".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let handler = Arc::new(CommandHandler::new_with_acp(
+        pool.clone(),
+        events,
+        work_queue,
+        Arc::new(AcpRuntimeManager::new_with_adapters(vec![])),
+    ));
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "review".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(failed_lead_id),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let old = stages::find_by_id(&pool, old_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.status, StageStatus::Skipped);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let retry_stage = all_stages
+        .iter()
+        .find(|stage| stage.stage_id == "review" && stage.attempt_number == 2)
+        .expect("fallback retry stage should be created");
+    assert_eq!(retry_stage.status, StageStatus::Pending);
+    assert_eq!(
+        retry_stage.retry_reason.as_deref(),
+        Some("operator_retry_stale_targeted_retry")
+    );
+
+    let pending_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.status == db::work_item::WorkItemStatus::Pending)
+        .collect::<Vec<_>>();
+    assert_eq!(pending_items.len(), 1);
+    assert_eq!(
+        pending_items[0].kind,
+        db::work_item::WorkItemKind::AdvanceRun
+    );
+    assert!(
+        !pending_items[0].id.starts_with("p058-targeted-retry:"),
+        "dead-generation fallback must not enqueue another generation-bound targeted retry"
+    );
+}
+
+#[tokio::test]
+async fn test_advance_run_rebuilds_projection_after_blocking_run() {
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("state_4_proposal_reviewed".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut failed_stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
+    failed_stage.stage_id = "state_4_proposal_reviewed".into();
+    failed_stage.label = "Proposal reviewed".into();
+    stages::insert(&pool, &failed_stage).await.unwrap();
+
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let initial_projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("initial run-state projection");
+    assert_eq!(initial_projection.run_state_json["status"], "running");
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::AdvanceRun,
+            Some(run_id),
+            Some("state_4_proposal_reviewed".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_4_proposal_reviewed"
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let blocked_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(blocked_run.status, RunStatus::Blocked);
+
+    let refreshed_projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("refreshed run-state projection");
+    assert_eq!(
+        refreshed_projection.run_state_json["status"], "blocked",
+        "executor-driven AdvanceRun must keep projection status in parity with canonical runs.status"
+    );
 }
 
 #[tokio::test]
@@ -961,6 +1288,7 @@ async fn test_retry_stage_rejects_active_latest_attempt() {
                 run_id,
                 stage_id: "flaky_stage".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1035,6 +1363,7 @@ agents:
                 run_id,
                 stage_id: "build".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -6351,6 +6680,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
                 run_id,
                 stage_id: "state_11_manual_release".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )

@@ -120,8 +120,12 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: starting session"
         );
 
-        if !req.keep_session_alive {
+        if !req.keep_session_alive && req.session_generation_id.is_none() {
             return adapter.execute(req).await;
+        }
+
+        if !req.keep_session_alive {
+            return self.execute_one_shot_session(adapter, req).await;
         }
 
         let session = adapter.open_session(&req).await?;
@@ -148,6 +152,46 @@ impl AcpRuntimeManager {
             .insert(generation_id.clone(), session);
         result.session_generation_id = Some(generation_id);
         result.reused_existing_session = false;
+        Ok(result)
+    }
+
+    async fn execute_one_shot_session(
+        &self,
+        adapter: Arc<dyn AcpAdapter>,
+        req: ExecutionRequest,
+    ) -> Result<ExecutionResult> {
+        let provider = req.provider.clone();
+        let generation_id = req.session_generation_id.clone();
+        let session = adapter.open_session(&req).await?;
+        if let Some(generation_id) = generation_id.as_deref() {
+            self.live_sessions
+                .lock()
+                .await
+                .insert(generation_id.to_string(), session.clone());
+        }
+
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(prompt_error) => {
+                if let Some(generation_id) = generation_id.as_deref() {
+                    self.live_sessions.lock().await.remove(generation_id);
+                }
+                if let Err(close_error) = session.close().await {
+                    warn!(
+                        provider = %provider,
+                        run_id = %req.run_id,
+                        stage_id = %req.stage_id,
+                        "ACP one-shot session close after prompt error failed: {close_error}"
+                    );
+                }
+                return Err(prompt_error);
+            }
+        };
+        if let Some(generation_id) = generation_id.as_deref() {
+            self.live_sessions.lock().await.remove(generation_id);
+        }
+        result.close_diagnostic = session.close().await?;
+        result.session_generation_id = None;
         Ok(result)
     }
 

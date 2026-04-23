@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::approval::{Approval, ApprovalDecision};
 use domain::ids::{ApprovalId, RunId};
@@ -112,6 +112,36 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<Approva
         .collect()
 }
 
+pub async fn list_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<Vec<Approval>> {
+    let run_id_str = run_id.to_string();
+    let rows = sqlx::query(
+        r#"SELECT id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at
+           FROM approvals WHERE run_id = ?1 ORDER BY requested_at ASC"#,
+    )
+    .bind(run_id_str)
+    .fetch_all(&mut **tx)
+    .await
+    .context("list approvals by run")?;
+
+    rows.into_iter()
+        .map(|r| {
+            parse_approval_row(
+                r.get("id"),
+                r.get("run_id"),
+                r.get("stage_id"),
+                r.get("decision"),
+                r.get("requested_at"),
+                r.get("decided_at"),
+                r.get("comment"),
+                r.get("expires_at"),
+            )
+        })
+        .collect()
+}
+
 pub async fn resolve(
     pool: &SqlitePool,
     id: ApprovalId,
@@ -131,6 +161,30 @@ pub async fn resolve(
     .bind(comment)
     .bind(id_str)
     .execute(pool)
+    .await
+    .context("resolve approval")?;
+    Ok(())
+}
+
+pub async fn resolve_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: ApprovalId,
+    decision: ApprovalDecision,
+    decided_at: DateTime<Utc>,
+    comment: Option<String>,
+) -> Result<()> {
+    let id_str = id.to_string();
+    let decision_str = decision.to_string();
+    let decided_at_str = decided_at.to_rfc3339();
+
+    sqlx::query(
+        r#"UPDATE approvals SET decision = ?1, decided_at = ?2, comment = COALESCE(?3, comment) WHERE id = ?4"#,
+    )
+    .bind(decision_str)
+    .bind(decided_at_str)
+    .bind(comment)
+    .bind(id_str)
+    .execute(&mut **tx)
     .await
     .context("resolve approval")?;
     Ok(())

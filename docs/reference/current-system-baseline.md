@@ -23,6 +23,7 @@ At the current baseline, the product includes:
 
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
+- capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
@@ -92,9 +93,9 @@ That boundary is owned by [operator-experience.md](operator-experience.md).
 
 The current MVP provider families are:
 
-1. `codex_acp`
-2. `claude_acp`
-3. `gemini_acp`
+1. `claude`
+2. `gemini`
+3. `codex`
 4. `auggie`
 5. `junie`
 

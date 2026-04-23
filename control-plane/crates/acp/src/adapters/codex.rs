@@ -196,18 +196,75 @@ fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
 /// Matches Swift `sanitizeRuntimeConfig`:
 /// - Strip sandbox settings
 /// - Strip model/effort overrides so session/new model takes priority
+/// - Strip inherited MCP/plugin/skill/project configuration. ACP runtime tool
+///   access must come from the workflow/engine contract, not the operator's
+///   personal Codex config.
 fn sanitize_runtime_config(source: &str) -> String {
-    source
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim().to_lowercase();
-            !trimmed.starts_with("sandbox")
-                && !trimmed.starts_with("disable_sandbox")
-                && !trimmed.starts_with("model")
-                && !trimmed.starts_with("hide_rate_limit")
+    let mut current_block_dropped = false;
+    let mut kept = Vec::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let lowered = trimmed.to_lowercase();
+
+        if lowered.starts_with('[') && lowered.ends_with(']') {
+            let table = lowered.trim_matches(&['[', ']'][..]).trim();
+            let root = table
+                .split(['.', '"'])
+                .find(|part| !part.is_empty())
+                .unwrap_or(table);
+            current_block_dropped = table == "notice.model_migrations"
+                || matches!(
+                    root,
+                    "mcp_servers" | "plugins" | "skills" | "projects" | "features"
+                );
+            if current_block_dropped {
+                continue;
+            }
+        }
+
+        if current_block_dropped {
+            continue;
+        }
+
+        if lowered.starts_with("sandbox")
+            || lowered.starts_with("disable_sandbox")
+            || lowered.starts_with("model")
+            || lowered.starts_with("model_reasoning_effort")
+            || lowered.starts_with("personality")
+            || lowered.starts_with("hide_rate_limit")
+        {
+            continue;
+        }
+
+        kept.push(line);
+    }
+
+    let mut sanitized = kept.join("\n");
+    // Force-write sandbox settings for runtime commands because the Codex seatbelt is
+    // known to deny file writes in provider command execution when inherited defaults
+    // resolve to restrictive profiles. Engine-runner-owned paths already provide the
+    // trust boundary we need for this pipeline, and writable toolchain/cache homes are
+    // required for Rust/Xcode command reliability.
+    if !sanitized.contains("disable_sandbox") {
+        sanitized.push('\n');
+        sanitized.push_str("disable_sandbox = true\n");
+    }
+
+    sanitized
+}
+
+fn configured_toolchain_home() -> PathBuf {
+    std::env::var("CHAINWORKS_TOOLCHAIN_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("TOOLCHAIN_HOME")
+                .ok()
+                .filter(|value| !value.is_empty())
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("chainworks-forge-toolchains"))
 }
 
 /// Build environment variables matching Swift `makeSessionEnvironment`.
@@ -219,17 +276,26 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("session");
-    let toolchain_root = std::env::temp_dir()
-        .join("chainworks-forge-codex-tooling")
+    let toolchain_root = configured_toolchain_home()
+        .join("providers")
+        .join("codex")
         .join(session_name);
     let tmp = toolchain_root.join("tmp");
-    let rustup_home = toolchain_root.join(".rustup");
-    let cargo_home = toolchain_root.join(".cargo");
+    let rustup_home = toolchain_root.join("rust").join("rustup");
+    let cargo_home = toolchain_root.join("rust").join("cargo");
+    let cargo_target_dir = toolchain_root.join("rust").join("target");
 
-    // Keep Rust toolchain caches outside CODEX_HOME: Codex tool calls may run
+    // Keep toolchain caches outside CODEX_HOME: provider tool calls may run
     // under a sandbox where the isolated runtime home is readable but not a
-    // writable root.
-    for dir in [&tmp, &rustup_home, &cargo_home] {
+    // writable root. The top-level contract is language-neutral; concrete
+    // toolchain variables below are adapters for tools that require them.
+    for dir in [
+        &toolchain_root,
+        &tmp,
+        &rustup_home,
+        &cargo_home,
+        &cargo_target_dir,
+    ] {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create {} directory", dir.display()))
             .unwrap_or_else(|error| {
@@ -242,18 +308,25 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
     }
 
     let path = format!("{}:{}", bin, std::env::var("PATH").unwrap_or_default());
+    let toolchain_home = toolchain_root.to_string_lossy().to_string();
     let tmp = tmp.to_string_lossy().to_string();
     let rustup_home = rustup_home.to_string_lossy().to_string();
     let cargo_home = cargo_home.to_string_lossy().to_string();
+    let cargo_target_dir = cargo_target_dir.to_string_lossy().to_string();
 
     vec![
         ("CODEX_HOME".into(), home.clone()),
         ("HOME".into(), home),
-        ("TMPDIR".into(), tmp),
+        ("CHAINWORKS_TOOLCHAIN_HOME".into(), toolchain_home.clone()),
+        ("TOOLCHAIN_HOME".into(), toolchain_home),
+        ("TMPDIR".into(), tmp.clone()),
+        ("TMP".into(), tmp.clone()),
+        ("TEMP".into(), tmp),
         ("PATH".into(), path),
         ("XDG_CACHE_HOME".into(), cache),
         ("RUSTUP_HOME".into(), rustup_home),
         ("CARGO_HOME".into(), cargo_home),
+        ("CARGO_TARGET_DIR".into(), cargo_target_dir),
     ]
 }
 
@@ -308,7 +381,58 @@ mod tests {
     }
 
     #[test]
-    fn session_environment_keeps_rust_toolchain_cache_outside_runtime_home() {
+    fn sanitize_runtime_config_strips_operator_tooling() {
+        let source = r#"
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+personality = "pragmatic"
+
+[projects."/Users/user/Documents/Chainworks Forge"]
+trust_level = "trusted"
+
+[notice]
+hide_full_access_warning = true
+
+[notice.model_migrations]
+"gpt-5.2" = "gpt-5.2-codex"
+
+[mcp_servers.xcode]
+command = "xcrun"
+args = ["mcpbridge"]
+enabled = true
+
+[mcp_servers.chainworks-control-plane]
+enabled = true
+url = "http://127.0.0.1:4000/mcp"
+
+[plugins."build-ios-apps@openai-curated"]
+enabled = true
+
+[skills.proposal_review]
+path = "/Users/user/.codex/skills/proposal-review-triad"
+
+[features]
+multi_agent = true
+"#;
+
+        let sanitized = sanitize_runtime_config(source);
+
+        assert!(!sanitized.contains("gpt-5.4"));
+        assert!(!sanitized.contains("[projects."));
+        assert!(!sanitized.contains("[mcp_servers."));
+        assert!(!sanitized.contains("[plugins."));
+        assert!(!sanitized.contains("[skills."));
+        assert!(!sanitized.contains("[features]"));
+        assert!(!sanitized.contains("mcpbridge"));
+        assert!(!sanitized.contains("multi_agent"));
+        assert!(sanitized.contains("disable_sandbox = true"));
+        assert!(!sanitized.contains("model_migrations"));
+        assert!(sanitized.contains("[notice]"));
+        assert!(sanitized.contains("hide_full_access_warning"));
+    }
+
+    #[test]
+    fn session_environment_keeps_toolchain_cache_outside_runtime_home() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_home = tmp.path().join(".forge-codex-acp").join("session-1");
         std::fs::create_dir_all(&runtime_home).unwrap();
@@ -322,13 +446,22 @@ mod tests {
 
         assert_eq!(value("CODEX_HOME"), runtime_home.to_string_lossy());
         assert_eq!(value("HOME"), runtime_home.to_string_lossy());
-        assert!(value("TMPDIR").contains("chainworks-forge-codex-tooling"));
-        assert!(value("RUSTUP_HOME").contains("chainworks-forge-codex-tooling"));
-        assert!(value("CARGO_HOME").contains("chainworks-forge-codex-tooling"));
+        assert_eq!(value("CHAINWORKS_TOOLCHAIN_HOME"), value("TOOLCHAIN_HOME"));
+        assert!(value("TMPDIR").starts_with(value("TOOLCHAIN_HOME")));
+        assert!(value("RUSTUP_HOME").starts_with(value("TOOLCHAIN_HOME")));
+        assert!(value("CARGO_HOME").starts_with(value("TOOLCHAIN_HOME")));
+        assert!(value("CARGO_TARGET_DIR").starts_with(value("TOOLCHAIN_HOME")));
+        assert!(value("RUSTUP_HOME").contains("/rust/rustup"));
+        assert!(value("CARGO_HOME").contains("/rust/cargo"));
+        assert!(value("CARGO_TARGET_DIR").contains("/rust/target"));
+        assert!(!value("TOOLCHAIN_HOME").starts_with(runtime_home.to_string_lossy().as_ref()));
         assert!(!value("RUSTUP_HOME").starts_with(runtime_home.to_string_lossy().as_ref()));
         assert!(!value("CARGO_HOME").starts_with(runtime_home.to_string_lossy().as_ref()));
+        assert!(!value("CARGO_TARGET_DIR").starts_with(runtime_home.to_string_lossy().as_ref()));
+        assert!(std::path::Path::new(value("TOOLCHAIN_HOME")).is_dir());
         assert!(std::path::Path::new(value("TMPDIR")).is_dir());
         assert!(std::path::Path::new(value("RUSTUP_HOME")).is_dir());
         assert!(std::path::Path::new(value("CARGO_HOME")).is_dir());
+        assert!(std::path::Path::new(value("CARGO_TARGET_DIR")).is_dir());
     }
 }

@@ -71,6 +71,21 @@ pub async fn find_by_id(pool: &SqlitePool, id: StageExecutionId) -> Result<Optio
     row.map(|r| parse_stage_row(&r)).transpose()
 }
 
+pub async fn find_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: StageExecutionId,
+) -> Result<Option<StageExecution>> {
+    let id_str = id.to_string();
+    let query = format!("SELECT {SELECT_COLS} FROM stage_executions WHERE id = ?1");
+    let row = sqlx::query(&query)
+        .bind(id_str)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("find stage execution by id")?;
+
+    row.map(|r| parse_stage_row(&r)).transpose()
+}
+
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<StageExecution>> {
     let run_id_str = run_id.to_string();
     let query = format!(
@@ -79,6 +94,23 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<StageEx
     let rows = sqlx::query(&query)
         .bind(run_id_str)
         .fetch_all(pool)
+        .await
+        .context("list stage executions by run")?;
+
+    rows.iter().map(|r| parse_stage_row(r)).collect()
+}
+
+pub async fn list_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<Vec<StageExecution>> {
+    let run_id_str = run_id.to_string();
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM stage_executions WHERE run_id = ?1 ORDER BY started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(run_id_str)
+        .fetch_all(&mut **tx)
         .await
         .context("list stage executions by run")?;
 
@@ -96,6 +128,22 @@ pub async fn update_status(
         .bind(status_str)
         .bind(id_str)
         .execute(pool)
+        .await
+        .context("update stage execution status")?;
+    Ok(())
+}
+
+pub async fn update_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: StageExecutionId,
+    status: StageStatus,
+) -> Result<()> {
+    let id_str = id.to_string();
+    let status_str = status.to_string();
+    sqlx::query(r#"UPDATE stage_executions SET status = ?1 WHERE id = ?2"#)
+        .bind(status_str)
+        .bind(id_str)
+        .execute(&mut **tx)
         .await
         .context("update stage execution status")?;
     Ok(())

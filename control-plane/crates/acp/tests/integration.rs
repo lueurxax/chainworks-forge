@@ -88,6 +88,73 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server script whose prompt stays active until the
+    /// client sends session/close. This proves runtime cleanup can interrupt a
+    /// one-shot session while it is still executing.
+    pub fn create_close_during_prompt_script(
+        tmpdir: &std::path::Path,
+        prompt_marker_path: &std::path::Path,
+        close_marker_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_close_during_prompt.py");
+        let prompt_marker = prompt_marker_path.to_string_lossy();
+        let close_marker = close_marker_path.to_string_lossy();
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, os
+
+PROMPT_MARKER = {prompt_marker:?}
+CLOSE_MARKER = {close_marker:?}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": "fixture-close-during-prompt"}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+with open(PROMPT_MARKER, "w") as f:
+    f.write("prompt-started\n")
+
+while True:
+    msg = recv()
+    if msg is None:
+        sys.exit(1)
+    if msg.get("method") == "session/close":
+        with open(CLOSE_MARKER, "w") as f:
+            f.write("close-seen\n")
+        sys.exit(0)
+"#
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that completes the handshake but
     /// returns a JSON-RPC error for `session/prompt`, triggering `AgentStatus::Failed`.
     pub fn create_fail_script(tmpdir: &std::path::Path) -> String {
@@ -1071,6 +1138,83 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         .close_session(&session_generation_id)
         .await
         .expect("manager should close the reused live session");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::{AcpRuntimeManager, ExecutionRequest};
+    use domain::ids::RunId;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let prompt_marker = tmp.path().join("prompt-started.txt");
+    let close_marker = tmp.path().join("close-seen.txt");
+    let script =
+        fixture::create_close_during_prompt_script(tmp.path(), &prompt_marker, &close_marker);
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let manager = Arc::new(AcpRuntimeManager::new_with_adapters(vec![
+        Arc::new(adapter) as Arc<dyn AcpAdapter>,
+    ]));
+    let generation_id = "generation-one-shot-close";
+
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_id: "stage_one_shot".into(),
+        agent_id: "one-shot-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "stay running until close".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: Some(generation_id.into()),
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+    };
+
+    let execution = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.execute(req).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !prompt_marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture should enter session/prompt");
+
+    manager
+        .close_session(generation_id)
+        .await
+        .expect("manager should close an in-flight one-shot session by generation id");
+
+    let error = execution
+        .await
+        .expect("execution task should not panic")
+        .expect_err("interrupted prompt should return an execution error");
+    assert!(
+        error.to_string().contains("closed during active prompt"),
+        "unexpected interrupted prompt error: {error:#}"
+    );
+    assert!(
+        close_marker.is_file(),
+        "fixture must receive session/close before the one-shot subprocess exits"
+    );
+    assert!(
+        !manager.has_live_session(generation_id, None).await,
+        "one-shot generation handle should be removed after close"
+    );
 }
 
 #[cfg(unix)]

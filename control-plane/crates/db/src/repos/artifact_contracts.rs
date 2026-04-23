@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use domain::agent::{AgentOutputSettlement, ArtifactSourceClaimState};
 use domain::artifact_contracts::{
@@ -14,6 +15,8 @@ use domain::artifact_contracts::{
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::ids::{AgentExecutionId, ArtifactId, RunId};
+
+use crate::pool::{begin_immediate_with_retry, log_write_transaction};
 
 #[derive(Clone, Debug)]
 pub struct RunStateProjectionRow {
@@ -47,8 +50,11 @@ pub async fn upsert_generation_and_rebuild_tx(
     tx: &mut Transaction<'_, Sqlite>,
     input: ActiveArtifactGenerationInput,
 ) -> Result<()> {
-    let raw_status =
-        effective_raw_status_for_generation(&input.contract_id, &input.raw_path, &input.raw_status)?;
+    let raw_status = effective_raw_status_for_generation(
+        &input.contract_id,
+        &input.raw_path,
+        &input.raw_status,
+    )?;
     let normalized =
         normalize_contract_status(&input.contract_id, &raw_status).map_err(anyhow::Error::msg)?;
     let mut warnings = input.warnings.clone();
@@ -380,8 +386,11 @@ pub async fn import_generation_with_claim_cas_tx(
     source_session_generation_id: &str,
     input: ActiveArtifactGenerationInput,
 ) -> Result<SourceGenerationImportDecision> {
-    let raw_status =
-        effective_raw_status_for_generation(&input.contract_id, &input.raw_path, &input.raw_status)?;
+    let raw_status = effective_raw_status_for_generation(
+        &input.contract_id,
+        &input.raw_path,
+        &input.raw_status,
+    )?;
     let normalized =
         normalize_contract_status(&input.contract_id, &raw_status).map_err(anyhow::Error::msg)?;
     let mut warnings = input.warnings.clone();
