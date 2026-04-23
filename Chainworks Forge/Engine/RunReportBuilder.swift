@@ -184,7 +184,7 @@ final class RunReportBuilder {
                 return cursor.nextScheduledStateID ?? cursor.lastCompletedStateID ?? "unknown"
             case .transitionStarted:
                 return cursor.nextScheduledStateID ?? "unknown"
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 return cursor.lastCompletedStateID ?? "unknown"
             case .awaitingFirstState:
                 break
@@ -373,6 +373,10 @@ final class RunReportBuilder {
 
         // Proposal 032: Read durable transition cursor for report truth.
         let cursor = run.transitionCursor
+        let workflowConflict = summarySnapshotMode.suppressRecoveryNarrative
+            ? nil
+            : WorkflowConflictReportSnapshot.make(from: run)
+        let implementationHandoffStatus = run.implementationHandoffStatus
 
         return RunReportPayload(
             ideaTitle: run.idea?.title ?? "Unknown",
@@ -412,6 +416,8 @@ final class RunReportBuilder {
             failureEvidenceSummaries: failureEvidenceSummaries,
             proposalLoopSummary: proposalLoopSummary,
             mcpTelemetry: kpiSummary?.mcpTelemetry,
+            workflowConflict: workflowConflict,
+            implementationHandoffStatus: implementationHandoffStatus,
             transitionCursorLastCompletedStateID: cursor?.lastCompletedStateID,
             transitionCursorNextScheduledStateID: cursor?.nextScheduledStateID,
             transitionCursorSettlementPhase: cursor?.settlementPhase.rawValue,
@@ -890,6 +896,9 @@ final class RunReportBuilder {
         lines.append("")
         lines.append("## 9. Recovery Notes")
         if let reason = payload.blockedReason { lines.append("- Blocked reason: \(reason)") }
+        if let conflict = payload.workflowConflict?.current {
+            lines.append("- Workflow conflict: \(conflict.reason.rawValue) / \(conflict.status.rawValue)")
+        }
         if let retry = payload.retryPath { lines.append("- Retry path: \(retry)") }
         if let resume = payload.resumePath { lines.append("- Resume path: \(resume)") }
         if let drift = payload.driftDecision { lines.append("- Drift decision: \(drift)") }
@@ -997,6 +1006,12 @@ final class RunReportBuilder {
         if let cost = payload.totalCostCents { lines.append("Cost: \(cost) cents") }
         if let drift = payload.driftNote { lines.append("Drift: \(drift)") }
         if let blockedReason = payload.blockedReason { lines.append("Blocked reason: \(blockedReason)") }
+        if let conflict = payload.workflowConflict?.current {
+            lines.append("Workflow conflict: \(conflict.reason.rawValue) / \(conflict.status.rawValue)")
+        }
+        if let handoff = payload.implementationHandoffStatus {
+            lines.append("Implementation handoff: \(handoff.status) / code_writer \(handoff.codeWriterStartStatus)")
+        }
         if let retryPath = payload.retryPath { lines.append("Retry path: \(retryPath)") }
         if let resumePath = payload.resumePath { lines.append("Resume path: \(resumePath)") }
         if let profile = payload.contextStrategyProfileID { lines.append("Strategy: \(profile)") }
@@ -1051,6 +1066,8 @@ final class RunReportBuilder {
             "failedStages": payload.failedStages,
             "elapsedSeconds": payload.elapsedSeconds,
             "blockedReason": payload.blockedReason as Any,
+            "workflowConflict": payload.workflowConflict.map(Self.jsonObject) as Any,
+            "implementationHandoffStatus": payload.implementationHandoffStatus.map(Self.jsonObject) as Any,
             "retryPath": payload.retryPath as Any,
             "resumePath": payload.resumePath as Any,
             "failureEvidenceSummaries": payload.failureEvidenceSummaries.map {
@@ -1098,6 +1115,16 @@ final class RunReportBuilder {
     }
 
     // MARK: - Helpers
+
+    private static func jsonObject<T: Encodable>(from value: T) -> Any {
+        guard
+            let data = try? JSONEncoder().encode(value),
+            let object = try? JSONSerialization.jsonObject(with: data)
+        else {
+            return NSNull()
+        }
+        return object
+    }
 
     private func elapsedTime(for run: Run) -> Double {
         let end = run.completedAt ?? Date()
@@ -1285,6 +1312,11 @@ struct RunReportPayload: Codable, Sendable {
     // Proposal 022: Feedback fidelity / review carry-forward summary
     let proposalLoopSummary: ProposalLoopFeedbackSummary?
     let mcpTelemetry: SessionReuseKPIExporter.MCPTelemetrySummary?
+
+    // Proposal 017: Swift report JSON exposes camelCase workflowConflict with
+    // snake_case enum values from the temporary Run JSON bridge.
+    let workflowConflict: WorkflowConflictReportSnapshot?
+    let implementationHandoffStatus: ImplementationHandoffStatus?
 
     // Proposal 032: Transition cursor truth for interrupted-transition reporting.
     let transitionCursorLastCompletedStateID: String?

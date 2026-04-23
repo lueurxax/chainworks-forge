@@ -5,7 +5,10 @@ use async_graphql::*;
 use sqlx::SqlitePool;
 use tokio_stream::wrappers::BroadcastStream;
 
-use db::repos::{approvals, artifact_contracts, ideas, projections, runs, steward as steward_repo};
+use db::repos::{
+    approvals, artifact_contracts, ideas, projections, runs, steward as steward_repo,
+    workflow_conflicts,
+};
 use domain::commands::{
     ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
     StartRunCmd,
@@ -107,6 +110,16 @@ async fn enrich_run_with_artifact_contracts(
         artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
             .await?
             .map(|stored| stored.summary.into());
+    gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
+        .await?
+        .map(Into::into);
+    gql.implementation_handoff_status_json = if let Some(status) =
+        workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
+    {
+        Some(async_graphql::Json(serde_json::to_value(status)?))
+    } else {
+        None
+    };
     Ok(())
 }
 
@@ -159,12 +172,10 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?;
         if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
-            runs_with_implementation_summaries(pool, items.into_iter().map(GqlRun::from).collect())
-                .await
+            runs_with_latest_summaries(pool, items.into_iter().map(GqlRun::from).collect()).await
         } else {
             let items = projections::list_active_projection(pool).await?;
-            runs_with_implementation_summaries(pool, items.into_iter().map(GqlRun::from).collect())
-                .await
+            runs_with_latest_summaries(pool, items.into_iter().map(GqlRun::from).collect()).await
         }
     }
 
@@ -464,18 +475,15 @@ impl From<DaemonStatus> for GqlDaemonStatus {
     }
 }
 
-async fn runs_with_implementation_summaries(
-    pool: &SqlitePool,
-    runs: Vec<GqlRun>,
-) -> Result<Vec<GqlRun>> {
+async fn runs_with_latest_summaries(pool: &SqlitePool, runs: Vec<GqlRun>) -> Result<Vec<GqlRun>> {
     let mut with_summaries = Vec::with_capacity(runs.len());
     for run in runs {
-        with_summaries.push(run_with_implementation_summary(pool, run).await?);
+        with_summaries.push(run_with_latest_summary(pool, run).await?);
     }
     Ok(with_summaries)
 }
 
-async fn run_with_implementation_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<GqlRun> {
+async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<GqlRun> {
     let run_id: RunId = run
         .id
         .as_str()
@@ -485,6 +493,16 @@ async fn run_with_implementation_summary(pool: &SqlitePool, mut run: GqlRun) -> 
         artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
             .await?
             .map(|stored| stored.summary.into());
+    run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
+        .await?
+        .map(Into::into);
+    run.implementation_handoff_status_json = if let Some(status) =
+        workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
+    {
+        Some(async_graphql::Json(serde_json::to_value(status)?))
+    } else {
+        None
+    };
     Ok(run)
 }
 
@@ -1075,7 +1093,10 @@ mod tests {
     use async_graphql::Request;
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, projections, runs, stages, steward};
+    use db::repos::{
+        artifact_contracts, artifacts, ideas, projections, runs, stages, steward,
+        workflow_conflicts,
+    };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -1091,6 +1112,11 @@ mod tests {
     use domain::validation::{
         ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
+    };
+    use domain::workflow_conflict::{
+        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
+        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+        WorkflowConflictStatus,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
@@ -1193,6 +1219,53 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+        }
+    }
+
+    fn make_workflow_conflict(run_id: RunId) -> WorkflowConflictRecord {
+        let candidates = vec![CandidateTransitionEvaluation {
+            transition_id: "review_to_refine".into(),
+            from_state_id: "review".into(),
+            to_state_id: "refine".into(),
+            condition_expression_id: Some("proposal_review_summary.pass == false".into()),
+            result: CandidateTransitionResult::MissingInput,
+            required_artifacts: vec!["proposal_review_summary".into()],
+            missing_artifacts: vec!["proposal_review_summary".into()],
+            missing_fields: vec![],
+            source_artifact_ids: vec![],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some("proposal_review_summary is required".into()),
+        }];
+        let reason = WorkflowConflictReason::RequiredArtifactOrFieldMissingForTransition;
+        let candidate_hash = candidate_transition_hash(&candidates);
+        WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: workflow_conflict_fingerprint(
+                &run_id.to_string(),
+                "review",
+                &reason,
+                &candidate_hash,
+                &[],
+            ),
+            run_id: run_id.to_string(),
+            stage_execution_id: None,
+            lineage_id: Some("lineage-p017".into()),
+            current_state_id: "review".into(),
+            reason,
+            operator_label: "Required transition input is missing".into(),
+            status: WorkflowConflictStatus::Unresolved,
+            candidate_transitions: candidates,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs: vec![],
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".into(),
         }
     }
 
@@ -1703,6 +1776,132 @@ mod tests {
         assert_eq!(
             summary["blockingRemainingCodeTaskCount"],
             serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_run_query_exposes_current_workflow_conflict() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let conflict = make_workflow_conflict(run_id);
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(Request::new(format!(
+                r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    id
+                    workflowConflict {{
+                      reason
+                      status
+                      currentStateId
+                      candidateTransitions {{
+                        transitionId
+                        result
+                        missingArtifacts
+                      }}
+                    }}
+                  }}
+                }}
+                "#
+            )))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let conflict_json = &json["run"]["workflowConflict"];
+        assert_eq!(
+            conflict_json["reason"],
+            serde_json::json!("REQUIRED_ARTIFACT_OR_FIELD_MISSING_FOR_TRANSITION")
+        );
+        assert_eq!(conflict_json["status"], serde_json::json!("UNRESOLVED"));
+        assert_eq!(conflict_json["currentStateId"], serde_json::json!("review"));
+        assert_eq!(
+            conflict_json["candidateTransitions"][0]["result"],
+            serde_json::json!("MISSING_INPUT")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_runs_query_exposes_current_workflow_conflict_summary() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &make_workflow_conflict(run_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(Request::new(
+                r#"
+                query Runs {
+                  runs {
+                    id
+                    workflowConflict {
+                      reason
+                      status
+                      currentStateId
+                    }
+                  }
+                }
+                "#,
+            ))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let run_json = json["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["id"] == serde_json::json!(run_id.to_string()))
+            .expect("run appears in active run list");
+        assert_eq!(
+            run_json["workflowConflict"]["reason"],
+            serde_json::json!("REQUIRED_ARTIFACT_OR_FIELD_MISSING_FOR_TRANSITION")
+        );
+        assert_eq!(
+            run_json["workflowConflict"]["status"],
+            serde_json::json!("UNRESOLVED")
+        );
+        assert_eq!(
+            run_json["workflowConflict"]["currentStateId"],
+            serde_json::json!("review")
         );
     }
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, sessions,
-    validation,
+    validation, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -88,6 +88,8 @@ pub async fn execute(
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
+                "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
+                "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
             }));
             if let Some(projection) =
@@ -121,6 +123,26 @@ pub async fn execute(
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+    }
+}
+
+pub(crate) async fn workflow_conflict_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    match workflow_conflicts::get_current_blocking_conflict(pool, run_id).await? {
+        Some(conflict) => Ok(serde_json::to_value(conflict)?),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+pub(crate) async fn implementation_handoff_status_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    match workflow_conflicts::get_implementation_handoff_status(pool, run_id).await? {
+        Some(status) => Ok(serde_json::to_value(status)?),
+        None => Ok(serde_json::Value::Null),
     }
 }
 
@@ -451,7 +473,7 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation};
+    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation, workflow_conflicts};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -463,6 +485,11 @@ mod tests {
     use domain::validation::{
         ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
+    };
+    use domain::workflow_conflict::{
+        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
+        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+        WorkflowConflictStatus,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
@@ -710,6 +737,53 @@ mod tests {
         }
     }
 
+    fn make_workflow_conflict(run_id: RunId) -> WorkflowConflictRecord {
+        let candidates = vec![CandidateTransitionEvaluation {
+            transition_id: "review_to_complete".into(),
+            from_state_id: "review".into(),
+            to_state_id: "complete".into(),
+            condition_expression_id: Some("proposal_review_summary.pass == true".into()),
+            result: CandidateTransitionResult::MissingInput,
+            required_artifacts: vec!["proposal_review_summary".into()],
+            missing_artifacts: vec!["proposal_review_summary".into()],
+            missing_fields: vec![],
+            source_artifact_ids: vec![],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some("proposal_review_summary is required".into()),
+        }];
+        let reason = WorkflowConflictReason::RequiredArtifactOrFieldMissingForTransition;
+        let candidate_hash = candidate_transition_hash(&candidates);
+        WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: workflow_conflict_fingerprint(
+                &run_id.to_string(),
+                "review",
+                &reason,
+                &candidate_hash,
+                &[],
+            ),
+            run_id: run_id.to_string(),
+            stage_execution_id: None,
+            lineage_id: Some("lineage-p017".into()),
+            current_state_id: "review".into(),
+            reason,
+            operator_label: "Required transition input is missing".into(),
+            status: WorkflowConflictStatus::Unresolved,
+            candidate_transitions: candidates,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs: vec![],
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".into(),
+        }
+    }
+
     async fn persist_handoff_required_summary(pool: &sqlx::SqlitePool, run_id: RunId) {
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -857,6 +931,54 @@ mod tests {
         assert_eq!(
             summary["owner_class_counts"]["release"],
             serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_reports_get_includes_current_workflow_conflict() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let conflict = make_workflow_conflict(run_id);
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let workflow_conflict = &mcp_truth["workflow_conflict"];
+
+        assert_eq!(
+            workflow_conflict["reason"],
+            serde_json::json!("required_artifact_or_field_missing_for_transition")
+        );
+        assert_eq!(workflow_conflict["status"], serde_json::json!("unresolved"));
+        assert_eq!(
+            workflow_conflict["candidate_transitions"][0]["result"],
+            serde_json::json!("missing_input")
+        );
+        assert_eq!(
+            workflow_conflict["current_state_id"],
+            serde_json::json!("review")
         );
     }
 

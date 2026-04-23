@@ -174,6 +174,14 @@ final class ResumeManager {
             run.driftDetails = nil
         }
 
+        if run.transitionCursor?.settlementPhase == .awaitingConflictResolution,
+           let conflict = run.currentWorkflowConflictRecord {
+            return .needsDecision(
+                run,
+                reason: "Workflow conflict requires resolution before resume: \(conflict.reason.rawValue)"
+            )
+        }
+
         // Check 4: Side-effect stage detection (e.g., git push, release)
         // Even without drift, if the run was interrupted mid-side-effect, flag it
         if wasInterruptedDuringSideEffect(run: run, plan: plan) {

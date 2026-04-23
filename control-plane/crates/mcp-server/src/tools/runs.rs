@@ -157,7 +157,10 @@ pub async fn execute(
                             db::repos::artifact_contracts::find_run_state_projection(pool, run_id)
                                 .await?
                         {
-                            obj.insert("active_artifact_index".into(), projection.active_index_json);
+                            obj.insert(
+                                "active_artifact_index".into(),
+                                projection.active_index_json,
+                            );
                             obj.insert("run_state_projection".into(), projection.run_state_json);
                             obj.insert(
                                 "operator_overrides".into(),

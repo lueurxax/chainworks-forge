@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, runs, stages, startup_repairs, work_items,
+    workflow_conflicts,
 };
 use db::work_item::WorkItemKind;
 use domain::agent::{AgentFailureKind, AgentOutputSettlement};
@@ -279,6 +280,10 @@ impl RecoveryService {
                 .await?;
             requeued += 1;
         } else {
+            if self.transition_cursor_blocks_startup_catchup(run).await? {
+                return Ok(requeued);
+            }
+
             // Even if no stages are stuck in Running, the run may need
             // advancement — e.g. daemon crashed after settling a stage as
             // Completed but before evaluate_and_transition ran, or after
@@ -317,6 +322,28 @@ impl RecoveryService {
         }
 
         Ok(requeued)
+    }
+
+    async fn transition_cursor_blocks_startup_catchup(&self, run: &Run) -> Result<bool> {
+        let Some(cursor) = workflow_conflicts::get_transition_cursor(&self.pool, run.id).await?
+        else {
+            return Ok(false);
+        };
+        let blocks_catchup = matches!(
+            cursor.resume_policy.as_str(),
+            "await_conflict_resolution" | "terminal_failure"
+        );
+        if blocks_catchup {
+            info!(
+                run_id = %run.id,
+                current_state = %cursor.current_state_id,
+                cursor_status = %cursor.cursor_status,
+                resume_policy = %cursor.resume_policy,
+                conflict_id = ?cursor.conflict_id,
+                "Startup recovery leaving run parked at workflow transition cursor"
+            );
+        }
+        Ok(blocks_catchup)
     }
 
     async fn latest_execution_provenance_suffix(
