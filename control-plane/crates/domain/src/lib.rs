@@ -8,6 +8,7 @@ pub mod events;
 pub mod idea;
 pub mod ids;
 pub mod lifecycle;
+pub mod provider;
 pub mod run;
 pub mod session;
 pub mod stage;

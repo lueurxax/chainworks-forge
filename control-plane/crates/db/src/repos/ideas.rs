@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::IdeaId;
+
+use crate::pool::begin_immediate_with_retry;
 
 pub async fn insert(pool: &SqlitePool, idea: &Idea) -> Result<()> {
     let id = idea.id.to_string();
@@ -39,6 +41,32 @@ pub async fn find_by_id(pool: &SqlitePool, id: IdeaId) -> Result<Option<Idea>> {
     )
     .bind(id_str)
     .fetch_optional(pool)
+    .await
+    .context("find idea by id")?;
+
+    row.map(|r| {
+        parse_idea_row(
+            r.get("id"),
+            r.get("title"),
+            r.get("body"),
+            r.get("workspace_root_path"),
+            r.get("project_key"),
+            r.get("status"),
+            r.get("created_at"),
+            r.get("archived_at"),
+        )
+    })
+    .transpose()
+}
+
+pub async fn find_by_id_tx(tx: &mut Transaction<'_, Sqlite>, id: IdeaId) -> Result<Option<Idea>> {
+    let id_str = id.to_string();
+    let row = sqlx::query(
+        r#"SELECT id, title, body, workspace_root_path, project_key, status, created_at, archived_at
+           FROM ideas WHERE id = ?1"#,
+    )
+    .bind(id_str)
+    .fetch_optional(&mut **tx)
     .await
     .context("find idea by id")?;
 
@@ -93,6 +121,17 @@ pub async fn list(pool: &SqlitePool, include_archived: bool) -> Result<Vec<Idea>
 }
 
 pub async fn update_status(pool: &SqlitePool, id: IdeaId, status: IdeaStatus) -> Result<()> {
+    let mut tx = begin_immediate_with_retry(pool, "ideas.update_status").await?;
+    update_status_tx(&mut tx, id, status).await?;
+    tx.commit().await.context("commit update idea status")?;
+    Ok(())
+}
+
+pub async fn update_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: IdeaId,
+    status: IdeaStatus,
+) -> Result<()> {
     let id_str = id.to_string();
     let status_str = status.to_string();
     let archived_at: Option<String> = if matches!(status, IdeaStatus::Archived) {
@@ -107,7 +146,7 @@ pub async fn update_status(pool: &SqlitePool, id: IdeaId, status: IdeaStatus) ->
     .bind(status_str)
     .bind(archived_at)
     .bind(id_str)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("update idea status")?;
     Ok(())

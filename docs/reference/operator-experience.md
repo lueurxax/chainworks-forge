@@ -57,6 +57,7 @@ Each row shows:
 - total cost,
 - last progress timestamp,
 - attention level,
+- queued agent count (when > 0),
 - runtime provenance.
 
 Contextual actions are status-aware:
@@ -66,6 +67,30 @@ Contextual actions are status-aware:
 - `Recover` appears only for blocked or failed runs
 - `Compare` appears only when a compatible target exists
 - `View report` appears only when report artifacts exist
+
+## Scheduler Health and Backpressure
+
+Backpressure is treated as normal scheduling state, not failure. When the system
+reaches capacity (global, provider, or run-local), work remains queued and is
+visible as "Queued" or "Waiting for provider slot".
+
+Surfaces for backpressure visibility:
+- **Sidebar Badge**: Shows queued agent count next to the run status.
+- **Run Detail**: Displays active agents, queued agents, oldest queued age, and
+  top backpressure reason.
+- **Stage Detail**: Includes a "Backpressured Agents" disclosure showing pending
+  agents by provider and reason.
+- **Scheduler Health**: A dedicated section in PilotReadinessView showing system-wide
+  capacity, write pressure, and command latency.
+- **Sustained Backpressure Alerts**: Notifications trigger when work remains queued
+  longer than the configured threshold (default 5 minutes).
+
+### Host Interruption
+
+Interruptions like system sleep or network migration are classified as
+`host_interruption`. They are displayed with friendly labels like "Recovering
+from system sleep" and neutral visual indicators (e.g., SF Symbol `moon.zzz`),
+distinct from failed states.
 
 The operator shell must not promise an action that cannot actually run from the current row.
 

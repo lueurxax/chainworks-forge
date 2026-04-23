@@ -45,6 +45,7 @@ pub enum AgentFailureKind {
     InvalidOutputContract,
     CancelledByOperator,
     SupersededByRetry,
+    HostInterruption,
     Unknown,
 }
 
@@ -542,6 +543,9 @@ impl GqlAgentExecutionRuntimeFacts {
                 }
                 domain::agent::AgentFailureKind::SupersededByRetry => {
                     AgentFailureKind::SupersededByRetry
+                }
+                domain::agent::AgentFailureKind::HostInterruption => {
+                    AgentFailureKind::HostInterruption
                 }
                 domain::agent::AgentFailureKind::Unknown => AgentFailureKind::Unknown,
             }),

@@ -17,6 +17,9 @@ struct ContentView: View {
     /// banner renders nothing when the daemon is unavailable but keeps
     /// the Retry + Export Diagnostics affordances alive.
     @StateObject private var daemonStatus = DaemonStatusViewModel.bootstrap()
+    @StateObject private var schedulerHealth = SchedulerHealthViewModel.bootstrap()
+    @State private var pilotReadinessFocusRequest: PilotReadinessFocusRequest?
+    @State private var pilotReadinessFocusSequence = 0
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
 
@@ -86,8 +89,12 @@ struct ContentView: View {
                     // Only renders when there is something to report —
                     // a running daemon that's Ready hides the banner so
                     // the main UI keeps its real estate.
-                    if daemonStatus.shouldDisplayBanner {
-                        DaemonLifecycleBanner(viewModel: daemonStatus)
+                    if daemonStatus.shouldDisplayBanner || schedulerHealth.bannerIssue != nil {
+                        DaemonLifecycleBanner(
+                            viewModel: daemonStatus,
+                            schedulerHealthIssue: schedulerHealth.bannerIssue,
+                            onOpenSchedulerHealth: openSchedulerHealth
+                        )
                             .padding(.horizontal, 12)
                             .padding(.top, 8)
                     }
@@ -99,6 +106,9 @@ struct ContentView: View {
                     // repeat call during view lifecycle just cancels
                     // the prior task and re-seeds.
                     await daemonStatus.startSnapshotPlusSubscribe()
+                }
+                .task {
+                    await refreshSchedulerHealthLoop()
                 }
             }
         }
@@ -165,7 +175,7 @@ struct ContentView: View {
                 .accessibilityIdentifier("tab-workflow-inspector")
 
                 deferredTab(.pilotReadiness) {
-                    PilotReadinessView()
+                    PilotReadinessView(focusRequest: pilotReadinessFocusRequest)
                 }
                     .tabItem { Label("Pilot Readiness", systemImage: "checkmark.shield") }
                     .tag(Tab.pilotReadiness)
@@ -205,6 +215,22 @@ struct ContentView: View {
             }
             // Approval badge on Ideas tab when approvals are pending
             .badge(executionService.pendingApprovalCount > 0 ? executionService.pendingApprovalCount : 0)
+        }
+    }
+
+    private func openSchedulerHealth() {
+        pilotReadinessFocusSequence += 1
+        pilotReadinessFocusRequest = PilotReadinessFocusRequest(
+            id: pilotReadinessFocusSequence,
+            focus: .schedulerHealth
+        )
+        selectedTab = .pilotReadiness
+    }
+
+    private func refreshSchedulerHealthLoop() async {
+        while !Task.isCancelled {
+            await schedulerHealth.refresh()
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
         }
     }
 

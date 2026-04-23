@@ -1,5 +1,5 @@
 {
-  "proposal_revision_id": "p053-r7-2026-04-20",
+  "proposal_revision_id": "p053-r7-generated-state-housekeeping-2026-04-22",
   "source_review_pass_id": "p053-review-pass-1",
   "title": "Proposal 053: Bounded ACP Artifact Discovery and Startup Latency",
   "date": "2026-04-20",
@@ -32,6 +32,9 @@
       "Current post-prompt filesystem diff can infer outputs from dirty worktrees rather than declared contracts.",
       "Path-only expected_output_paths cannot carry labels, requiredness, reuse policy, size policy, or durable rejection reasons.",
       "Current engine validation can read declared target paths from disk after discovery, which would bypass stale, oversized, escaped, or unauthorized exact-path rejection unless P053 changes the handoff."
+    ],
+    "evidence": [
+      "Dogfood workspace size reached approximately 80 GB, dominated by .chainworks/worktrees, control-plane/target, .forge-codex-acp, .claude/worktrees, DB backups, and .git/objects. Broad traversal of the workspace can therefore masquerade as provider startup latency even when the target run worktree is small."
     ]
   },
   "goals": [
@@ -46,7 +49,8 @@
     "Make legacy broad discovery explicit, audited, capped, post-prompt only, and off by default.",
     "Validate candidate output byte caps against representative production runs before implementation fixes the defaults.",
     "Ship in phased slices so the core latency fix can be proven independently from compatibility and UI follow-ons.",
-    "Provide deterministic tests and a proposal-053|p053 gate that prove behavior rather than host-speed timing."
+    "Provide deterministic tests and a proposal-053|p053 gate that prove behavior rather than host-speed timing.",
+    "Explicitly exclude generated state such as nested worktree targets, ACP homes, DB backups, and git object stores from fallback/support discovery so cleanup is an optimization, not a correctness prerequisite."
   ],
   "non_goals": [
     "Do not switch ACP transport from stdio to HTTP.",
@@ -428,6 +432,32 @@
         "Does not outrank accepted declared outputs, provider envelopes, or source-generation settlement.",
         "Logs workflow, stage, run id, root, reason, file count, elapsed time, and truncation."
       ]
+    },
+    "generated_state_exclusion_policy": {
+      "purpose": "Prevent fallback traversal, support scans, diagnostics, and migration inventories from walking generated state when rooted at a workspace or worktree path.",
+      "minimum_denylist": [
+        ".chainworks/worktrees",
+        ".chainworks/backups",
+        ".forge-codex-acp",
+        ".claude/worktrees",
+        ".git/objects",
+        "control-plane/target",
+        "**/target",
+        "DerivedData",
+        ".build",
+        "node_modules",
+        ".chainworks/*.db.backup-*",
+        ".chainworks/*.sqlite"
+      ],
+      "primary_invariant": "The denylist is defense-in-depth. Fresh ACP startup still must send initialize before any repository, workspace-root, worktree-root, broad Git, or generated-state traversal.",
+      "housekeeping_policy": [
+        "Remove generated build outputs only for inactive, cancelled, archived, or explicitly stale run worktrees.",
+        "Never delete worktrees, source files, .git worktree metadata, run artifacts, or active run build outputs as part of housekeeping.",
+        "Remove stale .forge-codex-acp session homes only when no live provider/MCP process references the directory.",
+        "Keep the current DB, WAL/SHM, newest pre-cleanup backup, and operator-pinned backups; prune older migration/test backups only through explicit housekeeping.",
+        "Report reclaimed bytes by category and keep cleanup safe while the daemon is active when touching only inactive generated outputs.",
+        "P061 or a follow-up owns long-term retention automation; P053 discovery must not rely on cleanup for correctness."
+      ]
     }
   },
   "architecture": {
@@ -707,7 +737,8 @@
       "For already-frozen runs, do not assume YAML edits affect resume. Either rerun with a newly compiled snapshot or use the retry/resume legacy discovery override input so the target StageExecutionId and override row are created atomically. The standalone overrideLegacyDiscoveryPolicy and legacy_discovery_override_create paths are only for already-created pending retry attempts that have not started prompt execution.",
       "A valid override is consumed before the resumed agent prompt begins; stale, expired, duplicate conflicting, or wrong-stage overrides fail closed and leave legacy broad discovery disabled.",
       "At resume time, emit a warning naming run id, workflow, stage, frozen policy, expected-output completeness, and whether a compatibility override is active.",
-      "Operators confirm P053 is active by seeing acp_pre_initialize_local_latency_ms for every ACP session and no acp_legacy_broad_discovery_used warnings for migrated workflows."
+      "Operators confirm P053 is active by seeing acp_pre_initialize_local_latency_ms for every ACP session and no acp_legacy_broad_discovery_used warnings for migrated workflows.",
+      "Add housekeeping runbook for inactive worktree target directories, stale ACP homes, old DB backups, and git object garbage; do not require cleanup for P053 correctness."
     ],
     "rollback": [
       "The removal of pre-initialize broad scanning can be reverted independently only if exact-path discovery has a critical regression.",
@@ -780,7 +811,8 @@
       "Pre-initialize startup does not call DiscoveryFilesystem traversal, snapshot_workspace, walkdir, find, or broad git status/diff hooks.",
       "Provider handshake latency is reported separately from local pre-initialize latency.",
       "Rejected OutputDiscoveryDecision records cannot be bypassed by load_declared_output_bytes or declared artifact persistence.",
-      "Phase 1 p053 gate can pass with legacy broad discovery fully disabled."
+      "Phase 1 p053 gate can pass with legacy broad discovery fully disabled.",
+      "Generated-state denylist fixtures prove fallback/support scans skip .chainworks/worktrees, **/target, .forge-codex-acp, .claude/worktrees, .chainworks/backups, and git object stores."
     ],
     "focused_tests": [
       "No pre-initialize broad scan using an instrumented traversal hook and fake provider.",
@@ -815,7 +847,8 @@
       "P037 idle watchdog does not classify post-prompt discovery or git manifest generation as provider idle time.",
       "Missing required outputs include display labels, output ids, expected absolute paths, statuses, and diagnostic reasons.",
       "RunDetailPanel view-model maps missing outputs to compact vertical rows at sidebar width, limits default visible rows, and defines disabled/open-nearest-parent behavior for Open Location.",
-      "Status color/icon mapping covers missing, stale, oversized, capped, symlink_escape, unauthorized_root, and contract_invalid."
+      "Status color/icon mapping covers missing, stale, oversized, capped, symlink_escape, unauthorized_root, and contract_invalid.",
+      "Reference large-workspace fixture includes generated-state directories and proves no generated-state traversal occurs before initialize or outside bounded current-run meta-root discovery."
     ]
   },
   "risks_and_mitigations": [
@@ -868,6 +901,11 @@
       "risk": "Security boundaries around file paths are missed.",
       "impact": "External agent paths could escape authorized roots or cause large reads.",
       "mitigation": "Require security review before PR landing; if a named security reviewer is unavailable, record formal risk acceptance before merge."
+    },
+    {
+      "risk": "Generated build/runtime state dominates the workspace and makes broad scans look like provider startup latency.",
+      "impact": "ACP startup and support diagnostics can time out or be misclassified even when the target run worktree is small.",
+      "mitigation": "Generated-state denylist, no pre-initialize traversal invariant, and explicit housekeeping policy for inactive targets, stale ACP homes, old DB backups, and git object garbage."
     }
   ],
   "open_questions": [
@@ -894,7 +932,7 @@
     {
       "issue_id": "PO-B-01",
       "status": "addressed",
-    "resolution": "Defined output_policies.<output_name>.reuse_policy with allowed values must_produce and allow_unchanged_existing, compiler freezing behavior, acceptance semantics, and runtime provenance while preserving outputs as a list."
+      "resolution": "Defined output_policies.<output_name>.reuse_policy with allowed values must_produce and allow_unchanged_existing, compiler freezing behavior, acceptance semantics, and runtime provenance while preserving outputs as a list."
     },
     {
       "issue_id": "ARCH-R2-01",
@@ -914,7 +952,7 @@
     {
       "issue_id": "ARCH-R2-04",
       "status": "addressed",
-    "resolution": "Named agent_execution_discovery_diagnostics as the durable diagnostics owner, with P058 runtime facts and failed-stage evidence carrying summaries or projections."
+      "resolution": "Named agent_execution_discovery_diagnostics as the durable diagnostics owner, with P058 runtime facts and failed-stage evidence carrying summaries or projections."
     },
     {
       "issue_id": "ARCH-R2-05",
@@ -1148,6 +1186,7 @@
     "Stage Detail and Evidence panels render Startup Performance with Forge overhead separated from Provider latency.",
     "Discovery truncation renders a Capped warning indicator with the specific cap reason.",
     "ArtifactInspectorView has a Source Changes renderer for changed_files_manifest with raw JSON fallback.",
-    "scripts/test-gate.sh and docs/reference/test-gates.md register and document proposal-053|p053."
+    "scripts/test-gate.sh and docs/reference/test-gates.md register and document proposal-053|p053.",
+    "Fallback/support discovery skips generated-state roots such as .chainworks/worktrees, **/target, .forge-codex-acp, .claude/worktrees, .chainworks/backups, and git object stores, and cleanup remains optional for correctness."
   ]
 }

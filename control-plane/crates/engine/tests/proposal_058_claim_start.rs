@@ -688,6 +688,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
                 run_id,
                 stage_id: "implementation".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -857,6 +858,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 run_id,
                 stage_id: "implementation".into(),
                 consume_quota_budget_now: false,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -882,6 +884,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 run_id,
                 stage_id: "implementation".into(),
                 consume_quota_budget_now: true,
+                agent_execution_id: None,
             }),
             CallerContext::test_fixture(),
         )

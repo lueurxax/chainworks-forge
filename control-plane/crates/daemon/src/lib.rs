@@ -1,4 +1,5 @@
 pub mod failed_serve;
+pub mod host_interruption_sources;
 pub mod log_redaction;
 pub mod log_retention;
 pub mod packaging;
