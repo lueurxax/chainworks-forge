@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use tracing::warn;
 
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{AcpCloseDiagnostic, ExecutionRequest, ExecutionResult};
@@ -74,11 +75,17 @@ impl AcpSession {
 
     /// Close the live ACP session and wait for the subprocess to exit.
     pub async fn close(&mut self) -> Result<Option<AcpCloseDiagnostic>> {
-        let close_diagnostic = self.transport.close().await?;
+        let close_result = self.transport.close().await;
         if let Some(path) = self.cleanup_path.take() {
-            let _ = std::fs::remove_dir_all(path);
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                warn!(
+                    cleanup_path = %path.display(),
+                    error = %error,
+                    "Failed to remove ACP session cleanup path"
+                );
+            }
         }
-        Ok(close_diagnostic)
+        close_result
     }
 }
 

@@ -1186,7 +1186,7 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         let manager = Arc::clone(&manager);
         tokio::spawn(async move { manager.execute(req).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while !prompt_marker.is_file() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

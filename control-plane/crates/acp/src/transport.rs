@@ -1384,6 +1384,26 @@ pub async fn run_acp_session(
     Ok((status, paths, artifacts))
 }
 
+impl Drop for AcpTransportSession {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            signal_process_group(pid, libc::SIGTERM);
+        }
+        if let Err(error) = self.child.start_kill() {
+            warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "Failed to start-kill unclosed ACP subprocess during drop"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
