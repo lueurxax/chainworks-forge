@@ -47,6 +47,15 @@ The client must not infer:
 | Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionID:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. |
 | Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution (`approvals.resolve`) is an operator-side MCP action on a separate surface; P031's thin UI renders the inbox read-only. |
 | Artifact viewer | `artifacts(runID:)` | artifact index projection / `db::repos::projections::list_artifacts_projection` | Implemented | Browse the server artifact hierarchy only; direct file open/export may happen only after server selection. |
+| Scheduler health | `schedulerHealthSummary` | `scheduler_health_snapshots` projection | Implemented | Render system-wide capacity, pressure, and latency health. |
+| Startup recovery | `startupRecoverySummary` | `startup_recovery_readbacks` projection | Implemented | Render startup recovery progress, counts, and backpressure state. |
+| Command latency | `commandLatencySummary` | `scheduler_health_snapshots` projection | Implemented | Render p95 latency for operator commands (approve, retry, cancel). |
+| DB contention | `dbWriterContentionSummary` | `scheduler_health_snapshots` projection | Implemented | Render SQLite write wait p95 and transaction contention. |
+| Provider capacity | `activeExecutionCountsByProvider` | `agent_executions` active counts | Implemented | Render active execution counts per canonical provider family. |
+| Global queue depth | `oldestQueuedAge` and `queuedBackpressuredCountsByProviderAndReason` | `scheduler_queue_summaries` | Implemented | Render system-wide oldest queued item age and counts by reason. |
+| Run/Stage queue | `runQueueSummary(runID:)` and `stageQueueSummary(stageExecutionID:)` | `scheduler_queue_summaries` projection | Implemented | Render queued/backpressured work counts and reasons. |
+| Queue position | `queuePositionHint` | `scheduler_queue_summaries` | Implemented | Render non-ETA position hint for queued work. |
+| Host interruption | `hostInterruptionEpochs` and `hostInterruptionAffectedExecutions` | `host_interruption_epochs` / `affected_executions` | Implemented | Render host sleep/wake and network migration history and impact. |
 | Report viewer | report metadata through `artifacts(runID:)`; dedicated report payload query remains future work | artifact/report projection and future payload owner | Partial | Report metadata can render; payload rendering stays disabled unless a server-owned GraphQL payload path exists. |
 | Daemon lifecycle | `daemonStatus` and `daemonStatusChanged` | [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) | Implemented | Render daemon live/degraded/failed/unavailable state from the lifecycle read model; do not infer lifecycle state from arbitrary request failures. |
 | Experiment comparison | future comparison read query | future comparison/report owner | Deferred | Keep comparison disabled or placeholder-only. |
@@ -115,6 +124,7 @@ Recognized subscription names for this contract:
 | `stageStatusChanged(runID:)` | Projection-enriched `GqlStageExecution` via `list_stages_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch stage decision flags; controls remain disabled during `projection_lag`. |
 | `approvalRequested` | Emits current approval row for the requested approval. | May update approval inbox; command completion refresh still required after decisions. |
 | `approvalResolved` | Emits current approval row for the resolved approval. | May remove/update approval row; bounded refresh fallback remains valid if subscription is unavailable. |
+| `schedulerBackpressureChanged` | Emits sustained-backpressure events when thresholds are crossed. | May trigger UI health alerts or banner changes. |
 | `runtimeStatusChanged` | Broader runtime/adapter health event stream remains future work beyond the implemented daemon lifecycle stream. | Deferred for P031 adapter-health UI until a server-owned runtime-health contract is accepted. |
 
 Missing subscription support is not a reason for the client to infer truth locally. It only changes the refresh strategy to bounded visible-surface polling.
@@ -147,7 +157,15 @@ P043 owns the read contract and server-published facts. P031 owns macOS UI timer
 | Stage status subscription | `stageStatusChanged(runID:)` emits projection-enriched stage decision and freshness fields. | Sufficient for P031 event patching. |
 | Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for P031 event patching. |
 | Approval inbox | `approvalInbox` is projection-backed. | Sufficient for P031 ship. |
-| Artifact viewer | `artifacts(runID:)` is projection-backed. | Sufficient for P031 ship. |
+| Artifact viewer | `artifacts(runID:)` | is projection-backed. | Sufficient for P031 ship. |
+| Scheduler health | `schedulerHealthSummary` returns global capacity, active counts, oldest queued age, and sustained backpressure state. | Sufficient for P031 health alerts. |
+| Startup recovery | `startupRecoverySummary` returns recovered items, backpressured recovery counts, and affected runs. | Sufficient for P031 recovery UI. |
+| Command latency | `commandLatencySummary` returns p95 latency for approve, retry, and cancel. | Sufficient for P031 diagnostics. |
+| DB contention | `dbWriterContentionSummary` returns write wait p95 and transaction contention. | Sufficient for P031 diagnostics. |
+| Provider capacity | `activeExecutionCountsByProvider` returns active execution counts per canonical family. | Sufficient for P031 capacity UI. |
+| Queue summaries | `runQueueSummary`, `stageQueueSummary`, and `queuedBackpressuredCountsByProviderAndReason` are projection-backed. | Sufficient for P031 backpressure UI. |
+| Queue position | `queuePositionHint` returns non-ETA position hint from projection truth. | Sufficient for P031 queue UI. |
+| Host interruption | `hostInterruptionEpochs` and `hostInterruptionAffectedExecutions` are canonical readbacks. | Sufficient for P031 recovery UI. |
 | Report viewer | Metadata-backed only; dedicated report payload path is not complete. | Partial proof only. |
 | Runtime health | No P043-owned GraphQL health proof for thin-client use. | Deferred. |
 | Experiment comparison | No current GraphQL query proof. | Deferred. |
@@ -162,6 +180,10 @@ P043 owns the read contract and server-published facts. P031 owns macOS UI timer
 | Stage detail | Projection parity is maintained through canonical row plus stage projection enrichment and explicit projection freshness fields. |
 | Approval inbox | Projection parity is maintained through the inbox projection owner. |
 | Artifact viewer | Projection parity is maintained through the artifact index projection owner. |
+| Scheduler health | Projection parity is maintained through the health snapshot projection owner. |
+| Startup recovery | Projection parity is maintained through the startup recovery readback projection owner. |
+| Queue summaries | Projection parity is maintained through the queue summary projection owner. |
+| Host interruption | Projection parity is not applicable; these are canonical readbacks of detected epochs. |
 | Report viewer | Projection parity is partial and limited to metadata until report payload readback lands. |
 | Runtime health | Projection parity is deferred to the lifecycle owner. |
 | Experiment comparison | Projection parity is deferred to the future comparison owner. |

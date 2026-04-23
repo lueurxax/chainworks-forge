@@ -24,7 +24,10 @@ fn write_temp_fixture(filename: &str, content: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::plan::RunPlan {
+fn compile_result_from_strings(
+    workflow_yaml: &str,
+    catalog_yaml: &str,
+) -> anyhow::Result<workflow::plan::RunPlan> {
     let workflow_yaml = if workflow_yaml.trim_start().starts_with("workflow:") {
         workflow_yaml.to_string()
     } else {
@@ -32,7 +35,11 @@ fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::pl
     };
     let wf_path = write_temp_fixture("workflow.yaml", &workflow_yaml);
     let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
-    compiler::compile(&wf_path, &cat_path).expect("should compile plan")
+    compiler::compile(&wf_path, &cat_path)
+}
+
+fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::plan::RunPlan {
+    compile_result_from_strings(workflow_yaml, catalog_yaml).expect("should compile plan")
 }
 
 #[test]
@@ -642,6 +649,69 @@ agents:
         Some("proposal_review_raw")
     );
     assert_eq!(schema.required_fields, vec!["agent_id", "verdict"]);
+}
+
+#[test]
+fn proposal_061_catalog_provider_aliases_use_shared_provider_family_resolver() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+"#;
+    let catalog = r#"
+backend_profiles:
+  review_profile:
+    provider: openai_codex
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+"#;
+
+    let plan = compile_from_strings(workflow, catalog);
+    let task = &plan.states["start"].tasks[0];
+    assert_eq!(plan.states["start"].owner.provider, "codex");
+    assert_eq!(task.agent.provider, "codex");
+}
+
+#[test]
+fn proposal_061_catalog_unknown_provider_fails_validation() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+"#;
+    let catalog = r#"
+backend_profiles:
+  review_profile:
+    provider: mystery_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+"#;
+
+    let error = compile_result_from_strings(workflow, catalog)
+        .expect_err("unknown provider aliases must fail catalog validation");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("unknown provider family alias: mystery_acp"),
+        "expected typed provider-family error in chain, got: {message}"
+    );
+    assert!(
+        message.contains("Agent 'reviewer' backend_profile 'review_profile'"),
+        "expected catalog context, got: {message}"
+    );
 }
 
 #[test]

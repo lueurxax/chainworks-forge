@@ -3270,6 +3270,7 @@ name = "workflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "domain",
  "serde",
  "serde_json",
  "serde_yaml",

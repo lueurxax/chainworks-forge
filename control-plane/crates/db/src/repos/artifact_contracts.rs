@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use domain::agent::{AgentOutputSettlement, ArtifactSourceClaimState};
 use domain::artifact_contracts::{
@@ -14,6 +15,8 @@ use domain::artifact_contracts::{
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::ids::{AgentExecutionId, ArtifactId, RunId};
+
+use crate::pool::{begin_immediate_with_retry, log_write_transaction};
 
 #[derive(Clone, Debug)]
 pub struct RunStateProjectionRow {

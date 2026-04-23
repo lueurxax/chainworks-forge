@@ -1,8 +1,8 @@
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use db::pool::create_pool;
 use db::repos::{
     agent_executions, approvals, artifact_contracts as artifact_contract_repos, artifacts, ideas,
-    projections, runs, sessions, stages, steward, validation, work_items,
+    projections, runs, scheduler, sessions, stages, steward, validation, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentStatus};
@@ -15,6 +15,7 @@ use domain::artifact_contracts::{
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::{Run, RunStatus};
 use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
@@ -482,6 +483,459 @@ async fn migrations_create_hot_scheduler_indexes() {
             "idx_work_items_status_kind_scheduled".to_string(),
         ]
     );
+}
+
+async fn explain_query_plan(pool: &sqlx::SqlitePool, sql: &str) -> Vec<String> {
+    use sqlx::Row;
+
+    sqlx::query(sql)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect()
+}
+
+fn assert_plan_uses_index(plan: &[String], index_name: &str) {
+    assert!(
+        plan.iter().any(|detail| detail.contains(index_name)),
+        "query plan should use {index_name}; plan was {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn proposal_061_hot_index_query_plans_use_indexes_at_fixture_scale() {
+    let pool = test_pool().await;
+    let run_id = seed_contract_run(&pool).await;
+    let stage = StageExecution {
+        id: StageExecutionId::new(),
+        run_id,
+        stage_id: "implementation".into(),
+        label: "Implementation".into(),
+        status: StageStatus::Running,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        owner_agent: Some("code_writer".into()),
+        provider: Some("codex".into()),
+        model: None,
+        stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
+    };
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let scheduled_at = Utc::now() - Duration::minutes(10);
+    for index in 0..1_000 {
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: format!("p061-hot-pending-{index:04}"),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "provider": "codex_cli",
+                    "stage_execution_id": stage.id.to_string()
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some("implementation".into()),
+                created_at: scheduled_at,
+                scheduled_at,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    for index in 0..500 {
+        agent_executions::insert(
+            &pool,
+            &AgentExecution {
+                id: AgentExecutionId::new(),
+                stage_execution_id: stage.id,
+                agent_id: format!("codex-agent-{index:03}"),
+                provider: "codex_cli".into(),
+                model: Some("default".into()),
+                started_at: Utc::now(),
+                completed_at: None,
+                status: AgentStatus::Running,
+                owner_execution_lineage_id: Some(stage.id.to_string()),
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: None,
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let pending_plan = explain_query_plan(
+        &pool,
+        r#"EXPLAIN QUERY PLAN
+           SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
+           FROM work_items
+           WHERE status = 'pending'
+             AND (scheduled_at <= '9999-12-31T23:59:59Z'
+                  OR datetime(scheduled_at) <= datetime('9999-12-31T23:59:59Z'))
+             AND kind = 'invoke_agent'
+           ORDER BY scheduled_at ASC, rowid ASC
+           LIMIT 32"#,
+    )
+    .await;
+    assert_plan_uses_index(&pending_plan, "idx_work_items_kind_status_scheduled_at");
+
+    let provider_count_plan = explain_query_plan(
+        &pool,
+        r#"EXPLAIN QUERY PLAN
+           SELECT COUNT(*)
+           FROM agent_executions
+           WHERE status = 'running' AND provider_family = 'codex'"#,
+    )
+    .await;
+    assert_plan_uses_index(
+        &provider_count_plan,
+        "idx_agent_executions_status_provider_family",
+    );
+
+    let run_count_plan = explain_query_plan(
+        &pool,
+        &format!(
+            r#"EXPLAIN QUERY PLAN
+               SELECT COUNT(*)
+               FROM agent_executions ae
+               INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+               WHERE ae.status = 'running' AND se.run_id = '{}'"#,
+            run_id
+        ),
+    )
+    .await;
+    assert_plan_uses_index(&run_count_plan, "idx_agent_executions_status_stage");
+}
+
+#[tokio::test]
+async fn scheduler_refresh_returns_notification_only_at_sustained_backpressure_boundaries() {
+    let pool = test_pool().await;
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let old_scheduled_at = Utc::now() - Duration::minutes(6);
+    let pending = WorkItem {
+        id: "p061-backpressure-pending".into(),
+        kind: WorkItemKind::InvokeAgent,
+        payload_json: serde_json::json!({
+            "provider": "codex",
+            "stage_execution_id": stage_execution_id.to_string()
+        })
+        .to_string(),
+        status: WorkItemStatus::Pending,
+        run_id: Some(run_id),
+        stage_id: Some("implementation".into()),
+        created_at: old_scheduled_at,
+        scheduled_at: old_scheduled_at,
+        attempt_count: 0,
+        last_error: None,
+    };
+    work_items::enqueue(&pool, &pending).await.unwrap();
+
+    let capacity = InvokeAgentCapacityConfig::default();
+    let first = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(first.notification, None);
+    assert_eq!(
+        scheduler::latest_health_snapshot(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .sustained_backpressure_state,
+        "pending_active"
+    );
+
+    let active = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap()
+        .notification
+        .expect("second high-pressure snapshot should activate notification");
+    assert_eq!(active.state, "active");
+    assert_eq!(active.top_reason, "queued");
+    assert_eq!(active.queued_count, 1);
+    assert_eq!(active.global_queue_depth, 1);
+
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE id = ?1")
+        .bind(&pending.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let first_clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(first_clear.notification, None);
+    assert_eq!(
+        scheduler::latest_health_snapshot(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .sustained_backpressure_state,
+        "pending_clear"
+    );
+
+    let clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap()
+        .notification
+        .expect("second clear snapshot should clear notification");
+    assert_eq!(clear.state, "clear");
+    assert_eq!(clear.top_reason, "clear");
+    assert_eq!(clear.queued_count, 0);
+    assert_eq!(clear.global_queue_depth, 0);
+}
+
+#[tokio::test]
+async fn scheduler_backpressure_fire_requires_two_consecutive_high_snapshots() {
+    let pool = test_pool().await;
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let old_scheduled_at = Utc::now() - Duration::minutes(6);
+    let pending = WorkItem {
+        id: "p061-backpressure-consecutive-fire".into(),
+        kind: WorkItemKind::InvokeAgent,
+        payload_json: serde_json::json!({
+            "provider": "codex",
+            "stage_execution_id": stage_execution_id.to_string()
+        })
+        .to_string(),
+        status: WorkItemStatus::Pending,
+        run_id: Some(run_id),
+        stage_id: Some("implementation".into()),
+        created_at: old_scheduled_at,
+        scheduled_at: old_scheduled_at,
+        attempt_count: 0,
+        last_error: None,
+    };
+    work_items::enqueue(&pool, &pending).await.unwrap();
+
+    let capacity = InvokeAgentCapacityConfig::default();
+    let first_high = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(first_high.notification, None);
+    let snapshot = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.sustained_backpressure_state, "pending_active");
+    assert_eq!(snapshot.fire_consecutive_snapshots, 1);
+
+    let middle_scheduled_at = Utc::now() - Duration::minutes(3);
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+        .bind(middle_scheduled_at.to_rfc3339())
+        .bind(&pending.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let middle = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(middle.notification, None);
+    let snapshot = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.sustained_backpressure_state, "clear");
+    assert_eq!(snapshot.fire_consecutive_snapshots, 0);
+
+    let old_scheduled_at = Utc::now() - Duration::minutes(6);
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+        .bind(old_scheduled_at.to_rfc3339())
+        .bind(&pending.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let restarted = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(restarted.notification, None);
+    assert_eq!(
+        scheduler::latest_health_snapshot(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .fire_consecutive_snapshots,
+        1
+    );
+
+    let active = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap()
+        .notification
+        .expect("second consecutive high-pressure snapshot should activate notification");
+    assert_eq!(active.state, "active");
+}
+
+#[tokio::test]
+async fn scheduler_backpressure_clear_interruption_does_not_refire_active_notification() {
+    let pool = test_pool().await;
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let old_scheduled_at = Utc::now() - Duration::minutes(6);
+    let pending = WorkItem {
+        id: "p061-backpressure-clear-interrupted".into(),
+        kind: WorkItemKind::InvokeAgent,
+        payload_json: serde_json::json!({
+            "provider": "codex",
+            "stage_execution_id": stage_execution_id.to_string()
+        })
+        .to_string(),
+        status: WorkItemStatus::Pending,
+        run_id: Some(run_id),
+        stage_id: Some("implementation".into()),
+        created_at: old_scheduled_at,
+        scheduled_at: old_scheduled_at,
+        attempt_count: 0,
+        last_error: None,
+    };
+    work_items::enqueue(&pool, &pending).await.unwrap();
+
+    let capacity = InvokeAgentCapacityConfig::default();
+    scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    let active = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap()
+        .notification
+        .expect("second high-pressure snapshot should activate notification");
+    assert_eq!(active.state, "active");
+
+    let clear_scheduled_at = Utc::now() - Duration::minutes(1);
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+        .bind(clear_scheduled_at.to_rfc3339())
+        .bind(&pending.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first_clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(first_clear.notification, None);
+    assert_eq!(
+        scheduler::latest_health_snapshot(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .sustained_backpressure_state,
+        "pending_clear"
+    );
+
+    let middle_scheduled_at = Utc::now() - Duration::minutes(3);
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+        .bind(middle_scheduled_at.to_rfc3339())
+        .bind(&pending.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let interrupted_clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    assert_eq!(interrupted_clear.notification, None);
+    let snapshot = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.sustained_backpressure_state, "active");
+    assert_eq!(snapshot.clear_consecutive_snapshots, 0);
+}
+
+#[tokio::test]
+async fn invoke_completion_and_failure_refresh_scheduler_projection_in_write_path() {
+    let pool = test_pool().await;
+    let old_scheduled_at = Utc::now() - Duration::minutes(6);
+    let stage_execution_id = StageExecutionId::new();
+    let running_id = "p061-running-refresh";
+    let pending_id = "p061-pending-refresh";
+
+    for (id, status) in [
+        (running_id, WorkItemStatus::Running),
+        (pending_id, WorkItemStatus::Pending),
+    ] {
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: id.into(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "provider": "codex",
+                    "stage_execution_id": stage_execution_id.to_string()
+                })
+                .to_string(),
+                status,
+                run_id: None,
+                stage_id: Some("implementation".into()),
+                created_at: old_scheduled_at,
+                scheduled_at: old_scheduled_at,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let capacity = InvokeAgentCapacityConfig::default();
+    scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
+        .await
+        .unwrap();
+    let initial = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.queued_count, 1);
+    assert_eq!(initial.active_agent_executions, 1);
+
+    work_items::complete(&pool, running_id).await.unwrap();
+    let after_complete = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_complete.queued_count, 1);
+    assert_eq!(after_complete.active_agent_executions, 0);
+
+    work_items::fail(&pool, pending_id, "provider failed")
+        .await
+        .unwrap();
+    let after_fail = scheduler::latest_health_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_fail.queued_count, 0);
+    assert_eq!(after_fail.global_queue_depth, 0);
+    assert!(scheduler::list_queue_summaries(&pool)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

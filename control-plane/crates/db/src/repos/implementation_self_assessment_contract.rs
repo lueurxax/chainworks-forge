@@ -38,8 +38,8 @@ pub async fn persist_implementation_self_assessment_summary(
     summary: &ImplementationSelfAssessmentSummary,
     created_at: DateTime<Utc>,
 ) -> Result<StoredImplementationSelfAssessmentSummary> {
-    let mut tx = pool
-        .begin()
+    let tx_started = Instant::now();
+    let mut tx = begin_immediate_with_retry(pool, "artifact_contract_summaries.persist")
         .await
         .context("begin artifact contract transaction")?;
     let run_id_str = run_id.to_string();
@@ -183,6 +183,7 @@ pub async fn persist_implementation_self_assessment_summary(
     tx.commit()
         .await
         .context("commit artifact contract transaction")?;
+    log_write_transaction("artifact_contract_summaries.persist", tx_started);
 
     find_active_implementation_self_assessment_summary(pool, run_id)
         .await?

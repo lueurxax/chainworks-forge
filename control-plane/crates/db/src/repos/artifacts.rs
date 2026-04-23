@@ -1,11 +1,18 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::ids::{ArtifactId, RunId};
 
 pub async fn insert(pool: &SqlitePool, artifact: &Artifact) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin insert artifact")?;
+    insert_tx(&mut tx, artifact).await?;
+    tx.commit().await.context("commit insert artifact")?;
+    Ok(())
+}
+
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, artifact: &Artifact) -> Result<()> {
     let id = artifact.id.to_string();
     let run_id = artifact.run_id.to_string();
     let format = artifact.format.to_string();
@@ -36,7 +43,7 @@ pub async fn insert(pool: &SqlitePool, artifact: &Artifact) -> Result<()> {
     .bind(is_pinned)
     .bind(&artifact.report_kind)
     .bind(artifact.report_version)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert artifact")?;
     Ok(())
