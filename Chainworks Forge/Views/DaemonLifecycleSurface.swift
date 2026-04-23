@@ -80,6 +80,8 @@ enum DaemonDiagnosticsExportCommand {
 struct DaemonLifecycleBanner: View {
     @ObservedObject var viewModel: DaemonStatusViewModel
     @ObservedObject var supervisor: DaemonProcessSupervisor = .shared
+    var schedulerHealthIssue: SchedulerHealthBannerIssue?
+    var onOpenSchedulerHealth: (() -> Void)?
     @State private var showAnomalousPidLockAlert: Bool = false
     @State private var showCrashBudgetResetResultAlert: Bool = false
     @State private var crashBudgetResetResultSummary: String = ""
@@ -141,6 +143,15 @@ struct DaemonLifecycleBanner: View {
 
     @ViewBuilder
     private func phaseView(for status: DaemonStatus) -> some View {
+        if let schedulerHealthIssue, status.state != .failed {
+            schedulerHealthView(issue: schedulerHealthIssue)
+        } else {
+            lifecyclePhaseView(for: status)
+        }
+    }
+
+    @ViewBuilder
+    private func lifecyclePhaseView(for status: DaemonStatus) -> some View {
         switch status.state {
         case .starting, .restarting, .notStarted:
             row(symbol: "hourglass", tint: .gray, text: "Daemon starting…")
@@ -159,7 +170,7 @@ struct DaemonLifecycleBanner: View {
                 symbol: "xmark.octagon.fill",
                 tint: .red,
                 text: "Daemon failed — \(reason)",
-                action: { failedStateActions(failureKind: status.failure?.kind) }
+                action: { combinedFailedStateActions(failureKind: status.failure?.kind) }
             )
         case .shutdown:
             row(symbol: "power", tint: .gray, text: "Daemon shut down")
@@ -172,8 +183,20 @@ struct DaemonLifecycleBanner: View {
             symbol: "bolt.horizontal.icloud",
             tint: .orange,
             text: "Daemon unavailable",
-            action: unavailableActions
+            action: { combinedUnavailableActions() }
         )
+    }
+
+    @ViewBuilder
+    private func schedulerHealthView(issue: SchedulerHealthBannerIssue) -> some View {
+        let tint = schedulerHealthTint(issue.kind)
+        row(
+            symbol: issue.systemImage,
+            tint: tint,
+            text: "\(issue.title) — \(issue.detail)",
+            action: schedulerHealthAction
+        )
+        .accessibilityIdentifier("daemon-scheduler-health-banner")
     }
 
     @ViewBuilder
@@ -217,6 +240,14 @@ struct DaemonLifecycleBanner: View {
         }
     }
 
+    @ViewBuilder
+    private func combinedFailedStateActions(failureKind: FailureKind?) -> some View {
+        HStack(spacing: 8) {
+            failedStateActions(failureKind: failureKind)
+            schedulerHealthAction()
+        }
+    }
+
     private func performCrashBudgetReset() {
         let result = CrashBudgetResetCoordinator.shared.performReset()
         crashBudgetResetResultSummary = result.summary
@@ -240,6 +271,34 @@ struct DaemonLifecycleBanner: View {
                 DaemonDiagnosticsExportCommand.run()
             }
             .controlSize(.small)
+        }
+    }
+
+    @ViewBuilder
+    private func combinedUnavailableActions() -> some View {
+        HStack(spacing: 8) {
+            unavailableActions()
+            schedulerHealthAction()
+        }
+    }
+
+    @ViewBuilder
+    private func schedulerHealthAction() -> some View {
+        if schedulerHealthIssue != nil, let onOpenSchedulerHealth {
+            Button("Scheduler Health") {
+                onOpenSchedulerHealth()
+            }
+            .controlSize(.small)
+            .accessibilityIdentifier("daemon-open-scheduler-health")
+        }
+    }
+
+    private func schedulerHealthTint(_ kind: SchedulerHealthBannerIssue.Kind) -> Color {
+        switch kind {
+        case .sustainedBackpressure, .dbWriterPressure:
+            return .orange
+        case .staleProjection:
+            return .yellow
         }
     }
 }

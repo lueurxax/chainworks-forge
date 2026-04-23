@@ -14,11 +14,11 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 - [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, and report/recovery read precedence
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, and startup recovery progress readback
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
-- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), and persisted runtime truth
+- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), persisted runtime truth, and capacity management
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, and durable validation-failure substrate
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
@@ -27,19 +27,19 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, and write serialization
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
 - [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
-- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, and P031 consumption rules
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and P031 consumption rules
 
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
-- [operator-experience.md](operator-experience.md) — Operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications
+- [operator-experience.md](operator-experience.md) — Operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications, backpressure visibility, and host interruption labels
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
-- [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, first-run and pilot surfaces
+- [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) — Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split

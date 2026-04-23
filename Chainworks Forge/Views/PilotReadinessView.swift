@@ -1,6 +1,15 @@
 import SwiftUI
 import SwiftData
 
+enum PilotReadinessFocus: Hashable {
+    case schedulerHealth
+}
+
+struct PilotReadinessFocusRequest: Equatable {
+    let id: Int
+    let focus: PilotReadinessFocus
+}
+
 struct PilotReadinessView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(ExecutionService.self) private var executionService
@@ -15,46 +24,53 @@ struct PilotReadinessView: View {
     @State private var readinessReport: PreflightReport?
     @State private var showWizard = false
     @State private var showPreflightReport = false
+    @StateObject private var schedulerHealth = SchedulerHealthViewModel.bootstrap()
 
     @State private var isRefreshing = false
+    private let focusRequest: PilotReadinessFocusRequest?
     private let showsUITestReadyMarker = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"] != nil
+
+    init(focusRequest: PilotReadinessFocusRequest? = nil) {
+        self.focusRequest = focusRequest
+    }
 
     var body: some View {
         NavigationStack {
-            List {
-                if showsUITestReadyMarker {
+            ScrollViewReader { scrollProxy in
+                List {
+                    if showsUITestReadyMarker {
+                        Section {
+                            Button("Pilot Readiness Ready") {}
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("pilot-readiness-surface-ready")
+                        }
+                    }
+
+                    // Proposal 012 (H-02): Hero status banner
                     Section {
-                        Button("Pilot Readiness Ready") {}
-                            .buttonStyle(.plain)
-                            .accessibilityIdentifier("pilot-readiness-surface-ready")
+                        readinessHeroBanner
                     }
-                }
 
-                // Proposal 012 (H-02): Hero status banner
-                Section {
-                    readinessHeroBanner
-                }
-
-                // Proposal 012 (H-02): Configuration paths in collapsible DisclosureGroup
-                Section {
-                    DisclosureGroup("Configuration Paths") {
-                        LabeledContent("Source", value: appConfigurationStore.configuration.activeConfigurationSource.displayName)
-                        LabeledContent("Workflow", value: appConfigurationStore.configuration.workflowSourcePath)
-                        LabeledContent("Catalog", value: appConfigurationStore.configuration.agentCatalogSourcePath)
-                        LabeledContent("Run Storage", value: appConfigurationStore.configuration.runStorageBasePath)
-                        if let worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath {
-                            LabeledContent("Worktree Base", value: worktreeBasePath)
-                        }
-                        if let diagnosticsMessage = appConfigurationStore.diagnosticsMessage {
-                            Label(diagnosticsMessage, systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .accessibilityIdentifier("pilot-readiness-app-configuration-diagnostics")
+                    // Proposal 012 (H-02): Configuration paths in collapsible DisclosureGroup
+                    Section {
+                        DisclosureGroup("Configuration Paths") {
+                            LabeledContent("Source", value: appConfigurationStore.configuration.activeConfigurationSource.displayName)
+                            LabeledContent("Workflow", value: appConfigurationStore.configuration.workflowSourcePath)
+                            LabeledContent("Catalog", value: appConfigurationStore.configuration.agentCatalogSourcePath)
+                            LabeledContent("Run Storage", value: appConfigurationStore.configuration.runStorageBasePath)
+                            if let worktreeBasePath = appConfigurationStore.configuration.worktreeBasePath {
+                                LabeledContent("Worktree Base", value: worktreeBasePath)
+                            }
+                            if let diagnosticsMessage = appConfigurationStore.diagnosticsMessage {
+                                Label(diagnosticsMessage, systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .accessibilityIdentifier("pilot-readiness-app-configuration-diagnostics")
+                            }
                         }
                     }
-                }
 
-                Section("Providers") {
+                    Section("Providers") {
                     if providerRegistry.configuredProviders.isEmpty {
                         Text("No providers configured")
                             .foregroundStyle(.secondary)
@@ -174,6 +190,11 @@ struct PilotReadinessView: View {
                     }
                 }
 
+                Section("Scheduler Health") {
+                    schedulerHealthSection
+                }
+                .id(PilotReadinessFocus.schedulerHealth)
+
                 Section("Pilot Actions") {
                     Button("Open First Run Wizard") {
                         showWizard = true
@@ -233,6 +254,10 @@ struct PilotReadinessView: View {
             }
             .task {
                 await refreshReadiness()
+                focusIfNeeded(focusRequest, scrollProxy: scrollProxy)
+            }
+            .onChange(of: focusRequest) { _, request in
+                focusIfNeeded(request, scrollProxy: scrollProxy)
             }
             .sheet(isPresented: $showWizard) {
                 FirstRunSetupWizard(isPresented: $showWizard)
@@ -256,6 +281,19 @@ struct PilotReadinessView: View {
             }
         }
     }
+    }
+
+    private func focusIfNeeded(
+        _ request: PilotReadinessFocusRequest?,
+        scrollProxy: ScrollViewProxy
+    ) {
+        guard request?.focus == .schedulerHealth else { return }
+        DispatchQueue.main.async {
+            withAnimation {
+                scrollProxy.scrollTo(PilotReadinessFocus.schedulerHealth, anchor: .top)
+            }
+        }
+    }
 
     private func exportSupportBundle() async {
         let exporter = SupportBundleExporter(
@@ -275,6 +313,7 @@ struct PilotReadinessView: View {
         isRefreshing = true
         defer { isRefreshing = false }
         await providerRegistry.refreshDiagnostics(appConfiguration: appConfigurationStore.configuration)
+        await schedulerHealth.refresh()
         let preflight = PreflightService(
             appConfigurationStore: appConfigurationStore,
             providerRegistry: providerRegistry
@@ -332,6 +371,93 @@ struct PilotReadinessView: View {
         case .fail:
             return DesignTokens.Status.error
         }
+    }
+
+    @ViewBuilder
+    private var schedulerHealthSection: some View {
+        if let health = schedulerHealth.readback?.health {
+            LabeledContent("Active Agents", value: "\(health.activeAgentExecutions)")
+                .accessibilityIdentifier("pilot-readiness-scheduler-active-agents")
+            LabeledContent("Queued Agents", value: "\(health.queuedCount)")
+                .accessibilityIdentifier("pilot-readiness-scheduler-queued-agents")
+            LabeledContent("Oldest Queued", value: durationLabel(milliseconds: health.oldestQueuedAgeMs))
+            LabeledContent("Global Queue", value: "\(health.globalQueueDepth)")
+            LabeledContent("State", value: health.sustainedBackpressureState.replacingOccurrences(of: "_", with: " ").capitalized)
+            if let wait = health.dbWriterWaitP95Ms {
+                Label("Database writer busy: p95 \(wait) ms", systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(wait > 0 ? .orange : .secondary)
+                    .accessibilityIdentifier("pilot-readiness-scheduler-db-writer")
+            }
+            if let latency = health.commandLatencyP95MsJson, !latency.isEmpty {
+                Text("Command p95 \(latency)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let epochID = health.lastHostInterruptionEpochId {
+                Label("Recovering interrupted work: \(epochID)", systemImage: "arrow.clockwise.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("pilot-readiness-host-interruption")
+            }
+            if health.isStale {
+                Label("Scheduler projection stale", systemImage: "clock.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("pilot-readiness-scheduler-stale")
+            }
+        } else if let error = schedulerHealth.lastError {
+            Label("Scheduler Health unavailable: \(error.description)", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("pilot-readiness-scheduler-error")
+        } else {
+            Text("Scheduler Health unavailable")
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("pilot-readiness-scheduler-empty")
+        }
+
+        let activeProviders = schedulerHealth.readback?.activeProviders ?? []
+        if !activeProviders.isEmpty {
+            ForEach(activeProviders) { provider in
+                LabeledContent(provider.providerFamily.capitalized, value: "\(provider.activeCount) active")
+                    .font(.caption)
+            }
+        }
+
+        let queueSummaries = schedulerHealth.readback?.queueSummaries ?? []
+        if !queueSummaries.isEmpty {
+            DisclosureGroup("Backpressured Agents") {
+                ForEach(queueSummaries) { summary in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(SchedulerHealthPresentation.reasonLabel(summary.topReason))
+                            Spacer()
+                            Text("\(summary.queuedCount)")
+                                .font(.caption2.bold())
+                        }
+                        Text("\(summary.providerFamily ?? "all providers") · oldest \(durationLabel(milliseconds: summary.oldestQueuedAgeMs))")
+                            .font(.caption)
+                            .foregroundStyle(summary.isStale ? .orange : .secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .accessibilityIdentifier("pilot-readiness-backpressured-agents")
+        }
+    }
+
+    private func durationLabel(milliseconds: Int) -> String {
+        if milliseconds <= 0 {
+            return "0s"
+        }
+        let seconds = milliseconds / 1000
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        return remainder == 0 ? "\(minutes)m" : "\(minutes)m \(remainder)s"
     }
 
     // MARK: - Proposal 012 (H-02): Hero Readiness Banner

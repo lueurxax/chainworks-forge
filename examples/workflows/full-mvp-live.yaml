@@ -18,7 +18,7 @@ variables:
   min_individual_proposal_score: 8
   implementation_target_status: Implemented
   max_proposal_revision_cycles: 15
-  max_implementation_progress_cycles: 20
+  max_implementation_progress_cycles: 50
   max_implementation_revision_cycles: 12
 failure_policy:
   on_error: pause_and_require_human

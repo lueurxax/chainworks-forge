@@ -285,6 +285,17 @@ struct DaemonClientEndpoint: Sendable, Equatable {
         components.path = "/graphql/ws"
         return components.url!
     }
+
+    static func operatorDefault() -> DaemonClientEndpoint {
+        let bearer = DaemonOperatorTokenStore.resolveOperatorToken() ?? "unset"
+        let base: URL
+        do {
+            base = try DaemonPortFile.baseURL()
+        } catch {
+            base = URL(string: "http://127.0.0.1:\(DaemonPortFile.defaultPort)")!
+        }
+        return DaemonClientEndpoint(baseURL: base, bearerToken: bearer)
+    }
 }
 
 struct DaemonLifecycleClient {
@@ -324,6 +335,31 @@ struct DaemonLifecycleClient {
         return try Self.decodeSnapshot(respData)
     }
 
+    func schedulerReadback() async throws -> SchedulerHealthReadback {
+        let body: [String: Any] = ["query": Self.schedulerReadbackQuery]
+        let data = try JSONSerialization.data(withJSONObject: body)
+        var request = URLRequest(url: endpoint.graphqlURL)
+        request.httpMethod = "POST"
+        request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(endpoint.bearerToken)", forHTTPHeaderField: "Authorization")
+
+        let (respData, response): (Data, URLResponse)
+        do {
+            (respData, response) = try await urlSession.data(for: request)
+        } catch {
+            throw DaemonClientError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw DaemonClientError.httpFailure(status: -1, body: "no HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = String(data: respData, encoding: .utf8) ?? "<binary>"
+            throw DaemonClientError.httpFailure(status: http.statusCode, body: body)
+        }
+        return try Self.decodeSchedulerReadback(respData)
+    }
+
     static func decodeSnapshot(_ data: Data) throws -> DaemonStatus {
         let envelope: SnapshotEnvelope
         do {
@@ -356,6 +392,62 @@ struct DaemonLifecycleClient {
     }
 
     static let snapshotQuery: String = "{ daemonStatus { json } }"
+
+    static let schedulerReadbackQuery: String = """
+    {
+      schedulerHealthSummary {
+        queuedCount
+        oldestQueuedAgeMs
+        globalQueueDepth
+        activeAgentExecutions
+        dbWriterWaitP95Ms
+        commandLatencyP95MsJson
+        lastHostInterruptionEpochId
+        sustainedBackpressureState
+        staleAfterMs
+        updatedAt
+        isStale
+      }
+      activeExecutionCountsByProvider {
+        providerFamily
+        activeCount
+      }
+      queuedBackpressuredCountsByProviderAndReason {
+        providerFamily
+        topReason
+        queuedCount
+        oldestQueuedAgeMs
+        globalQueueDepth
+        staleAfterMs
+        updatedAt
+        isStale
+      }
+    }
+    """
+
+    static func decodeSchedulerReadback(_ data: Data) throws -> SchedulerHealthReadback {
+        let envelope: SchedulerReadbackEnvelope
+        do {
+            envelope = try JSONDecoder().decode(SchedulerReadbackEnvelope.self, from: data)
+        } catch {
+            throw DaemonClientError.decoding(error)
+        }
+        if let errors = envelope.errors, !errors.isEmpty {
+            throw DaemonClientError.graphqlErrors(errors.map { $0.message })
+        }
+        guard let data = envelope.data else {
+            throw DaemonClientError.decoding(
+                NSError(domain: "DaemonClient", code: -1, userInfo: [
+                    NSLocalizedDescriptionKey: "scheduler readback data missing"
+                ])
+            )
+        }
+        return SchedulerHealthReadback(
+            health: data.schedulerHealthSummary,
+            activeProviders: data.activeExecutionCountsByProvider,
+            queueSummaries: data.queuedBackpressuredCountsByProviderAndReason
+        )
+    }
 
     // MARK: - Subscription (daemonStatusChanged)
 
@@ -544,6 +636,213 @@ private struct GraphQLError: Decodable {
     let message: String
 }
 
+struct SchedulerHealthReadback: Sendable, Equatable {
+    let health: SchedulerHealthSummaryPayload?
+    let activeProviders: [SchedulerProviderActiveCountPayload]
+    let queueSummaries: [SchedulerQueueSummaryPayload]
+}
+
+struct SchedulerHealthSummaryPayload: Decodable, Sendable, Equatable {
+    let queuedCount: Int
+    let oldestQueuedAgeMs: Int
+    let globalQueueDepth: Int
+    let activeAgentExecutions: Int
+    let dbWriterWaitP95Ms: Int?
+    let commandLatencyP95MsJson: String?
+    let lastHostInterruptionEpochId: String?
+    let sustainedBackpressureState: String
+    let staleAfterMs: Int
+    let updatedAt: String
+    let isStale: Bool
+}
+
+struct SchedulerProviderActiveCountPayload: Decodable, Sendable, Equatable, Identifiable {
+    var id: String { providerFamily }
+    let providerFamily: String
+    let activeCount: Int
+}
+
+struct SchedulerQueueSummaryPayload: Decodable, Sendable, Equatable, Identifiable {
+    var id: String { "\(providerFamily ?? "all")-\(topReason)" }
+    let providerFamily: String?
+    let topReason: String
+    let queuedCount: Int
+    let oldestQueuedAgeMs: Int
+    let globalQueueDepth: Int
+    let staleAfterMs: Int
+    let updatedAt: String
+    let isStale: Bool
+}
+
+struct SchedulerHealthBannerIssue: Sendable, Equatable {
+    enum Kind: String, Sendable {
+        case sustainedBackpressure
+        case staleProjection
+        case dbWriterPressure
+    }
+
+    let kind: Kind
+    let title: String
+    let detail: String
+    let systemImage: String
+}
+
+private struct SchedulerReadbackEnvelope: Decodable {
+    let data: SchedulerReadbackData?
+    let errors: [GraphQLError]?
+}
+
+private struct SchedulerReadbackData: Decodable {
+    let schedulerHealthSummary: SchedulerHealthSummaryPayload?
+    let activeExecutionCountsByProvider: [SchedulerProviderActiveCountPayload]
+    let queuedBackpressuredCountsByProviderAndReason: [SchedulerQueueSummaryPayload]
+}
+
+@MainActor
+final class SchedulerHealthViewModel: ObservableObject {
+    @Published private(set) var readback: SchedulerHealthReadback?
+    @Published private(set) var lastError: DaemonClientError?
+
+    private let client: DaemonLifecycleClient
+
+    init(client: DaemonLifecycleClient) {
+        self.client = client
+    }
+
+    func refresh() async {
+        do {
+            readback = try await client.schedulerReadback()
+            lastError = nil
+        } catch let error as DaemonClientError {
+            lastError = error
+        } catch {
+            lastError = .transport(error)
+        }
+    }
+
+    static func bootstrap() -> SchedulerHealthViewModel {
+        SchedulerHealthViewModel(
+            client: DaemonLifecycleClient(endpoint: .operatorDefault())
+        )
+    }
+
+    var bannerIssue: SchedulerHealthBannerIssue? {
+        SchedulerHealthPresentation.bannerIssue(for: readback)
+    }
+}
+
+enum SchedulerHealthPresentation {
+    static func bannerIssue(for readback: SchedulerHealthReadback?) -> SchedulerHealthBannerIssue? {
+        guard let health = readback?.health else { return nil }
+        if health.isStale {
+            return SchedulerHealthBannerIssue(
+                kind: .staleProjection,
+                title: "Scheduler projection stale",
+                detail: "Open Scheduler Health",
+                systemImage: "clock.badge.exclamationmark"
+            )
+        }
+        if isSustainedBackpressure(health) {
+            return SchedulerHealthBannerIssue(
+                kind: .sustainedBackpressure,
+                title: "System Busy - queued agents",
+                detail: "\(health.queuedCount) queued, oldest \(durationLabel(milliseconds: health.oldestQueuedAgeMs))",
+                systemImage: "hourglass.circle"
+            )
+        }
+        if let wait = health.dbWriterWaitP95Ms, wait > 0 {
+            return SchedulerHealthBannerIssue(
+                kind: .dbWriterPressure,
+                title: "Database writer busy",
+                detail: "p95 wait \(wait) ms",
+                systemImage: "externaldrive.badge.exclamationmark"
+            )
+        }
+        return nil
+    }
+
+    private static func isSustainedBackpressure(_ health: SchedulerHealthSummaryPayload) -> Bool {
+        guard health.queuedCount > 0 else { return false }
+        let state = health.sustainedBackpressureState
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !["", "none", "clear", "healthy", "idle"].contains(state) {
+            return true
+        }
+        return health.oldestQueuedAgeMs >= 5 * 60 * 1000
+    }
+
+    static func durationLabel(milliseconds: Int) -> String {
+        if milliseconds <= 0 {
+            return "0s"
+        }
+        let seconds = milliseconds / 1000
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        return remainder == 0 ? "\(minutes)m" : "\(minutes)m \(remainder)s"
+    }
+
+    static func reasonLabel(_ reason: String) -> String {
+        switch reason {
+        case "run_capacity": return "Run at agent limit"
+        case "provider_capacity": return "Waiting for provider slot"
+        case "global_capacity": return "System agent limit reached"
+        case "startup_recovery_backpressure": return "Recovering queued work"
+        case "db_writer_capacity": return "Database writer busy"
+        default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    static func hostInterruptionLabel(_ kind: String) -> String {
+        switch kind {
+        case "system_sleep", "wall_clock_gap": return "Recovering from system sleep"
+        case "network_migration": return "Resuming after network change"
+        default: return "Recovering interrupted work"
+        }
+    }
+
+    static func hostInterruptionSymbol(_ kind: String) -> String {
+        switch kind {
+        case "system_sleep", "wall_clock_gap": return "moon.zzz"
+        case "network_migration": return "wifi.exclamationmark"
+        default: return "arrow.clockwise.circle"
+        }
+    }
+}
+
+enum DaemonOperatorTokenStore {
+    /// Minimal reader for `principals.json` — the app's principals file
+    /// is a JSON list; the operator token is the first entry whose
+    /// `class == "operator"`. Returns `nil` when the file is absent,
+    /// malformed, or contains no operator.
+    static func resolveOperatorToken() -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let path = home
+            .appendingPathComponent(".chainworks", isDirectory: true)
+            .appendingPathComponent("auth", isDirectory: true)
+            .appendingPathComponent("principals.json", isDirectory: false)
+        guard let data = try? Data(contentsOf: path),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let list = root["principals"] as? [[String: Any]]
+        else {
+            return nil
+        }
+        for entry in list {
+            if let cls = entry["class"] as? String,
+               cls == "operator",
+               let token = entry["token"] as? String,
+               !token.isEmpty
+            {
+                return token
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - View model
 
 @MainActor
@@ -640,43 +939,7 @@ final class DaemonStatusViewModel: ObservableObject {
     /// affordances in that case.
     @MainActor
     static func bootstrap() -> DaemonStatusViewModel {
-        let bearer = Self.resolveOperatorToken() ?? "unset"
-        let base: URL
-        do {
-            base = try DaemonPortFile.baseURL()
-        } catch {
-            base = URL(string: "http://127.0.0.1:\(DaemonPortFile.defaultPort)")!
-        }
-        let endpoint = DaemonClientEndpoint(baseURL: base, bearerToken: bearer)
-        let client = DaemonLifecycleClient(endpoint: endpoint)
+        let client = DaemonLifecycleClient(endpoint: .operatorDefault())
         return DaemonStatusViewModel(client: client)
-    }
-
-    /// Minimal reader for `principals.json` — the app's principals file
-    /// is a JSON list; the operator token is the first entry whose
-    /// `class == "operator"`. Returns `nil` when the file is absent,
-    /// malformed, or contains no operator.
-    private static func resolveOperatorToken() -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let path = home
-            .appendingPathComponent(".chainworks", isDirectory: true)
-            .appendingPathComponent("auth", isDirectory: true)
-            .appendingPathComponent("principals.json", isDirectory: false)
-        guard let data = try? Data(contentsOf: path),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let list = root["principals"] as? [[String: Any]]
-        else {
-            return nil
-        }
-        for entry in list {
-            if let cls = entry["class"] as? String,
-               cls == "operator",
-               let token = entry["token"] as? String,
-               !token.isEmpty
-            {
-                return token
-            }
-        }
-        return nil
     }
 }

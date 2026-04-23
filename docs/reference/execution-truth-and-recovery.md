@@ -149,6 +149,7 @@ Current `AgentFailureKind` values include:
 - `invalid_output_contract`
 - `cancelled_by_operator`
 - `superseded_by_retry`
+- `host_interruption`
 - `unknown`
 
 Rules:
@@ -227,7 +228,40 @@ Recovery snapshots should prefer runtime facts when selecting the next action:
 - `mcp_permission_modal_stall` -> Xcode/MCP authorization,
 - `missing_required_outputs` -> inspect outputs then retry,
 - `invalid_required_outputs` -> inspect contract then retry,
-- `valid_outputs_from_failed_execution` -> accept degraded outputs or retry.
+- `valid_outputs_from_failed_execution` -> accept degraded outputs or retry,
+- `host_interruption` -> automated jittered retry under capacity caps.
+
+### Host Interruption
+
+`host_interruption` is a neutral or cautionary failure kind, not a critical provider
+failure. It is detected by comparing monotonic and wall-clock timestamps or via macOS
+system hooks.
+
+Rules:
+- Only executions running across the detected epoch are eligible for host interruption
+  classification.
+- Host-interrupted executions terminate ACP sessions and provider process groups
+  before retry.
+- Retries are exempt from provider quota retry budget but still count against
+  active execution capacity.
+- Late or partial outputs from superseded host-interrupted attempts are skipped
+  unless existing settlement rules allow promotion.
+
+### Startup Recovery
+
+Startup recovery repair is the first phase of daemon execution. It reconciles
+stale running work from a previous process crash or hard shutdown.
+
+Rules:
+- **Capacity-Aware Requeue**: Recovered work is requeued through the same capacity
+  gates as ordinary work. It does not bypass global, provider, or per-run caps.
+- **Durable Readback**: Startup recovery progress is persisted in the
+  `startup_recovery_readbacks` table and exposed via GraphQL/MCP so operators
+  can see the recovery backlog during initialization.
+- **Stale Repair**: A terminal, skipped, or superseded stage must not own a
+  running agent execution after startup repair completes.
+- **Idempotency**: Repeated startup repair cycles converge to the same truth
+  without duplicating work items.
 
 ## Resume and Approval Restore
 

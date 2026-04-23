@@ -139,13 +139,15 @@ backend_profile
 
 ### ACP-native adapters
 
-The currently implemented ACP-native adapters are:
+The currently implemented ACP-native adapters are normalized into canonical 
+provider families (`claude`, `gemini`, `codex`, `auggie`, `junie`) for 
+consistent capacity management and backpressure:
 
-- `ClaudeAgentACPTransport`
-- `GeminiCLIACPTransport`
-- `CodexACPTransport`
-- `AuggieCLIACPTransport`
-- `JunieCLIACPTransport`
+- `ClaudeAgentACPTransport` (canonical: `claude`)
+- `GeminiCLIACPTransport` (canonical: `gemini`)
+- `CodexACPTransport` (canonical: `codex`)
+- `AuggieCLIACPTransport` (canonical: `auggie`)
+- `JunieCLIACPTransport` (canonical: `junie`)
 
 Shared ACP plumbing lives in:
 

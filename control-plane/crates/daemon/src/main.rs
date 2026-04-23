@@ -234,32 +234,62 @@ async fn main() -> Result<()> {
         "Steward runtime config loaded"
     );
 
-    let work_queue = WorkQueue::new(pool.clone());
+    let invoke_agent_capacity_config =
+        engine::capacity::load_invoke_agent_capacity_config_from_env();
+    let work_queue = WorkQueue::with_events_and_capacity(
+        pool.clone(),
+        events.clone(),
+        invoke_agent_capacity_config.clone(),
+    );
     let acp = Arc::new(AcpRuntimeManager::new());
-    let cmd_handler = Arc::new(CommandHandler::new_with_acp(
+    let host_interruption_service =
+        engine::host_interruption::HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+            pool.clone(),
+            work_queue.clone(),
+            invoke_agent_capacity_config.clone(),
+            acp.clone(),
+        );
+    let _host_interruption_monitor = engine::host_interruption::spawn_runtime_heartbeat_monitor(
+        host_interruption_service.clone(),
+    );
+    let _native_host_interruption_monitor =
+        daemon::host_interruption_sources::spawn_native_host_interruption_monitor(
+            host_interruption_service,
+        );
+    info!("Host interruption heartbeat monitor started");
+    let cmd_handler = Arc::new(CommandHandler::new_with_acp_and_capacity(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
         acp.clone(),
+        invoke_agent_capacity_config.clone(),
     ));
     let orchestrator = Arc::new(Orchestrator::new(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = Arc::new(BackgroundExecutor::new_with_steward_runtime_inputs(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator.clone(),
-        acp.clone(),
-        events.clone(),
-        steward_runtime_inputs.clone(),
-    ));
+    let executor = Arc::new(
+        BackgroundExecutor::new_with_steward_runtime_inputs_and_capacity(
+            pool.clone(),
+            work_queue.clone(),
+            orchestrator.clone(),
+            acp.clone(),
+            events.clone(),
+            steward_runtime_inputs.clone(),
+            invoke_agent_capacity_config.clone(),
+        ),
+    );
     let _executor_handle = executor.start();
     info!("BackgroundExecutor started");
 
     // Startup recovery: repair any run left mid-flight by a previous crash.
-    let recovery = RecoveryService::new(pool.clone(), work_queue.clone(), events.clone());
+    let recovery = RecoveryService::new_with_capacity(
+        pool.clone(),
+        work_queue.clone(),
+        events.clone(),
+        invoke_agent_capacity_config,
+    );
     let summary = recovery.run_startup_repair().await?;
     info!(
         runs_inspected = summary.runs_inspected,
@@ -280,19 +310,21 @@ async fn main() -> Result<()> {
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
-            let mcp = mcp_server::server::McpServer::new(
+            let mcp = mcp_server::server::McpServer::new_with_events(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table,
+                events.clone(),
             );
             mcp.run_stdio().await?;
         }
         _ => {
             // Daemon mode: GraphQL + MCP HTTP on the same port.
-            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new(
+            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new_with_events(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table.clone(),
+                events.clone(),
             ));
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");

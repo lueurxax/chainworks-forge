@@ -3,8 +3,8 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, sessions,
-    validation,
+    agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, scheduler,
+    sessions, startup_repairs, validation,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -88,6 +88,12 @@ pub async fn execute(
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
+                "scheduler_health": scheduler_health_json(pool).await?,
+                "startup_recovery": startup_recovery_json(pool).await?,
+                "scheduler_queue_summaries": scheduler_queue_summaries_json(pool, run_id).await?,
+                "active_execution_counts_by_provider": active_execution_counts_by_provider_json(pool).await?,
+                "scheduler_backpressure_notification": scheduler_backpressure_notification_json(pool).await?,
+                "host_interruption_epochs": host_interruption_epochs_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
             }));
             if let Some(projection) =
@@ -172,6 +178,159 @@ pub(crate) async fn execution_mcp_truth_json(
         }));
     }
     Ok(serde_json::Value::Array(items))
+}
+
+async fn startup_recovery_json(pool: &SqlitePool) -> Result<serde_json::Value> {
+    let Some(summary) = startup_repairs::latest_startup_recovery_readback(pool).await? else {
+        return Ok(serde_json::Value::Null);
+    };
+    Ok(serde_json::json!({
+        "id": summary.id,
+        "recovered_item_count": summary.recovered_item_count,
+        "queued_under_startup_recovery_backpressure_count": summary.queued_under_startup_recovery_backpressure_count,
+        "oldest_recovered_queued_age_ms": summary.oldest_recovered_queued_age_ms,
+        "affected_run_count": summary.affected_run_count,
+        "next_retry_or_backoff_time": summary.next_retry_or_backoff_time.map(|value| value.to_rfc3339()),
+        "freshness": scheduler_freshness_json(summary.updated_at, summary.stale_after_ms),
+    }))
+}
+
+async fn scheduler_health_json(pool: &SqlitePool) -> Result<serde_json::Value> {
+    let Some(snapshot) = scheduler::latest_health_snapshot(pool).await? else {
+        return Ok(serde_json::Value::Null);
+    };
+    let command_latency_p95_ms = snapshot
+        .command_latency_p95_ms_json
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    Ok(serde_json::json!({
+        "id": snapshot.id,
+        "queued_count": snapshot.queued_count,
+        "oldest_queued_age_ms": snapshot.oldest_queued_age_ms,
+        "global_queue_depth": snapshot.global_queue_depth,
+        "active_agent_executions": snapshot.active_agent_executions,
+        "db_writer_wait_p95_ms": snapshot.db_writer_wait_p95_ms,
+        "command_latency_p95_ms": command_latency_p95_ms,
+        "last_host_interruption_epoch_id": snapshot.last_host_interruption_epoch_id,
+        "sustained_backpressure_state": snapshot.sustained_backpressure_state,
+        "freshness": scheduler_freshness_json(snapshot.updated_at, snapshot.stale_after_ms),
+    }))
+}
+
+async fn scheduler_queue_summaries_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let summaries = scheduler::list_queue_summaries_by_run(pool, &run_id.to_string()).await?;
+    Ok(serde_json::Value::Array(
+        summaries
+            .into_iter()
+            .map(|summary| {
+                serde_json::json!({
+                    "scope": summary.scope,
+                    "scope_id": summary.scope_id,
+                    "run_id": summary.run_id,
+                    "stage_execution_id": summary.stage_execution_id,
+                    "provider_family": summary.provider_family,
+                    "top_reason": summary.top_reason,
+                    "queued_count": summary.queued_count,
+                    "oldest_queued_age_ms": summary.oldest_queued_age_ms,
+                    "global_queue_depth": summary.global_queue_depth,
+                    "freshness": scheduler_freshness_json(summary.updated_at, summary.stale_after_ms),
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn active_execution_counts_by_provider_json(pool: &SqlitePool) -> Result<serde_json::Value> {
+    let counts = scheduler::list_active_execution_counts_by_provider(pool).await?;
+    Ok(serde_json::Value::Array(
+        counts
+            .into_iter()
+            .map(|count| {
+                serde_json::json!({
+                    "provider_family": count.provider_family,
+                    "active_count": count.active_count,
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn scheduler_backpressure_notification_json(pool: &SqlitePool) -> Result<serde_json::Value> {
+    let Some(notification) = scheduler::latest_backpressure_notification(pool).await? else {
+        return Ok(serde_json::Value::Null);
+    };
+    Ok(serde_json::json!({
+        "run_id": notification.run_id,
+        "stage_execution_id": notification.stage_execution_id,
+        "provider_family": notification.provider_family,
+        "top_reason": notification.top_reason,
+        "queued_count": notification.queued_count,
+        "oldest_queued_age_ms": notification.oldest_queued_age_ms,
+        "global_queue_depth": notification.global_queue_depth,
+        "state": notification.state,
+        "freshness": scheduler_freshness_json(notification.updated_at, notification.stale_after_ms),
+    }))
+}
+
+async fn host_interruption_epochs_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let epochs = scheduler::list_host_interruption_epochs_by_run(pool, &run_id.to_string()).await?;
+    Ok(serde_json::Value::Array(
+        epochs
+            .into_iter()
+            .map(|readback| {
+                let affected_executions = readback
+                    .affected_executions
+                    .into_iter()
+                    .map(|affected| {
+                        serde_json::json!({
+                            "epoch_id": affected.epoch_id,
+                            "agent_execution_id": affected.agent_execution_id,
+                            "run_id": affected.run_id,
+                            "stage_execution_id": affected.stage_execution_id,
+                            "provider_family": affected.provider_family,
+                            "action": affected.action,
+                            "previous_status": affected.previous_status,
+                            "settlement_status": affected.settlement_status,
+                            "cleanup_status": affected.cleanup_status,
+                            "quota_budget_effect": affected.quota_budget_effect,
+                            "retry_enqueued_at": affected.retry_enqueued_at.map(|value| value.to_rfc3339()),
+                            "created_at": affected.created_at.to_rfc3339(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "id": readback.epoch.id,
+                    "kind": readback.epoch.kind,
+                    "started_at": readback.epoch.started_at.to_rfc3339(),
+                    "ended_at": readback.epoch.ended_at.map(|value| value.to_rfc3339()),
+                    "monotonic_gap_ms": readback.epoch.monotonic_gap_ms,
+                    "wall_clock_gap_ms": readback.epoch.wall_clock_gap_ms,
+                    "details_json": readback.epoch.details_json,
+                    "created_at": readback.epoch.created_at.to_rfc3339(),
+                    "affected_executions": affected_executions,
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn scheduler_freshness_json(
+    updated_at: chrono::DateTime<chrono::Utc>,
+    stale_after_ms: i64,
+) -> serde_json::Value {
+    let is_stale =
+        updated_at + chrono::Duration::milliseconds(stale_after_ms) <= chrono::Utc::now();
+    serde_json::json!({
+        "updated_at": updated_at.to_rfc3339(),
+        "stale_after_ms": stale_after_ms,
+        "is_stale": is_stale,
+    })
 }
 
 async fn runtime_facts_json(
@@ -451,7 +610,9 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation};
+    use db::repos::{
+        artifact_contracts, artifacts, ideas, runs, scheduler, startup_repairs, validation,
+    };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -857,6 +1018,176 @@ mod tests {
         assert_eq!(
             summary["owner_class_counts"]["release"],
             serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_061_reports_get_includes_scheduler_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, agent_execution_id) = seed_validation_attempt(&pool, run_id).await;
+        let now = Utc::now();
+
+        scheduler::upsert_queue_summary(
+            &pool,
+            &scheduler::SchedulerQueueSummary {
+                scope: "run".into(),
+                scope_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: Some(stage_execution_id.to_string()),
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 301_000,
+                global_queue_depth: 5,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_health_snapshot(
+            &pool,
+            &scheduler::SchedulerHealthSnapshot {
+                id: "scheduler-health-1".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 301_000,
+                global_queue_depth: 5,
+                active_agent_executions: 20,
+                db_writer_wait_p95_ms: Some(7),
+                command_latency_p95_ms_json: Some(r#"{"approve_stage":42}"#.into()),
+                last_host_interruption_epoch_id: Some("host-epoch-1".into()),
+                sustained_backpressure_state: "active".into(),
+                fire_consecutive_snapshots: 2,
+                clear_consecutive_snapshots: 0,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        startup_repairs::record_startup_recovery_readback(
+            &pool,
+            &startup_repairs::StartupRecoveryReadback {
+                id: "startup-recovery-mcp-1".into(),
+                recovered_item_count: 4,
+                queued_under_startup_recovery_backpressure_count: 2,
+                oldest_recovered_queued_age_ms: Some(301_000),
+                affected_run_count: 2,
+                next_retry_or_backoff_time: Some(now + chrono::Duration::seconds(7)),
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_epoch(
+            &pool,
+            &scheduler::HostInterruptionEpoch {
+                id: "host-epoch-1".into(),
+                kind: "network_change".into(),
+                started_at: now,
+                ended_at: Some(now + chrono::Duration::seconds(3)),
+                monotonic_gap_ms: None,
+                wall_clock_gap_ms: Some(30_000),
+                details_json: Some(r#"{"path":"wifi"}"#.into()),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_affected_execution(
+            &pool,
+            &scheduler::HostInterruptionAffectedExecution {
+                epoch_id: "host-epoch-1".into(),
+                agent_execution_id: agent_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: stage_execution_id.to_string(),
+                provider_family: Some("codex".into()),
+                action: "retry_enqueued".into(),
+                previous_status: "running".into(),
+                settlement_status: "retry_enqueued".into(),
+                cleanup_status: "succeeded".into(),
+                quota_budget_effect: "not_consumed".into(),
+                retry_enqueued_at: Some(now + chrono::Duration::seconds(7)),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+
+        assert_eq!(
+            mcp_truth["scheduler_health"]["sustained_backpressure_state"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            mcp_truth["scheduler_health"]["command_latency_p95_ms"]["approve_stage"],
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            mcp_truth["startup_recovery"]["recovered_item_count"],
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            mcp_truth["startup_recovery"]["queued_under_startup_recovery_backpressure_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            mcp_truth["startup_recovery"]["oldest_recovered_queued_age_ms"],
+            serde_json::json!(301_000)
+        );
+        assert_eq!(
+            mcp_truth["startup_recovery"]["affected_run_count"],
+            serde_json::json!(2)
+        );
+        assert!(
+            mcp_truth["startup_recovery"]["next_retry_or_backoff_time"]
+                .as_str()
+                .is_some(),
+            "MCP report must expose startup recovery next retry/backoff time"
+        );
+        assert_eq!(
+            mcp_truth["scheduler_queue_summaries"][0]["top_reason"],
+            serde_json::json!("provider_capacity")
+        );
+        assert_eq!(
+            mcp_truth["scheduler_backpressure_notification"]["state"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            mcp_truth["host_interruption_epochs"][0]["affected_executions"][0]["action"],
+            serde_json::json!("retry_enqueued")
+        );
+        assert_eq!(
+            mcp_truth["host_interruption_epochs"][0]["affected_executions"][0]["cleanup_status"],
+            serde_json::json!("succeeded")
+        );
+        assert_eq!(
+            mcp_truth["host_interruption_epochs"][0]["affected_executions"][0]["quota_budget_effect"],
+            serde_json::json!("not_consumed")
         );
     }
 

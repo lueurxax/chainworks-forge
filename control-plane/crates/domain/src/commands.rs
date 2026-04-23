@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{IdeaId, RunId};
+use crate::ids::{AgentExecutionId, IdeaId, RunId};
 
 // ── P029: Canonical PrincipalClass definition (owned by domain) ────────
 
@@ -71,6 +71,10 @@ pub struct RetryStageCmd {
     pub stage_id: String,
     #[serde(default)]
     pub consume_quota_budget_now: bool,
+    /// Optional narrow retry target. When set, the command schedules only the
+    /// matching InvokeAgent task instead of rerunning the full stage fanout.
+    #[serde(default)]
+    pub agent_execution_id: Option<AgentExecutionId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

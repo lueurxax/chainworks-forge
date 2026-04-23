@@ -2,13 +2,14 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    ideas, runs, stages, work_items,
+    artifacts, ideas, runs, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
     ArtifactSourceClaimState, OperatorActionHint,
 };
+use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
     ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey,
     SourceGenerationImportDecision,
@@ -649,9 +650,28 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
     .await
     .unwrap();
 
+    let artifact_id = ArtifactId::new();
+    let artifact = Artifact {
+        id: artifact_id,
+        run_id,
+        stage_id: "state_1".into(),
+        agent_id: "code_writer".into(),
+        name: "prepush_review_report".into(),
+        contract_id: "prepush_review_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: "review/prepush.json".into(),
+        checksum_sha256: None,
+        size_bytes: Some(128),
+        provider: "claude".into(),
+        model: Some("sonnet".into()),
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
     let input = ActiveArtifactGenerationInput {
         run_id,
-        artifact_id: ArtifactId::new(),
+        artifact_id,
         contract_id: "prepush_review_v1".into(),
         canonical_path: "review/prepush.json".into(),
         raw_path: "review/prepush.json".into(),
@@ -671,6 +691,9 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
     facts.valid_required_outputs = true;
 
     let mut rollback_tx = pool.begin().await.unwrap();
+    artifacts::insert_tx(&mut rollback_tx, &artifact)
+        .await
+        .unwrap();
     let decision = artifact_contracts::import_generation_with_claim_cas_tx(
         &mut rollback_tx,
         &key,
@@ -681,6 +704,9 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
     .unwrap();
     assert_eq!(decision, SourceGenerationImportDecision::Activated);
     agent_execution_runtime_facts::upsert_tx(&mut rollback_tx, &facts)
+        .await
+        .unwrap();
+    artifact_contracts::close_source_generation_claim_tx(&mut rollback_tx, &key)
         .await
         .unwrap();
     rollback_tx.rollback().await.unwrap();
@@ -702,8 +728,23 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
             .unwrap()
             .is_none()
     );
+    assert!(
+        artifacts::find_by_id(&pool, artifact_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "declared artifact row must roll back with contract import"
+    );
+    let claim = artifact_contracts::load_source_generation_claim(&pool, &key)
+        .await
+        .unwrap()
+        .expect("claim should survive rolled-back import");
+    assert_eq!(claim.claim_state, ArtifactSourceClaimState::Active);
 
     let mut commit_tx = pool.begin().await.unwrap();
+    artifacts::insert_tx(&mut commit_tx, &artifact)
+        .await
+        .unwrap();
     let decision = artifact_contracts::import_generation_with_claim_cas_tx(
         &mut commit_tx,
         &key,
@@ -714,6 +755,9 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
     .unwrap();
     assert_eq!(decision, SourceGenerationImportDecision::Activated);
     agent_execution_runtime_facts::upsert_tx(&mut commit_tx, &facts)
+        .await
+        .unwrap();
+    artifact_contracts::close_source_generation_claim_tx(&mut commit_tx, &key)
         .await
         .unwrap();
     commit_tx.commit().await.unwrap();
@@ -737,4 +781,14 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
         .unwrap()
         .unwrap();
     assert!(read.valid_required_outputs);
+    let artifact_read = artifacts::find_by_id(&pool, artifact_id)
+        .await
+        .unwrap()
+        .expect("declared artifact row should commit with accepted import");
+    assert_eq!(artifact_read.contract_id, "prepush_review_v1");
+    let claim = artifact_contracts::load_source_generation_claim(&pool, &key)
+        .await
+        .unwrap()
+        .expect("claim should commit closed with accepted import");
+    assert_eq!(claim.claim_state, ArtifactSourceClaimState::Closed);
 }

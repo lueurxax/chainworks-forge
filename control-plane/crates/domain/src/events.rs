@@ -50,4 +50,19 @@ pub enum DomainEvent {
     DaemonStatusChanged {
         status: DaemonStatus,
     },
+    /// Durable scheduler backpressure notification changed (P061).
+    /// Payload mirrors the operator readback shape so GraphQL and MCP can
+    /// push state without re-deriving freshness from event-only data.
+    SchedulerBackpressureChanged {
+        run_id: Option<String>,
+        stage_execution_id: Option<String>,
+        provider_family: Option<String>,
+        top_reason: String,
+        queued_count: i64,
+        oldest_queued_age_ms: i64,
+        global_queue_depth: i64,
+        state: String,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        stale_after_ms: i64,
+    },
 }
