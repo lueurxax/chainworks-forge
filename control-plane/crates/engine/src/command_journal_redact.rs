@@ -26,6 +26,7 @@
 //! | `RejectStage`        | `run_id`, `stage_id`           | preserve   |
 //! | `RejectStage`        | `comment`                      | **redact** |
 //! | `RetryStage`         | all fields                     | preserve   |
+//! | `OverrideLegacyDiscoveryPolicy` | all fields            | preserve   |
 //! | `CancelRun`          | all fields                     | preserve   |
 //! | `ResetSession`       | all fields                     | preserve   |
 //! | `RunStewardAnalysis` | `reason`, `artifact_base`      | preserve   |
@@ -85,6 +86,9 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::RetryStage(_) => {
             // §8.1: preserve all fields.
         }
+        Command::OverrideLegacyDiscoveryPolicy(_) => {
+            // P053: preserve typed override fields for operator audit.
+        }
         Command::CancelRun(_) => {
             // §8.1: preserve all fields.
         }
@@ -134,10 +138,11 @@ fn redact_field_if_present(obj: &mut serde_json::Map<String, Value>, field: &str
 mod tests {
     use super::*;
     use domain::commands::{
-        ApproveStageCmd, CancelRunCmd, Command, RejectStageCmd, ResetSessionCmd, RetryStageCmd,
-        RunStewardAnalysisCmd, StartRunCmd,
+        ApproveStageCmd, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
+        ResetSessionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
     };
-    use domain::ids::{IdeaId, RunId};
+    use domain::discovery::LegacyBroadDiscoveryPolicy;
+    use domain::ids::{IdeaId, RunId, StageExecutionId};
     use serde_json::Value;
 
     fn round_trip(cmd: &Command) -> Value {
@@ -293,6 +298,8 @@ mod tests {
             stage_id: "state_7".into(),
             consume_quota_budget_now: true,
             agent_execution_id: None,
+            legacy_discovery_override_policy: None,
+            legacy_discovery_override_reason: None,
         });
         let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         let redacted = round_trip(&cmd);
@@ -383,6 +390,16 @@ mod tests {
                 stage_id: "s".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+            }),
+            Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
+                run_id: RunId::new(),
+                stage_id: "s".into(),
+                target_stage_execution_id: StageExecutionId::new(),
+                target_attempt_number: 2,
+                legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+                legacy_discovery_override_reason: "operator override".into(),
             }),
             Command::CancelRun(CancelRunCmd {
                 run_id: RunId::new(),
@@ -415,6 +432,7 @@ mod tests {
                 Command::ApproveStage(_) => {}
                 Command::RejectStage(_) => {}
                 Command::RetryStage(_) => {}
+                Command::OverrideLegacyDiscoveryPolicy(_) => {}
                 Command::CancelRun(_) => {}
                 Command::ResetSession(_) => {}
                 Command::RunStewardAnalysis(_) => {}

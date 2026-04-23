@@ -1,17 +1,14 @@
-use std::sync::Arc;
-use std::time::Instant;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, runs, scheduler, stages, startup_repairs,
-    work_items,
+    agent_execution_runtime_facts, agent_executions, runs, stages, startup_repairs, work_items,
+    workflow_conflicts,
 };
-use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
-use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
+use db::work_item::WorkItemKind;
+use domain::agent::{AgentFailureKind, AgentOutputSettlement};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::Run;
 use domain::stage::StageStatus;
@@ -24,7 +21,6 @@ pub struct RecoveryService {
     work_queue: WorkQueue,
     #[allow(dead_code)]
     events: EventSender,
-    capacity_config: Arc<InvokeAgentCapacityConfig>,
 }
 
 #[cfg(test)]
@@ -61,10 +57,10 @@ pub struct RecoverySummary {
     pub runs_inspected: usize,
     pub runs_repaired: usize,
     pub work_items_requeued: usize,
-    pub recovered_item_count: usize,
-    pub queued_under_startup_recovery_backpressure_count: usize,
+    pub recovered_item_count: i64,
+    pub queued_under_startup_recovery_backpressure_count: i64,
     pub oldest_recovered_queued_age_ms: Option<i64>,
-    pub affected_run_count: usize,
+    pub affected_run_count: i64,
     pub next_retry_or_backoff_time: Option<chrono::DateTime<Utc>>,
 }
 
@@ -149,25 +145,28 @@ fn recovery_action_from_runtime_facts(
 
 impl RecoveryService {
     pub fn new(pool: SqlitePool, work_queue: WorkQueue, events: EventSender) -> Self {
-        Self::new_with_capacity(
-            pool,
-            work_queue,
-            events,
-            InvokeAgentCapacityConfig::default(),
-        )
-    }
-
-    pub fn new_with_capacity(
-        pool: SqlitePool,
-        work_queue: WorkQueue,
-        events: EventSender,
-        capacity_config: InvokeAgentCapacityConfig,
-    ) -> Self {
         Self {
             pool,
             work_queue,
             events,
-            capacity_config: Arc::new(capacity_config),
+        }
+    }
+
+    pub fn new_with_capacity(
+        pool: SqlitePool,
+        _work_queue: WorkQueue,
+        events: EventSender,
+        invoke_agent_capacity: InvokeAgentCapacityConfig,
+    ) -> Self {
+        let work_queue = WorkQueue::with_events_and_capacity(
+            pool.clone(),
+            events.clone(),
+            invoke_agent_capacity,
+        );
+        Self {
+            pool,
+            work_queue,
+            events,
         }
     }
 
@@ -180,42 +179,15 @@ impl RecoveryService {
         info!(runs_inspected = %runs_inspected, "Starting startup recovery");
 
         for run in &active_runs {
-            let tx_started = Instant::now();
-            let writer_wait_started_at = Instant::now();
-            let mut tx =
-                db::pool::begin_immediate_with_retry(&self.pool, "recovery.startup_repair")
-                    .await
-                    .context("begin startup repair transaction")?;
-            let writer_wait_ms = writer_wait_started_at.elapsed().as_millis() as i64;
-            let now = Utc::now();
-            let repair_result = self.repair_run_tx(&mut tx, run, now).await;
-            let refresh = match repair_result {
+            match self.repair_run(run).await {
                 Ok(requeued) => {
-                    let refresh = scheduler::refresh_queue_summaries_for_notification_tx(
-                        &mut tx,
-                        &self.capacity_config,
-                        now,
-                        "recovery.startup_repair",
-                        writer_wait_ms,
-                    )
-                    .await?;
-                    tx.commit()
-                        .await
-                        .context("commit startup repair transaction")?;
-                    db::pool::log_write_transaction("recovery.startup_repair", tx_started);
-                    Some((requeued, refresh))
+                    if requeued > 0 {
+                        runs_repaired += 1;
+                        work_items_requeued += requeued;
+                    }
                 }
-                Err(error) => {
-                    warn!(run_id = %run.id, error = %error, "Failed to repair run during startup");
-                    None
-                }
-            };
-
-            if let Some((requeued, refresh)) = refresh {
-                self.work_queue.publish_scheduler_notification(refresh);
-                if requeued > 0 {
-                    runs_repaired += 1;
-                    work_items_requeued += requeued;
+                Err(e) => {
+                    warn!(run_id = %run.id, error = %e, "Failed to repair run during startup");
                 }
             }
         }
@@ -227,36 +199,48 @@ impl RecoveryService {
             "Startup recovery complete"
         );
 
-        let readback = startup_repairs::build_startup_recovery_readback(
-            &self.pool,
-            work_items_requeued as i64,
-            runs_repaired as i64,
-            Utc::now(),
-        )
-        .await?;
-        startup_repairs::record_startup_recovery_readback(&self.pool, &readback).await?;
+        let readback = if work_items_requeued > 0 {
+            self.work_queue.refresh_scheduler_projection().await?;
+            let readback = startup_repairs::build_startup_recovery_readback(
+                &self.pool,
+                work_items_requeued as i64,
+                runs_repaired as i64,
+                Utc::now(),
+            )
+            .await?;
+            startup_repairs::record_startup_recovery_readback(&self.pool, &readback).await?;
+            Some(readback)
+        } else {
+            None
+        };
 
         Ok(RecoverySummary {
             runs_inspected,
             runs_repaired,
             work_items_requeued,
-            recovered_item_count: work_items_requeued,
+            recovered_item_count: readback
+                .as_ref()
+                .map(|readback| readback.recovered_item_count)
+                .unwrap_or(work_items_requeued as i64),
             queued_under_startup_recovery_backpressure_count: readback
-                .queued_under_startup_recovery_backpressure_count
-                as usize,
-            oldest_recovered_queued_age_ms: readback.oldest_recovered_queued_age_ms,
-            affected_run_count: runs_repaired,
-            next_retry_or_backoff_time: readback.next_retry_or_backoff_time,
+                .as_ref()
+                .map(|readback| readback.queued_under_startup_recovery_backpressure_count)
+                .unwrap_or(0),
+            oldest_recovered_queued_age_ms: readback
+                .as_ref()
+                .and_then(|readback| readback.oldest_recovered_queued_age_ms),
+            affected_run_count: readback
+                .as_ref()
+                .map(|readback| readback.affected_run_count)
+                .unwrap_or(runs_repaired as i64),
+            next_retry_or_backoff_time: readback
+                .as_ref()
+                .and_then(|readback| readback.next_retry_or_backoff_time),
         })
     }
 
-    async fn repair_run_tx(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        run: &Run,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<usize> {
-        let run_stages = stages::list_by_run_tx(tx, run.id).await?;
+    async fn repair_run(&self, run: &Run) -> Result<usize> {
+        let run_stages = stages::list_by_run(&self.pool, run.id).await?;
         let mut requeued = 0usize;
 
         // Check for stages stuck in Running state — these might be orphaned from a crash
@@ -265,14 +249,14 @@ impl RecoveryService {
             .filter(|s| s.status == StageStatus::Running)
             .collect();
 
+        let now = Utc::now();
         let mut blocked_running_stages = 0usize;
-        let mut stale_running_executions = 0usize;
 
         for stage in &running_stages {
-            let requeued_preclaimed = work_items::requeue_running_preclaimed_invoke_for_stage_tx(
-                tx,
+            let requeued_preclaimed = work_items::requeue_running_preclaimed_invoke_for_stage(
+                &self.pool,
                 run.id,
-                &stage.id.to_string(),
+                stage.id,
                 &stage.stage_id,
             )
             .await?;
@@ -287,7 +271,8 @@ impl RecoveryService {
                 continue;
             }
 
-            let provenance_suffix = Self::latest_execution_provenance_suffix_tx(tx, stage.id)
+            let provenance_suffix = self
+                .latest_execution_provenance_suffix(stage.id)
                 .await
                 .unwrap_or_default();
             warn!(
@@ -296,7 +281,7 @@ impl RecoveryService {
                 "Found stage stuck in Running state during startup repair — re-enqueuing AdvanceRun"
             );
             // Mark as blocked so we can retry safely
-            stages::update_status_tx(tx, stage.id, StageStatus::Blocked).await?;
+            stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
             let drift_details = serde_json::json!({
                 "source": "startup_repair",
                 "reason": "stage_stuck_running",
@@ -304,12 +289,13 @@ impl RecoveryService {
                 "stage_id": stage.stage_id,
                 "action": "marked_blocked_for_operator_retry",
             });
-            runs::update_drift_detection_tx(tx, run.id, now, &drift_details.to_string()).await?;
+            runs::update_drift_detection(&self.pool, run.id, now, &drift_details.to_string())
+                .await?;
 
             // Audit trail: record the repair action (proposal §6.3)
             let repair_id = uuid::Uuid::new_v4().to_string();
-            startup_repairs::record_tx(
-                &mut **tx,
+            let _ = startup_repairs::record(
+                &self.pool,
                 &repair_id,
                 &run.id.to_string(),
                 "stage_blocked",
@@ -319,12 +305,12 @@ impl RecoveryService {
                     stage.stage_id, provenance_suffix
                 )),
             )
-            .await?;
+            .await;
 
             // Recovery recommendation: the operator should retry or cancel
             let rec_id = uuid::Uuid::new_v4().to_string();
-            startup_repairs::recommend_tx(
-                &mut **tx,
+            let _ = startup_repairs::recommend(
+                &self.pool,
                 &rec_id,
                 &run.id.to_string(),
                 Some(&stage.stage_id),
@@ -335,67 +321,26 @@ impl RecoveryService {
                 ),
                 now,
             )
-            .await?;
+            .await;
             blocked_running_stages += 1;
         }
 
-        for stage in run_stages
-            .iter()
-            .filter(|stage| stage.status != StageStatus::Running)
-        {
-            let executions = agent_executions::find_by_stage_tx(tx, stage.id).await?;
-            let running_execution_ids = executions
-                .iter()
-                .filter(|execution| execution.status == AgentStatus::Running)
-                .map(|execution| execution.id)
-                .collect::<Vec<_>>();
-            if running_execution_ids.is_empty() {
-                continue;
-            }
-
-            for execution_id in &running_execution_ids {
-                agent_executions::update_completed_tx(
-                    tx,
-                    *execution_id,
-                    AgentStatus::Cancelled,
-                    now,
-                )
-                .await?;
-            }
-            let cancelled_work_items =
-                work_items::cancel_pending_or_running_invoke_by_stage_execution_tx(
-                    tx,
-                    run.id,
-                    &stage.id.to_string(),
-                    now,
-                    "stale_stage_execution_startup_repair",
-                )
-                .await?;
-            let repair_id = uuid::Uuid::new_v4().to_string();
-            startup_repairs::record_tx(
-                &mut **tx,
-                &repair_id,
-                &run.id.to_string(),
-                "stale_running_agent_execution_cancelled",
-                now,
-                Some(&format!(
-                    "Cancelled {} stale Running agent execution(s) attached to non-running stage '{}' ({:?}); cancelled {} matching InvokeAgent work item(s)",
-                    running_execution_ids.len(),
-                    stage.stage_id,
-                    stage.status,
-                    cancelled_work_items
-                )),
-            )
-            .await?;
-            stale_running_executions += running_execution_ids.len();
-        }
-
-        if blocked_running_stages > 0 || stale_running_executions > 0 {
+        if blocked_running_stages > 0 {
             // Re-enqueue an AdvanceRun for this run to recheck state
-            let item = advance_run_work_item(run.id, "startup_repair", now);
-            work_items::enqueue_tx(tx, &item).await?;
+            self.work_queue
+                .enqueue(
+                    WorkItemKind::AdvanceRun,
+                    Some(run.id),
+                    None,
+                    serde_json::json!({ "run_id": run.id.to_string(), "reason": "startup_repair" }),
+                )
+                .await?;
             requeued += 1;
         } else {
+            if self.transition_cursor_blocks_startup_catchup(run).await? {
+                return Ok(requeued);
+            }
+
             // Even if no stages are stuck in Running, the run may need
             // advancement — e.g. daemon crashed after settling a stage as
             // Completed but before evaluate_and_transition ran, or after
@@ -403,15 +348,32 @@ impl RecoveryService {
             // enqueuing the follow-up AdvanceRun. Unconditionally enqueue
             // an AdvanceRun for any active run. The advance handler is
             // idempotent — if nothing needs doing, it returns Ok(()).
-            let has_pending_work = work_items::has_pending_or_running_by_run_tx(tx, run.id).await?;
+            let has_pending_work = db::repos::work_items::list_by_run(&self.pool, run.id)
+                .await
+                .map(|items| {
+                    items.iter().any(|w| {
+                        matches!(
+                            w.status,
+                            db::work_item::WorkItemStatus::Pending
+                                | db::work_item::WorkItemStatus::Running
+                        )
+                    })
+                })
+                .unwrap_or(false);
 
             if !has_pending_work {
                 info!(
                     run_id = %run.id,
                     "Active run with no pending/running work — enqueuing AdvanceRun"
                 );
-                let item = advance_run_work_item(run.id, "startup_catchup", now);
-                work_items::enqueue_tx(tx, &item).await?;
+                self.work_queue
+                    .enqueue(
+                        WorkItemKind::AdvanceRun,
+                        Some(run.id),
+                        None,
+                        serde_json::json!({ "run_id": run.id.to_string(), "reason": "startup_catchup" }),
+                    )
+                    .await?;
                 requeued += 1;
             }
         }
@@ -419,11 +381,33 @@ impl RecoveryService {
         Ok(requeued)
     }
 
-    async fn latest_execution_provenance_suffix_tx(
-        tx: &mut Transaction<'_, Sqlite>,
+    async fn transition_cursor_blocks_startup_catchup(&self, run: &Run) -> Result<bool> {
+        let Some(cursor) = workflow_conflicts::get_transition_cursor(&self.pool, run.id).await?
+        else {
+            return Ok(false);
+        };
+        let blocks_catchup = matches!(
+            cursor.resume_policy.as_str(),
+            "await_conflict_resolution" | "terminal_failure"
+        );
+        if blocks_catchup {
+            info!(
+                run_id = %run.id,
+                current_state = %cursor.current_state_id,
+                cursor_status = %cursor.cursor_status,
+                resume_policy = %cursor.resume_policy,
+                conflict_id = ?cursor.conflict_id,
+                "Startup recovery leaving run parked at workflow transition cursor"
+            );
+        }
+        Ok(blocks_catchup)
+    }
+
+    async fn latest_execution_provenance_suffix(
+        &self,
         stage_execution_id: domain::ids::StageExecutionId,
     ) -> Option<String> {
-        let executions = agent_executions::find_by_stage_tx(tx, stage_execution_id)
+        let executions = agent_executions::find_by_stage(&self.pool, stage_execution_id)
             .await
             .ok()?;
         let execution = executions.last()?;
@@ -447,28 +431,5 @@ impl RecoveryService {
                 details.join(", ")
             ))
         }
-    }
-}
-
-fn advance_run_work_item(
-    run_id: domain::ids::RunId,
-    reason: &str,
-    now: chrono::DateTime<Utc>,
-) -> WorkItem {
-    WorkItem {
-        id: uuid::Uuid::new_v4().to_string(),
-        kind: WorkItemKind::AdvanceRun,
-        payload_json: serde_json::json!({
-            "run_id": run_id.to_string(),
-            "reason": reason,
-        })
-        .to_string(),
-        status: WorkItemStatus::Pending,
-        run_id: Some(run_id),
-        stage_id: None,
-        created_at: now,
-        scheduled_at: now,
-        attempt_count: 0,
-        last_error: None,
     }
 }

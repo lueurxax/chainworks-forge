@@ -154,6 +154,15 @@ Shared ACP plumbing lives in:
 - `ACPSubprocessManager`
 - `ACPStreamEventMapper`
 
+#### Bounded Discovery and DiscoveryFilesystem (P053)
+
+P053 removes broad filesystem discovery from the pre-`initialize` path. Instead of implicit inference from the entire repository or worktree, the system now uses a bounded discovery model:
+
+- **DiscoveryFilesystem Ownership**: Shared discovery value-types and filesystem logic live in `domain::discovery`, while policy construction remains engine-owned.
+- **Bounded Discovery**: Discovery is restricted to the run meta-root and explicitly declared expected output paths.
+- **Pre-Prompt Metadata**: Metadata capture is now a per-execution, per-prompt-turn step for both fresh and reused sessions.
+- **Settlement Pipeline**: An engine-owned pipeline settles discovered artifacts based on typed expected outputs and discovery decisions.
+
 ## Current factory behavior
 
 `DefaultRuntimeTransportFactory` now resolves only ACP families:

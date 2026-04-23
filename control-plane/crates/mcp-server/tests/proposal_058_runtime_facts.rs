@@ -1,13 +1,19 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, ideas, runs,
-    sessions, stages,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
+    agent_retry_budget_ledger, ideas, runs, sessions, stages,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
+};
+use domain::discovery::{
+    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, ExpectedOutputRole,
+    OutputDiscoveryDecision, OutputDiscoveryProvenance, OutputDiscoveryReason,
+    OutputDiscoveryStatus, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
@@ -198,6 +204,112 @@ fn make_command_handler(pool: sqlx::SqlitePool) -> CommandHandler {
     CommandHandler::new(pool.clone(), events.clone(), WorkQueue::new(pool))
 }
 
+fn accepted_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: "implementation_self_assessment".into(),
+        output_role: ExpectedOutputRole::Machine,
+        target_path: "implementation/self-assessment.json".into(),
+        companion_of: None,
+        status: OutputDiscoveryStatus::Accepted,
+        reason: OutputDiscoveryReason::ExactPathNew,
+        provenance: None,
+        canonical_path: Some("/tmp/artifacts/implementation/self-assessment.json".into()),
+        root_class: None,
+        baseline_status: None,
+        size_bytes: Some(128),
+        content_digest: Some("sha256:accepted".into()),
+        max_bytes_applied: Some(10 * 1024 * 1024),
+        aggregate_bytes_after_acceptance: Some(128),
+        accepted_payload_ref: Some("provider_envelope:implementation_self_assessment".into()),
+        accepted_bytes_sha256: Some("accepted".into()),
+        generated_by: Some(agent_execution_id.to_string()),
+        diagnostics: BTreeMap::new(),
+        decision_at: Utc::now(),
+    }
+}
+
+fn stale_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: "proposal_review".into(),
+        output_role: ExpectedOutputRole::Machine,
+        target_path: "proposal_review.json".into(),
+        companion_of: None,
+        status: OutputDiscoveryStatus::Missing,
+        reason: OutputDiscoveryReason::StaleExpectedOutput,
+        provenance: Some(OutputDiscoveryProvenance::ExactPath),
+        canonical_path: Some("/tmp/artifacts/proposal_review.json".into()),
+        root_class: None,
+        baseline_status: None,
+        size_bytes: Some(128),
+        content_digest: Some("sha256:stale".into()),
+        max_bytes_applied: Some(10 * 1024 * 1024),
+        aggregate_bytes_after_acceptance: None,
+        accepted_payload_ref: None,
+        accepted_bytes_sha256: None,
+        generated_by: None,
+        diagnostics: BTreeMap::from([(
+            "agent_execution_id".to_string(),
+            agent_execution_id.to_string(),
+        )]),
+        decision_at: Utc::now(),
+    }
+}
+
+fn discovery_payload(
+    agent_execution_id: AgentExecutionId,
+    decisions: Vec<OutputDiscoveryDecision>,
+    now: chrono::DateTime<Utc>,
+) -> DiscoveryDiagnosticsV1 {
+    DiscoveryDiagnosticsV1 {
+        schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
+        agent_execution_id: agent_execution_id.to_string(),
+        decisions,
+        pre_prompt_expected_outputs: Vec::new(),
+        legacy_broad_discovery_used: false,
+        bounded_meta_root_discovery: None,
+        git_manifest_status: None,
+        resume_warnings: Vec::new(),
+        warnings: Vec::new(),
+        generated_at: now,
+        acp_pre_initialize_local_latency_ms: None,
+        acp_initialize_latency_ms: None,
+        acp_session_new_latency_ms: None,
+        acp_prompt_duration_ms: None,
+        acp_pre_prompt_metadata_latency_ms: None,
+        acp_pre_prompt_metadata_timeout: None,
+        acp_pre_prompt_metadata_digest_bytes: None,
+        acp_expected_output_spec_count: None,
+        acp_control_plane_manifest_latency_ms: None,
+        acp_exact_output_acceptance_latency_ms: None,
+        acp_meta_root_discovery_latency_ms: None,
+        acp_git_changed_files_latency_ms: None,
+        acp_expected_outputs_found_count: None,
+        acp_expected_outputs_missing_count: None,
+        acp_expected_outputs_stale_count: None,
+        acp_expected_outputs_rejected_count: None,
+        acp_meta_discovery_truncated: None,
+        acp_meta_discovery_truncation_reason: None,
+        acp_legacy_broad_discovery_policy: None,
+        acp_legacy_broad_discovery_used: None,
+        acp_git_manifest_status: None,
+        acp_resume_discovery_warning: None,
+        acp_discovery_schema_version: None,
+        acp_discovery_override_status: None,
+        acp_missing_required_output_count: None,
+        acp_rejected_output_count: None,
+        acp_stale_output_count: None,
+        acp_exact_output_acceptance_timeout: None,
+        acp_exact_output_aggregate_bytes: None,
+        acp_exact_output_aggregate_cap_hit: None,
+        acp_cap_validation_sample_size: None,
+        acp_cap_validation_p90_output_bytes: None,
+        acp_cap_validation_p90_aggregate_bytes: None,
+        acp_legacy_broad_discovery_timeout_ms: None,
+        acp_legacy_broad_discovery_truncation_reason: None,
+        acp_reconciliation_pending: None,
+    }
+}
+
 #[tokio::test]
 async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -376,4 +488,78 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         serde_json::json!(true)
     );
     assert_eq!(resource_runtime_facts["quota_ledger_id"], ledger.id);
+}
+
+#[tokio::test]
+async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
+    let now = Utc::now();
+    let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(
+        discovery_payload(
+            agent_execution_id,
+            vec![
+                accepted_discovery_decision(agent_execution_id),
+                stale_discovery_decision(agent_execution_id),
+            ],
+            now,
+        ),
+        now,
+    );
+    agent_execution_discovery_diagnostics::upsert(&pool, &diagnostics)
+        .await
+        .unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    let payload = mcp_server::tools::reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &make_command_handler(pool.clone()),
+        &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+    )
+    .await
+    .unwrap();
+
+    let canonical = payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
+        .expect("mcp execution truth report");
+    let execution = &canonical["agent_executions"][0];
+    assert_eq!(
+        execution["discovery_diagnostics"]["reconciliation_pending"],
+        true
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["stale_output_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["missing_required_output_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["payload"]["resume_warnings"],
+        serde_json::json!(["reconciliation_pending"])
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["runtime_facts_present"],
+        true
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["matching_active_artifact_generation_count"],
+        0
+    );
+    assert_eq!(
+        execution["runtime_facts"]["output_settlement"],
+        "valid_outputs_from_completed_execution"
+    );
+    assert_eq!(execution["runtime_facts"]["valid_required_outputs"], false);
 }

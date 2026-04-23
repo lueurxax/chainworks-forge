@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentExecutionId, IdeaId, RunId};
+use crate::discovery::LegacyBroadDiscoveryPolicy;
+use crate::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
 
 // ── P029: Canonical PrincipalClass definition (owned by domain) ────────
 
@@ -28,6 +29,7 @@ pub enum Command {
     ApproveStage(ApproveStageCmd),
     RejectStage(RejectStageCmd),
     RetryStage(RetryStageCmd),
+    OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd),
     CancelRun(CancelRunCmd),
     ResetSession(ResetSessionCmd),
     RunStewardAnalysis(RunStewardAnalysisCmd),
@@ -75,6 +77,20 @@ pub struct RetryStageCmd {
     /// matching InvokeAgent task instead of rerunning the full stage fanout.
     #[serde(default)]
     pub agent_execution_id: Option<AgentExecutionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_discovery_override_policy: Option<LegacyBroadDiscoveryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_discovery_override_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OverrideLegacyDiscoveryPolicyCmd {
+    pub run_id: RunId,
+    pub stage_id: String,
+    pub target_stage_execution_id: StageExecutionId,
+    pub target_attempt_number: i64,
+    pub legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy,
+    pub legacy_discovery_override_reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

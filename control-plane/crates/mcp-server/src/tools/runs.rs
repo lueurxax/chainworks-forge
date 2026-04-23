@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{artifact_contracts, projections, runs};
+use db::repos::{artifact_contracts, legacy_discovery_overrides, projections, runs};
 use domain::commands::{CancelRunCmd, Command, StartRunCmd};
 use domain::ids::{IdeaId, RunId};
 use engine::command_handler::CommandHandler;
@@ -170,6 +170,12 @@ pub async fn execute(
                                 )?,
                             );
                         }
+                        obj.insert(
+                            "legacy_discovery_overrides".into(),
+                            serde_json::to_value(
+                                legacy_discovery_overrides::list_by_run(pool, run_id).await?,
+                            )?,
+                        );
                     }
                     attach_implementation_self_assessment_summary(pool, value).await
                 }

@@ -123,8 +123,12 @@ plane:
 - `quota_ledger_id`
 - timestamps and active session-generation matching fields
 
-Readback rules:
+**Workflow Conflict:**
+The report also includes the `workflow_conflict` object (Proposal 017) containing
+current blocking conflicts, conflict history, and advisory rejection records.
 
+Readback rules:
+...
 - operator principals may see raw debug failure-kind detail,
 - observer and agent principals receive redacted/null raw debug fields,
 - `reports.get` and `report://{run_id}` must stay in parity for the same run,

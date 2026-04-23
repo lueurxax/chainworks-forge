@@ -496,7 +496,9 @@ impl HostInterruptionService {
             {
                 Ok(Ok(())) => {
                     summary.succeeded += 1;
-                    summary.execution_status.insert(execution_id, "succeeded".to_string());
+                    summary
+                        .execution_status
+                        .insert(execution_id, "succeeded".to_string());
                 }
                 Ok(Err(error)) => {
                     warn!(
@@ -506,7 +508,9 @@ impl HostInterruptionService {
                         "host interruption runtime cleanup failed before retry enqueue"
                     );
                     summary.failed += 1;
-                    summary.execution_status.insert(execution_id, "failed".to_string());
+                    summary
+                        .execution_status
+                        .insert(execution_id, "failed".to_string());
                 }
                 Err(_) => {
                     warn!(
@@ -516,7 +520,9 @@ impl HostInterruptionService {
                         "host interruption runtime cleanup timed out before retry enqueue"
                     );
                     summary.failed += 1;
-                    summary.execution_status.insert(execution_id, "failed".to_string());
+                    summary
+                        .execution_status
+                        .insert(execution_id, "failed".to_string());
                 }
             }
         }

@@ -5,8 +5,8 @@
 | Date | 2026-04-22 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [061-sqlite-write-serialization-and-executor-backpressure.md](061-sqlite-write-serialization-and-executor-backpressure.md), [051-shared-xcode-mcp-bridge-pool.md](051-shared-xcode-mcp-bridge-pool.md) |
-| Scope | Add adapter-local cache/build directory mappings for Swift/Xcode and Go provider sessions under the generic `TOOLCHAIN_HOME` contract established by P061. |
+| Depends on | [rust-control-plane.md#provider-runtime-homes-and-toolchain-caches](../reference/rust-control-plane.md#provider-runtime-homes-and-toolchain-caches), [051-shared-xcode-mcp-bridge-pool.md](051-shared-xcode-mcp-bridge-pool.md) |
+| Scope | Add adapter-local cache/build directory mappings for Swift/Xcode and Go provider sessions under the generic `TOOLCHAIN_HOME` contract documented in the Rust control-plane reference. |
 | Goal | Daemon-launched agents that build Swift/Xcode or Go projects get writable, isolated, observable toolchain caches without making the scheduler or proposal workflow language-specific. |
 
 **Gate naming note:** this proposal owns the future canonical gate alias `proposal-066|p066`. It must be added to `scripts/test-gate.sh` and `docs/reference/test-gates.md` when implementation starts.
@@ -15,13 +15,13 @@
 
 ## 1. Context and Motivation
 
-P061 introduces the generic daemon/provider contract:
+The implemented control-plane daemon provides the generic daemon/provider contract:
 
 - every provider session gets `CHAINWORKS_TOOLCHAIN_HOME` and `TOOLCHAIN_HOME`;
 - toolchain caches must live outside isolated runtime homes that can become read-only under provider sandboxing;
 - orchestration must not encode "Rust-heavy", "Swift-heavy", or "Go-heavy" as first-class scheduler concepts.
 
-The immediate P061 implementation can prove the contract with Codex/Rust because that is the failure currently blocking local control-plane work. Swift/Xcode and Go need the same treatment, but they should not expand P061 while it is already in implementation.
+The current implementation proves the contract with Codex/Rust because that is the failure currently blocking local control-plane work. Swift/Xcode and Go need the same treatment without changing the scheduler's language-neutral capacity model.
 
 This proposal is the follow-up that turns the generic contract into concrete adapter-local mappings for:
 
@@ -69,10 +69,10 @@ P066 includes:
 P066 does not include:
 
 - introducing language-specific scheduler dimensions;
-- changing P061's generic `TOOLCHAIN_HOME` contract;
+- changing the generic `TOOLCHAIN_HOME` contract;
 - changing agent catalog semantics or reviewer routing;
 - Xcode MCP bridge pooling; that remains P051;
-- MCP profile/config isolation; that remains P061/P065-adjacent runtime config work;
+- MCP profile/config isolation; that remains adjacent runtime config work;
 - UI use of MCP tools or new GraphQL write paths.
 
 ---
@@ -81,7 +81,7 @@ P066 does not include:
 
 ### 4.1 Root layout
 
-P061 owns the generic root:
+The Rust control-plane reference owns the generic root:
 
 ```text
 ${CHAINWORKS_TOOLCHAIN_HOME:-$TOOLCHAIN_HOME}/
@@ -161,7 +161,7 @@ Runtime facts must not include access tokens, full command prompts, or personal 
 5. A read-only provider runtime home does not break Swift/Xcode or Go cache writes.
 6. The executor and scheduler do not gain language-specific capacity concepts; all language-specific behavior remains in provider adapters.
 7. Logs/runtime facts expose the mapping decision and failures without leaking secrets.
-8. Existing P061 Codex/Rust behavior remains compatible with the generic `TOOLCHAIN_HOME` contract.
+8. Existing Codex/Rust behavior remains compatible with the generic `TOOLCHAIN_HOME` contract.
 
 ---
 
@@ -187,7 +187,7 @@ The gate should include:
 - Go adapter tests that inspect `GOCACHE`, `GOMODCACHE`, `GOPATH`, and `TMPDIR`;
 - read-only runtime-home tests proving cache directories are created under `TOOLCHAIN_HOME`;
 - concurrency tests proving two active runs do not share the same generated output directories by default;
-- regression tests proving P061 Codex/Rust mappings still work.
+- regression tests proving existing Codex/Rust mappings still work.
 
 The gate should use fake provider invocations by default. Real `xcodebuild`, simulator, or Go network/module fetches are not required for proposal readiness.
 

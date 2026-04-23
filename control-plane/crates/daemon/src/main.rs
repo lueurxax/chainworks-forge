@@ -393,11 +393,27 @@ async fn main() -> Result<()> {
             // the supervisor can distinguish a stuck daemon from a
             // voluntary shutdown.
             let shutdown_reporter = reporter.clone();
+            let shutdown_acp = Arc::clone(&acp);
             let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
             let shutdown_signal = async move {
                 wait_for_shutdown_signal().await;
                 info!("shutdown signal received; transitioning to Shutdown");
                 shutdown_reporter.set_state(DaemonLifecycleState::Shutdown);
+                match tokio::time::timeout(
+                    SHUTDOWN_DRAIN_DEADLINE,
+                    shutdown_acp.close_all_sessions(),
+                )
+                .await
+                {
+                    Ok(closed_sessions) => info!(
+                        closed_sessions,
+                        "closed live ACP sessions during daemon shutdown"
+                    ),
+                    Err(_) => warn!(
+                        deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
+                        "timed out closing live ACP sessions during daemon shutdown"
+                    ),
+                }
                 // Notify the main task that the drain window has started.
                 // Ignore the send error — it only fails if the receiver
                 // was dropped, which means serve is already finishing.

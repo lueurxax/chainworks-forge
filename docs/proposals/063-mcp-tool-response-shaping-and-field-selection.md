@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-20 |
-| Status | Draft |
+| Status | Draft (amended by P068: agent callers must use MCP-only continuation paths; GraphQL is UI-only) |
 | Author | Andrey Khasanov |
-| Depends on | [reference/mcp-northbound-control-plane-server.md](../reference/mcp-northbound-control-plane-server.md), [031-thin-ui-rewrite-over-projections-and-mcp.md](031-thin-ui-rewrite-over-projections-and-mcp.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md) |
+| Depends on | [reference/mcp-northbound-control-plane-server.md](../reference/mcp-northbound-control-plane-server.md), [031-thin-ui-rewrite-over-projections-and-mcp.md](031-thin-ui-rewrite-over-projections-and-mcp.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md](068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md) |
 | Scope | Make every MCP tool response safe to consume by an LLM agent caller (Claude Code, Claude Desktop, other MCP clients) by establishing a tool-response size budget, trimming oversized fields by default, giving callers explicit field-selection / include-by-opt-in semantics, **and retaining per-round review scores so the inspection tools can return a real score trajectory instead of the last snapshot**. |
-| Goal | An agent using the MCP surface for routine inspection (`runs.get`, `reports.get`, `steward.get_analysis`, `reviews.score_trajectory`) receives a response that fits inside its tool-result context budget, with explicit escape hatches for the rare cases where a full blob is genuinely needed. GraphQL remains the typed long-form read surface; MCP remains the command surface plus compact inspection tools. |
+| Goal | An agent using the MCP surface for routine inspection (`runs.get`, `reports.get`, `steward.get_analysis`, `reviews.score_trajectory`) receives a response that fits inside its tool-result context budget, with explicit MCP `include` escape hatches for the rare cases where a full blob is genuinely needed. Per P068, GraphQL remains the macOS UI read surface and must not be presented as the agent fallback. |
 
 ---
 
@@ -15,7 +15,7 @@
 
 P029 made MCP the northbound command surface and GraphQL the read surface. P031 doubled down: clients read via GraphQL projections, mutate via MCP tools. Both locked in the split.
 
-In practice, callers-who-are-themselves-LLM-agents (Claude Code, Claude Desktop, automation pipelines) also want to **inspect** run/report/steward state via MCP — it's the natural surface when they have MCP-tool bindings but no GraphQL client. Today that works for compact tools (`ideas.list`, `runs.list`) but falls over on rich-record tools.
+In practice, callers-who-are-themselves-LLM-agents (Claude Code, Claude Desktop, automation pipelines) also want to **inspect** run/report/steward state via MCP — it is the required surface for agent operation. Today that works for compact tools (`ideas.list`, `runs.list`) but falls over on rich-record tools.
 
 Direct evidence captured on 2026-04-20:
 
@@ -35,13 +35,13 @@ That single response exceeds typical LLM tool-result caps (25 k tokens) and forc
 | `active_artifact_index` | variable | Full artifact index including advisory artifacts; usually the caller just wants the current exported path. |
 | everything else combined | ~1 000–2 000 | Lifecycle status, stage counts, projection lag, timestamps — the fields the caller actually asked for. |
 
-The **intended** caller use case that motivated this audit was "give me current state + stage counts for every active run", which needs ~100 bytes per run and is served perfectly by GraphQL:
+The **intended** caller use case that motivated this audit was "give me current state + stage counts for every active run", which needs ~100 bytes per run. GraphQL can serve that shape for the macOS UI, but agent callers need the equivalent compact shape through MCP:
 
 ```graphql
 { runs { id status totalStages completedStages failedStages } }
 ```
 
-MCP today forces the caller to pull 66 KB per run. That is the bug. The split between MCP-as-command-surface and GraphQL-as-read-surface is right, but "read-for-quick-inspection" via MCP is a legitimate second read surface and it has to respect a response-size budget to stay useful to LLM-shaped callers.
+MCP today forces the caller to pull 66 KB per run. That is the bug. P068 tightens the split: GraphQL is the UI read surface, while agents use MCP for both command and compact inspection. MCP therefore has to respect a response-size budget to stay useful to LLM-shaped callers.
 
 ### 1.1 A second, related gap: per-round review scores are not durably retained
 
@@ -81,8 +81,8 @@ This proposal does not propose that MCP mirrors GraphQL's schema or pagination m
 1. Can an LLM agent call `runs.get` and `reports.get` on an arbitrary production run and receive a response that fits inside a 25 k-token tool-result context without fallback?
 2. Is there a predictable, typed way to request the heavy fields when they genuinely are needed (replay, debugging, audit)?
 3. Do we have an enforced default size budget per MCP tool response, and a test that fails the gate when a single compact response exceeds it?
-4. Does the response shape degrade gracefully when a field is trimmed — does the caller see `truncated_fields: […]` with a clear pointer to the GraphQL field or artifact path that carries the full blob?
-5. Does this proposal preserve the P029/P031 split? MCP stays the command surface + compact-inspection surface; GraphQL stays the typed long-form read surface.
+4. Does the response shape degrade gracefully when a field is trimmed — does the caller see `truncated_fields: [...]` with a clear MCP `include` continuation path or artifact/resource URI that carries the full blob?
+5. Does this proposal preserve the P068 split? MCP stays the agent command + compact-inspection surface; GraphQL stays the macOS UI read surface.
 6. Is the change backward-compatible for existing MCP clients, or does it need a versioned tool rename?
 7. Can an operator (or an agent) ask "show me the score trajectory across review rounds for run X" and get a structured, per-round answer — including reviewer scores, aggregate score, blocker count, and decision — without relying on a stale `orchestrator.md` snapshot or reading overwritten JSON files?
 8. Does the retention scheme survive proposal revisions to the review contract (e.g. new reviewer classes, new rubric weighting) without requiring retroactive backfill?
@@ -96,9 +96,9 @@ This proposal does not propose that MCP mirrors GraphQL's schema or pagination m
 - A default response-size budget for MCP **read-shaped** tools (`runs.get`, `reports.get`, `steward.get_analysis`, and any future equivalents). Target: ≤ 8 KB default envelope.
 - A per-tool list of fields that are **omitted by default** (the "heavy fields" table below) and are retrievable only via explicit `include` opt-in.
 - A typed `include: [field_name, …]` argument on every affected tool. Unknown field names produce a typed error rather than silent pass-through.
-- A `truncated_fields` metadata block that lists the fields that were available on the server but omitted from this response, each annotated with the GraphQL query path (or artifact-on-disk path) the caller can use for the full value.
+- A `truncated_fields` metadata block that lists the fields that were available on the server but omitted from this response, each annotated with an MCP `include` continuation path or resource/artifact URI the agent caller can use for the full value. A UI-only GraphQL hint may be documented separately, but must not be the agent continuation path.
 - A per-round **review-score retention scheme** (§ 4.7): on-disk archive under `.chainworks/runs/<run>/reviews/proposal/history/round-NNN/`, plus a new indexed SQLite table `review_score_trajectories` that captures the compact score fields per round without the heavy report bodies.
-- A new MCP tool **`reviews.score_trajectory`** (§ 4.7) and a GraphQL mirror `run(id).reviewScoreTrajectory(…)`, both serving the compact trajectory inside the same 8 KB budget.
+- A new MCP tool **`reviews.score_trajectory`** (§ 4.7) and a UI-only GraphQL mirror `run(id).reviewScoreTrajectory(...)`, both serving the compact trajectory inside the same 8 KB budget.
 - A compact `latest_review_round` field added to `runs.get` default response so one inspection call answers "where is this run in its review loop".
 - A migration script that backfills `review_score_trajectories` with whatever rounds are reconstructible from the current `summary.json` + `orchestrator.md` snapshots; missing rounds stay absent and are documented as such.
 - A focused gate test `proposal-063-mcp-response-shape` that asserts: (a) compact default responses fit the budget for every covered tool against a fixture run, (b) `include` opt-in restores the named fields, (c) unknown `include` names return a typed error envelope, (d) the review aggregator writes per-round archives + trajectory rows, (e) `reviews.score_trajectory` returns consistent data for a multi-round fixture run.
@@ -132,10 +132,10 @@ Initial heavy-field assignments:
 
 | Tool | Heavy fields (omitted by default) | Where the full value lives |
 |---|---|---|
-| `runs.get` | `catalog_snapshot_json`, `workflow_snapshot_json`, `delivery_configuration_json`, `delivery_preflight_json`, `catalog_snapshot_hash`, `operator_overrides`, `cancellation_settlement_log`, `active_artifact_index` (except `exported_path`, `owner`, `run_id`, `schema_version`) | GraphQL `run(id)` full field set; artifact files under `chainworks_meta_root` |
-| `runs.start` | Same heavy-field set as `runs.get` plus `operator_overrides_json`, `active_artifact_index`, `drift_details_json`. The compact default returns only the fields a caller needs to confirm the run was created: `id`, `idea_id`, `status`, `current_state`, `started_at`, `target_branch`, `base_revision`, `workflow_id`, `workflow_title`, plus `blocked` + `reason` + `delivery_preflight` (small preflight summary) when the call was blocked by preflight. | GraphQL `run(id)` full field set; the delivery-preflight JSON is served compact by default and retrievable in full via `include=["delivery_preflight_json"]` when debugging a preflight block. |
-| `reports.get` | `agent_executions` (full execution records), `run_state_projection` blobs, any embedded artifact JSON > 1 KB | GraphQL `run(id) { agentExecutions { … } }`; artifact files referenced in the compact summary |
-| `steward.get_analysis` | `input_snapshot_json`, `analysis_report_json` full blob | GraphQL `stewardAnalysis(id)` full field set |
+| `runs.get` | `catalog_snapshot_json`, `workflow_snapshot_json`, `delivery_configuration_json`, `delivery_preflight_json`, `catalog_snapshot_hash`, `operator_overrides`, `cancellation_settlement_log`, `active_artifact_index` (except `exported_path`, `owner`, `run_id`, `schema_version`) | MCP `include=[...]`; artifact/resource URIs under `chainworks_meta_root`; UI-only GraphQL can read the same fields for app screens |
+| `runs.start` | Same heavy-field set as `runs.get` plus `operator_overrides_json`, `active_artifact_index`, `drift_details_json`. The compact default returns only the fields a caller needs to confirm the run was created: `id`, `idea_id`, `status`, `current_state`, `started_at`, `target_branch`, `base_revision`, `workflow_id`, `workflow_title`, plus `blocked` + `reason` + `delivery_preflight` (small preflight summary) when the call was blocked by preflight. | MCP `include=[...]`; the delivery-preflight JSON is served compact by default and retrievable in full via `include=["delivery_preflight_json"]` when debugging a preflight block. |
+| `reports.get` | `agent_executions` (full execution records), `run_state_projection` blobs, any embedded artifact JSON > 1 KB | MCP `include=[...]`; artifact files/resources referenced in the compact summary; UI-only GraphQL can mirror for app screens |
+| `steward.get_analysis` | `input_snapshot_json`, `analysis_report_json` full blob | MCP `include=[...]`; UI-only GraphQL can mirror for app screens |
 
 Fields NOT on the list stay in the default response unconditionally.
 
@@ -160,10 +160,10 @@ The fix therefore applies the same shaping pipeline. Two concrete shapes:
   "workflow_title": "Full MVP Live",
   "journal_id": "b85dfcf7-...",
   "truncated_fields": {
-    "catalog_snapshot_json": { "size_bytes": 54000, "graphql_hint": "...", "mcp_hint": "..." },
-    "workflow_snapshot_json": { "size_bytes": 13000, "graphql_hint": "...", "mcp_hint": "..." },
-    "delivery_configuration_json": { "size_bytes": 280, "graphql_hint": "...", "mcp_hint": "..." },
-    "delivery_preflight_json": { "size_bytes": 450, "graphql_hint": "...", "mcp_hint": "..." }
+    "catalog_snapshot_json": { "size_bytes": 54000, "mcp_hint": "runs.get(run_id, include=[\"catalog_snapshot_json\"])", "ui_graphql_hint": "UI-only full run field" },
+    "workflow_snapshot_json": { "size_bytes": 13000, "mcp_hint": "runs.get(run_id, include=[\"workflow_snapshot_json\"])", "ui_graphql_hint": "UI-only full run field" },
+    "delivery_configuration_json": { "size_bytes": 280, "mcp_hint": "runs.get(run_id, include=[\"delivery_configuration_json\"])", "ui_graphql_hint": "UI-only full run field" },
+    "delivery_preflight_json": { "size_bytes": 450, "mcp_hint": "runs.get(run_id, include=[\"delivery_preflight_json\"])", "ui_graphql_hint": "UI-only full run field" }
   }
 }
 ```
@@ -214,19 +214,19 @@ Compact default responses include a top-level `truncated_fields` object:
   "truncated_fields": {
     "catalog_snapshot_json": {
       "size_bytes": 52451,
-      "graphql_hint": "{ run(id: \"4b3a582a-…\") { catalogSnapshotJson } }",
-      "mcp_hint": "runs.get(run_id, include=[\"catalog_snapshot_json\"])"
+      "mcp_hint": "runs.get(run_id, include=[\"catalog_snapshot_json\"])",
+      "resource_hint": "run://4b3a582a-…"
     },
     "workflow_snapshot_json": {
       "size_bytes": 12416,
-      "graphql_hint": "{ run(id: \"4b3a582a-…\") { workflowSnapshotJson } }",
-      "mcp_hint": "runs.get(run_id, include=[\"workflow_snapshot_json\"])"
+      "mcp_hint": "runs.get(run_id, include=[\"workflow_snapshot_json\"])",
+      "resource_hint": "run://4b3a582a-…"
     }
   }
 }
 ```
 
-`size_bytes` is the bytes the caller would have received if the field had been included; `graphql_hint` and `mcp_hint` are plain strings safe to paste.
+`size_bytes` is the bytes the caller would have received if the field had been included. `mcp_hint` is the binding continuation path for agent callers. `resource_hint` points to an MCP resource when the full value is better retrieved as a resource. UI-only GraphQL hints may exist in implementation docs, but they must not replace the MCP continuation path.
 
 ### 4.5 Tool-schema documentation
 
@@ -234,7 +234,7 @@ Each affected tool's description in `tools/list` gains:
 
 - A short "Default response ≤ 8 KB" line.
 - The heavy-fields table for that tool.
-- A reminder that GraphQL is the canonical surface for full field access.
+- A reminder that MCP `include` or MCP resources are the canonical full-field continuation path for agent callers. GraphQL examples, if present, must be labeled UI-only.
 
 ### 4.6 Error shape on validation failure
 
@@ -350,12 +350,12 @@ Numeric score columns are `REAL NOT NULL`able so a failed round (no aggregate co
     "per_round_reviewer_reports": {
       "size_bytes": 348291,
       "mcp_hint": "reviews.score_trajectory(run_id, include=[\"per_round_reviewer_reports\"])",
-      "graphql_hint": "{ run(id:\"...\") { reviewScoreTrajectory { rounds { fullReviewerReports } } } }"
+      "ui_graphql_hint": "UI-only reviewScoreTrajectory.fullReviewerReports"
     },
     "per_round_score_lift_backlog": {
       "size_bytes": 58210,
       "mcp_hint": "reviews.score_trajectory(run_id, include=[\"per_round_score_lift_backlog\"])",
-      "graphql_hint": "{ run(id:\"...\") { reviewScoreTrajectory { rounds { scoreLiftBacklog } } } }"
+      "ui_graphql_hint": "UI-only reviewScoreTrajectory.scoreLiftBacklog"
     }
   }
 }
@@ -418,7 +418,7 @@ Failure mode: if the copy OR the insert fails, the aggregator's stage exits with
 Existing callers who request `runs.get` without `include` TODAY receive the full blob. After this proposal:
 
 - They receive the **compact envelope** plus `truncated_fields`. Every compact field they were using is still present.
-- If a caller specifically relies on one of the heavy fields, they either add it to `include` or migrate to GraphQL.
+- If an agent caller specifically relies on one of the heavy fields, it adds the field to MCP `include` or follows the MCP resource hint. It does not migrate to GraphQL.
 
 Detection plan for existing usage:
 
@@ -487,7 +487,7 @@ This is a behavior change, not a rename. No new tool names. The affected tools k
 2. **Field completeness** — the compact default envelope preserves every field currently used by the `full-mvp-live` Swift client's `RunDetailView` GraphQL query. Regression test that the set of non-truncated fields is stable.
 3. **Include round-trip** — requesting a heavy field via `include` returns a response that contains that heavy field with byte-for-byte equality to the value that was stored in the DB (for shaped `*.get` tools) or the on-disk archive (for `reviews.score_trajectory`).
 4. **Error shape** — unknown `include` names produce a typed JSON-RPC `-32602` with populated `data.allowed_fields`. No silent pass-through, no partial success.
-5. **Truncated-fields hints** — every `truncated_fields` entry carries `size_bytes`, `graphql_hint`, and `mcp_hint`. The `graphql_hint` is a syntactically valid GraphQL query string that resolves against the current schema on the daemon.
+5. **Truncated-fields hints** — every `truncated_fields` entry carries `size_bytes` and an MCP continuation path (`mcp_hint` or `resource_hint`). UI-only GraphQL hints are optional and must not be used as the agent continuation path.
 
 ### Review-score retention
 

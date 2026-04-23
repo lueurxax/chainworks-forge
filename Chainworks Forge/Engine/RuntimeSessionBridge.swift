@@ -633,7 +633,9 @@ final class RuntimeSessionBridge: Sendable {
         }
 
         if agent.id == "code_writer",
-           task.task == "initial_implementation" || task.task == "continue_implementation" {
+           task.task == "start_implementation"
+            || task.task == "initial_implementation"
+            || task.task == "continue_implementation" {
             parts.append("")
             parts.append("### Task-Specific Guidance")
             parts.append("Treat the provided worktree/project roots and canonical input artifact paths as the authoritative starting point for implementation.")

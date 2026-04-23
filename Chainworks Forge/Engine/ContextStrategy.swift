@@ -378,7 +378,9 @@ struct HandoffCompiler: Sendable {
         }
 
         if agent.id == "code_writer",
-           task.task == "initial_implementation" || task.task == "continue_implementation" {
+           task.task == "start_implementation"
+            || task.task == "initial_implementation"
+            || task.task == "continue_implementation" {
             let declaredInputs = Set((task.inputs ?? [])
                 .filter { $0 != "current_task_description" }
                 .filter { available.contains($0) })

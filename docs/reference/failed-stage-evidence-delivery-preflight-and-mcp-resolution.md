@@ -58,7 +58,6 @@ On failed stage settlement:
 2. the failed-stage evidence builder reads that stage-owned recovery snapshot
 3. the evidence packet mirrors the recovery snapshot into the report payload
 4. if recovery cannot be computed, the producer writes a typed unavailable snapshot rather than leaving newly failed P048-era stages silent
-
 ### Evidence packet content
 
 The V1 packet records:
@@ -74,6 +73,14 @@ The V1 packet records:
 - stage-owned recovery snapshot
 
 Some fields remain nullable when Rust has no durable producer for them yet, including agent display title and some transport classification details.
+
+#### Phase 1 Minimal Readback Path (P053)
+
+Production-exposed Phase 1 implementations must provide a stable readback route for support and operator diagnosis. The minimal readback owner is the control-plane run evidence path:
+- `settle_agent_outputs_from_discovery_decisions` writes the discovery projection.
+- The existing failed-stage/run-detail evidence payload reads this projection for `FailedStageEvidencePanel` and run report diagnostics.
+
+This path ensures that even before full Phase 2/3 UI enrichment, operators can diagnose discovery decisions and artifact settlement.
 
 ### Artifact lane
 

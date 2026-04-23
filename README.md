@@ -91,6 +91,7 @@ The current MVP provider set is:
 The repository is past the scaffold stage. The implemented system now includes:
 
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
+- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017)
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
@@ -102,7 +103,6 @@ The repository is past the scaffold stage. The implemented system now includes:
 
 Active proposal work is currently concentrated in:
 
-- [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
 The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
@@ -124,6 +124,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
 - artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`
+  - `bounded artifact discovery and settlement optimization (P053)`
   - report/export surfaces
 - provider platform slices:
   - provider settings
@@ -246,6 +247,7 @@ Start here:
 Implemented-system references:
 
 - [`docs/reference/workflow-execution-engine.md`](docs/reference/workflow-execution-engine.md)
+- [`docs/reference/artifact-discovery-and-settlement-optimization.md`](docs/reference/artifact-discovery-and-settlement-optimization.md)
 - [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
 - [`docs/reference/execution-truth-and-recovery.md`](docs/reference/execution-truth-and-recovery.md)
 - [`docs/reference/output-contracts-failure-evidence-and-recovery.md`](docs/reference/output-contracts-failure-evidence-and-recovery.md)

@@ -251,6 +251,46 @@ Important:
 - the gate keeps its historical proposal label for reproducibility
 - the documentation source of truth for the slice is now [design-system-and-brand-application.md](design-system-and-brand-application.md), not the old proposal file
 
+### `proposal-017`
+
+Proposal 017 Phase A workflow-authority and conflict-truth gate.
+
+Scope:
+
+- `TransitionAuthorityResolver` and `CandidateTransitionEvaluation` parity fixtures (Swift/Rust)
+- blocking conflict persistence by fingerprint
+- non-blocking advisory rejection history
+- `ImplementationHandoffStatus` authority and handoff-failure readback
+- aggregate field authority for `proposal_review_summary_v1`
+- fail-closed unknown transition-input classification
+- per-surface `workflow_conflict` report shape parity (Swift/MCP/GraphQL)
+- transition cursor and resume consistency with conflict truth
+- Phase A only: this gate does not prove Phase B lead mediation or Phase C lead-validation coverage
+
+Use when:
+
+- changing workflow authority, transition evaluation, or conflict/advisory persistence
+- changing implementation-entry handoff or approved proposal freeze logic
+- changing report/API shapes for workflow conflicts
+- changing the Phase A workflow-conflict persistence/readback slice
+
+Host policy:
+
+- local target; exercises Swift and Rust workspace tests without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-017
+```
+
+Important:
+
+- this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
+- it validates that agent-authored `next_stage` cannot override the compiled graph
+- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the current Phase A slice
+- it must not be cited as proof for Rust `agent_executions` owner-kind migration, lead mediation runtime, or Phase C lead-validation requirements until those surfaces and tests exist
+
 ### `proposal-019`
 
 Context-strategy framework gate for strategy handoff, lazy evidence, telemetry, and recommendation proof.
@@ -837,7 +877,6 @@ Important:
 - this gate is the canonical proof path for the implemented [implementation self-assessment and handoff contract](output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff); the historical `proposal-054|p054` alias is retained for reproducibility
 - it validates that rejected implementation approvals loop back to proposal refinement without manual repair
 
-### `full`
 ### `proposal-050|p050`
 
 Per-run workspace isolation gate for the Rust control-plane.
@@ -868,6 +907,160 @@ Important:
 - `proposal-050` is the canonical proof path for [per-run-workspace-isolation.md](per-run-workspace-isolation.md)
 - the runner also accepts the `p050` alias
 - this gate runs `cargo test --workspace` from `control-plane/`
+
+### `proposal-053|p053`
+
+Bounded ACP artifact discovery and startup latency gate.
+
+Scope:
+
+- Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/proposals/053.review/`
+- full Phase 0 cap-validation schema, including sampled execution IDs, readiness timing, envelope/aggregate cap selections, and discovery ownership
+- Phase 1 evidence pack:
+  - `manual-latency-spot-check.md`, including the manual reference-workspace measurement and observed `acp_pre_initialize_local_latency_ms`
+  - `operator-clarity-evidence.md`
+  - `phase-1-retrospective.md`
+- `control-plane` discovery logic (`crates/domain/src/discovery.rs`)
+- engine discovery settlement pipeline
+- `OutputDiscoveryDecision` and `agent_execution_discovery_diagnostics` persistence
+- pre-prompt metadata capture and digest-backed validation
+- bounded meta-root discovery (max 500 files, 10 MiB aggregate)
+- discovery filesystem operation-recorder coverage for bounded traversal and metadata reads
+- trait-backed `DiscoveryFilesystem` fake coverage for deterministic P053 filesystem tests
+- stale-vs-absent required-output settlement and GraphQL/MCP stale-count readback
+- legacy broad discovery opt-in policy
+- GraphQL and MCP readback for discovery diagnostics
+
+Use when:
+
+- changing artifact discovery, inference, or settlement logic
+- changing ACP pre-prompt metadata capture
+- changing meta-root bounding or legacy discovery policy
+
+Host policy:
+
+- local Rust toolchain required
+- local target only; no UI host or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-053
+```
+
+Important:
+
+- `p053` is accepted as an alias
+- broad recursive discovery is disabled by default
+- discovery settlement is governed by the engine-owned pipeline, not provider-side heuristics
+- a `gate_only_internal` cap-validation artifact is sufficient for same-tree control-plane validation, but production exposure requires a refreshed production sampling/signoff artifact
+- the gate enforces the full declared Phase 0 cap-validation schema rather than a reduced subset
+- the Phase 1 evidence pack must exist in-tree before P053 closeout
+
+### `proposal-057|p057`
+
+Historical proposal gate for the implemented canonical artifact contracts and run-state
+projection contract. The proposal document has been retired after implementation; the
+gate name remains stable because tests, scripts, and historical proof records use that
+identifier.
+
+Scope:
+
+- typed artifact contract status normalization for machine-consumed reports
+- active-index SQLite owner and exported `active-index.json` projection semantics
+- generated run-state projection from DB truth plus active contracts
+- degraded output policy default-deny / explicit-allow contract
+- typed operator overrides with capability-gated MCP ownership
+- GraphQL/MCP readback parity for canonical artifact statuses, override truth, and projection warnings
+
+Use when:
+
+- changing transition evaluation for artifact status fields
+- changing artifact import, supersession, active contract pointers, or run-state projection
+- changing canonical artifact override command/readback behavior
+- changing degraded partial-output settlement policy
+
+Host policy:
+
+- local Rust toolchain required
+- control-plane-only Rust evidence; this gate must not invoke Xcode or Swift test plans
+- no simulator, daemon process, UI target, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-057
+```
+
+Prerequisite posture:
+
+- P037 control-plane evidence bucket: P057 consumes the failed/partial ACP execution settlement prerequisite through its own Rust engine degraded-output tests instead of invoking the broader Xcode-backed `proposal-037` gate.
+- Same-tree composed gates: `proposal-043` and `proposal-050` run before P057-local assertions.
+- P057 prerequisite: the implementation-completeness handoff contract is now stable reference truth in [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff), and `proposal-054|p054` is retained as the reproducible gate alias for that implemented contract. If P057 changes implementation self-assessment or handoff transition semantics, compose the retained `proposal-054` gate or document the accepted schema delta in this gate reference.
+- P057 prerequisite waiver: P056, dated 2026-04-19. No registered `proposal-056` gate exists on this tree. The canonical artifact-contract implementation keeps new artifact contract and override payloads in typed domain/db/engine modules and proves that slice locally; compose `proposal-056` here when it is registered. Rollback/hold rule: if P056 registers a module-boundary gate that changes artifact contract ownership, pause canonical artifact-contract closure until the P056 gate is same-tree green or this waiver names the accepted boundary delta.
+
+Important:
+
+- `p057` is accepted as an alias
+- the active artifact index is canonical in SQLite; `active-index.json` is only an exported projection and stale/partial exports must never drive transition truth
+- degraded partial-output settlement is denied by default and requires explicit compiled stage policy before `valid_outputs_from_failed_execution` can satisfy transitions
+- typed operator overrides are separate from raw report files, require operator capability, write command journal evidence, expire at `expires_at_stage`, and remain visible in readback after expiry
+- the gate fails closed if canonical status normalization, active-index SQLite ownership, stale export rebuild, raw artifact fallback denial, degraded policy, typed overrides, or GraphQL/MCP readback parity evidence is missing
+
+### `proposal-058|p058`
+
+Implemented regression gate for ACP provider failure classification and session artifact ownership.
+
+The original proposal document has been retired after implementation. The gate name
+remains `proposal-058` because the Rust test targets and historical proof lane use that
+identifier.
+
+Scope:
+
+- typed `AgentFailureKind`, `AgentOutputSettlement`, runtime facts, and operator action hints
+- typed ACP/P037/P045/P051/P057 failure-observation classification matrix coverage
+- runtime failure redaction fixtures and P045 recovery-action mapping from P058 runtime facts
+- durable `agent_execution_runtime_facts` read/write behavior
+- artifact source-generation claims, including `superseded_pending_retry`
+- `InvokeAgent` claim/start ownership: generic work-queue claim skips `InvokeAgent`, while the engine-owned start transaction pre-creates exactly one `agent_executions` row and matching source-generation claim
+- retry enqueue-to-claim late-output rejection and source-generation CAS behavior
+- GraphQL/MCP runtime-facts parity and artifact source provenance
+- no-secret redacted runtime failure readback
+
+Use when:
+
+- changing ACP provider/transport error classification
+- changing executor output validation settlement or degraded output behavior
+- changing session reuse, retry supersession, or late-output handling
+- changing artifact active-index source provenance
+- changing GraphQL or MCP execution truth readback
+
+Host policy:
+
+- local Rust toolchain required
+- no live provider account, Xcode, simulator, daemon process, UI target, network, or real quota exhaustion required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-058
+```
+
+Prerequisite posture:
+
+- Same-tree dependency evidence: P058 consumes P037 timeout semantics, P045 recovery/retry semantics, P051 Xcode MCP observations, and canonical artifact contracts.
+- The focused P058 gate uses fixture/fake transport coverage for those consumed seams rather than requiring live provider, live Xcode, or UI evidence.
+
+Important:
+
+- `p058` is accepted as an alias
+- runtime facts are durable typed execution truth, not log parsing
+- `InvokeAgent` provider startup must use the pre-created execution identity from the claim/start DTO; creating a second execution row after the claim boundary is a gate failure
+- P058 claim/start tests must run; compiling them with `--no-run` is not sufficient proof
+- DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
+- `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
+- stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
+- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
 
 ### `full`
 
@@ -1088,6 +1281,11 @@ Important:
 ### `proposal-061|p061`
 
 SQLite write serialization and executor backpressure gate.
+
+The `proposal-061|p061` names are retained historical aliases for the implemented
+SQLite write-serialization, scheduler-backpressure, host-interruption, and
+generated-state housekeeping contract documented in
+[`rust-control-plane.md`](rust-control-plane.md).
 
 Scope:
 

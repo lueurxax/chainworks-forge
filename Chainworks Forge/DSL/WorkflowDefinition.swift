@@ -5,6 +5,7 @@ import Foundation
 struct WorkflowDefinition: Codable, Sendable {
     let schemaVersion: Int
     let workflow: WorkflowMeta
+    let discovery: DiscoveryConfig?
     let variables: [String: AnyCodableValue]?
     let failurePolicy: FailurePolicy?
     let scoring: ScoringConfig?
@@ -12,11 +13,44 @@ struct WorkflowDefinition: Codable, Sendable {
     let states: [String: WorkflowState]
 
     enum CodingKeys: String, CodingKey {
-        case workflow, variables, scoring, states
+        case workflow, discovery, variables, scoring, states
         case schemaVersion = "schema_version"
         case failurePolicy = "failure_policy"
         case initialState = "initial_state"
     }
+
+    init(
+        schemaVersion: Int,
+        workflow: WorkflowMeta,
+        discovery: DiscoveryConfig? = nil,
+        variables: [String: AnyCodableValue]?,
+        failurePolicy: FailurePolicy?,
+        scoring: ScoringConfig?,
+        initialState: String,
+        states: [String: WorkflowState]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.workflow = workflow
+        self.discovery = discovery
+        self.variables = variables
+        self.failurePolicy = failurePolicy
+        self.scoring = scoring
+        self.initialState = initialState
+        self.states = states
+    }
+}
+
+struct DiscoveryConfig: Codable, Sendable {
+    let legacyBroadDiscoveryPolicy: LegacyBroadDiscoveryPolicy?
+
+    enum CodingKeys: String, CodingKey {
+        case legacyBroadDiscoveryPolicy = "legacy_broad_discovery_policy"
+    }
+}
+
+enum LegacyBroadDiscoveryPolicy: String, Codable, Sendable {
+    case disabled
+    case workflowOptIn = "workflow_opt_in"
 }
 
 struct WorkflowMeta: Codable, Sendable {
@@ -87,6 +121,39 @@ struct AgentTask: Codable, Sendable {
     let task: String
     let inputs: [String]?
     let outputs: [String]?
+    let outputPolicies: [String: OutputPolicyDefinition]?
+
+    enum CodingKeys: String, CodingKey {
+        case agent, task, inputs, outputs
+        case outputPolicies = "output_policies"
+    }
+
+    init(
+        agent: String,
+        task: String,
+        inputs: [String]?,
+        outputs: [String]?,
+        outputPolicies: [String: OutputPolicyDefinition]? = nil
+    ) {
+        self.agent = agent
+        self.task = task
+        self.inputs = inputs
+        self.outputs = outputs
+        self.outputPolicies = outputPolicies
+    }
+}
+
+struct OutputPolicyDefinition: Codable, Sendable {
+    let reusePolicy: OutputReusePolicyDefinition?
+
+    enum CodingKeys: String, CodingKey {
+        case reusePolicy = "reuse_policy"
+    }
+}
+
+enum OutputReusePolicyDefinition: String, Codable, Sendable {
+    case mustProduce = "must_produce"
+    case allowUnchangedExisting = "allow_unchanged_existing"
 }
 
 struct Transition: Codable, Sendable {

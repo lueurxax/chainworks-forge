@@ -24,6 +24,9 @@ pub struct RunPlan {
     pub risk_class: Option<String>,
     /// Frozen stack identifier from parsed workflow metadata.
     pub stack: Option<String>,
+    /// Frozen P053 policy for compatibility-only broad discovery.
+    #[serde(default)]
+    pub legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy,
     /// SHA-256 over canonical parsed workflow snapshot JSON.
     pub workflow_snapshot_hash: String,
     /// SHA-256 over canonical parsed agent-catalog snapshot JSON.
@@ -32,6 +35,14 @@ pub struct RunPlan {
     pub workflow_snapshot_json: String,
     /// Canonical parsed agent-catalog snapshot JSON.
     pub catalog_snapshot_json: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyBroadDiscoveryPolicy {
+    #[default]
+    Disabled,
+    WorkflowOptIn,
 }
 
 /// A single compiled state in the workflow state machine.
@@ -113,6 +124,8 @@ pub struct CompiledTask {
     pub task_name: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub output_policies: HashMap<String, OutputPolicy>,
     /// Resolved output schemas keyed by output artifact name.
     /// Populated from an explicit `output_contract` for single-output agents
     /// or matching multi-output aliases, then by exact normalized/raw artifact
@@ -127,6 +140,18 @@ pub struct CompiledTask {
     /// only enqueued after all phase 0 tasks complete.
     #[serde(default)]
     pub phase: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputReusePolicy {
+    MustProduce,
+    AllowUnchangedExisting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputPolicy {
+    pub reuse_policy: OutputReusePolicy,
 }
 
 /// Resolved output schema from a catalog contract.

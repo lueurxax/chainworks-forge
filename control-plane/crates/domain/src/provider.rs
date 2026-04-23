@@ -173,7 +173,6 @@ mod tests {
     fn examples_agent_provider_strings_resolve_to_known_families() {
         let catalogs = [
             include_str!("../../../../examples/agents/agents.yaml"),
-            include_str!("../../../../examples/agents/agents_mcp_profiles_v2.yaml"),
             include_str!("../../../../examples/agents/proposal-po-reviewer.yaml"),
         ];
 

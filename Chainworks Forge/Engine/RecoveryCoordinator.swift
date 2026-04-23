@@ -569,7 +569,7 @@ final class RecoveryCoordinator {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
                 return continuationStateIDIfResumable(continuationStateID, stage: continuationStage)
-            case .awaitingFirstState, .terminal:
+            case .awaitingFirstState, .terminal, .awaitingConflictResolution:
                 break
             }
         }
