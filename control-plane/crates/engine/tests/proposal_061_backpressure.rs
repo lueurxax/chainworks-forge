@@ -382,6 +382,7 @@ async fn approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_a
                 Command::RetryStage(RetryStageCmd {
                     run_id: retry_run_id,
                     stage_id: retry_stage_id,
+                    agent_execution_id: None,
                     consume_quota_budget_now: false,
                 }),
                 CallerContext::test_fixture(),
@@ -960,6 +961,7 @@ async fn retry_stage_capacity_refresh_clears_superseded_invoke_backpressure() {
             Command::RetryStage(RetryStageCmd {
                 run_id,
                 stage_id: "implementation".into(),
+                agent_execution_id: None,
                 consume_quota_budget_now: false,
             }),
             CallerContext::test_fixture(),
@@ -1097,6 +1099,7 @@ async fn retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_
                 Command::RetryStage(RetryStageCmd {
                     run_id,
                     stage_id: "implementation".into(),
+                    agent_execution_id: None,
                     consume_quota_budget_now: false,
                 }),
                 CallerContext::test_fixture(),
@@ -1932,6 +1935,18 @@ async fn host_interruption_records_epoch_cancels_execution_and_requeues_invoke_w
         readback[0].affected_executions[0].action,
         "recovering_from_system_sleep"
     );
+    assert_eq!(readback[0].affected_executions[0].previous_status, "running");
+    assert_eq!(readback[0].affected_executions[0].settlement_status, "retry_enqueued");
+    assert_eq!(readback[0].affected_executions[0].cleanup_status, "succeeded");
+    assert_eq!(
+        readback[0].affected_executions[0].quota_budget_effect,
+        "not_consumed"
+    );
+    assert!(
+        readback[0].affected_executions[0]
+            .retry_enqueued_at
+            .is_some()
+    );
     assert_eq!(
         readback[0].affected_executions[0]
             .provider_family
@@ -2240,13 +2255,14 @@ async fn host_interruption_requires_runtime_cleanup_before_retry_enqueue() {
             details_json: Some(r#"{"source":"test"}"#.into()),
         })
         .await
-        .expect("host interruption retry should continue after best-effort cleanup failure");
+        .expect("host interruption should record cleanup failure");
 
     assert_eq!(summary.runtime_cleanup_attempted, 1);
     assert_eq!(summary.runtime_cleanup_succeeded, 0);
     assert_eq!(summary.runtime_cleanup_failed, 1);
     assert_eq!(summary.cancelled_executions, 1);
-    assert_eq!(summary.retries_enqueued, 1);
+    assert_eq!(summary.retries_enqueued, 0);
+    assert_eq!(summary.retries_deferred_cleanup_failed, 1);
     assert_eq!(
         runtime_cleanup
             .closed_generations
@@ -2270,10 +2286,10 @@ async fn host_interruption_requires_runtime_cleanup_before_retry_enqueue() {
         .await
         .unwrap();
     assert!(
-        pending
+        !pending
             .iter()
             .any(|item| item.id == "codex-running-cleanup-fails"),
-        "cleanup failure should not block retry requeue"
+        "cleanup failure must defer retry enqueue until cleanup succeeds"
     );
     let epochs = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
         .await
@@ -2282,6 +2298,12 @@ async fn host_interruption_requires_runtime_cleanup_before_retry_enqueue() {
         !epochs.is_empty(),
         "cleanup failure should not block durable host interruption epoch creation"
     );
+    let affected = &epochs[0].affected_executions[0];
+    assert_eq!(affected.previous_status, "running");
+    assert_eq!(affected.cleanup_status, "failed");
+    assert_eq!(affected.settlement_status, "retry_deferred_cleanup_failed");
+    assert_eq!(affected.quota_budget_effect, "not_consumed");
+    assert_eq!(affected.retry_enqueued_at, None);
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ pub mod evidence;
 pub mod executor;
 pub mod failure_classifier;
 pub mod host_interruption;
+pub mod housekeeping;
 pub mod lifecycle_reporter;
 pub mod mcp;
 pub mod orchestrator;

@@ -444,6 +444,10 @@ PROPOSAL_061_TESTS=(
   "host_interruption_late_output_from_superseded_attempt_cannot_promote_over_retry_generation"
   "host_interruption_requires_runtime_cleanup_before_retry_enqueue"
   "host_interruption_retry_does_not_consume_provider_quota_budget"
+  "active_and_blocked_run_targets_are_preserved"
+  "terminal_run_cleanup_preserves_worktree_sources_artifacts_and_databases"
+  "terminal_run_cleanup_skips_unmanaged_worktree_targets"
+  "stale_unreferenced_acp_home_is_removed"
 )
 
 PROPOSAL_029_MCP_TESTS=(

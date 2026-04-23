@@ -1859,6 +1859,10 @@ mod tests {
                 stage_execution_id: stage_execution_id.to_string(),
                 provider_family: Some("codex".into()),
                 action: "recovering_from_system_sleep".into(),
+                previous_status: "running".into(),
+                settlement_status: "retry_enqueued".into(),
+                cleanup_status: "succeeded".into(),
+                quota_budget_effect: "not_consumed".into(),
                 retry_enqueued_at: Some(now + chrono::Duration::seconds(5)),
                 created_at: now,
             },
@@ -1933,12 +1937,20 @@ mod tests {
                           agentExecutionId
                           providerFamily
                           action
+                          previousStatus
+                          settlementStatus
+                          cleanupStatus
+                          quotaBudgetEffect
                         }}
                       }}
                       hostInterruptionAffectedExecutions(epochId: "host-epoch-gql-1") {{
                         epochId
                         stageExecutionId
                         action
+                        previousStatus
+                        settlementStatus
+                        cleanupStatus
+                        quotaBudgetEffect
                       }}
                     }}"#
                 ))
@@ -2003,8 +2015,20 @@ mod tests {
             "recovering_from_system_sleep"
         );
         assert_eq!(
+            data["hostInterruptionEpochs"][0]["affectedExecutions"][0]["cleanupStatus"],
+            "succeeded"
+        );
+        assert_eq!(
+            data["hostInterruptionEpochs"][0]["affectedExecutions"][0]["quotaBudgetEffect"],
+            "not_consumed"
+        );
+        assert_eq!(
             data["hostInterruptionAffectedExecutions"][0]["stageExecutionId"],
             stage_execution_id.to_string()
+        );
+        assert_eq!(
+            data["hostInterruptionAffectedExecutions"][0]["settlementStatus"],
+            "retry_enqueued"
         );
     }
 

@@ -186,6 +186,10 @@ pub struct GqlHostInterruptionAffectedExecution {
     pub stage_execution_id: ID,
     pub provider_family: Option<String>,
     pub action: String,
+    pub previous_status: String,
+    pub settlement_status: String,
+    pub cleanup_status: String,
+    pub quota_budget_effect: String,
     pub retry_enqueued_at: Option<String>,
     pub created_at: String,
 }
@@ -199,6 +203,10 @@ impl From<HostInterruptionAffectedExecution> for GqlHostInterruptionAffectedExec
             stage_execution_id: ID(affected.stage_execution_id),
             provider_family: affected.provider_family,
             action: affected.action,
+            previous_status: affected.previous_status,
+            settlement_status: affected.settlement_status,
+            cleanup_status: affected.cleanup_status,
+            quota_budget_effect: affected.quota_budget_effect,
             retry_enqueued_at: affected.retry_enqueued_at.map(|value| value.to_rfc3339()),
             created_at: affected.created_at.to_rfc3339(),
         }

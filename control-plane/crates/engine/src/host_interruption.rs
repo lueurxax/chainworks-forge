@@ -254,6 +254,7 @@ pub struct HostInterruptionRecoverySummary {
     pub cancelled_executions: usize,
     pub retries_enqueued: usize,
     pub retries_deferred_capacity: usize,
+    pub retries_deferred_cleanup_failed: usize,
     pub retries_missing_work_item: usize,
     pub runtime_cleanup_attempted: usize,
     pub runtime_cleanup_succeeded: usize,
@@ -344,6 +345,7 @@ impl HostInterruptionService {
             cancelled_executions: affected.len(),
             retries_enqueued: 0,
             retries_deferred_capacity: 0,
+            retries_deferred_cleanup_failed: 0,
             retries_missing_work_item: 0,
             runtime_cleanup_attempted: cleanup_summary.attempted,
             runtime_cleanup_succeeded: cleanup_summary.succeeded,
@@ -353,9 +355,18 @@ impl HostInterruptionService {
         for execution in affected {
             let action = event.kind.operator_action().to_string();
             let mut retry_enqueued_at = None;
+            let cleanup_status = cleanup_summary
+                .execution_status
+                .get(&execution.id.to_string())
+                .cloned()
+                .unwrap_or_else(|| "not_required".to_string());
+            let mut settlement_status = "retry_enqueued".to_string();
             let provider_family = execution.provider_family.clone();
 
-            if let Some(provider_family) = provider_family.as_deref() {
+            if cleanup_status == "failed" {
+                summary.retries_deferred_cleanup_failed += 1;
+                settlement_status = "retry_deferred_cleanup_failed".to_string();
+            } else if let Some(provider_family) = provider_family.as_deref() {
                 let family = ProviderFamily::resolve(provider_family)
                     .context("resolve affected execution provider family")?;
                 let provider_batch = provider_batches
@@ -371,8 +382,10 @@ impl HostInterruptionService {
                         .is_none()
                     {
                         summary.retries_missing_work_item += 1;
+                        settlement_status = "retry_missing_work_item".to_string();
                     } else {
                         summary.retries_deferred_capacity += 1;
+                        settlement_status = "retry_deferred_capacity".to_string();
                         retry_enqueued_at = Some(scheduled_at);
                     }
                 } else {
@@ -387,6 +400,7 @@ impl HostInterruptionService {
                     {
                         slots.release(execution.run_id, family);
                         summary.retries_missing_work_item += 1;
+                        settlement_status = "retry_missing_work_item".to_string();
                     } else {
                         *provider_batch += 1;
                         summary.retries_enqueued += 1;
@@ -400,8 +414,10 @@ impl HostInterruptionService {
                     .is_none()
                 {
                     summary.retries_missing_work_item += 1;
+                    settlement_status = "retry_missing_work_item".to_string();
                 } else {
                     summary.retries_deferred_capacity += 1;
+                    settlement_status = "retry_deferred_capacity".to_string();
                     retry_enqueued_at = Some(scheduled_at);
                 }
             }
@@ -415,6 +431,10 @@ impl HostInterruptionService {
                     stage_execution_id: execution.stage_execution_id.to_string(),
                     provider_family,
                     action,
+                    previous_status: "running".to_string(),
+                    settlement_status,
+                    cleanup_status,
+                    quota_budget_effect: "not_consumed".to_string(),
                     retry_enqueued_at,
                     created_at: now,
                 },
@@ -461,16 +481,23 @@ impl HostInterruptionService {
         let mut summary = RuntimeCleanupSummary::default();
         for execution in affected {
             let Some(generation_id) = execution.session_generation_id.as_deref() else {
+                summary
+                    .execution_status
+                    .insert(execution.id.to_string(), "not_required".to_string());
                 continue;
             };
             summary.attempted += 1;
+            let execution_id = execution.id.to_string();
             match timeout(
                 RUNTIME_CLEANUP_TIMEOUT,
                 runtime_cleanup.close_session_generation(generation_id),
             )
             .await
             {
-                Ok(Ok(())) => summary.succeeded += 1,
+                Ok(Ok(())) => {
+                    summary.succeeded += 1;
+                    summary.execution_status.insert(execution_id, "succeeded".to_string());
+                }
                 Ok(Err(error)) => {
                     warn!(
                         error = %error,
@@ -479,6 +506,7 @@ impl HostInterruptionService {
                         "host interruption runtime cleanup failed before retry enqueue"
                     );
                     summary.failed += 1;
+                    summary.execution_status.insert(execution_id, "failed".to_string());
                 }
                 Err(_) => {
                     warn!(
@@ -488,6 +516,7 @@ impl HostInterruptionService {
                         "host interruption runtime cleanup timed out before retry enqueue"
                     );
                     summary.failed += 1;
+                    summary.execution_status.insert(execution_id, "failed".to_string());
                 }
             }
         }
@@ -501,6 +530,7 @@ struct RuntimeCleanupSummary {
     attempted: usize,
     succeeded: usize,
     failed: usize,
+    execution_status: BTreeMap<String, String>,
 }
 
 async fn requeue_retry_for_execution_tx(

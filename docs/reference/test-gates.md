@@ -1103,6 +1103,7 @@ Scope:
 - Sustained-backpressure subscription/MCP notification fire and clear behavior
 - Simulated host sleep/wake and network migration classification, process cleanup, jittered retry under caps, and quota exemption
 - DB contention instrumentation in runtime health logs and projections
+- Generated-state housekeeping safety for active/blocked run outputs, managed worktree targets, source files, run artifacts, SQLite database files, stale ACP homes, and unmanaged worktrees
 
 Use when:
 

@@ -295,6 +295,10 @@ async fn host_interruption_epochs_json(
                             "stage_execution_id": affected.stage_execution_id,
                             "provider_family": affected.provider_family,
                             "action": affected.action,
+                            "previous_status": affected.previous_status,
+                            "settlement_status": affected.settlement_status,
+                            "cleanup_status": affected.cleanup_status,
+                            "quota_budget_effect": affected.quota_budget_effect,
                             "retry_enqueued_at": affected.retry_enqueued_at.map(|value| value.to_rfc3339()),
                             "created_at": affected.created_at.to_rfc3339(),
                         })
@@ -1106,6 +1110,10 @@ mod tests {
                 stage_execution_id: stage_execution_id.to_string(),
                 provider_family: Some("codex".into()),
                 action: "retry_enqueued".into(),
+                previous_status: "running".into(),
+                settlement_status: "retry_enqueued".into(),
+                cleanup_status: "succeeded".into(),
+                quota_budget_effect: "not_consumed".into(),
                 retry_enqueued_at: Some(now + chrono::Duration::seconds(7)),
                 created_at: now,
             },
@@ -1172,6 +1180,14 @@ mod tests {
         assert_eq!(
             mcp_truth["host_interruption_epochs"][0]["affected_executions"][0]["action"],
             serde_json::json!("retry_enqueued")
+        );
+        assert_eq!(
+            mcp_truth["host_interruption_epochs"][0]["affected_executions"][0]["cleanup_status"],
+            serde_json::json!("succeeded")
+        );
+        assert_eq!(
+            mcp_truth["host_interruption_epochs"][0]["affected_executions"][0]["quota_budget_effect"],
+            serde_json::json!("not_consumed")
         );
     }
 

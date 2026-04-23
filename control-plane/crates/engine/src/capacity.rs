@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(config.per_run_active_agent_executions, 4);
         assert_eq!(config.provider_cap(ProviderFamily::Claude), 8);
         assert_eq!(config.provider_cap(ProviderFamily::Gemini), 4);
-        assert_eq!(config.provider_cap(ProviderFamily::Codex), 3);
+        assert_eq!(config.provider_cap(ProviderFamily::Codex), 10);
         assert_eq!(config.provider_cap(ProviderFamily::Auggie), 1);
         assert_eq!(config.provider_cap(ProviderFamily::Junie), 1);
     }

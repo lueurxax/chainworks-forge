@@ -107,6 +107,10 @@ pub struct HostInterruptionAffectedExecution {
     pub stage_execution_id: String,
     pub provider_family: Option<String>,
     pub action: String,
+    pub previous_status: String,
+    pub settlement_status: String,
+    pub cleanup_status: String,
+    pub quota_budget_effect: String,
     pub retry_enqueued_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -507,8 +511,9 @@ pub async fn insert_host_interruption_affected_execution_tx(
     sqlx::query(
         r#"INSERT INTO host_interruption_affected_executions
            (epoch_id, agent_execution_id, run_id, stage_execution_id, provider_family,
-            action, retry_enqueued_at, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            action, previous_status, settlement_status, cleanup_status, quota_budget_effect,
+            retry_enqueued_at, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
     )
     .bind(&affected.epoch_id)
     .bind(&affected.agent_execution_id)
@@ -516,6 +521,10 @@ pub async fn insert_host_interruption_affected_execution_tx(
     .bind(&affected.stage_execution_id)
     .bind(&affected.provider_family)
     .bind(&affected.action)
+    .bind(&affected.previous_status)
+    .bind(&affected.settlement_status)
+    .bind(&affected.cleanup_status)
+    .bind(&affected.quota_budget_effect)
     .bind(affected.retry_enqueued_at.map(|value| value.to_rfc3339()))
     .bind(affected.created_at.to_rfc3339())
     .execute(&mut **tx)
@@ -546,7 +555,8 @@ pub async fn list_host_interruption_epochs_by_run(
         let epoch = parse_host_interruption_epoch_row(row)?;
         let affected_rows = sqlx::query(
             r#"SELECT epoch_id, agent_execution_id, run_id, stage_execution_id, provider_family,
-                      action, retry_enqueued_at, created_at
+                      action, previous_status, settlement_status, cleanup_status,
+                      quota_budget_effect, retry_enqueued_at, created_at
                FROM host_interruption_affected_executions
                WHERE epoch_id = ?1 AND run_id = ?2
                ORDER BY created_at ASC, agent_execution_id ASC"#,
@@ -575,7 +585,8 @@ pub async fn list_host_interruption_affected_executions_by_epoch(
 ) -> Result<Vec<HostInterruptionAffectedExecution>> {
     let rows = sqlx::query(
         r#"SELECT epoch_id, agent_execution_id, run_id, stage_execution_id, provider_family,
-                  action, retry_enqueued_at, created_at
+                  action, previous_status, settlement_status, cleanup_status,
+                  quota_budget_effect, retry_enqueued_at, created_at
            FROM host_interruption_affected_executions
            WHERE epoch_id = ?1
            ORDER BY created_at ASC, agent_execution_id ASC"#,
@@ -1518,6 +1529,10 @@ fn parse_host_interruption_affected_execution_row(
         stage_execution_id: row.get("stage_execution_id"),
         provider_family: row.get("provider_family"),
         action: row.get("action"),
+        previous_status: row.get("previous_status"),
+        settlement_status: row.get("settlement_status"),
+        cleanup_status: row.get("cleanup_status"),
+        quota_budget_effect: row.get("quota_budget_effect"),
         retry_enqueued_at: parse_optional_datetime(row.get("retry_enqueued_at"))?,
         created_at: parse_datetime(row.get("created_at"))?,
     })

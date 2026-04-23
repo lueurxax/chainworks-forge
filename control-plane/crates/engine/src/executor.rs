@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::release::{
     connect::ConnectPublishService,
@@ -44,6 +44,7 @@ use crate::contracts::{
 };
 use crate::event_bus::EventSender;
 use crate::failure_classifier::{classify_observation, observation_from_acp_error_message};
+use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
 use crate::orchestrator::Orchestrator;
 use crate::recovery::RecoveryService;
 use crate::session::fingerprint::{
@@ -1371,6 +1372,10 @@ fn build_steward_agent_prompt(
     parts.join("\n\n")
 }
 
+fn error_chain_message(error: &Error) -> String {
+    format!("{error:#}")
+}
+
 impl BackgroundExecutor {
     pub fn new(
         pool: SqlitePool,
@@ -1449,9 +1454,80 @@ impl BackgroundExecutor {
 
     /// Start the background loop. Returns a JoinHandle.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let housekeeping_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            housekeeping_executor
+                .run_generated_state_housekeeping_loop()
+                .await;
+        });
+
         tokio::spawn(async move {
             self.run_loop().await;
         })
+    }
+
+    async fn run_generated_state_housekeeping_loop(self: Arc<Self>) {
+        let config = GeneratedStateHousekeepingConfig::from_env();
+        if !config.enabled {
+            info!("Generated-state housekeeping disabled");
+            return;
+        }
+
+        info!(
+            interval_secs = config.interval.as_secs(),
+            min_age_secs = config.min_age.as_secs(),
+            "Generated-state housekeeping loop started"
+        );
+
+        loop {
+            if let Err(error) = GeneratedStateHousekeeper::run_once(&self.pool, &config).await {
+                warn!(error = %error, "Generated-state housekeeping failed");
+            }
+            sleep(config.interval).await;
+        }
+    }
+
+    async fn mark_agent_execution_failed_if_running(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        item_id: &str,
+        error_message: &str,
+    ) {
+        match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
+            Ok(Some(execution)) if execution.status == AgentStatus::Running => {
+                if let Err(update_error) = agent_executions::update_completed(
+                    &self.pool,
+                    agent_execution_id,
+                    AgentStatus::Failed,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    error!(
+                        item_id = %item_id,
+                        agent_execution_id = %agent_execution_id,
+                        error = %update_error,
+                        "Failed to close running agent execution after InvokeAgent work item failure"
+                    );
+                } else {
+                    warn!(
+                        item_id = %item_id,
+                        agent_execution_id = %agent_execution_id,
+                        failure = %error_message,
+                        "Closed stale running agent execution after InvokeAgent work item failure"
+                    );
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(find_error) => {
+                error!(
+                    item_id = %item_id,
+                    agent_execution_id = %agent_execution_id,
+                    error = %find_error,
+                    "Failed to inspect agent execution after InvokeAgent work item failure"
+                );
+            }
+        }
     }
 
     /// Claim and process the next pending work item. Returns `Ok(true)` if an
@@ -1468,6 +1544,7 @@ impl BackgroundExecutor {
                 .await?;
             let item_id = claimed.work_item_id.clone();
             let run_id = Some(claimed.run_id);
+            let agent_execution_id = claimed.agent_execution_id;
             if claimed.session_generation_id.is_empty() {
                 let payload: serde_json::Value =
                     serde_json::from_str(&claimed.work_item.payload_json)?;
@@ -1477,12 +1554,14 @@ impl BackgroundExecutor {
                     && is_first_party_acp_provider(provider)
                     && self.acp.get_adapter(provider).is_none()
                 {
-                    self.work_queue
-                        .fail(
-                            &item_id,
-                            "InvokeAgent payload missing session_reuse_scope; P058 claim/start requires session ownership",
-                        )
-                        .await?;
+                    let error_message = "InvokeAgent payload missing session_reuse_scope; P058 claim/start requires session ownership";
+                    self.mark_agent_execution_failed_if_running(
+                        agent_execution_id,
+                        &item_id,
+                        error_message,
+                    )
+                    .await;
+                    self.work_queue.fail(&item_id, error_message).await?;
                     return Ok(false);
                 }
             }
@@ -1493,7 +1572,14 @@ impl BackgroundExecutor {
                     return Ok(true);
                 }
                 Err(e) => {
-                    self.work_queue.fail(&item_id, &e.to_string()).await?;
+                    let error_message = error_chain_message(&e);
+                    self.mark_agent_execution_failed_if_running(
+                        agent_execution_id,
+                        &item_id,
+                        &error_message,
+                    )
+                    .await;
+                    self.work_queue.fail(&item_id, &error_message).await?;
                     self.enqueue_advance_after_invoke_failure(&item_id, run_id)
                         .await;
                     return Err(e);
@@ -1515,7 +1601,8 @@ impl BackgroundExecutor {
                         Ok(true)
                     }
                     Err(e) => {
-                        self.work_queue.fail(&item_id, &e.to_string()).await?;
+                        let error_message = error_chain_message(&e);
+                        self.work_queue.fail(&item_id, &error_message).await?;
                         if matches!(kind, WorkItemKind::InvokeAgent) {
                             self.enqueue_advance_after_invoke_failure(&item_id, run_id)
                                 .await;
@@ -1546,6 +1633,7 @@ impl BackgroundExecutor {
                     }
                     let item_id = claimed.work_item_id.clone();
                     let run_id = Some(claimed.run_id);
+                    let agent_execution_id = claimed.agent_execution_id;
                     info!(item_id = %item_id, kind = %WorkItemKind::InvokeAgent, "Processing claimed InvokeAgent work item");
                     let executor = Arc::clone(self);
                     tokio::spawn(async move {
@@ -1556,9 +1644,17 @@ impl BackgroundExecutor {
                                 }
                             }
                             Err(e) => {
-                                error!(item_id = %item_id, kind = %WorkItemKind::InvokeAgent, error = %e, "Work item failed");
+                                let error_message = error_chain_message(&e);
+                                error!(item_id = %item_id, kind = %WorkItemKind::InvokeAgent, error = %error_message, "Work item failed");
+                                executor
+                                    .mark_agent_execution_failed_if_running(
+                                        agent_execution_id,
+                                        &item_id,
+                                        &error_message,
+                                    )
+                                    .await;
                                 if let Err(e2) =
-                                    executor.work_queue.fail(&item_id, &e.to_string()).await
+                                    executor.work_queue.fail(&item_id, &error_message).await
                                 {
                                     error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                 }
@@ -1602,9 +1698,10 @@ impl BackgroundExecutor {
                                     }
                                 }
                                 Err(e) => {
-                                    error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
+                                    let error_message = error_chain_message(&e);
+                                    error!(item_id = %item_id, kind = %kind, error = %error_message, "Work item failed");
                                     if let Err(e2) =
-                                        executor.work_queue.fail(&item_id, &e.to_string()).await
+                                        executor.work_queue.fail(&item_id, &error_message).await
                                     {
                                         error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                     }
@@ -1622,9 +1719,10 @@ impl BackgroundExecutor {
                                 }
                             }
                             Err(e) => {
-                                error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
+                                let error_message = error_chain_message(&e);
+                                error!(item_id = %item_id, kind = %kind, error = %error_message, "Work item failed");
                                 if let Err(e2) =
-                                    self.work_queue.fail(&item_id, &e.to_string()).await
+                                    self.work_queue.fail(&item_id, &error_message).await
                                 {
                                     error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                 }
