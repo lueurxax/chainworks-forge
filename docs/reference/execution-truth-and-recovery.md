@@ -305,7 +305,7 @@ That classification already considers:
 Approval-bound runs are allowed to restore visible pending approval context after relaunch.
 The contract is:
 
-- approval gates restore the same operator decision point when the persisted state still supports it,
+- approval gates restore the same operator decision point (read-only/diagnostic in P031) when the persisted state still supports it,
 - drift can be surfaced as context without silently discarding the approval state,
 - recovery or report readers must not invent a new approval truth that was not persisted.
 

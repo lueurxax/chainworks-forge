@@ -1,23 +1,27 @@
 import SwiftUI
-import SwiftData
+import AppKit
 
-// MARK: - ApprovalGateView (Proposal 002 — Approval inbox/detail surface)
+// MARK: - ApprovalGateView (P031 diagnostic-only approval surface)
 
-/// Displays a pending approval request with approve/reject actions.
-/// Used within RunProgressView for inline approval and as a standalone detail.
+/// Displays a pending approval request as diagnostic-only readback.
 struct ApprovalGateView: View {
-    @Environment(ExecutionService.self) private var executionService
     let request: ApprovalRequest
-    @State private var comment: String = ""
-    @State private var isResolving = false
+
+    private var diagnosticItems: [(label: String, value: String)] {
+        [
+            ("approval_id", request.id.uuidString),
+            ("run_id", request.runID.uuidString),
+            ("stage_id", request.stageID)
+        ]
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: ForgeSpacing.medium) {
             HStack(alignment: .top, spacing: ForgeSpacing.medium) {
                 ForgeSectionHeader(
-                    title: "Approval Required",
+                    title: "Approval write path unavailable",
                     subtitle: request.stageLabel,
-                    symbol: "checkmark.seal.fill"
+                    symbol: "lock.doc"
                 )
                 Spacer()
                 Text(request.requestedAt, format: .dateTime)
@@ -28,9 +32,20 @@ struct ApprovalGateView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
+                Text("Managed outside UI")
+                    .font(ForgeTypography.supporting.weight(.semibold))
+                    .foregroundStyle(DesignTokens.Action.caution)
+                Text("Approval decisions are read-only in this operator surface. Use the approved external workflow or reference P031-FOLLOWUP-APPROVAL-WRITE-PATH.")
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityIdentifier("approval-diagnostic-callout")
+
+            VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
                 LabeledContent("Stage", value: request.stageID)
                     .font(ForgeTypography.supporting)
-                LabeledContent("Run", value: request.runID.uuidString.prefix(8) + "...")
+                LabeledContent("Run", value: request.runID.uuidString)
                     .font(ForgeTypography.supporting)
             }
 
@@ -53,62 +68,49 @@ struct ApprovalGateView: View {
             }
 
             VStack(alignment: .leading, spacing: ForgeSpacing.compact) {
-                Text("Comment (optional)")
+                Text("Copy diagnostic identifiers")
                     .font(ForgeTypography.supporting)
                     .foregroundStyle(ForgeColor.Text.secondary)
-                TextField("Add a comment...", text: $comment, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(2...4)
-            }
-
-            HStack {
-                Button(role: .destructive) {
-                    resolveApproval(granted: false)
-                } label: {
-                    Label("Reject", systemImage: "xmark.circle")
+                ForEach(diagnosticItems, id: \.label) { item in
+                    HStack(spacing: ForgeSpacing.compact) {
+                        LabeledContent(item.label, value: item.value)
+                            .font(ForgeTypography.supporting)
+                        Spacer(minLength: ForgeSpacing.compact)
+                        Button {
+                            copyDiagnosticValue(item.value)
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                                .labelStyle(.iconOnly)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy \(item.label)")
+                        .accessibilityLabel("Copy \(item.label)")
+                    }
                 }
-                .disabled(isResolving)
-                .keyboardShortcut(.delete, modifiers: [.command])
-                .accessibilityIdentifier("approval-reject-button")
-
-                Spacer()
-
-                Button {
-                    resolveApproval(granted: true)
-                } label: {
-                    Label("Approve", systemImage: "checkmark.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(DesignTokens.Action.approve)
-                .disabled(isResolving)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .accessibilityIdentifier("approval-approve-button")
             }
         }
         .forgePanel(tint: DesignTokens.Action.caution, fill: ForgeColor.Surface.elevated)
         .accessibilityIdentifier("approval-gate-view")
     }
 
-    private func resolveApproval(granted: Bool) {
-        isResolving = true
-        executionService.resolveApproval(
-            approvalID: request.id,
-            granted: granted,
-            comment: comment.isEmpty ? nil : comment
-        )
+    private func copyDiagnosticValue(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 }
 
 // MARK: - ApprovalInboxView (standalone list of all pending approvals)
 
-/// Displays all pending approval requests across all active runs.
-/// Can be used as a standalone tab or navigation destination.
+/// Displays pending approval requests supplied by the GraphQL read surface.
 struct ApprovalInboxView: View {
-    @Environment(ExecutionService.self) private var executionService
+    let approvalRequests: [ApprovalRequest]
 
     private var sortedApprovals: [ApprovalRequest] {
-        executionService.pendingApprovals.values
-            .sorted { $0.requestedAt < $1.requestedAt }
+        approvalRequests.sorted { $0.requestedAt < $1.requestedAt }
+    }
+
+    init(approvalRequests: [ApprovalRequest] = []) {
+        self.approvalRequests = approvalRequests
     }
 
     var body: some View {

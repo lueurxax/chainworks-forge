@@ -1,0 +1,68 @@
+{
+  "manifest_version": "1.0",
+  "entries": [
+    {
+      "key": "governing_contract",
+      "path": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "synchronized",
+      "blocking_phase": "Phase 0a"
+    },
+    {
+      "key": "p043_reconciliation_evidence",
+      "path": "docs/reference/query-projections-and-client-consumption-contract.md",
+      "owner_role": "P031 thin macOS UI owner",
+      "validation_status": "reconciled",
+      "blocking_phase": "Phase 0a"
+    },
+    {
+      "key": "p031_gate_evidence",
+      "path": "scripts/test-gate.sh",
+      "owner_role": "P031 thin macOS UI owner",
+      "validation_status": "registered",
+      "blocking_phase": "Phase 0a"
+    },
+    {
+      "key": "ui_inventory",
+      "path": "docs/reference/p031-thin-ui-inventory.json",
+      "owner_role": "P031 thin macOS UI owner",
+      "validation_status": "checked-in",
+      "blocking_phase": "Phase 0b"
+    },
+    {
+      "key": "schema_decision_record",
+      "path": "control-plane/crates/graphql-server/src/types/p031.rs",
+      "owner_role": "P031 Rust control-plane owner",
+      "validation_status": "implemented",
+      "blocking_phase": "Phase 0a"
+    },
+    {
+      "key": "operator_write_path_guide",
+      "path": "docs/reference/p031-operator-write-path-guide.json",
+      "owner_role": "P031 release owner",
+      "validation_status": "checked-in",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "key": "rollback_evidence",
+      "path": "docs/evidence/p031-rollback-drill.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "pending",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "key": "report_payload_priority_decision",
+      "path": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "pending",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "key": "dogfood_signoff_template",
+      "path": "docs/evidence/p031-dogfood-signoff.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "pending",
+      "blocking_phase": "Phase 0d"
+    }
+  ]
+}

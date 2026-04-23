@@ -65,19 +65,6 @@ fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
     Ok(())
 }
 
-fn require_operator_or_observer_read(ctx: &Context<'_>) -> Result<()> {
-    let principal = ctx
-        .data::<auth::Principal>()
-        .map_err(|_| Error::new("unauthorized"))?;
-    if !matches!(
-        principal.class,
-        auth::PrincipalClass::Operator | auth::PrincipalClass::Observer
-    ) {
-        return Err(Error::new("forbidden"));
-    }
-    Ok(())
-}
-
 async fn run_from_projection_or_canonical(
     pool: &SqlitePool,
     run_id: RunId,
@@ -150,6 +137,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         include_archived: Option<bool>,
     ) -> Result<Vec<GqlIdea>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let include = include_archived.unwrap_or(false);
         let items = ideas::list(pool, include).await?;
@@ -157,6 +145,7 @@ impl QueryRoot {
     }
 
     async fn idea(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlIdea>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let idea_id: IdeaId = id
             .parse()
@@ -222,7 +211,7 @@ impl QueryRoot {
     }
 
     async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
-        require_operator_or_observer_read(ctx)?;
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = id
             .parse()
@@ -235,7 +224,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<Vec<GqlAgentExecution>> {
-        require_operator_or_observer_read(ctx)?;
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = stage_execution_id
             .parse()
@@ -436,6 +425,7 @@ impl QueryRoot {
         limit: Option<i32>,
         status: Option<String>,
     ) -> Result<Vec<GqlStewardAnalysis>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let parsed_status = status
             .as_deref()
@@ -459,6 +449,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         id: ID,
     ) -> Result<Option<GqlStewardAnalysis>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let item = steward_repo::find_analysis(pool, id.as_str()).await?;
         if let Some(item) = item {
@@ -479,6 +470,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardAnalysisRunLink>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_run_links(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -492,6 +484,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardRecommendation>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_recommendations(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -1055,9 +1048,7 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRun>>>> {
         // P029 §4.1.c: principal is injected by on_connection_init during WS handshake.
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1094,9 +1085,7 @@ impl SubscriptionRoot {
         run_id: ID,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>>>
     {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1132,9 +1121,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1160,9 +1147,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1193,9 +1178,7 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>>>
     {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
@@ -3462,8 +3445,8 @@ mod tests {
             serde_json::json!(approval_id.to_string())
         );
         assert!(
-            approval["serverDebugDetail"].is_string(),
-            "operator diagnostic detail should be available for approval rows"
+            approval["serverDebugDetail"].is_null(),
+            "serverDebugDetail must be null for Phase 0 approval rows"
         );
     }
 

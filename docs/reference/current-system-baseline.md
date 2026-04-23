@@ -23,6 +23,7 @@ At the current baseline, the product includes:
 
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
+- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
@@ -73,6 +74,7 @@ Use these reference docs as the current source of truth:
 | Test strategy and gates | [test-suite-architecture.md](test-suite-architecture.md), [test-gates.md](test-gates.md), [agent-ui-test-execution.md](agent-ui-test-execution.md) |
 | Design-system adoption | [design-system-and-brand-application.md](design-system-and-brand-application.md) |
 | UI/brand design authority | [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) |
+| GraphQL read contract | [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) |
 
 ## Canonical product boundaries
 
@@ -88,6 +90,19 @@ It is an operator surface where the engineer should be able to answer:
 - and what safe next action is available.
 
 That boundary is owned by [operator-experience.md](operator-experience.md).
+
+### UI Boundary
+
+Per P031-r18, the macOS UI is a **thin read-only client**.
+
+Current baseline:
+
+- production workflow truth is read from GraphQL projections,
+- UI state is limited to presentation, server-derived caches, and freshness handling,
+- all mutation paths (Start, Cancel, Retry, Approval Resolution) move to external CLI/MCP workflows,
+- governed UI screens provide diagnostic identifiers and instructions for these external workflows.
+
+That boundary is owned by [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
 
 ### Provider boundary
 

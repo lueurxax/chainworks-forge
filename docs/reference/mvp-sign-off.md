@@ -124,17 +124,17 @@ The sign-off layer does not create a second shell.
 
 Canonical owner path:
 
-1. `RunsHomeView`
-2. `RecoverySheet` / `BlockedRunRecoveryView`
-3. `RunReportView`
-4. `CompletedRunExportHub`
-5. `MVPSignOffSummaryView`
+1. `RunsHomeView` (GraphQL-only reads)
+2. `RecoverySheet` / `BlockedRunRecoveryView` (Diagnostic-only identifiers)
+3. `RunReportView` (Read-only artifacts)
+4. `CompletedRunExportHub` (Read-only)
+5. `MVPSignOffSummaryView` (Read-only)
 
 Rules:
 
-- blocked recovery remains operator-visible from the existing shell,
-- terminal repo-backed runs expose export and sign-off summary as subordinate report routes,
-- waiting-approval relaunch must restore the pending approval state instead of silently rerunning the stage,
+- blocked recovery remains operator-visible from the existing shell as diagnostic guidance,
+- terminal repo-backed runs expose export and sign-off summary as subordinate read-only report routes,
+- waiting-approval relaunch must restore the pending approval **diagnostic** state instead of silently rerunning the stage,
 - export state is driven by persisted truth such as `evidencePackExportedAt`, not by optimistic artifact presence alone.
 
 ## Export and replayability

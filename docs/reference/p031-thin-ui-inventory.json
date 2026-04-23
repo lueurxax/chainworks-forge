@@ -1,0 +1,175 @@
+{
+  "schema_version": "p031-thin-ui-inventory-v1",
+  "governed_swift_files": [
+    "Chainworks Forge/Views/RunsHomeView.swift",
+    "Chainworks Forge/Views/StageDetailView.swift",
+    "Chainworks Forge/Views/ApprovalGateView.swift",
+    "Chainworks Forge/Views/ArtifactInspectorView.swift",
+    "Chainworks Forge/Views/RunArtifactHierarchyView.swift",
+    "Chainworks Forge/Views/RunReportView.swift",
+    "Chainworks Forge/Views/BlockedRunRecoveryView.swift",
+    "Chainworks Forge/Views/RecoverySheet.swift",
+    "Chainworks Forge/Views/RunComparisonView.swift",
+    "Chainworks Forge/Views/WorkflowInspectorView.swift",
+    "Chainworks Forge/Views/WorkflowMapView.swift",
+    "Chainworks Forge/Views/DaemonLifecycleSurface.swift"
+  ],
+  "governed_graphql_documents": [],
+  "generated_graphql_outputs": [],
+  "legacy_only_files": [
+    {
+      "path": "Chainworks Forge/Views/AgentCatalogView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/AgentSessionInspector.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ArchivedIdeasView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ArtifactContentRenderer.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/CompletedRunExportHub.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/DeliveryPreflightReportView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/FailedStageEvidencePanel.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/FirstRunSetupWizard.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ForegroundBannerView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/IdeaListView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/IdeasArchiveView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/MVPSignOffSummaryView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/MenuBarStatusView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/PilotReadinessView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/PreflightReportView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ProviderSettingsView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ProviderSetupEvidencePanel.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ProviderTroubleshootingPanel.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/ReleaseGateView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/RunProgressView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/RunStartModePresentation.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/RunStartOverridesView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/RunSurfacePaneRouting.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/RunTimelineInspectorView.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/SessionReuseBadge.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/StartRunSheet.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/StrategyBadge.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    },
+    {
+      "path": "Chainworks Forge/Views/UITestDirectSurfaces.swift",
+      "legacy_mode_only": true,
+      "mode_env": "CHAINWORKS_THIN_UI_MODE=legacy"
+    }
+  ],
+  "explicit_exclusions": [
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "reason": "Implements the boundary checks and naturally contains forbidden pattern strings"
+    }
+  ],
+  "forbidden_pattern_groups": [
+    "mcp",
+    "graphql_mutations",
+    "local_write_fallback",
+    "command_plumbing",
+    "raw_truth_probing",
+    "removed_write_controls"
+  ]
+}

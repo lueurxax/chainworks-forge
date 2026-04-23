@@ -198,7 +198,7 @@ Overrides apply to the current run only and never mutate YAML/catalog definition
 
 ## Preflight and diagnostics
 
-The operator should learn about problems before hitting `Start Run`.
+The operator should learn about problems before issuing a run command externally. In P031, the macOS UI provides diagnostic preflight readback but does not host the `Start Run` action.
 
 Preflight categories:
 
@@ -216,11 +216,10 @@ Preflight categories:
 - warnings,
 - blocking issues.
 
-Run-start gate semantics:
-
-- `pass` -> start enabled
-- `warn` -> start allowed only with explicit confirmation
-- `fail` -> start disabled
+**Diagnostic Gate Semantics (UI Read-only):**
+- `pass` -> diagnostic green
+- `warn` -> diagnostic amber; external start advised only with caution
+- `fail` -> diagnostic red; external start likely to fail
 
 Preflight reads from persisted configuration stores, not ad hoc path state.
 
@@ -278,12 +277,12 @@ Those surfaces cover:
 - provider configuration,
 - provider verification,
 - ACP runtime readiness and provider diagnostics,
-- sample-run bootstrap,
+- sample-run bootstrap (Diagnostic-only),
 - current provider/YAML/workspace health,
 - configuration source,
 - last successful run,
 - blocked runs,
-- pending approvals.
+- pending approvals (Diagnostic-only).
 
 The goal is to make the system operable on a fresh machine, not just understandable to someone already living in the codebase.
 ## Boundaries

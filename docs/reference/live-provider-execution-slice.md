@@ -47,7 +47,7 @@ This slice proves the control-plane model without introducing writable repo side
 - live-mode execution for the proposal loop only
 - `RuntimeAgentExecutor`, `RuntimeSessionBridge`, runtime adapters, and `ExecutionEventBridge`
 - fixture-backed live transport used by the app and tests
-- app-launched Start Run, Run Progress, approval, and artifact-inspection surfaces
+- read-only/diagnostic Start Run, Run Progress, approval, and artifact-inspection surfaces (per P031-r18)
 - durable transcript, receipt, proposal, review, and summary artifacts
 - fail-closed read-only launch policy
 - structured artifact validation before success and transition evaluation
@@ -206,7 +206,7 @@ The point is to make a live run inspectable after the fact without relying on hi
 
 ### 7.1 Start Run
 
-The Start Run surface exposes:
+The Start Run surface (Diagnostic-only placeholder in P031) exposes:
 
 - workflow selection
 - simulated vs live mode
@@ -216,18 +216,18 @@ The Start Run surface exposes:
 
 ### 7.2 Run Progress
 
-The live run surface keeps the important state above the fold:
+The live run surface (GraphQL read-only in P031) keeps the important state above the fold:
 
 - current phase
 - live agent activity
-- approval state
+- approval state (Diagnostic-only)
 - decision context
 - spend or explicit unavailable state
 - shortcuts to the latest proposal, review summary, and receipt artifacts
 
 ### 7.3 Approval and artifact inspection
 
-At approval time, the operator can inspect:
+At approval time, the operator can inspect (Read-only) :
 
 - current proposal draft
 - latest review summary
@@ -238,7 +238,7 @@ The artifact inspector renders both user-facing markdown and raw structured/prov
 
 ### 7.4 Resume
 
-Waiting-approval state is restored on relaunch.
+Waiting-approval state is restored on relaunch as a diagnostic decision point.
 
 The live slice is allowed to resume only for safe interrupted states. Ambiguous or partial provider executions must block or fail clearly rather than auto-resume silently.
 

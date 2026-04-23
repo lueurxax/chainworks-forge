@@ -28,7 +28,8 @@ Those remain owned by:
 - [provider-platform.md](provider-platform.md) for provider settings, diagnostics, and frozen provider truth,
 - [project-workspace-contract.md](project-workspace-contract.md) for idea-owned workspace and frozen run root rules,
 - [release-gate.md](release-gate.md) for deterministic native release execution and release receipt semantics,
-- [live-workflow-map.md](live-workflow-map.md) for run-detail topology rendering.
+- [live-workflow-map.md](live-workflow-map.md) for run-detail topology rendering,
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) for the thin-UI GraphQL read contract.
 
 ## Core rules
 
@@ -71,7 +72,7 @@ The three manual gates are:
 2. approval to begin implementation,
 3. manual release approval.
 
-The product does not skip those gates in the repo-backed slice.
+Per P031-r18, these gates are **diagnostic-only** in the macOS UI. The UI renders the pending gate and provides diagnostic identifiers for external resolution via CLI or MCP tools. The product does not skip those gates in the repo-backed slice.
 
 ## Delivery configuration
 
@@ -222,8 +223,8 @@ The app does not autonomously push or distribute code without the manual release
 
 ### Release gate
 
-`ReleaseGateView` is the operator-facing approval surface for the final gate.
-It must show enough context to make an informed decision:
+`ReleaseGateView` is the operator-facing **diagnostic** surface for the final gate.
+It must show enough context to make an informed decision for execution via an external workflow:
 
 - proposal and workflow context,
 - review artifact availability,
@@ -234,6 +235,9 @@ It must show enough context to make an informed decision:
 **Verification Truth:**
 When `implementation_self_assessment_v2` is available, `ReleaseGateView` uses its `verification_green` signal instead of legacy test results.
 If the status is `blocked`, a high-visibility warning row is shown at the top of the Change Summary section.
+
+**Decision Execution:**
+Buttons for `Approve` or `Reject` are replaced with diagnostic banners or technical details (run ID, branch name, target) for use in external workflows.
 
 ### Deterministic release sequence
 
@@ -269,21 +273,21 @@ Repo-backed delivery does not introduce a separate shell.
 
 Canonical owner path:
 
-1. `Ideas` and `Start Run`,
-2. run progress / run detail,
-3. approval gate and release gate,
-4. report / receipts / evidence export.
+1. `Ideas` and `Start Run` (Removed or replaced with diagnostic placeholders in P031),
+2. run progress / run detail (GraphQL read-only),
+3. approval gate and release gate (Diagnostic-only),
+4. report / receipts / evidence export (Read-only artifacts).
 
 **Implementation assessment UI:**
-`WorkflowRunProgressView` includes an `ImplementationSelfAssessmentPanel` in the Decision Context section. This panel provides a structured view of the `implementation_self_assessment_v2` artifact, showing status, verification greenness, remaining code tasks, and handoff tasks with owner icons.
+`WorkflowRunProgressView` includes a **read-only** `ImplementationSelfAssessmentPanel` in the Decision Context section. This panel provides a structured view of the `implementation_self_assessment_v2` artifact, showing status, verification greenness, remaining code tasks, and handoff tasks with owner icons.
 
 The key surfaces are:
 
-- repo-backed `Start Run` preset and preflight,
+- repo-backed diagnostic preflight,
 - run progress with repo/worktree-aware context and implementation assessment summary,
-- `ReleaseGateView`,
+- `ReleaseGateView` (Diagnostic),
 - report and evidence export,
-- existing recovery/comparison surfaces from the operator baseline.
+- existing recovery/comparison surfaces (Read-only) from the operator baseline.
 
 ## Dogfooding and evidence export
 

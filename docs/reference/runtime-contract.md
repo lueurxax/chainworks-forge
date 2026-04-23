@@ -30,7 +30,7 @@ Recommended status sets:
 - **Approval**: `pending`, `requested`, `granted`, `rejected`, `expired`
 - **Side effect**: `pending`, `armed`, `running`, `completed`, `failed`, `blocked`
 
-These states should be visible in SwiftData metadata and in the UI.
+These states should be visible in SwiftData metadata and in the UI (read-only from GraphQL projections in P031).
 
 ## 3. Artifact model
 

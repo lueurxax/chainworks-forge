@@ -558,6 +558,40 @@ Use when:
 - updating the P031 consumption contract for read surfaces, freshness, or deferred UI states
 - reproving the P043 read-contract lane without touching UI or daemon lifecycle implementation
 
+### `proposal-031|p031`
+
+Proposal 031 thin GraphQL-only UI inventory, static guard, and write-path guide gate.
+
+Scope:
+
+- Python script validation (`scripts/p031-thin-ui-gate.py`) for governed UI constraints
+- verification of `docs/reference/p031-thin-ui-inventory.json`, `docs/reference/p031-operator-write-path-guide.json`, and `docs/reference/p031-phase-0-artifact-manifest.json`
+- rust tests for `proposal_031_` prefix in `graphql-server`
+- rust authorization tests `proposal_031_authorization` in `graphql-server`
+
+Use when:
+
+- changing the GraphQL-only thin macOS client boundary
+- updating the UI inventory, operator write-path guide, or Phase 0 artifact manifest
+- modifying GraphQL read/subscription authorization boundaries for P031 UI
+
+Host policy:
+
+- Python 3 and local Rust toolchain required
+- no macOS UI target, simulator, or live daemon required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-031
+```
+
+Important:
+
+- `p031` is accepted as an alias
+- the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary or if required Phase 0 artifacts are missing or invalid
+
+
 Host policy:
 
 - local Rust toolchain required

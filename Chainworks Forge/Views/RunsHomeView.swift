@@ -84,7 +84,7 @@ struct RunsHomeView: View {
                                 effectiveStatus: entry.effectiveStatus,
                                 attentionLevel: .high,
                                 onOpen: { selectedRunID = entry.run.id },
-                                onOpenGate: { resolveApprovalGate(for: entry.run) },
+                                onOpenGate: nil,
                                 onRecover: { selectedRunID = entry.run.id; showRecoverySheet = true },
                                 onCompare: { selectedRunID = entry.run.id; showComparisonPicker = true },
                                 onViewReport: { selectedRunID = entry.run.id; showReportView = true },
@@ -396,15 +396,6 @@ struct RunsHomeView: View {
     /// Uses RunComparisonService to check true compatibility rather than "any sibling run".
     private var compatibilityChecker: CompatibilityChecker {
         CompatibilityChecker(modelContext: modelContext)
-    }
-
-    // MARK: - Approval Gate Resolution
-
-    private func resolveApprovalGate(for run: Run) {
-        // Find the pending approval for this run and resolve it via ExecutionService
-        if let approvalEntry = executionService.pendingApprovals.first(where: { $0.value.runID == run.id }) {
-            executionService.resolveApproval(approvalID: approvalEntry.key, granted: true)
-        }
     }
 
     private func resumeInterruptedRunsManually() {
@@ -910,16 +901,6 @@ struct RunDetailPanel: View {
         .sheet(item: $selectedArtifactLeaf) { leaf in
             RunArtifactLeafInspectorSheet(run: run, leaf: leaf)
         }
-        .alert("Stop Run?", isPresented: $showStopConfirmation) {
-            Button("Stop", role: .destructive) {
-                Task {
-                    await executionService.cancelRun(runID: run.id)
-                }
-            }
-            Button("Keep Running", role: .cancel) { }
-        } message: {
-            Text("This will stop all active agents for \"\(run.idea?.title ?? run.workflowTitle)\". Run history and artifacts remain visible as terminal history.")
-        }
     }
 
     @ViewBuilder
@@ -952,16 +933,15 @@ struct RunDetailPanel: View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.small) {
             HStack(alignment: .center, spacing: DesignTokens.Spacing.small) {
                 if run.canBeCancelledByOperator {
-                    Button(
-                        run.cancellationRequestedAt != nil ? "Cancelling\u{2026}" : "Stop Run",
-                        systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "stop.fill"
-                    ) {
-                        showStopConfirmation = true
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(DesignTokens.Status.error)
-                    .disabled(run.cancellationRequestedAt != nil)
-                    .accessibilityIdentifier("runs-home-stop-run-button")
+                    Label(
+                        run.cancellationRequestedAt != nil
+                            ? "Cancellation requested outside UI"
+                            : "Stop managed outside UI",
+                        systemImage: run.cancellationRequestedAt != nil ? "hourglass" : "lock"
+                    )
+                    .font(DesignTokens.Typography.supporting)
+                    .foregroundStyle(DesignTokens.Status.neutral)
+                    .accessibilityIdentifier("runs-home-stop-run-diagnostic")
                 }
 
                 if effectiveRunStatus == .blocked || effectiveRunStatus == .failed {

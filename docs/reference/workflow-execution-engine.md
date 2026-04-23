@@ -11,6 +11,13 @@ interruption.
 All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
 `control-plane/crates/engine/` (Rust daemon).
 
+**P031 Thin UI Boundary:**
+Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's 
+state via GraphQL projections. While the Swift engine remains implemented for 
+parity, the governed UI is prohibited from calling mutation paths in 
+`ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and 
+Approval actions move to external CLI/MCP workflows.
+
 **Rust Daemon Implementation:**
 The Rust control-plane daemon implements the same state machine and transition 
 semantics while adding robust capacity-aware scheduling, scheduler fairness, 

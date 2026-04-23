@@ -1936,11 +1936,6 @@ case "$GATE" in
     )
     log "Proposal 029-MCP control-plane gate passed"
     ;;
-  proposal-031|p031)
-    log "Proposal 031 gate: thin GraphQL-only UI inventory, static guards, and write-path guide"
-    python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
-    log "Proposal 031 gate passed"
-    ;;
   proposal-032|p032)
     check_idle_environment allow_app
     if [[ -n "$BEFORE_CRASH_LOG" ]]; then
@@ -2219,6 +2214,41 @@ for forbidden in [
 PY
     )
     log "Proposal 043 control-plane gate passed"
+    ;;
+  proposal-031|p031)
+    log "Proposal 031 gate: thin GraphQL-only UI rewrite"
+    # 1. Run the static inventory and write-path guide gate
+    python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
+    
+    # 2. Run the server-side authorization and read-model tests
+    (
+      cd "$ROOT_DIR"
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-031-gate cargo test -p graphql-server --lib proposal_031_ -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-031-gate cargo test -p graphql-server --test proposal_031_authorization -- --test-threads=1 --nocapture
+      cd "$ROOT_DIR"
+      
+      # 3. Validate Phase 0 artifact manifest and references
+      python3 - <<'PY'
+from pathlib import Path
+import json
+
+def require_file(path):
+    p = Path(path)
+    if not p.is_file():
+        raise SystemExit(f"proposal-031: missing required artifact {path}")
+
+require_file("docs/reference/p031-thin-ui-inventory.json")
+require_file("docs/reference/p031-operator-write-path-guide.json")
+require_file("docs/reference/p031-phase-0-artifact-manifest.json")
+
+manifest_path = Path("docs/reference/p031-phase-0-artifact-manifest.json")
+manifest = json.loads(manifest_path.read_text())
+for entry in manifest.get("entries", []):
+    require_file(entry["path"])
+PY
+    )
+    log "Proposal 031 gate passed"
     ;;
   proposal-044|p044)
     log "Proposal 044 control-plane gate: post-approval + N-phase + end-state"

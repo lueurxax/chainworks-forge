@@ -33,11 +33,12 @@ impl From<Approval> for GqlApproval {
             decided_at: a.decided_at.map(|t| t.to_rfc3339()),
             comment: a.comment,
             expires_at: a.expires_at.map(|t| t.to_rfc3339()),
+            // Phase 0 approval projections do not yet track per-row lag; rows are read-only diagnostic.
             freshness_state: GqlFreshnessState::Live,
             disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
             write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
             diagnostic_id: Some(diagnostic_id),
-            server_debug_detail: Some("P031 renders approval rows as diagnostic read-only".into()),
+            server_debug_detail: None,
         }
     }
 }
@@ -54,11 +55,12 @@ impl From<ApprovalInboxRow> for GqlApproval {
             decided_at: r.decided_at,
             comment: r.comment,
             expires_at: r.expires_at,
+            // Phase 0 approval projections do not yet track per-row lag; rows are read-only diagnostic.
             freshness_state: GqlFreshnessState::Live,
             disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
             write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
             diagnostic_id: Some(diagnostic_id),
-            server_debug_detail: Some("P031 renders approval rows as diagnostic read-only".into()),
+            server_debug_detail: None,
         }
     }
 }

@@ -20,25 +20,26 @@ Related stable docs:
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 
 ## Scope
 
-This reference covers the read-only and repo-agnostic operator layer:
+This reference covers the **read-only** and repo-agnostic operator layer (per P031-r18):
 
-- `RunsHomeView` as the primary landing surface
+- `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
-- immutable run reports plus mutable latest summaries
-- safe recovery actions for non-destructive run states
-- deterministic run comparison
+- immutable run reports plus mutable latest summaries (metadata inspection only)
+- diagnostic-only guidance for approvals and recovery
+- deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does not define repo-backed write/release recovery. That boundary belongs to [full-mvp-delivery.md](full-mvp-delivery.md).
+It does **NOT** define in-app write/recovery. Every write control (Start, Cancel, Retry, Resolve Approval) is removed or replaced with diagnostic guidance for external workflows.
 
 ## Runs Home
 
-`RunsHomeView` is the operator landing surface.
+`RunsHomeView` is the operator landing surface. It consumes workflow truth exclusively through GraphQL projections.
 
 Runs are grouped into:
 
@@ -58,15 +59,12 @@ Each row shows:
 - last progress timestamp,
 - attention level,
 - queued agent count (when > 0),
-- runtime provenance.
+- runtime provenance,
+- **Freshness state** (Live, Refreshing, Stale, etc.).
 
-Contextual actions are status-aware:
-
-- `Open` is always available
-- `Open gate` appears only for approval-blocked runs
-- `Recover` appears only for blocked or failed runs
-- `Compare` appears only when a compatible target exists
-- `View report` appears only when report artifacts exist
+**Actions are diagnostic-only:**
+- `Open` is available for drill-down.
+- Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
 
 ## Scheduler Health and Backpressure
 
@@ -148,23 +146,21 @@ Report content includes:
 - recovery notes,
 - deterministic outcome.
 
-## Recovery
+## Recovery (Diagnostic-only in P031-r18)
 
-The implemented recovery toolkit covers non-destructive paths for the current baseline:
+The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows:
 
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
-4. `Clone Run (Frozen Snapshot)`
-5. `Clone Run (Current Config)`
+4. `Clone Run`
 
-`RecoverySheet` shows:
+`RecoverySheet` and diagnostic banners show:
 
-- blocked reason,
-- most recent stage,
-- trust/provenance summary,
-- suggested safe next action,
-- only the actions allowed for the current run type.
+- `run_id`, `stage_id`, or `approval_id` for copy-paste,
+- suggested CLI / MCP command strings,
+- `writePathState`: `read_only_diagnostic`,
+- `disabledReasonCode`: `WRITE_PATH_NOT_AVAILABLE`.
 
 Out of scope here:
 
