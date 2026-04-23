@@ -3753,6 +3753,14 @@ final class WorkflowOrchestrator {
 
     private func persistedArtifacts() -> [Artifact] {
         guard !run.isDeleted, run.modelContext != nil else { return [] }
+        do {
+            return try artifactManager.artifacts(forRunID: run.id)
+        } catch {
+            RuntimeDiagnostics.log(
+                "persistedArtifacts fetchFailed runID=\(run.id) error=\(error.localizedDescription)"
+            )
+        }
+
         return run.stageExecutions
             .sorted { $0.startedAt < $1.startedAt }
             .flatMap { stage in
@@ -4065,8 +4073,7 @@ final class WorkflowOrchestrator {
 
         if let fields = validatedFields[artifact.name] {
             artifactFields[artifact.name] = fields
-        } else if artifact.format == .json,
-            let data,
+        } else if let data,
             let fields = tryExtractScalarFields(from: data, artifactName: artifact.name)
         {
             artifactFields[artifact.name] = fields

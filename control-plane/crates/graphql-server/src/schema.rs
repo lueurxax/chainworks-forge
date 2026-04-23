@@ -817,6 +817,7 @@ impl MutationRoot {
             run_id: rid,
             stage_id,
             consume_quota_budget_now: consume_quota_budget_now.unwrap_or(false),
+            agent_execution_id: None,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;

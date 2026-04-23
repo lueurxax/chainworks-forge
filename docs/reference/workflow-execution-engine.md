@@ -204,24 +204,75 @@ Value resolution supports `vars.*` (runtime variables), `artifact.field` (artifa
 metadata), and literals (int, double, bool, quoted string). Comparison operators:
 `==`, `>`, `>=`, `!=`. Unrecognized expressions fail closed (return false).
 
+### Transition Authority Resolver (`WorkflowOrchestrator.swift`)
+
+The Transition Authority Resolver (ARCH-032) enforces the compiled workflow graph
+as the sole authority for stage progression.
+
+**Authority Rules:**
+- The compiled workflow graph is the only authority for legal next state selection.
+- Agent-authored `next_stage`, `next_action`, `run_state.json`, and narrative 
+  transition hints are treated as **advisory evidence only**.
+- A legal declarative transition always takes precedence over a conflicting 
+  advisory hint.
+- An advisory `next_stage` absent from the graph never creates a synthetic state.
+- Multiple matched declarative transitions without a tie-break result in a 
+  blocking conflict.
+- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate 
+  to true; they are classified as `invalid_expression` (undeclared) or 
+  `missing_input` (declared but absent).
+
+### Aggregate Artifact Field Authority
+
+To ensure deterministic evaluation, aggregate artifact fields are classified by 
+authority (ARCH-035). For example, in `proposal_review_summary_v1`:
+
+- **Transition Authoritative**: `pass`, `blocker_count`, `blocking_issues`, 
+  `required_changes`. These drive graph transitions.
+- **Advisory Only**: `next_action`, `next_stage`. These are recorded as 
+  advisory evidence but cannot select a graph transition alone.
+- **Contradiction Bearing**: `decision`. Used to detect internal aggregate 
+  inconsistency.
+
+### Candidate Transition Evaluation
+
+Every transition evaluation produces a `CandidateTransitionEvaluation` record 
+detailing why a transition matched or failed (ARCH-033).
+
+Results include:
+- `matched`
+- `not_matched`
+- `missing_input` (declared artifact absent)
+- `invalid_expression` (undeclared artifact or invalid field)
+- `evaluation_error`
+
+### Transition Input Dependency Classification
+
+Fail-closed behavior applies to all transition inputs (ARCH-036):
+- If a referenced artifact is not declared by the workflow/catalog contract, 
+  it is `invalid_expression`.
+- If declared but absent, it is `missing_input`.
+- `exists(unknown_artifact)` never returns true in graph-authoritative evaluation.
+
+### Workflow Conflict and Advisory Rejection
+
+If graph authority cannot determine a single valid next state, the engine persists 
+a `WorkflowConflictRecord`:
+- `no_declarative_transition_matched`
+- `multiple_declarative_transitions_matched_without_tie_break`
+- `required_artifact_or_field_missing_for_transition`
+- `aggregate_transition_truth_conflicted`
+- `workflow_conflict_unverifiable`
+- `implementation_handoff_unavailable`
+
+If the graph advances legally despite a conflicting agent hint, the hint is 
+persisted as a `WorkflowAdvisoryRejectionRecord` for historical truth.
+
 #### Status-based implementation handoff transitions
 
 The implementation completeness and handoff contract uses status-based
 transitions for the implementation loop. The `code_writer` exits the implementation
 loop when the self-assessment status is `complete`, `handoff_required`, or `blocked`.
-
-Example predicates used in `full-mvp-live.yaml`:
-
-- `when: implementation_self_assessment_v2.status == 'needs_code_fixes'`
-- `when: implementation_self_assessment_v2.status == 'complete' or implementation_self_assessment_v2.status == 'handoff_required' or implementation_self_assessment_v2.status == 'blocked'`
-
-**Special Mapping:**
-To support the v2 contract while maintaining compatibility with existing YAML
-definitions, the `TransitionEvaluator` includes a special mapping where
-`implementation_self_assessment_v2.field` automatically resolves to the
-`implementation_self_assessment` artifact's fields. This allows the workflow to
-use the structured v2 status even if the output name in the YAML remains the
-legacy `implementation_self_assessment`.
 
 ---
 
@@ -235,27 +286,11 @@ Classifies interrupted runs at app launch (ARCH-029). Three outcomes per run:
 - **`.cannotResume`** -- compiler version mismatch or snapshot corruption. Marked
   failed.
 
-Side-effect detection uses permission profiles (`RELEASE_GIT`, `RELEASE_PUBLISH`),
-the `requiresHumanApproval` flag, and stage-name heuristics (commit, push, release,
-publish, deploy).
+### Transition Cursor Authority
 
-### Execution Service (`ExecutionService.swift`)
-
-App-scoped `@MainActor @Observable` singleton (ARCH-022). Manages the collection
-of active orchestrators (ARCH-028 -- not a per-run singleton).
-
-Responsibilities:
-
-- **Start run** -- creates an orchestrator, wires approval and completion callbacks,
-  selects the appropriate executor (simulated vs. live).
-- **Resume interrupted runs** -- delegates to `ResumeManager`, then starts
-  orchestrators for resumable runs; marks others blocked or failed.
-- **Approval resolution** -- routes approval decisions to the correct orchestrator.
-- **Cancellation** -- cancels the orchestrator and cleans up state.
-- **Executor selection** -- for live workflows (`proposal_loop_live`), selects a
-  `RuntimeAgentExecutor` backed by the selected `RuntimeTransportProtocol`
-  implementation and optional provider/model override.
-- **Post-run hooks** -- triggers Steward analysis and emits run reports on completion.
+Transition completion and cursor update are one atomic settlement unit (ARCH-034). 
+The run-level transition cursor is the authoritative continuation signal, 
+anchoring the run at the current state when a blocking conflict exists.
 
 ---
 
@@ -274,6 +309,9 @@ Responsibilities:
 | ARCH-029 | Resume safety: compiler version check, drift detection, side-effect stage detection. |
 | ARCH-030 | Executors return `[String: Data]`. `ArtifactManager` is the sole disk writer. |
 | ARCH-031 | Transition conditions use only the canonical pattern set; unrecognized expressions fail closed. |
+| ARCH-032 | Workflow Authority: The compiled graph is the sole authority; agent hints are advisory only. |
+| ARCH-033 | Conflict Truth: Blocking graph outcomes must persist as typed `WorkflowConflictRecord`. |
+| ARCH-034 | Cursor Authority: Transition settlement and cursor update are atomic; cursor anchors on conflicts. |
 
 ---
 

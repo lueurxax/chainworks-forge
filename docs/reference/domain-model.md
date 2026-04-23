@@ -57,6 +57,7 @@ One execution instance of a workflow for one idea. Stores both mutable execution
 | `status` | `RunStatus` | Current lifecycle state |
 | `loopCounters` | `[String: Int]` | e.g. `proposal_revision_cycles: 2` |
 | `totalCostCents` | `Int64?` | Total cost in minor currency units (cents); `$12.34` = `1234` |
+| `workflow_conflict_records_json_v1` | `String?` | JSON bridge for Phase A workflow conflicts and advisory rejections |
 
 #### Immutable provenance snapshot (RunPlanSnapshot)
 
@@ -121,28 +122,31 @@ Tracks the execution of a single stage (state) in the workflow.
 
 **File:** `Models/AgentExecution.swift`
 
-Tracks a single agent's work within a stage.
+Tracks a single agent's work. In Phase B, this model migrates to a general 
+owner model (ARCH-037) to support lead-mediated conflicts.
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | `UUID` | Unique identifier |
+| `ownerKind` | `String` | `stage_execution` or `lead_conflict_mediation` |
+| `ownerID` | `UUID` | References the owner record |
 | `agentID` | `String` | Agent identifier from the catalog |
 | `agentTitle` | `String` | Human-readable agent name |
 | `taskName` | `String` | Task from workflow YAML |
 | `startedAt` | `Date` | When agent started |
 | `completedAt` | `Date?` | When agent finished |
 | `status` | `AgentStatus` | Current lifecycle state |
-| `provider` | `String` | ACP-backed provider identifier such as `claude_acp`, `codex_acp`, or `gemini_acp` |
+| `provider` | `String` | ACP-backed provider identifier |
 | `effort` | `String` | `low` · `medium` · `high` · `critical` |
-| `costCents` | `Int64?` | Cost in minor units; `$0.73` = `73` |
-| `logSnippet` | `String?` | Last N lines of log for quick preview |
+| `costCents` | `Int64?` | Cost in minor units |
+| `logSnippet` | `String?` | Last N lines of log |
 | `runtimeSessionID` | `String?` | Runtime session tracking |
 
 #### Relationships
 
 | Relationship | Target | Delete Rule |
 |---|---|---|
-| `stageExecution` | `StageExecution` | Inverse of `StageExecution.agentExecutions` |
+| `stageExecution` | `StageExecution?` | Optional in Phase B; non-null for stage-owned work |
 | `artifacts` | `[Artifact]` | Cascade |
 
 ### `Approval`

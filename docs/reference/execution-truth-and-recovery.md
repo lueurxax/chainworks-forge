@@ -117,7 +117,19 @@ The Rust control plane persists provider-independent runtime facts for every ACP
 agent execution that reaches the engine-owned execution path. These facts are not log
 parsing and are not reconstructed from transcripts during readback.
 
-`agent_execution_runtime_facts` is the durable execution-facts row keyed by
+#### AgentExecution Owner Model
+
+To support lead-mediated conflicts without synthetic stage states, `AgentExecution` 
+uses a general owner model (ARCH-037). 
+- **owner_kind**: `stage_execution` or `lead_conflict_mediation`.
+- **owner_id**: References either `stage_execution_id` or `mediation_record_id`.
+- **stage_execution_id**: Becomes nullable; required for `stage_execution` owners 
+  and null for `lead_conflict_mediation`.
+
+This allows mediation-owned executions to reuse the same retry, quota, 
+artifact, and cost infrastructure as stage-owned executions.
+
+`agent_execution_runtime_facts` is the durable execution-facts row keyed by 
 `agent_execution_id`. It records:
 
 - `failure_kind` as a stable `AgentFailureKind`,
@@ -197,6 +209,50 @@ The important contract is ownership, not file shape:
 
 `recoverySnapshotJSON` is stage-owned next-action truth, not agent-level execution truth.
 It may narrow the operator action after a watchdog failure or exhausted retry, but it must not override the settled `AgentExecution` truth described above.
+
+### Workflow Conflict Recovery
+
+When declarative graph authority fails to select a valid next state, the run 
+blocks with a `WorkflowConflictRecord`.
+
+**Conflict Classification:**
+- `unresolved`: Initial state requiring attention.
+- `lead_mediation_pending`: Escalated to a system lead for same-run resolution.
+- `operator_confirmation_required`: Lead produced a resolution that requires 
+  manual approval.
+- `resolved`: Successfully settled back into graph authority.
+- `superseded`: A newer conflict fingerprint arrived before resolution.
+- `terminal_unverifiable`: Irrecoverable conflict requiring manual resolution 
+  (e.g., clone or manual edit).
+
+**Advisory Rejection Truth:**
+If the graph advances legally despite agent hints that would have caused a 
+conflict, the runtime persists a `WorkflowAdvisoryRejectionRecord`. These are 
+not blocking and appear in run reports and history as non-critical evidence of 
+graph authority.
+
+### Transition Cursor Authority
+
+Transition completion and cursor update are one atomic settlement unit. 
+The run-level transition cursor is the authoritative continuation signal:
+
+- `currentStageID` resolution is cursor-first.
+- If a blocking `WorkflowConflictRecord` is current, the cursor remains anchored 
+  at the current state with `resume_policy=await_conflict_resolution`.
+- Transition settlement cannot be inferred from partial stage snapshots alone.
+
+### Implementation Handoff Status
+
+Runs entering implementation (Phase A/B) use `ImplementationHandoffStatus` to 
+track engine-owned handoff truth (ARCH-038):
+- **Engine-Owned Handoff**: The engine owns the deterministic `approved_proposal` 
+  snapshot and handoff artifacts.
+- **Durable Readback**: `code_writer_start_status` remains `not_queued` until an 
+  execution is actually claimed. `implementation_handoff_status` distinguishes 
+  between `ready`, `blocked_before_code`, and `running`.
+- **Failure Handling**: P053-style timeouts during planning block with 
+  `implementation_handoff_unavailable` without losing the deterministic approved 
+  proposal. Retry resumes from the handoff/planning boundary.
 
 ### Recovery uses the narrowest valid next action
 

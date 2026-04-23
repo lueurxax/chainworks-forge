@@ -5,9 +5,28 @@ CREATE TABLE IF NOT EXISTS workflow_conflicts (
   stage_execution_id TEXT REFERENCES stage_executions(id),
   lineage_id TEXT,
   current_state_id TEXT NOT NULL,
-  reason TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (
+    reason IN (
+      'invalid_next_stage_hint',
+      'no_declarative_transition_matched',
+      'multiple_declarative_transitions_matched_without_tie_break',
+      'required_artifact_or_field_missing_for_transition',
+      'aggregate_transition_truth_conflicted',
+      'workflow_conflict_unverifiable',
+      'implementation_handoff_unavailable'
+    )
+  ),
   operator_label TEXT NOT NULL,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN (
+      'unresolved',
+      'lead_mediation_pending',
+      'operator_confirmation_required',
+      'resolved',
+      'superseded',
+      'terminal_unverifiable'
+    )
+  ),
   candidate_transitions_json TEXT NOT NULL,
   candidate_transition_hash TEXT NOT NULL,
   advisory_evidence_refs_json TEXT NOT NULL DEFAULT '[]',
@@ -19,7 +38,9 @@ CREATE TABLE IF NOT EXISTS workflow_conflicts (
   superseded_by_conflict_id TEXT,
   resolution_record_json TEXT,
   terminal_failure_reason TEXT,
-  diagnostic_redaction_tier TEXT NOT NULL,
+  diagnostic_redaction_tier TEXT NOT NULL CHECK (
+    diagnostic_redaction_tier IN ('operator_safe', 'debug', 'internal')
+  ),
   record_json TEXT NOT NULL,
   UNIQUE(run_id, current_state_id, conflict_fingerprint)
 );

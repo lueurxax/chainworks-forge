@@ -48,6 +48,8 @@ pub async fn upsert_conflict_by_fingerprint_tx(
         record.clone()
     };
 
+    supersede_current_blocking_conflicts_tx(tx, &stored).await?;
+
     Ok(stored)
 }
 
@@ -87,10 +89,12 @@ pub async fn get_current_blocking_conflict(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Option<WorkflowConflictRecord>> {
-    let statuses: Vec<String> = current_blocking_statuses()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+    let statuses = current_blocking_statuses();
+    assert_eq!(
+        statuses.len(),
+        3,
+        "workflow_conflicts SQL expects exactly three current blocking statuses"
+    );
     let row = sqlx::query(
         r#"SELECT record_json
            FROM workflow_conflicts
@@ -99,9 +103,9 @@ pub async fn get_current_blocking_conflict(
            LIMIT 1"#,
     )
     .bind(run_id.to_string())
-    .bind(&statuses[0])
-    .bind(&statuses[1])
-    .bind(&statuses[2])
+    .bind(statuses[0].to_string())
+    .bind(statuses[1].to_string())
+    .bind(statuses[2].to_string())
     .fetch_optional(pool)
     .await
     .context("get current blocking workflow conflict")?;
@@ -280,7 +284,10 @@ pub async fn transition_conflict_status(
 
     record.status = status;
     record.updated_at = transitioned_at;
-    record.resolved_at = if matches!(record.status, WorkflowConflictStatus::Resolved) {
+    record.resolved_at = if matches!(
+        record.status,
+        WorkflowConflictStatus::Resolved | WorkflowConflictStatus::TerminalUnverifiable
+    ) {
         Some(transitioned_at)
     } else {
         record.resolved_at
@@ -299,6 +306,53 @@ fn current_blocking_statuses() -> [WorkflowConflictStatus; 3] {
         WorkflowConflictStatus::LeadMediationPending,
         WorkflowConflictStatus::OperatorConfirmationRequired,
     ]
+}
+
+fn is_current_blocking_status(status: &WorkflowConflictStatus) -> bool {
+    current_blocking_statuses().contains(status)
+}
+
+async fn supersede_current_blocking_conflicts_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    current: &WorkflowConflictRecord,
+) -> Result<()> {
+    if !is_current_blocking_status(&current.status) {
+        return Ok(());
+    }
+
+    let statuses = current_blocking_statuses();
+    assert_eq!(
+        statuses.len(),
+        3,
+        "workflow_conflicts SQL expects exactly three current blocking statuses"
+    );
+    let rows = sqlx::query(
+        r#"SELECT record_json
+           FROM workflow_conflicts
+           WHERE run_id = ?1
+             AND current_state_id = ?2
+             AND conflict_id != ?3
+             AND status IN (?4, ?5, ?6)"#,
+    )
+    .bind(&current.run_id)
+    .bind(&current.current_state_id)
+    .bind(&current.conflict_id)
+    .bind(statuses[0].to_string())
+    .bind(statuses[1].to_string())
+    .bind(statuses[2].to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .context("find superseded current workflow conflicts")?;
+
+    for row in rows {
+        let mut superseded = decode_conflict_row(&row)?;
+        superseded.status = WorkflowConflictStatus::Superseded;
+        superseded.updated_at = current.updated_at;
+        superseded.superseded_by_conflict_id = Some(current.conflict_id.clone());
+        write_conflict_update_tx(tx, &superseded).await?;
+    }
+
+    Ok(())
 }
 
 async fn write_conflict_insert_tx(

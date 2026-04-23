@@ -224,6 +224,55 @@ async fn p017_workflow_conflict_upsert_is_stable_by_fingerprint() {
 }
 
 #[tokio::test]
+async fn p017_new_current_state_conflict_supersedes_prior_blocking_conflict() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let mut first = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-first",
+        "First current-state conflict",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    first.conflict_fingerprint = "sha256:p017-first-current-conflict".into();
+    let mut second = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-second",
+        "Second current-state conflict",
+        WorkflowConflictStatus::Unresolved,
+        30,
+    );
+    second.conflict_fingerprint = "sha256:p017-second-current-conflict".into();
+
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &first)
+        .await
+        .unwrap();
+    let stored_second = workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &second)
+        .await
+        .unwrap();
+    let history = workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let current = workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("newer conflict should remain current");
+
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].conflict_id, "conflict-first");
+    assert_eq!(history[0].status, WorkflowConflictStatus::Superseded);
+    assert_eq!(
+        history[0].superseded_by_conflict_id.as_deref(),
+        Some("conflict-second")
+    );
+    assert_eq!(history[1].conflict_id, "conflict-second");
+    assert_eq!(history[1].status, WorkflowConflictStatus::Unresolved);
+    assert_eq!(current.conflict_id, stored_second.conflict_id);
+}
+
+#[tokio::test]
 async fn p017_current_blocking_conflict_ignores_resolved_status() {
     let pool = test_pool().await;
     let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
@@ -264,6 +313,71 @@ async fn p017_current_blocking_conflict_ignores_resolved_status() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn p017_terminal_unverifiable_sets_resolved_at_for_terminal_conflicts() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let conflict = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-terminal",
+        "Workflow conflict became terminal",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    let stored = workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+    let transitioned_at = Utc::now();
+
+    let updated = workflow_conflicts::transition_conflict_status(
+        &pool,
+        &stored.conflict_id,
+        WorkflowConflictStatus::TerminalUnverifiable,
+        transitioned_at,
+        None,
+        Some("terminal_unverifiable".into()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(updated.status, WorkflowConflictStatus::TerminalUnverifiable);
+    assert_eq!(updated.resolved_at, Some(transitioned_at));
+    assert!(
+        workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn p017_conflict_insert_rejects_invalid_redaction_tier() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let mut conflict = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-invalid-tier",
+        "Bad diagnostic tier",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    conflict.diagnostic_redaction_tier = "DEBUG".into();
+
+    let error = workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .expect_err("invalid redaction tier should fail schema validation");
+
+    assert!(
+        error
+            .to_string()
+            .contains("CHECK constraint failed"),
+        "unexpected error: {error:#}"
     );
 }
 

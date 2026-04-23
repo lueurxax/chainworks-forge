@@ -115,9 +115,11 @@ struct Proposal017Tests {
             planCompilerVersion: plan.planCompilerVersion
         )
         run.frozenWorkspaceRootPath = workspace.workspaceRoot.path
-        run.transitionCursor = TransitionCursor.initial().markingWorkflowConflictBlocked(
-            currentStateID: "state_4_proposal_reviewed",
-            currentStageExecutionID: nil
+        run.persistTransitionCursor(
+            TransitionCursor.initial().markingWorkflowConflictBlocked(
+                currentStateID: "state_4_proposal_reviewed",
+                currentStageExecutionID: nil
+            )
         )
         run.upsertWorkflowConflictRecord(
             makeP017Conflict(

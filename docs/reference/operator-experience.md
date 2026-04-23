@@ -85,70 +85,20 @@ Surfaces for backpressure visibility:
 - **Sustained Backpressure Alerts**: Notifications trigger when work remains queued
   longer than the configured threshold (default 5 minutes).
 
-### Host Interruption
+### Workflow Conflict Details
 
-Interruptions like system sleep or network migration are classified as
-`host_interruption`. They are displayed with friendly labels like "Recovering
-from system sleep" and neutral visual indicators (e.g., SF Symbol `moon.zzz`),
-distinct from failed states.
+When a run blocks due to a workflow conflict, a dedicated **Conflict Details** 
+GroupBox appears immediately after the Blocker Summary. It provides:
 
-The operator shell must not promise an action that cannot actually run from the current row.
+- **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step") 
+  plus status capsule.
+- **Current State**: The authoritative graph state where the run is anchored.
+- **Lead & Mediation**: The system lead agent assigned to the conflict and 
+  active mediation progress.
+- **Advisory Suggestion**: Redacted summary of the rejected agent hint.
+- **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
 
-If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
-
-## Runtime provenance
-
-Operator surfaces must expose runtime trust instead of hiding it behind generic success/failure labels.
-
-The current trust states are:
-
-- `Fixture / verified baseline`
-- `Legacy / unverified`
-- `Legacy / verified`
-- `Runtime / unverified`
-- `Runtime / verified`
-
-That provenance appears in:
-
-- `RunsHomeView`
-- run reports
-- run comparison
-- artifact metadata
-
-## Reports
-
-Run reporting is intentionally split into immutable history and a movable latest summary.
-
-Every stable checkpoint emits:
-
-- `run_report_v{n}.md`
-- `run_report_v{n}.json`
-- `run_summary_latest.md`
-- `run_summary_latest.json`
-
-Rules:
-
-- immutable reports are never overwritten,
-- recovery and re-arm actions append a new immutable version,
-- latest summary may advance to the newest state,
-- UI must distinguish immutable history from the latest summary.
-
-Report content includes:
-
-- run header and timestamps,
-- elapsed time and total cost,
-- workflow/catalog provenance,
-- runtime trust level,
-- runtime profile / adapter-family truth,
-- skill provenance,
-- MCP requested / predicted / actual / denied truth,
-- stage and approval summary,
-- agent/provider/model/effort usage,
-- pinned artifacts,
-- recovery notes,
-- deterministic outcome.
-
-## Recovery
+### Recovery
 
 The implemented recovery toolkit covers non-destructive paths for the current baseline:
 
@@ -157,6 +107,14 @@ The implemented recovery toolkit covers non-destructive paths for the current ba
 3. `Resume from Approval Gate`
 4. `Clone Run (Frozen Snapshot)`
 5. `Clone Run (Current Config)`
+
+**Workflow Conflict Actions:**
+- **Request lead mediation**: Escalate a conflict to the system lead for 
+  automated resolution.
+- **Inspect lead mediation**: View sanitized live status updates (queued, 
+  running, validating) while mediation is active.
+- **Manual Resolution**: For terminal conflicts, provides direct actions like 
+  `Clone Run` or `Open editable recovery artifact`.
 
 `RecoverySheet` shows:
 

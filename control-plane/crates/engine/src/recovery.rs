@@ -9,6 +9,7 @@ use db::repos::{
 };
 use db::work_item::WorkItemKind;
 use domain::agent::{AgentFailureKind, AgentOutputSettlement};
+use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::Run;
 use domain::stage::StageStatus;
 
@@ -56,6 +57,11 @@ pub struct RecoverySummary {
     pub runs_inspected: usize,
     pub runs_repaired: usize,
     pub work_items_requeued: usize,
+    pub recovered_item_count: i64,
+    pub queued_under_startup_recovery_backpressure_count: i64,
+    pub oldest_recovered_queued_age_ms: Option<i64>,
+    pub affected_run_count: i64,
+    pub next_retry_or_backoff_time: Option<chrono::DateTime<Utc>>,
 }
 
 pub async fn persist_failed_stage_recovery_snapshot(
@@ -146,6 +152,24 @@ impl RecoveryService {
         }
     }
 
+    pub fn new_with_capacity(
+        pool: SqlitePool,
+        _work_queue: WorkQueue,
+        events: EventSender,
+        invoke_agent_capacity: InvokeAgentCapacityConfig,
+    ) -> Self {
+        let work_queue = WorkQueue::with_events_and_capacity(
+            pool.clone(),
+            events.clone(),
+            invoke_agent_capacity,
+        );
+        Self {
+            pool,
+            work_queue,
+            events,
+        }
+    }
+
     pub async fn run_startup_repair(&self) -> Result<RecoverySummary> {
         let active_runs = runs::list_active(&self.pool).await?;
         let runs_inspected = active_runs.len();
@@ -175,10 +199,43 @@ impl RecoveryService {
             "Startup recovery complete"
         );
 
+        let readback = if work_items_requeued > 0 {
+            self.work_queue.refresh_scheduler_projection().await?;
+            let readback = startup_repairs::build_startup_recovery_readback(
+                &self.pool,
+                work_items_requeued as i64,
+                runs_repaired as i64,
+                Utc::now(),
+            )
+            .await?;
+            startup_repairs::record_startup_recovery_readback(&self.pool, &readback).await?;
+            Some(readback)
+        } else {
+            None
+        };
+
         Ok(RecoverySummary {
             runs_inspected,
             runs_repaired,
             work_items_requeued,
+            recovered_item_count: readback
+                .as_ref()
+                .map(|readback| readback.recovered_item_count)
+                .unwrap_or(work_items_requeued as i64),
+            queued_under_startup_recovery_backpressure_count: readback
+                .as_ref()
+                .map(|readback| readback.queued_under_startup_recovery_backpressure_count)
+                .unwrap_or(0),
+            oldest_recovered_queued_age_ms: readback
+                .as_ref()
+                .and_then(|readback| readback.oldest_recovered_queued_age_ms),
+            affected_run_count: readback
+                .as_ref()
+                .map(|readback| readback.affected_run_count)
+                .unwrap_or(runs_repaired as i64),
+            next_retry_or_backoff_time: readback
+                .as_ref()
+                .and_then(|readback| readback.next_retry_or_backoff_time),
         })
     }
 
