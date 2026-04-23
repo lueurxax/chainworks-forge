@@ -26,13 +26,31 @@ Related stable docs:
 
 ## Supported MVP provider families
 
-The current MVP provider set is:
+The current MVP provider set is normalized into five canonical families for 
+consistent capacity management and scheduling:
 
-1. `codex_acp`
-2. `claude_acp`
-3. `gemini_acp`
-4. `auggie`
-5. `junie`
+1. `claude` (aliases: `claude_acp`, `claude_agent`, `claude_agent_acp`)
+2. `gemini` (aliases: `gemini_acp`, `gemini_cli`, `gemini_cli_acp`)
+3. `codex` (aliases: `codex_acp`, `codex_cli`, `codex_cli_acp`, `openai_codex`)
+4. `auggie` (aliases: `auggie_acp`)
+5. `junie` (aliases: `junie_acp`)
+
+### Capacity Caps
+
+The control-plane daemon enforces default active-execution caps per provider family to 
+prevent saturation and ensure scheduling fairness:
+
+| Family | Default Cap |
+|---|---|
+| `claude` | 8 |
+| `gemini` | 4 |
+| `codex` | 3 |
+| `auggie` | 1 |
+| `junie` | 1 |
+
+System-wide, the daemon enforces a global cap of **20 active agent executions** and 
+a per-run cap of **4 active agent executions**. Surplus work remains queued 
+(backpressured) rather than failing.
 
 The operator should reason about provider family, configured installation/account, model, effort, capabilities, and current health without needing to care about transport internals.
 

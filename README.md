@@ -102,7 +102,6 @@ The repository is past the scaffold stage. The implemented system now includes:
 
 Active proposal work is currently concentrated in:
 
-- [`docs/proposals/015-skill-resolution-and-runtime-injection.md`](docs/proposals/015-skill-resolution-and-runtime-injection.md)
 - [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
@@ -121,6 +120,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - `ExecutionService`
   - `WorkflowOrchestrator`
   - `ResumeManager`
+  - Capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon)
 - artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`

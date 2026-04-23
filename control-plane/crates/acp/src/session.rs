@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{AcpCloseDiagnostic, ExecutionRequest, ExecutionResult};
@@ -89,23 +89,35 @@ impl AcpSession {
 #[derive(Clone)]
 pub struct AcpSessionHandle {
     inner: Arc<Mutex<AcpSession>>,
+    close_requested: Arc<Notify>,
 }
 
 impl AcpSessionHandle {
     pub fn new(session: AcpSession) -> Self {
         Self {
             inner: Arc::new(Mutex::new(session)),
+            close_requested: Arc::new(Notify::new()),
         }
     }
 
     /// Send a prompt through the live session.
     pub async fn prompt(&self, req: &ExecutionRequest) -> Result<ExecutionResult> {
         let mut session = self.inner.lock().await;
-        session.prompt(req).await
+        tokio::select! {
+            result = session.prompt(req) => result,
+            _ = self.close_requested.notified() => {
+                session.close().await?;
+                Err(anyhow::anyhow!(
+                    "ACP session closed during active prompt (session={})",
+                    session.transport.session_id()
+                ))
+            }
+        }
     }
 
     /// Close the live session.
     pub async fn close(&self) -> Result<Option<AcpCloseDiagnostic>> {
+        self.close_requested.notify_waiters();
         let mut session = self.inner.lock().await;
         session.close().await
     }

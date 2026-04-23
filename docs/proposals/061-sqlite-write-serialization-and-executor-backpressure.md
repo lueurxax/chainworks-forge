@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-19 |
-| Status | Draft |
+| Status | Implemented |
 | Author | Andrey Khasanov |
 | Depends on | [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [051-shared-xcode-mcp-bridge-pool.md](051-shared-xcode-mcp-bridge-pool.md), [056-control-plane-engine-modularization-and-typed-contracts.md](056-control-plane-engine-modularization-and-typed-contracts.md), [060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md](060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md) |
 | Scope | Keep the local Rust/SQLite control plane stable at 5 active proposal runs, bounded at 10 active runs, and capable of up to 20 active agent executions through explicit executor backpressure, provider caps, serialized write paths, and DB contention observability. |

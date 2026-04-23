@@ -6,7 +6,17 @@ The Workflow Execution Engine compiles YAML workflow definitions and agent catal
 into executable run plans, then drives them through a state machine to completion.
 It handles sequential and parallel agent execution, human approval gates, bounded
 loops, artifact persistence, transition evaluation, and safe resume after app
-interruption. All engine code lives under `Chainworks Forge/Engine/`.
+interruption.
+
+All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
+`control-plane/crates/engine/` (Rust daemon).
+
+**Rust Daemon Implementation:**
+The Rust control-plane daemon implements the same state machine and transition 
+semantics while adding robust capacity-aware scheduling, scheduler fairness, 
+executor backpressure, and host interruption recovery to handle concurrent runs 
+on a single host. See [rust-control-plane.md](rust-control-plane.md) for details 
+on the daemon's scheduler, write serialization, and recovery logic.
 
 Related stable docs:
 

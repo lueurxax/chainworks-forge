@@ -2,7 +2,7 @@
 
 Stable reference for the Rust + SQLite local control-plane daemon.
 
-This document describes the implemented system at `control-plane/` as of the P027 baseline. It is not a proposal or future-state design.
+This document describes the implemented system at `control-plane/` as of the P061 baseline. It is not a proposal or future-state design.
 
 Related stable docs:
 
@@ -57,17 +57,18 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
                |  graphql-server  |  mcp-server             |
                |       |              |                     |
                |       +------+-------+                     |
-               |              |                             |
-               |       command-handler                      |
-               |              |                             |
-               |       +------+------+                      |
-               |       |             |                      |
-               |  orchestrator   work-queue                 |
-               |       |             |                      |
-               |  domain-engine  background-executor        |
-               |       |             |                      |
-               |       +------+------+                      |
-               |              |                             |
+               |              |                     |
+               |       command-handler              |
+               |              |                     |
+               |       +------+------+              |
+               |       |             |              |
+               |  orchestrator   scheduler /        |
+               |       |         work-queue         |
+               |  domain-engine  background-executor|
+               |       |             |              |
+               |       +------+------+              |
+               |              |                     |
+
                |           event-bus                        |
                |              |                             |
                +-------+------+------+------+---------------+
@@ -281,52 +282,86 @@ The `db` crate creates the pool at `crates/db/src/pool.rs`:
 - Auto-create database file if missing
 - Migrations applied automatically on pool creation
 
-### Local concurrency target
+### Capacity-aware scheduling and backpressure
 
-The active local target, tracked by [P061](../proposals/061-sqlite-write-serialization-and-executor-backpressure.md), keeps SQLite as the source of truth and scales by bounding work rather than by adding external infrastructure:
+The active local target keeps SQLite as the source of truth and scales by bounding
+work rather than by adding external infrastructure:
 
 - 5 active runs should be stable without operator babysitting.
 - 10 active runs are allowed only when executor backpressure keeps active agent executions bounded.
-- Active run count is not active agent execution count; surplus agent work may remain queued.
+- Active run count is not active agent execution count; surplus agent work remains queued.
 - Active execution target: 20 total.
-- Initial provider caps: Gemini 4, Codex 3, Claude 8, Auggie 1, Junie 1.
-- Capacity pressure should leave work pending/backpressured; capacity alone must not mark work failed.
+- Default provider caps: Gemini 4, Codex 3, Claude 8, Auggie 1, Junie 1.
+- Provider aliases are normalized to canonical families: `claude`, `gemini`, `codex`, `auggie`, `junie`.
+- Capacity pressure leaves work pending/backpressured; capacity alone must not mark work failed.
+- Capacity state is durable, visible to operators, and supports backpressure alerts via GraphQL subscriptions and MCP notifications.
+
+### SQLite write serialization
+
+The engine enforces a single-writer model for all domain mutations through a dedicated
+write coordination layer:
+
+- **Transaction Scope**: Multi-row invariants run in a single transaction under
+  `BEGIN IMMEDIATE` with bounded retry. This covers commands like `RetryStage`,
+  `CancelRun`, and `StartupRepair` where multiple table updates must be atomic.
+- **Atomic Supersession**: Operations like `RetryStage` atomically supersede old
+  stage attempts, active agent executions, work items, and artifact source claims
+  to prevent stale running work.
+- **Excluded I/O**: Provider I/O, filesystem scans, and network waits never run
+  inside a database transaction.
+- **Write Coordination**: The `engine` crate owns command ordering and recovery
+  semantics, while `db` exposes transaction-scoped repository methods.
+- **Command Latency**: The system targets p95 command latency (approve, retry, cancel)
+  below 2 seconds even under saturated agent load. The `proposal-061` gate enforces
+  this under a load of 20 active fake agents.
+- **Contention Monitoring**: DB write lock wait time and transaction duration are
+  instrumented and exposed via GraphQL and MCP. SQLITE_BUSY retries are logged
+  and surfaced if exhausted.
+- **Host Interruption Recovery**: Detected host sleep/wake and network migration
+  epochs classify affected executions, which are then cleaned up and requeued
+  with jitter under capacity caps. Retries are exempt from provider quota budgets.
 
 ### Schema
 
-Three migration files define 18 tables across three groups.
+The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Migration 001** (`crates/db/migrations/001_initial.sql`) -- canonical tables:
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
-| `runs` | Run lifecycle: status, workflow binding, timestamps, cancellation |
+| `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
 | `agent_executions` | Per-agent invocation records (provider, model, status) |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
-| `command_journal` | Audit trail for mutating commands (type, payload, result, errors) |
+| `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
 
-**Migration 002** (`crates/db/migrations/002_projections.sql`) -- support and projection tables:
+**Projections and read-model tables** (e.g., `002_projections.sql`, `021_scheduler_backpressure_foundation.sql`):
 
 | Table | Purpose |
 |---|---|
-| `session_lineages` | Session reuse/reset metadata per agent |
-| `aggregate_settlements` | Run-level aggregate settlement records |
-| `background_leases` | Resource-keyed leases to prevent double-dispatch |
-| `startup_repairs` | Audit log of startup repair actions |
-| `runtime_invocations` | ACP adapter call tracking (provider, status, cost) |
 | `run_summaries` | Materialized run projections (stage counts, approval counts) |
 | `stage_summaries` | Materialized stage projections (status, artifacts, approvals) |
+| `scheduler_queue_summaries` | Durable aggregate readback for queued/backpressured work |
+| `scheduler_health_snapshots` | Durable health readback for counts, pressure, latency |
 | `approval_inbox` | Pending approval projection for operator surfaces |
 | `artifact_index` | Artifact discovery projection (format, pinned, report kind) |
+| `artifact_contract_summaries` | Structured verification truth for implementation assessment |
+
+**Scheduling, recovery, and host-interruption tables** (e.g., `021_scheduler_backpressure_foundation.sql` to `023_scheduler_backpressure_hysteresis_counters.sql`):
+
+| Table | Purpose |
+|---|---|
+| `scheduler_service_state` | Durable least-recently-served state for fairness |
+| `host_interruption_epochs` | Detected host sleep/wake and network migration epochs |
+| `host_interruption_affected_executions` | Executions affected by a host interruption epoch |
+| `startup_recovery_readbacks` | Durable readback for startup recovery progress and backpressure |
 | `recovery_recommendations` | Operator-facing recovery suggestions per run/stage |
-
-**Migration 003** (`crates/db/migrations/003_workflow_state_machine.sql`) -- workflow extensions:
-
-Adds `current_state`, `workflow_yaml_path`, `agent_catalog_yaml_path` to `runs`. Adds `owner_agent`, `provider`, `model`, `stage_type` to `stage_executions`.
+| `session_lineages` | Session reuse/reset metadata per agent |
+| `agent_execution_runtime_facts` | Durable provider-independent execution truth |
+| `artifact_source_claims` | CAS-backed ownership for artifact generation |
 
 ### Projection rebuild
 
@@ -351,7 +386,31 @@ The work queue (`crates/engine/src/work_queue.rs`) wraps the `work_items` SQLite
 
 The background executor (`crates/engine/src/executor.rs`) polls the queue in a loop with 100ms sleep when idle. `InvokeAgent` items are spawned as concurrent tasks; all other kinds run inline on the executor loop.
 
-The current baseline has a count-based capacity-aware claim/start gate for `InvokeAgent`: the executor checks global, provider, and per-run active execution caps before mutating ownership, and leaves capacity-blocked work pending. `InvokeAgent` completion inserts an idempotent post-completion `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the completed work item before settling the stage. P061 tracks the remaining target behavior: durable queued/backpressured readback, stronger scheduler fairness, and gate evidence for the 20-agent ceiling.
+## Capacity-aware Scheduling
+
+The executor uses a capacity-aware claim/start gate for `InvokeAgent`: it checks global,
+provider, and per-run active execution caps before mutating ownership, and leaves
+capacity-blocked work pending. 
+
+- **Default Caps**: Global 20, per-run 4, Claude 8, Gemini 4, Codex 3, Auggie 1, Junie 1.
+- **Backpressure Visibility**: Blocked work remains `pending` and is exposed via 
+  `scheduler_queue_summaries` and `scheduler_health_snapshots` projections.
+- **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion 
+  `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the 
+  completed work item before settling the stage.
+
+### Scheduler Fairness
+
+The scheduler ensures that no single run or provider family starves others:
+
+- **Bounded Candidate Window**: Reads a window of pending work (default 20) ordered 
+  by `scheduled_at` and `rowid`.
+- **Least-Recently-Served**: Selects the oldest eligible item from the run that was
+  least recently served, using the `scheduler_service_state` table to persist
+  fairness state across restarts.
+- **Deterministic Tie-breaking**: Uses `scheduled_at` then `rowid`.
+- **Hot Indexes**: Scans are backed by hot indexes on `work_items` and 
+  `agent_executions` to ensure O(1) or O(log N) lookup at scale.
 
 ## Command handler
 
@@ -389,6 +448,9 @@ The service returns a `RecoverySummary` with counts of inspected runs, repaired 
 | `GRAPHQL_ADDR` | `0.0.0.0:4000` | Bind address for the HTTP server |
 | `RUST_LOG` | `info` | Tracing filter (standard `tracing-subscriber` env filter) |
 | `MODE` | `daemon` | `daemon` for HTTP server, `mcp` for stdio MCP server |
+| `CHAINWORKS_INVOKE_AGENT_GLOBAL_CAP` | `20` | Global active agent execution cap |
+| `CHAINWORKS_INVOKE_AGENT_PER_RUN_CAP` | `4` | Per-run active agent execution cap |
+| `CHAINWORKS_INVOKE_AGENT_PROVIDER_CAP_{PROVIDER}` | varies | Provider-specific active execution caps (e.g. `_CLAUDE`, `_GEMINI`, `_CODEX`) |
 
 Provider binary paths (required when executing agents):
 
@@ -473,6 +535,11 @@ Integration tests are located in:
 - `crates/workflow/tests/integration.rs`
 - `crates/acp/tests/integration.rs`
 - `crates/daemon/tests/mcp_stdio.rs`
+
+Additional implementation-ready gates:
+
+- `./scripts/test-gate.sh proposal-058` for ACP failure classification and runtime facts.
+- `./scripts/test-gate.sh proposal-061` for SQLite write serialization and executor backpressure.
 
 ## Key design decisions
 

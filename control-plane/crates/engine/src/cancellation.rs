@@ -4,13 +4,14 @@ use acp::AcpRuntimeManager;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::sync::Arc;
 
-use db::repos::{agent_executions, projections, runs, sessions, stages, work_items};
+use db::repos::{agent_executions, projections, runs, scheduler, sessions, stages, work_items};
 use domain::agent::AgentStatus;
 use domain::events::DomainEvent;
 use domain::ids::RunId;
+use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::RunStatus;
 use domain::session::{SessionEvent, SessionEventType, SessionGenerationStatus};
 use domain::stage::StageSettlementKind;
@@ -30,12 +31,53 @@ pub struct CancellationSettlementEntry {
     pub settled_at: DateTime<Utc>,
 }
 
+pub struct BeginSettlementResult {
+    pub settlement_log: String,
+    pub scheduler_refresh: scheduler::RefreshQueueSummariesResult,
+}
+
 pub async fn begin_settlement(
     pool: &SqlitePool,
     run_id: RunId,
     requested_at: DateTime<Utc>,
 ) -> Result<String> {
-    let executions_before = agent_executions::list_by_run(pool, run_id).await?;
+    let capacity = InvokeAgentCapacityConfig::default();
+    begin_settlement_with_capacity(pool, run_id, requested_at, &capacity).await
+}
+
+pub async fn begin_settlement_with_capacity(
+    pool: &SqlitePool,
+    run_id: RunId,
+    requested_at: DateTime<Utc>,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<String> {
+    let tx_started = std::time::Instant::now();
+    let mut tx =
+        db::pool::begin_immediate_with_retry(pool, "cancellation.begin_settlement").await?;
+    let result = begin_settlement_tx(
+        &mut tx,
+        run_id,
+        requested_at,
+        capacity,
+        "cancellation.begin_settlement",
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit cancellation begin settlement")?;
+    db::pool::log_write_transaction("cancellation.begin_settlement", tx_started);
+    projections::rebuild_all_for_run(pool, run_id).await?;
+    Ok(result.settlement_log)
+}
+
+pub async fn begin_settlement_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    requested_at: DateTime<Utc>,
+    capacity: &InvokeAgentCapacityConfig,
+    refresh_context: &'static str,
+) -> Result<BeginSettlementResult> {
+    let executions_before = agent_executions::list_by_run_tx(tx, run_id).await?;
 
     let entries: Vec<CancellationSettlementEntry> = executions_before
         .iter()
@@ -51,21 +93,31 @@ pub async fn begin_settlement(
         })
         .collect();
 
-    agent_executions::cancel_running_by_run(pool, run_id, requested_at).await?;
-    work_items::cancel_running_by_run(pool, run_id).await?;
+    agent_executions::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
+    work_items::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
 
-    for stage in stages::list_by_run(pool, run_id).await? {
+    for stage in stages::list_by_run_tx(tx, run_id).await? {
         if stage.status == domain::stage::StageStatus::Running {
-            stages::settle(pool, stage.id, StageSettlementKind::Failed, requested_at).await?;
+            stages::settle_tx(tx, stage.id, StageSettlementKind::Failed, requested_at).await?;
         }
     }
 
     let settlement_log =
         serde_json::to_string(&entries).context("serialize cancellation settlement log")?;
-    runs::mark_cancelling(pool, run_id, requested_at).await?;
-    runs::update_cancellation_settlement_log(pool, run_id, &settlement_log).await?;
-    projections::rebuild_all_for_run(pool, run_id).await?;
-    Ok(settlement_log)
+    runs::mark_cancelling_tx(tx, run_id, requested_at).await?;
+    runs::update_cancellation_settlement_log_tx(tx, run_id, &settlement_log).await?;
+    let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+        tx,
+        capacity,
+        requested_at,
+        refresh_context,
+        0,
+    )
+    .await?;
+    Ok(BeginSettlementResult {
+        settlement_log,
+        scheduler_refresh,
+    })
 }
 
 pub fn spawn_finalize_settlement(

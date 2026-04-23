@@ -3,21 +3,87 @@ use std::sync::Arc;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use db::repos::{agent_executions, projections, runs, stages};
 use engine::command_handler::CommandHandler;
+use engine::event_bus::EventSender;
 
 use crate::protocol::JsonRpcRequest;
 use crate::protocol::JsonRpcResponse;
 use crate::protocol::McpTool;
 use crate::tools;
+use domain::events::DomainEvent;
 use domain::ResourceTemplateId;
 
 pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
     pub principal_table: auth::PrincipalTable,
+    events: Option<EventSender>,
+}
+
+async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
+    if let Ok(json) = serde_json::to_string(value) {
+        let mut stdout = stdout.lock().await;
+        let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+    }
+}
+
+fn spawn_scheduler_notification_pump(
+    events: EventSender,
+    stdout: Arc<Mutex<tokio::io::Stdout>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rx = events.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Some(notification) = scheduler_backpressure_mcp_notification(event) {
+                        write_json_line(&stdout, &notification).await;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn scheduler_backpressure_mcp_notification(event: DomainEvent) -> Option<serde_json::Value> {
+    let DomainEvent::SchedulerBackpressureChanged {
+        run_id,
+        stage_execution_id,
+        provider_family,
+        top_reason,
+        queued_count,
+        oldest_queued_age_ms,
+        global_queue_depth,
+        state,
+        updated_at,
+        stale_after_ms,
+    } = event
+    else {
+        return None;
+    };
+
+    Some(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "scheduler.backpressure.changed",
+        "params": {
+            "run_id": run_id,
+            "stage_execution_id": stage_execution_id,
+            "provider_family": provider_family,
+            "top_reason": top_reason,
+            "queued_count": queued_count,
+            "oldest_queued_age_ms": oldest_queued_age_ms,
+            "global_queue_depth": global_queue_depth,
+            "state": state,
+            "updated_at": updated_at.to_rfc3339(),
+            "stale_after_ms": stale_after_ms
+        }
+    }))
 }
 
 impl McpServer {
@@ -30,6 +96,21 @@ impl McpServer {
             pool,
             cmd_handler,
             principal_table,
+            events: None,
+        }
+    }
+
+    pub fn new_with_events(
+        pool: SqlitePool,
+        cmd_handler: Arc<CommandHandler>,
+        principal_table: auth::PrincipalTable,
+        events: EventSender,
+    ) -> Self {
+        Self {
+            pool,
+            cmd_handler,
+            principal_table,
+            events: Some(events),
         }
     }
 
@@ -37,10 +118,11 @@ impl McpServer {
         info!("McpServer: starting stdio JSON-RPC loop");
 
         let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
+        let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
         let mut session_principal: Option<auth::Principal> = None;
+        let mut notification_task: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
             line.clear();
@@ -59,8 +141,7 @@ impl McpServer {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
-                    let json = serde_json::to_string(&resp).unwrap_or_default();
-                    let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+                    write_json_line(&stdout, &resp).await;
                     continue;
                 }
             };
@@ -79,9 +160,7 @@ impl McpServer {
                         -32600,
                         "Session already initialized".to_string(),
                     );
-                    if let Ok(json) = serde_json::to_string(&resp) {
-                        let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
-                    }
+                    write_json_line(&stdout, &resp).await;
                     continue;
                 }
 
@@ -94,15 +173,22 @@ impl McpServer {
                 match token {
                     Some(t) => match auth::resolve_bearer(t, &self.principal_table) {
                         Ok(p) => {
+                            let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
                             session_principal = Some(p);
                             // Return normal initialize response
                             let resp = self
                                 .handle_request(request, session_principal.as_ref().unwrap())
                                 .await;
-                            if !is_notification {
-                                if let Ok(json) = serde_json::to_string(&resp) {
-                                    let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+                            if notification_task.is_none() && is_operator {
+                                if let Some(events) = &self.events {
+                                    notification_task = Some(spawn_scheduler_notification_pump(
+                                        events.clone(),
+                                        Arc::clone(&stdout),
+                                    ));
                                 }
+                            }
+                            if !is_notification {
+                                write_json_line(&stdout, &resp).await;
                             }
                         }
                         Err(_) => {
@@ -111,9 +197,7 @@ impl McpServer {
                                 -32000,
                                 "unauthorized: unknown token".to_string(),
                             );
-                            if let Ok(json) = serde_json::to_string(&resp) {
-                                let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
-                            }
+                            write_json_line(&stdout, &resp).await;
                             break;
                         }
                     },
@@ -123,9 +207,7 @@ impl McpServer {
                             -32000,
                             "unauthorized: principal_token required on initialize".to_string(),
                         );
-                        if let Ok(json) = serde_json::to_string(&resp) {
-                            let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
-                        }
+                        write_json_line(&stdout, &resp).await;
                         break;
                     }
                 }
@@ -141,9 +223,7 @@ impl McpServer {
                         -32002,
                         "server not initialized".to_string(),
                     );
-                    if let Ok(json) = serde_json::to_string(&resp) {
-                        let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
-                    }
+                    write_json_line(&stdout, &resp).await;
                     break;
                 }
             };
@@ -153,12 +233,13 @@ impl McpServer {
                 let _ = self.handle_request(request, principal).await;
             } else {
                 let response = self.handle_request(request, principal).await;
-                if let Ok(json) = serde_json::to_string(&response) {
-                    let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
-                }
+                write_json_line(&stdout, &response).await;
             }
         }
 
+        if let Some(task) = notification_task {
+            task.abort();
+        }
         Ok(())
     }
 
@@ -686,6 +767,41 @@ fn resource_template_value(id: ResourceTemplateId) -> serde_json::Value {
 #[cfg(test)]
 mod resource_tests {
     use super::*;
+
+    #[test]
+    fn scheduler_backpressure_domain_event_maps_to_mcp_notification() {
+        let updated_at = chrono::Utc::now();
+        let notification =
+            scheduler_backpressure_mcp_notification(DomainEvent::SchedulerBackpressureChanged {
+                run_id: Some("run-1".into()),
+                stage_execution_id: Some("stage-1".into()),
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 300_000,
+                global_queue_depth: 5,
+                state: "active".into(),
+                updated_at,
+                stale_after_ms: 60_000,
+            })
+            .expect("scheduler event should map to MCP notification");
+
+        assert_eq!(notification["jsonrpc"], serde_json::json!("2.0"));
+        assert_eq!(
+            notification["method"],
+            serde_json::json!("scheduler.backpressure.changed")
+        );
+        assert_eq!(notification["params"]["run_id"], serde_json::json!("run-1"));
+        assert_eq!(
+            notification["params"]["provider_family"],
+            serde_json::json!("codex")
+        );
+        assert_eq!(notification["params"]["state"], serde_json::json!("active"));
+        assert_eq!(
+            notification["params"]["updated_at"],
+            serde_json::json!(updated_at.to_rfc3339())
+        );
+    }
 
     #[test]
     fn test_mcp_resource_uri_parser_maps_templates_at_server_boundary() {

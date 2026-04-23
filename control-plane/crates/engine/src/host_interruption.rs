@@ -1,23 +1,34 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Instant;
 
+use acp::AcpRuntimeManager;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use db::repos::{agent_executions, scheduler, work_items};
-use domain::agent::{AgentStatus, OperatorActionHint};
+use db::repos::{agent_executions, artifact_contracts, scheduler, work_items};
+use domain::agent::AgentStatus;
 use domain::ids::RunId;
 use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout, Duration as TokioDuration, MissedTickBehavior};
+use tracing::warn;
 
 use crate::work_queue::WorkQueue;
 
 const RETRY_BATCH_PER_PROVIDER: i64 = 2;
 const RETRY_JITTER_MIN_SECONDS: i64 = 5;
 const RETRY_JITTER_SPAN_SECONDS: i64 = 26;
+const HEARTBEAT_INTERVAL_SECONDS: u64 = 10;
+const RUNTIME_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct HostInterruptionService {
     pool: SqlitePool,
     work_queue: WorkQueue,
     capacity_config: InvokeAgentCapacityConfig,
+    runtime_cleanup: Option<Arc<dyn HostInterruptionRuntimeCleanup>>,
 }
 
 pub struct HostInterruptionDetector {
@@ -74,24 +85,31 @@ impl HostInterruptionKind {
     fn operator_action(self) -> &'static str {
         match self {
             HostInterruptionKind::SystemSleep | HostInterruptionKind::WallClockGap => {
-                OperatorActionHint::RecoveringFromSystemSleep.to_string_static()
+                "recovering_from_system_sleep"
             }
-            HostInterruptionKind::NetworkMigration => {
-                OperatorActionHint::ResumingAfterNetworkChange.to_string_static()
-            }
+            HostInterruptionKind::NetworkMigration => "resuming_after_network_change",
         }
     }
 }
 
-trait StaticOperatorActionHint {
-    fn to_string_static(&self) -> &'static str;
+#[async_trait]
+pub trait HostInterruptionRuntimeCleanup: Send + Sync {
+    async fn close_session_generation(&self, generation_id: &str) -> Result<()>;
 }
 
-impl StaticOperatorActionHint for OperatorActionHint {
-    fn to_string_static(&self) -> &'static str {
-        match self {
-            OperatorActionHint::RecoveringFromSystemSleep => "recovering_from_system_sleep",
-            OperatorActionHint::ResumingAfterNetworkChange => "resuming_after_network_change",
+#[async_trait]
+impl HostInterruptionRuntimeCleanup for AcpRuntimeManager {
+    async fn close_session_generation(&self, generation_id: &str) -> Result<()> {
+        match self.close_session(generation_id).await {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("No live ACP session registered for generation id") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -193,6 +211,42 @@ impl HostInterruptionDetector {
     }
 }
 
+pub fn spawn_runtime_heartbeat_monitor(service: HostInterruptionService) -> JoinHandle<()> {
+    spawn_runtime_heartbeat_monitor_with_config(
+        service,
+        HostInterruptionDetectorConfig::default(),
+        TokioDuration::from_secs(HEARTBEAT_INTERVAL_SECONDS),
+    )
+}
+
+pub fn spawn_runtime_heartbeat_monitor_with_config(
+    service: HostInterruptionService,
+    config: HostInterruptionDetectorConfig,
+    heartbeat_interval: TokioDuration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let monotonic_started = Instant::now();
+        let mut detector = HostInterruptionDetector::with_config(service, config);
+        let mut ticks = interval(heartbeat_interval);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticks.tick().await;
+            let monotonic_elapsed_ms = monotonic_started.elapsed().as_millis() as i64;
+            let snapshot = HostInterruptionClockSnapshot {
+                wall_clock: Utc::now(),
+                monotonic_elapsed_ms: Some(monotonic_elapsed_ms),
+            };
+            if let Err(error) = detector.observe_clock_snapshot(snapshot).await {
+                warn!(
+                    error = %error,
+                    "host interruption heartbeat recovery failed"
+                );
+            }
+        }
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostInterruptionRecoverySummary {
     pub epoch_id: String,
@@ -201,6 +255,9 @@ pub struct HostInterruptionRecoverySummary {
     pub retries_enqueued: usize,
     pub retries_deferred_capacity: usize,
     pub retries_missing_work_item: usize,
+    pub runtime_cleanup_attempted: usize,
+    pub runtime_cleanup_succeeded: usize,
+    pub runtime_cleanup_failed: usize,
 }
 
 impl HostInterruptionService {
@@ -217,6 +274,21 @@ impl HostInterruptionService {
             pool,
             work_queue,
             capacity_config,
+            runtime_cleanup: None,
+        }
+    }
+
+    pub fn with_capacity_config_and_runtime_cleanup(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        capacity_config: InvokeAgentCapacityConfig,
+        runtime_cleanup: Arc<dyn HostInterruptionRuntimeCleanup>,
+    ) -> Self {
+        Self {
+            pool,
+            work_queue,
+            capacity_config,
+            runtime_cleanup: Some(runtime_cleanup),
         }
     }
 
@@ -225,6 +297,15 @@ impl HostInterruptionService {
         event: HostInterruptionEvent,
     ) -> Result<HostInterruptionRecoverySummary> {
         let now = Utc::now();
+        let cleanup_summary = self.cleanup_runtime_sessions_for_event(&event, now).await?;
+        let transaction_started = Instant::now();
+        let writer_wait_started_at = Instant::now();
+        let mut tx = db::pool::begin_immediate_with_retry(
+            &self.pool,
+            "host_interruption.record_and_requeue",
+        )
+        .await?;
+        let writer_wait_ms = writer_wait_started_at.elapsed().as_millis() as i64;
         let epoch = scheduler::HostInterruptionEpoch {
             id: uuid::Uuid::new_v4().to_string(),
             kind: event.kind.as_str().to_string(),
@@ -235,19 +316,19 @@ impl HostInterruptionService {
             details_json: event.details_json,
             created_at: now,
         };
-        scheduler::insert_host_interruption_epoch(&self.pool, &epoch).await?;
+        scheduler::insert_host_interruption_epoch_tx(&mut tx, &epoch).await?;
 
         let affected_end = event.ended_at.unwrap_or(now);
-        let affected = agent_executions::list_running_across_interval(
-            &self.pool,
+        let affected = agent_executions::list_running_across_interval_tx(
+            &mut tx,
             event.started_at,
             affected_end,
         )
         .await?;
 
         for execution in &affected {
-            agent_executions::update_completed(
-                &self.pool,
+            agent_executions::update_completed_tx(
+                &mut tx,
                 execution.id,
                 AgentStatus::Cancelled,
                 now,
@@ -255,7 +336,7 @@ impl HostInterruptionService {
             .await?;
         }
 
-        let mut slots = ActiveSlotCounts::load(&self.pool).await?;
+        let mut slots = ActiveSlotCounts::load_tx(&mut tx).await?;
         let mut provider_batches: BTreeMap<String, i64> = BTreeMap::new();
         let mut summary = HostInterruptionRecoverySummary {
             epoch_id: epoch.id.clone(),
@@ -264,6 +345,9 @@ impl HostInterruptionService {
             retries_enqueued: 0,
             retries_deferred_capacity: 0,
             retries_missing_work_item: 0,
+            runtime_cleanup_attempted: cleanup_summary.attempted,
+            runtime_cleanup_succeeded: cleanup_summary.succeeded,
+            runtime_cleanup_failed: cleanup_summary.failed,
         };
 
         for execution in affected {
@@ -282,16 +366,10 @@ impl HostInterruptionService {
                     || !slots.try_reserve(execution.run_id, family, &self.capacity_config)
                 {
                     let scheduled_at = delayed_retry_at(now, summary.retries_deferred_capacity);
-                    let requeued =
-                        work_items::requeue_running_invoke_agent_by_stage_for_host_interruption(
-                            &self.pool,
-                            execution.run_id,
-                            &execution.stage_id,
-                            execution.stage_execution_id,
-                            scheduled_at,
-                        )
-                        .await?;
-                    if requeued == 0 {
+                    if requeue_retry_for_execution_tx(&mut tx, &execution, scheduled_at, &epoch.id)
+                        .await?
+                        .is_none()
+                    {
                         summary.retries_missing_work_item += 1;
                     } else {
                         summary.retries_deferred_capacity += 1;
@@ -303,16 +381,10 @@ impl HostInterruptionService {
                             RETRY_JITTER_MIN_SECONDS
                                 + (summary.retries_enqueued as i64 % RETRY_JITTER_SPAN_SECONDS),
                         );
-                    let requeued =
-                        work_items::requeue_running_invoke_agent_by_stage_for_host_interruption(
-                            &self.pool,
-                            execution.run_id,
-                            &execution.stage_id,
-                            execution.stage_execution_id,
-                            scheduled_at,
-                        )
-                        .await?;
-                    if requeued == 0 {
+                    if requeue_retry_for_execution_tx(&mut tx, &execution, scheduled_at, &epoch.id)
+                        .await?
+                        .is_none()
+                    {
                         slots.release(execution.run_id, family);
                         summary.retries_missing_work_item += 1;
                     } else {
@@ -323,16 +395,10 @@ impl HostInterruptionService {
                 }
             } else {
                 let scheduled_at = delayed_retry_at(now, summary.retries_deferred_capacity);
-                let requeued =
-                    work_items::requeue_running_invoke_agent_by_stage_for_host_interruption(
-                        &self.pool,
-                        execution.run_id,
-                        &execution.stage_id,
-                        execution.stage_execution_id,
-                        scheduled_at,
-                    )
-                    .await?;
-                if requeued == 0 {
+                if requeue_retry_for_execution_tx(&mut tx, &execution, scheduled_at, &epoch.id)
+                    .await?
+                    .is_none()
+                {
                     summary.retries_missing_work_item += 1;
                 } else {
                     summary.retries_deferred_capacity += 1;
@@ -340,8 +406,8 @@ impl HostInterruptionService {
                 }
             }
 
-            scheduler::insert_host_interruption_affected_execution(
-                &self.pool,
+            scheduler::insert_host_interruption_affected_execution_tx(
+                &mut tx,
                 &scheduler::HostInterruptionAffectedExecution {
                     epoch_id: epoch.id.clone(),
                     agent_execution_id: execution.id.to_string(),
@@ -356,9 +422,114 @@ impl HostInterruptionService {
             .await?;
         }
 
-        self.work_queue.refresh_scheduler_projection().await?;
+        let refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &self.capacity_config,
+            now,
+            "host_interruption.record_and_requeue",
+            writer_wait_ms,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit host interruption recovery")?;
+        db::pool::log_write_transaction(
+            "host_interruption.record_and_requeue",
+            transaction_started,
+        );
+        self.work_queue.publish_scheduler_notification(refresh);
         Ok(summary)
     }
+
+    async fn cleanup_runtime_sessions_for_event(
+        &self,
+        event: &HostInterruptionEvent,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeCleanupSummary> {
+        let Some(runtime_cleanup) = &self.runtime_cleanup else {
+            return Ok(RuntimeCleanupSummary::default());
+        };
+
+        let affected_end = event.ended_at.unwrap_or(now);
+        let affected = agent_executions::list_running_across_interval(
+            &self.pool,
+            event.started_at,
+            affected_end,
+        )
+        .await?;
+
+        let mut summary = RuntimeCleanupSummary::default();
+        for execution in affected {
+            let Some(generation_id) = execution.session_generation_id.as_deref() else {
+                continue;
+            };
+            summary.attempted += 1;
+            match timeout(
+                RUNTIME_CLEANUP_TIMEOUT,
+                runtime_cleanup.close_session_generation(generation_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => summary.succeeded += 1,
+                Ok(Err(error)) => {
+                    warn!(
+                        error = %error,
+                        generation_id,
+                        execution_id = %execution.id,
+                        "host interruption runtime cleanup failed before retry enqueue"
+                    );
+                    summary.failed += 1;
+                }
+                Err(_) => {
+                    warn!(
+                        generation_id,
+                        execution_id = %execution.id,
+                        timeout_ms = RUNTIME_CLEANUP_TIMEOUT.as_millis() as i64,
+                        "host interruption runtime cleanup timed out before retry enqueue"
+                    );
+                    summary.failed += 1;
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+}
+
+#[derive(Default)]
+struct RuntimeCleanupSummary {
+    attempted: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+async fn requeue_retry_for_execution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    execution: &agent_executions::RunningAgentExecution,
+    scheduled_at: DateTime<Utc>,
+    epoch_id: &str,
+) -> Result<Option<String>> {
+    let requeued_work_item_ids =
+        work_items::requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
+            tx,
+            execution.run_id,
+            &execution.stage_id,
+            execution.stage_execution_id,
+            scheduled_at,
+        )
+        .await?;
+    let superseding_work_item_id = requeued_work_item_ids.first().cloned();
+    if let Some(work_item_id) = superseding_work_item_id.as_deref() {
+        artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
+            tx,
+            execution.run_id,
+            &execution.stage_execution_id.to_string(),
+            work_item_id,
+            epoch_id,
+        )
+        .await?;
+    }
+    Ok(superseding_work_item_id)
 }
 
 fn delayed_retry_at(now: DateTime<Utc>, deferred_count: usize) -> DateTime<Utc> {
@@ -373,11 +544,11 @@ struct ActiveSlotCounts {
 }
 
 impl ActiveSlotCounts {
-    async fn load(pool: &SqlitePool) -> Result<Self> {
+    async fn load_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<Self> {
         let mut counts = Self::default();
         counts.global =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
-                .fetch_one(pool)
+                .fetch_one(&mut **tx)
                 .await
                 .context("count running executions for host interruption retry slots")?;
 
@@ -388,7 +559,7 @@ impl ActiveSlotCounts {
                WHERE ae.status = 'running'
                GROUP BY se.run_id"#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .context("count running executions by run for host interruption retry slots")?;
         for row in run_rows {
@@ -401,7 +572,7 @@ impl ActiveSlotCounts {
                WHERE status = 'running'
                GROUP BY COALESCE(provider_family, provider)"#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .context("count running executions by provider for host interruption retry slots")?;
         for row in provider_rows {

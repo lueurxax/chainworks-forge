@@ -5,7 +5,10 @@ use async_graphql::*;
 use sqlx::SqlitePool;
 use tokio_stream::wrappers::BroadcastStream;
 
-use db::repos::{approvals, artifact_contracts, ideas, projections, runs, steward as steward_repo};
+use db::repos::{
+    approvals, artifact_contracts, ideas, projections, runs, scheduler, startup_repairs,
+    steward as steward_repo,
+};
 use domain::commands::{
     ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
     StartRunCmd,
@@ -21,6 +24,12 @@ use crate::types::approval::GqlApproval;
 use crate::types::artifact::GqlArtifact;
 use crate::types::idea::GqlIdea;
 use crate::types::run::GqlRun;
+use crate::types::scheduler::{
+    GqlCommandLatencySummary, GqlDbWriterContentionSummary, GqlHostInterruptionAffectedExecution,
+    GqlHostInterruptionEpoch, GqlSchedulerBackpressureNotification, GqlSchedulerHealthSummary,
+    GqlSchedulerProviderActiveCount, GqlSchedulerQueuePositionHint, GqlSchedulerQueueSummary,
+    GqlStartupRecoverySummary,
+};
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
@@ -47,22 +56,24 @@ pub fn build_schema(
 pub struct QueryRoot;
 
 fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
-    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
-        if principal.class != auth::PrincipalClass::Operator {
-            return Err(Error::new("forbidden"));
-        }
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    if principal.class != auth::PrincipalClass::Operator {
+        return Err(Error::new("forbidden"));
     }
     Ok(())
 }
 
 fn require_operator_or_observer_read(ctx: &Context<'_>) -> Result<()> {
-    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
-        if !matches!(
-            principal.class,
-            auth::PrincipalClass::Operator | auth::PrincipalClass::Observer
-        ) {
-            return Err(Error::new("forbidden"));
-        }
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    if !matches!(
+        principal.class,
+        auth::PrincipalClass::Operator | auth::PrincipalClass::Observer
+    ) {
+        return Err(Error::new("forbidden"));
     }
     Ok(())
 }
@@ -219,6 +230,192 @@ impl QueryRoot {
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let items = db::repos::agent_executions::find_by_stage(pool, stage_execution_id).await?;
         Ok(items.into_iter().map(GqlAgentExecution::from).collect())
+    }
+
+    async fn scheduler_health_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlSchedulerHealthSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(GqlSchedulerHealthSummary::from))
+    }
+
+    async fn startup_recovery_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlStartupRecoverySummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(startup_repairs::latest_startup_recovery_readback(pool)
+            .await?
+            .map(GqlStartupRecoverySummary::from))
+    }
+
+    async fn command_latency_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlCommandLatencySummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(|snapshot| {
+                let now = chrono::Utc::now();
+                let is_stale = snapshot.is_stale_at(now);
+                GqlCommandLatencySummary {
+                    command_latency_p95_ms_json: snapshot.command_latency_p95_ms_json,
+                    updated_at: snapshot.updated_at.to_rfc3339(),
+                    stale_after_ms: snapshot.stale_after_ms,
+                    is_stale,
+                }
+            }))
+    }
+
+    async fn db_writer_contention_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlDbWriterContentionSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(|snapshot| {
+                let now = chrono::Utc::now();
+                GqlDbWriterContentionSummary {
+                    db_writer_wait_p95_ms: snapshot.db_writer_wait_p95_ms,
+                    updated_at: snapshot.updated_at.to_rfc3339(),
+                    stale_after_ms: snapshot.stale_after_ms,
+                    is_stale: snapshot.is_stale_at(now),
+                }
+            }))
+    }
+
+    async fn active_execution_counts_by_provider(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<GqlSchedulerProviderActiveCount>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::list_active_execution_counts_by_provider(pool)
+            .await?
+            .into_iter()
+            .map(GqlSchedulerProviderActiveCount::from)
+            .collect())
+    }
+
+    async fn queued_backpressured_counts_by_provider_and_reason(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<GqlSchedulerQueueSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::list_queue_summaries(pool)
+            .await?
+            .into_iter()
+            .filter(|summary| summary.scope == "global")
+            .map(GqlSchedulerQueueSummary::from)
+            .collect())
+    }
+
+    async fn run_queue_summary(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlSchedulerQueueSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_queue_summaries_by_run(pool, run_id.as_str())
+                .await?
+                .into_iter()
+                .map(GqlSchedulerQueueSummary::from)
+                .collect(),
+        )
+    }
+
+    async fn stage_queue_summary(
+        &self,
+        ctx: &Context<'_>,
+        stage_execution_id: ID,
+    ) -> Result<Vec<GqlSchedulerQueueSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_queue_summaries_by_stage(pool, stage_execution_id.as_str())
+                .await?
+                .into_iter()
+                .map(GqlSchedulerQueueSummary::from)
+                .collect(),
+        )
+    }
+
+    async fn oldest_queued_age(&self, ctx: &Context<'_>) -> Result<Option<i64>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(scheduler::latest_health_snapshot(pool)
+            .await?
+            .map(|snapshot| snapshot.oldest_queued_age_ms))
+    }
+
+    async fn queue_position_hint(
+        &self,
+        ctx: &Context<'_>,
+        run_id: Option<ID>,
+        stage_execution_id: Option<ID>,
+    ) -> Result<Option<GqlSchedulerQueuePositionHint>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        match (run_id, stage_execution_id) {
+            (Some(run_id), None) => {
+                Ok(scheduler::queue_position_hint_by_run(pool, run_id.as_str())
+                    .await?
+                    .map(GqlSchedulerQueuePositionHint::from))
+            }
+            (None, Some(stage_execution_id)) => Ok(scheduler::queue_position_hint_by_stage(
+                pool,
+                stage_execution_id.as_str(),
+            )
+            .await?
+            .map(GqlSchedulerQueuePositionHint::from)),
+            _ => Err(Error::new(
+                "provide exactly one of runId or stageExecutionId",
+            )),
+        }
+    }
+
+    async fn host_interruption_epochs(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlHostInterruptionEpoch>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_host_interruption_epochs_by_run(pool, run_id.as_str())
+                .await?
+                .into_iter()
+                .map(GqlHostInterruptionEpoch::from)
+                .collect(),
+        )
+    }
+
+    async fn host_interruption_affected_executions(
+        &self,
+        ctx: &Context<'_>,
+        epoch_id: ID,
+    ) -> Result<Vec<GqlHostInterruptionAffectedExecution>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(
+            scheduler::list_host_interruption_affected_executions_by_epoch(pool, epoch_id.as_str())
+                .await?
+                .into_iter()
+                .map(GqlHostInterruptionAffectedExecution::from)
+                .collect(),
+        )
     }
 
     async fn steward_analyses(
@@ -1054,6 +1251,52 @@ impl SubscriptionRoot {
             }
         }))
     }
+
+    async fn scheduler_backpressure_changed(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<
+        impl async_graphql::futures_util::Stream<Item = Result<GqlSchedulerBackpressureNotification>>,
+    > {
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        if principal.class != auth::PrincipalClass::Operator {
+            return Err(Error::new("forbidden"));
+        }
+
+        let events = ctx.data::<EventSender>()?.clone();
+        let rx = events.subscribe();
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| async move {
+            let event = msg.ok()?;
+            match event {
+                DomainEvent::SchedulerBackpressureChanged {
+                    run_id,
+                    stage_execution_id,
+                    provider_family,
+                    top_reason,
+                    queued_count,
+                    oldest_queued_age_ms,
+                    global_queue_depth,
+                    state,
+                    updated_at,
+                    stale_after_ms,
+                } => Some(Ok(GqlSchedulerBackpressureNotification::from_event(
+                    run_id,
+                    stage_execution_id,
+                    provider_family,
+                    top_reason,
+                    queued_count,
+                    oldest_queued_age_ms,
+                    global_queue_depth,
+                    state,
+                    updated_at,
+                    stale_after_ms,
+                ))),
+                _ => None,
+            }
+        }))
+    }
 }
 
 /// Runtime lifecycle event surfaced to GraphQL subscribers.
@@ -1214,6 +1457,57 @@ mod tests {
         create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed")
+    }
+
+    #[tokio::test]
+    async fn test_operator_query_rejects_missing_principal() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let response = schema.execute(Request::new("{ runs { id } }")).await;
+
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|error| error.message == "unauthorized"),
+            "operator query without principal must fail closed, got {:?}",
+            response.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_observer_query_rejects_missing_principal() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let response = schema
+            .execute(Request::new(format!(
+                r#"{{ stage(id: "{}") {{ id }} }}"#,
+                domain::ids::StageExecutionId::new()
+            )))
+            .await;
+
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|error| error.message == "unauthorized"),
+            "observer query without principal must fail closed, got {:?}",
+            response.errors
+        );
     }
 
     async fn p043_test_pool() -> sqlx::SqlitePool {
@@ -1391,6 +1685,403 @@ mod tests {
                 "source": "runtime_policy"
             }
         })
+    }
+
+    #[tokio::test]
+    async fn proposal_061_scheduler_graphql_readback_exposes_durable_state() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+        let running_agent_execution_id = domain::ids::AgentExecutionId::new();
+        let now = Utc::now();
+        db::repos::agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: running_agent_execution_id,
+                stage_execution_id,
+                agent_id: "code_writer".to_string(),
+                provider: "codex_cli".to_string(),
+                model: None,
+                started_at: now,
+                completed_at: None,
+                status: domain::agent::AgentStatus::Running,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: None,
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: "p061-queued-agent".into(),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "provider": "codex_cli"
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some("stage_1".into()),
+                created_at: now - chrono::Duration::seconds(130),
+                scheduled_at: now - chrono::Duration::seconds(120),
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+        for summary in [
+            scheduler::SchedulerQueueSummary {
+                scope: "global".into(),
+                scope_id: String::new(),
+                run_id: None,
+                stage_execution_id: None,
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 3,
+                oldest_queued_age_ms: 301_000,
+                global_queue_depth: 7,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+            scheduler::SchedulerQueueSummary {
+                scope: "run".into(),
+                scope_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: None,
+                provider_family: Some("codex".into()),
+                top_reason: "run_capacity".into(),
+                queued_count: 2,
+                oldest_queued_age_ms: 121_000,
+                global_queue_depth: 7,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+            scheduler::SchedulerQueueSummary {
+                scope: "stage".into(),
+                scope_id: stage_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: Some(stage_execution_id.to_string()),
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 1,
+                oldest_queued_age_ms: 120_000,
+                global_queue_depth: 7,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        ] {
+            scheduler::upsert_queue_summary(&pool, &summary)
+                .await
+                .unwrap();
+        }
+        scheduler::insert_health_snapshot(
+            &pool,
+            &scheduler::SchedulerHealthSnapshot {
+                id: "scheduler-health-gql-1".into(),
+                queued_count: 3,
+                oldest_queued_age_ms: 301_000,
+                global_queue_depth: 7,
+                active_agent_executions: 20,
+                db_writer_wait_p95_ms: Some(9),
+                command_latency_p95_ms_json: Some(r#"{"approve_stage":42}"#.into()),
+                last_host_interruption_epoch_id: Some("host-epoch-gql-1".into()),
+                sustained_backpressure_state: "active".into(),
+                fire_consecutive_snapshots: 2,
+                clear_consecutive_snapshots: 0,
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        startup_repairs::record_startup_recovery_readback(
+            &pool,
+            &startup_repairs::StartupRecoveryReadback {
+                id: "startup-recovery-gql-1".into(),
+                recovered_item_count: 4,
+                queued_under_startup_recovery_backpressure_count: 2,
+                oldest_recovered_queued_age_ms: Some(120_000),
+                affected_run_count: 2,
+                next_retry_or_backoff_time: Some(now + chrono::Duration::seconds(30)),
+                stale_after_ms: 60_000,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_epoch(
+            &pool,
+            &scheduler::HostInterruptionEpoch {
+                id: "host-epoch-gql-1".into(),
+                kind: "system_sleep".into(),
+                started_at: now - chrono::Duration::seconds(60),
+                ended_at: Some(now),
+                monotonic_gap_ms: None,
+                wall_clock_gap_ms: Some(60_000),
+                details_json: Some(r#"{"source":"test"}"#.into()),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_affected_execution(
+            &pool,
+            &scheduler::HostInterruptionAffectedExecution {
+                epoch_id: "host-epoch-gql-1".into(),
+                agent_execution_id: running_agent_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: stage_execution_id.to_string(),
+                provider_family: Some("codex".into()),
+                action: "recovering_from_system_sleep".into(),
+                retry_enqueued_at: Some(now + chrono::Duration::seconds(5)),
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"{{
+                      schedulerHealthSummary {{
+                        sustainedBackpressureState
+                        oldestQueuedAgeMs
+                        commandLatencyP95MsJson
+                        isStale
+                      }}
+                      startupRecoverySummary {{
+                        recoveredItemCount
+                        queuedUnderStartupRecoveryBackpressureCount
+                        oldestRecoveredQueuedAgeMs
+                        affectedRunCount
+                        nextRetryOrBackoffTime
+                      }}
+                      commandLatencySummary {{
+                        commandLatencyP95MsJson
+                      }}
+                      dbWriterContentionSummary {{
+                        dbWriterWaitP95Ms
+                      }}
+                      activeExecutionCountsByProvider {{
+                        providerFamily
+                        activeCount
+                      }}
+                      queuedBackpressuredCountsByProviderAndReason {{
+                        scope
+                        providerFamily
+                        topReason
+                        queuedCount
+                        globalQueueDepth
+                      }}
+                      runQueueSummary(runId: "{run_id}") {{
+                        scope
+                        scopeId
+                        topReason
+                        queuedCount
+                      }}
+                      stageQueueSummary(stageExecutionId: "{stage_execution_id}") {{
+                        scope
+                        stageExecutionId
+                        topReason
+                        queuedCount
+                      }}
+                      oldestQueuedAge
+                      queuePositionHint(runId: "{run_id}") {{
+                        queuePosition
+                        queuedAheadCount
+                        scopedQueuedCount
+                        globalQueueDepth
+                      }}
+                      hostInterruptionEpochs(runId: "{run_id}") {{
+                        id
+                        kind
+                        affectedExecutions {{
+                          agentExecutionId
+                          providerFamily
+                          action
+                        }}
+                      }}
+                      hostInterruptionAffectedExecutions(epochId: "host-epoch-gql-1") {{
+                        epochId
+                        stageExecutionId
+                        action
+                      }}
+                    }}"#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "scheduler readback query must succeed: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        assert_eq!(
+            data["schedulerHealthSummary"]["sustainedBackpressureState"],
+            "active"
+        );
+        assert_eq!(
+            data["schedulerHealthSummary"]["commandLatencyP95MsJson"],
+            r#"{"approve_stage":42}"#
+        );
+        assert_eq!(data["startupRecoverySummary"]["recoveredItemCount"], 4);
+        assert_eq!(
+            data["startupRecoverySummary"]["queuedUnderStartupRecoveryBackpressureCount"],
+            2
+        );
+        assert_eq!(
+            data["startupRecoverySummary"]["oldestRecoveredQueuedAgeMs"],
+            120_000
+        );
+        assert_eq!(data["startupRecoverySummary"]["affectedRunCount"], 2);
+        assert!(
+            data["startupRecoverySummary"]["nextRetryOrBackoffTime"]
+                .as_str()
+                .is_some(),
+            "startup recovery readback must expose next retry/backoff time"
+        );
+        assert_eq!(
+            data["commandLatencySummary"]["commandLatencyP95MsJson"],
+            r#"{"approve_stage":42}"#
+        );
+        assert_eq!(data["dbWriterContentionSummary"]["dbWriterWaitP95Ms"], 9);
+        assert_eq!(data["oldestQueuedAge"], 301_000);
+        assert_eq!(
+            data["queuedBackpressuredCountsByProviderAndReason"][0]["topReason"],
+            "provider_capacity"
+        );
+        assert_eq!(data["runQueueSummary"][0]["topReason"], "run_capacity");
+        assert_eq!(
+            data["stageQueueSummary"][0]["stageExecutionId"],
+            stage_execution_id.to_string()
+        );
+        assert_eq!(
+            data["activeExecutionCountsByProvider"][0]["providerFamily"],
+            "codex"
+        );
+        assert_eq!(data["activeExecutionCountsByProvider"][0]["activeCount"], 1);
+        assert_eq!(data["queuePositionHint"]["queuePosition"], 1);
+        assert_eq!(data["queuePositionHint"]["scopedQueuedCount"], 1);
+        assert_eq!(data["hostInterruptionEpochs"][0]["id"], "host-epoch-gql-1");
+        assert_eq!(
+            data["hostInterruptionEpochs"][0]["affectedExecutions"][0]["action"],
+            "recovering_from_system_sleep"
+        );
+        assert_eq!(
+            data["hostInterruptionAffectedExecutions"][0]["stageExecutionId"],
+            stage_execution_id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_061_scheduler_backpressure_subscription_maps_event_payload() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let run_id = RunId::new().to_string();
+        let stage_execution_id = domain::ids::StageExecutionId::new().to_string();
+        let mut stream = schema.execute_stream(
+            Request::new(
+                r#"subscription {
+                  schedulerBackpressureChanged {
+                    runId
+                    stageExecutionId
+                    providerFamily
+                    topReason
+                    queuedCount
+                    oldestQueuedAgeMs
+                    globalQueueDepth
+                    state
+                    isStale
+                  }
+                }"#,
+            )
+            .data(operator_principal()),
+        );
+
+        let event_bus = bus.clone();
+        let event_run_id = run_id.clone();
+        let event_stage_execution_id = stage_execution_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = event_bus.send(DomainEvent::SchedulerBackpressureChanged {
+                run_id: Some(event_run_id),
+                stage_execution_id: Some(event_stage_execution_id),
+                provider_family: Some("codex".into()),
+                top_reason: "provider_capacity".into(),
+                queued_count: 3,
+                oldest_queued_age_ms: 301_000,
+                global_queue_depth: 7,
+                state: "active".into(),
+                updated_at: Utc::now(),
+                stale_after_ms: 60_000,
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("scheduler backpressure subscription frame timed out")
+            .expect("scheduler backpressure stream ended");
+        assert!(
+            frame.errors.is_empty(),
+            "subscription frame must succeed: {frame:?}"
+        );
+        let data = frame.data.into_json().unwrap();
+        assert_eq!(
+            data["schedulerBackpressureChanged"]["runId"],
+            serde_json::json!(run_id)
+        );
+        assert_eq!(
+            data["schedulerBackpressureChanged"]["stageExecutionId"],
+            serde_json::json!(stage_execution_id)
+        );
+        assert_eq!(
+            data["schedulerBackpressureChanged"]["topReason"],
+            "provider_capacity"
+        );
+        assert_eq!(data["schedulerBackpressureChanged"]["state"], "active");
     }
 
     fn validation_failure_record(

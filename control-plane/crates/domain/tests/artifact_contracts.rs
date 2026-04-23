@@ -222,9 +222,11 @@ fn handoff_tasks_do_not_force_code_fix_status() {
 
 #[test]
 fn generic_status_normalization_accepts_handoff_required() {
-    let normalized =
-        normalize_contract_status(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, "handoff_required")
-            .unwrap();
+    let normalized = normalize_contract_status(
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "handoff_required",
+    )
+    .unwrap();
 
     assert!(normalized.valid);
     assert_eq!(normalized.canonical_status, "handoff_required");

@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+use crate::pool::begin_immediate_with_retry;
 use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 
 const STALE_AFTER_MS: i64 = 60_000;
@@ -54,6 +55,8 @@ pub struct SchedulerHealthSnapshot {
     pub command_latency_p95_ms_json: Option<String>,
     pub last_host_interruption_epoch_id: Option<String>,
     pub sustained_backpressure_state: String,
+    pub fire_consecutive_snapshots: i64,
+    pub clear_consecutive_snapshots: i64,
     pub stale_after_ms: i64,
     pub updated_at: DateTime<Utc>,
 }
@@ -134,7 +137,22 @@ impl SchedulerBackpressureNotification {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RefreshQueueSummariesResult {
+    pub notification: Option<SchedulerBackpressureNotification>,
+}
+
 pub async fn upsert_service_state(pool: &SqlitePool, state: &SchedulerServiceState) -> Result<()> {
+    let mut tx = begin_immediate_with_retry(pool, "scheduler.upsert_service_state").await?;
+    upsert_service_state_tx(&mut tx, state).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn upsert_service_state_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    state: &SchedulerServiceState,
+) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO scheduler_service_state
            (scope, scope_id, last_served_at, last_claimed_work_item_id, updated_at)
@@ -149,7 +167,7 @@ pub async fn upsert_service_state(pool: &SqlitePool, state: &SchedulerServiceSta
     .bind(state.last_served_at.map(|value| value.to_rfc3339()))
     .bind(&state.last_claimed_work_item_id)
     .bind(state.updated_at.to_rfc3339())
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("upsert scheduler service state")?;
     Ok(())
@@ -160,6 +178,17 @@ pub async fn get_service_state(
     scope: &str,
     scope_id: &str,
 ) -> Result<Option<SchedulerServiceState>> {
+    let mut tx = pool.begin().await?;
+    let state = get_service_state_tx(&mut tx, scope, scope_id).await?;
+    tx.commit().await?;
+    Ok(state)
+}
+
+pub async fn get_service_state_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    scope: &str,
+    scope_id: &str,
+) -> Result<Option<SchedulerServiceState>> {
     let row = sqlx::query(
         r#"SELECT scope, scope_id, last_served_at, last_claimed_work_item_id, updated_at
            FROM scheduler_service_state
@@ -167,7 +196,7 @@ pub async fn get_service_state(
     )
     .bind(scope)
     .bind(scope_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .context("get scheduler service state")?;
 
@@ -289,8 +318,9 @@ pub async fn insert_health_snapshot(
         r#"INSERT INTO scheduler_health_snapshots
            (id, queued_count, oldest_queued_age_ms, global_queue_depth, active_agent_executions,
             db_writer_wait_p95_ms, command_latency_p95_ms_json, last_host_interruption_epoch_id,
-            sustained_backpressure_state, stale_after_ms, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            sustained_backpressure_state, fire_consecutive_snapshots, clear_consecutive_snapshots,
+            stale_after_ms, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
     )
     .bind(&snapshot.id)
     .bind(snapshot.queued_count)
@@ -301,6 +331,8 @@ pub async fn insert_health_snapshot(
     .bind(&snapshot.command_latency_p95_ms_json)
     .bind(&snapshot.last_host_interruption_epoch_id)
     .bind(&snapshot.sustained_backpressure_state)
+    .bind(snapshot.fire_consecutive_snapshots)
+    .bind(snapshot.clear_consecutive_snapshots)
     .bind(snapshot.stale_after_ms)
     .bind(snapshot.updated_at.to_rfc3339())
     .execute(pool)
@@ -313,8 +345,8 @@ pub async fn latest_health_snapshot(pool: &SqlitePool) -> Result<Option<Schedule
     let row = sqlx::query(
         r#"SELECT id, queued_count, oldest_queued_age_ms, global_queue_depth,
                   active_agent_executions, db_writer_wait_p95_ms, command_latency_p95_ms_json,
-                  last_host_interruption_epoch_id, sustained_backpressure_state, stale_after_ms,
-                  updated_at
+                  last_host_interruption_epoch_id, sustained_backpressure_state,
+                  fire_consecutive_snapshots, clear_consecutive_snapshots, stale_after_ms, updated_at
            FROM scheduler_health_snapshots
            ORDER BY updated_at DESC
            LIMIT 1"#,
@@ -429,6 +461,16 @@ pub async fn insert_host_interruption_epoch(
     pool: &SqlitePool,
     epoch: &HostInterruptionEpoch,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_host_interruption_epoch_tx(&mut tx, epoch).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_host_interruption_epoch_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    epoch: &HostInterruptionEpoch,
+) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO host_interruption_epochs
            (id, kind, started_at, ended_at, monotonic_gap_ms, wall_clock_gap_ms, details_json, created_at)
@@ -442,7 +484,7 @@ pub async fn insert_host_interruption_epoch(
     .bind(epoch.wall_clock_gap_ms)
     .bind(&epoch.details_json)
     .bind(epoch.created_at.to_rfc3339())
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert host interruption epoch")?;
     Ok(())
@@ -450,6 +492,16 @@ pub async fn insert_host_interruption_epoch(
 
 pub async fn insert_host_interruption_affected_execution(
     pool: &SqlitePool,
+    affected: &HostInterruptionAffectedExecution,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_host_interruption_affected_execution_tx(&mut tx, affected).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_host_interruption_affected_execution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     affected: &HostInterruptionAffectedExecution,
 ) -> Result<()> {
     sqlx::query(
@@ -466,7 +518,7 @@ pub async fn insert_host_interruption_affected_execution(
     .bind(&affected.action)
     .bind(affected.retry_enqueued_at.map(|value| value.to_rfc3339()))
     .bind(affected.created_at.to_rfc3339())
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("insert host interruption affected execution")?;
     Ok(())
@@ -517,13 +569,69 @@ pub async fn list_host_interruption_epochs_by_run(
     Ok(readbacks)
 }
 
+pub async fn list_host_interruption_affected_executions_by_epoch(
+    pool: &SqlitePool,
+    epoch_id: &str,
+) -> Result<Vec<HostInterruptionAffectedExecution>> {
+    let rows = sqlx::query(
+        r#"SELECT epoch_id, agent_execution_id, run_id, stage_execution_id, provider_family,
+                  action, retry_enqueued_at, created_at
+           FROM host_interruption_affected_executions
+           WHERE epoch_id = ?1
+           ORDER BY created_at ASC, agent_execution_id ASC"#,
+    )
+    .bind(epoch_id)
+    .fetch_all(pool)
+    .await
+    .context("list host interruption affected executions by epoch")?;
+
+    rows.into_iter()
+        .map(parse_host_interruption_affected_execution_row)
+        .collect()
+}
+
 pub async fn refresh_queue_summaries(
     pool: &SqlitePool,
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<()> {
+    refresh_queue_summaries_for_notification(pool, capacity)
+        .await
+        .map(|_| ())
+}
+
+pub async fn refresh_queue_summaries_for_notification(
+    pool: &SqlitePool,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<RefreshQueueSummariesResult> {
     let now = Utc::now();
-    let pending = load_pending_invoke_agent_work(pool, now).await?;
-    let active = ActiveCounts::load(pool).await?;
+    let writer_wait_started_at = Instant::now();
+    let mut tx = begin_immediate_with_retry(pool, "scheduler.refresh_queue_summaries")
+        .await
+        .context("begin refresh scheduler queue summaries")?;
+    let writer_wait_ms = elapsed_millis_i64(writer_wait_started_at);
+    let result = refresh_queue_summaries_for_notification_tx(
+        &mut tx,
+        capacity,
+        now,
+        "refresh_queue_summaries",
+        writer_wait_ms,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit refresh scheduler queue summaries")?;
+    Ok(result)
+}
+
+pub async fn refresh_queue_summaries_for_notification_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    capacity: &InvokeAgentCapacityConfig,
+    now: DateTime<Utc>,
+    operation: &str,
+    writer_wait_ms: i64,
+) -> Result<RefreshQueueSummariesResult> {
+    let pending = load_pending_invoke_agent_work_tx(tx, now).await?;
+    let active = ActiveCounts::load_tx(tx).await?;
     let global_queue_depth = pending.len() as i64;
     let mut grouped: BTreeMap<SummaryKey, SummaryAccumulator> = BTreeMap::new();
 
@@ -575,20 +683,15 @@ pub async fn refresh_queue_summaries(
         }
     }
 
-    let writer_wait_started_at = Instant::now();
-    let mut tx = pool
-        .begin()
-        .await
-        .context("begin refresh scheduler queue summaries")?;
     sqlx::query("DELETE FROM scheduler_queue_summaries")
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("clear scheduler queue summaries")?;
-    let writer_wait_ms = elapsed_millis_i64(writer_wait_started_at);
-    insert_db_writer_wait_observation_tx(&mut tx, "refresh_queue_summaries", writer_wait_ms, now)
+    insert_db_writer_wait_observation_tx(tx, operation, writer_wait_ms, now)
         .await
         .context("record scheduler refresh DB writer wait")?;
 
+    let mut refreshed_summaries = Vec::with_capacity(grouped.len());
     for (key, accumulator) in grouped {
         let summary = SchedulerQueueSummary {
             scope: key.scope,
@@ -603,9 +706,10 @@ pub async fn refresh_queue_summaries(
             stale_after_ms: STALE_AFTER_MS,
             updated_at: now,
         };
-        insert_queue_summary_tx(&mut tx, &summary)
+        insert_queue_summary_tx(&mut *tx, &summary)
             .await
             .context("insert refreshed scheduler queue summary")?;
+        refreshed_summaries.push(summary);
     }
 
     let oldest_queued_age_ms = pending
@@ -613,35 +717,38 @@ pub async fn refresh_queue_summaries(
         .map(|item| (now - item.scheduled_at).num_milliseconds().max(0))
         .max()
         .unwrap_or(0);
-    let previous_state = latest_health_snapshot_tx(&mut tx)
-        .await?
-        .map(|snapshot| snapshot.sustained_backpressure_state)
-        .unwrap_or_else(|| "clear".to_string());
+    let previous_snapshot = latest_health_snapshot_tx(&mut *tx).await?;
+    let previous_state = previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.sustained_backpressure_state.as_str())
+        .unwrap_or("clear");
+    let hysteresis = next_sustained_backpressure_state(
+        previous_snapshot.as_ref(),
+        global_queue_depth,
+        oldest_queued_age_ms,
+    );
     let snapshot = SchedulerHealthSnapshot {
         id: uuid::Uuid::new_v4().to_string(),
         queued_count: global_queue_depth,
         oldest_queued_age_ms,
         global_queue_depth,
         active_agent_executions: active.global,
-        db_writer_wait_p95_ms: db_writer_wait_p95_ms_tx(&mut tx).await?,
-        command_latency_p95_ms_json: command_latency_p95_ms_json_tx(&mut tx).await?,
-        last_host_interruption_epoch_id: latest_host_interruption_epoch_id_tx(&mut tx).await?,
-        sustained_backpressure_state: next_sustained_backpressure_state(
-            &previous_state,
-            global_queue_depth,
-            oldest_queued_age_ms,
-        ),
+        db_writer_wait_p95_ms: db_writer_wait_p95_ms_tx(&mut *tx).await?,
+        command_latency_p95_ms_json: command_latency_p95_ms_json_tx(&mut *tx).await?,
+        last_host_interruption_epoch_id: latest_host_interruption_epoch_id_tx(&mut *tx).await?,
+        sustained_backpressure_state: hysteresis.state,
+        fire_consecutive_snapshots: hysteresis.fire_consecutive_snapshots,
+        clear_consecutive_snapshots: hysteresis.clear_consecutive_snapshots,
         stale_after_ms: STALE_AFTER_MS,
         updated_at: now,
     };
-    insert_health_snapshot_tx(&mut tx, &snapshot)
+    insert_health_snapshot_tx(&mut *tx, &snapshot)
         .await
         .context("insert refreshed scheduler health snapshot")?;
 
-    tx.commit()
-        .await
-        .context("commit refresh scheduler queue summaries")?;
-    Ok(())
+    let notification =
+        notification_for_state_transition(&previous_state, &snapshot, refreshed_summaries);
+    Ok(RefreshQueueSummariesResult { notification })
 }
 
 async fn latest_host_interruption_epoch_id_tx(
@@ -664,8 +771,8 @@ async fn latest_health_snapshot_tx(
     let row = sqlx::query(
         r#"SELECT id, queued_count, oldest_queued_age_ms, global_queue_depth,
                   active_agent_executions, db_writer_wait_p95_ms, command_latency_p95_ms_json,
-                  last_host_interruption_epoch_id, sustained_backpressure_state, stale_after_ms,
-                  updated_at
+                  last_host_interruption_epoch_id, sustained_backpressure_state,
+                  fire_consecutive_snapshots, clear_consecutive_snapshots, stale_after_ms, updated_at
            FROM scheduler_health_snapshots
            ORDER BY updated_at DESC
            LIMIT 1"#,
@@ -711,8 +818,9 @@ async fn insert_health_snapshot_tx(
         r#"INSERT INTO scheduler_health_snapshots
            (id, queued_count, oldest_queued_age_ms, global_queue_depth, active_agent_executions,
             db_writer_wait_p95_ms, command_latency_p95_ms_json, last_host_interruption_epoch_id,
-            sustained_backpressure_state, stale_after_ms, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            sustained_backpressure_state, fire_consecutive_snapshots, clear_consecutive_snapshots,
+            stale_after_ms, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
     )
     .bind(&snapshot.id)
     .bind(snapshot.queued_count)
@@ -723,6 +831,8 @@ async fn insert_health_snapshot_tx(
     .bind(&snapshot.command_latency_p95_ms_json)
     .bind(&snapshot.last_host_interruption_epoch_id)
     .bind(&snapshot.sustained_backpressure_state)
+    .bind(snapshot.fire_consecutive_snapshots)
+    .bind(snapshot.clear_consecutive_snapshots)
     .bind(snapshot.stale_after_ms)
     .bind(snapshot.updated_at.to_rfc3339())
     .execute(&mut **tx)
@@ -794,6 +904,7 @@ struct PendingInvokeAgentWork {
     stage_execution_id: Option<String>,
     provider_family: Option<String>,
     scheduled_at: DateTime<Utc>,
+    startup_recovery_requeued: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -934,6 +1045,74 @@ impl ActiveCounts {
 
         Ok(counts)
     }
+
+    async fn load_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<Self> {
+        let mut counts = Self::default();
+
+        let global_agent_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
+                .fetch_one(&mut **tx)
+                .await
+                .context("count running agent executions")?;
+        counts.global = global_agent_count;
+
+        let provider_rows = sqlx::query(
+            r#"SELECT COALESCE(provider_family, '') AS provider_family, COUNT(*) AS count
+               FROM agent_executions
+               WHERE status = 'running'
+               GROUP BY COALESCE(provider_family, '')"#,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("count running agent executions by provider")?;
+        for row in provider_rows {
+            let provider_family: String = row.get("provider_family");
+            if !provider_family.is_empty() {
+                counts
+                    .by_provider
+                    .insert(provider_family, row.get::<i64, _>("count"));
+            }
+        }
+
+        let run_rows = sqlx::query(
+            r#"SELECT se.run_id AS run_id, COUNT(*) AS count
+               FROM agent_executions ae
+               JOIN stage_executions se ON se.id = ae.stage_execution_id
+               WHERE ae.status = 'running'
+               GROUP BY se.run_id"#,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("count running agent executions by run")?;
+        for row in run_rows {
+            counts
+                .by_run
+                .insert(row.get("run_id"), row.get::<i64, _>("count"));
+        }
+
+        let running_work = load_running_invoke_agent_work_tx(tx).await?;
+        let mut running_work_by_run = BTreeMap::new();
+        let mut running_work_by_provider = BTreeMap::new();
+        counts.global = counts.global.max(running_work.len() as i64);
+        for item in running_work {
+            if let Some(run_id) = item.run_id {
+                *running_work_by_run.entry(run_id).or_insert(0) += 1;
+            }
+            if let Some(provider_family) = item.provider_family {
+                *running_work_by_provider.entry(provider_family).or_insert(0) += 1;
+            }
+        }
+        for (run_id, count) in running_work_by_run {
+            let entry = counts.by_run.entry(run_id).or_insert(0);
+            *entry = (*entry).max(count);
+        }
+        for (provider_family, count) in running_work_by_provider {
+            let entry = counts.by_provider.entry(provider_family).or_insert(0);
+            *entry = (*entry).max(count);
+        }
+
+        Ok(counts)
+    }
 }
 
 fn top_reason_for_item(
@@ -967,38 +1146,89 @@ fn top_reason_for_item(
         return "global_capacity".to_string();
     }
 
+    if item.startup_recovery_requeued {
+        return "startup_recovery_backpressure".to_string();
+    }
+
     "queued".to_string()
 }
 
+struct BackpressureHysteresis {
+    state: String,
+    fire_consecutive_snapshots: i64,
+    clear_consecutive_snapshots: i64,
+}
+
 fn next_sustained_backpressure_state(
-    previous_state: &str,
+    previous_snapshot: Option<&SchedulerHealthSnapshot>,
     queued_count: i64,
     oldest_queued_age_ms: i64,
-) -> String {
+) -> BackpressureHysteresis {
     let pressure_high =
         queued_count > 0 && oldest_queued_age_ms >= SUSTAINED_BACKPRESSURE_THRESHOLD_MS;
     let pressure_clear =
         queued_count == 0 || oldest_queued_age_ms < SUSTAINED_BACKPRESSURE_CLEAR_MS;
+    let previous_state = previous_snapshot
+        .map(|snapshot| snapshot.sustained_backpressure_state.as_str())
+        .unwrap_or("clear");
+    let previous_fire = previous_snapshot
+        .map(|snapshot| snapshot.fire_consecutive_snapshots)
+        .unwrap_or(0);
+    let previous_clear = previous_snapshot
+        .map(|snapshot| snapshot.clear_consecutive_snapshots)
+        .unwrap_or(0);
 
     if pressure_high {
-        match previous_state {
-            "pending_active" | "active" => "active",
-            _ => "pending_active",
+        let fire_consecutive_snapshots = if matches!(previous_state, "pending_active" | "active") {
+            (previous_fire + 1).min(2)
+        } else {
+            1
+        };
+        let state = if fire_consecutive_snapshots >= 2 {
+            "active"
+        } else {
+            "pending_active"
+        };
+        BackpressureHysteresis {
+            state: state.to_string(),
+            fire_consecutive_snapshots,
+            clear_consecutive_snapshots: 0,
         }
     } else if pressure_clear {
-        match previous_state {
-            "active" => "pending_clear",
-            "pending_clear" => "clear",
-            _ => "clear",
+        if matches!(previous_state, "active" | "pending_clear") {
+            let clear_consecutive_snapshots = (previous_clear + 1).min(2);
+            let state = if clear_consecutive_snapshots >= 2 {
+                "clear"
+            } else {
+                "pending_clear"
+            };
+            BackpressureHysteresis {
+                state: state.to_string(),
+                fire_consecutive_snapshots: 0,
+                clear_consecutive_snapshots,
+            }
+        } else {
+            BackpressureHysteresis {
+                state: "clear".to_string(),
+                fire_consecutive_snapshots: 0,
+                clear_consecutive_snapshots: 2,
+            }
         }
     } else {
-        match previous_state {
-            "active" | "pending_clear" => "active",
-            "pending_active" => "pending_active",
-            _ => "clear",
+        if matches!(previous_state, "active" | "pending_clear") {
+            BackpressureHysteresis {
+                state: "active".to_string(),
+                fire_consecutive_snapshots: 2,
+                clear_consecutive_snapshots: 0,
+            }
+        } else {
+            BackpressureHysteresis {
+                state: "clear".to_string(),
+                fire_consecutive_snapshots: 0,
+                clear_consecutive_snapshots: 0,
+            }
         }
     }
-    .to_string()
 }
 
 fn select_notification_summary(
@@ -1055,8 +1285,31 @@ fn backpressure_notification_from_parts(
     }
 }
 
-async fn load_pending_invoke_agent_work(
-    pool: &SqlitePool,
+fn notification_for_state_transition(
+    previous_state: &str,
+    snapshot: &SchedulerHealthSnapshot,
+    summaries: Vec<SchedulerQueueSummary>,
+) -> Option<SchedulerBackpressureNotification> {
+    let next_state = snapshot.sustained_backpressure_state.as_str();
+    let crossed_notification_boundary = (next_state == "active"
+        && previous_state == "pending_active"
+        && snapshot.fire_consecutive_snapshots >= 2)
+        || (next_state == "clear"
+            && previous_state == "pending_clear"
+            && snapshot.clear_consecutive_snapshots >= 2);
+    if !crossed_notification_boundary {
+        return None;
+    }
+
+    let selected_summary = select_notification_summary(summaries);
+    Some(backpressure_notification_from_parts(
+        snapshot,
+        selected_summary.as_ref(),
+    ))
+}
+
+async fn load_pending_invoke_agent_work_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     now: DateTime<Utc>,
 ) -> Result<Vec<PendingInvokeAgentWork>> {
     let rows = sqlx::query(
@@ -1066,7 +1319,7 @@ async fn load_pending_invoke_agent_work(
            ORDER BY scheduled_at ASC, rowid ASC"#,
     )
     .bind(now.to_rfc3339())
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await
     .context("load pending InvokeAgent work for scheduler summaries")?;
 
@@ -1141,6 +1394,21 @@ async fn load_running_invoke_agent_work(pool: &SqlitePool) -> Result<Vec<Pending
     rows.into_iter().map(parse_invoke_agent_work_row).collect()
 }
 
+async fn load_running_invoke_agent_work_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<Vec<PendingInvokeAgentWork>> {
+    let rows = sqlx::query(
+        r#"SELECT payload_json, run_id, scheduled_at
+           FROM work_items
+           WHERE kind = 'invoke_agent' AND status = 'running'"#,
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("load running InvokeAgent work for scheduler active counts")?;
+
+    rows.into_iter().map(parse_invoke_agent_work_row).collect()
+}
+
 fn parse_queue_position_candidate_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<QueuePositionCandidate> {
@@ -1172,6 +1440,7 @@ fn parse_invoke_agent_work_row(row: sqlx::sqlite::SqliteRow) -> Result<PendingIn
         stage_execution_id,
         provider_family,
         scheduled_at,
+        startup_recovery_requeued: payload.get("p061_startup_recovery").is_some(),
     })
 }
 
@@ -1217,6 +1486,8 @@ fn parse_health_snapshot_row(row: sqlx::sqlite::SqliteRow) -> Result<SchedulerHe
         command_latency_p95_ms_json: row.get("command_latency_p95_ms_json"),
         last_host_interruption_epoch_id: row.get("last_host_interruption_epoch_id"),
         sustained_backpressure_state: row.get("sustained_backpressure_state"),
+        fire_consecutive_snapshots: row.get("fire_consecutive_snapshots"),
+        clear_consecutive_snapshots: row.get("clear_consecutive_snapshots"),
         stale_after_ms: row.get("stale_after_ms"),
         updated_at: parse_datetime(row.get("updated_at"))?,
     })
