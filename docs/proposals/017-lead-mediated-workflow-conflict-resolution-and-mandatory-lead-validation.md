@@ -7,6 +7,22 @@
   "source_proposal": "docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md",
   "date": "2026-04-22",
   "canonical_gate": "./scripts/test-gate.sh proposal-017",
+  "post_ui_db_cutover_amendment": {
+    "date": "2026-04-23",
+    "decision": "P017 implementation scope is control-plane-only after the UI DB cutover.",
+    "canonical_implementation_target": "Rust control-plane: SQLite persistence, domain contracts, workflow compiler/engine behavior, MCP report/debug readback, and GraphQL read projections.",
+    "removed_implementation_targets": [
+      "SwiftData UI storage",
+      "Swift WorkflowOrchestrator transition authority",
+      "Swift RunReportBuilder workflow_conflict payload generation",
+      "Swift JSON report parity as an acceptance surface",
+      "SwiftData bridge migration as a future P017 requirement",
+      "UI conflict details, recovery action, timeline, or mediation surfaces"
+    ],
+    "ui_boundary": "The macOS UI must not read or write any app database for P017 truth. UI readback is a future thin-client concern over GraphQL projections only. MCP remains for operator/agent/debug control and must not be used by UI.",
+    "audit_instruction": "Future P017 audits must not treat missing SwiftData, Swift UI, or legacy Swift runtime implementation as a P017 blocker. They should audit whether control-plane truth and GraphQL/MCP readback satisfy the control-plane contract, and separately report any remaining legacy Swift code as deletion/quarantine work outside P017 conformance.",
+    "preserved_green_slice": "The already-merged Phase A control-plane implementation remains valid and should be preserved unless replaced by an equivalent or stricter control-plane implementation."
+  },
   "review_readiness": {
     "target": "aggregate score above 9",
     "previous_review": {
@@ -34,7 +50,7 @@
       "Repository, cancellation, MCP reports.get, GraphQL, runtime-facts, artifact, transcript, and cost behavior for mediation-owned executions are now specified instead of left to implementer interpretation.",
       "Aggregate artifact field authority is deterministic. proposal_review_summary pass/blocker fields are transition-authoritative, next_action/next_stage are advisory-only, and the D4F404B7 replay has a single expected outcome when the refinement transition exists: graph-authoritative refinement plus WorkflowAdvisoryRejectionRecord for the invalid advisory next_stage.",
       "CandidateTransitionEvaluation now explicitly replaces the current Rust unknown-artifact exists() fallback: unknown catalog artifact references never evaluate true and instead classify as invalid_expression or missing_input with parity fixtures.",
-      "The workflow_conflict northbound contract now separates canonical semantics from per-surface shapes: Swift report JSON uses camelCase, MCP reports.get uses snake_case, GraphQL uses typed fields and GraphQL enum casing, and parity fixtures must cover all translations.",
+      "The workflow_conflict northbound contract now separates canonical semantics from per-surface shapes: MCP reports.get uses snake_case, GraphQL uses typed fields and GraphQL enum casing, and parity fixtures must cover all translations.",
       "The bundled workflow scan now has an action threshold: non-zero simultaneous matches in bundled workflows block Phase A merge unless affected transitions are re-authored or an explicit operator-approved known-issues migration record exists.",
       "Phase C rollout now defines release cycle, inventory artifact, warning/waiver decision record, and migration warning evidence.",
       "The P053 implementation-entry incident class is now covered: approved_proposal freeze and implementation-start handoff truth are engine-owned, code_writer is not reported as started before claim/start, and lead/orchestrator timeouts block with precise blocked-before-code readback.",
@@ -43,10 +59,10 @@
       "Review-pass-4 owner-adjacent Rust feedback is resolved by extending Phase B owner_kind/owner_id migration to retry budget ledgers and artifact source-generation claims instead of leaving mediation-owned executions as table-specific exceptions.",
       "Product review-pass-4 feedback is resolved by adding measurable Phase B dogfood exit criteria, a concrete external catalog discovery/attestation mechanism, and a minimal operator-approved known-issues migration record schema.",
       "UX review-pass-4 suggestions are resolved by requiring started-at and relative-duration mediation labels plus direct terminal-unverifiable manual-resolution actions.",
-      "Architect review-pass-5 handoff specificity feedback is resolved by adding a scoped implementation-entry handoff sub-contract with durable storage owner, source-of-truth fields, northbound Swift/latest-summary/MCP/GraphQL shapes, redaction, and fixture expectations.",
+      "Architect review-pass-5 handoff specificity feedback is resolved by adding a scoped implementation-entry handoff sub-contract with durable storage owner, source-of-truth fields, northbound latest-summary/MCP/GraphQL shapes, redaction, and fixture expectations.",
       "Product review-pass-5 feedback is resolved by adding a Phase B readiness checkpoint, allowing intentionally-constructed dogfood scenarios to cover rare conflict types while preserving organic-run evidence, and defining the scope delta if Q-003 approves broader rationale export.",
-      "UX review-pass-6 mediation transparency feedback is resolved by exposing sanitized live mediation status updates in Inspect lead mediation while keeping chain-of-thought/private rationale out of operator surfaces.",
-      "UI feedback is explicitly retained as satisfied by the dedicated Conflict Details GroupBox, mediation icon/color guidance, timeline conflict icon, and grid-aligned debug disclosure."
+      "UX review-pass-6 mediation transparency feedback is superseded by the UI DB cutover: sanitized mediation status remains a GraphQL/MCP readback requirement, while concrete UI surfaces move to a future thin-client proposal.",
+      "UI feedback is retained as historical review context but is no longer a P017 implementation or audit target after the UI DB cutover."
     ]
   },
   "problem": {
@@ -70,14 +86,14 @@
     "Treat agent-authored next_stage, next_action, run_state.json, and narrative transition fields as advisory evidence only.",
     "Persist blocking invalid, ambiguous, missing-input, aggregate-conflict, or unverifiable transition outcomes as WorkflowConflictRecord.",
     "Persist rejected advisory hints that do not block graph-authoritative advancement as WorkflowAdvisoryRejectionRecord.",
-    "Define one shared Swift/Rust CandidateTransitionEvaluation contract with typed results, provenance, and sanitized diagnostics.",
+    "Define one shared control-plane CandidateTransitionEvaluation contract with typed results, provenance, and sanitized diagnostics.",
     "Keep Phase A independently shippable so the D4F404B7-class bug is fixed before lead mediation and mandatory lead validation land.",
     "Escalate same-run-resolvable blocking workflow conflicts to exactly one system lead before broad clone fallback once Phase B is enabled.",
     "Require every executable workflow/catalog pair to resolve exactly one valid system lead escalation path by Phase C.",
     "Expose conflict reason, current state, advisory rejection, lead owner, valid next action class, mediation progress, and resolution history in operator and report surfaces.",
     "Register and maintain ./scripts/test-gate.sh proposal-017 as the canonical gate.",
     "Make Phase B mediation-owned AgentExecution persistence implementable against current Rust, GraphQL, MCP, cancellation, runtime-facts, artifact, and cost boundaries before provider work begins.",
-    "Make aggregate artifact field authority and unknown transition-input classification single-valued across Swift and Rust.",
+    "Make aggregate artifact field authority and unknown transition-input classification single-valued in the control-plane.",
     "Make implementation-start handoff deterministic: approved proposal freeze, handoff artifact paths, worktree/provisioning metadata, and implementation-start readback are engine-owned and cannot be lost behind a lead/orchestrator ACP timeout.",
     "Define per-surface report/API naming and enum translation so semantic parity does not rely on one casing rule.",
     "Keep transition cursor, resume, recovery, and workflow_conflict truth atomically aligned for legal advancement, blocking conflicts, terminal outcomes, and lead-mediated settlement.",
@@ -89,22 +105,22 @@
     "No replacement of declarative transition evaluation with lead judgment.",
     "No broad multi-lead routing model; exactly one system lead remains required.",
     "No new scoring system or reviewer-voting semantics.",
-    "No broad UI redesign beyond existing blocked-run, recovery, timeline, report, and validation surfaces.",
+    "No UI implementation. P017 owns control-plane truth and readback only; UI replacement belongs to thin-client GraphQL projection work.",
     "No local UI smoke tests, Xcode, simulator, daemon startup, cargo tests, benchmarks, load tests, or fuzzing in proposal-readiness review mode.",
     "No synthetic StageExecution for lead mediation; mediation-owned executions are owner-kind records, not workflow graph states.",
     "No preservation of Rust exists(unknown_artifact) behavior for graph-authoritative transition decisions."
   ],
   "current_system_anchors": [
-    "Swift and Rust transition paths currently evaluate compiled plans and use first-match or generic blocking behavior rather than typed multi-candidate conflict classification.",
+    "Control-plane transition paths currently evaluate compiled plans and use first-match or generic blocking behavior rather than typed multi-candidate conflict classification.",
     "P057 already treats agent-authored run_state.json as advisory and preserves DB-owned run_state_projection and artifact_contract_advisories for readback.",
-    "RunReportPayload currently exposes blockedReason, recovery paths, failure evidence, and transition cursor fields, but no typed workflow_conflict object.",
+    "Control-plane report/readback payloads currently expose blockedReason, recovery paths, failure evidence, and transition cursor fields, but no typed workflow_conflict object.",
     "Rust GraphQL and MCP report surfaces already expose run_state_projection_json or report payloads that can receive additive optional fields.",
     "Example catalogs rely on lead_orchestrator by convention; P017 makes system_role=lead explicit executable catalog truth.",
     "Rust AgentExecution currently requires stage_execution_id in the domain, SQLite schema, repository joins, cancellation, GraphQL conversion, and stage readback; Phase B must migrate this explicitly before mediation execution work starts.",
-    "Rust currently has an unknown-artifact exists() fallback that can evaluate true, while Swift evaluates missing produced artifact names as false; P017 overrides this divergence with fail-closed candidate input classification.",
-    "Swift run reports use camelCase fields such as blockedReason, while the canonical workflow_conflict object is naturally snake_case for Rust/MCP report JSON; per-surface translation is required.",
+    "Rust currently has an unknown-artifact exists() fallback that can evaluate true; P017 overrides this behavior with fail-closed candidate input classification.",
+    "Canonical workflow_conflict JSON uses snake_case for storage and MCP report JSON; GraphQL exposes typed fields with GraphQL casing.",
     "P053 dogfood exposed a related workflow-entry defect: after implementation approval, state_7_implementation_started invoked lead_orchestrator to freeze approved_proposal and prepare implementation handoff artifacts; the ACP session idled out before producing outputs, code_writer never started, and run_state artifact readback could still imply running implementation while canonical DB state was blocked.",
-    "Swift transition settlement already persists transition-boundary truth through Run.transitionCursorJSON and WorkflowOrchestrator.settleTransition; P017 must preserve this cursor/resume invariant while replacing first-match or generic blocked behavior.",
+    "Transition settlement must persist transition-boundary truth through control-plane cursor/resume state while replacing first-match or generic blocked behavior.",
     "Rust retry budget and artifact source-generation claim paths are currently stage-scoped through stage_execution_id and agent_execution_id; Phase B mediation-owned executions must either migrate these adjacent tables to owner_kind/owner_id or use explicit mediation-specific equivalents with fixtures."
   ],
   "architecture": {
@@ -226,7 +242,7 @@
           "Raw advisory values are hashed for fingerprints and redacted for public/operator reports.",
           "If run_state_projection supersedes an agent-authored run_state.json value, the supersession is recorded in advisory provenance.",
           "Rust must consume existing artifact_contract_advisories and run_state_projections where possible.",
-          "Swift may use equivalent bridge fields in Phase A but must preserve the same logical provenance fields."
+          "Legacy Swift bridge fields are not a P017 implementation target after the UI DB cutover."
         ]
       },
       "aggregate_artifact_field_authority": {
@@ -290,7 +306,7 @@
           "If a referenced artifact id is declared but no current artifact instance is available, classify the candidate as missing_input and do not match the transition.",
           "If a referenced field is absent from a known structured artifact schema, classify as invalid_expression when the schema is authoritative and missing_input when the schema is intentionally open or unavailable.",
           "exists(unknown_artifact) never returns true in graph-authoritative evaluation.",
-          "Swift and Rust fixtures must cover exists(unknown_artifact), unknown_artifact.field, declared-but-absent artifact, declared artifact with missing field, and declared artifact with present field."
+          "Control-plane fixtures must cover exists(unknown_artifact), unknown_artifact.field, declared-but-absent artifact, declared artifact with missing field, and declared artifact with present field."
         ]
       },
       "transition_cursor_and_resume_invariant": {
@@ -376,7 +392,7 @@
           "Appears in workflow_conflict_history as a non_blocking_advisory_rejection event.",
           "Appears in MCP reports.get and GraphQL report readback under workflow_conflict.advisory_rejections.",
           "Counts in advisory_rejection_total and invalid_next_stage_hint_non_blocking_total metrics.",
-          "Is included in Swift/Rust parity fixtures for the D4F404B7 class when the graph can still advance."
+          "Is included in control-plane fixtures for the D4F404B7 class when the graph can still advance."
         ]
       },
       "lifecycle": {
@@ -442,34 +458,24 @@
       }
     },
     "persistence_contract": {
-      "swift_phase_a": {
-        "decision": "Use a constrained Run JSON bridge only for Phase A.",
-        "bridge_field": "run.workflow_conflict_records_json_v1",
-        "decoder_version": "p017_conflict_record_v1",
+      "control_plane_phase_a": {
+        "decision": "Persist workflow conflict truth in Rust control-plane tables only.",
+        "tables": [
+          "workflow_conflicts",
+          "workflow_advisory_rejections",
+          "workflow_transition_cursors"
+        ],
         "constraints": [
           "Logical fields match the shared WorkflowConflictRecord and WorkflowAdvisoryRejectionRecord contracts.",
-          "Bridge writes are append/upsert by conflict_fingerprint or rejection_id.",
-          "Queries may scan the JSON bridge during Phase A, and this limitation must be documented in code and tests.",
-          "Phase A may ship without first-class Swift mediation persistence because automatic lead mediation remains disabled."
+          "Writes are append/upsert by conflict_fingerprint or rejection_id.",
+          "Readback is rebuilt from control-plane persistence, not from SwiftData bridge records or agent-authored run_state.json.",
+          "Phase A may ship without automatic lead mediation because lead mediation remains disabled or manual-only."
         ]
       },
-      "swift_phase_b_migration": {
-        "entry_criterion": "Before broad Phase B mediation enablement, Swift must migrate bridge data to first-class conflict, advisory rejection, and mediation persistence.",
-        "destination_relationships": [
-          "Run has many WorkflowConflictRecords",
-          "Run has many WorkflowAdvisoryRejectionRecords",
-          "WorkflowConflictRecord optionally has one LeadConflictMediationRecord",
-          "LeadConflictMediationRecord has many linked AgentExecution attempts by mediation_owner_token"
-        ],
-        "backfill_key": "conflict_fingerprint for blocking conflicts and rejection_id for non-blocking advisory rejections",
-        "cutover": "Phase B performs idempotent read-through migration when opening a Phase A run and writes only first-class records after migration succeeds.",
-        "dual_read": "During the cutover window, readers check first-class records first and fall back to the JSON bridge only when no migrated marker exists.",
-        "removal_trigger": "The bridge may be removed only after fixtures prove a Phase A persisted conflict and advisory rejection remain readable in report, recovery, and history views after Phase B migration.",
-        "required_fixtures": [
-          "Phase A blocking conflict opened after Phase B migration",
-          "Phase A non-blocking advisory rejection opened after Phase B migration",
-          "Phase A terminal_unverifiable conflict opened after Phase B migration"
-        ]
+      "legacy_swift_bridge": {
+        "decision": "Deleted from P017 implementation scope after the UI DB cutover.",
+        "audit_rule": "Missing Swift workflow_conflict_records_json_v1, SwiftData bridge migration, or Swift report generation is not a P017 conformance blocker.",
+        "replacement": "GraphQL read projections and MCP reports.get expose the control-plane truth."
       },
       "rust": {
         "workflow_conflicts_table": "SQLite table keyed by conflict_id with indexes on run_id, status, current_state_id, and conflict_fingerprint.",
@@ -512,13 +518,13 @@
           "domain_model": [
             "Replace the single non-optional StageExecutionId owner in Rust AgentExecution with AgentExecutionOwner { StageExecution(StageExecutionId), LeadConflictMediation(MediationRecordId) } while preserving helper accessors for stage-owned call sites.",
             "Serialization includes owner_kind and owner_id. stage_execution_id remains present only for stage-owned rows and is null for mediation-owned rows.",
-            "Swift optional StageExecution relationship becomes parity-compatible only after owner_kind/owner_id is read and written on both sides."
+            "Legacy Swift optional StageExecution relationship is outside P017 conformance after the UI DB cutover."
           ],
           "repository_semantics": {
             "list_by_run": "Owner-aware run listing reads agent_executions by run_id and left joins stage_executions and lead_conflict_mediations. It returns both stage-owned and mediation-owned executions unless the caller explicitly requests stage_only.",
             "find_by_stage": "Filters owner_kind=stage_execution and stage_execution_id=<id>. It never returns mediation-owned executions.",
             "cancel_running_by_run": "Cancels all active AgentExecution rows for the run by run_id regardless of owner_kind. For owner_kind=lead_conflict_mediation it also transitions the linked LeadConflictMediationRecord to canceled in the same repository transaction.",
-            "stage_scoped_lists": "Existing stage-scoped UI/API lists remain backed by owner_kind=stage_execution rows only, preserving current behavior for existing consumers.",
+            "stage_scoped_lists": "Existing stage-scoped API lists remain backed by owner_kind=stage_execution rows only, preserving current behavior for existing consumers.",
             "cost_aggregation": "Run-level cost totals include both stage_execution and lead_conflict_mediation owners. Stage-level cost totals include stage_execution owners only. Mediation cost totals filter owner_kind=lead_conflict_mediation and owner_id=mediation_record_id."
           },
           "owner_adjacent_tables": {
@@ -599,7 +605,7 @@
       ],
       "authority_rules": [
         "The engine owns deterministic freeze/provision work. An LLM lead may summarize, plan, or refine implementation context, but it must not be the only actor capable of creating approved_proposal or durable implementation handoff truth.",
-        "A graph transition to an implementation-entry state does not by itself mean code implementation has started. Reports and UI must expose implementation_handoff_status and code_writer_start_status so the operator can distinguish entered_graph_state, handoff_ready, code_writer_running, and blocked_before_code.",
+        "A graph transition to an implementation-entry state does not by itself mean code implementation has started. Control-plane readback must expose implementation_handoff_status and code_writer_start_status so operators and future UI clients can distinguish entered_graph_state, handoff_ready, code_writer_running, and blocked_before_code.",
         "The first code_writer invocation may be queued only after engine-owned handoff truth exists or after the workflow explicitly declares that no handoff artifacts are required.",
         "If an optional lead planning invocation times out after deterministic handoff is complete, the run remains retryable from the planning/code boundary without losing approved_proposal truth.",
         "If deterministic handoff cannot be produced, the run blocks with typed workflow_conflict or handoff-failure readback instead of a generic provider timeout and without leaving run_state.json as the apparent source of truth.",
@@ -667,9 +673,8 @@
           }
         ],
         "northbound_shapes": {
-          "swift_run_report_json": "implementationHandoff object with handoffStatus, codeWriterStartStatus, approvedProposalArtifactId, approvedProposalDigest, missingHandoffOutputs, lastHandoffAgentExecutionId, retryableFrom, and blockedBeforeCodeReason.",
           "latest_summary_report": "Adds implementation_handoff_status, code_writer_start_status, approved_proposal_artifact_id, and retryable_from when the run is at an implementation-entry boundary.",
-          "mcp_reports_get": "implementation_handoff object in snake_case with the same semantic fields as Swift JSON and with missing/null optional planning execution ids preserved.",
+          "mcp_reports_get": "implementation_handoff object in snake_case with missing/null optional planning execution ids preserved.",
           "graphql": "GqlImplementationHandoff typed field on run/report readback with enum values for handoffStatus and codeWriterStartStatus plus nullable artifact/execution refs."
         },
         "redaction": [
@@ -681,12 +686,12 @@
         "fixtures": [
           "Engine-created approved_proposal snapshot survives optional lead planning timeout and is visible by artifact id/digest.",
           "code_writer_start_status remains not_queued or blocked_before_code until a code_writer AgentExecution is actually queued/claimed/started.",
-          "Swift JSON, latest summary, MCP reports.get, and GraphQL expose equivalent implementation handoff semantics after casing and enum translation.",
+          "Latest summary, MCP reports.get, and GraphQL expose equivalent implementation handoff semantics after casing and enum translation.",
           "Retry from handoff/planning boundary reuses the approved proposal snapshot and transition cursor resume policy.",
           "Stale agent-authored run_state.json cannot override implementation_handoff_status or code_writer_start_status."
         ]
       },
-      "workflow_authoring_rule": "Workflow labels such as implementation_started should not be the only operator-facing truth. If the state contains pre-code handoff work, report/UI readback must describe the substate precisely, or the workflow should split deterministic handoff and code implementation into separate states."
+      "workflow_authoring_rule": "Workflow labels such as implementation_started should not be the only operator-facing truth. If the state contains pre-code handoff work, control-plane readback must describe the substate precisely, or the workflow should split deterministic handoff and code implementation into separate states."
     },
     "northbound_report_api_contract": {
       "schema_versioning_decision": "Add workflow_conflict as an optional semantic object on RunReportPayload. No Phase A report schema version bump is required, but each northbound surface has an explicit shape and casing translation.",
@@ -757,10 +762,9 @@
         "operator_required_action"
       ],
       "readback_surfaces": [
-        "Swift JSON run report",
-        "latest summary report",
         "MCP reports.get",
-        "GraphQL run/report readback"
+        "GraphQL run/report readback",
+        "control-plane latest summary/report projection"
       ],
       "redaction": [
       "Raw advisory values are never public tier.",
@@ -771,22 +775,6 @@
       ],
       "per_surface_shapes": {
         "semantic_contract": "Canonical proposal text uses snake_case field names and snake_case JSON enum values for storage, MCP JSON, fixtures, and documentation tables.",
-        "swift_json_report": {
-          "object_key": "workflowConflict",
-          "field_casing": "camelCase",
-          "enum_encoding": "snake_case strings inside JSON payloads",
-          "required_keys": [
-            "current",
-            "history",
-            "advisoryRejections",
-            "blockedReason",
-            "leadOwner",
-            "validNextActionClass",
-            "candidateTransitionMatrix",
-            "resolutionRecordJson"
-          ],
-          "old_report_behavior": "Missing workflowConflict is equivalent to no workflow conflict data."
-        },
         "mcp_reports_get": {
           "object_key": "workflow_conflict",
           "field_casing": "snake_case",
@@ -809,61 +797,36 @@
           "enum_encoding": "GraphQL enum values use SCREAMING_SNAKE_CASE while JSON string payloads retain snake_case.",
           "old_report_behavior": "Null workflowConflict means the report predates P017 or has no conflict data."
         },
-        "parity_rule": "Fixtures assert semantic equality after casing and enum translation for Swift JSON, MCP reports.get, GraphQL, and latest summary readback."
+        "parity_rule": "Fixtures assert semantic equality after casing and enum translation for MCP reports.get, GraphQL, and control-plane latest summary/report readback."
       }
     }
   },
   "ux_ui_notes": {
-    "operator_story": "When a run blocks because workflow truth is invalid, ambiguous, missing, or unverifiable, the operator sees a typed workflow conflict with a plain-language reason and a clear next action instead of generic blocked state.",
-    "operator_labels": {
-      "invalid_next_stage_hint": "Agent suggested an unavailable next step",
-      "no_declarative_transition_matched": "No valid next step matched",
-      "multiple_declarative_transitions_matched_without_tie_break": "Ambiguous next step",
-      "required_artifact_or_field_missing_for_transition": "Missing information for next step",
-      "aggregate_transition_truth_conflicted": "Review result disagrees with suggested next step",
-      "workflow_conflict_unverifiable": "Next step could not be verified",
-      "advisory_hint": "Agent suggestion",
-      "terminal_unverifiable": "Needs operator decision"
-    },
-    "blocked_run_detail": [
-      "Place conflict metadata in a dedicated GroupBox titled Conflict Details immediately after Blocker Summary.",
-      "Use five compact rows in order: reason/status, current state/valid next action class, lead owner/mediation status, advisory suggestion summary, and terminal failure reason when present.",
-      "Reason/status row shows operator_label plus StatusCapsule with exclamationmark.shield for unresolved workflow conflicts.",
-      "Current state row shows current_state_id and selected or valid next action class; absent graph states are never shown as selectable destinations.",
-      "Lead row shows lead agent name when available, no lead available when validation cannot resolve one, or Active for duration with started-at timestamp while mediation is pending.",
-      "Advisory row shows redacted advisory next_action/next_stage summary and source artifact ref; raw candidate-transition data stays out of the primary view.",
-      "Use StatusCapsule with exclamationmark.shield for unresolved workflow conflicts.",
-      "Keep raw candidate-transition matrix in a debug DisclosureGroup separate from primary recovery actions."
+    "status": "out_of_scope_after_ui_db_cutover",
+    "decision": "P017 does not implement macOS UI surfaces. Operator-facing display belongs to a future thin UI proposal that consumes GraphQL read projections only.",
+    "operator_story": "When a run blocks because workflow truth is invalid, ambiguous, missing, or unverifiable, control-plane readback exposes typed workflow_conflict data that a future UI can render.",
+    "required_readback_for_future_ui": [
+      "conflict reason and status",
+      "current state and valid next action class",
+      "lead owner or no-lead indicator",
+      "advisory rejection summary",
+      "terminal failure reason when present",
+      "sanitized mediation progress when Phase B is enabled"
     ],
-    "recovery_actions": [
-      "Show Request lead mediation when a valid lead exists and no mediation is active.",
-      "Show Inspect lead mediation when a mediation record exists.",
-      "Inspect lead mediation shows sanitized live status updates such as queued, provider running, contract validating, waiting for operator confirmation, retrying after quota, or watchdog expired, with timestamps and attempt number.",
-      "Show Active for duration, started-at timestamp or relative time, and lead agent name while status is lead_mediation_pending.",
-      "Show terminal_failure_reason in the primary recovery view for terminal_unverifiable conflicts.",
-      "When status is terminal_unverifiable, show direct primary actions for the allowed manual path, such as Clone Run, Open conflict report, or Open editable recovery artifact, based on the run's recovery policy.",
-      "Use person.2.wave.2.fill and DesignTokens.Action.primary for constructive mediation actions.",
-      "Disable impossible actions with typed reasons instead of hiding them."
+    "forbidden_paths": [
+      "SwiftData UI readback",
+      "Swift UI writes to workflow truth",
+      "UI use of MCP command/debug surfaces",
+      "UI reconstruction of conflict state from local files or agent-authored run_state.json"
     ],
-    "timeline_and_reports": [
-      "Timeline conflict events use exclamationmark.arrow.triangle.2.circlepath or the closest existing conflict icon token and preserve conflict history.",
-      "Timeline exposes advisory rejection events as compact expandable entries so operators can see why an agent suggestion was bypassed without opening the full report.",
-      "Reports include a Conflict History section for recurring workflow design flaws.",
-      "Candidate-transition debug matrices use a grid layout for alignment.",
-      "Conflict Details placement is considered implementation-ready only when the field-by-field row order above is reflected in UI review fixtures or screenshots."
-    ],
-    "accessibility": [
-      "Provide stable labels for conflict reason, current state, lead owner, mediation status, terminal failure reason, and primary recovery action.",
-      "Do not require raw JSON inspection for the primary operator path."
-    ],
-    "ux_ui_signoff_gate": "UX and UI re-pass must complete before Phase B or Phase C operator-surface work merges."
+    "audit_rule": "Do not fail P017 for missing Conflict Details GroupBox, timeline conflict icon, recovery button, Swift accessibility label, or UI smoke evidence. Those are thin-client requirements for a separate proposal."
   },
   "implementation_plan": [
     {
       "phase": "Phase 0: gate and fixtures",
       "scope": [
         "Register ./scripts/test-gate.sh proposal-017.",
-        "Add fixture groups for blocking conflicts, non-blocking advisory rejections, report/API readback, Swift bridge migration, and Phase B mediation replay/resume.",
+        "Add fixture groups for blocking conflicts, non-blocking advisory rejections, control-plane report/API readback, and Phase B mediation replay/resume.",
         "Add sanitized D4F404B7-class replay evidence."
       ],
       "exit_criteria": [
@@ -876,14 +839,14 @@
       "phase": "Phase A: authority, conflict truth, and advisory rejection truth",
       "independently_shippable": true,
       "scope": [
-        "Implement TransitionAuthorityResolver and CandidateTransitionEvaluation in Swift and Rust.",
+        "Implement TransitionAuthorityResolver and CandidateTransitionEvaluation in the Rust control-plane.",
         "Integrate AdvisoryHintExtraction with P057 run_state_projection and artifact_contract_advisories.",
         "Persist blocking WorkflowConflictRecord by fingerprint.",
         "Persist non-blocking WorkflowAdvisoryRejectionRecord when graph truth advances despite a bad advisory hint.",
         "Expose workflow_conflict report object, blockedReason, recovery readback, and parity fixtures.",
         "Keep automatic lead mediation disabled or manual-only.",
         "Add aggregate artifact field-authority tables for proposal_review_summary_v1 and any related aggregate contract used by transition evaluation.",
-        "Replace Rust unknown-artifact exists() true fallback for graph-authoritative decisions and add Swift/Rust parity fixtures.",
+        "Replace Rust unknown-artifact exists() true fallback for graph-authoritative decisions and add control-plane fixtures.",
         "Preserve transition cursor/resume invariants: selected graph transitions, blocking conflicts, and terminal_unverifiable outcomes settle through one cursor boundary before report or recovery readback changes.",
         "Add implementation-entry handoff authority fixtures and readback: approved_proposal freeze is engine-owned, code_writer is not reported as started before claim/start, and P053-style lead timeout blocks with implementation_handoff_unavailable or equivalent typed handoff failure."
       ],
@@ -892,32 +855,29 @@
         "A legal graph transition with a rejected advisory hint advances and writes advisory rejection history, not workflow_conflict_current.",
         "No-match, multi-match, missing-input, aggregate-conflict, and unverifiable graph outcomes persist typed blocking WorkflowConflictRecord.",
         "D4F404B7-class replay yields either graph-authoritative refinement plus advisory rejection history or a typed blocking conflict with non-null blockedReason.",
-        "Swift and Rust resolver, advisory rejection, report, and conflict persistence fixtures match.",
+        "Control-plane resolver, advisory rejection, report, and conflict persistence fixtures pass.",
         "Transition cursor fixtures prove D4F404B7 legal refinement, no-match blocking conflict, lead-resolved continuation, terminal_unverifiable, and restart/resume readback stay aligned with WorkflowConflictRecord truth.",
         "D4F404B7-class replay has one expected outcome in parity fixtures: graph-authoritative refinement plus advisory rejection when the refinement transition exists.",
-        "exists(unknown_artifact) and unknown_artifact.field never match a transition in Swift or Rust.",
-        "Swift JSON, MCP reports.get, GraphQL, and latest summary pass per-surface workflow_conflict shape fixtures.",
+        "exists(unknown_artifact) and unknown_artifact.field never match a transition in the control-plane.",
+        "MCP reports.get, GraphQL, and control-plane latest summary/readback pass per-surface workflow_conflict shape fixtures.",
         "P053-style implementation-entry replay proves deterministic approved_proposal handoff survives a lead/orchestrator provider timeout and readback says blocked_before_code, not code implementation started."
       ]
     },
     {
       "phase": "Phase B: lead mediation",
       "scope": [
-        "Migrate Swift bridge data to first-class persistence before broad mediation enablement.",
         "Add LeadConflictMediationRecord persistence and mediation_owner_token.",
         "Execute lead sessions as normal AgentExecution records with owner_kind=lead_conflict_mediation.",
         "Validate LeadResolutionContract output and re-enter TransitionAuthorityResolver for settlement.",
         "Implement watchdog, retry, cancellation, resume repair, transcript, runtime facts, cost attribution, and report readback.",
-        "Add recovery view mediation progress and terminal failure context.",
+        "Expose mediation progress and terminal failure context through GraphQL/MCP readback, not UI-owned DB state.",
         "Run the Rust AgentExecution owner-kind migration before provider mediation sessions: owner_kind/owner_id become authoritative, stage_execution_id is nullable only for mediation-owned executions, and stage-scoped readback remains unchanged.",
         "Migrate or equivalently replace owner-adjacent retry budget ledgers and artifact source-generation claims before provider-backed mediation uses quota retry, output validation, or late-output settlement.",
-        "Emit sanitized mediation progress events for Inspect lead mediation without exposing hidden reasoning or raw transcript text."
+        "Emit sanitized mediation progress events in GraphQL/MCP readback without exposing hidden reasoning or raw transcript text."
       ],
       "entry_criteria": [
-        "After Phase A ships, run a Phase B readiness checkpoint that orders owner migration, retry/claim migration, Swift bridge migration, Q-003 privacy review, UX/UI re-pass, and dogfood work by dependency, effort, and parallelizable work.",
+        "After Phase A ships, run a Phase B readiness checkpoint that orders owner migration, retry/claim migration, Q-003 privacy review, GraphQL/MCP readback, and dogfood work by dependency, effort, and parallelizable work.",
         "Q-003 privacy review is complete or default debug-only rationale policy is enforced.",
-        "UX/UI re-pass signs off on Phase B operator surfaces.",
-        "Swift bridge migration fixtures pass.",
         "Rust mediation-owned execution migration fixtures pass for list_by_run, find_by_stage, cancel_running_by_run, MCP reports.get, GraphQL mediation readback, runtime facts, artifacts, transcripts, and cost aggregation.",
         "Rust owner-adjacent retry ledger and artifact source-generation claim fixtures pass for mediation-owned provider quota retry, source claim idempotency, LeadResolutionContract validation, and late-output settlement.",
         "Runtime flag default-on decision is blocked until Phase B dogfood exit criteria are met."
@@ -944,7 +904,7 @@
       ],
       "entry_criteria": [
         "Compatibility window decision is recorded: external legacy catalogs receive two release cycles of warning before Phase C fail-closed enforcement, unless no external active catalogs exist at ship time.",
-        "UX/UI re-pass signs off on validation error surfaces.",
+        "GraphQL/MCP readback fixtures prove validation error facts and typed codes are exposed for future thin-client rendering.",
         "Release cycle definition is recorded as two tagged releases carrying validation warnings and at least 60 calendar days unless the inventory proves no active external catalogs exist.",
         "External catalog discovery mechanism is recorded as automated catalog registry/usage telemetry when available, otherwise operator attestation with scanned paths, owner, last-used evidence, and approval."
       ],
@@ -960,14 +920,14 @@
     "sequencing": [
       "Land Phase 0 gate and fixtures first.",
       "Ship Phase A independently to fix graph authority, conflict persistence, advisory rejection history, report readback, and D4F404B7-class behavior.",
-      "Enable Phase B lead mediation behind a runtime flag until ownership, watchdog, retry, cancellation, cost, transcript, report, and UX/UI gates pass.",
+      "Enable Phase B lead mediation behind a runtime flag until ownership, watchdog, retry, cancellation, cost, transcript, report, and GraphQL/MCP readback gates pass.",
       "Enable Phase C fail-closed validation for bundled examples and new executable workflows first.",
       "Apply external legacy catalog enforcement after a two-release-cycle warning window unless no external active catalogs exist at Phase C ship time."
     ],
     "migration_notes": [
       "Phase A may surface workflows that relied on implicit first-match ordering as ambiguous next step conflicts. The fix is explicit tie-break syntax from a future proposal or transition re-authoring.",
       "Before Phase A merges, scan bundled workflow YAML examples for transition guards that can match simultaneously and document the count.",
-      "Swift Phase A JSON bridge is temporary and must be migrated before broad Phase B mediation.",
+      "Legacy Swift Phase A JSON bridge behavior is superseded by the UI DB cutover and is not part of P017 conformance.",
       "Catalog parser compatibility remains, but runtime-entry validation becomes fail-closed for executable pairs in Phase C.",
       "Bundled workflow scan action threshold: if simultaneous transition matches are found in bundled workflows, Phase A merge is blocked until those transitions are re-authored. Shipping with known issues requires an explicit operator-approved migration record naming each affected workflow and expected conflict label.",
       "For Phase C, one release cycle means one tagged app/control-plane release that carries runtime validation warnings and release-note migration guidance. The two-release-cycle window means two such tagged releases and at least 60 calendar days, unless the enforcement inventory proves no active external legacy catalogs exist.",
@@ -1049,9 +1009,9 @@
       "Zero D4F404B7-class replay fixtures block with null blockedReason.",
       "One hundred percent of blocking no-match, multi-match, missing-input, aggregate-conflict, invalid-hint-with-no-legal-transition, and unverifiable fixtures persist WorkflowConflictRecord.",
       "One hundred percent of legal-transition plus rejected advisory hint fixtures persist WorkflowAdvisoryRejectionRecord and do not set workflow_conflict_current.",
-      "Swift and Rust candidate-transition matrices, advisory rejection readback, and conflict reason mappings match for proposal-017 fixtures.",
+      "Control-plane candidate-transition matrices, advisory rejection readback, and conflict reason mappings match proposal-017 fixtures.",
       "One hundred percent of Phase C executable workflow/catalog validation cases resolve exactly one system lead or fail with a typed error.",
-      "One hundred percent of D4F404B7-class replay fixtures select the same Swift/Rust outcome for aggregate field authority.",
+      "One hundred percent of D4F404B7-class replay fixtures select the same control-plane outcome for aggregate field authority.",
       "One hundred percent of unknown transition-input parity fixtures fail closed and never match through exists(unknown_artifact).",
       "Zero mediation-owned AgentExecution rows appear in stage-scoped GraphQL or find_by_stage readback, while one hundred percent appear in owner-aware run/report readback."
     ],
@@ -1081,8 +1041,8 @@
   },
   "risks_and_tradeoffs": [
     {
-      "risk": "Swift Phase A JSON bridge becomes permanent technical debt.",
-      "mitigation": "Phase B entry requires first-class persistence migration, dual-read cutover, bridge removal trigger, and fixtures for Phase A runs opened after migration."
+      "risk": "Legacy Swift Phase A JSON bridge behavior remains in old code and is mistaken for P017 truth.",
+      "mitigation": "P017 conformance treats legacy Swift bridge behavior as deletion or quarantine work outside this proposal. Audits must evaluate the control-plane persistence and GraphQL/MCP readback contract instead."
     },
     {
       "risk": "Separate advisory rejection records add another durable readback path.",
@@ -1105,8 +1065,8 @@
       "mitigation": "Public/operator tiers are redacted and summary-only; full rationale and resolution_record_json remain local debug tier until Q-003 privacy review records a different outcome."
     },
     {
-      "risk": "Swift and Rust implementations diverge.",
-      "mitigation": "Shared enum casing, fixed report schema, parity fixtures, advisory extraction integration, and proposal-017 gate assertions are required."
+      "risk": "Legacy Swift implementation diverges from control-plane workflow truth.",
+      "mitigation": "Legacy Swift implementation is not a P017 acceptance surface after the UI DB cutover. P017 requires one control-plane implementation, fixed report schema, GraphQL/MCP readback parity, advisory extraction integration, and proposal-017 gate assertions."
     },
     {
       "risk": "General AgentExecution ownership migration touches more Rust/API code than a mediation-only nullable field.",
@@ -1142,7 +1102,7 @@
     },
     {
       "risk": "Operator demand for live mediation transparency could expose private rationale or hidden reasoning.",
-      "mitigation": "Inspect lead mediation exposes only sanitized progress events and timestamps. Full rationale, raw transcript text, prompts, and hidden reasoning remain redacted unless Q-003 explicitly approves a narrower redacted export scope with fixtures."
+      "mitigation": "GraphQL/MCP mediation readback exposes only sanitized progress events and timestamps. Full rationale, raw transcript text, prompts, and hidden reasoning remain redacted unless Q-003 explicitly approves a narrower redacted export scope with fixtures."
     }
   ],
   "acceptance_criteria": [
@@ -1172,7 +1132,7 @@
     },
     {
       "id": "AC-007",
-      "criterion": "MCP reports.get, GraphQL readback, Swift JSON report, and latest summary expose the same optional workflow_conflict object semantics."
+      "criterion": "MCP reports.get, GraphQL readback, and control-plane latest summary/report projection expose the same optional workflow_conflict object semantics."
     },
     {
       "id": "AC-008",
@@ -1200,7 +1160,7 @@
     },
     {
       "id": "AC-014",
-      "criterion": "./scripts/test-gate.sh proposal-017 exists, is listed by the gate wrapper, and exercises Swift/Rust parity fixtures for resolver, conflict record, advisory rejection, report, migration, mediation, and validation behavior."
+      "criterion": "./scripts/test-gate.sh proposal-017 exists, is listed by the gate wrapper, and exercises control-plane fixtures for resolver, conflict record, advisory rejection, report, mediation, and validation behavior."
     },
     {
       "id": "AC-015",
@@ -1208,11 +1168,11 @@
     },
     {
       "id": "AC-016",
-      "criterion": "proposal_review_summary_v1 field authority is fixture-proven: pass, blocker_count, blocking_issues, and required_changes are transition-authoritative; next_action and next_stage are advisory-only; D4F404B7 replay has one Swift/Rust outcome."
+      "criterion": "proposal_review_summary_v1 field authority is fixture-proven: pass, blocker_count, blocking_issues, and required_changes are transition-authoritative; next_action and next_stage are advisory-only; D4F404B7 replay has one control-plane outcome."
     },
     {
       "id": "AC-017",
-      "criterion": "exists(unknown_artifact), unknown_artifact.field, and declared-but-absent artifact fixtures fail closed in Swift and Rust and never produce a matched transition."
+      "criterion": "exists(unknown_artifact), unknown_artifact.field, and declared-but-absent artifact fixtures fail closed in the control-plane and never produce a matched transition."
     },
     {
       "id": "AC-018",
@@ -1248,11 +1208,11 @@
     },
     {
       "id": "AC-026",
-      "criterion": "Implementation-entry handoff readback maps implementation_handoff_status, code_writer_start_status, approved proposal artifact refs, missing outputs, last planning execution, and retryable_from to durable storage and equivalent Swift/latest-summary/MCP/GraphQL surfaces."
+      "criterion": "Implementation-entry handoff readback maps implementation_handoff_status, code_writer_start_status, approved proposal artifact refs, missing outputs, last planning execution, and retryable_from to durable storage and equivalent latest-summary/MCP/GraphQL surfaces."
     },
     {
       "id": "AC-027",
-      "criterion": "Inspect lead mediation exposes sanitized live status updates with timestamps and attempt number, while hidden reasoning, prompts, raw transcripts, and full rationale remain redacted according to Q-003 policy."
+      "criterion": "GraphQL/MCP mediation readback exposes sanitized live status updates with timestamps and attempt number, while hidden reasoning, prompts, raw transcripts, and full rationale remain redacted according to Q-003 policy."
     }
   ],
   "validation": {
@@ -1264,15 +1224,14 @@
       "D4F404B7-class replay fixture.",
       "AdvisoryHintExtraction fixtures consuming run_state_projection and artifact_contract_advisories.",
       "Conflict persistence and fingerprint upsert tests.",
-      "Report/API readback fixtures for Swift JSON report, latest summary, MCP reports.get, and GraphQL.",
-      "Swift Phase A bridge to Phase B first-class persistence migration fixtures.",
+      "Report/API readback fixtures for latest summary, MCP reports.get, and GraphQL.",
       "Lead mediation fixtures for valid output, malformed output, absent output, watchdog expiry, retry, cancellation, resume, AgentExecution linkage, and cost/transcript/runtime facts.",
-      "Lead mediation status update fixture proving Inspect lead mediation shows sanitized progress events and never exposes hidden reasoning, prompts, or raw transcripts.",
+      "Lead mediation status update fixture proving GraphQL/MCP readback exposes sanitized progress events and never exposes hidden reasoning, prompts, or raw transcripts.",
       "Transition cursor and resume fixtures for selected legal transition, no-match unresolved conflict, lead-resolved continuation, terminal_unverifiable, and restart readback.",
       "Validation tests for missing lead, duplicate lead, invalid provider/profile/permission coverage, and missing LeadResolutionContract coverage.",
       "Aggregate field-authority fixtures for proposal_review_summary_v1, including D4F404B7 single-outcome replay.",
       "Unknown transition-input fixtures for exists(unknown_artifact), unknown_artifact.field, declared-but-absent artifact, and missing field behavior.",
-      "Per-surface workflow_conflict shape fixtures for Swift camelCase report JSON, MCP snake_case reports.get, GraphQL typed fields/enums, and latest summary.",
+      "Per-surface workflow_conflict shape fixtures for MCP snake_case reports.get, GraphQL typed fields/enums, and latest summary.",
       "Rust AgentExecution owner-kind migration fixtures proving stage-owned rows remain unchanged and mediation-owned rows work in owner-aware list_by_run, cancel_running_by_run, MCP, GraphQL mediation readback, runtime facts, artifacts, transcripts, and cost aggregation.",
       "Rust retry budget ledger and artifact source-generation claim ownership fixtures for mediation-owned provider quota retry, source claim creation/reuse/supersession, LeadResolutionContract validation, and ignored late outputs.",
       "Bundled workflow simultaneous-match scan fixture with non-zero threshold behavior.",
@@ -1281,7 +1240,7 @@
       "Phase B dogfood exit record fixture covering sample size, organic versus constructed scenario source, rare conflict coverage, completion rate, duplicate-session, readback, time-to-resolution, and operator-feedback gates.",
       "Operator feedback metrics fixture for recovery_action_chosen_total and workflow_conflict_time_to_resolution_seconds.",
       "P053-style implementation-entry handoff fixture proving approved_proposal freeze is engine-owned, lead/orchestrator timeout before planning does not erase handoff truth, run_state.json remains advisory, and reports expose blocked_before_code with code_writer_started=false.",
-      "Implementation-entry handoff northbound shape fixtures proving Swift JSON, latest summary, MCP reports.get, and GraphQL expose equivalent handoff status, code writer start status, approved proposal refs, missing outputs, last planning execution, and retryable_from semantics."
+      "Implementation-entry handoff northbound shape fixtures proving latest summary, MCP reports.get, and GraphQL expose equivalent handoff status, code writer start status, approved proposal refs, missing outputs, last planning execution, and retryable_from semantics."
     ],
     "not_required_in_proposal_readiness_mode": [
       "Xcode build",
@@ -1311,7 +1270,7 @@
       "question": "Should full lead rationale be exportable outside local debug-tier reports?",
       "status": "scheduled_phase_b_readiness_gate",
       "default_for_p017": "No. Public and operator tiers remain summary-only; resolution_record_json and full rationale remain local debug tier unless privacy review approves broader exposure before Phase B readiness closes.",
-      "scope_delta_if_approved": "If privacy review approves broader export, Phase B scope expands only to explicitly-redacted rationale summaries, opt-in UI disclosure in Inspect lead mediation, per-surface Swift/MCP/GraphQL/report parity fixtures, and updated acceptance criteria proving prompts, secrets, hidden reasoning, and unrelated artifact payloads remain excluded. Provider-backed mediation may still proceed with debug-only default if this expanded scope is not approved or not implemented."
+      "scope_delta_if_approved": "If privacy review approves broader export, Phase B scope expands only to explicitly-redacted rationale summaries, GraphQL/MCP/report parity fixtures, and updated acceptance criteria proving prompts, secrets, hidden reasoning, and unrelated artifact payloads remain excluded. Provider-backed mediation may still proceed with debug-only default if this expanded scope is not approved or not implemented."
     },
     {
       "id": "Q-004",
@@ -1335,7 +1294,7 @@
     },
     {
       "source": "ARCH-017-R2-004 and SLB-R2-004",
-      "decision": "Swift bridge migration now has explicit source field, destination relationships, backfill key, dual-read behavior, cutover, removal trigger, and fixtures."
+      "decision": "Superseded by the UI DB cutover. Swift bridge migration is no longer a P017 implementation requirement; P017 truth is control-plane persistence plus GraphQL/MCP readback."
     },
     {
       "source": "ARCH-017-R2-005 and SLB-R2-005",
@@ -1347,27 +1306,27 @@
     },
     {
       "source": "UX-017-01 and SLB-R2-007",
-      "decision": "Operator-facing natural-language labels are specified for every conflict reason and for advisory hint terminology."
+      "decision": "Operator-facing natural-language labels are specified as readback payload labels for every conflict reason and advisory hint terminology. Concrete UI rendering is outside P017."
     },
     {
       "source": "UX-017-02 and SLB-R2-008",
-      "decision": "Lead mediation pending state shows Active for duration and lead agent name."
+      "decision": "Lead mediation pending readback exposes active duration and lead agent name for future UI rendering."
     },
     {
       "source": "UX-017-03 and SLB-R2-009",
-      "decision": "terminal_failure_reason is required in primary recovery view for terminal_unverifiable conflicts."
+      "decision": "terminal_failure_reason is required in GraphQL/MCP recovery readback for terminal_unverifiable conflicts."
     },
     {
       "source": "UI-017-001 and SLB-R2-010",
-      "decision": "Conflict metadata is placed in a dedicated Conflict Details GroupBox after Blocker Summary."
+      "decision": "Superseded by the UI DB cutover. The underlying conflict metadata remains required in GraphQL/MCP readback, but no P017 UI placement is required."
     },
     {
       "source": "UI-017-002 and SLB-R2-011",
-      "decision": "Mediation actions use person.2.wave.2.fill and DesignTokens.Action.primary."
+      "decision": "Superseded by the UI DB cutover. Icon and styling choices are future thin-client UI work, not P017 conformance."
     },
     {
       "source": "PO2-001 and SLB-R2-012",
-      "decision": "UX/UI re-pass is a merge gate before Phase B/C operator-surface work."
+      "decision": "Superseded by the UI DB cutover. GraphQL/MCP readback coverage is the P017 merge gate; future thin-client UI work owns UX/UI sign-off."
     },
     {
       "source": "PO2-002 and SLB-R2-013",
@@ -1399,7 +1358,7 @@
     },
     {
       "source": "ARCH-017-R3-004 and SLB-R3-004",
-      "decision": "workflow_conflict readback now has per-surface shapes: Swift camelCase JSON, MCP snake_case JSON, GraphQL typed fields and enum casing, plus semantic parity fixtures across translations."
+      "decision": "workflow_conflict readback now has per-surface shapes for MCP snake_case JSON and GraphQL typed fields with enum casing, plus semantic parity fixtures across translations. Swift JSON is no longer a P017 acceptance surface."
     },
     {
       "source": "ARCH-017-R3-005",
@@ -1419,7 +1378,7 @@
     },
     {
       "source": "UI-017-001 and SLB-R3-005",
-      "decision": "Conflict Details GroupBox placement now includes field-by-field row order and implementation-ready layout expectations."
+      "decision": "Superseded by the UI DB cutover. Conflict detail field order remains useful future UI guidance, but P017 audits must not require a Conflict Details GroupBox."
     },
     {
       "source": "ARCH-017-R4-001",
@@ -1447,7 +1406,7 @@
     },
     {
       "source": "ARCH-017-R5-001",
-      "decision": "Implementation-entry handoff authority now has a durable storage and API sub-contract. implementation_handoff_status, code_writer_start_status, approved_proposal refs, missing outputs, last planning execution, and retryable_from map to RunExecutionState, artifact records, transition cursor resume policy, and equivalent Swift/latest-summary/MCP/GraphQL readback."
+      "decision": "Implementation-entry handoff authority now has a durable storage and API sub-contract. implementation_handoff_status, code_writer_start_status, approved_proposal refs, missing outputs, last planning execution, and retryable_from map to RunExecutionState, artifact records, transition cursor resume policy, latest-summary readback, MCP reports.get, and GraphQL readback."
     },
     {
       "source": "PO5-001",
@@ -1459,11 +1418,11 @@
     },
     {
       "source": "PO5-003",
-      "decision": "Q-003 now has an explicit scope-delta rule: if broader rationale export is approved, Phase B must add redaction, UI disclosure, report/API parity, and acceptance fixtures before exposing it; otherwise debug-only remains default."
+      "decision": "Q-003 now has an explicit scope-delta rule: if broader rationale export is approved, Phase B must add redaction, report/API parity, and acceptance fixtures before exposing it; otherwise debug-only remains default. UI disclosure is future thin-client work."
     },
     {
       "source": "UX-017-R6-001",
-      "decision": "Inspect lead mediation now exposes sanitized live status updates with timestamps and attempt number, while hidden reasoning, prompts, raw transcript text, and full rationale remain redacted according to Q-003 policy."
+      "decision": "Mediation readback now exposes sanitized live status updates with timestamps and attempt number, while hidden reasoning, prompts, raw transcript text, and full rationale remain redacted according to Q-003 policy. Inspect UI rendering is outside P017."
     },
     {
       "source": "SUG-UX-017-003",
@@ -1471,12 +1430,12 @@
     },
     {
       "source": "SUG-UX-017-004",
-      "decision": "Advisory rejection history is now required in timeline as compact expandable entries, not only in reports."
+      "decision": "Advisory rejection history is required in durable readback. Timeline presentation is future thin-client UI work."
     },
     {
       "source": "UI-017-001 and UI-017-002 current review artifact",
-      "decision": "The repeated UI findings remain explicitly addressed by the dedicated Conflict Details GroupBox, field-by-field row order, mediation icon/color assignment, timeline conflict icon, and grid-aligned debug disclosure. No disagreement remains; the current UI artifact appears to repeat earlier feedback."
+      "decision": "Superseded by the UI DB cutover. Repeated UI findings are retained as historical context only and are not P017 implementation or audit requirements."
     }
   ],
-  "recommendation": "Proceed to implementation-readiness review. Phase 0 and Phase A remain implementation-planning ready, now with explicit transition cursor/resume invariants, implementation-entry handoff storage/API contracts, graph authority, advisory rejection truth, field-authority, fail-closed input classification, per-surface report shapes, and rollout thresholds. Broad Phase B provider-backed mediation remains gated on owner_kind/owner_id AgentExecution migration, owner-adjacent retry/claim fixtures, privacy/default-debug policy or approved Q-003 scope delta, UX/UI sign-off, readiness-checkpoint sequencing, and dogfood exit evidence. Phase C remains gated on enforcement inventory, external catalog discovery or attestation, release-window evidence, and validation UI sign-off."
+  "recommendation": "Proceed to implementation-readiness review for the control-plane scope. Phase 0 and Phase A remain implementation-planning ready, now with explicit transition cursor/resume invariants, implementation-entry handoff storage/API contracts, graph authority, advisory rejection truth, field-authority, fail-closed input classification, per-surface report shapes, and rollout thresholds. Broad Phase B provider-backed mediation remains gated on owner_kind/owner_id AgentExecution migration, owner-adjacent retry/claim fixtures, privacy/default-debug policy or approved Q-003 scope delta, GraphQL/MCP readback evidence, readiness-checkpoint sequencing, and dogfood exit evidence. Phase C remains gated on enforcement inventory, external catalog discovery or attestation, release-window evidence, and GraphQL/MCP validation readback."
 }
