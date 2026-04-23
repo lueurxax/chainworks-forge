@@ -28,7 +28,14 @@ It does not define:
 
 - lower-layer ACP transport details in [acp-runtime-transport.md](acp-runtime-transport.md),
 - higher-layer orchestrator topology in [workflow-execution-engine.md](workflow-execution-engine.md),
-- or operator-facing recovery presentation in [operator-experience.md](operator-experience.md).
+- operator-facing recovery presentation in [operator-experience.md](operator-experience.md),
+- or macOS operator UI rendering for these diagnostics. P053 UI rendering is deferred to [Proposal 069](../proposals/069-p053-discovery-diagnostics-operator-ui.md), which is blocked by [Proposal 031](../proposals/031-thin-ui-rewrite-over-projections-and-mcp.md).
+
+## Operator UI Deferral
+
+The implemented P053 reference truth is the control-plane discovery and settlement model plus durable readback. The macOS operator UI for P053 diagnostics is intentionally not part of P053 closeout.
+
+P069 owns the future UI surfaces for missing/stale/rejected outputs, discovery mode, startup timing, cap warnings, source changes, Copy Path, Open Location, accessibility labels, and Dynamic Type behavior. P069 must build on the P031 thin UI boundary and consume GraphQL read projections only. The macOS UI must not use MCP, direct SQLite reads, local artifact scanning, or Swift-local workflow truth for P053 diagnostics.
 
 ## Bounded Discovery Model
 
@@ -136,7 +143,7 @@ The discovery process produces a `DiscoveryDiagnosticsV1` payload stored in the 
 For runs that are production-exposed in Phase 1, the system provides a minimal durable discovery-decision projection. This is the stable route for support and operator diagnosis before the full Phase 2 diagnostics land.
 
 - **Storage**: Written by `settle_agent_outputs_from_discovery_decisions` into the run evidence path.
-- **Consumption**: Read by `FailedStageEvidencePanel` and run report diagnostics.
+- **Consumption**: Exposed for server-owned diagnostics, MCP/agent readback, run report diagnostics, and future P069 UI rendering through GraphQL projections.
 - **Fields**: `output_name`, `target_path`, `status`, `reason`, `provenance`, `size_bytes`, `decision_at`.
 
 
