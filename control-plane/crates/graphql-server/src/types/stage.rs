@@ -6,6 +6,8 @@ use domain::ids::StageExecutionId;
 use domain::session::{SessionGeneration, SessionLineage};
 use domain::stage::StageExecution;
 
+use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
+
 fn fresh_provider_process_for_disposition(disposition: Option<&str>) -> Option<bool> {
     match disposition {
         Some("reused") => Some(false),
@@ -115,6 +117,7 @@ pub struct GqlStageExecution {
     pub projection_present: bool,
     pub projection_updated_at: Option<String>,
     pub projection_lag: bool,
+    pub freshness_state: GqlFreshnessState,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -390,6 +393,7 @@ impl From<StageExecution> for GqlStageExecution {
             projection_present: false,
             projection_updated_at: None,
             projection_lag: true,
+            freshness_state: GqlFreshnessState::ProjectionLag,
         }
     }
 }
@@ -406,6 +410,7 @@ impl GqlStageExecution {
         gql.projection_present = r.projection_present;
         gql.projection_updated_at = r.projection_updated_at;
         gql.projection_lag = r.projection_lag;
+        gql.freshness_state = freshness_from_projection_lag(gql.projection_lag);
         gql
     }
 }
@@ -432,6 +437,7 @@ impl From<StageSummaryRow> for GqlStageExecution {
             projection_present: r.projection_present,
             projection_updated_at: r.projection_updated_at,
             projection_lag: r.projection_lag,
+            freshness_state: freshness_from_projection_lag(r.projection_lag),
         }
     }
 }

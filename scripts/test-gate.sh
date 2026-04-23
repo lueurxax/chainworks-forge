@@ -1503,6 +1503,7 @@ Available gates:
   proposal-027r   Proposal 027 unified read-only JSON/markdown rendering gate (legacy renderer)
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
+  proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
@@ -1797,6 +1798,11 @@ case "$GATE" in
       cargo test --workspace 2>&1
     )
     log "Proposal 029-MCP control-plane gate passed"
+    ;;
+  proposal-031|p031)
+    log "Proposal 031 gate: thin GraphQL-only UI inventory, static guards, and write-path guide"
+    python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
+    log "Proposal 031 gate passed"
     ;;
   proposal-032|p032)
     check_idle_environment allow_app

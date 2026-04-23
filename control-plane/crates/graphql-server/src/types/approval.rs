@@ -2,6 +2,8 @@ use async_graphql::*;
 use db::repos::projections::ApprovalInboxRow;
 use domain::approval::Approval;
 
+use crate::types::p031::{GqlDisabledReasonCode, GqlFreshnessState, GqlWritePathState};
+
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlApproval {
     pub id: ID,
@@ -12,12 +14,18 @@ pub struct GqlApproval {
     pub decided_at: Option<String>,
     pub comment: Option<String>,
     pub expires_at: Option<String>,
+    pub freshness_state: GqlFreshnessState,
+    pub disabled_reason_code: Option<GqlDisabledReasonCode>,
+    pub write_path_state: GqlWritePathState,
+    pub diagnostic_id: Option<String>,
+    pub server_debug_detail: Option<String>,
 }
 
 impl From<Approval> for GqlApproval {
     fn from(a: Approval) -> Self {
+        let diagnostic_id = a.id.to_string();
         GqlApproval {
-            id: ID(a.id.to_string()),
+            id: ID(diagnostic_id.clone()),
             run_id: ID(a.run_id.to_string()),
             stage_id: a.stage_id,
             decision: a.decision.to_string(),
@@ -25,12 +33,18 @@ impl From<Approval> for GqlApproval {
             decided_at: a.decided_at.map(|t| t.to_rfc3339()),
             comment: a.comment,
             expires_at: a.expires_at.map(|t| t.to_rfc3339()),
+            freshness_state: GqlFreshnessState::Live,
+            disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
+            write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
+            diagnostic_id: Some(diagnostic_id),
+            server_debug_detail: Some("P031 renders approval rows as diagnostic read-only".into()),
         }
     }
 }
 
 impl From<ApprovalInboxRow> for GqlApproval {
     fn from(r: ApprovalInboxRow) -> Self {
+        let diagnostic_id = r.id.clone();
         GqlApproval {
             id: ID(r.id),
             run_id: ID(r.run_id),
@@ -40,6 +54,11 @@ impl From<ApprovalInboxRow> for GqlApproval {
             decided_at: r.decided_at,
             comment: r.comment,
             expires_at: r.expires_at,
+            freshness_state: GqlFreshnessState::Live,
+            disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
+            write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
+            diagnostic_id: Some(diagnostic_id),
+            server_debug_detail: Some("P031 renders approval rows as diagnostic read-only".into()),
         }
     }
 }

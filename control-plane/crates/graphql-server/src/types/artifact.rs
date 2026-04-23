@@ -6,6 +6,10 @@ use domain::validation::ValidationFailureRecord;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::types::p031::{
+    is_report_metadata, GqlFreshnessState, GqlPayloadAvailabilityState,
+    GqlPayloadUnavailableReasonCode,
+};
 use crate::types::stage::AgentOutputSettlement;
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -35,6 +39,11 @@ pub struct GqlArtifact {
     pub supersedes_artifact_generation_id: Option<String>,
     pub output_settlement: Option<AgentOutputSettlement>,
     pub source_generation_verified: Option<bool>,
+    pub freshness_state: GqlFreshnessState,
+    pub payload_availability_state: GqlPayloadAvailabilityState,
+    pub payload_unavailable_reason_code: Option<GqlPayloadUnavailableReasonCode>,
+    pub diagnostic_id: Option<String>,
+    pub server_debug_detail: Option<String>,
 }
 
 #[derive(SimpleObject, Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -104,8 +113,10 @@ pub struct GqlRecoveryRecommendation {
 
 impl From<Artifact> for GqlArtifact {
     fn from(a: Artifact) -> Self {
+        let artifact_id = a.id.to_string();
+        let is_report = is_report_metadata(&a.format.to_string(), a.report_kind.as_deref());
         GqlArtifact {
-            id: ID(a.id.to_string()),
+            id: ID(artifact_id.clone()),
             run_id: ID(a.run_id.to_string()),
             stage_id: a.stage_id,
             agent_id: a.agent_id,
@@ -129,6 +140,21 @@ impl From<Artifact> for GqlArtifact {
             supersedes_artifact_generation_id: None,
             output_settlement: None,
             source_generation_verified: None,
+            freshness_state: GqlFreshnessState::Live,
+            payload_availability_state: if is_report {
+                GqlPayloadAvailabilityState::MetadataOnly
+            } else {
+                GqlPayloadAvailabilityState::Available
+            },
+            payload_unavailable_reason_code: if is_report {
+                Some(GqlPayloadUnavailableReasonCode::PayloadDeferredByP031)
+            } else {
+                None
+            },
+            diagnostic_id: is_report.then_some(artifact_id),
+            server_debug_detail: is_report.then_some(
+                "P031 exposes report metadata only; payload rendering is deferred".into(),
+            ),
         }
     }
 }
@@ -139,8 +165,9 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             .output_settlement
             .as_deref()
             .and_then(output_settlement_from_db);
+        let is_report = is_report_metadata(&r.format, r.report_kind.as_deref());
         GqlArtifact {
-            id: ID(r.id),
+            id: ID(r.id.clone()),
             run_id: ID(r.run_id),
             stage_id: r.stage_id,
             agent_id: r.agent_id,
@@ -164,6 +191,21 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             supersedes_artifact_generation_id: r.supersedes_artifact_generation_id,
             output_settlement,
             source_generation_verified: r.source_generation_verified,
+            freshness_state: GqlFreshnessState::Live,
+            payload_availability_state: if is_report {
+                GqlPayloadAvailabilityState::MetadataOnly
+            } else {
+                GqlPayloadAvailabilityState::Available
+            },
+            payload_unavailable_reason_code: if is_report {
+                Some(GqlPayloadUnavailableReasonCode::PayloadDeferredByP031)
+            } else {
+                None
+            },
+            diagnostic_id: is_report.then_some(r.id),
+            server_debug_detail: is_report.then_some(
+                "P031 exposes report metadata only; payload rendering is deferred".into(),
+            ),
         }
     }
 }

@@ -1,0 +1,54 @@
+Xcode version: 26.4.1 (17E202)
+23:46:16.216 xcodebuild[38865:33530713] Beginning test session Chainworks ForgeTests-EC85B772-145F-4CFE-9A3E-80710CF7B638 at 2026-04-22 23:46:16.215 on target <DVTLocalComputer: 0xbf6a0a600 (My Mac | arm64e)> (26.4.1 (25E253))
+23:46:16.216 xcodebuild[38865:33530713] 	/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild
+test
+-project
+Chainworks Forge.xcodeproj
+-scheme
+Chainworks Forge
+-destination
+platform=macOS
+-parallel-testing-enabled
+NO
+-maximum-parallel-testing-workers
+1
+-derivedDataPath
+tmp/p031-boundary-pass2-derived-data-unsigned
+-resultBundlePath
+tmp/p031-boundary-pass2-unsigned.xcresult
+-skip-testing:Chainworks ForgeUITests
+-only-testing:Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests
+CODE_SIGNING_ALLOWED=NO
+CODE_SIGNING_REQUIRED=NO
+CODE_SIGN_IDENTITY=
+23:46:16.217 xcodebuild[38865:33530713] Test standard output and standard error is at /Users/user/Documents/Chainworks Forge/.chainworks/worktrees/cw-implement-proposal-031-thin-gr-72409268/tmp/p031-boundary-pass2-unsigned.xcresult/Staging/1_Test/Diagnostics/Chainworks ForgeTests-068FF845-E08F-4C6B-93B3-8C95C2212B33-Configuration-Configuration 1-Iteration-1/Chainworks ForgeTests-A83C5719-1804-46CE-8AB2-530F4229C5A1/StandardOutputAndStandardError.txt
+23:46:16.218 xcodebuild[38865:33530713] Setting up test runner session
+23:46:16.218 xcodebuild[38865:33530713] Requesting a socket for communication with testmanagerd.
+23:46:16.218 xcodebuild[38865:33530713] Registering/updating daemon-based crash report observer for process names (
+    WindowServer,
+    "Chainworks ForgeTests",
+    "Chainworks Forge",
+    xctest,
+    DTServiceHub,
+    debugserver,
+    testmanagerd
+)
+23:46:16.220 xcodebuild[38865:33544420] Got socket for DTX-layer communication.
+23:46:16.220 xcodebuild[38865:33543572] Received connection for test runner session
+23:46:16.220 xcodebuild[38865:33543572] Listening for proxy connection request from the test bundle
+23:46:16.220 xcodebuild[38865:33544420] XPC connection for control was invalidated.
+23:46:16.220 xcodebuild[38865:33530713] Test runner session acquired connection.
+23:46:16.221 xcodebuild[38865:33543572] Initiating session with identifier: EC85B772-145F-4CFE-9A3E-80710CF7B638
+23:46:16.240 xcodebuild[38865:33534906] Got reply to session initiation request with identifier EC85B772-145F-4CFE-9A3E-80710CF7B638 (error: (null))
+23:46:16.991 xcodebuild[38865:33530713] Finished requesting crash reports. Continuing with testing.
+23:46:17.063 xcodebuild[38865:33530713] Launch session started.
+23:46:17.182 xcodebuild[38865:33530713] Test process runnable PID is 41141.
+23:46:17.182 xcodebuild[38865:33544420] XCTHTestOperationStateMachine: Transitioning from state Initial to AcquiredPID
+23:51:37.183 xcodebuild[38865:33586353] XCTHTestOperationStateMachine: Startup timer fired; the test runner has not made forward progress for 300.00 seconds
+23:51:37.183 xcodebuild[38865:33586353] XCTHTestOperationStateMachine: Transitioning from state AcquiredPID to BootstrappingHang
+23:51:37.221 xcodebuild[38865:33530713] Acquiring spindump to help determine why test runner got stuck after launching
+23:52:19.238 xcodebuild[38865:33530713] Retrieved spindump data of 9357388 bytes
+23:52:19.238 xcodebuild[38865:33530713] Test operation failure: Error Domain=XCTHTestOperationCoordinatorErrorDomain Code=14 "The test runner hung before establishing connection." UserInfo={NSLocalizedDescription=The test runner hung before establishing connection.}
+23:52:19.239 xcodebuild[38865:33530713] _finishWithError:Error Domain=XCTHTestOperationCoordinatorErrorDomain Code=14 "The test runner hung before establishing connection." UserInfo={NSLocalizedDescription=The test runner hung before establishing connection.}
+23:52:19.239 xcodebuild[38865:33530713] Current state: testRunnerLaunchSessionHasFinishedReceivingData: NO, delegateBlockQueue.count: 0
+23:52:19.239 xcodebuild[38865:33530713] <XCTHTestOperationCoordinator: 0xbf7d6a880>: _considerFlushingDelegateBlockQueue - nothing to flush

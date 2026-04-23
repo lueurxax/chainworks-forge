@@ -177,11 +177,23 @@ impl QueryRoot {
         run_from_projection_or_canonical(pool, run_id).await
     }
 
-    async fn approval_inbox(&self, ctx: &Context<'_>) -> Result<Vec<GqlApproval>> {
+    async fn approval_inbox(
+        &self,
+        ctx: &Context<'_>,
+        run_id: Option<ID>,
+    ) -> Result<Vec<GqlApproval>> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_pending_inbox_projection(pool).await?;
-        Ok(items.into_iter().map(GqlApproval::from).collect())
+        Ok(items
+            .into_iter()
+            .filter(|row| {
+                run_id.as_ref().map_or(true, |requested_run_id| {
+                    row.run_id == requested_run_id.as_str()
+                })
+            })
+            .map(GqlApproval::from)
+            .collect())
     }
 
     async fn artifacts(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlArtifact>> {
@@ -1228,6 +1240,21 @@ mod tests {
         let events = event_bus::new_bus(64);
         let work_queue = WorkQueue::new(pool.clone());
         Arc::new(CommandHandler::new(pool, events, work_queue))
+    }
+
+    fn assert_enum_values(json: &serde_json::Value, alias: &str, expected: &[&str]) {
+        let values = json[alias]["enumValues"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{alias} enumValues should be present"));
+        let actual: Vec<&str> = values
+            .iter()
+            .map(|value| {
+                value["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{alias} enum value name should be a string"))
+            })
+            .collect();
+        assert_eq!(actual, expected.to_vec(), "{alias} enum values drifted");
     }
 
     async fn persist_blocked_implementation_summary(pool: &sqlx::SqlitePool, run_id: RunId) {
@@ -2461,6 +2488,562 @@ mod tests {
             json["stage"]["projectionLag"],
             serde_json::json!(false),
             "missing stage projection must not be indistinguishable from normal false flags"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_schema_exposes_required_enum_values() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P031EnumContract {
+                      freshness: __type(name: "FreshnessState") {
+                        enumValues { name }
+                      }
+                      disabledReason: __type(name: "DisabledReasonCode") {
+                        enumValues { name }
+                      }
+                      writePath: __type(name: "WritePathState") {
+                        enumValues { name }
+                      }
+                      payloadAvailability: __type(name: "PayloadAvailabilityState") {
+                        enumValues { name }
+                      }
+                      payloadUnavailableReason: __type(name: "PayloadUnavailableReasonCode") {
+                        enumValues { name }
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 enum contract introspection must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_enum_values(
+            &json,
+            "freshness",
+            &[
+                "live",
+                "refreshing",
+                "projection_lag",
+                "stale",
+                "unavailable",
+                "unauthorized",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "disabledReason",
+            &[
+                "WRITE_PATH_NOT_AVAILABLE",
+                "MANAGED_OUTSIDE_UI",
+                "AMBIGUOUS_APPROVAL_IDENTITY",
+                "STALE_READ",
+                "PROJECTION_LAG",
+                "UNAUTHORIZED",
+                "UNSUPPORTED_ACTION",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "writePath",
+            &[
+                "read_only_diagnostic",
+                "write_path_not_available",
+                "external_transport_required",
+                "hidden",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "payloadAvailability",
+            &[
+                "available",
+                "metadata_only",
+                "payload_deferred",
+                "generating",
+                "unavailable",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "payloadUnavailableReason",
+            &[
+                "PAYLOAD_DEFERRED_BY_P031",
+                "GENERATING",
+                "NOT_INDEXED",
+                "NOT_AUTHORIZED",
+                "NOT_AVAILABLE",
+                "UNKNOWN",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_freshness_state_is_derived_from_server_projection() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let lagging = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031LaggingFreshness {{
+                      run(id: "{run_id}") {{ freshnessState projectionLag }}
+                      stage(id: "{stage_execution_id}") {{ freshnessState projectionLag }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            lagging.errors.is_empty(),
+            "P031 lagging freshness query must succeed: {lagging:?}"
+        );
+        let lagging_json = lagging.data.into_json().unwrap();
+        assert_eq!(
+            lagging_json["run"]["freshnessState"],
+            serde_json::json!("projection_lag")
+        );
+        assert_eq!(
+            lagging_json["stage"]["freshnessState"],
+            serde_json::json!("projection_lag")
+        );
+
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        let live = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031LiveFreshness {{
+                      run(id: "{run_id}") {{ freshnessState projectionLag }}
+                      stage(id: "{stage_execution_id}") {{ freshnessState projectionLag }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            live.errors.is_empty(),
+            "P031 live freshness query must succeed: {live:?}"
+        );
+        let live_json = live.data.into_json().unwrap();
+        assert_eq!(
+            live_json["run"]["freshnessState"],
+            serde_json::json!("live")
+        );
+        assert_eq!(
+            live_json["stage"]["freshnessState"],
+            serde_json::json!("live")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_approval_inbox_is_diagnostic_read_only() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P031ApprovalDiagnostics {
+                      approvalInbox {
+                        id
+                        freshnessState
+                        disabledReasonCode
+                        writePathState
+                        diagnosticId
+                        serverDebugDetail
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 approval diagnostic query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let approval = &json["approvalInbox"][0];
+        assert_eq!(approval["freshnessState"], serde_json::json!("live"));
+        assert_eq!(
+            approval["disabledReasonCode"],
+            serde_json::json!("WRITE_PATH_NOT_AVAILABLE")
+        );
+        assert_eq!(
+            approval["writePathState"],
+            serde_json::json!("read_only_diagnostic")
+        );
+        assert_eq!(
+            approval["diagnosticId"],
+            serde_json::json!(approval_id.to_string())
+        );
+        assert!(
+            approval["serverDebugDetail"].is_string(),
+            "operator diagnostic detail should be available for approval rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_approval_inbox_can_be_scoped_to_run() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let other_run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        let other_approval_id = domain::ids::ApprovalId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        runs::insert(&pool, &make_run(other_run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: other_approval_id,
+                run_id: other_run_id,
+                stage_id: "stage_2".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+        projections::rebuild_approval_inbox(&pool, other_run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031RunScopedApprovalDiagnostics {{
+                      approvalInbox(runId: "{run_id}") {{
+                        id
+                        runId
+                        stageId
+                        writePathState
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 run-scoped approval query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["approvalInbox"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["approvalInbox"][0]["id"],
+            serde_json::json!(approval_id.to_string())
+        );
+        assert_eq!(
+            json["approvalInbox"][0]["runId"],
+            serde_json::json!(run_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_report_artifacts_are_metadata_only_payloads() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "report".into(),
+                agent_id: "release".into(),
+                name: "Release report".into(),
+                contract_id: "release_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(64),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("release".into()),
+                report_version: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ReportPayloadMetadata {{
+                      artifacts(runId: "{run_id}") {{
+                        id
+                        freshnessState
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        diagnosticId
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 report metadata query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifacts"][0];
+        assert_eq!(artifact["freshnessState"], serde_json::json!("live"));
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("metadata_only")
+        );
+        assert_eq!(
+            artifact["payloadUnavailableReasonCode"],
+            serde_json::json!("PAYLOAD_DEFERRED_BY_P031")
+        );
+        assert_eq!(
+            artifact["diagnosticId"],
+            serde_json::json!(artifact_id.to_string())
+        );
+        assert!(
+            artifact["serverDebugDetail"].is_string(),
+            "operator diagnostic detail should explain why report payload rendering is deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_diagnostic_metadata_is_operator_only() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        let artifact_id = ArtifactId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "report".into(),
+                agent_id: "release".into(),
+                name: "Release report".into(),
+                contract_id: "release_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(64),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("release".into()),
+                report_version: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let approval_response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P031ApprovalDiagnosticsObserverDenied {
+                      approvalInbox {
+                        diagnosticId
+                        serverDebugDetail
+                        disabledReasonCode
+                        writePathState
+                      }
+                    }
+                    "#,
+                )
+                .data(observer_principal()),
+            )
+            .await;
+        assert!(
+            approval_response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "observer principals must not read P031 approval diagnostic metadata: {approval_response:?}"
+        );
+
+        let artifact_response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ReportDiagnosticsObserverDenied {{
+                      artifacts(runId: "{run_id}") {{
+                        diagnosticId
+                        serverDebugDetail
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                      }}
+                    }}
+                    "#
+                ))
+                .data(observer_principal()),
+            )
+            .await;
+        assert!(
+            artifact_response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "observer principals must not read P031 report diagnostic metadata: {artifact_response:?}"
         );
     }
 
