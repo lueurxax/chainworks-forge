@@ -5,6 +5,10 @@ use domain::artifact_contracts::{
     TargetStageSummary, ValidationIssue,
 };
 use domain::run::Run;
+use domain::workflow_conflict::{
+    CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
+    WorkflowConflictRecord, WorkflowConflictStatus,
+};
 
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlRun {
@@ -44,6 +48,9 @@ pub struct GqlRun {
     pub active_artifact_index_json: Option<String>,
     pub run_state_projection_json: Option<String>,
     pub operator_overrides_json: Option<String>,
+    pub workflow_conflict: Option<GqlWorkflowConflict>,
+    pub implementation_handoff_status_json: Option<Json<serde_json::Value>>,
+    pub legacy_discovery_overrides_json: Option<String>,
     pub implementation_self_assessment_summary: Option<GqlImplementationSelfAssessmentSummary>,
 }
 
@@ -84,6 +91,9 @@ impl From<Run> for GqlRun {
             active_artifact_index_json: None,
             run_state_projection_json: None,
             operator_overrides_json: None,
+            workflow_conflict: None,
+            implementation_handoff_status_json: None,
+            legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
         }
     }
@@ -143,7 +153,183 @@ impl From<RunProjectionRow> for GqlRun {
             active_artifact_index_json: None,
             run_state_projection_json: None,
             operator_overrides_json: None,
+            workflow_conflict: None,
+            implementation_handoff_status_json: None,
+            legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlWorkflowConflict {
+    pub conflict_id: ID,
+    pub conflict_fingerprint: String,
+    pub run_id: ID,
+    pub stage_execution_id: Option<ID>,
+    pub lineage_id: Option<String>,
+    pub current_state_id: String,
+    pub reason: GqlWorkflowConflictReason,
+    pub operator_label: String,
+    pub status: GqlWorkflowConflictStatus,
+    pub candidate_transitions: Vec<GqlCandidateTransitionEvaluation>,
+    pub candidate_transition_hash: String,
+    pub advisory_evidence_refs: Vec<String>,
+    pub lead_agent_id: Option<String>,
+    pub mediation_record_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+    pub superseded_by_conflict_id: Option<String>,
+    pub resolution_record_json: Option<Json<serde_json::Value>>,
+    pub terminal_failure_reason: Option<String>,
+    pub diagnostic_redaction_tier: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlCandidateTransitionEvaluation {
+    pub transition_id: String,
+    pub from_state_id: String,
+    pub to_state_id: String,
+    pub condition_expression_id: Option<String>,
+    pub result: GqlCandidateTransitionResult,
+    pub required_artifacts: Vec<String>,
+    pub missing_artifacts: Vec<String>,
+    pub missing_fields: Vec<String>,
+    pub source_artifact_ids: Vec<String>,
+    pub source_agent_execution_id: Option<String>,
+    pub sanitized_diagnostic: Option<String>,
+}
+
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlWorkflowConflictReason {
+    InvalidNextStageHint,
+    NoDeclarativeTransitionMatched,
+    MultipleDeclarativeTransitionsMatchedWithoutTieBreak,
+    RequiredArtifactOrFieldMissingForTransition,
+    AggregateTransitionTruthConflicted,
+    WorkflowConflictUnverifiable,
+    ImplementationHandoffUnavailable,
+}
+
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlWorkflowConflictStatus {
+    Unresolved,
+    LeadMediationPending,
+    OperatorConfirmationRequired,
+    Resolved,
+    Superseded,
+    TerminalUnverifiable,
+}
+
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlCandidateTransitionResult {
+    Matched,
+    NotMatched,
+    MissingInput,
+    InvalidExpression,
+    EvaluationError,
+}
+
+impl From<WorkflowConflictRecord> for GqlWorkflowConflict {
+    fn from(record: WorkflowConflictRecord) -> Self {
+        GqlWorkflowConflict {
+            conflict_id: ID(record.conflict_id),
+            conflict_fingerprint: record.conflict_fingerprint,
+            run_id: ID(record.run_id),
+            stage_execution_id: record.stage_execution_id.map(ID),
+            lineage_id: record.lineage_id,
+            current_state_id: record.current_state_id,
+            reason: record.reason.into(),
+            operator_label: record.operator_label,
+            status: record.status.into(),
+            candidate_transitions: record
+                .candidate_transitions
+                .into_iter()
+                .map(GqlCandidateTransitionEvaluation::from)
+                .collect(),
+            candidate_transition_hash: record.candidate_transition_hash,
+            advisory_evidence_refs: record.advisory_evidence_refs,
+            lead_agent_id: record.lead_agent_id,
+            mediation_record_id: record.mediation_record_id,
+            created_at: record.created_at.to_rfc3339(),
+            updated_at: record.updated_at.to_rfc3339(),
+            resolved_at: record.resolved_at.map(|dt| dt.to_rfc3339()),
+            superseded_by_conflict_id: record.superseded_by_conflict_id,
+            resolution_record_json: record.resolution_record_json.map(Json),
+            terminal_failure_reason: record.terminal_failure_reason,
+            diagnostic_redaction_tier: record.diagnostic_redaction_tier,
+        }
+    }
+}
+
+impl From<CandidateTransitionEvaluation> for GqlCandidateTransitionEvaluation {
+    fn from(candidate: CandidateTransitionEvaluation) -> Self {
+        GqlCandidateTransitionEvaluation {
+            transition_id: candidate.transition_id,
+            from_state_id: candidate.from_state_id,
+            to_state_id: candidate.to_state_id,
+            condition_expression_id: candidate.condition_expression_id,
+            result: candidate.result.into(),
+            required_artifacts: candidate.required_artifacts,
+            missing_artifacts: candidate.missing_artifacts,
+            missing_fields: candidate.missing_fields,
+            source_artifact_ids: candidate.source_artifact_ids,
+            source_agent_execution_id: candidate.source_agent_execution_id,
+            sanitized_diagnostic: candidate.sanitized_diagnostic,
+        }
+    }
+}
+
+impl From<WorkflowConflictReason> for GqlWorkflowConflictReason {
+    fn from(reason: WorkflowConflictReason) -> Self {
+        match reason {
+            WorkflowConflictReason::InvalidNextStageHint => Self::InvalidNextStageHint,
+            WorkflowConflictReason::NoDeclarativeTransitionMatched => {
+                Self::NoDeclarativeTransitionMatched
+            }
+            WorkflowConflictReason::MultipleDeclarativeTransitionsMatchedWithoutTieBreak => {
+                Self::MultipleDeclarativeTransitionsMatchedWithoutTieBreak
+            }
+            WorkflowConflictReason::RequiredArtifactOrFieldMissingForTransition => {
+                Self::RequiredArtifactOrFieldMissingForTransition
+            }
+            WorkflowConflictReason::AggregateTransitionTruthConflicted => {
+                Self::AggregateTransitionTruthConflicted
+            }
+            WorkflowConflictReason::WorkflowConflictUnverifiable => {
+                Self::WorkflowConflictUnverifiable
+            }
+            WorkflowConflictReason::ImplementationHandoffUnavailable => {
+                Self::ImplementationHandoffUnavailable
+            }
+        }
+    }
+}
+
+impl From<WorkflowConflictStatus> for GqlWorkflowConflictStatus {
+    fn from(status: WorkflowConflictStatus) -> Self {
+        match status {
+            WorkflowConflictStatus::Unresolved => Self::Unresolved,
+            WorkflowConflictStatus::LeadMediationPending => Self::LeadMediationPending,
+            WorkflowConflictStatus::OperatorConfirmationRequired => {
+                Self::OperatorConfirmationRequired
+            }
+            WorkflowConflictStatus::Resolved => Self::Resolved,
+            WorkflowConflictStatus::Superseded => Self::Superseded,
+            WorkflowConflictStatus::TerminalUnverifiable => Self::TerminalUnverifiable,
+        }
+    }
+}
+
+impl From<CandidateTransitionResult> for GqlCandidateTransitionResult {
+    fn from(result: CandidateTransitionResult) -> Self {
+        match result {
+            CandidateTransitionResult::Matched => Self::Matched,
+            CandidateTransitionResult::NotMatched => Self::NotMatched,
+            CandidateTransitionResult::MissingInput => Self::MissingInput,
+            CandidateTransitionResult::InvalidExpression => Self::InvalidExpression,
+            CandidateTransitionResult::EvaluationError => Self::EvaluationError,
         }
     }
 }

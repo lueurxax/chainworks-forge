@@ -87,6 +87,7 @@ final class WorkflowOrchestrator {
     private var producedArtifactNames: Set<String> = []
     /// Tracks artifact field data for expression evaluation
     private var artifactFields: [String: [String: AnyCodableValue]] = [:]
+    private var transitionAdvisories: [TransitionAdvisoryHint] = []
     /// Runtime variables (clone of plan.variables, mutable for loop counters)
     private var runtimeVariables: [String: AnyCodableValue]
     /// Tracks currently active agent executions for live event routing.
@@ -257,6 +258,13 @@ final class WorkflowOrchestrator {
                 if !success {
                     RuntimeDiagnostics.log(
                         "resumeAfterApproval runAfterApprovalFailed stageID=\(stageID)")
+                    if run.status == .blocked,
+                        run.currentWorkflowConflictRecord?.reason == .implementationHandoffUnavailable
+                    {
+                        isRunning = false
+                        onComplete?(false)
+                        return
+                    }
                     handleFailure(state: state)
                     return
                 }
@@ -264,22 +272,33 @@ final class WorkflowOrchestrator {
         }
 
         // Evaluate transitions from the resolved approval state
-        let context = TransitionEvaluator.EvaluationContext(
-            producedArtifactNames: producedArtifactNames,
+        let context = makeTransitionEvaluationContext(
             approvalGranted: approvalGranted,
-            approvalRejected: !approvalGranted,
-            variables: runtimeVariables,
-            artifactFields: artifactFields
+            approvalRejected: !approvalGranted
         )
 
-        guard
-            let transition = TransitionEvaluator.evaluateFirst(
-                transitions: state.transitions,
-                context: context
-            )
-        else {
+        let resolution = TransitionEvaluator.resolveAuthority(
+            transitions: state.transitions,
+            fromStateID: state.id,
+            context: context
+        )
+
+        guard let transition = resolution.selectedTransition else {
             RuntimeDiagnostics.log("resumeAfterApproval noTransition stageID=\(stageID)")
+            let completedStageExecutionID = run.stageExecutions.first(where: {
+                $0.stageID == stageID && $0.status == .completed
+            })?.id
             run.status = .blocked
+            let conflict = persistBlockingWorkflowConflict(
+                resolution: resolution,
+                currentStateID: state.id,
+                stageExecutionID: completedStageExecutionID
+            )
+            settleWorkflowConflict(
+                conflict,
+                currentStateID: state.id,
+                currentStageExecutionID: completedStageExecutionID
+            )
             isRunning = false
             onComplete?(false)
             return
@@ -306,6 +325,16 @@ final class WorkflowOrchestrator {
             onComplete?(false)
             return
         }
+        resolveWorkflowConflictAfterSelectedTransition(
+            resolution: resolution,
+            currentStateID: stageID,
+            stageExecutionID: completedStageExec?.id
+        )
+        recordAdvisoryRejectionsAfterSelectedTransition(
+            resolution: resolution,
+            currentStateID: stageID,
+            stageExecutionID: completedStageExec?.id
+        )
 
         RuntimeDiagnostics.log(
             "resumeAfterApproval transition stageID=\(stageID) to=\(transition.to)")
@@ -347,6 +376,10 @@ final class WorkflowOrchestrator {
             case .paused:
                 // Waiting for approval — exit loop, will resume later
                 return
+            case .blocked:
+                isRunning = false
+                onComplete?(false)
+                return
             case .failed:
                 handleFailure(state: state)
                 return
@@ -372,47 +405,58 @@ final class WorkflowOrchestrator {
             }
 
             // Evaluate transitions
-            let context = TransitionEvaluator.EvaluationContext(
-                producedArtifactNames: producedArtifactNames,
+            let context = makeTransitionEvaluationContext(
                 approvalGranted: isApprovalGranted(for: state.id),
-                approvalRejected: isApprovalRejected(for: state.id),
-                variables: runtimeVariables,
-                artifactFields: artifactFields
+                approvalRejected: isApprovalRejected(for: state.id)
             )
 
-            guard
-                let transition = TransitionEvaluator.evaluateFirst(
-                    transitions: state.transitions,
-                    context: context
-                )
-            else {
+            if state.transitions.isEmpty {
                 // No transition matches — check if we should wait (approval) or fail
                 if state.approvalRequired && !isApprovalGranted(for: state.id) {
                     // Already handled in executeState — should be paused
                     return
                 }
                 // Dead end — mark complete if no transitions defined
-                if state.transitions.isEmpty {
-                    RuntimeDiagnostics.log(
-                        "executeStateMachine deadEndComplete stateID=\(state.id)")
-                    run.status = .completed
-                    run.completedAt = Date()
-                    settleTerminal(
-                        lastCompletedStateID: state.id,
-                        lastCompletedStageExec: run.stageExecutions.last {
-                            $0.stageID == state.id && $0.status == .completed
-                        })
-                    persistDeliveryReceiptIfNeeded(finalStateID: state.id)
-                    isRunning = false
-                    onComplete?(true)
-                    return
-                }
+                RuntimeDiagnostics.log(
+                    "executeStateMachine deadEndComplete stateID=\(state.id)")
+                run.status = .completed
+                run.completedAt = Date()
+                settleTerminal(
+                    lastCompletedStateID: state.id,
+                    lastCompletedStageExec: run.stageExecutions.last {
+                        $0.stageID == state.id && $0.status == .completed
+                    })
+                persistDeliveryReceiptIfNeeded(finalStateID: state.id)
+                isRunning = false
+                onComplete?(true)
+                return
+            }
+
+            let resolution = TransitionEvaluator.resolveAuthority(
+                transitions: state.transitions,
+                fromStateID: state.id,
+                context: context
+            )
+
+            guard let transition = resolution.selectedTransition else {
                 // Otherwise, stalled
                 RuntimeDiagnostics.log(
                     "executeStateMachine blockedNoTransition stateID=\(state.id) artifacts=\(producedArtifactNames.sorted())"
                 )
+                let completedStageExecutionID = run.stageExecutions.last {
+                    $0.stageID == state.id && $0.status == .completed
+                }?.id
                 run.status = .blocked
-                settleTerminal()
+                let conflict = persistBlockingWorkflowConflict(
+                    resolution: resolution,
+                    currentStateID: state.id,
+                    stageExecutionID: completedStageExecutionID
+                )
+                settleWorkflowConflict(
+                    conflict,
+                    currentStateID: state.id,
+                    currentStageExecutionID: completedStageExecutionID
+                )
                 isRunning = false
                 onComplete?(false)
                 return
@@ -442,6 +486,16 @@ final class WorkflowOrchestrator {
                 onComplete?(false)
                 return
             }
+            resolveWorkflowConflictAfterSelectedTransition(
+                resolution: resolution,
+                currentStateID: state.id,
+                stageExecutionID: completedStageExec?.id
+            )
+            recordAdvisoryRejectionsAfterSelectedTransition(
+                resolution: resolution,
+                currentStateID: state.id,
+                stageExecutionID: completedStageExec?.id
+            )
 
             RuntimeDiagnostics.log(
                 "executeStateMachine transition from=\(state.id) to=\(transition.to)")
@@ -450,11 +504,302 @@ final class WorkflowOrchestrator {
         }
     }
 
+    private func makeTransitionEvaluationContext(
+        approvalGranted: Bool,
+        approvalRejected: Bool
+    ) -> TransitionEvaluator.EvaluationContext {
+        TransitionEvaluator.EvaluationContext(
+            producedArtifactNames: producedArtifactNames,
+            declaredArtifactNames: declaredWorkflowArtifactNames,
+            approvalGranted: approvalGranted,
+            approvalRejected: approvalRejected,
+            variables: runtimeVariables,
+            artifactFields: artifactFields
+        )
+    }
+
+    private var declaredWorkflowArtifactNames: Set<String> {
+        var names = Set(plan.agentBindings.values.flatMap(\.outputs))
+        for state in plan.states.values {
+            collectDeclaredOutputs(from: state.runBlock, into: &names)
+            collectDeclaredOutputs(from: state.runAfterApproval, into: &names)
+        }
+        return names
+    }
+
+    private func collectDeclaredOutputs(
+        from block: ExecutableRunBlock?,
+        into names: inout Set<String>
+    ) {
+        guard let block else { return }
+        for phase in block.phases {
+            let tasks: [AgentTask]
+            switch phase {
+            case .sequential(let phaseTasks), .parallel(let phaseTasks):
+                tasks = phaseTasks
+            }
+            for task in tasks {
+                for output in task.outputs ?? [] {
+                    names.insert(output)
+                }
+            }
+        }
+    }
+
+    private func persistBlockingWorkflowConflict(
+        resolution: TransitionEvaluator.AuthorityResolution,
+        currentStateID: String,
+        stageExecutionID: UUID?
+    ) -> WorkflowConflictRecord {
+        let reason = resolution.conflictReason ?? .workflowConflictUnverifiable
+        let candidateHash = workflowConflictHash(for: resolution.candidateEvaluations)
+        let fingerprint = workflowConflictFingerprint(
+            currentStateID: currentStateID,
+            reason: reason,
+            candidateHash: candidateHash
+        )
+        let now = ISO8601DateFormatter().string(from: Date())
+        let existing = run.workflowConflictBridgeV1.conflicts.first {
+            $0.conflictFingerprint == fingerprint
+        }
+        let status = workflowConflictInitialStatus(for: reason)
+        let terminalFailureReason = workflowConflictTerminalFailureReason(for: reason)
+        let record = WorkflowConflictRecord(
+            conflictID: existing?.conflictID ?? "conflict-\(UUID().uuidString)",
+            conflictFingerprint: fingerprint,
+            runID: run.id.uuidString,
+            stageExecutionID: stageExecutionID?.uuidString,
+            lineageID: nil,
+            currentStateID: currentStateID,
+            reason: reason,
+            operatorLabel: resolution.operatorLabel ?? "Workflow transition requires resolution",
+            status: status,
+            candidateTransitions: resolution.candidateEvaluations,
+            candidateTransitionHash: candidateHash,
+            advisoryEvidenceRefs: [],
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+            terminalFailureReason: terminalFailureReason
+        )
+        run.upsertWorkflowConflictRecord(record)
+        RuntimeDiagnostics.log(
+            "workflowConflict persisted stateID=\(currentStateID) reason=\(reason.rawValue) fingerprint=\(fingerprint)"
+        )
+        do {
+            try modelContext.save()
+        } catch {
+            RuntimeDiagnostics.log(
+                "workflowConflict saveFailed stateID=\(currentStateID) error=\(error.localizedDescription)"
+            )
+            run.driftDetails =
+                "Workflow conflict persisted in memory but could not be saved: \(error.localizedDescription)"
+        }
+        return record
+    }
+
+    private func workflowConflictInitialStatus(for reason: WorkflowConflictReason) -> WorkflowConflictStatus {
+        switch reason {
+        case .aggregateTransitionTruthConflicted:
+            return .operatorConfirmationRequired
+        case .workflowConflictUnverifiable:
+            return .terminalUnverifiable
+        default:
+            return .unresolved
+        }
+    }
+
+    private func workflowConflictTerminalFailureReason(for reason: WorkflowConflictReason) -> String? {
+        guard reason == .workflowConflictUnverifiable else { return nil }
+        return "Workflow transition outcome could not be verified"
+    }
+
+    private func resolveWorkflowConflictAfterSelectedTransition(
+        resolution: TransitionEvaluator.AuthorityResolution,
+        currentStateID: String,
+        stageExecutionID: UUID?
+    ) {
+        guard let selectedEvaluation = resolution.selectedEvaluation,
+            let selectedNextStateID = resolution.selectedNextStateID
+        else {
+            return
+        }
+        let now = ISO8601DateFormatter().string(from: Date())
+        let resolvedCount = run.resolveCurrentWorkflowConflicts(
+            currentStateID: currentStateID,
+            selectedTransitionID: selectedEvaluation.transitionID,
+            selectedNextStateID: selectedNextStateID,
+            stageExecutionID: stageExecutionID,
+            resolvedAt: now
+        )
+        guard resolvedCount > 0 else { return }
+        do {
+            try modelContext.save()
+            RuntimeDiagnostics.log(
+                "workflowConflict resolved stateID=\(currentStateID) selectedTransitionID=\(selectedEvaluation.transitionID) count=\(resolvedCount)"
+            )
+        } catch {
+            RuntimeDiagnostics.log(
+                "workflowConflict resolveSaveFailed stateID=\(currentStateID) error=\(error.localizedDescription)"
+            )
+            run.driftDetails =
+                "Workflow conflict resolved in memory but could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    private func recordAdvisoryRejectionsAfterSelectedTransition(
+        resolution: TransitionEvaluator.AuthorityResolution,
+        currentStateID: String,
+        stageExecutionID: UUID?
+    ) {
+        guard let selectedEvaluation = resolution.selectedEvaluation,
+            let selectedNextStateID = resolution.selectedNextStateID
+        else {
+            return
+        }
+
+        let rejectedAdvisories = transitionAdvisories.filter { advisory in
+            guard let nextStage = advisory.nextStageHint else { return false }
+            return nextStage != selectedNextStateID
+        }
+        guard !rejectedAdvisories.isEmpty else { return }
+
+        let now = ISO8601DateFormatter().string(from: Date())
+        for advisory in rejectedAdvisories {
+            let graphMembershipResult = advisoryGraphMembershipResult(
+                advisory: advisory,
+                selectedNextStateID: selectedNextStateID
+            )
+            let advisoryHintHash = workflowConflictHash(for: [
+                "schema": AnyCodableValue.string("workflow_advisory_hint_v1"),
+                "source_artifact_id": .string(advisory.sourceArtifactID),
+                "next_stage": advisory.nextStageHint.map(AnyCodableValue.string) ?? .null,
+                "next_action": advisory.nextAction.map(AnyCodableValue.string) ?? .null,
+                "graph_membership_result": .string(graphMembershipResult)
+            ])
+            let record = WorkflowAdvisoryRejectionRecord(
+                rejectionID: "advisory-rejection-\(UUID().uuidString)",
+                runID: run.id.uuidString,
+                stageExecutionID: stageExecutionID?.uuidString,
+                lineageID: stageExecutionID?.uuidString,
+                currentStateID: currentStateID,
+                selectedTransitionID: selectedEvaluation.transitionID,
+                selectedNextStateID: selectedNextStateID,
+                advisoryNextStageHint: advisory.nextStageHint,
+                advisoryNextAction: advisory.nextAction,
+                advisoryHintHash: advisoryHintHash,
+                advisoryHintProvenance: advisoryProvenance(
+                    for: advisory,
+                    graphMembershipResult: graphMembershipResult
+                ),
+                graphMembershipResult: graphMembershipResult,
+                createdAt: now
+            )
+            run.appendWorkflowAdvisoryRejectionRecord(record)
+        }
+
+        do {
+            try modelContext.save()
+            RuntimeDiagnostics.log(
+                "workflowAdvisoryRejection persisted stateID=\(currentStateID) selectedNextStateID=\(selectedNextStateID) count=\(rejectedAdvisories.count)"
+            )
+        } catch {
+            RuntimeDiagnostics.log(
+                "workflowAdvisoryRejection saveFailed stateID=\(currentStateID) error=\(error.localizedDescription)"
+            )
+            run.driftDetails =
+                "Workflow advisory rejection persisted in memory but could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    private func advisoryGraphMembershipResult(
+        advisory: TransitionAdvisoryHint,
+        selectedNextStateID: String
+    ) -> String {
+        guard let nextStage = advisory.nextStageHint else {
+            return "no_next_stage_hint"
+        }
+        guard plan.states[nextStage] != nil else {
+            return "absent_from_graph"
+        }
+        return nextStage == selectedNextStateID ? "graph_state_selected" : "graph_state_not_selected"
+    }
+
+    private func advisoryProvenance(
+        for advisory: TransitionAdvisoryHint,
+        graphMembershipResult: String
+    ) -> [AdvisoryHintExtraction] {
+        var provenance: [AdvisoryHintExtraction] = []
+        if let nextStage = advisory.nextStageHint {
+            provenance.append(
+                AdvisoryHintExtraction(
+                    sourceArtifactID: advisory.sourceArtifactID,
+                    sourceAgentExecutionID: advisory.sourceAgentExecutionID,
+                    advisoryPath: "$.next_stage",
+                    rawValueHash: workflowConflictHash(for: nextStage),
+                    redactedValue: nextStage,
+                    graphMembershipResult: graphMembershipResult,
+                    supersededByProjection: advisory.supersededByProjection,
+                    includedInCandidateTransitionHash: true
+                )
+            )
+        }
+        if let nextAction = advisory.nextAction {
+            provenance.append(
+                AdvisoryHintExtraction(
+                    sourceArtifactID: advisory.sourceArtifactID,
+                    sourceAgentExecutionID: advisory.sourceAgentExecutionID,
+                    advisoryPath: "$.next_action",
+                    rawValueHash: workflowConflictHash(for: nextAction),
+                    redactedValue: nextAction,
+                    graphMembershipResult: graphMembershipResult,
+                    supersededByProjection: advisory.supersededByProjection,
+                    includedInCandidateTransitionHash: true
+                )
+            )
+        }
+        return provenance
+    }
+
+    private func workflowConflictHash(
+        for evaluations: [CandidateTransitionEvaluation]
+    ) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = (try? encoder.encode(evaluations)) ?? Data()
+        return "sha256:\(sha256Hex(data))"
+    }
+
+    private func workflowConflictHash<T: Encodable>(for value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = (try? encoder.encode(value)) ?? Data()
+        return "sha256:\(sha256Hex(data))"
+    }
+
+    private func workflowConflictFingerprint(
+        currentStateID: String,
+        reason: WorkflowConflictReason,
+        candidateHash: String
+    ) -> String {
+        let source = [
+            run.id.uuidString,
+            currentStateID,
+            reason.rawValue,
+            candidateHash
+        ].joined(separator: "|")
+        return "sha256:\(sha256Hex(Data(source.utf8)))"
+    }
+
+    private func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     // MARK: - State Execution Result
 
     private enum StateResult {
         case succeeded
         case failed
+        case blocked
         case paused  // waiting for approval
     }
 
@@ -554,6 +899,11 @@ final class WorkflowOrchestrator {
             let blockSuccess = await executeRunBlock(runBlock, state: state, stageExec: stageExec)
             if !blockSuccess {
                 RuntimeDiagnostics.log("executeState runBlockFailed stateID=\(state.id)")
+                if run.status == .blocked,
+                    run.currentWorkflowConflictRecord?.reason == .implementationHandoffUnavailable
+                {
+                    return .blocked
+                }
                 stageExec.status = .failed
                 stageExec.completedAt = Date()
                 return .failed
@@ -595,6 +945,11 @@ final class WorkflowOrchestrator {
                 runAfterApproval, state: state, stageExec: stageExec)
             if !afterSuccess {
                 RuntimeDiagnostics.log("executeState runAfterApprovalFailed stateID=\(state.id)")
+                if run.status == .blocked,
+                    run.currentWorkflowConflictRecord?.reason == .implementationHandoffUnavailable
+                {
+                    return .blocked
+                }
                 stageExec.status = .failed
                 stageExec.completedAt = Date()
                 return .failed
@@ -625,6 +980,244 @@ final class WorkflowOrchestrator {
         healPrematureBlockedStateIfNeeded()
         RuntimeDiagnostics.log("executeState completed stateID=\(state.id)")
         return .succeeded
+    }
+
+    private func implementationHandoffUnavailable(
+        for task: AgentTask,
+        agent: ResolvedAgent,
+        state: ExecutableState,
+        stageExec: StageExecution
+    ) -> Bool {
+        guard isCodeWriterImplementationTask(task, agent: agent) else {
+            return false
+        }
+
+        let requiredArtifacts = (task.inputs ?? []).sorted()
+        guard !requiredArtifacts.isEmpty else {
+            persistImplementationHandoffStatus(
+                stateID: state.id,
+                taskName: task.task,
+                requiredArtifacts: [],
+                availableArtifacts: [],
+                missingArtifacts: [],
+                codeWriterStartStatus: "not_queued",
+                status: "not_required"
+            )
+            return false
+        }
+
+        ensureApprovedProposalHandoffArtifactIfPossible(state: state, stageExec: stageExec)
+        let persisted = persistedArtifacts()
+        let availableArtifacts = Set(persisted.map(\.name))
+        let missingArtifacts = requiredArtifacts.filter { !availableArtifacts.contains($0) }
+        if missingArtifacts.isEmpty {
+            persistImplementationHandoffStatus(
+                stateID: state.id,
+                taskName: task.task,
+                requiredArtifacts: requiredArtifacts,
+                availableArtifacts: requiredArtifacts,
+                missingArtifacts: [],
+                codeWriterStartStatus: "not_queued",
+                status: "ready"
+            )
+            return false
+        }
+
+        RuntimeDiagnostics.log(
+            "implementationHandoffUnavailable stateID=\(state.id) task=\(task.task) missing=\(missingArtifacts.joined(separator: ","))"
+        )
+        stageExec.status = .blocked
+        stageExec.completedAt = Date()
+        run.status = .blocked
+        persistImplementationHandoffStatus(
+            stateID: state.id,
+            taskName: task.task,
+            requiredArtifacts: requiredArtifacts,
+            availableArtifacts: requiredArtifacts.filter { availableArtifacts.contains($0) },
+            missingArtifacts: missingArtifacts,
+            codeWriterStartStatus: "blocked_before_code",
+            status: "blocked_before_code"
+        )
+        persistImplementationHandoffUnavailableConflict(
+            currentStateID: state.id,
+            stageExecutionID: stageExec.id,
+            requiredArtifacts: requiredArtifacts,
+            missingArtifacts: missingArtifacts
+        )
+        settleWorkflowConflictBlocked(
+            currentStateID: state.id,
+            currentStageExecutionID: stageExec.id
+        )
+        return true
+    }
+
+    private func isCodeWriterImplementationTask(
+        _ task: AgentTask,
+        agent: ResolvedAgent
+    ) -> Bool {
+        guard agent.id == "code_writer" else { return false }
+        return task.task == "start_implementation"
+            || task.task == "initial_implementation"
+            || task.task == "continue_implementation"
+    }
+
+    private func persistImplementationHandoffStatus(
+        stateID: String,
+        taskName: String,
+        requiredArtifacts: [String],
+        availableArtifacts: [String],
+        missingArtifacts: [String],
+        codeWriterStartStatus: String,
+        status: String
+    ) {
+        let approvedProposalArtifact = persistedArtifacts()
+            .last { $0.name == "approved_proposal" }
+        run.implementationHandoffStatus = ImplementationHandoffStatus(
+            runID: run.id.uuidString,
+            currentStateID: stateID,
+            taskName: taskName,
+            requiredInputArtifacts: requiredArtifacts,
+            availableInputArtifacts: availableArtifacts,
+            missingInputArtifacts: missingArtifacts,
+            approvedProposalPresent: availableArtifacts.contains("approved_proposal"),
+            approvedProposalArtifactID: approvedProposalArtifact?.id.uuidString,
+            approvedProposalDigest: approvedProposalArtifact?.checksumSHA256,
+            worktreeRoot: run.worktreeRoot,
+            workspaceRoot: run.workspaceRoot,
+            artifactRoot: run.artifactRoot,
+            codeWriterStartStatus: codeWriterStartStatus,
+            status: status,
+            missingHandoffOutputs: missingArtifacts,
+            retryableFrom: "implementation_handoff:\(stateID)",
+            blockedBeforeCodeReason: status == "blocked_before_code"
+                ? "implementation_handoff_unavailable"
+                : nil,
+            updatedAt: ISO8601DateFormatter().string(from: Date())
+        )
+    }
+
+    private func persistImplementationHandoffCodeWriterStartStatus(_ status: String) {
+        guard let current = run.implementationHandoffStatus,
+            current.status != "blocked_before_code"
+        else {
+            return
+        }
+
+        run.implementationHandoffStatus = ImplementationHandoffStatus(
+            schemaVersion: current.schemaVersion,
+            runID: current.runID,
+            currentStateID: current.currentStateID,
+            taskName: current.taskName,
+            requiredInputArtifacts: current.requiredInputArtifacts,
+            availableInputArtifacts: current.availableInputArtifacts,
+            missingInputArtifacts: current.missingInputArtifacts,
+            approvedProposalPresent: current.approvedProposalPresent,
+            approvedProposalArtifactID: current.approvedProposalArtifactID,
+            approvedProposalDigest: current.approvedProposalDigest,
+            worktreeRoot: current.worktreeRoot,
+            workspaceRoot: current.workspaceRoot,
+            artifactRoot: current.artifactRoot,
+            codeWriterStartStatus: status,
+            status: current.status,
+            missingHandoffOutputs: current.missingHandoffOutputs,
+            lastHandoffAgentExecutionID: current.lastHandoffAgentExecutionID,
+            retryableFrom: current.retryableFrom,
+            blockedBeforeCodeReason: current.blockedBeforeCodeReason,
+            updatedAt: ISO8601DateFormatter().string(from: Date())
+        )
+
+        do {
+            try modelContext.save()
+        } catch {
+            RuntimeDiagnostics.log(
+                "implementationHandoffStartStatusSaveFailed status=\(status) error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func ensureApprovedProposalHandoffArtifactIfPossible(
+        state: ExecutableState,
+        stageExec: StageExecution
+    ) {
+        let artifacts = persistedArtifacts()
+        guard !artifacts.contains(where: { $0.name == "approved_proposal" }),
+            let proposalCurrent = artifacts.last(where: { $0.name == "proposal_current" }),
+            let data = try? artifactManager.readArtifact(proposalCurrent, workspace: workspace)
+        else {
+            return
+        }
+
+        do {
+            _ = try artifactManager.persistSystemArtifact(
+                name: "approved_proposal",
+                data: data,
+                contractID: "approved_proposal",
+                format: proposalCurrent.format,
+                workspace: workspace,
+                stageID: state.id,
+                agentID: "engine",
+                provider: "engine",
+                model: nil,
+                effort: nil,
+                attemptNumber: stageExec.attemptNumber
+            )
+            RuntimeDiagnostics.log(
+                "implementationHandoffSnapshottedApprovedProposal stateID=\(state.id) sourceArtifactID=\(proposalCurrent.id.uuidString)"
+            )
+        } catch {
+            RuntimeDiagnostics.log(
+                "implementationHandoffApprovedProposalSnapshotFailed stateID=\(state.id) error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func persistImplementationHandoffUnavailableConflict(
+        currentStateID: String,
+        stageExecutionID: UUID?,
+        requiredArtifacts: [String],
+        missingArtifacts: [String]
+    ) {
+        let candidate = CandidateTransitionEvaluation(
+            transitionID: "\(currentStateID)__implementation_handoff",
+            fromStateID: currentStateID,
+            toStateID: currentStateID,
+            conditionExpressionID: "implementation_handoff.required_inputs",
+            result: .missingInput,
+            requiredArtifacts: requiredArtifacts,
+            missingArtifacts: missingArtifacts,
+            missingFields: [],
+            sourceArtifactIDs: [],
+            sourceAgentExecutionID: nil,
+            sanitizedDiagnostic:
+                "Implementation handoff is missing required input artifact(s): \(missingArtifacts.joined(separator: ", "))"
+        )
+        let candidateHash = workflowConflictHash(for: [candidate])
+        let fingerprint = workflowConflictFingerprint(
+            currentStateID: currentStateID,
+            reason: .implementationHandoffUnavailable,
+            candidateHash: candidateHash
+        )
+        let now = ISO8601DateFormatter().string(from: Date())
+        let existing = run.workflowConflictBridgeV1.conflicts.first {
+            $0.conflictFingerprint == fingerprint
+        }
+        let record = WorkflowConflictRecord(
+            conflictID: existing?.conflictID ?? "conflict-\(UUID().uuidString)",
+            conflictFingerprint: fingerprint,
+            runID: run.id.uuidString,
+            stageExecutionID: stageExecutionID?.uuidString,
+            lineageID: nil,
+            currentStateID: currentStateID,
+            reason: .implementationHandoffUnavailable,
+            operatorLabel: "Implementation handoff is unavailable",
+            status: .unresolved,
+            candidateTransitions: [candidate],
+            candidateTransitionHash: candidateHash,
+            advisoryEvidenceRefs: [],
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now
+        )
+        run.upsertWorkflowConflictRecord(record)
     }
 
     // MARK: - Execute Run Blocks
@@ -660,6 +1253,10 @@ final class WorkflowOrchestrator {
             return false
         }
         let agent = effectiveAgent(from: resolvedAgent)
+
+        if implementationHandoffUnavailable(for: task, agent: agent, state: state, stageExec: stageExec) {
+            return false
+        }
 
         let agentExec: AgentExecution
         if let resumableAgent = resumableAgentExecution(for: task, agent: agent, in: stageExec) {
@@ -725,6 +1322,9 @@ final class WorkflowOrchestrator {
             )
             unregisterLiveExecution(agentExec, for: agent.id)
             return false
+        }
+        if isCodeWriterImplementationTask(task, agent: agent) {
+            persistImplementationHandoffCodeWriterStartStatus("running")
         }
 
         // Gather input artifacts
@@ -1755,6 +2355,15 @@ final class WorkflowOrchestrator {
         for task in tasks {
             guard let resolvedAgent = plan.agentBindings[task.agent] else { continue }
             let agent = effectiveAgent(from: resolvedAgent)
+
+            if implementationHandoffUnavailable(
+                for: task,
+                agent: agent,
+                state: state,
+                stageExec: stageExec
+            ) {
+                return false
+            }
 
             let agentExec: AgentExecution
             if let resumableAgent = resumableAgentExecution(for: task, agent: agent, in: stageExec)
@@ -3144,6 +3753,14 @@ final class WorkflowOrchestrator {
 
     private func persistedArtifacts() -> [Artifact] {
         guard !run.isDeleted, run.modelContext != nil else { return [] }
+        do {
+            return try artifactManager.artifacts(forRunID: run.id)
+        } catch {
+            RuntimeDiagnostics.log(
+                "persistedArtifacts fetchFailed runID=\(run.id) error=\(error.localizedDescription)"
+            )
+        }
+
         return run.stageExecutions
             .sorted { $0.startedAt < $1.startedAt }
             .flatMap { stage in
@@ -3456,14 +4073,198 @@ final class WorkflowOrchestrator {
 
         if let fields = validatedFields[artifact.name] {
             artifactFields[artifact.name] = fields
-        } else if artifact.format == .json,
-            let data,
+        } else if let data,
             let fields = tryExtractScalarFields(from: data, artifactName: artifact.name)
         {
             artifactFields[artifact.name] = fields
         }
 
+        if let data {
+            for advisory in transitionAdvisoryHints(from: artifact, data: data) {
+                upsertTransitionAdvisory(advisory)
+            }
+        }
+
         applyImplementationSelfAssessmentProjectionToTransitionFields()
+    }
+
+    private struct TransitionAdvisoryHint: Sendable {
+        let sourceArtifactID: String
+        let sourceAgentExecutionID: String?
+        let nextStageHint: String?
+        let nextAction: String?
+        let supersededByProjection: Bool
+    }
+
+    private func transitionAdvisoryHints(
+        from artifact: Artifact,
+        data: Data
+    ) -> [TransitionAdvisoryHint] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        var advisories: [TransitionAdvisoryHint] = []
+        let nextStage = advisoryStringValue(
+            in: json,
+            snakeCaseKey: "next_stage",
+            camelCaseKey: "nextStage"
+        )
+        let nextAction = advisoryStringValue(
+            in: json,
+            snakeCaseKey: "next_action",
+            camelCaseKey: "nextAction"
+        )
+        if nextStage != nil || nextAction != nil {
+            advisories.append(
+                TransitionAdvisoryHint(
+                    sourceArtifactID: artifact.id.uuidString,
+                    sourceAgentExecutionID: artifact.agentExecution?.id.uuidString,
+                    nextStageHint: nextStage,
+                    nextAction: nextAction,
+                    supersededByProjection: false
+                )
+            )
+        }
+
+        advisories.append(contentsOf: projectedTransitionAdvisoryHints(from: artifact, json: json))
+        return advisories
+    }
+
+    private func projectedTransitionAdvisoryHints(
+        from artifact: Artifact,
+        json: [String: Any]
+    ) -> [TransitionAdvisoryHint] {
+        guard isRunStateProjectionArtifact(artifact, json: json) else { return [] }
+
+        var items = advisoryArtifactItems(in: json)
+        if let activeIndex = json["active_index"] as? [String: Any] {
+            items.append(contentsOf: advisoryArtifactItems(in: activeIndex))
+        }
+        if let activeIndex = json["activeIndex"] as? [String: Any] {
+            items.append(contentsOf: advisoryArtifactItems(in: activeIndex))
+        }
+        if let activeIndexJSON = json["active_index_json"] as? [String: Any] {
+            items.append(contentsOf: advisoryArtifactItems(in: activeIndexJSON))
+        }
+
+        var advisories: [TransitionAdvisoryHint] = []
+        var seenPaths = Set<String>()
+        for item in items {
+            guard let path = advisoryStringValue(
+                in: item,
+                snakeCaseKey: "advisory_path",
+                camelCaseKey: "advisoryPath"
+            ) else {
+                continue
+            }
+            guard seenPaths.insert(path).inserted else { continue }
+
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            guard isWorkspaceOwnedProjectionAdvisoryURL(url) else { continue }
+            guard let data = try? Data(contentsOf: url),
+                let advisoryJSON = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                continue
+            }
+
+            let sourceArtifactID = advisoryStringValue(
+                in: item,
+                snakeCaseKey: "advisory_id",
+                camelCaseKey: "advisoryID"
+            ) ?? advisoryStringValue(
+                in: item,
+                snakeCaseKey: "artifact_id",
+                camelCaseKey: "artifactID"
+            ) ?? path
+            let sourceAgentExecutionID = advisoryStringValue(
+                in: item,
+                snakeCaseKey: "source_agent_execution_id",
+                camelCaseKey: "sourceAgentExecutionID"
+            )
+            let nextStage = advisoryStringValue(
+                in: advisoryJSON,
+                snakeCaseKey: "next_stage",
+                camelCaseKey: "nextStage"
+            )
+            let nextAction = advisoryStringValue(
+                in: advisoryJSON,
+                snakeCaseKey: "next_action",
+                camelCaseKey: "nextAction"
+            )
+            guard nextStage != nil || nextAction != nil else { continue }
+            advisories.append(
+                TransitionAdvisoryHint(
+                    sourceArtifactID: sourceArtifactID,
+                    sourceAgentExecutionID: sourceAgentExecutionID,
+                    nextStageHint: nextStage,
+                    nextAction: nextAction,
+                    supersededByProjection: true
+                )
+            )
+        }
+
+        return advisories
+    }
+
+    private func isWorkspaceOwnedProjectionAdvisoryURL(_ url: URL) -> Bool {
+        let advisoryPath = url.path
+        let allowedRoots = [
+            workspace.workspaceRoot.standardizedFileURL.path,
+            workspace.artifactRoot.standardizedFileURL.path
+        ]
+        return allowedRoots.contains { root in
+            advisoryPath == root || advisoryPath.hasPrefix(root + "/")
+        }
+    }
+
+    private func isRunStateProjectionArtifact(_ artifact: Artifact, json: [String: Any]) -> Bool {
+        artifact.contractID == "run_state_projection_v1"
+            || artifact.name == "run_state_projection"
+            || artifact.name == "run_state_projection_v1"
+            || advisoryStringValue(
+                in: json,
+                snakeCaseKey: "contract_id",
+                camelCaseKey: "contractID"
+            ) == "run_state_projection_v1"
+    }
+
+    private func advisoryArtifactItems(in json: [String: Any]) -> [[String: Any]] {
+        var items: [[String: Any]] = []
+        if let advisoryArtifacts = json["advisory_artifacts"] as? [[String: Any]] {
+            items.append(contentsOf: advisoryArtifacts)
+        }
+        if let advisoryArtifacts = json["advisoryArtifacts"] as? [[String: Any]] {
+            items.append(contentsOf: advisoryArtifacts)
+        }
+        if let contractAdvisories = json["artifact_contract_advisories"] as? [[String: Any]] {
+            items.append(contentsOf: contractAdvisories)
+        }
+        if let contractAdvisories = json["artifactContractAdvisories"] as? [[String: Any]] {
+            items.append(contentsOf: contractAdvisories)
+        }
+        return items
+    }
+
+    private func advisoryStringValue(
+        in json: [String: Any],
+        snakeCaseKey: String,
+        camelCaseKey: String
+    ) -> String? {
+        let rawValue = json[snakeCaseKey] ?? json[camelCaseKey]
+        guard let value = rawValue as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func upsertTransitionAdvisory(_ advisory: TransitionAdvisoryHint) {
+        if let index = transitionAdvisories.firstIndex(where: {
+            $0.sourceArtifactID == advisory.sourceArtifactID
+        }) {
+            transitionAdvisories[index] = advisory
+        } else {
+            transitionAdvisories.append(advisory)
+        }
     }
 
     private func refreshImplementationSelfAssessmentProjection(
@@ -3584,14 +4385,70 @@ final class WorkflowOrchestrator {
     /// Mark the cursor as terminal (completed, failed, blocked, or cancelled).
     private func settleTerminal(
         lastCompletedStateID: String? = nil,
-        lastCompletedStageExec: StageExecution? = nil
+        lastCompletedStageExec: StageExecution? = nil,
+        terminalFailureReason: String? = nil
     ) {
         let currentCursor = run.transitionCursor ?? .initial()
         let newCursor = currentCursor.markingTerminal(
             lastCompletedStateID: lastCompletedStateID,
-            lastCompletedStageExecutionID: lastCompletedStageExec?.id
+            lastCompletedStageExecutionID: lastCompletedStageExec?.id,
+            terminalFailureReason: terminalFailureReason
         )
         run.persistTransitionCursor(newCursor)
+    }
+
+    private func settleWorkflowConflict(
+        _ conflict: WorkflowConflictRecord,
+        currentStateID: String,
+        currentStageExecutionID: UUID?
+    ) {
+        guard conflict.status != .terminalUnverifiable else {
+            settleTerminal(
+                lastCompletedStateID: currentStateID,
+                terminalFailureReason: conflict.terminalFailureReason
+            )
+            do {
+                try modelContext.save()
+                RuntimeDiagnostics.log(
+                    "settleWorkflowConflictTerminal stateID=\(currentStateID) reason=\(conflict.reason.rawValue)"
+                )
+            } catch {
+                RuntimeDiagnostics.log(
+                    "settleWorkflowConflictTerminal FAILED stateID=\(currentStateID) error=\(error.localizedDescription)"
+                )
+                run.driftDetails =
+                    "Terminal workflow conflict cursor could not be saved for '\(currentStateID)': \(error.localizedDescription)"
+            }
+            return
+        }
+        settleWorkflowConflictBlocked(
+            currentStateID: currentStateID,
+            currentStageExecutionID: currentStageExecutionID
+        )
+    }
+
+    private func settleWorkflowConflictBlocked(
+        currentStateID: String,
+        currentStageExecutionID: UUID?
+    ) {
+        let currentCursor = run.transitionCursor ?? .initial()
+        let newCursor = currentCursor.markingWorkflowConflictBlocked(
+            currentStateID: currentStateID,
+            currentStageExecutionID: currentStageExecutionID
+        )
+        run.persistTransitionCursor(newCursor)
+        do {
+            try modelContext.save()
+            RuntimeDiagnostics.log(
+                "settleWorkflowConflictBlocked seq=\(newCursor.sequenceNumber) stateID=\(currentStateID)"
+            )
+        } catch {
+            RuntimeDiagnostics.log(
+                "settleWorkflowConflictBlocked FAILED seq=\(newCursor.sequenceNumber) stateID=\(currentStateID) error=\(error.localizedDescription)"
+            )
+            run.driftDetails =
+                "Workflow conflict cursor could not be saved for '\(currentStateID)': \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Failure Handling

@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 use domain::provider::ProviderFamily;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -50,6 +50,19 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         .as_ref()
         .and_then(|m| m.stack.clone())
         .or_else(|| Some("unknown".to_string()));
+    let legacy_broad_discovery_policy = wf
+        .discovery
+        .as_ref()
+        .and_then(|discovery| discovery.legacy_broad_discovery_policy)
+        .map(|policy| match policy {
+            definition::LegacyBroadDiscoveryPolicyDef::Disabled => {
+                LegacyBroadDiscoveryPolicy::Disabled
+            }
+            definition::LegacyBroadDiscoveryPolicyDef::WorkflowOptIn => {
+                LegacyBroadDiscoveryPolicy::WorkflowOptIn
+            }
+        })
+        .unwrap_or_default();
     let workflow_snapshot_json =
         canonical_json_string(&wf).context("serializing canonical workflow snapshot")?;
     let catalog_snapshot_json =
@@ -101,6 +114,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         workflow_family: Some(workflow_family),
         risk_class,
         stack,
+        legacy_broad_discovery_policy,
         workflow_snapshot_hash,
         catalog_snapshot_hash,
         workflow_snapshot_json,
@@ -652,6 +666,7 @@ fn compile_agent_task(
     let agent = resolve_agent(&at.agent, agents)?;
     let outputs = at.outputs.clone().unwrap_or_default();
     let explicit_contract = agent.output_contract.as_deref();
+    let output_policies = compile_output_policies(&outputs, at.output_policies.as_ref())?;
 
     // Resolve output schemas. For single-output agents, an explicit
     // output_contract is authoritative. For multi-output agents, the explicit
@@ -676,10 +691,45 @@ fn compile_agent_task(
         task_name: at.task.clone(),
         inputs: at.inputs.clone().unwrap_or_default(),
         outputs,
+        output_policies,
         output_schemas,
         parallel,
         phase: 0, // caller overrides for then-tasks
     })
+}
+
+fn compile_output_policies(
+    outputs: &[String],
+    policies: Option<&HashMap<String, definition::OutputPolicyDef>>,
+) -> Result<HashMap<String, OutputPolicy>> {
+    let Some(policies) = policies else {
+        return Ok(HashMap::new());
+    };
+
+    let output_names: HashSet<&str> = outputs.iter().map(String::as_str).collect();
+    for output_name in policies.keys() {
+        if !output_names.contains(output_name.as_str()) {
+            anyhow::bail!(
+                "output_policies key '{output_name}' does not match any declared task output"
+            );
+        }
+    }
+
+    Ok(policies
+        .iter()
+        .map(|(output_name, policy)| {
+            let reuse_policy = match policy
+                .reuse_policy
+                .unwrap_or(definition::OutputReusePolicyDef::MustProduce)
+            {
+                definition::OutputReusePolicyDef::MustProduce => OutputReusePolicy::MustProduce,
+                definition::OutputReusePolicyDef::AllowUnchangedExisting => {
+                    OutputReusePolicy::AllowUnchangedExisting
+                }
+            };
+            (output_name.clone(), OutputPolicy { reuse_policy })
+        })
+        .collect())
 }
 
 fn compile_loop(

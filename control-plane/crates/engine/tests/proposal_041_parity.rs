@@ -1418,8 +1418,10 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
                     }))
                     .expect("fixture artifact payload serializes"),
                     source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 })
                 .collect(),
+            pre_prompt_expected_outputs: Vec::new(),
             transcript_text: None,
             cost_cents: None,
             usage: None,
@@ -1442,6 +1444,14 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             mcp_session_startup_latency_ms: Some(0),
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
         })
     }
 }

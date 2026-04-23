@@ -7,7 +7,7 @@
 //! - Streaming `session/update` notifications during the prompt phase
 //! - Auto-grant for `session/request_permission` (selects `allow_once` first)
 //! - `session/close` + graceful SIGTERM/SIGKILL subprocess shutdown
-//! - Artifact discovery via workspace filesystem diff (pre- vs post-session)
+//! - Artifact discovery via workspace filesystem diff captured after ACP startup
 //!
 //! Provider differences are expressed through [`AcpSessionConfig`]:
 //! - Claude: `mode = "bypassPermissions"`, includes `_meta.claudeCode.options`
@@ -16,19 +16,25 @@
 
 use anyhow::{bail, Context, Result};
 use domain::agent::AgentStatus;
-use domain::xcode_runtime::XcodeShimWarningEvent;
+use domain::discovery::{
+    DiscoveryFilesystem, ExpectedOutputSpec, ExpectedPathBaseline, ExpectedPathBaselineStatus,
+    LegacyBroadDiscoverySnapshot, NoopDiscoveryOperationRecorder, PrePromptExpectedOutputContext,
+    PrePromptExpectedOutputMetadata, StdDiscoveryFilesystem,
+};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::time::timeout;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    AcpMcpServerPayload, DiscoveredArtifact, ExecutionRequest, McpActualObservation,
-    ResolvedMcpServerTransport, UsageSnapshot,
+    AcpCloseDiagnostic, AcpMcpServerPayload, DiscoveredArtifact, DiscoveredArtifactSourceKind,
+    ExecutionRequest, McpActualObservation, ResolvedMcpServerTransport, UsageSnapshot,
 };
 
 /// Strip ANSI escape sequences from a string for clean log output.
@@ -211,48 +217,100 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
 const OUTPUT_END_MARKER: &str = "<<<END_CHAINWORKS_OUTPUT>>>";
-const RESIDUAL_XCODE_PATH_PATTERNS: &[&str] = &[
-    "/usr/bin/xcodebuild",
-    "/usr/bin/xcrun",
-    "/usr/bin/simctl",
-    "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild",
-    "/Applications/Xcode.app/Contents/Developer/usr/bin/simctl",
-    "/Applications/Xcode.app/Contents/Developer/usr/bin/xcrun",
-    "xcrun mcpbridge",
-];
+const DEFAULT_PROVIDER_ENVELOPE_MAX_BYTES: usize = 10 * 1024 * 1024;
+const ACP_NDJSON_LINE_OVERHEAD_BYTES: usize = 64 * 1024;
+const MAX_STREAMED_TRANSCRIPT_BYTES: usize = 10 * 1024 * 1024;
+const STREAMED_TRANSCRIPT_TRUNCATION_MARKER: &str =
+    "\n[chainworks transcript truncated at 10485760 bytes]\n";
 
-// ---------------------------------------------------------------------------
-// Workspace snapshot — used for artifact discovery
-// ---------------------------------------------------------------------------
+fn handshake_timeout_for_provider(provider: &str) -> Duration {
+    if provider.eq_ignore_ascii_case("gemini") {
+        GEMINI_HANDSHAKE_TIMEOUT
+    } else {
+        DEFAULT_HANDSHAKE_TIMEOUT
+    }
+}
 
-fn collect_files(dir: &Path, out: &mut HashSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Put each provider subprocess in its own process group so forced shutdown can
+/// reap MCP/plugin children that outlive the ACP parent process.
+pub fn isolate_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: libc::c_int) {
+    if pid > libc::pid_t::MAX as u32 {
         return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_symlink() {
-            continue;
-        }
-        if path.is_dir() {
-            // Skip hidden directories (e.g. .git, .claude)
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') {
-                continue;
-            }
-            collect_files(&path, out);
-        } else if path.is_file() {
-            if let Some(s) = path.to_str() {
-                out.insert(s.to_string());
-            }
+    }
+    // Safety: killpg only observes the numeric process-group id and signal.
+    let rc = unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        let errno = error.raw_os_error();
+        if errno != Some(libc::ESRCH) {
+            warn!(
+                pid,
+                signal,
+                error = %error,
+                "ACP process-group signal failed"
+            );
         }
     }
 }
 
-fn snapshot_workspace(root: &str) -> HashSet<String> {
-    let mut files = HashSet::new();
-    collect_files(Path::new(root), &mut files);
-    files
+fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
+    line.contains("EPIPE") || line.contains("write EPIPE")
+}
+
+fn legacy_broad_file_modified_after_prompt_start(
+    path: &str,
+    prompt_started_at: SystemTime,
+) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified >= prompt_started_at)
+}
+
+fn pre_prompt_expected_output_context(
+    req: &ExecutionRequest,
+    session_id: &str,
+    prompt_id: u64,
+) -> PrePromptExpectedOutputContext {
+    PrePromptExpectedOutputContext {
+        agent_execution_id: req
+            .agent_execution_id
+            .clone()
+            .unwrap_or_else(|| req.agent_id.clone()),
+        stage_execution_id: req
+            .stage_execution_id
+            .clone()
+            .unwrap_or_else(|| req.stage_id.clone()),
+        attempt_number: req.attempt_number,
+        session_generation_id: req
+            .session_generation_id
+            .clone()
+            .unwrap_or_else(|| session_id.to_string()),
+        prompt_turn_id: format!("prompt-{prompt_id}"),
+        discovery_generation_id: uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+fn capture_pre_prompt_expected_outputs(
+    filesystem: &dyn DiscoveryFilesystem,
+    req: &ExecutionRequest,
+    context: &PrePromptExpectedOutputContext,
+) -> Vec<PrePromptExpectedOutputMetadata> {
+    req.expected_outputs
+        .iter()
+        .map(|spec| {
+            let recorder = NoopDiscoveryOperationRecorder;
+            filesystem
+                .capture_pre_prompt_expected_output_metadata_with_recorder(spec, context, &recorder)
+        })
+        .collect()
 }
 
 fn extract_text_from_value(value: &Value) -> Option<String> {
@@ -432,6 +490,48 @@ fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSna
         .or(current.model_context_window);
 }
 
+fn non_empty_transcript(text: String) -> Option<String> {
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn truncate_string_to_byte_len(text: &mut String, max_len: usize) {
+    if text.len() <= max_len {
+        return;
+    }
+    let mut end = max_len;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn push_streamed_transcript_chunk(buffer: &mut String, chunk: &str, truncated: &mut bool) {
+    if *truncated {
+        return;
+    }
+
+    let sanitized = strip_ansi(chunk);
+    if buffer.len().saturating_add(sanitized.len()) <= MAX_STREAMED_TRANSCRIPT_BYTES {
+        buffer.push_str(&sanitized);
+        return;
+    }
+
+    let max_content_len =
+        MAX_STREAMED_TRANSCRIPT_BYTES.saturating_sub(STREAMED_TRANSCRIPT_TRUNCATION_MARKER.len());
+    if buffer.len() > max_content_len {
+        truncate_string_to_byte_len(buffer, max_content_len);
+    } else {
+        let remaining = max_content_len - buffer.len();
+        let mut end = remaining.min(sanitized.len());
+        while end > 0 && !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        buffer.push_str(&sanitized[..end]);
+    }
+    buffer.push_str(STREAMED_TRANSCRIPT_TRUNCATION_MARKER);
+    *truncated = true;
+}
+
 fn observe_mcp_actuals(
     session_new_result: &Value,
     req: &ExecutionRequest,
@@ -522,7 +622,10 @@ fn observe_mcp_actuals(
     })
 }
 
-fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
+fn extract_output_envelopes(
+    stream_text: &str,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Vec<DiscoveredArtifact> {
     let mut artifacts = Vec::new();
     let mut cursor = 0usize;
 
@@ -544,44 +647,195 @@ fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
             break;
         };
         let content_end = content_start + end_rel;
-        let content = stream_text[content_start..content_end].to_string();
+        let content = &stream_text[content_start..content_end];
         artifacts.push(DiscoveredArtifact {
             name: output_name.to_string(),
-            content: content.into_bytes(),
+            content: bounded_envelope_payload_bytes(
+                output_name,
+                content.as_bytes(),
+                expected_outputs,
+            ),
             source_path: None,
+            source_kind: DiscoveredArtifactSourceKind::ProviderEnvelope,
         });
         cursor = content_end + OUTPUT_END_MARKER.len();
     }
 
-    if let Ok(value) = serde_json::from_str::<Value>(stream_text.trim()) {
-        append_json_output_envelopes(&mut artifacts, &value);
+    let mut seen: HashSet<String> = artifacts
+        .iter()
+        .map(|artifact| artifact.name.clone())
+        .collect();
+    for artifact in extract_json_object_output_envelopes(stream_text, expected_outputs) {
+        if seen.insert(artifact.name.clone()) {
+            artifacts.push(artifact);
+        }
     }
 
     artifacts
 }
 
-fn append_json_output_envelopes(artifacts: &mut Vec<DiscoveredArtifact>, value: &Value) {
-    let Some(outputs) = value
-        .get("CHAINWORKS_OUTPUT")
-        .and_then(|outputs| outputs.as_object())
-    else {
-        return;
+fn extract_json_object_output_envelopes(
+    stream_text: &str,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Vec<DiscoveredArtifact> {
+    let mut artifacts = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found_rel) = stream_text[cursor..].find("\"CHAINWORKS_OUTPUT\"") {
+        let found = cursor + found_rel;
+        let Some(value) = parse_enclosing_json_object_with_chainworks_output(
+            stream_text,
+            found,
+            expected_outputs,
+        ) else {
+            cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
+            continue;
+        };
+        artifacts.extend(chainworks_output_artifacts_from_value(
+            &value,
+            expected_outputs,
+        ));
+        cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
+    }
+    artifacts
+}
+
+fn parse_enclosing_json_object_with_chainworks_output(
+    stream_text: &str,
+    marker: usize,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Option<Value> {
+    let parse_cap = ndjson_line_cap_bytes(expected_outputs);
+    let mut starts: Vec<usize> = stream_text[..marker]
+        .match_indices('{')
+        .map(|(idx, _)| idx)
+        .collect();
+    starts.push(marker);
+    starts.into_iter().rev().find_map(|start| {
+        let candidate = &stream_text[start..];
+        if candidate.len() > parse_cap {
+            return None;
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(candidate);
+        let value = Value::deserialize(&mut deserializer).ok()?;
+        value.get("CHAINWORKS_OUTPUT").is_some().then_some(value)
+    })
+}
+
+fn chainworks_output_artifacts_from_value(
+    value: &Value,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Vec<DiscoveredArtifact> {
+    let Some(Value::Object(outputs)) = value.get("CHAINWORKS_OUTPUT") else {
+        return Vec::new();
     };
 
-    for (name, content) in outputs {
-        if name.is_empty() || artifacts.iter().any(|artifact| artifact.name == *name) {
-            continue;
-        }
-        let bytes = match content {
-            Value::String(text) => text.as_bytes().to_vec(),
-            _ => serde_json::to_vec(content).unwrap_or_default(),
-        };
-        artifacts.push(DiscoveredArtifact {
-            name: name.clone(),
-            content: bytes,
-            source_path: None,
-        });
+    outputs
+        .iter()
+        .filter_map(|(name, payload)| {
+            if name.trim().is_empty() {
+                return None;
+            }
+            let content = match payload {
+                Value::String(text) => {
+                    bounded_envelope_payload_bytes(name, text.as_bytes(), expected_outputs)
+                }
+                other => {
+                    let bytes = serde_json::to_vec(other).ok()?;
+                    bounded_envelope_payload_bytes(name, &bytes, expected_outputs)
+                }
+            };
+            Some(DiscoveredArtifact {
+                name: name.clone(),
+                content,
+                source_path: None,
+                source_kind: DiscoveredArtifactSourceKind::ChainworksOutput,
+            })
+        })
+        .collect()
+}
+
+/// Return cap + 1 bytes on truncation so settlement can distinguish an
+/// oversized declared payload without materializing the full provider output.
+fn bounded_envelope_payload_bytes(
+    output_name: &str,
+    bytes: &[u8],
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Vec<u8> {
+    let cap = provider_envelope_cap_bytes(output_name, expected_outputs);
+    if bytes.len() <= cap {
+        return bytes.to_vec();
     }
+
+    // Returning cap + 1 bytes is intentional: settlement treats len > max_bytes
+    // as the truncation/oversize signal while still retaining a bounded sample.
+    let truncated_len = cap.saturating_add(1).min(bytes.len());
+    bytes[..truncated_len].to_vec()
+}
+
+fn provider_envelope_cap_bytes(
+    output_name: &str,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> usize {
+    expected_outputs
+        .iter()
+        .find(|spec| spec.output_name == output_name || spec.target_path == output_name)
+        .and_then(|spec| usize::try_from(spec.max_bytes).ok())
+        .unwrap_or(DEFAULT_PROVIDER_ENVELOPE_MAX_BYTES)
+}
+
+fn ndjson_line_cap_bytes(expected_outputs: &[ExpectedOutputSpec]) -> usize {
+    let payload_cap = expected_outputs
+        .iter()
+        .filter_map(|spec| usize::try_from(spec.max_bytes).ok())
+        .max()
+        .unwrap_or(DEFAULT_PROVIDER_ENVELOPE_MAX_BYTES)
+        .max(DEFAULT_PROVIDER_ENVELOPE_MAX_BYTES);
+    payload_cap.saturating_add(ACP_NDJSON_LINE_OVERHEAD_BYTES)
+}
+
+async fn read_capped_ndjson_line<R>(
+    reader: &mut R,
+    line: &mut String,
+    max_bytes: usize,
+    context: &str,
+) -> Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    line.clear();
+    let mut bytes = Vec::new();
+
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .await
+            .with_context(|| format!("{context} fill_buf error"))?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            break;
+        }
+
+        let take_len = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|position| position + 1)
+            .unwrap_or(buffer.len());
+        if bytes.len().saturating_add(take_len) > max_bytes {
+            bail!("{context} exceeded bounded ACP NDJSON line cap of {max_bytes} bytes");
+        }
+
+        bytes.extend_from_slice(&buffer[..take_len]);
+        reader.consume(take_len);
+        if bytes.last() == Some(&b'\n') {
+            break;
+        }
+    }
+
+    let n = bytes.len();
+    *line = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------
@@ -620,10 +874,30 @@ pub(crate) async fn await_response(
         let remaining = time_limit - elapsed;
 
         line.clear();
-        let n = timeout(remaining, reader.read_line(&mut line))
-            .await
-            .context("ACP handshake read timeout")?
-            .context("ACP handshake read_line error")?;
+        let n = match timeout(
+            remaining,
+            read_capped_ndjson_line(
+                reader,
+                &mut line,
+                ndjson_line_cap_bytes(&[]),
+                "ACP handshake read_line",
+            ),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err).context("ACP handshake read_line error"),
+            Err(_) => {
+                return diagnose_late_handshake_response(
+                    reader,
+                    expected_id,
+                    phase,
+                    start,
+                    time_limit,
+                )
+                .await;
+            }
+        };
 
         if n == 0 {
             bail!("ACP subprocess stdout closed before responding to id={expected_id}");
@@ -673,33 +947,39 @@ pub(crate) async fn await_response(
     }
 }
 
-/// Run only the ACP initialize handshake against a freshly spawned provider.
-///
-/// P051 uses this before constructing brokered HTTP MCP `session/new` payloads
-/// so stdio-only providers fail closed without receiving HTTP MCP entries.
-pub(crate) async fn probe_initialize(mut child: Child) -> Result<Value> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("ACP capability probe subprocess has no stdin pipe")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("ACP capability probe subprocess has no stdout pipe")?;
-    let mut reader = BufReader::new(stdout);
-
-    send_ndjson(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": 1,
-                "clientInfo": {
-                    "name": "chainworks-control-plane",
-                    "version": "0.1.0"
-                }
+async fn diagnose_late_handshake_response(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    expected_id: u64,
+    phase: &str,
+    start: Instant,
+    time_limit: Duration,
+) -> Result<Value> {
+    let mut line = String::new();
+    match timeout(
+        LATE_RESPONSE_DIAGNOSTIC_WINDOW,
+        read_capped_ndjson_line(
+            reader,
+            &mut line,
+            ndjson_line_cap_bytes(&[]),
+            "ACP late handshake diagnostic read_line",
+        ),
+    )
+    .await
+    {
+        Ok(Ok(0)) => {
+            bail!(
+                "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; subprocess stdout closed during late-response diagnostic window",
+                time_limit.as_secs()
+            );
+        }
+        Ok(Ok(_)) => {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                bail!(
+                    "ACP {phase} handshake timed out after {}s waiting for response id={expected_id}; only an empty late line arrived within {}s",
+                    time_limit.as_secs(),
+                    LATE_RESPONSE_DIAGNOSTIC_WINDOW.as_secs()
+                );
             }
         }),
     )
@@ -776,17 +1056,31 @@ pub struct AcpTransportSession {
     session_id: String,
     mcp_observation: Option<McpActualObservation>,
     mcp_session_startup_latency_ms: Option<i64>,
+    acp_pre_initialize_local_latency_ms: u64,
+    acp_initialize_latency_ms: u64,
+    acp_session_new_latency_ms: u64,
     snapshot_root: String,
-    baseline_files: HashSet<String>,
+    baseline_files: Option<LegacyBroadDiscoverySnapshot>,
+    discovery_filesystem: Box<dyn DiscoveryFilesystem>,
     request_counter: u64,
     closed: bool,
 }
 
 impl AcpTransportSession {
     pub async fn start(
+        child: Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+    ) -> Result<Self> {
+        Self::start_with_discovery_filesystem(child, req, config, Box::new(StdDiscoveryFilesystem))
+            .await
+    }
+
+    pub async fn start_with_discovery_filesystem(
         mut child: Child,
         req: &ExecutionRequest,
         config: &AcpSessionConfig<'_>,
+        discovery_filesystem: Box<dyn DiscoveryFilesystem>,
     ) -> Result<Self> {
         let startup_started = Instant::now();
         let mut stdin = child
@@ -871,9 +1165,16 @@ impl AcpTransportSession {
         } else {
             req.workspace_root.clone()
         };
-        let baseline_files = snapshot_workspace(&snapshot_root);
-
+        let acp_pre_initialize_local_latency_ms = startup_started.elapsed().as_millis() as u64;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_pre_initialize_local_latency_ms = acp_pre_initialize_local_latency_ms,
+            "P053 ACP pre-initialize local overhead measured"
+        );
         let init_id = next_id!();
+        let initialize_started = Instant::now();
         send_ndjson(
             &mut stdin,
             &serde_json::json!({
@@ -895,10 +1196,19 @@ impl AcpTransportSession {
         await_response(&mut reader, init_id, HANDSHAKE_TIMEOUT)
             .await
             .context("ACP: initialize handshake")?;
+        let acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_initialize_latency_ms = acp_initialize_latency_ms,
+            "P053 ACP initialize latency measured"
+        );
 
         let sn_id = next_id!();
         let sn_params =
             build_session_new_params(req, config).context("ACP: build session/new params")?;
+        let session_new_started = Instant::now();
         {
             send_ndjson(
                 &mut stdin,
@@ -916,6 +1226,14 @@ impl AcpTransportSession {
         let sn_result = await_response(&mut reader, sn_id, HANDSHAKE_TIMEOUT)
             .await
             .context("ACP: session/new handshake")?;
+        let acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_session_new_latency_ms = acp_session_new_latency_ms,
+            "P053 ACP session/new latency measured"
+        );
 
         let session_id = sn_result["sessionId"]
             .as_str()
@@ -978,8 +1296,12 @@ impl AcpTransportSession {
             session_id,
             mcp_observation,
             mcp_session_startup_latency_ms,
+            acp_pre_initialize_local_latency_ms,
+            acp_initialize_latency_ms,
+            acp_session_new_latency_ms,
             snapshot_root,
-            baseline_files,
+            baseline_files: None,
+            discovery_filesystem,
             request_counter: req_counter,
             closed: false,
         })
@@ -1005,6 +1327,45 @@ impl AcpTransportSession {
         self.mcp_session_startup_latency_ms
     }
 
+    pub fn acp_pre_initialize_local_latency_ms(&self) -> u64 {
+        self.acp_pre_initialize_local_latency_ms
+    }
+
+    pub fn acp_initialize_latency_ms(&self) -> u64 {
+        self.acp_initialize_latency_ms
+    }
+
+    pub fn acp_session_new_latency_ms(&self) -> u64 {
+        self.acp_session_new_latency_ms
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.closed = true;
+                warn!(
+                    session_id = %self.session_id,
+                    exit_status = ?status,
+                    "ACP subprocess exited before session reuse healthcheck"
+                );
+                false
+            }
+            Ok(None) => true,
+            Err(error) => {
+                self.closed = true;
+                warn!(
+                    session_id = %self.session_id,
+                    "ACP subprocess healthcheck failed: {error}"
+                );
+                false
+            }
+        }
+    }
+
     pub async fn prompt(
         &mut self,
         req: &ExecutionRequest,
@@ -1012,12 +1373,98 @@ impl AcpTransportSession {
         AgentStatus,
         Vec<String>,
         Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
         Option<String>,
         Option<UsageSnapshot>,
-        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
     )> {
+        let typed_expected_outputs = !req.expected_outputs.is_empty();
+        let expected_baseline_paths: Vec<&str> = if typed_expected_outputs {
+            Vec::new()
+        } else {
+            req.expected_output_paths
+                .iter()
+                .take(200)
+                .map(String::as_str)
+                .collect()
+        };
+        let expected_path_baselines: Vec<ExpectedPathBaseline> = expected_baseline_paths
+            .iter()
+            .map(|path| {
+                let recorder = NoopDiscoveryOperationRecorder;
+                self.discovery_filesystem
+                    .capture_expected_path_baseline_with_recorder(Path::new(*path), &recorder)
+            })
+            .collect();
         self.request_counter += 1;
         let prompt_id = self.request_counter;
+        let metadata_context = pre_prompt_expected_output_context(req, &self.session_id, prompt_id);
+        let pre_prompt_metadata_started = Instant::now();
+        let pre_prompt_expected_outputs: Vec<PrePromptExpectedOutputMetadata> =
+            capture_pre_prompt_expected_outputs(
+                self.discovery_filesystem.as_ref(),
+                req,
+                &metadata_context,
+            );
+        let missing_count = pre_prompt_expected_outputs
+            .iter()
+            .filter(|metadata| metadata.baseline_status == ExpectedPathBaselineStatus::Absent)
+            .count();
+        let stale_or_digest_count = pre_prompt_expected_outputs
+            .iter()
+            .filter(|metadata| {
+                metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured
+            })
+            .count();
+        let rejected_baseline_count = pre_prompt_expected_outputs
+            .iter()
+            .filter(|metadata| {
+                matches!(
+                    metadata.baseline_status,
+                    ExpectedPathBaselineStatus::Oversized
+                        | ExpectedPathBaselineStatus::Unreadable
+                        | ExpectedPathBaselineStatus::NotRegularFile
+                        | ExpectedPathBaselineStatus::SymlinkEscape
+                        | ExpectedPathBaselineStatus::UnauthorizedRoot
+                        | ExpectedPathBaselineStatus::MetadataTimeout
+                        | ExpectedPathBaselineStatus::Uncertain
+                )
+            })
+            .count();
+        let pre_prompt_metadata_timeout = pre_prompt_expected_outputs.iter().any(|metadata| {
+            metadata.baseline_status == ExpectedPathBaselineStatus::MetadataTimeout
+        });
+        let pre_prompt_metadata_digest_bytes = pre_prompt_expected_outputs
+            .iter()
+            .filter_map(|metadata| metadata.content_digest.as_ref().zip(metadata.size_bytes))
+            .map(|(_, size_bytes)| size_bytes)
+            .sum::<u64>();
+        let acp_pre_prompt_metadata_latency_ms =
+            pre_prompt_metadata_started.elapsed().as_millis() as u64;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_pre_prompt_metadata_latency_ms = acp_pre_prompt_metadata_latency_ms,
+            acp_pre_prompt_metadata_timeout = pre_prompt_metadata_timeout,
+            acp_pre_prompt_metadata_digest_bytes = pre_prompt_metadata_digest_bytes,
+            acp_expected_output_spec_count = req.expected_outputs.len(),
+            acp_expected_outputs_missing_count = missing_count,
+            acp_expected_outputs_stale_count = stale_or_digest_count,
+            acp_expected_outputs_rejected_count = rejected_baseline_count,
+            "P053 pre-prompt expected-output metadata measured"
+        );
+        let legacy_broad_discovery_enabled =
+            req.legacy_broad_discovery_policy.allows_broad_discovery();
+        let broad_baseline = self.baseline_files.clone();
+        let prompt_started_at = SystemTime::now();
         send_ndjson(
             &mut self.stdin,
             &serde_json::json!({
@@ -1036,6 +1483,7 @@ impl AcpTransportSession {
         let mut line = String::new();
         let mut last_activity = Instant::now();
         let mut streamed_text = String::new();
+        let mut streamed_text_truncated = false;
         let mut latest_usage_snapshot = None;
         let mut xcode_shim_warning_events = Vec::new();
         let mut seen_xcode_warning_keys = HashSet::new();
@@ -1052,10 +1500,18 @@ impl AcpTransportSession {
             let remaining = IDLE_TIMEOUT - idle;
 
             line.clear();
-            let n = timeout(remaining, self.reader.read_line(&mut line))
-                .await
-                .context("ACP session idle timeout — no message received")?
-                .context("ACP prompt stream read_line error")?;
+            let n = timeout(
+                remaining,
+                read_capped_ndjson_line(
+                    &mut self.reader,
+                    &mut line,
+                    ndjson_line_cap_bytes(&req.expected_outputs),
+                    "ACP prompt stream read_line",
+                ),
+            )
+            .await
+            .context("ACP session idle timeout — no message received")?
+            .context("ACP prompt stream read_line error")?;
 
             if n == 0 {
                 bail!(
@@ -1117,7 +1573,11 @@ impl AcpTransportSession {
                             }
                         }
                         if let Some(chunk) = extract_text_chunk(&parsed) {
-                            streamed_text.push_str(&strip_ansi(&chunk));
+                            push_streamed_transcript_chunk(
+                                &mut streamed_text,
+                                &chunk,
+                                &mut streamed_text_truncated,
+                            );
                         }
                         continue;
                     }
@@ -1140,13 +1600,25 @@ impl AcpTransportSession {
                             AgentStatus::Failed,
                             vec![],
                             vec![],
+                            pre_prompt_expected_outputs,
                             non_empty_transcript(streamed_text),
                             latest_usage_snapshot,
-                            xcode_shim_warning_events,
+                            self.acp_pre_initialize_local_latency_ms,
+                            self.acp_initialize_latency_ms,
+                            self.acp_session_new_latency_ms,
+                            0,
+                            acp_pre_prompt_metadata_latency_ms,
+                            pre_prompt_metadata_timeout,
+                            pre_prompt_metadata_digest_bytes,
+                            None,
                         ));
                     }
                     if let Some(chunk) = extract_text_chunk(&parsed) {
-                        streamed_text.push_str(&strip_ansi(&chunk));
+                        push_streamed_transcript_chunk(
+                            &mut streamed_text,
+                            &chunk,
+                            &mut streamed_text_truncated,
+                        );
                     }
                     break 'streaming;
                 }
@@ -1154,20 +1626,145 @@ impl AcpTransportSession {
             }
         }
 
-        let post_files = snapshot_workspace(&self.snapshot_root);
-        let mut new_files: Vec<String> = post_files
-            .difference(&self.baseline_files)
-            .cloned()
-            .collect();
-        for path in &req.expected_output_paths {
-            if std::path::Path::new(path).is_file() && !new_files.iter().any(|p| p == path) {
-                new_files.push(path.clone());
+        let acp_prompt_duration_ms = SystemTime::now()
+            .duration_since(prompt_started_at)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_prompt_duration_ms = acp_prompt_duration_ms,
+            "P053 ACP prompt duration measured"
+        );
+
+        let post_files = legacy_broad_discovery_enabled.then(|| {
+            let recorder = NoopDiscoveryOperationRecorder;
+            self.discovery_filesystem
+                .snapshot_legacy_broad_discovery_with_recorder(
+                    Path::new(&self.snapshot_root),
+                    &recorder,
+                )
+        });
+        let mut new_files: Vec<String> = match (broad_baseline.as_ref(), post_files.as_ref()) {
+            (Some(baseline), Some(post_files)) => {
+                let paths: Vec<String> = post_files
+                    .files
+                    .difference(&baseline.files)
+                    .cloned()
+                    .collect();
+                warn!(
+                    run_id = %req.run_id,
+                    stage_id = %req.stage_id,
+                    root = %self.snapshot_root,
+                    discovered_count = paths.len(),
+                    baseline_files_visited = baseline.files_visited,
+                    post_files_visited = post_files.files_visited,
+                    baseline_truncated = baseline.was_truncated(),
+                    post_truncated = post_files.was_truncated(),
+                    baseline_total_bytes = baseline.total_bytes,
+                    post_total_bytes = post_files.total_bytes,
+                    "ACP legacy broad discovery is enabled for this prompt"
+                );
+                paths
+            }
+            (None, Some(post_files)) => {
+                let paths: Vec<String> = post_files
+                    .files
+                    .iter()
+                    .filter(|path| {
+                        legacy_broad_file_modified_after_prompt_start(path, prompt_started_at)
+                    })
+                    .cloned()
+                    .collect();
+                warn!(
+                    run_id = %req.run_id,
+                    stage_id = %req.stage_id,
+                    root = %self.snapshot_root,
+                    discovered_count = paths.len(),
+                    post_files_visited = post_files.files_visited,
+                    post_truncated = post_files.was_truncated(),
+                    post_total_bytes = post_files.total_bytes,
+                    "ACP legacy broad discovery is enabled for this prompt without a previous post-prompt baseline"
+                );
+                paths
+            }
+            _ => Vec::new(),
+        };
+        if typed_expected_outputs {
+            new_files.retain(|path| {
+                let Some(spec) = req
+                    .expected_outputs
+                    .iter()
+                    .find(|spec| spec.target_path == *path)
+                else {
+                    return true;
+                };
+                let Some(metadata) = pre_prompt_expected_outputs.iter().find(|metadata| {
+                    metadata.output_name == spec.output_name
+                        && metadata.target_path == spec.target_path
+                }) else {
+                    return false;
+                };
+                let recorder = NoopDiscoveryOperationRecorder;
+                self.discovery_filesystem
+                    .expected_output_has_current_content_with_recorder(
+                        spec,
+                        metadata,
+                        &metadata_context,
+                        &recorder,
+                    )
+            });
+            for spec in &req.expected_outputs {
+                if let Some(metadata) = pre_prompt_expected_outputs.iter().find(|metadata| {
+                    metadata.output_name == spec.output_name
+                        && metadata.target_path == spec.target_path
+                }) {
+                    let recorder = NoopDiscoveryOperationRecorder;
+                    if self
+                        .discovery_filesystem
+                        .expected_output_has_current_content_with_recorder(
+                            spec,
+                            metadata,
+                            &metadata_context,
+                            &recorder,
+                        )
+                        && !new_files.iter().any(|p| p == &spec.target_path)
+                    {
+                        new_files.push(spec.target_path.clone());
+                    }
+                }
+            }
+        } else {
+            new_files.retain(|path| {
+                let Some(baseline) = expected_path_baselines
+                    .iter()
+                    .find(|baseline| baseline.target_path == *path)
+                else {
+                    return true;
+                };
+                let recorder = NoopDiscoveryOperationRecorder;
+                self.discovery_filesystem
+                    .expected_path_has_current_content_with_recorder(baseline, &recorder)
+            });
+            for baseline in &expected_path_baselines {
+                let recorder = NoopDiscoveryOperationRecorder;
+                if self
+                    .discovery_filesystem
+                    .expected_path_has_current_content_with_recorder(baseline, &recorder)
+                    && !new_files.iter().any(|p| p == &baseline.target_path)
+                {
+                    new_files.push(baseline.target_path.clone());
+                }
             }
         }
         new_files.sort();
-        self.baseline_files = post_files;
+        if let Some(post_files_snapshot) = post_files.clone() {
+            self.baseline_files = Some(post_files_snapshot);
+        }
 
-        let mut discovered_artifacts = extract_output_envelopes(&streamed_text);
+        let mut discovered_artifacts =
+            extract_output_envelopes(&streamed_text, &req.expected_outputs);
         for path in &new_files {
             let path_obj = Path::new(path);
             let name = path_obj
@@ -1182,11 +1779,18 @@ impl AcpTransportSession {
             {
                 continue;
             }
-            if let Ok(content) = std::fs::read(path_obj) {
+            let max_bytes = req
+                .expected_outputs
+                .iter()
+                .find(|spec| spec.target_path == *path)
+                .map(|spec| spec.max_bytes)
+                .unwrap_or(DEFAULT_PROVIDER_ENVELOPE_MAX_BYTES as u64);
+            if let Some(content) = read_file_with_cap(path_obj, max_bytes.saturating_add(1)) {
                 discovered_artifacts.push(DiscoveredArtifact {
                     name,
                     content,
                     source_path: Some(path.clone()),
+                    source_kind: DiscoveredArtifactSourceKind::ExactPath,
                 });
             }
         }
@@ -1195,9 +1799,17 @@ impl AcpTransportSession {
             AgentStatus::Completed,
             new_files,
             discovered_artifacts,
+            pre_prompt_expected_outputs,
             non_empty_transcript(streamed_text),
             latest_usage_snapshot,
-            xcode_shim_warning_events,
+            self.acp_pre_initialize_local_latency_ms,
+            self.acp_initialize_latency_ms,
+            self.acp_session_new_latency_ms,
+            acp_prompt_duration_ms,
+            acp_pre_prompt_metadata_latency_ms,
+            pre_prompt_metadata_timeout,
+            pre_prompt_metadata_digest_bytes,
+            post_files,
         ))
     }
 
@@ -1242,7 +1854,51 @@ impl AcpTransportSession {
         if !exit_success {
             warn!(session_id = %self.session_id, "ACP subprocess exited with non-zero status");
         }
-        Ok(())
+        Ok(close_diagnostic)
+    }
+}
+
+fn read_file_with_cap(path: &Path, cap_bytes: u64) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = file.take(cap_bytes);
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content).ok()?;
+    Some(content)
+}
+
+fn transport_error_code_from_message(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("epipe") || lower.contains("broken pipe")).then(|| "EPIPE".to_string())
+}
+
+fn merge_close_diagnostic(
+    diagnostic: &mut Option<AcpCloseDiagnostic>,
+    message: Option<String>,
+    transport_error_code: Option<String>,
+    provider_exit_status: Option<i64>,
+) {
+    match diagnostic {
+        Some(existing) => {
+            if let Some(message) = message {
+                if !existing.message.is_empty() {
+                    existing.message.push_str("; ");
+                }
+                existing.message.push_str(&message);
+            }
+            if existing.transport_error_code.is_none() {
+                existing.transport_error_code = transport_error_code;
+            }
+            if existing.provider_exit_status.is_none() {
+                existing.provider_exit_status = provider_exit_status;
+            }
+        }
+        None => {
+            *diagnostic = Some(AcpCloseDiagnostic {
+                transport_error_code,
+                provider_exit_status,
+                message: message.unwrap_or_else(|| "ACP session close diagnostic".to_string()),
+            });
+        }
     }
 }
 
@@ -1255,11 +1911,234 @@ pub async fn run_acp_session(
     config: &AcpSessionConfig<'_>,
 ) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>)> {
     let mut session = AcpTransportSession::start(child, req, config).await?;
-    let (status, paths, artifacts, _transcript, _usage, _warnings) = session.prompt(req).await?;
+    let (
+        status,
+        paths,
+        artifacts,
+        _pre_prompt_expected_outputs,
+        _transcript_text,
+        _usage,
+        _acp_pre_initialize_local_latency_ms,
+        _acp_initialize_latency_ms,
+        _acp_session_new_latency_ms,
+        _acp_prompt_duration_ms,
+        _acp_pre_prompt_metadata_latency_ms,
+        _acp_pre_prompt_metadata_timeout,
+        _acp_pre_prompt_metadata_digest_bytes,
+        _legacy_broad_discovery_snapshot,
+    ) = session.prompt(req).await?;
     let _ = session.close().await;
     Ok((status, paths, artifacts))
 }
 
-fn non_empty_transcript(text: String) -> Option<String> {
-    (!text.is_empty()).then_some(text)
+impl Drop for AcpTransportSession {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            signal_process_group(pid, libc::SIGTERM);
+        }
+        if let Err(error) = self.child.start_kill() {
+            warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "Failed to start-kill unclosed ACP subprocess during drop"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_uses_longer_handshake_timeout() {
+        assert_eq!(
+            handshake_timeout_for_provider("gemini"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            handshake_timeout_for_provider("Gemini"),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn non_gemini_providers_keep_default_handshake_timeout() {
+        assert_eq!(
+            handshake_timeout_for_provider("claude"),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            handshake_timeout_for_provider("codex"),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn stderr_epipe_is_diagnostic_warning() {
+        assert!(stderr_line_is_diagnostic_warning(
+            "ACP write error: Error: write EPIPE"
+        ));
+        assert!(stderr_line_is_diagnostic_warning("code: 'EPIPE'"));
+        assert!(!stderr_line_is_diagnostic_warning("ordinary debug detail"));
+    }
+
+    #[test]
+    fn proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake() {
+        let output_path = "/tmp/run/proposal_review.json";
+        let expected_output = ExpectedOutputSpec {
+            output_name: "proposal_review".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: output_path.to_string(),
+            companion_of: None,
+            display_label: "Proposal review".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![domain::discovery::AuthorizedRoot {
+                root_class: domain::discovery::OutputRootClass::ChainworksMetaRoot,
+                root_path: "/tmp/run".to_string(),
+            }],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        };
+        let context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let mut metadata = PrePromptExpectedOutputMetadata::absent(&expected_output, &context);
+        metadata.baseline_status = ExpectedPathBaselineStatus::RegularContentCaptured;
+        metadata.existed = true;
+        metadata.file_type = "regular".to_string();
+        metadata.size_bytes = Some(42);
+        let fake = domain::discovery::FakeDiscoveryFilesystem::new()
+            .with_pre_prompt_metadata("proposal_review", metadata.clone());
+        let req = ExecutionRequest {
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: Some("stage-exec-1".to_string()),
+            stage_id: "stage-1".to_string(),
+            attempt_number: 1,
+            agent_execution_id: Some("agent-exec-1".to_string()),
+            agent_id: "agent-1".to_string(),
+            provider: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("high".to_string()),
+            workspace_root: "/tmp/run".to_string(),
+            prompt: "write the output".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: vec![expected_output],
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: Some("session-1".to_string()),
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some("/tmp/run".to_string()),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        };
+
+        let captured = capture_pre_prompt_expected_outputs(&fake, &req, &context);
+
+        assert_eq!(captured, vec![metadata]);
+    }
+
+    #[test]
+    fn output_envelope_extraction_caps_declared_payload_before_settlement() {
+        let output_path = "/tmp/run/proposal_review.json";
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "proposal_review".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: output_path.to_string(),
+            companion_of: None,
+            display_label: "Proposal review".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 8,
+            aggregate_acceptance_cap_bytes: 64,
+            authorized_roots: vec![domain::discovery::AuthorizedRoot {
+                root_class: domain::discovery::OutputRootClass::ChainworksMetaRoot,
+                root_path: "/tmp/run".to_string(),
+            }],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let stream =
+            format!("{OUTPUT_START_MARKER}proposal_review>>>1234567890abcdef{OUTPUT_END_MARKER}");
+
+        let artifacts = extract_output_envelopes(&stream, &expected_outputs);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "proposal_review");
+        assert_eq!(artifacts[0].content, b"123456789");
+        assert_eq!(
+            artifacts[0].source_kind,
+            DiscoveredArtifactSourceKind::ProviderEnvelope
+        );
+    }
+
+    #[test]
+    fn streamed_transcript_accumulation_is_capped_with_marker() {
+        let mut transcript = "a".repeat(MAX_STREAMED_TRANSCRIPT_BYTES - 4);
+        let mut truncated = false;
+
+        push_streamed_transcript_chunk(&mut transcript, "bbbbbbbb", &mut truncated);
+
+        assert!(truncated);
+        assert!(transcript.len() <= MAX_STREAMED_TRANSCRIPT_BYTES);
+        assert!(transcript.ends_with(STREAMED_TRANSCRIPT_TRUNCATION_MARKER));
+
+        let len_after_truncation = transcript.len();
+        push_streamed_transcript_chunk(&mut transcript, "ignored", &mut truncated);
+        assert_eq!(transcript.len(), len_after_truncation);
+    }
+
+    #[test]
+    fn json_chainworks_output_extraction_caps_declared_payload_before_settlement() {
+        let output_path = "/tmp/run/implementation/progress.md";
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "implementation_progress".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: output_path.to_string(),
+            companion_of: None,
+            display_label: "Implementation progress".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 4,
+            aggregate_acceptance_cap_bytes: 64,
+            authorized_roots: vec![domain::discovery::AuthorizedRoot {
+                root_class: domain::discovery::OutputRootClass::ChainworksMetaRoot,
+                root_path: "/tmp/run".to_string(),
+            }],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let stream = serde_json::json!({
+            "CHAINWORKS_OUTPUT": {
+                output_path: "abcdef",
+            }
+        })
+        .to_string();
+
+        let artifacts = extract_output_envelopes(&stream, &expected_outputs);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, output_path);
+        assert_eq!(artifacts[0].content, b"abcde");
+        assert_eq!(
+            artifacts[0].source_kind,
+            DiscoveredArtifactSourceKind::ChainworksOutput
+        );
+    }
 }

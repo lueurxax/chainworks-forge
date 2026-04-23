@@ -1,0 +1,149 @@
+{
+  "schema_version": "proposal_017_phase0_fixture_inventory_v1",
+  "blocking_conflict_fixtures": [
+    {
+      "name": "no_declarative_transition_matched_unresolved_report_fields",
+      "reason": "no_declarative_transition_matched",
+      "status": "unresolved",
+      "expected_current_conflict": true
+    },
+    {
+      "name": "multiple_declarative_transitions_matched_without_tie_break_unresolved_report_fields",
+      "reason": "multiple_declarative_transitions_matched_without_tie_break",
+      "status": "unresolved",
+      "expected_current_conflict": true
+    },
+    {
+      "name": "required_artifact_or_field_missing_for_transition_unresolved_report_fields",
+      "reason": "required_artifact_or_field_missing_for_transition",
+      "status": "unresolved",
+      "expected_current_conflict": true
+    },
+    {
+      "name": "aggregate_transition_truth_conflicted_operator_confirmation_required_report_fields",
+      "reason": "aggregate_transition_truth_conflicted",
+      "status": "operator_confirmation_required",
+      "expected_current_conflict": true
+    },
+    {
+      "name": "workflow_conflict_unverifiable_terminal_unverifiable_report_fields",
+      "reason": "workflow_conflict_unverifiable",
+      "status": "terminal_unverifiable",
+      "expected_current_conflict": false
+    },
+    {
+      "name": "implementation_handoff_unavailable_unresolved_readback_fields",
+      "reason": "implementation_handoff_unavailable",
+      "status": "unresolved",
+      "expected_current_conflict": true
+    }
+  ],
+  "advisory_rejection_fixtures": [
+    {
+      "name": "d4f404b7_legal_refinement_rejects_absent_next_stage_advisory",
+      "selected_transition_id": "proposal_review_failed_refine",
+      "selected_next_state_id": "state_5_proposal_refined",
+      "advisory_next_stage_hint": "state_3_proposal_drafted",
+      "expected_current_conflict": false,
+      "expected_history_event": "non_blocking_advisory_rejection"
+    }
+  ],
+  "report_surface_fixtures": [
+    {
+      "surface": "swift_report_json",
+      "object_key": "workflowConflict",
+      "field_casing": "camelCase",
+      "enum_casing": "snake_case"
+    },
+    {
+      "surface": "mcp_reports_get",
+      "object_key": "workflow_conflict",
+      "field_casing": "snake_case",
+      "enum_casing": "snake_case"
+    },
+    {
+      "surface": "graphql",
+      "object_key": "workflowConflict",
+      "field_casing": "camelCase",
+      "enum_casing": "SCREAMING_SNAKE_CASE"
+    },
+    {
+      "surface": "latest_summary",
+      "object_key": "workflowConflict",
+      "field_casing": "camelCase",
+      "enum_casing": "snake_case"
+    }
+  ],
+  "transition_cursor_resume_fixtures": [
+    "d4f404b7_legal_refinement_cursor_settled",
+    "no_match_blocking_conflict_cursor_awaits_resolution",
+    "lead_resolved_continuation_reenters_graph_settlement",
+    "terminal_unverifiable_cursor_terminal_failure_reason",
+    "restart_readback_prefers_cursor_and_workflow_conflict"
+  ],
+  "aggregate_field_authority_fixtures": [
+    {
+      "contract_id": "proposal_review_summary_v1",
+      "transition_authoritative": ["pass", "blocker_count", "blocking_issues", "required_changes"],
+      "contradiction_bearing": ["decision"],
+      "advisory_only": ["next_action", "next_stage"],
+      "non_authoritative": ["summary"]
+    }
+  ],
+  "unknown_transition_input_fixtures": [
+    {
+      "name": "exists_unknown_artifact_invalid_expression",
+      "expression": "exists('unknown_artifact')",
+      "declared_artifact": false,
+      "expected_result": "invalid_expression",
+      "expected_match": false
+    },
+    {
+      "name": "unknown_artifact_field_invalid_expression",
+      "expression": "unknown_artifact.pass == true",
+      "declared_artifact": false,
+      "expected_result": "invalid_expression",
+      "expected_match": false
+    },
+    {
+      "name": "declared_absent_artifact_missing_input",
+      "expression": "exists('proposal_review_summary')",
+      "declared_artifact": true,
+      "artifact_present": false,
+      "expected_result": "missing_input",
+      "expected_match": false
+    },
+    {
+      "name": "declared_present_missing_field_missing_input",
+      "expression": "proposal_review_summary.pass == false",
+      "declared_artifact": true,
+      "artifact_present": true,
+      "field_present": false,
+      "expected_result": "missing_input",
+      "expected_match": false
+    },
+    {
+      "name": "declared_present_field_matched",
+      "expression": "proposal_review_summary.pass == false",
+      "declared_artifact": true,
+      "artifact_present": true,
+      "field_present": true,
+      "expected_result": "matched",
+      "expected_match": true
+    }
+  ],
+  "implementation_entry_handoff_fixtures": [
+    "approved_proposal_freeze_survives_lead_timeout",
+    "code_writer_started_false_when_handoff_not_claimed",
+    "retry_from_handoff_boundary_preserves_approved_proposal",
+    "implementation_handoff_unavailable_conflict_reason"
+  ],
+  "phase_b_mediation_skeleton_fixtures": [
+    "bridge_write",
+    "dual_read",
+    "backfill",
+    "removal_trigger",
+    "lead_mediation_replay_resume_skeleton"
+  ]
+}
+ 

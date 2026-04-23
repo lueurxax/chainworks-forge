@@ -5,7 +5,7 @@
 | Date | 2026-04-21 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [052-orchestrator-loop-budget-source-of-truth.md](052-orchestrator-loop-budget-source-of-truth.md), [output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md), [execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [061-sqlite-write-serialization-and-executor-backpressure.md](061-sqlite-write-serialization-and-executor-backpressure.md), [064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md](064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md) |
+| Depends on | [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [052-orchestrator-loop-budget-source-of-truth.md](052-orchestrator-loop-budget-source-of-truth.md), [output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md), [execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [rust-control-plane.md#capacity-aware-scheduling-and-backpressure](../reference/rust-control-plane.md#capacity-aware-scheduling-and-backpressure), [064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md](064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md) |
 | Scope | Add a durable, operator-owned retry instruction channel so `stages.retry` can narrowly direct the next invocation without manual artifact edits or permanent prompt mutation. |
 | Goal | Let operators retry a blocked stage with a short, auditable instruction such as "only implement the GraphQL scheduler readback slice" while preserving frozen run artifacts, retry lineage, and command accountability. |
 
@@ -15,7 +15,7 @@
 
 ## 1. Context and Motivation
 
-During parallel run dogfooding on 2026-04-21, P051 and P061 reached implementation-loop exhaustion with useful but overly broad remaining task lists. The operator needed a narrow retry command:
+During parallel run dogfooding on 2026-04-21, the shared Xcode MCP and scheduler-backpressure implementation loops reached exhaustion with useful but overly broad remaining task lists. The operator needed a narrow retry command:
 
 ```text
 Retry this stage, but only do the GraphQL scheduler readback slice.
@@ -289,7 +289,7 @@ Required proof:
 4. Add invocation input injection for retry-created work items only.
 5. Add readback/projection fields.
 6. Register and run `./scripts/test-gate.sh proposal-065`.
-7. Use the feature on P051/P061-style blocked implementation loops before broadening to `agents.retry`.
+7. Use the feature on blocked implementation loops with broad remaining task lists before broadening to `agents.retry`.
 
 ---
 

@@ -38,6 +38,10 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use domain::agent::AgentStatus;
+use domain::discovery::{
+    ExpectedOutputSpec, LegacyBroadDiscoveryPolicy, LegacyBroadDiscoverySnapshot,
+    PrePromptExpectedOutputMetadata,
+};
 use domain::ids::{AgentExecutionId, RunId};
 use domain::xcode_runtime::{XcodeRuntimeObservationUpdate, XcodeShimWarningEvent};
 use serde::{Deserialize, Serialize};
@@ -49,7 +53,21 @@ pub struct ExecutionRequest {
     #[serde(default)]
     pub agent_execution_id: Option<AgentExecutionId>,
     pub run_id: RunId,
+    /// Durable stage execution UUID when this request originates from the
+    /// orchestrator. Adapter-level tests and legacy serialized requests fall
+    /// back to `stage_id`.
+    #[serde(default)]
+    pub stage_execution_id: Option<String>,
     pub stage_id: String,
+    /// Stage execution attempt number. P053 pre-prompt discovery metadata uses
+    /// this to keep retry baselines distinct from earlier attempts.
+    #[serde(default = "default_attempt_number")]
+    pub attempt_number: u32,
+    /// Durable agent execution UUID when this request originates from the
+    /// orchestrator. Adapter-level tests and legacy serialized requests fall
+    /// back to `agent_id`.
+    #[serde(default)]
+    pub agent_execution_id: Option<String>,
     pub agent_id: String,
     pub provider: String,
     pub model: Option<String>,
@@ -71,6 +89,11 @@ pub struct ExecutionRequest {
     /// file instead of creating a brand-new one.
     #[serde(default)]
     pub expected_output_paths: Vec<String>,
+    /// Typed P053 discovery specs. New runtime paths consume this when present;
+    /// `expected_output_paths` remains a compatibility projection for older
+    /// adapters and prompt rendering.
+    #[serde(default)]
+    pub expected_outputs: Vec<ExpectedOutputSpec>,
     /// Keep the ACP transport-backed session alive after the first prompt so
     /// a later turn can reuse it via `session/prompt`.
     #[serde(default)]
@@ -97,6 +120,14 @@ pub struct ExecutionRequest {
     /// YAML artifact path templates resolve to the per-run directory.
     #[serde(default)]
     pub chainworks_meta_root: Option<String>,
+    /// P053 compatibility escape hatch. Broad workspace/worktree diffing is
+    /// disabled unless the frozen run plan or audited retry override enables it.
+    #[serde(default)]
+    pub legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy,
+}
+
+fn default_attempt_number() -> u32 {
+    1
 }
 
 impl ExecutionRequest {
@@ -144,6 +175,10 @@ pub struct ExecutionResult {
     pub artifact_paths: Vec<String>,
     #[serde(default)]
     pub discovered_artifacts: Vec<DiscoveredArtifact>,
+    /// P053 typed metadata captured for declared expected outputs immediately
+    /// before this prompt turn is sent to the provider.
+    #[serde(default)]
+    pub pre_prompt_expected_outputs: Vec<PrePromptExpectedOutputMetadata>,
     /// Sanitized text streamed by the ACP provider during this prompt turn.
     /// This is persisted by the engine as recovery evidence when present.
     #[serde(default)]
@@ -180,6 +215,22 @@ pub struct ExecutionResult {
     /// after the provider already returned a prompt result.
     #[serde(default)]
     pub close_diagnostic: Option<AcpCloseDiagnostic>,
+    #[serde(default)]
+    pub acp_pre_initialize_local_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_initialize_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_session_new_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_prompt_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_pre_prompt_metadata_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub acp_pre_prompt_metadata_timeout: bool,
+    #[serde(default)]
+    pub acp_pre_prompt_metadata_digest_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_broad_discovery_snapshot: Option<LegacyBroadDiscoverySnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,4 +321,15 @@ pub struct DiscoveredArtifact {
     pub content: Vec<u8>,
     #[serde(default)]
     pub source_path: Option<String>,
+    #[serde(default)]
+    pub source_kind: DiscoveredArtifactSourceKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveredArtifactSourceKind {
+    #[default]
+    ProviderEnvelope,
+    ChainworksOutput,
+    ExactPath,
 }

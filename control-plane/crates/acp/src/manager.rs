@@ -389,6 +389,27 @@ impl AcpRuntimeManager {
         close_result
     }
 
+    /// Close and remove all live ACP sessions.
+    pub async fn close_all_sessions(&self) -> usize {
+        let sessions = {
+            let mut live_sessions = self.live_sessions.lock().await;
+            std::mem::take(&mut *live_sessions)
+        };
+        let mut closed = 0;
+        for (generation_id, session) in sessions {
+            match session.close().await {
+                Ok(_) => {
+                    closed += 1;
+                }
+                Err(error) => warn!(
+                    session_generation_id = %generation_id,
+                    "ACP live session close during shutdown failed: {error}"
+                ),
+            }
+        }
+        closed
+    }
+
     /// Route an execution request to the matching adapter or live session.
     pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
         let result = if req.reuse_existing_session {

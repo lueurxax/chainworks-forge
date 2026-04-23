@@ -66,7 +66,7 @@ Run and stage read payloads expose projection freshness explicitly. This prevent
 
 | GraphQL type | Fields | Semantics | Focused proof |
 |---|---|---|---|
-| `GqlRun` | `projectionPresent`, `projectionUpdatedAt`, `projectionLag` | `projectionPresent=false` and `projectionLag=true` when no `run_summaries` row exists. `projectionLag=true` when the projection row exists but status diverges from the canonical run row. | `proposal_043_missing_projection_rows_are_explicit_lag_state`, `proposal_043_run_query_uses_projection_summary_fields`, `proposal_043_run_subscription_uses_projection_summary_fields` |
+| `GqlRun` | `projectionPresent`, `projectionUpdatedAt`, `projectionLag`, `workflowConflict` | `projectionPresent=false` and `projectionLag=true` when no `run_summaries` row exists. `projectionLag=true` when the projection row exists but status diverges from the canonical run row. `workflowConflict` exposes current and historical conflict truth. | `proposal_043_missing_projection_rows_are_explicit_lag_state`, `proposal_043_run_query_uses_projection_summary_fields`, `proposal_043_run_subscription_uses_projection_summary_fields`, `proposal_017_workflow_conflict_readback` |
 | `GqlStageExecution` | `projectionPresent`, `projectionUpdatedAt`, `projectionLag` | `projectionPresent=false` and `projectionLag=true` when no `stage_summaries` row exists. `projectionLag=true` when the projection row exists but status or attempt diverges from the canonical stage row. | `proposal_043_missing_projection_rows_are_explicit_lag_state`, `proposal_043_stage_queries_expose_projection_decision_flags`, `proposal_043_stage_subscription_uses_projection_decision_flags` |
 
 Client behavior:
@@ -149,7 +149,7 @@ P043 owns the read contract and server-published facts. P031 owns macOS UI timer
 | Surface | Proof | Result |
 |---|---|---|
 | Runs home | Projection-backed list query through `list_by_idea_projection` and `list_active_projection`. | Sufficient for P031 ship. |
-| Run detail | `run(id:)` returns projection-enriched counters, summaries, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag` from `find_run_projection`. | Sufficient for P031 ship. |
+| Run detail | `run(id:)` returns projection-enriched counters, summaries, `workflowConflict`, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag` from `find_run_projection`. | Sufficient for P031 ship. |
 | Stage list / progress | `stages(runID:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for P031 ship. |
 | Stage detail | `stage(id:)` returns projection-enriched decision flags and projection freshness while preserving canonical evidence/recovery payloads. | Sufficient for P031 ship. |
 | Missing projection rows | Missing `run_summaries` or `stage_summaries` rows surface as `projectionPresent=false` and `projectionLag=true`, not normal zero/false truth. | Sufficient for P031 projection-lag rendering. |

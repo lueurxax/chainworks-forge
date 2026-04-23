@@ -432,9 +432,16 @@ struct YAMLValidator: Sendable {
 
         if let seq = block.sequence, seq.isEmpty {
             issues.append(ValidationIssue(severity: .warning, message: "Empty sequence block", location: "states.\(stateID).\(blockName).sequence"))
+        } else if let seq = block.sequence {
+            issues += validateOutputPolicies(seq, stateID: stateID, blockName: blockName, phaseName: "sequence")
         }
         if let par = block.parallel, par.isEmpty {
             issues.append(ValidationIssue(severity: .error, message: "Empty parallel block in fanout", location: "states.\(stateID).\(blockName).parallel"))
+        } else if let par = block.parallel {
+            issues += validateOutputPolicies(par, stateID: stateID, blockName: blockName, phaseName: "parallel")
+        }
+        if let then = block.then {
+            issues += validateOutputPolicies(then, stateID: stateID, blockName: blockName, phaseName: "then")
         }
 
         // Duplicate agent in then: agent appears in both parallel and then
@@ -447,6 +454,22 @@ struct YAMLValidator: Sendable {
             }
         }
 
+        return issues
+    }
+
+    private static func validateOutputPolicies(_ tasks: [AgentTask], stateID: String, blockName: String, phaseName: String) -> [ValidationIssue] {
+        var issues: [ValidationIssue] = []
+        for task in tasks {
+            guard let outputPolicies = task.outputPolicies, !outputPolicies.isEmpty else { continue }
+            let outputs = Set(task.outputs ?? [])
+            for policyOutput in outputPolicies.keys where !outputs.contains(policyOutput) {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "output_policies key '\(policyOutput)' does not match any declared task output",
+                    location: "states.\(stateID).\(blockName).\(phaseName).\(task.task).output_policies"
+                ))
+            }
+        }
         return issues
     }
 }

@@ -3,8 +3,9 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, sessions,
-    validation,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
+    artifact_contracts, artifacts, legacy_discovery_overrides, sessions, validation,
+    workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -89,6 +90,8 @@ pub async fn execute(
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
+                "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
+                "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
             }));
             if let Some(projection) =
@@ -115,6 +118,7 @@ pub async fn execute(
                     "active_index": projection.active_index_json,
                     "run_state_projection": projection.run_state_json,
                     "operator_overrides": overrides,
+                    "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
                 }));
             }
 
@@ -122,6 +126,26 @@ pub async fn execute(
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+    }
+}
+
+pub(crate) async fn workflow_conflict_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    match workflow_conflicts::get_current_blocking_conflict(pool, run_id).await? {
+        Some(conflict) => Ok(serde_json::to_value(conflict)?),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+pub(crate) async fn implementation_handoff_status_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    match workflow_conflicts::get_implementation_handoff_status(pool, run_id).await? {
+        Some(status) => Ok(serde_json::to_value(status)?),
+        None => Ok(serde_json::Value::Null),
     }
 }
 
@@ -139,18 +163,59 @@ pub(crate) async fn execution_mcp_truth_json(
             (execution_id, facts)
         })
         .collect::<HashMap<_, _>>();
+    let discovery_diagnostics =
+        agent_execution_discovery_diagnostics::list_readback_by_run(pool, run_id).await?;
+    let discovery_diagnostics_by_execution_id: HashMap<_, _> = discovery_diagnostics
+        .into_iter()
+        .map(|readback| (readback.diagnostics.agent_execution_id.clone(), readback))
+        .collect::<HashMap<_, _>>();
     let mut items = Vec::with_capacity(executions.len());
     for execution in executions.into_iter() {
         let execution_id = execution.id.to_string();
+        let discovery_diagnostics_readback =
+            discovery_diagnostics_by_execution_id.get(&execution_id);
+        let reconciliation_pending =
+            discovery_diagnostics_readback.is_some_and(|readback| readback.reconciliation_pending);
         let runtime_facts = match runtime_facts_by_execution_id.get(&execution_id) {
             Some(facts) => {
-                runtime_facts_json(pool, &execution, facts, include_operator_debug).await?
-            }
-            None => {
-                let facts =
-                    AgentExecutionRuntimeFacts::defaults_for(execution.id, chrono::Utc::now());
+                let mut facts = facts.clone();
+                if reconciliation_pending {
+                    facts.valid_required_outputs = false;
+                }
                 runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
             }
+            None => {
+                let mut facts =
+                    AgentExecutionRuntimeFacts::defaults_for(execution.id, chrono::Utc::now());
+                if reconciliation_pending {
+                    facts.valid_required_outputs = false;
+                }
+                runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
+            }
+        };
+        let discovery_diagnostics = match discovery_diagnostics_readback {
+            Some(readback) => {
+                let diagnostics = &readback.diagnostics;
+                serde_json::json!({
+                "agent_execution_id": diagnostics.agent_execution_id.clone(),
+                "discovery_schema_version": diagnostics.discovery_schema_version.clone(),
+                "legacy_broad_discovery_used": diagnostics.legacy_broad_discovery_used,
+                "missing_required_output_count": diagnostics.missing_required_output_count,
+                "rejected_output_count": diagnostics.rejected_output_count,
+                "stale_output_count": diagnostics.stale_output_count,
+                "meta_discovery_truncated": diagnostics.meta_discovery_truncated,
+                "git_manifest_status": diagnostics.git_manifest_status.clone(),
+                "resume_warning_count": diagnostics.resume_warning_count,
+                "reconciliation_pending": readback.reconciliation_pending,
+                "reconciliation_warnings": readback.reconciliation_warnings.clone(),
+                "runtime_facts_present": readback.runtime_facts_present,
+                "matching_active_artifact_generation_count": readback.matching_active_artifact_generation_count,
+                "payload": readback.projected_payload(),
+                "created_at": diagnostics.created_at.to_rfc3339(),
+                "updated_at": diagnostics.updated_at.to_rfc3339(),
+                })
+            }
+            None => serde_json::Value::Null,
         };
         items.push(serde_json::json!({
             "agent_execution_id": execution_id,
@@ -173,16 +238,10 @@ pub(crate) async fn execution_mcp_truth_json(
             ),
             "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
             "runtime_facts": runtime_facts,
+            "discovery_diagnostics": discovery_diagnostics,
         }));
     }
     Ok(serde_json::Value::Array(items))
-}
-
-fn xcode_runtime_observation_json(raw_json: Option<&str>) -> serde_json::Value {
-    raw_json
-        .and_then(|raw| serde_json::from_str::<XcodeRuntimeObservation>(raw).ok())
-        .and_then(|observation| serde_json::to_value(observation.redacted_for_surface()).ok())
-        .unwrap_or(serde_json::Value::Null)
 }
 
 async fn runtime_facts_json(
@@ -462,7 +521,7 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation};
+    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation, workflow_conflicts};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -474,6 +533,11 @@ mod tests {
     use domain::validation::{
         ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
+    };
+    use domain::workflow_conflict::{
+        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
+        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+        WorkflowConflictStatus,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
@@ -835,6 +899,53 @@ mod tests {
         }
     }
 
+    fn make_workflow_conflict(run_id: RunId) -> WorkflowConflictRecord {
+        let candidates = vec![CandidateTransitionEvaluation {
+            transition_id: "review_to_complete".into(),
+            from_state_id: "review".into(),
+            to_state_id: "complete".into(),
+            condition_expression_id: Some("proposal_review_summary.pass == true".into()),
+            result: CandidateTransitionResult::MissingInput,
+            required_artifacts: vec!["proposal_review_summary".into()],
+            missing_artifacts: vec!["proposal_review_summary".into()],
+            missing_fields: vec![],
+            source_artifact_ids: vec![],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some("proposal_review_summary is required".into()),
+        }];
+        let reason = WorkflowConflictReason::RequiredArtifactOrFieldMissingForTransition;
+        let candidate_hash = candidate_transition_hash(&candidates);
+        WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: workflow_conflict_fingerprint(
+                &run_id.to_string(),
+                "review",
+                &reason,
+                &candidate_hash,
+                &[],
+            ),
+            run_id: run_id.to_string(),
+            stage_execution_id: None,
+            lineage_id: Some("lineage-p017".into()),
+            current_state_id: "review".into(),
+            reason,
+            operator_label: "Required transition input is missing".into(),
+            status: WorkflowConflictStatus::Unresolved,
+            candidate_transitions: candidates,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs: vec![],
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".into(),
+        }
+    }
+
     async fn persist_handoff_required_summary(pool: &sqlx::SqlitePool, run_id: RunId) {
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -982,6 +1093,54 @@ mod tests {
         assert_eq!(
             summary["owner_class_counts"]["release"],
             serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_reports_get_includes_current_workflow_conflict() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let conflict = make_workflow_conflict(run_id);
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let workflow_conflict = &mcp_truth["workflow_conflict"];
+
+        assert_eq!(
+            workflow_conflict["reason"],
+            serde_json::json!("required_artifact_or_field_missing_for_transition")
+        );
+        assert_eq!(workflow_conflict["status"], serde_json::json!("unresolved"));
+        assert_eq!(
+            workflow_conflict["candidate_transitions"][0]["result"],
+            serde_json::json!("missing_input")
+        );
+        assert_eq!(
+            workflow_conflict["current_state_id"],
+            serde_json::json!("review")
         );
     }
 

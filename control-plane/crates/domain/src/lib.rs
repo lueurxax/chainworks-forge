@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod artifact_contracts;
 pub mod capabilities;
 pub mod commands;
+pub mod discovery;
 pub mod events;
 pub mod idea;
 pub mod ids;
@@ -14,7 +15,7 @@ pub mod session;
 pub mod stage;
 pub mod steward;
 pub mod validation;
-pub mod xcode_runtime;
+pub mod workflow_conflict;
 
 // P029: PrincipalClass is canonically defined in domain::commands.
 pub use capabilities::{CapabilityToolId, ResourceTemplateId};

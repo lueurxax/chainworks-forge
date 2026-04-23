@@ -1006,6 +1006,64 @@ struct YAMLParserTests {
         )
         #expect(workflow.states.count == 12)
         #expect(workflow.initialState == "state_1_idea_received")
+        #expect(workflow.discovery?.legacyBroadDiscoveryPolicy == nil)
+    }
+
+    @Test func parseWorkflowLegacyBroadDiscoveryPolicy() throws {
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("workflow-discovery-\(UUID()).yaml")
+        let yaml = """
+        schema_version: 1
+        workflow:
+          id: wf-discovery
+          name: Discovery Workflow
+          description: test
+          execution:
+            single_active_run_per_idea: true
+            resume_policy: automatic_on_launch
+          required_providers: []
+        discovery:
+          legacy_broad_discovery_policy: workflow_opt_in
+        initial_state: start
+        states:
+          start:
+            label: Start
+            type: start
+            owner: lead_orchestrator
+        """
+        try yaml.write(to: tmpURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        let workflow = try YAMLParser.loadWorkflow(from: tmpURL)
+        #expect(workflow.discovery?.legacyBroadDiscoveryPolicy == .workflowOptIn)
+    }
+
+    @Test func invalidWorkflowLegacyBroadDiscoveryPolicyThrows() throws {
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("workflow-discovery-invalid-\(UUID()).yaml")
+        let yaml = """
+        schema_version: 1
+        workflow:
+          id: wf-discovery
+          name: Discovery Workflow
+          description: test
+          execution:
+            single_active_run_per_idea: true
+            resume_policy: automatic_on_launch
+          required_providers: []
+        discovery:
+          legacy_broad_discovery_policy: always
+        initial_state: start
+        states:
+          start:
+            label: Start
+            type: start
+            owner: lead_orchestrator
+        """
+        try yaml.write(to: tmpURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        #expect(throws: YAMLParserError.self) {
+            _ = try YAMLParser.loadWorkflow(from: tmpURL)
+        }
     }
 
     @Test func parseCompactWorkflow() throws {
@@ -1509,6 +1567,32 @@ struct YAMLValidatorTests {
         )
         let issues = YAMLValidator.validateRunBlockSemantics(wf)
         #expect(issues.contains(where: { $0.message.contains("dup_agent") && $0.message.contains("both parallel and then") }))
+    }
+
+    @Test func outputPoliciesMustReferenceDeclaredOutputs() {
+        let wf = makeWorkflow(
+            initialState: "s1",
+            states: ["s1": WorkflowState(label: "S1", type: "start", owner: "o", approval: nil,
+                                          run: RunBlock(
+                                              sequence: [
+                                                  AgentTask(
+                                                      agent: "writer",
+                                                      task: "write",
+                                                      inputs: nil,
+                                                      outputs: ["proposal_review"],
+                                                      outputPolicies: [
+                                                          "stale_review": OutputPolicyDefinition(reusePolicy: .allowUnchangedExisting)
+                                                      ]
+                                                  )
+                                              ],
+                                              parallel: nil,
+                                              then: nil
+                                          ),
+                                          runAfterApproval: nil, loop: nil, transitions: nil)]
+        )
+
+        let issues = YAMLValidator.validateRunBlockSemantics(wf)
+        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("output_policies key 'stale_review'") }))
     }
 }
 

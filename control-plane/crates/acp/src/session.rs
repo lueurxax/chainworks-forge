@@ -1,7 +1,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tracing::warn;
 
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{ExecutionRequest, ExecutionResult};
@@ -64,9 +65,17 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
+            pre_prompt_expected_outputs,
             transcript_text,
             usage,
-            xcode_shim_warning_events,
+            acp_pre_initialize_local_latency_ms,
+            acp_initialize_latency_ms,
+            acp_session_new_latency_ms,
+            acp_prompt_duration_ms,
+            acp_pre_prompt_metadata_latency_ms,
+            acp_pre_prompt_metadata_timeout,
+            acp_pre_prompt_metadata_digest_bytes,
+            legacy_broad_discovery_snapshot,
         ) = self.transport.prompt(req).await?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
@@ -82,6 +91,7 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
+            pre_prompt_expected_outputs,
             transcript_text,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,
@@ -94,16 +104,30 @@ impl AcpSession {
             mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
             xcode_shim_warning_events,
             close_diagnostic: None,
+            acp_pre_initialize_local_latency_ms: Some(acp_pre_initialize_local_latency_ms),
+            acp_initialize_latency_ms: Some(acp_initialize_latency_ms),
+            acp_session_new_latency_ms: Some(acp_session_new_latency_ms),
+            acp_prompt_duration_ms: Some(acp_prompt_duration_ms),
+            acp_pre_prompt_metadata_latency_ms: Some(acp_pre_prompt_metadata_latency_ms),
+            acp_pre_prompt_metadata_timeout,
+            acp_pre_prompt_metadata_digest_bytes,
+            legacy_broad_discovery_snapshot,
         })
     }
 
     /// Close the live ACP session and wait for the subprocess to exit.
-    pub async fn close(&mut self) -> Result<()> {
-        self.transport.close().await?;
-        for path in self.cleanup_paths.drain(..) {
-            cleanup_path(&path);
+    pub async fn close(&mut self) -> Result<Option<AcpCloseDiagnostic>> {
+        let close_result = self.transport.close().await;
+        if let Some(path) = self.cleanup_path.take() {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                warn!(
+                    cleanup_path = %path.display(),
+                    error = %error,
+                    "Failed to remove ACP session cleanup path"
+                );
+            }
         }
-        Ok(())
+        close_result
     }
 
     pub fn is_live(&mut self) -> bool {
