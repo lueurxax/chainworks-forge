@@ -28,7 +28,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, and startup recovery progress
-- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, and write serialization
+- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, write serialization, provider toolchain homes, and generated-state housekeeping
 
 ### Agents, skills, and MCP
 

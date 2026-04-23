@@ -27,7 +27,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, and write serialization
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, write serialization, provider toolchain homes, and generated-state housekeeping
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
 - [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics

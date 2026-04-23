@@ -5,7 +5,7 @@
 | Date | 2026-04-21 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [050-per-run-workspace-isolation.md](050-per-run-workspace-isolation.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [061-sqlite-write-serialization-and-executor-backpressure.md](061-sqlite-write-serialization-and-executor-backpressure.md), [062-implementation-approval-rejection-loopback.md](062-implementation-approval-rejection-loopback.md) |
+| Depends on | [050-per-run-workspace-isolation.md](050-per-run-workspace-isolation.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [rust-control-plane.md#capacity-aware-scheduling-and-backpressure](../reference/rust-control-plane.md#capacity-aware-scheduling-and-backpressure), [062-implementation-approval-rejection-loopback.md](062-implementation-approval-rejection-loopback.md) |
 | Scope | Make implementation run worktrees stay current with `main` without blocking or losing work, and make completed-run lessons available to unfinished runs through durable orchestration artifacts rather than manual operator memory. |
 | Goal | The orchestrator can safely synchronize `main` into active implementation branches, preserve dirty work before any merge attempt, route merge conflicts as normal work, and inject relevant knowledge from completed or failed runs into later run prompts. |
 

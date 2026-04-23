@@ -456,7 +456,7 @@
         "Remove stale .forge-codex-acp session homes only when no live provider/MCP process references the directory.",
         "Keep the current DB, WAL/SHM, newest pre-cleanup backup, and operator-pinned backups; prune older migration/test backups only through explicit housekeeping.",
         "Report reclaimed bytes by category and keep cleanup safe while the daemon is active when touching only inactive generated outputs.",
-        "P061 or a follow-up owns long-term retention automation; P053 discovery must not rely on cleanup for correctness."
+        "The Rust control-plane generated-state housekeeping contract owns safe inactive generated-state cleanup; P053 discovery must not rely on cleanup for correctness."
       ]
     }
   },

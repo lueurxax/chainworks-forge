@@ -1089,6 +1089,11 @@ Important:
 
 SQLite write serialization and executor backpressure gate.
 
+The `proposal-061|p061` names are retained historical aliases for the implemented
+SQLite write-serialization, scheduler-backpressure, host-interruption, and
+generated-state housekeeping contract documented in
+[`rust-control-plane.md`](rust-control-plane.md).
+
 Scope:
 
 - `InvokeAgentCapacityConfig` defaults and provider alias normalization

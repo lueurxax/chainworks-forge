@@ -2,7 +2,7 @@
 
 Stable reference for the Rust + SQLite local control-plane daemon.
 
-This document describes the implemented system at `control-plane/` as of the P061 baseline. It is not a proposal or future-state design.
+This document describes the implemented system at `control-plane/`. It is not a proposal or future-state design.
 
 Related stable docs:
 
@@ -312,7 +312,7 @@ write coordination layer:
 - **Write Coordination**: The `engine` crate owns command ordering and recovery
   semantics, while `db` exposes transaction-scoped repository methods.
 - **Command Latency**: The system targets p95 command latency (approve, retry, cancel)
-  below 2 seconds even under saturated agent load. The `proposal-061` gate enforces
+  below 2 seconds even under saturated agent load. The retained `proposal-061` gate alias enforces
   this under a load of 20 active fake agents.
 - **Contention Monitoring**: DB write lock wait time and transaction duration are
   instrumented and exposed via GraphQL and MCP. SQLITE_BUSY retries are logged
@@ -320,6 +320,22 @@ write coordination layer:
 - **Host Interruption Recovery**: Detected host sleep/wake and network migration
   epochs classify affected executions, which are then cleaned up and requeued
   with jitter under capacity caps. Retries are exempt from provider quota budgets.
+
+### Provider runtime homes and toolchain caches
+
+Provider runtime homes are isolated from writable toolchain cache roots. The
+Codex adapter derives a per-session toolchain root and publishes both
+`CHAINWORKS_TOOLCHAIN_HOME` and `TOOLCHAIN_HOME` to the provider process. Rust
+tooling uses subpaths under that root for `TMPDIR`, `RUSTUP_HOME`,
+`CARGO_HOME`, and `CARGO_TARGET_DIR` so generated build/cache output does not
+land inside read-only provider runtime homes or shared repository-global build
+directories.
+
+The scheduler stays language-neutral: it allocates bounded execution capacity
+and writable roots, while provider adapters map the generic toolchain root to
+tool-specific environment variables or command arguments. Swift/Xcode and Go
+adapter-specific mappings extend this same contract; they must not add
+language-specific scheduler capacity dimensions.
 
 ### Schema
 
@@ -536,10 +552,10 @@ Integration tests are located in:
 - `crates/acp/tests/integration.rs`
 - `crates/daemon/tests/mcp_stdio.rs`
 
-Additional implementation-ready gates:
+Additional focused gates:
 
 - `./scripts/test-gate.sh proposal-058` for ACP failure classification and runtime facts.
-- `./scripts/test-gate.sh proposal-061` for SQLite write serialization and executor backpressure.
+- `./scripts/test-gate.sh proposal-061` for SQLite write serialization, executor backpressure, host-interruption recovery, scheduler-health readback, and generated-state housekeeping safety. The `proposal-061|p061` names are retained historical gate aliases for this implemented contract.
 
 ## Key design decisions
 
@@ -559,7 +575,7 @@ These decisions are fixed for the baseline and are not under reconsideration. Ac
 
 7. **Client remains canonical during parity.** The SwiftUI app owns user-visible behavior until the thin-client cutover (P031). The daemon provides verifiable shadow truth.
 
-8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. P061 keeps SQLite but targets explicit write serialization, a longer busy timeout, and executor backpressure instead of relying on more writer concurrency.
+8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. The daemon keeps SQLite as the source of truth and uses explicit write serialization plus executor backpressure instead of relying on more writer concurrency.
 
 9. **Bounded local concurrency target.** The local daemon target is 5 active runs stable, 10 active runs only with bounded scheduling, and up to 20 active agent executions. Excess work should queue visibly instead of starting every fan-out task immediately.
 
