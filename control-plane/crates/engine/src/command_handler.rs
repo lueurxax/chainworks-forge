@@ -8,11 +8,12 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
-    ideas, projections, runs, scheduler, sessions, stages, work_items,
+    ideas, legacy_discovery_overrides, projections, runs, scheduler, sessions, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
+use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
 use domain::provider::InvokeAgentCapacityConfig;
@@ -37,15 +38,35 @@ pub struct CommandHandler {
 }
 
 pub enum CommandResult {
-    RunStarted { run_id: RunId },
+    RunStarted {
+        run_id: RunId,
+    },
     StartRunBlockedByDeliveryPreflight(StartRunBlockedByDeliveryPreflight),
-    StageApproved { approval_id: ApprovalId },
-    StageRejected { approval_id: ApprovalId },
-    StageRetryScheduled { run_id: RunId, stage_id: String },
-    RunCancelled { run_id: RunId },
-    SessionReset { run_id: RunId, stage_id: String },
+    StageApproved {
+        approval_id: ApprovalId,
+    },
+    StageRejected {
+        approval_id: ApprovalId,
+    },
+    StageRetryScheduled {
+        run_id: RunId,
+        stage_id: String,
+        legacy_discovery_override_id: Option<String>,
+    },
+    LegacyDiscoveryOverrideCreated {
+        override_id: String,
+    },
+    RunCancelled {
+        run_id: RunId,
+    },
+    SessionReset {
+        run_id: RunId,
+        stage_id: String,
+    },
     StewardAnalysisQueued,
-    ArtifactContractOverrideCreated { override_id: String },
+    ArtifactContractOverrideCreated {
+        override_id: String,
+    },
 }
 
 pub struct StartRunBlockedByDeliveryPreflight {
@@ -79,6 +100,7 @@ impl CommandJournalEntry {
             Command::ApproveStage(_) => "ApproveStage",
             Command::RejectStage(_) => "RejectStage",
             Command::RetryStage(_) => "RetryStage",
+            Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
@@ -91,6 +113,7 @@ impl CommandJournalEntry {
             Command::ApproveStage(c) => Some(c.run_id.to_string()),
             Command::RejectStage(c) => Some(c.run_id.to_string()),
             Command::RetryStage(c) => Some(c.run_id.to_string()),
+            Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
@@ -119,6 +142,7 @@ impl CommandJournalEntry {
                 | "ApproveStage"
                 | "RejectStage"
                 | "RetryStage"
+                | "OverrideLegacyDiscoveryPolicy"
                 | "CancelRun"
                 | "ResetSession"
         )
@@ -166,6 +190,28 @@ fn find_source_invoke_work_item<'a>(
             matches.then_some(item)
         })
         .max_by_key(|item| item.created_at)
+}
+
+fn frozen_legacy_broad_discovery_policy(run: &Run) -> Result<LegacyBroadDiscoveryPolicy> {
+    let Some(snapshot_json) = run.workflow_snapshot_json.as_deref() else {
+        return Ok(LegacyBroadDiscoveryPolicy::Disabled);
+    };
+    let workflow: workflow::definition::WorkflowFile = serde_json::from_str(snapshot_json)
+        .map_err(|e| anyhow!("parse workflow_snapshot_json for legacy discovery policy: {e}"))?;
+    Ok(
+        match workflow
+            .discovery
+            .and_then(|discovery| discovery.legacy_broad_discovery_policy)
+            .unwrap_or(workflow::definition::LegacyBroadDiscoveryPolicyDef::Disabled)
+        {
+            workflow::definition::LegacyBroadDiscoveryPolicyDef::Disabled => {
+                LegacyBroadDiscoveryPolicy::Disabled
+            }
+            workflow::definition::LegacyBroadDiscoveryPolicyDef::WorkflowOptIn => {
+                LegacyBroadDiscoveryPolicy::WorkflowOptIn
+            }
+        },
+    )
 }
 
 impl CommandHandler {
@@ -247,6 +293,20 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: OverrideArtifactContract requires operator principal");
         }
+        if matches!(
+            &cmd,
+            Command::RetryStage(c) if c.legacy_discovery_override_policy.is_some()
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!(
+                "forbidden: RetryStage legacy_discovery_override_policy requires operator principal"
+            );
+        }
+        if matches!(&cmd, Command::OverrideLegacyDiscoveryPolicy(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: OverrideLegacyDiscoveryPolicy requires operator principal");
+        }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal = CommandJournalEntry::new(&cmd, &caller);
@@ -269,7 +329,7 @@ impl CommandHandler {
             .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
         }
 
-        let result = self.execute_command(cmd, &journal).await;
+        let result = self.execute_command(cmd, &journal, &caller).await;
 
         // Completion/failure are best-effort — log errors but don't fail the command
         if !journal.is_recorded_in_command_transaction() {
@@ -307,6 +367,7 @@ impl CommandHandler {
         &self,
         cmd: Command,
         journal: &CommandJournalEntry,
+        caller: &CallerContext,
     ) -> Result<CommandResult> {
         let journal_id = journal.id.as_str();
         match cmd {
@@ -785,6 +846,11 @@ impl CommandHandler {
 
             Command::RetryStage(c) => {
                 if let Some(agent_execution_id) = c.agent_execution_id {
+                    if c.legacy_discovery_override_policy.is_some() {
+                        anyhow::bail!(
+                            "legacy_discovery_override_policy is only supported for full stage retry"
+                        );
+                    }
                     return self
                         .retry_agent_execution(
                             c.run_id,
@@ -839,11 +905,11 @@ impl CommandHandler {
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
                     return Err(error);
                 };
+                let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
-                        let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
-                            .await?
-                            .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
                         run.status == RunStatus::Blocked
                             && (run.current_state.as_deref() == Some(c.stage_id.as_str())
                                 || old_stage.stage_id == c.stage_id)
@@ -897,6 +963,30 @@ impl CommandHandler {
                     recovery_snapshot_json: None,
                     retry_reason: Some("operator_retry".into()),
                 };
+                let legacy_discovery_override_input = if let Some(requested_policy) =
+                    c.legacy_discovery_override_policy
+                {
+                    let reason = c.legacy_discovery_override_reason.clone().ok_or_else(|| {
+                            anyhow!(
+                                "legacy_discovery_override_reason is required with legacy_discovery_override_policy"
+                            )
+                        })?;
+                    Some(LegacyDiscoveryOverrideInput {
+                        run_id: c.run_id,
+                        stage_id: c.stage_id.clone(),
+                        workflow_id: run.workflow_id.clone(),
+                        target_stage_execution_id: new_stage.id,
+                        target_attempt_number: next_attempt_number,
+                        actor_id: caller.principal_id.clone(),
+                        reason,
+                        requested_policy,
+                        from_policy: frozen_legacy_broad_discovery_policy(&run)?,
+                        approval_source: caller.caller_tool.clone(),
+                        journal_id: journal_id.to_string(),
+                    })
+                } else {
+                    None
+                };
                 let retry_advance_work_item_id = new_stage.id.to_string();
                 let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
                 apply_quota_retry_budget_for_stage_tx(
@@ -930,6 +1020,19 @@ impl CommandHandler {
                 self.maybe_inject_retry_stage_failure("settle_old_stage")?;
                 stages::insert_tx(&mut retry_tx, &new_stage).await?;
                 self.maybe_inject_retry_stage_failure("insert_new_stage")?;
+                let legacy_discovery_override_id =
+                    if let Some(input) = legacy_discovery_override_input.as_ref() {
+                        Some(
+                            legacy_discovery_overrides::create_for_pending_retry_tx(
+                                &mut retry_tx,
+                                input,
+                            )
+                            .await?
+                            .override_id,
+                        )
+                    } else {
+                        None
+                    };
                 artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
                     &mut retry_tx,
                     c.run_id,
@@ -982,6 +1085,93 @@ impl CommandHandler {
                 Ok(CommandResult::StageRetryScheduled {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
+                    legacy_discovery_override_id,
+                })
+            }
+
+            Command::OverrideLegacyDiscoveryPolicy(c) => {
+                let run = runs::find_by_id(&self.pool, c.run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                let target_stage = stages::find_by_id(&self.pool, c.target_stage_execution_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "legacy discovery override target stage execution {} not found",
+                            c.target_stage_execution_id
+                        )
+                    })?;
+                if target_stage.run_id != c.run_id || target_stage.stage_id != c.stage_id {
+                    return Err(anyhow!(
+                        "legacy discovery override target stage execution {} does not match run {} stage {}",
+                        c.target_stage_execution_id,
+                        c.run_id,
+                        c.stage_id
+                    ));
+                }
+                if target_stage.attempt_number != c.target_attempt_number {
+                    return Err(anyhow!(
+                        "legacy discovery override target attempt mismatch: requested {}, found {}",
+                        c.target_attempt_number,
+                        target_stage.attempt_number
+                    ));
+                }
+                if target_stage.status != StageStatus::Pending {
+                    return Err(anyhow!(
+                        "legacy discovery override target stage execution {} already started or settled with status {}",
+                        c.target_stage_execution_id,
+                        target_stage.status
+                    ));
+                }
+
+                let input = LegacyDiscoveryOverrideInput {
+                    run_id: c.run_id,
+                    stage_id: c.stage_id.clone(),
+                    workflow_id: run.workflow_id.clone(),
+                    target_stage_execution_id: c.target_stage_execution_id,
+                    target_attempt_number: c.target_attempt_number,
+                    actor_id: caller.principal_id.clone(),
+                    reason: c.legacy_discovery_override_reason,
+                    requested_policy: c.legacy_discovery_override_policy,
+                    from_policy: frozen_legacy_broad_discovery_policy(&run)?,
+                    approval_source: caller.caller_tool.clone(),
+                    journal_id: journal_id.to_string(),
+                };
+                let tx_started = Instant::now();
+                let mut tx = db::pool::begin_immediate_with_retry(
+                    &self.pool,
+                    "command.OverrideLegacyDiscoveryPolicy",
+                )
+                .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow!("command journal insert failed: {e}"))?;
+                let created =
+                    legacy_discovery_overrides::create_for_pending_retry_tx(&mut tx, &input)
+                        .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction(
+                    "command.OverrideLegacyDiscoveryPolicy",
+                    tx_started,
+                );
+
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
+                Ok(CommandResult::LegacyDiscoveryOverrideCreated {
+                    override_id: created.override_id,
                 })
             }
 
@@ -1345,6 +1535,7 @@ impl CommandHandler {
         Ok(CommandResult::StageRetryScheduled {
             run_id,
             stage_id: stage_id.to_string(),
+            legacy_discovery_override_id: None,
         })
     }
 
@@ -1597,6 +1788,7 @@ impl CommandHandler {
         Ok(CommandResult::StageRetryScheduled {
             run_id,
             stage_id: stage_id.to_string(),
+            legacy_discovery_override_id: None,
         })
     }
 

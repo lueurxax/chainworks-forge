@@ -2,7 +2,7 @@
 
 Stable reference for the Rust + SQLite local control-plane daemon.
 
-This document describes the implemented system at `control-plane/` as of the P061 baseline. It is not a proposal or future-state design.
+This document describes the implemented system at `control-plane/`. It is not a proposal or future-state design.
 
 Related stable docs:
 
@@ -194,8 +194,23 @@ Single-task stages settle immediately after the agent completes.
 
 ### Transition evaluation
 
-After a stage completes, the orchestrator evaluates transition conditions in order. The first matching transition wins. Supported expression syntax (`crates/engine/src/orchestrator.rs`, line 487):
+After a stage completes, the orchestrator evaluates transition conditions in order
+via the **Transition Authority Resolver**. The first matching declarative
+transition wins. Agent-authored hints are treated as advisory only.
 
+**Authority Rules:**
+- The compiled workflow graph is the only authority.
+- Agent-authored hints (`next_stage`, `next_action`) are advisory evidence.
+- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate 
+  to true; they fail closed as `invalid_expression` or `missing_input`.
+
+**Aggregate Artifact Field Authority:**
+To ensure deterministic evaluation, aggregate artifact fields are classified by 
+authority. For `proposal_review_summary_v1`:
+- `pass` and `blocker_count` are **transition authoritative**.
+- `next_action` and `next_stage` are **advisory only**.
+
+Supported expression syntax (`crates/engine/src/orchestrator.rs`, line 487):
 | Pattern | Meaning |
 |---|---|
 | `"true"` / `"false"` | Boolean literals |
@@ -204,6 +219,11 @@ After a stage completes, the orchestrator evaluates transition conditions in ord
 | `approval.rejected == true` | Checks if any approval for the run was rejected |
 | `lhs == rhs`, `!=`, `<`, `<=`, `>`, `>=` | Comparison (numeric or string) |
 | `expr and expr`, `expr or expr` | Logical connectives (parenthesis-aware split) |
+
+**Workflow Conflict Persistence:**
+If no transition matches or multiple match without a tie-break, the orchestrator 
+persists a `WorkflowConflictRecord` to the `workflow_conflicts` table. Non-blocking 
+rejected hints are recorded in `workflow_advisory_rejections`.
 
 **Implementation self-assessment mapping:**
 Transition expressions can inspect `implementation_self_assessment_v2.status` and other fields. These resolve against the domain-owned assessment summary projection rather than raw files.
@@ -238,7 +258,9 @@ When the subprocess sends `session/request_permission`, the transport auto-grant
 
 ### Artifact discovery
 
-Before the session starts, the transport snapshots all regular files under `workspace_root`. After the session ends, it diffs to find new files. These are returned as `artifact_paths` in the execution result.
+P053 bounded discovery replaces broad pre-prompt workspace scanning with an engine-owned settlement pipeline. The transport captures deterministic digest-backed pre-prompt metadata only for declared outputs. After the prompt completes, the engine builds `OutputDiscoveryDecision` records from exact expected paths, provider output envelopes, control-plane generated manifests, and a bounded scan of the current run's `chainworks_meta_root` (maximum 500 files, 10 MiB aggregate size unless sampled defaults are tuned).
+
+Legacy recursive broad discovery is post-prompt only, disabled by default, and requires an explicit `discovery.legacy_broad_discovery_policy: workflow_opt_in` in the workflow YAML or an operator `Command::RetryStage` override for frozen runs. Discovery decisions are written to `agent_execution_discovery_diagnostics` and mapped to runtime facts output settlement.
 
 ### Per-adapter session config
 
@@ -312,7 +334,7 @@ write coordination layer:
 - **Write Coordination**: The `engine` crate owns command ordering and recovery
   semantics, while `db` exposes transaction-scoped repository methods.
 - **Command Latency**: The system targets p95 command latency (approve, retry, cancel)
-  below 2 seconds even under saturated agent load. The `proposal-061` gate enforces
+  below 2 seconds even under saturated agent load. The retained `proposal-061` gate alias enforces
   this under a load of 20 active fake agents.
 - **Contention Monitoring**: DB write lock wait time and transaction duration are
   instrumented and exposed via GraphQL and MCP. SQLITE_BUSY retries are logged
@@ -321,22 +343,50 @@ write coordination layer:
   epochs classify affected executions, which are then cleaned up and requeued
   with jitter under capacity caps. Retries are exempt from provider quota budgets.
 
+### Provider runtime homes and toolchain caches
+
+Provider runtime homes are isolated from writable toolchain cache roots. The
+Codex adapter derives a per-session toolchain root and publishes both
+`CHAINWORKS_TOOLCHAIN_HOME` and `TOOLCHAIN_HOME` to the provider process. Rust
+tooling uses subpaths under that root for `TMPDIR`, `RUSTUP_HOME`,
+`CARGO_HOME`, and `CARGO_TARGET_DIR` so generated build/cache output does not
+land inside read-only provider runtime homes or shared repository-global build
+directories.
+
+The scheduler stays language-neutral: it allocates bounded execution capacity
+and writable roots, while provider adapters map the generic toolchain root to
+tool-specific environment variables or command arguments. Swift/Xcode and Go
+adapter-specific mappings extend this same contract; they must not add
+language-specific scheduler capacity dimensions.
+
 ### Schema
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `021_p017_workflow_conflicts.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
-| `agent_executions` | Per-agent invocation records (provider, model, status) |
+| `agent_executions` | Per-agent invocation records (provider, model, status, **owner_kind**, **owner_id**) |
+| `workflow_conflicts` | Blocking graph-authority conflicts by fingerprint and status |
+| `workflow_advisory_rejections` | Non-blocking historical records of rejected agent hints |
+| `lead_mediation` | State for lead-owned conflict resolution attempts |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
+
+**AgentExecution Owner Migration (Phase B):**
+To support lead-mediated conflicts without synthetic stage states, `agent_executions` 
+migrated to a general owner model:
+- `owner_kind`: `stage_execution` or `lead_conflict_mediation`.
+- `owner_id`: References either `stage_execution_id` or `mediation_record_id`.
+- `stage_execution_id` remains as a nullable compatibility field.
+- This allows mediation-owned executions to reuse the same retry, quota, 
+  artifact, and cost infrastructure as stage-owned executions.
 
 **Projections and read-model tables** (e.g., `002_projections.sql`, `021_scheduler_backpressure_foundation.sql`):
 
@@ -536,10 +586,10 @@ Integration tests are located in:
 - `crates/acp/tests/integration.rs`
 - `crates/daemon/tests/mcp_stdio.rs`
 
-Additional implementation-ready gates:
+Additional focused gates:
 
 - `./scripts/test-gate.sh proposal-058` for ACP failure classification and runtime facts.
-- `./scripts/test-gate.sh proposal-061` for SQLite write serialization and executor backpressure.
+- `./scripts/test-gate.sh proposal-061` for SQLite write serialization, executor backpressure, host-interruption recovery, scheduler-health readback, and generated-state housekeeping safety. The `proposal-061|p061` names are retained historical gate aliases for this implemented contract.
 
 ## Key design decisions
 
@@ -559,7 +609,7 @@ These decisions are fixed for the baseline and are not under reconsideration. Ac
 
 7. **Client remains canonical during parity.** The SwiftUI app owns user-visible behavior until the thin-client cutover (P031). The daemon provides verifiable shadow truth.
 
-8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. P061 keeps SQLite but targets explicit write serialization, a longer busy timeout, and executor backpressure instead of relying on more writer concurrency.
+8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. The daemon keeps SQLite as the source of truth and uses explicit write serialization plus executor backpressure instead of relying on more writer concurrency.
 
 9. **Bounded local concurrency target.** The local daemon target is 5 active runs stable, 10 active runs only with bounded scheduling, and up to 20 active agent executions. Excess work should queue visibly instead of starting every fan-out task immediately.
 

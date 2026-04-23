@@ -91,8 +91,13 @@ import SwiftData
     // Serialized TransitionCursor — the single canonical continuation truth for resume,
     // recovery, and report surfaces. Nil for pre-P032 runs (fallback to heuristic path).
     var transitionCursorJSON: Data?
+    // Proposal 017 Phase A bridge: temporary JSON storage for workflow conflict
+    // truth until Swift moves to first-class conflict persistence.
+    var workflowConflictRecordsJSONV1: Data?
     // Proposal 054: Canonical implementation_self_assessment_summary projection.
     var implementationSelfAssessmentSummaryJSON: Data?
+    // Proposal 017 Phase A: engine-owned implementation-entry handoff readback.
+    var implementationHandoffStatusJSON: Data?
 
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?
@@ -110,7 +115,7 @@ import SwiftData
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
                 return cursor.nextScheduledStateID
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 return cursor.lastCompletedStateID
             case .awaitingFirstState:
                 break
@@ -145,7 +150,7 @@ import SwiftData
             return cursor.lastCompletedStateID ?? "None"
         case .transitionStarted:
             return cursor.nextScheduledStateID ?? "None"
-        case .terminal:
+        case .terminal, .awaitingConflictResolution:
             return cursor.lastCompletedStateID ?? "None"
         case .awaitingFirstState:
             return currentStageID ?? "Not started"
@@ -376,7 +381,7 @@ extension Run {
             case .awaitingFirstState:
                 // No state ever completed — start from the beginning (nil = initial).
                 return nil
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 // Terminal runs shouldn't be resumed, but if called, return last completed.
                 return cursor.lastCompletedStateID
             }
@@ -442,6 +447,115 @@ extension Run {
         guard !hasPersistedArtifacts else { return nil }
 
         return latestInterruptibleStage.stageID
+    }
+}
+
+extension Run {
+    var implementationHandoffStatus: ImplementationHandoffStatus? {
+        get {
+            guard let data = implementationHandoffStatusJSON else { return nil }
+            return try? JSONDecoder().decode(ImplementationHandoffStatus.self, from: data)
+        }
+        set {
+            implementationHandoffStatusJSON = try? JSONEncoder().encode(newValue)
+        }
+    }
+
+    var workflowConflictBridgeV1: WorkflowConflictBridgeV1 {
+        get {
+            guard let data = workflowConflictRecordsJSONV1 else {
+                return WorkflowConflictBridgeV1()
+            }
+            return (try? JSONDecoder().decode(WorkflowConflictBridgeV1.self, from: data))
+                ?? WorkflowConflictBridgeV1()
+        }
+        set {
+            workflowConflictRecordsJSONV1 = try? JSONEncoder().encode(newValue)
+        }
+    }
+
+    var currentWorkflowConflictRecord: WorkflowConflictRecord? {
+        workflowConflictBridgeV1.conflicts.last { $0.status.isCurrentBlocking }
+    }
+
+    func upsertWorkflowConflictRecord(_ record: WorkflowConflictRecord) {
+        var bridge = workflowConflictBridgeV1
+        let now = record.updatedAt
+        if record.status.isCurrentBlocking {
+            bridge.conflicts = bridge.conflicts.map { existing in
+                guard existing.status.isCurrentBlocking,
+                    existing.currentStateID == record.currentStateID,
+                    existing.conflictFingerprint != record.conflictFingerprint,
+                    existing.conflictID != record.conflictID
+                else {
+                    return existing
+                }
+                return existing.updatingStatus(
+                    .superseded,
+                    updatedAt: now,
+                    supersededByConflictID: record.conflictID
+                )
+            }
+        }
+        if let index = bridge.conflicts.firstIndex(where: {
+            $0.conflictFingerprint == record.conflictFingerprint
+                || $0.conflictID == record.conflictID
+        }) {
+            bridge.conflicts[index] = record
+        } else {
+            bridge.conflicts.append(record)
+        }
+        workflowConflictBridgeV1 = bridge
+    }
+
+    @discardableResult
+    func resolveCurrentWorkflowConflicts(
+        currentStateID: String,
+        selectedTransitionID: String,
+        selectedNextStateID: String,
+        stageExecutionID: UUID?,
+        resolvedAt: String
+    ) -> Int {
+        var bridge = workflowConflictBridgeV1
+        var resolvedCount = 0
+        let resolution = WorkflowConflictRecord.graphResolutionRecord(
+            selectedTransitionID: selectedTransitionID,
+            selectedNextStateID: selectedNextStateID,
+            stageExecutionID: stageExecutionID
+        )
+        bridge.conflicts = bridge.conflicts.map { conflict in
+            guard conflict.status.isCurrentBlocking,
+                conflict.currentStateID == currentStateID
+            else {
+                return conflict
+            }
+            resolvedCount += 1
+            return conflict.updatingStatus(
+                .resolved,
+                updatedAt: resolvedAt,
+                resolvedAt: resolvedAt,
+                resolutionRecordJSON: resolution
+            )
+        }
+        workflowConflictBridgeV1 = bridge
+        return resolvedCount
+    }
+
+    func appendWorkflowAdvisoryRejectionRecord(_ record: WorkflowAdvisoryRejectionRecord) {
+        var bridge = workflowConflictBridgeV1
+        if let index = bridge.advisoryRejections.firstIndex(where: {
+            $0.rejectionID == record.rejectionID
+                || (
+                    $0.currentStateID == record.currentStateID
+                        && $0.selectedTransitionID == record.selectedTransitionID
+                        && $0.advisoryHintHash == record.advisoryHintHash
+                )
+        }) {
+            bridge.advisoryRejections[index] = record
+        } else {
+            bridge.advisoryRejections.append(record)
+        }
+        workflowConflictBridgeV1 = bridge
     }
 }
 

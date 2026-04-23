@@ -84,6 +84,10 @@ PROPOSAL_015_NON_UI_TESTS=(
   "Chainworks ForgeTests/RuntimeSessionBridgeTests"
 )
 
+PROPOSAL_017_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal017Tests"
+)
+
 PROPOSAL_018_TESTS=(
   "Chainworks ForgeTests/AgentSessionTests"
   "Chainworks ForgeTests/RuntimeAgentExecutorTests"
@@ -1614,6 +1618,7 @@ Available gates:
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-015    Proposal 015 skill resolution and runtime injection gate
+  proposal-017    Proposal 017 Phase A workflow conflict truth gate
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
@@ -1639,6 +1644,7 @@ Available gates:
   proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
   proposal-049    Proposal 049 steward analysis system gate
   proposal-050    Proposal 050 per-run workspace isolation gate
+  proposal-053    Proposal 053 bounded ACP artifact discovery gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
   proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
   proposal-060|p060  Proposal 060 Phase 0a/0b control artifact wrapper gate
@@ -1795,6 +1801,23 @@ case "$GATE" in
     run_build "proposal-015"
     run_targeted_tests "proposal-015-non-ui" "${PROPOSAL_015_NON_UI_TESTS[@]}"
     run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
+    ;;
+  proposal-017|p017)
+    log "Proposal 017 gate: Phase A Swift bridge/report readback plus control-plane conflict truth"
+    check_idle_environment allow_app
+    run_targeted_tests "proposal-017-swift" "${PROPOSAL_017_SWIFT_TESTS[@]}"
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-017-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p workflow proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p domain --test proposal_017_workflow_conflict -- --test-threads=1 --nocapture
+      cargo test -p db --test proposal_017_workflow_conflict_persistence -- --test-threads=1 --nocapture
+      cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p mcp-server proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p graphql-server proposal_017_ -- --test-threads=1 --nocapture
+    )
+    log "Proposal 017 gate passed"
     ;;
   proposal-018|p018)
     check_idle_environment allow_app
@@ -2400,6 +2423,176 @@ for item in required:
         raise SystemExit(f"proposal-057: docs/reference/test-gates.md missing {item}")
 PY
     log "Proposal 057 control-plane gate passed"
+    ;;
+  proposal-053|p053)
+    log "Proposal 053 control-plane gate: bounded ACP artifact discovery"
+    python3 - <<'PY'
+import json
+from datetime import datetime
+from pathlib import Path
+
+root = Path.cwd()
+cap = root / "docs/proposals/053.review/cap-validation.json"
+security = root / "docs/proposals/053.review/security-checklist.md"
+manual_latency = root / "docs/proposals/053.review/manual-latency-spot-check.md"
+operator_clarity = root / "docs/proposals/053.review/operator-clarity-evidence.md"
+retrospective = root / "docs/proposals/053.review/phase-1-retrospective.md"
+if not cap.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/cap-validation.json")
+if not security.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/security-checklist.md")
+if not manual_latency.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/manual-latency-spot-check.md")
+if not operator_clarity.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/operator-clarity-evidence.md")
+if not retrospective.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/phase-1-retrospective.md")
+data = json.loads(cap.read_text())
+required = {
+    "schema_version",
+    "proposal_revision_id",
+    "sampled_execution_ids",
+    "source_query_or_extraction_method",
+    "sample_coverage_by_workflow_template",
+    "sample_coverage_by_agent_provider",
+    "dependency_readiness_recorded_within_two_working_days",
+    "dependency_escalations",
+    "narrow_adapter_owner_when_needed",
+    "phase_1_exposure_mode",
+    "production_data_availability_status",
+    "production_data_fallback_decision",
+    "excluded_outputs",
+    "per_output_bytes_p50",
+    "per_output_bytes_p90",
+    "per_output_bytes_p99",
+    "aggregate_bytes_p50",
+    "aggregate_bytes_p90",
+    "aggregate_bytes_p99",
+    "expected_output_spec_count_p90",
+    "dependency_readiness",
+    "chosen_max_expected_output_specs",
+    "chosen_pre_prompt_metadata_timeout_ms",
+    "chosen_pre_prompt_digest_budget_bytes",
+    "chosen_max_exact_output_bytes",
+    "chosen_max_provider_envelope_bytes",
+    "chosen_max_aggregate_declared_output_bytes",
+    "chosen_provider_envelope_buffer_policy",
+    "workflow_output_size_policy_required",
+    "fresh_and_reused_session_metadata_semantics_frozen",
+    "discovery_filesystem_owner",
+    "chosen_aggregate_acceptance_cap_bytes",
+    "interface_freeze",
+    "reviewer_signoff",
+    "generated_at",
+}
+missing = sorted(required.difference(data))
+if missing:
+    raise SystemExit(f"proposal-053: cap-validation missing fields: {missing}")
+if not isinstance(data["sampled_execution_ids"], list) or not data["sampled_execution_ids"]:
+    raise SystemExit("proposal-053: sampled_execution_ids must be a non-empty list")
+if data["dependency_readiness_recorded_within_two_working_days"] is not True:
+    raise SystemExit("proposal-053: dependency_readiness_recorded_within_two_working_days must be true")
+if data["phase_1_exposure_mode"] not in {"gate_only_internal", "production_exposed"}:
+    raise SystemExit("proposal-053: phase_1_exposure_mode must be gate_only_internal or production_exposed")
+if data["phase_1_exposure_mode"] == "production_exposed":
+    if data.get("phase_1_exposure_decision", {}).get("production_shippable") is not True:
+        raise SystemExit("proposal-053: production_exposed mode requires production_shippable=true")
+    if data.get("production_data_availability_status") != "approved_replacement_sample":
+        raise SystemExit("proposal-053: production_exposed mode requires approved replacement sample evidence")
+    for key in [
+        "per_output_bytes_p50",
+        "per_output_bytes_p90",
+        "per_output_bytes_p99",
+        "aggregate_bytes_p50",
+        "aggregate_bytes_p90",
+        "aggregate_bytes_p99",
+        "expected_output_spec_count_p90",
+    ]:
+        if data.get(key) is None:
+            raise SystemExit(f"proposal-053: production_exposed mode requires {key}")
+try:
+    datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(f"proposal-053: generated_at must be ISO-8601 ({exc})")
+for dep in ["P037", "P050", "P057", "P058"]:
+    if dep not in data["dependency_readiness"]:
+        raise SystemExit(f"proposal-053: dependency_readiness missing {dep}")
+    if data["dependency_readiness"][dep].get("status") not in {"ready", "ready_with_adapter", "blocked"}:
+        raise SystemExit(f"proposal-053: dependency_readiness.{dep}.status invalid")
+for key in [
+    "expected_output_spec",
+    "pre_prompt_expected_output_metadata",
+    "output_discovery_decision",
+    "discovery_filesystem_operation_recorder",
+    "git_manifest_runner",
+    "captured_output_builder",
+    "settle_agent_outputs_from_discovery_decisions",
+    "discovery_filesystem_trait",
+    "discovery_filesystem_fake",
+]:
+    if data["interface_freeze"].get(key) is not True:
+        raise SystemExit(f"proposal-053: interface_freeze.{key} must be true")
+text = security.read_text()
+for needle in [
+    "Production exposure | Approved for P053 control-plane/API/readback behavior",
+    "proposal_053_gate_uses_discovery_filesystem_trait_fake",
+    "StaleExpectedOutput",
+]:
+    if needle not in text:
+        raise SystemExit(f"proposal-053: security checklist missing {needle!r}")
+for path, required_needles in [
+    (
+        manual_latency,
+        [
+            "# P053 Manual Latency Spot-Check",
+            "Reference Workspace Measurement",
+            "8.9 GB",
+            "126,643",
+            "acp_pre_initialize_local_latency_ms=0",
+            "Result:",
+            "pre-`initialize`",
+        ],
+    ),
+    (operator_clarity, ["# P053 Operator Clarity Evidence", "Result:", "provider latency"]),
+    (retrospective, ["# P053 Phase 1 Retrospective", "Decision:", "P069"]),
+]:
+    text = path.read_text()
+    for needle in required_needles:
+        if needle not in text:
+            raise SystemExit(f"proposal-053: {path.name} missing {needle!r}")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-053-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain discovery::tests::generated_state_denylist_matches_p053_roots -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::proposal_053_operation_recorder_observes_bounded_discovery_without_generated_state_reads -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::proposal_053_gate_uses_discovery_filesystem_trait_fake -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::proposal_053_operation_recorder_orders_metadata_before_file_read -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::expected_output_spec_serializes_p053_policy_fields -- --exact --nocapture &&
+      cargo test -p domain bounded_pre_prompt_metadata -- --nocapture &&
+      cargo test -p domain proposal_053_bounded_meta_root -- --nocapture &&
+      cargo test -p domain proposal_053_legacy_broad_discovery -- --nocapture &&
+      cargo test -p db proposal_053_discovery_diagnostics --test proposal_053_discovery_diagnostics -- --nocapture &&
+      cargo test -p workflow proposal_053_output_policies -- --nocapture &&
+      cargo test -p workflow proposal_053_legacy_broad_discovery_policy -- --nocapture &&
+      cargo test -p acp caps_declared_payload_before_settlement -- --nocapture &&
+      cargo test -p acp proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake --lib -- --nocapture &&
+      cargo test -p acp test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default --test integration -- --nocapture &&
+      cargo test -p acp test_claude_adapter_executes_subprocess_and_returns_artifacts --test integration -- --nocapture &&
+      cargo test -p engine expected_output_specs -- --nocapture &&
+      cargo test -p engine proposal_053_must_produce_does_not_accept_unchanged_existing_output --lib -- --nocapture &&
+      cargo test -p engine proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only --lib -- --nocapture &&
+      cargo test -p engine proposal_053_engine_settlement_uses_discovery_filesystem_fake_for_exact_path --lib -- --nocapture &&
+      cargo test -p engine proposal_053_engine_stale_detection_uses_discovery_filesystem_fake --lib -- --nocapture &&
+      cargo test -p engine proposal_053_bounded_meta_root_uses_discovery_filesystem_fake --lib -- --nocapture &&
+      cargo test -p engine proposal_053_git_manifest_runner -- --nocapture &&
+      cargo test -p engine proposal_053_declared_manifest_preserves_agent_authored_file -- --nocapture &&
+      cargo test -p engine test_retry_stage_legacy_discovery_override_validation_failure_leaves_no_journal --test integration -- --nocapture &&
+      cargo test -p graphql-server proposal_053_agent_execution_projects_discovery_reconciliation_pending --test proposal_058_runtime_facts -- --nocapture &&
+      cargo test -p mcp-server proposal_053_reports_get_projects_discovery_reconciliation_pending --test proposal_058_runtime_facts -- --nocapture
+    )
+    log "Proposal 053 control-plane gate passed"
     ;;
   proposal-058|p058)
     log "Proposal 058 control-plane gate: ACP provider failure classification and session artifact ownership"

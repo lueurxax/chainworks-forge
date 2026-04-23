@@ -83,14 +83,18 @@ Surfaces for backpressure visibility:
 - **Sustained Backpressure Alerts**: Notifications trigger when work remains queued
   longer than the configured threshold (default 5 minutes).
 
-### Host Interruption
+### Workflow Conflict Details
 
-Interruptions like system sleep or network migration are classified as
-`host_interruption`. They are displayed with friendly labels like "Recovering
-from system sleep" and neutral visual indicators (e.g., SF Symbol `moon.zzz`),
-distinct from failed states.
+When a run blocks due to a workflow conflict, a dedicated **Conflict Details** 
+GroupBox appears immediately after the Blocker Summary. It provides:
 
-The operator shell must not promise an action that cannot actually run from the current row.
+- **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step") 
+  plus status capsule.
+- **Current State**: The authoritative graph state where the run is anchored.
+- **Lead & Mediation**: The system lead agent assigned to the conflict and 
+  active mediation progress.
+- **Advisory Suggestion**: Redacted summary of the rejected agent hint.
+- **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
 
 If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
 
@@ -146,7 +150,7 @@ Report content includes:
 - recovery notes,
 - deterministic outcome.
 
-## Recovery (Diagnostic-only in P031-r18)
+### Recovery
 
 The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows:
 
@@ -154,6 +158,14 @@ The P031 thin UI does not execute recovery actions. Instead, it provides diagnos
 2. `Retry Stage`
 3. `Resume from Approval Gate`
 4. `Clone Run`
+
+**Workflow Conflict Actions:**
+- **Request lead mediation**: Escalate a conflict to the system lead for 
+  automated resolution.
+- **Inspect lead mediation**: View sanitized live status updates (queued, 
+  running, validating) while mediation is active.
+- **Manual Resolution**: For terminal conflicts, provides direct actions like 
+  `Clone Run` or `Open editable recovery artifact`.
 
 `RecoverySheet` and diagnostic banners show:
 
@@ -234,6 +246,10 @@ Displayed provenance includes:
 - skill reference / role / frozen snapshot hash when available,
 - attempt,
 - runtime trust level.
+
+### Bounded Startup Latency (P053)
+
+The system enforces bounded artifact discovery to prevent broad local filesystem scanning from delaying ACP session initialization. Operators should notice significantly faster startup times in large workspaces compared to legacy implicit discovery models. Discovery diagnostics are available in the `Diagnostics` pane for technical inspection of settlement decisions.
 
 ## Notifications and presence
 

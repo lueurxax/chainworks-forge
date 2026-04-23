@@ -132,7 +132,10 @@ mod tests {
     fn request_with_meta_root(workspace_root: &str, meta_root: Option<&str>) -> ExecutionRequest {
         ExecutionRequest {
             run_id: RunId::new(),
+            stage_execution_id: None,
             stage_id: "stage".into(),
+            attempt_number: 1,
+            agent_execution_id: None,
             agent_id: "docs_guardian".into(),
             provider: "gemini".into(),
             model: None,
@@ -143,12 +146,14 @@ mod tests {
             worktree_write_enabled: true,
             worktree_strategy: Some("shared_implementation_worktree".into()),
             expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
             keep_session_alive: false,
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: meta_root.map(str::to_string),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         }
     }
 

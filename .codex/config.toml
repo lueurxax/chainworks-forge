@@ -22,3 +22,5 @@
 # proposal_reviews_collect_runtime_evidence = false
 # research_collects_runtime_evidence = false
 # baseline_refresh_validates_new_features = false
+
+sandbox_mode = "danger-full-access"

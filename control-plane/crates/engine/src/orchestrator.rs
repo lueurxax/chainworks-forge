@@ -1,17 +1,26 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
-use db::repos::{approvals, artifact_contracts, artifacts, ideas, runs, stages};
+use db::repos::{
+    approvals, artifact_contracts, artifacts, ideas, runs, stages, workflow_conflicts,
+};
 use db::work_item::WorkItemKind;
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::ImplementationSelfAssessmentStatus;
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, RunId};
+use domain::ids::{ApprovalId, ArtifactId, RunId};
 use domain::run::RunStatus;
 use domain::stage::{StageExecution, StageStatus};
+use domain::workflow_conflict::{
+    candidate_transition_hash, classify_workflow_conflict_reason, workflow_conflict_fingerprint,
+    AdvisoryHintExtraction, CandidateTransitionEvaluation, CandidateTransitionResult,
+    ImplementationHandoffStatus, WorkflowAdvisoryRejectionRecord, WorkflowConflictReason,
+    WorkflowConflictRecord, WorkflowConflictStatus, WorkflowTransitionCursorRecord,
+};
 
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
@@ -386,6 +395,19 @@ impl Orchestrator {
                                         for (i, task) in effective.iter().enumerate() {
                                             if task.phase != np {
                                                 continue;
+                                            }
+                                            if self
+                                                .block_code_writer_handoff_if_unavailable(
+                                                    run_id,
+                                                    &current_state_id,
+                                                    stage,
+                                                    task,
+                                                    &plan,
+                                                    run,
+                                                )
+                                                .await?
+                                            {
+                                                return Ok(());
                                             }
                                             let prompt = build_task_prompt(
                                                 task,
@@ -920,6 +942,19 @@ impl Orchestrator {
                 .approval_rejection_context_for_state(run_id, &current_state_id)
                 .await?;
             for (i, task) in &phase0_tasks {
+                if self
+                    .block_code_writer_handoff_if_unavailable(
+                        run_id,
+                        &current_state_id,
+                        &stage,
+                        task,
+                        &plan,
+                        &run,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
                 let prompt = build_task_prompt(
                     task,
                     &plan,
@@ -1065,6 +1100,356 @@ impl Orchestrator {
         Ok(active.summary.status == ImplementationSelfAssessmentStatus::Blocked)
     }
 
+    async fn block_code_writer_handoff_if_unavailable(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        stage: &StageExecution,
+        task: &workflow::plan::CompiledTask,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+    ) -> Result<bool> {
+        if !is_code_writer_implementation_task(task) {
+            return Ok(false);
+        }
+
+        let required_artifacts: Vec<String> = task
+            .inputs
+            .iter()
+            .filter(|name| !is_inline_runtime_input(name))
+            .cloned()
+            .collect();
+        let mut available_artifacts = Vec::new();
+        let mut missing_artifacts = Vec::new();
+        let mut persisted_artifacts = artifacts::list_by_run(&self.pool, run_id).await?;
+        let mut approved_proposal_artifact_id = None;
+        let mut approved_proposal_digest = None;
+
+        for artifact_name in &required_artifacts {
+            let (artifact_available, ensured_artifact) = self
+                .ensure_implementation_handoff_artifact(
+                    artifact_name,
+                    run,
+                    plan,
+                    stage,
+                    &persisted_artifacts,
+                )
+                .await?;
+            if artifact_available {
+                if let Some(artifact) = ensured_artifact {
+                    if artifact.name == "approved_proposal" {
+                        approved_proposal_artifact_id = Some(artifact.id.to_string());
+                        approved_proposal_digest = artifact.checksum_sha256.clone();
+                    }
+                    if !persisted_artifacts
+                        .iter()
+                        .any(|existing| existing.id == artifact.id)
+                    {
+                        persisted_artifacts.push(artifact);
+                    }
+                }
+                available_artifacts.push(artifact_name.clone());
+            } else {
+                missing_artifacts.push(artifact_name.clone());
+            }
+        }
+
+        let now = Utc::now();
+        let code_writer_start_status = if missing_artifacts.is_empty() {
+            "not_queued"
+        } else {
+            "blocked_before_code"
+        };
+        let status = if required_artifacts.is_empty() {
+            "not_required"
+        } else if missing_artifacts.is_empty() {
+            "ready"
+        } else {
+            "blocked_before_code"
+        };
+        let handoff_status = ImplementationHandoffStatus {
+            schema_version: ImplementationHandoffStatus::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            task_name: task.task_name.clone(),
+            required_input_artifacts: required_artifacts.clone(),
+            available_input_artifacts: available_artifacts.clone(),
+            missing_input_artifacts: missing_artifacts.clone(),
+            approved_proposal_present: available_artifacts
+                .iter()
+                .any(|artifact| artifact == "approved_proposal"),
+            approved_proposal_artifact_id,
+            approved_proposal_digest,
+            worktree_root: run.worktree_root.clone(),
+            workspace_root: run.workspace_root.clone(),
+            artifact_root: run.artifact_root.clone(),
+            code_writer_start_status: code_writer_start_status.to_string(),
+            status: status.to_string(),
+            missing_handoff_outputs: missing_artifacts.clone(),
+            last_handoff_agent_execution_id: None,
+            retryable_from: Some(format!("implementation_handoff:{current_state_id}")),
+            blocked_before_code_reason: (!missing_artifacts.is_empty())
+                .then(|| "implementation_handoff_unavailable".to_string()),
+            updated_at: now,
+        };
+        workflow_conflicts::upsert_implementation_handoff_status(&self.pool, &handoff_status)
+            .await?;
+
+        if missing_artifacts.is_empty() {
+            return Ok(false);
+        }
+
+        self.persist_implementation_handoff_unavailable_conflict(
+            run_id,
+            current_state_id,
+            stage,
+            &required_artifacts,
+            &missing_artifacts,
+            now,
+        )
+        .await?;
+        stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+        if run.status != RunStatus::Blocked {
+            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+        }
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Blocked,
+        });
+        let _ = self.events.send(DomainEvent::RunStatusChanged {
+            run_id,
+            status: RunStatus::Blocked,
+        });
+        warn!(
+            run_id = %run_id,
+            state = current_state_id,
+            task = %task.task_name,
+            missing_artifacts = ?missing_artifacts,
+            "Implementation handoff unavailable — code_writer not enqueued"
+        );
+        Ok(true)
+    }
+
+    async fn ensure_implementation_handoff_artifact(
+        &self,
+        artifact_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        stage: &StageExecution,
+        persisted_artifacts: &[Artifact],
+    ) -> Result<(bool, Option<Artifact>)> {
+        if let Some(artifact) = persisted_artifacts
+            .iter()
+            .rev()
+            .find(|artifact| artifact.name == artifact_name)
+        {
+            return Ok((true, Some(artifact.clone())));
+        }
+
+        if artifact_name == "approved_proposal" {
+            if let Some(artifact) = self
+                .snapshot_approved_proposal_handoff_artifact(run, plan, stage, persisted_artifacts)
+                .await?
+            {
+                return Ok((true, Some(artifact)));
+            }
+        }
+
+        match artifact_contracts::active_contract_exists_result(&self.pool, run.id, artifact_name)
+            .await
+        {
+            Ok(artifact_contracts::CanonicalContractField::Resolved(_)) => return Ok((true, None)),
+            Ok(artifact_contracts::CanonicalContractField::MissingControlled { .. }) => {
+                return Ok((false, None))
+            }
+            Ok(artifact_contracts::CanonicalContractField::UncontrolledAlias) => {}
+            Err(error) => {
+                if artifact_contracts::contract_id_for_alias(artifact_name).is_some() {
+                    warn!(
+                        run_id = %run.id,
+                        artifact_name,
+                        error = %error,
+                        "Controlled implementation handoff artifact lookup failed"
+                    );
+                    return Ok((false, None));
+                }
+            }
+        }
+
+        let Some(path_template) = plan.artifact_paths.get(artifact_name) else {
+            return Ok((false, None));
+        };
+        let resolved = resolve_path_template(
+            path_template,
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        if std::path::Path::new(&resolved).exists() {
+            return Ok((true, None));
+        }
+        Ok((false, None))
+    }
+
+    async fn snapshot_approved_proposal_handoff_artifact(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        stage: &StageExecution,
+        persisted_artifacts: &[Artifact],
+    ) -> Result<Option<Artifact>> {
+        let Some(path_template) = plan.artifact_paths.get("approved_proposal") else {
+            return Ok(None);
+        };
+        let target_path = resolve_path_template(
+            path_template,
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        let target_path = std::path::PathBuf::from(target_path);
+        if !target_path.exists() {
+            let Some(source) = persisted_artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.name == "proposal_current")
+            else {
+                return Ok(None);
+            };
+            let source_path = Self::absolute_artifact_path(&source.file_path, &run.workspace_root);
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "create approved_proposal handoff directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            std::fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "snapshot proposal_current {} to approved_proposal {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+
+        let data = std::fs::read(&target_path).with_context(|| {
+            format!(
+                "read engine-owned approved_proposal handoff artifact {}",
+                target_path.display()
+            )
+        })?;
+        let digest = Sha256::digest(&data);
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id: run.id,
+            stage_id: stage.stage_id.clone(),
+            agent_id: "engine".to_string(),
+            name: "approved_proposal".to_string(),
+            contract_id: "approved_proposal".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: target_path.to_string_lossy().into_owned(),
+            checksum_sha256: Some(format!("{digest:x}")),
+            size_bytes: Some(data.len() as i64),
+            provider: "engine".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        Ok(Some(artifact))
+    }
+
+    fn absolute_artifact_path(file_path: &str, workspace_root: &str) -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(file_path);
+        if path.is_absolute() {
+            path
+        } else {
+            std::path::Path::new(workspace_root).join(path)
+        }
+    }
+
+    async fn persist_implementation_handoff_unavailable_conflict(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        stage: &StageExecution,
+        required_artifacts: &[String],
+        missing_artifacts: &[String],
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let candidate = CandidateTransitionEvaluation {
+            transition_id: format!("{current_state_id}__implementation_handoff"),
+            from_state_id: current_state_id.to_string(),
+            to_state_id: current_state_id.to_string(),
+            condition_expression_id: Some("implementation_handoff.required_inputs".to_string()),
+            result: CandidateTransitionResult::MissingInput,
+            required_artifacts: required_artifacts.to_vec(),
+            missing_artifacts: missing_artifacts.to_vec(),
+            missing_fields: Vec::new(),
+            source_artifact_ids: Vec::new(),
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(format!(
+                "Implementation handoff is missing required input artifact(s): {}",
+                missing_artifacts.join(", ")
+            )),
+        };
+        let candidates = vec![candidate];
+        let candidate_hash = candidate_transition_hash(&candidates);
+        let reason = WorkflowConflictReason::ImplementationHandoffUnavailable;
+        let fingerprint = workflow_conflict_fingerprint(
+            &run_id.to_string(),
+            current_state_id,
+            &reason,
+            &candidate_hash,
+            &[],
+        );
+        let stage_execution_id = stage.id.to_string();
+        let record = WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: fingerprint,
+            run_id: run_id.to_string(),
+            stage_execution_id: Some(stage_execution_id.clone()),
+            lineage_id: Some(stage_execution_id),
+            current_state_id: current_state_id.to_string(),
+            operator_label: workflow_conflict_operator_label(&reason).to_string(),
+            reason,
+            status: WorkflowConflictStatus::Unresolved,
+            candidate_transitions: candidates,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs: Vec::new(),
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".to_string(),
+        };
+        let stored =
+            workflow_conflicts::upsert_conflict_by_fingerprint(&self.pool, &record).await?;
+        self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            cursor_status: "awaiting_conflict_resolution".to_string(),
+            resume_policy: "await_conflict_resolution".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(stored.conflict_id),
+            conflict_fingerprint: Some(stored.conflict_fingerprint),
+            candidate_transition_hash: Some(stored.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: stored.updated_at,
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn approval_rejection_context_for_state(
         &self,
         run_id: RunId,
@@ -1155,6 +1540,7 @@ impl Orchestrator {
                     "total_tasks": total_tasks,
                     "worktree_write_enabled": task.agent.worktree_write_enabled,
                     "worktree_strategy": effective_worktree_strategy_for_task(task),
+                    "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
                     "session_reuse_scope": task.agent.session_reuse_scope,
                     "session_family_id": task.agent.session_family_id,
                     "declared_outputs": declared_outputs,
@@ -1165,7 +1551,25 @@ impl Orchestrator {
                         .unwrap_or_default(),
                 }),
             )
-            .await
+            .await?;
+        if is_code_writer_implementation_task(task) {
+            self.mark_code_writer_start_status_queued(run_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_code_writer_start_status_queued(&self, run_id: RunId) -> Result<()> {
+        let Some(mut status) =
+            workflow_conflicts::get_implementation_handoff_status(&self.pool, run_id).await?
+        else {
+            return Ok(());
+        };
+        if status.status == "blocked_before_code" {
+            return Ok(());
+        }
+        status.code_writer_start_status = "queued".to_string();
+        status.updated_at = Utc::now();
+        workflow_conflicts::upsert_implementation_handoff_status(&self.pool, &status).await
     }
 
     async fn enqueue_invoke_agent_for_owner(
@@ -1209,6 +1613,7 @@ impl Orchestrator {
                     "total_tasks": total_tasks,
                     "worktree_write_enabled": agent.worktree_write_enabled,
                     "worktree_strategy": agent.worktree_strategy,
+                    "legacy_broad_discovery_policy": workflow::plan::LegacyBroadDiscoveryPolicy::Disabled,
                     "session_reuse_scope": agent.session_reuse_scope,
                     "session_family_id": agent.session_family_id,
                     "declared_outputs": Vec::<crate::contracts::DeclaredOutput>::new(),
@@ -1334,8 +1739,11 @@ impl Orchestrator {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
 
-        // Evaluate transitions — find the first that matches.
-        for transition in &state.transitions {
+        // Evaluate transitions against compiled graph truth. P017 keeps the
+        // existing transition action path, but records a typed candidate result
+        // before choosing a graph-authoritative transition.
+        let mut candidate_evaluations = Vec::new();
+        for (transition_index, transition) in state.transitions.iter().enumerate() {
             if loop_budget_exhausted
                 && transition_consumes_loop_budget(current_state_id, transition)
             {
@@ -1349,57 +1757,156 @@ impl Orchestrator {
                 continue;
             }
 
-            let matches = self
-                .evaluate_condition(&transition.condition, &run, plan, current_state_id)
+            let evaluation = self
+                .evaluate_transition_candidate(
+                    transition_index,
+                    current_state_id,
+                    transition,
+                    &run,
+                    plan,
+                )
                 .await;
-            if matches {
+            candidate_evaluations.push(evaluation);
+        }
+
+        if let Some(aggregate_diagnostic) = self
+            .proposal_review_summary_transition_truth_conflict(&candidate_evaluations, &run, plan)
+            .await?
+        {
+            warn!(
+                run_id = %run_id,
+                state = current_state_id,
+                diagnostic = %aggregate_diagnostic,
+                "Aggregate transition truth conflicted — run blocked"
+            );
+            annotate_aggregate_transition_truth_conflict(
+                &mut candidate_evaluations,
+                &aggregate_diagnostic,
+            );
+            self.record_workflow_conflict_and_block(
+                run_id,
+                current_state_id,
+                all_stages,
+                candidate_evaluations,
+                plan,
+                &run,
+                Some(WorkflowConflictReason::AggregateTransitionTruthConflicted),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let matched_transition_indexes: Vec<usize> = candidate_evaluations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, evaluation)| {
+                (evaluation.result == CandidateTransitionResult::Matched).then_some(index)
+            })
+            .collect();
+
+        if matched_transition_indexes.len() > 1 {
+            warn!(
+                run_id = %run_id,
+                state = current_state_id,
+                matched_transition_count = matched_transition_indexes.len(),
+                candidate_transitions = ?candidate_evaluations,
+                "Multiple declarative transitions matched without tie-break — run blocked"
+            );
+            self.record_workflow_conflict_and_block(
+                run_id,
+                current_state_id,
+                all_stages,
+                candidate_evaluations,
+                plan,
+                &run,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(transition_index) = matched_transition_indexes.first().copied() {
+            let transition = &state.transitions[transition_index];
+            let selected_transition_id =
+                transition_id_for(current_state_id, &transition.to, transition_index);
+            info!(
+                run_id = %run_id,
+                from = current_state_id,
+                to = %transition.to,
+                condition = %transition.condition,
+                "Transition matched"
+            );
+            self.record_advisory_rejections_for_selected_transition(
+                run_id,
+                current_state_id,
+                &selected_transition_id,
+                &transition.to,
+                plan,
+                all_stages,
+                &run,
+            )
+            .await?;
+            self.resolve_current_workflow_conflict_for_selected_transition(
+                run_id,
+                current_state_id,
+                &selected_transition_id,
+                &transition.to,
+            )
+            .await?;
+            self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
+                schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+                run_id: run_id.to_string(),
+                current_state_id: current_state_id.to_string(),
+                cursor_status: "graph_transition_selected".to_string(),
+                resume_policy: "continue_from_selected_transition".to_string(),
+                selected_transition_id: Some(selected_transition_id.clone()),
+                selected_next_state_id: Some(transition.to.clone()),
+                conflict_id: None,
+                conflict_fingerprint: None,
+                candidate_transition_hash: Some(candidate_transition_hash(&candidate_evaluations)),
+                terminal_failure_reason: None,
+                updated_at: Utc::now(),
+            })
+            .await?;
+            if transition.to == current_state_id {
+                let target_state = plan.states.get(&transition.to).ok_or_else(|| {
+                    anyhow::anyhow!("Transition target state not found: {}", transition.to)
+                })?;
+                let next_stage = self
+                    .create_stage_for_state(run_id, &transition.to, target_state)
+                    .await?;
                 info!(
                     run_id = %run_id,
-                    from = current_state_id,
-                    to = %transition.to,
-                    condition = %transition.condition,
-                    "Transition matched"
+                    state = %transition.to,
+                    stage_execution_id = %next_stage.id,
+                    iteration = next_stage.iteration,
+                    "Self-loop transition created next pending stage iteration"
                 );
-                if transition.to == current_state_id {
-                    let target_state = plan.states.get(&transition.to).ok_or_else(|| {
-                        anyhow::anyhow!("Transition target state not found: {}", transition.to)
-                    })?;
-                    let next_stage = self
-                        .create_stage_for_state(run_id, &transition.to, target_state)
-                        .await?;
-                    info!(
-                        run_id = %run_id,
-                        state = %transition.to,
-                        stage_execution_id = %next_stage.id,
-                        iteration = next_stage.iteration,
-                        "Self-loop transition created next pending stage iteration"
-                    );
-                }
-                runs::update_current_state(&self.pool, run_id, &transition.to).await?;
-                db::repos::artifact_contracts::expire_overrides_for_stage(
-                    &self.pool,
-                    run_id,
-                    &transition.to,
+            }
+            runs::update_current_state(&self.pool, run_id, &transition.to).await?;
+            db::repos::artifact_contracts::expire_overrides_for_stage(
+                &self.pool,
+                run_id,
+                &transition.to,
+            )
+            .await?;
+            db::repos::projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+            // Re-enter advance_run for the new state
+            self.work_queue
+                .enqueue(
+                    WorkItemKind::AdvanceRun,
+                    Some(run_id),
+                    None,
+                    serde_json::json!({
+                        "run_id": run_id.to_string(),
+                        "reason": "state_transition",
+                        "from": current_state_id,
+                        "to": transition.to,
+                    }),
                 )
                 .await?;
-                db::repos::projections::rebuild_all_for_run(&self.pool, run_id).await?;
-
-                // Re-enter advance_run for the new state
-                self.work_queue
-                    .enqueue(
-                        WorkItemKind::AdvanceRun,
-                        Some(run_id),
-                        None,
-                        serde_json::json!({
-                            "run_id": run_id.to_string(),
-                            "reason": "state_transition",
-                            "from": current_state_id,
-                            "to": transition.to,
-                        }),
-                    )
-                    .await?;
-                return Ok(());
-            }
+            return Ok(());
         }
 
         // No transition matched — check if run should complete or block.
@@ -1415,87 +1922,523 @@ impl Orchestrator {
             info!(
                 run_id = %run_id,
                 state = current_state_id,
+                candidate_transitions = ?candidate_evaluations,
                 "No transition matched — run blocked"
             );
-            if let Ok(Some(run)) = runs::find_by_id(&self.pool, run_id).await {
-                if run.status != RunStatus::Blocked {
-                    runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
-                    let _ = self.events.send(DomainEvent::RunStatusChanged {
-                        run_id,
-                        status: RunStatus::Blocked,
-                    });
-                }
-            }
+            self.record_workflow_conflict_and_block(
+                run_id,
+                current_state_id,
+                all_stages,
+                candidate_evaluations,
+                plan,
+                &run,
+                None,
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    /// Condition evaluator for transition `when` expressions.
-    /// Matches Swift `TransitionEvaluator` (ARCH-031 canonical patterns).
-    ///
-    /// Supported:
-    /// - `"true"` / `"false"` → literals
-    /// - `exists('artifact_name')` → check filesystem
-    /// - `approval.granted == true` → check granted approvals
-    /// - `approval.rejected == true` → check rejected approvals
-    /// - `artifact.field {==,!=,<,<=,>,>=} value` → read JSON artifact field
-    /// - `vars.name` → runtime variable from plan
-    /// - `expr and expr`, `expr or expr` → logical connectives
-    async fn evaluate_condition(
+    async fn record_workflow_conflict_and_block(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        all_stages: &[StageExecution],
+        candidate_evaluations: Vec<CandidateTransitionEvaluation>,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+        reason_override: Option<WorkflowConflictReason>,
+    ) -> Result<()> {
+        let reason = reason_override.unwrap_or_else(|| {
+            classify_workflow_conflict_reason(&candidate_evaluations)
+                .unwrap_or(WorkflowConflictReason::NoDeclarativeTransitionMatched)
+        });
+        let candidate_hash = candidate_transition_hash(&candidate_evaluations);
+        let advisory_evidence_refs = self
+            .collect_blocking_advisory_evidence_refs(run, plan)
+            .await?;
+        let fingerprint = workflow_conflict_fingerprint(
+            &run_id.to_string(),
+            current_state_id,
+            &reason,
+            &candidate_hash,
+            &advisory_evidence_refs,
+        );
+        let stage_execution_id = all_stages
+            .iter()
+            .filter(|stage| stage.stage_id == current_state_id)
+            .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at))
+            .map(|stage| stage.id.to_string());
+        let now = Utc::now();
+        let status = initial_workflow_conflict_status(&reason);
+        let terminal_failure_reason = initial_workflow_conflict_terminal_failure_reason(&reason);
+        let record = WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: fingerprint,
+            run_id: run_id.to_string(),
+            stage_execution_id: stage_execution_id.clone(),
+            lineage_id: stage_execution_id,
+            current_state_id: current_state_id.to_string(),
+            operator_label: workflow_conflict_operator_label(&reason).to_string(),
+            reason,
+            status,
+            candidate_transitions: candidate_evaluations,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs,
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason,
+            diagnostic_redaction_tier: "operator_safe".to_string(),
+        };
+        let stored =
+            workflow_conflicts::upsert_conflict_by_fingerprint(&self.pool, &record).await?;
+        info!(
+            run_id = %run_id,
+            state = current_state_id,
+            conflict_id = %stored.conflict_id,
+            conflict_fingerprint = %stored.conflict_fingerprint,
+            reason = %stored.reason,
+            "Persisted workflow conflict record"
+        );
+
+        if let Ok(Some(run)) = runs::find_by_id(&self.pool, run_id).await {
+            if run.status != RunStatus::Blocked {
+                runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Blocked,
+                });
+            }
+        }
+        self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            cursor_status: if stored.status == WorkflowConflictStatus::TerminalUnverifiable {
+                "terminal_unverifiable".to_string()
+            } else {
+                "awaiting_conflict_resolution".to_string()
+            },
+            resume_policy: if stored.status == WorkflowConflictStatus::TerminalUnverifiable {
+                "terminal_failure".to_string()
+            } else {
+                "await_conflict_resolution".to_string()
+            },
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(stored.conflict_id.clone()),
+            conflict_fingerprint: Some(stored.conflict_fingerprint.clone()),
+            candidate_transition_hash: Some(stored.candidate_transition_hash.clone()),
+            terminal_failure_reason: stored.terminal_failure_reason.clone(),
+            updated_at: stored.updated_at,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn record_workflow_transition_cursor(
+        &self,
+        cursor: WorkflowTransitionCursorRecord,
+    ) -> Result<()> {
+        workflow_conflicts::upsert_transition_cursor(&self.pool, &cursor).await
+    }
+
+    async fn record_advisory_rejections_for_selected_transition(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        selected_transition_id: &str,
+        selected_next_state_id: &str,
+        plan: &workflow::plan::RunPlan,
+        all_stages: &[StageExecution],
+        run: &domain::run::Run,
+    ) -> Result<()> {
+        let stage_execution_id = latest_stage_execution_id_for_state(all_stages, current_state_id);
+        for advisory in self.collect_transition_advisories(run, plan).await? {
+            let Some(next_stage_hint) = advisory.next_stage_hint.as_deref() else {
+                continue;
+            };
+            if next_stage_hint == selected_next_state_id {
+                continue;
+            }
+
+            let graph_membership_result =
+                advisory_graph_membership_result(plan, &advisory, Some(selected_next_state_id));
+            let advisory_hint_hash = sha256_prefixed_json(&serde_json::json!({
+                "schema": "workflow_advisory_hint_v1",
+                "source_artifact_id": advisory.source_artifact_id.clone(),
+                "next_stage": advisory.next_stage_hint.clone(),
+                "next_action": advisory.next_action.clone(),
+                "graph_membership_result": graph_membership_result,
+            }));
+            let mut provenance = Vec::new();
+            if let Some(next_stage) = advisory.next_stage_hint.clone() {
+                provenance.push(AdvisoryHintExtraction {
+                    source_artifact_id: advisory.source_artifact_id.clone(),
+                    source_agent_execution_id: advisory.source_agent_execution_id.clone(),
+                    advisory_path: "$.next_stage".to_string(),
+                    raw_value_hash: sha256_prefixed_json(&next_stage),
+                    redacted_value: Some(next_stage),
+                    graph_membership_result: graph_membership_result.to_string(),
+                    superseded_by_projection: advisory.superseded_by_projection,
+                    included_in_candidate_transition_hash: true,
+                });
+            }
+            if let Some(next_action) = advisory.next_action.clone() {
+                provenance.push(AdvisoryHintExtraction {
+                    source_artifact_id: advisory.source_artifact_id.clone(),
+                    source_agent_execution_id: advisory.source_agent_execution_id.clone(),
+                    advisory_path: "$.next_action".to_string(),
+                    raw_value_hash: sha256_prefixed_json(&next_action),
+                    redacted_value: Some(next_action),
+                    graph_membership_result: graph_membership_result.to_string(),
+                    superseded_by_projection: advisory.superseded_by_projection,
+                    included_in_candidate_transition_hash: true,
+                });
+            }
+
+            let record = WorkflowAdvisoryRejectionRecord {
+                rejection_id: uuid::Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                stage_execution_id: stage_execution_id.clone(),
+                lineage_id: stage_execution_id.clone(),
+                current_state_id: current_state_id.to_string(),
+                selected_transition_id: selected_transition_id.to_string(),
+                selected_next_state_id: selected_next_state_id.to_string(),
+                advisory_next_stage_hint: advisory.next_stage_hint.clone(),
+                advisory_next_action: advisory.next_action.clone(),
+                advisory_hint_hash,
+                advisory_hint_provenance: provenance,
+                graph_membership_result: graph_membership_result.to_string(),
+                created_at: Utc::now(),
+            };
+            workflow_conflicts::insert_advisory_rejection(&self.pool, &record).await?;
+            info!(
+                run_id = %run_id,
+                state = current_state_id,
+                selected_transition_id = selected_transition_id,
+                selected_next_state_id = selected_next_state_id,
+                advisory_next_stage_hint = ?record.advisory_next_stage_hint,
+                graph_membership_result = graph_membership_result,
+                "Persisted workflow advisory rejection"
+            );
+        }
+        Ok(())
+    }
+
+    async fn resolve_current_workflow_conflict_for_selected_transition(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        selected_transition_id: &str,
+        selected_next_state_id: &str,
+    ) -> Result<()> {
+        let Some(conflict) =
+            workflow_conflicts::get_current_blocking_conflict(&self.pool, run_id).await?
+        else {
+            return Ok(());
+        };
+        if conflict.current_state_id != current_state_id {
+            return Ok(());
+        }
+
+        workflow_conflicts::transition_conflict_status(
+            &self.pool,
+            &conflict.conflict_id,
+            WorkflowConflictStatus::Resolved,
+            Utc::now(),
+            Some(serde_json::json!({
+                "resolution_kind": "graph_authoritative_transition_selected",
+                "selected_transition_id": selected_transition_id,
+                "selected_next_state_id": selected_next_state_id,
+            })),
+            None,
+            None,
+        )
+        .await?;
+        info!(
+            run_id = %run_id,
+            state = current_state_id,
+            conflict_id = %conflict.conflict_id,
+            selected_transition_id = selected_transition_id,
+            selected_next_state_id = selected_next_state_id,
+            "Resolved current workflow conflict before graph-authoritative transition"
+        );
+        Ok(())
+    }
+
+    async fn collect_blocking_advisory_evidence_refs(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<Vec<String>> {
+        let mut refs = std::collections::BTreeSet::new();
+        for advisory in self.collect_transition_advisories(run, plan).await? {
+            let graph_membership_result = advisory_graph_membership_result(plan, &advisory, None);
+            for evidence_ref in advisory_evidence_refs_for_hint(&advisory, graph_membership_result)
+            {
+                refs.insert(evidence_ref);
+            }
+        }
+        Ok(refs.into_iter().collect())
+    }
+
+    async fn collect_transition_advisories(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<Vec<TransitionAdvisoryHint>> {
+        let mut advisories = Vec::new();
+        let mut seen_sources = std::collections::BTreeSet::new();
+
+        if let Some(projection) =
+            artifact_contracts::find_run_state_projection(&self.pool, run.id).await?
+        {
+            if let Some(items) = projection
+                .active_index_json
+                .get("advisory_artifacts")
+                .and_then(|value| value.as_array())
+            {
+                for item in items {
+                    let Some(path) = item.get("advisory_path").and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    if !seen_sources.insert(format!("projection:{path}")) {
+                        continue;
+                    }
+                    let Some(json) = read_json_file(path) else {
+                        continue;
+                    };
+                    if let Some(hint) = advisory_hint_from_json(
+                        item.get("advisory_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(path),
+                        item.get("source_agent_execution_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        true,
+                        &json,
+                    ) {
+                        advisories.push(hint);
+                    }
+                }
+            }
+        }
+
+        for (artifact_name, path_template) in &plan.artifact_paths {
+            let path = resolve_path_template(
+                path_template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            );
+            if !seen_sources.insert(format!("plan:{path}")) {
+                continue;
+            }
+            let Some(json) = read_json_file(&path) else {
+                continue;
+            };
+            if let Some(hint) = advisory_hint_from_json(artifact_name, None, false, &json) {
+                advisories.push(hint);
+            }
+        }
+
+        Ok(advisories)
+    }
+
+    async fn proposal_review_summary_transition_truth_conflict(
+        &self,
+        candidate_evaluations: &[CandidateTransitionEvaluation],
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<Option<String>> {
+        if !candidate_evaluations.iter().any(|candidate| {
+            candidate
+                .required_artifacts
+                .iter()
+                .any(|artifact| artifact == "proposal_review_summary")
+        }) {
+            return Ok(None);
+        }
+
+        let pass = self
+            .read_artifact_field("proposal_review_summary", "pass", run, plan)
+            .await
+            .and_then(|value| value.as_bool());
+        let blocker_count = self
+            .read_artifact_field("proposal_review_summary", "blocker_count", run, plan)
+            .await
+            .and_then(|value| json_value_to_u64(&value));
+        let blocking_issues = self
+            .read_artifact_field("proposal_review_summary", "blocking_issues", run, plan)
+            .await;
+        let required_changes = self
+            .read_artifact_field("proposal_review_summary", "required_changes", run, plan)
+            .await;
+        let decision = self
+            .read_artifact_field("proposal_review_summary", "decision", run, plan)
+            .await
+            .and_then(|value| value.as_str().map(str::to_string));
+
+        let has_blocker_count = blocker_count.is_some_and(|count| count > 0);
+        let has_blocking_issues = json_value_has_entries(blocking_issues.as_ref());
+        let has_required_changes = json_value_has_entries(required_changes.as_ref());
+        let has_blocking_evidence =
+            has_blocker_count || has_blocking_issues || has_required_changes;
+
+        if pass == Some(true) && has_blocking_evidence {
+            return Ok(Some(
+                "proposal_review_summary_v1 has pass=true while blocker evidence is non-empty"
+                    .to_string(),
+            ));
+        }
+
+        let explicitly_no_blocking_issues = blocking_issues
+            .as_ref()
+            .is_some_and(json_value_is_empty_collection);
+        let explicitly_no_required_changes = required_changes
+            .as_ref()
+            .is_some_and(json_value_is_empty_collection);
+        if pass == Some(false)
+            && blocker_count == Some(0)
+            && explicitly_no_blocking_issues
+            && explicitly_no_required_changes
+        {
+            return Ok(Some(
+                "proposal_review_summary_v1 has pass=false while blocker evidence is explicitly empty"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(decision) = decision.as_deref() {
+            let decision = decision.to_ascii_lowercase();
+            let decision_passes = decision.contains("pass")
+                || decision.contains("approve")
+                || decision.contains("approved");
+            let decision_blocks = decision.contains("fail")
+                || decision.contains("block")
+                || decision.contains("revise")
+                || decision.contains("changes_required");
+            if decision_passes && (pass == Some(false) || has_blocking_evidence) {
+                return Ok(Some(
+                    "proposal_review_summary_v1 decision indicates pass while authoritative fields block"
+                        .to_string(),
+                ));
+            }
+            if decision_blocks && pass == Some(true) && !has_blocking_evidence {
+                return Ok(Some(
+                    "proposal_review_summary_v1 decision indicates blocking while authoritative fields pass"
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn evaluate_transition_candidate(
+        &self,
+        transition_index: usize,
+        current_state_id: &str,
+        transition: &workflow::plan::CompiledTransition,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> CandidateTransitionEvaluation {
+        let condition = self
+            .evaluate_condition_classified(&transition.condition, run, plan, current_state_id)
+            .await;
+        CandidateTransitionEvaluation {
+            transition_id: transition_id_for(current_state_id, &transition.to, transition_index),
+            from_state_id: current_state_id.to_string(),
+            to_state_id: transition.to.clone(),
+            condition_expression_id: Some(format!("transition_condition_{}", transition_index)),
+            result: condition.result,
+            required_artifacts: condition.required_artifacts,
+            missing_artifacts: condition.missing_artifacts,
+            missing_fields: condition.missing_fields,
+            source_artifact_ids: condition.source_artifact_ids,
+            source_agent_execution_id: None,
+            sanitized_diagnostic: condition.sanitized_diagnostic,
+        }
+    }
+
+    async fn evaluate_condition_classified(
         &self,
         condition: &str,
         run: &domain::run::Run,
         plan: &workflow::plan::RunPlan,
         current_state_id: &str,
-    ) -> bool {
+    ) -> ClassifiedConditionEvaluation {
         let trimmed = condition.trim().trim_matches('"');
 
         if trimmed == "true" || trimmed == "'true'" {
-            return true;
+            return ClassifiedConditionEvaluation::matched();
         }
         if trimmed == "false" || trimmed == "'false'" {
-            return false;
+            return ClassifiedConditionEvaluation::not_matched();
         }
 
-        // Handle `and` / `or` connectives (top-level split)
         if let Some(split) = split_connective(trimmed, " and ") {
-            return Box::pin(self.evaluate_condition(split.0, run, plan, current_state_id)).await
-                && Box::pin(self.evaluate_condition(split.1, run, plan, current_state_id)).await;
+            let left =
+                Box::pin(self.evaluate_condition_classified(split.0, run, plan, current_state_id))
+                    .await;
+            let right =
+                Box::pin(self.evaluate_condition_classified(split.1, run, plan, current_state_id))
+                    .await;
+            return ClassifiedConditionEvaluation::combine_and(left, right);
         }
         if let Some(split) = split_connective(trimmed, " or ") {
-            return Box::pin(self.evaluate_condition(split.0, run, plan, current_state_id)).await
-                || Box::pin(self.evaluate_condition(split.1, run, plan, current_state_id)).await;
+            let left =
+                Box::pin(self.evaluate_condition_classified(split.0, run, plan, current_state_id))
+                    .await;
+            let right =
+                Box::pin(self.evaluate_condition_classified(split.1, run, plan, current_state_id))
+                    .await;
+            return ClassifiedConditionEvaluation::combine_or(left, right);
         }
 
-        // exists('artifact_name')
         if trimmed.starts_with("exists(") && trimmed.ends_with(')') {
             let artifact_name = trimmed[7..trimmed.len() - 1]
                 .trim_matches('\'')
                 .trim_matches('"');
-            return self.check_artifact_exists(artifact_name, run, plan).await;
+            return self
+                .evaluate_artifact_exists_classified(artifact_name, run, plan)
+                .await;
         }
 
-        // approval.granted == true / approval.rejected == true
         if trimmed == "approval.granted == true" {
             let approvals = approvals::list_by_run(&self.pool, run.id)
                 .await
                 .unwrap_or_default();
-            return approvals.iter().any(|a| {
-                a.stage_id == current_state_id && a.decision == ApprovalDecision::Granted
-            });
+            return if approvals
+                .iter()
+                .any(|a| a.stage_id == current_state_id && a.decision == ApprovalDecision::Granted)
+            {
+                ClassifiedConditionEvaluation::matched()
+            } else {
+                ClassifiedConditionEvaluation::not_matched()
+            };
         }
         if trimmed == "approval.rejected == true" {
             let approvals = approvals::list_by_run(&self.pool, run.id)
                 .await
                 .unwrap_or_default();
-            return approvals.iter().any(|a| {
-                a.stage_id == current_state_id && a.decision == ApprovalDecision::Rejected
-            });
+            return if approvals
+                .iter()
+                .any(|a| a.stage_id == current_state_id && a.decision == ApprovalDecision::Rejected)
+            {
+                ClassifiedConditionEvaluation::matched()
+            } else {
+                ClassifiedConditionEvaluation::not_matched()
+            };
         }
 
-        // Comparison expressions: lhs op rhs
-        // Try operators in order: <=, >=, !=, ==, <, >
         for (op_str, op) in &[
             (" <= ", CompOp::Le),
             (" >= ", CompOp::Ge),
@@ -1507,37 +2450,39 @@ impl Orchestrator {
             if let Some(pos) = trimmed.find(op_str) {
                 let lhs = trimmed[..pos].trim();
                 let rhs = trimmed[pos + op_str.len()..].trim();
+                if let Some((artifact_name, field_name)) = artifact_field_ref(lhs) {
+                    return self
+                        .evaluate_artifact_field_comparison_classified(
+                            artifact_name,
+                            field_name,
+                            *op,
+                            rhs,
+                            run,
+                            plan,
+                        )
+                        .await;
+                }
                 let lv = self.resolve_value(lhs, run, plan).await;
                 let rv = self.resolve_value(rhs, run, plan).await;
-                let result = apply_comparison(&lv, *op, &rv);
-                info!(
-                    lhs = lhs,
-                    rhs = rhs,
-                    op = ?op,
-                    lhs_val = ?lv,
-                    rhs_val = ?rv,
-                    result = result,
-                    "Transition comparison"
-                );
-                return result;
+                return if apply_comparison(&lv, *op, &rv) {
+                    ClassifiedConditionEvaluation::matched()
+                } else {
+                    ClassifiedConditionEvaluation::not_matched()
+                };
             }
         }
 
-        // Unrecognized — fail closed (false), not open
-        warn!(
-            condition = trimmed,
-            "Unrecognized transition condition — returning false"
-        );
-        false
+        ClassifiedConditionEvaluation::invalid_expression(format!(
+            "Unsupported transition condition: {trimmed}"
+        ))
     }
 
-    /// Check if an artifact exists on the filesystem.
-    async fn check_artifact_exists(
+    async fn evaluate_artifact_exists_classified(
         &self,
         artifact_name: &str,
         run: &domain::run::Run,
         plan: &workflow::plan::RunPlan,
-    ) -> bool {
+    ) -> ClassifiedConditionEvaluation {
         match db::repos::artifact_contracts::active_contract_exists_result(
             &self.pool,
             run.id,
@@ -1546,70 +2491,157 @@ impl Orchestrator {
         .await
         {
             Ok(db::repos::artifact_contracts::CanonicalContractField::Resolved(_)) => {
-                info!(
-                    artifact = artifact_name,
-                    "P057-controlled exists() = true from active SQLite contract"
-                );
-                return true;
+                return ClassifiedConditionEvaluation::matched()
+                    .with_required_artifact(artifact_name)
+                    .with_source_artifact(artifact_name);
             }
             Ok(db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
                 contract_id,
             }) => {
-                warn!(
-                    artifact = artifact_name,
-                    contract_id = %contract_id,
-                    "P057-controlled exists() missing active SQLite contract; raw artifact fallback disabled"
-                );
-                return false;
+                return ClassifiedConditionEvaluation::missing_input(format!(
+                    "Controlled artifact {contract_id} is missing canonical DB truth"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_artifact(artifact_name);
             }
             Ok(db::repos::artifact_contracts::CanonicalContractField::UncontrolledAlias) => {}
             Err(error) => {
                 if let Some(contract_id) =
                     db::repos::artifact_contracts::contract_id_for_alias(artifact_name)
                 {
-                    warn!(
-                        artifact = artifact_name,
-                        contract_id = %contract_id,
-                        error = %error,
-                        "P057-controlled exists() lookup failed; raw artifact fallback disabled"
-                    );
-                    return false;
+                    return ClassifiedConditionEvaluation::missing_input(format!(
+                        "Controlled artifact {contract_id} lookup failed: {error}"
+                    ))
+                    .with_required_artifact(artifact_name)
+                    .with_missing_artifact(artifact_name);
                 }
             }
         }
-        if let Some(path_template) = plan.artifact_paths.get(artifact_name) {
-            let resolved = resolve_path_template(
-                path_template,
-                &run.workspace_root,
-                run.chainworks_meta_root.as_deref(),
-            );
-            if std::path::Path::new(&resolved).exists() {
-                info!(artifact = artifact_name, path = %resolved, "exists() = true");
-                return true;
-            }
-            // Fallback: artifact_root — only for legacy runs without per-run meta root.
-            // P050: Post-P050 runs must NOT fall back to shared artifact_root because
-            // stale files from prior runs would pollute transition conditions.
-            if run.chainworks_meta_root.is_none() {
-                for suffix in &[
-                    artifact_name.to_string(),
-                    format!("{}/{}", run.id, artifact_name),
-                ] {
-                    let path = format!("{}/{}", run.artifact_root, suffix);
-                    if std::path::Path::new(&path).exists() {
-                        info!(artifact = artifact_name, path = %path, "exists() = true (artifact_root legacy fallback)");
-                        return true;
-                    }
-                }
-            }
-            info!(artifact = artifact_name, "exists() = false");
-            return false;
-        }
-        warn!(
-            artifact = artifact_name,
-            "Artifact not in catalog — returning true"
+
+        let Some(path_template) = plan.artifact_paths.get(artifact_name) else {
+            return ClassifiedConditionEvaluation::invalid_expression(format!(
+                "Artifact {artifact_name} is not declared by the workflow/catalog contract"
+            ))
+            .with_required_artifact(artifact_name);
+        };
+
+        let resolved = resolve_path_template(
+            path_template,
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
         );
-        true
+        if std::path::Path::new(&resolved).exists() {
+            return ClassifiedConditionEvaluation::matched()
+                .with_required_artifact(artifact_name)
+                .with_source_artifact(artifact_name);
+        }
+        if run.chainworks_meta_root.is_none() {
+            for suffix in &[
+                artifact_name.to_string(),
+                format!("{}/{}", run.id, artifact_name),
+            ] {
+                let path = format!("{}/{}", run.artifact_root, suffix);
+                if std::path::Path::new(&path).exists() {
+                    return ClassifiedConditionEvaluation::matched()
+                        .with_required_artifact(artifact_name)
+                        .with_source_artifact(artifact_name);
+                }
+            }
+        }
+
+        ClassifiedConditionEvaluation::missing_input(format!(
+            "Declared artifact {artifact_name} is absent"
+        ))
+        .with_required_artifact(artifact_name)
+        .with_missing_artifact(artifact_name)
+    }
+
+    async fn evaluate_artifact_field_comparison_classified(
+        &self,
+        artifact_name: &str,
+        field_name: &str,
+        op: CompOp,
+        rhs: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> ClassifiedConditionEvaluation {
+        let field_ref = format!("{artifact_name}.{field_name}");
+        match db::repos::artifact_contracts::canonical_contract_field_result(
+            &self.pool,
+            run.id,
+            artifact_name,
+            field_name,
+        )
+        .await
+        {
+            Ok(db::repos::artifact_contracts::CanonicalContractField::Resolved(value)) => {
+                let rv = self.resolve_value(rhs, run, plan).await;
+                return if apply_comparison(&value, op, &rv) {
+                    ClassifiedConditionEvaluation::matched()
+                } else {
+                    ClassifiedConditionEvaluation::not_matched()
+                }
+                .with_required_artifact(artifact_name)
+                .with_source_artifact(artifact_name);
+            }
+            Ok(db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
+                contract_id,
+            }) => {
+                return ClassifiedConditionEvaluation::missing_input(format!(
+                    "Controlled artifact field {contract_id}.{field_name} is missing canonical DB truth"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_field(&field_ref);
+            }
+            Ok(db::repos::artifact_contracts::CanonicalContractField::UncontrolledAlias) => {}
+            Err(error) => {
+                if let Some(contract_id) =
+                    db::repos::artifact_contracts::contract_id_for_alias(artifact_name)
+                {
+                    return ClassifiedConditionEvaluation::missing_input(format!(
+                        "Controlled artifact field {contract_id}.{field_name} lookup failed: {error}"
+                    ))
+                    .with_required_artifact(artifact_name)
+                    .with_missing_field(&field_ref);
+                }
+            }
+        }
+
+        if !plan.artifact_paths.contains_key(artifact_name) {
+            return ClassifiedConditionEvaluation::invalid_expression(format!(
+                "Artifact field {field_ref} references an undeclared artifact"
+            ))
+            .with_required_artifact(artifact_name);
+        }
+
+        let Some(value) = self
+            .read_artifact_field(artifact_name, field_name, run, plan)
+            .await
+        else {
+            let exists = self
+                .evaluate_artifact_exists_classified(artifact_name, run, plan)
+                .await;
+            return if exists.result == CandidateTransitionResult::MissingInput
+                && exists.missing_artifacts.iter().any(|a| a == artifact_name)
+            {
+                exists
+            } else {
+                ClassifiedConditionEvaluation::missing_input(format!(
+                    "Declared artifact field {field_ref} is absent"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_field(&field_ref)
+            };
+        };
+
+        let rv = self.resolve_value(rhs, run, plan).await;
+        if apply_comparison(&value, op, &rv) {
+            ClassifiedConditionEvaluation::matched()
+        } else {
+            ClassifiedConditionEvaluation::not_matched()
+        }
+        .with_required_artifact(artifact_name)
+        .with_source_artifact(artifact_name)
     }
 
     /// Resolve a value reference to a JSON Value.
@@ -1920,9 +2952,117 @@ impl Orchestrator {
     }
 }
 
-/// Resolve `${VAR:-default}` patterns in artifact path templates.
-/// Falls back to the default value if the env var is not set.
-/// Also resolves bare `.` as workspace_root.
+/// Agent-authored transition hints are advisory evidence only. These values
+/// are compared against the selected graph transition and persisted as
+/// non-blocking rejection history when they diverge.
+#[derive(Clone, Debug)]
+struct TransitionAdvisoryHint {
+    source_artifact_id: String,
+    source_agent_execution_id: Option<String>,
+    next_stage_hint: Option<String>,
+    next_action: Option<String>,
+    superseded_by_projection: bool,
+}
+
+fn transition_id_for(current_state_id: &str, to_state_id: &str, transition_index: usize) -> String {
+    format!("{current_state_id}__to__{to_state_id}__{transition_index}")
+}
+
+fn latest_stage_execution_id_for_state(
+    all_stages: &[StageExecution],
+    current_state_id: &str,
+) -> Option<String> {
+    all_stages
+        .iter()
+        .filter(|stage| stage.stage_id == current_state_id)
+        .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at))
+        .map(|stage| stage.id.to_string())
+}
+
+fn read_json_file(path: &str) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn advisory_hint_from_json(
+    source_artifact_id: &str,
+    source_agent_execution_id: Option<String>,
+    superseded_by_projection: bool,
+    json: &serde_json::Value,
+) -> Option<TransitionAdvisoryHint> {
+    let next_stage_hint = json
+        .get("next_stage")
+        .or_else(|| json.get("nextStage"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let next_action = json
+        .get("next_action")
+        .or_else(|| json.get("nextAction"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+
+    if next_stage_hint.is_none() && next_action.is_none() {
+        return None;
+    }
+
+    Some(TransitionAdvisoryHint {
+        source_artifact_id: source_artifact_id.to_string(),
+        source_agent_execution_id,
+        next_stage_hint,
+        next_action,
+        superseded_by_projection,
+    })
+}
+
+fn advisory_graph_membership_result(
+    plan: &workflow::plan::RunPlan,
+    advisory: &TransitionAdvisoryHint,
+    selected_next_state_id: Option<&str>,
+) -> &'static str {
+    let Some(next_stage_hint) = advisory.next_stage_hint.as_deref() else {
+        return "no_next_stage_hint";
+    };
+    if !plan.states.contains_key(next_stage_hint) {
+        return "absent_from_graph";
+    }
+    if selected_next_state_id == Some(next_stage_hint) {
+        "graph_state_selected"
+    } else {
+        "graph_state_not_selected"
+    }
+}
+
+fn advisory_evidence_refs_for_hint(
+    advisory: &TransitionAdvisoryHint,
+    graph_membership_result: &str,
+) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(next_stage) = advisory.next_stage_hint.as_deref() {
+        refs.push(format!(
+            "{}:$.next_stage:{}:{}",
+            advisory.source_artifact_id,
+            graph_membership_result,
+            sha256_prefixed_json(next_stage)
+        ));
+    }
+    if let Some(next_action) = advisory.next_action.as_deref() {
+        refs.push(format!(
+            "{}:$.next_action:{}",
+            advisory.source_artifact_id,
+            sha256_prefixed_json(next_action)
+        ));
+    }
+    refs
+}
+
+fn sha256_prefixed_json<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    let json = serde_json::to_vec(value).expect("workflow advisory hash payload should serialize");
+    let digest = Sha256::digest(json);
+    format!("sha256:{digest:x}")
+}
+
 // ---------------------------------------------------------------------------
 // Expression evaluation helpers (match Swift TransitionEvaluator)
 // ---------------------------------------------------------------------------
@@ -1935,6 +3075,245 @@ enum CompOp {
     Le,
     Gt,
     Ge,
+}
+
+#[derive(Debug, Clone)]
+struct ClassifiedConditionEvaluation {
+    result: CandidateTransitionResult,
+    required_artifacts: Vec<String>,
+    missing_artifacts: Vec<String>,
+    missing_fields: Vec<String>,
+    source_artifact_ids: Vec<String>,
+    sanitized_diagnostic: Option<String>,
+}
+
+impl ClassifiedConditionEvaluation {
+    fn matched() -> Self {
+        Self::new(CandidateTransitionResult::Matched, None)
+    }
+
+    fn not_matched() -> Self {
+        Self::new(CandidateTransitionResult::NotMatched, None)
+    }
+
+    fn missing_input(diagnostic: String) -> Self {
+        Self::new(CandidateTransitionResult::MissingInput, Some(diagnostic))
+    }
+
+    fn invalid_expression(diagnostic: String) -> Self {
+        Self::new(
+            CandidateTransitionResult::InvalidExpression,
+            Some(diagnostic),
+        )
+    }
+
+    fn new(result: CandidateTransitionResult, sanitized_diagnostic: Option<String>) -> Self {
+        Self {
+            result,
+            required_artifacts: Vec::new(),
+            missing_artifacts: Vec::new(),
+            missing_fields: Vec::new(),
+            source_artifact_ids: Vec::new(),
+            sanitized_diagnostic,
+        }
+    }
+
+    fn with_required_artifact(mut self, artifact_name: &str) -> Self {
+        push_unique(&mut self.required_artifacts, artifact_name);
+        self
+    }
+
+    fn with_missing_artifact(mut self, artifact_name: &str) -> Self {
+        push_unique(&mut self.missing_artifacts, artifact_name);
+        self
+    }
+
+    fn with_missing_field(mut self, field_ref: &str) -> Self {
+        push_unique(&mut self.missing_fields, field_ref);
+        self
+    }
+
+    fn with_source_artifact(mut self, artifact_name: &str) -> Self {
+        push_unique(&mut self.source_artifact_ids, artifact_name);
+        self
+    }
+
+    fn combine_and(left: Self, right: Self) -> Self {
+        let result = dominant_result_for_all(&[&left, &right]).unwrap_or_else(|| {
+            if left.result == CandidateTransitionResult::Matched
+                && right.result == CandidateTransitionResult::Matched
+            {
+                CandidateTransitionResult::Matched
+            } else {
+                CandidateTransitionResult::NotMatched
+            }
+        });
+        Self::combine_with_result(result, left, right)
+    }
+
+    fn combine_or(left: Self, right: Self) -> Self {
+        let result = dominant_result_for_all(&[&left, &right]).unwrap_or_else(|| {
+            if left.result == CandidateTransitionResult::Matched
+                || right.result == CandidateTransitionResult::Matched
+            {
+                CandidateTransitionResult::Matched
+            } else {
+                CandidateTransitionResult::NotMatched
+            }
+        });
+        Self::combine_with_result(result, left, right)
+    }
+
+    fn combine_with_result(result: CandidateTransitionResult, left: Self, right: Self) -> Self {
+        let mut combined = Self::new(
+            result,
+            left.sanitized_diagnostic
+                .clone()
+                .or_else(|| right.sanitized_diagnostic.clone()),
+        );
+        for value in left
+            .required_artifacts
+            .iter()
+            .chain(right.required_artifacts.iter())
+        {
+            push_unique(&mut combined.required_artifacts, value);
+        }
+        for value in left
+            .missing_artifacts
+            .iter()
+            .chain(right.missing_artifacts.iter())
+        {
+            push_unique(&mut combined.missing_artifacts, value);
+        }
+        for value in left
+            .missing_fields
+            .iter()
+            .chain(right.missing_fields.iter())
+        {
+            push_unique(&mut combined.missing_fields, value);
+        }
+        for value in left
+            .source_artifact_ids
+            .iter()
+            .chain(right.source_artifact_ids.iter())
+        {
+            push_unique(&mut combined.source_artifact_ids, value);
+        }
+        combined
+    }
+}
+
+fn dominant_result_for_all(
+    evaluations: &[&ClassifiedConditionEvaluation],
+) -> Option<CandidateTransitionResult> {
+    for result in [
+        CandidateTransitionResult::EvaluationError,
+        CandidateTransitionResult::InvalidExpression,
+        CandidateTransitionResult::MissingInput,
+    ] {
+        if evaluations
+            .iter()
+            .any(|evaluation| evaluation.result == result)
+        {
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
+}
+
+fn workflow_conflict_operator_label(reason: &WorkflowConflictReason) -> &'static str {
+    match reason {
+        WorkflowConflictReason::InvalidNextStageHint => "Invalid next-stage advisory hint",
+        WorkflowConflictReason::NoDeclarativeTransitionMatched => {
+            "No declarative workflow transition matched"
+        }
+        WorkflowConflictReason::MultipleDeclarativeTransitionsMatchedWithoutTieBreak => {
+            "Multiple workflow transitions matched without a tie-break"
+        }
+        WorkflowConflictReason::RequiredArtifactOrFieldMissingForTransition => {
+            "Required transition artifact or field is missing"
+        }
+        WorkflowConflictReason::AggregateTransitionTruthConflicted => {
+            "Aggregate transition truth is conflicted"
+        }
+        WorkflowConflictReason::WorkflowConflictUnverifiable => {
+            "Workflow transition outcome is unverifiable"
+        }
+        WorkflowConflictReason::ImplementationHandoffUnavailable => {
+            "Implementation handoff is unavailable"
+        }
+    }
+}
+
+fn initial_workflow_conflict_status(reason: &WorkflowConflictReason) -> WorkflowConflictStatus {
+    match reason {
+        WorkflowConflictReason::AggregateTransitionTruthConflicted => {
+            WorkflowConflictStatus::OperatorConfirmationRequired
+        }
+        WorkflowConflictReason::WorkflowConflictUnverifiable => {
+            WorkflowConflictStatus::TerminalUnverifiable
+        }
+        _ => WorkflowConflictStatus::Unresolved,
+    }
+}
+
+fn initial_workflow_conflict_terminal_failure_reason(
+    reason: &WorkflowConflictReason,
+) -> Option<String> {
+    match reason {
+        WorkflowConflictReason::WorkflowConflictUnverifiable => Some(
+            "Workflow transition outcome could not be verified from declared graph inputs"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn annotate_aggregate_transition_truth_conflict(
+    candidate_evaluations: &mut [CandidateTransitionEvaluation],
+    diagnostic: &str,
+) {
+    for candidate in candidate_evaluations.iter_mut().filter(|candidate| {
+        candidate
+            .required_artifacts
+            .iter()
+            .any(|artifact| artifact == "proposal_review_summary")
+    }) {
+        candidate.result = CandidateTransitionResult::EvaluationError;
+        candidate.sanitized_diagnostic = Some(diagnostic.to_string());
+    }
+}
+
+fn json_value_to_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_value_has_entries(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Array(values)) => !values.is_empty(),
+        Some(serde_json::Value::Object(values)) => !values.is_empty(),
+        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn json_value_is_empty_collection(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => values.is_empty(),
+        serde_json::Value::String(value) => value.trim().is_empty(),
+        _ => false,
+    }
 }
 
 fn transition_consumes_loop_budget(
@@ -1976,6 +3355,17 @@ fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a
         }
     }
     None
+}
+
+fn artifact_field_ref(ref_str: &str) -> Option<(&str, &str)> {
+    if ref_str.starts_with("vars.") || ref_str.starts_with("approval.") {
+        return None;
+    }
+    let (artifact_name, field_name) = ref_str.split_once('.')?;
+    if artifact_name.is_empty() || field_name.is_empty() {
+        return None;
+    }
+    Some((artifact_name, field_name))
 }
 
 /// Apply a comparison operator to two JSON values.
@@ -2034,6 +3424,18 @@ fn state_produces_implementation_review(state: &workflow::plan::CompiledState) -
             .condition
             .contains("implementation_review_summary.")
     })
+}
+
+fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bool {
+    task.agent.agent_id == "code_writer"
+        && matches!(
+            task.task_name.as_str(),
+            "start_implementation" | "initial_implementation" | "continue_implementation"
+        )
+}
+
+fn is_inline_runtime_input(input_name: &str) -> bool {
+    matches!(input_name, "input.idea" | "idea" | "input.file" | "file")
 }
 
 fn extract_json_field(json: &serde_json::Value, field_name: &str) -> Option<serde_json::Value> {
@@ -2132,6 +3534,16 @@ fn build_declared_outputs(
                 output_name: output_name.clone(),
                 target_path,
                 schema,
+                reuse_policy: task.output_policies.get(output_name).map(|policy| {
+                    match policy.reuse_policy {
+                        workflow::plan::OutputReusePolicy::MustProduce => {
+                            domain::discovery::OutputReusePolicy::MustProduce
+                        }
+                        workflow::plan::OutputReusePolicy::AllowUnchangedExisting => {
+                            domain::discovery::OutputReusePolicy::AllowUnchangedExisting
+                        }
+                    }
+                }),
                 companion_output_name,
                 companion_path,
             }
@@ -2585,7 +3997,10 @@ fn append_task_specific_guidance(
     }
 
     if agent_id == "code_writer"
-        && (task_name == "initial_implementation" || task_name == "continue_implementation")
+        && matches!(
+            task_name,
+            "start_implementation" | "initial_implementation" | "continue_implementation"
+        )
     {
         parts.push(String::new());
         parts.push(String::from("### Task-Specific Guidance"));
@@ -2792,10 +4207,14 @@ pub fn resolve_scalar_template(template: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use domain::ids::{IdeaId, RunId};
+    use domain::ids::{IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
+    use domain::stage::StageStatus;
     use std::collections::HashMap;
-    use workflow::plan::{CompiledTask, OutputSchema, ResolvedAgent, RunPlan};
+    use workflow::plan::{
+        CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy, OutputSchema,
+        ResolvedAgent, RunPlan,
+    };
 
     fn test_run(run_id: RunId) -> Run {
         Run {
@@ -2848,6 +4267,7 @@ mod tests {
             workflow_family: None,
             risk_class: None,
             stack: None,
+            legacy_broad_discovery_policy: workflow::plan::LegacyBroadDiscoveryPolicy::Disabled,
             workflow_snapshot_hash: "workflow".into(),
             catalog_snapshot_hash: "catalog".into(),
             workflow_snapshot_json: "{}".into(),
@@ -2896,9 +4316,31 @@ mod tests {
             task_name: "review_proposal_as_product_owner".into(),
             inputs: Vec::new(),
             outputs: vec!["proposal_review_po".into()],
+            output_policies: HashMap::new(),
             output_schemas,
             parallel: true,
             phase: 0,
+        }
+    }
+
+    fn compiled_state(
+        id: &str,
+        transitions: Vec<CompiledTransition>,
+        is_end: bool,
+    ) -> CompiledState {
+        let task = reviewer_task();
+        CompiledState {
+            id: id.into(),
+            label: id.into(),
+            state_type: None,
+            owner: task.agent.clone(),
+            is_manual_gate: false,
+            is_end,
+            tasks: vec![task],
+            post_approval_tasks: Vec::new(),
+            transitions,
+            loop_config: None,
+            degraded_output_policy: DegradedOutputPolicy::default(),
         }
     }
 
@@ -3136,15 +4578,17 @@ mod tests {
             "${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json".into(),
         );
 
-        assert!(
-            !orchestrator
-                .evaluate_condition(
-                    "exists('prepush_review_report')",
-                    &run,
-                    &plan,
-                    "state_8_implementation"
-                )
-                .await,
+        let missing = orchestrator
+            .evaluate_condition_classified(
+                "exists('prepush_review_report')",
+                &run,
+                &plan,
+                "state_8_implementation",
+            )
+            .await;
+        assert_eq!(
+            missing.result,
+            CandidateTransitionResult::MissingInput,
             "P057-controlled exists() must fail closed when only raw file truth exists"
         );
 
@@ -3171,15 +4615,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            orchestrator
-                .evaluate_condition(
-                    "exists('prepush_review_report')",
-                    &run,
-                    &plan,
-                    "state_8_implementation"
-                )
-                .await,
+        let resolved = orchestrator
+            .evaluate_condition_classified(
+                "exists('prepush_review_report')",
+                &run,
+                &plan,
+                "state_8_implementation",
+            )
+            .await;
+        assert_eq!(
+            resolved.result,
+            CandidateTransitionResult::Matched,
             "P057-controlled exists() should read active SQLite contract truth"
         );
     }
@@ -3213,6 +4659,811 @@ mod tests {
                 .resolve_value("prepush_review_report.status", &run, &plan)
                 .await,
             serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_exists_unknown_artifact_fails_closed() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool),
+        );
+        let run = test_run(RunId::new());
+        let plan = test_plan();
+
+        let evaluation = orchestrator
+            .evaluate_condition_classified("exists('unknown_artifact')", &run, &plan, "review")
+            .await;
+        assert_eq!(
+            evaluation.result,
+            CandidateTransitionResult::InvalidExpression,
+            "P017 requires unknown catalog artifact references to fail closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_persists_no_match_workflow_conflict() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "workflow conflict runtime wiring".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        let meta_root = tmp.path().join(".chainworks/runs").join(run_id.to_string());
+        run.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+        let advisory_path = meta_root.join("reviews/proposal/product-owner.json");
+        std::fs::create_dir_all(advisory_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &advisory_path,
+            r#"{"next_stage":"state_3_proposal_drafted","next_action":"revise_proposal"}"#,
+        )
+        .unwrap();
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "false".into(),
+                }],
+                false,
+            ),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage.clone()])
+            .await
+            .unwrap();
+
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("blocking workflow conflict should be persisted");
+        assert_eq!(
+            blocked.reason,
+            WorkflowConflictReason::NoDeclarativeTransitionMatched
+        );
+        assert_eq!(blocked.current_state_id, "review");
+        assert_eq!(blocked.stage_execution_id, Some(stage.id.to_string()));
+        assert_eq!(blocked.candidate_transitions.len(), 1);
+        assert_eq!(
+            blocked.candidate_transitions[0].result,
+            CandidateTransitionResult::NotMatched
+        );
+        assert!(
+            blocked
+                .advisory_evidence_refs
+                .iter()
+                .any(|evidence_ref| evidence_ref
+                    .starts_with("proposal_review_po:$.next_stage:absent_from_graph:sha256:")),
+            "blocking conflicts should retain invalid advisory next_stage provenance"
+        );
+        assert!(
+            blocked
+                .advisory_evidence_refs
+                .iter()
+                .any(|evidence_ref| evidence_ref
+                    .starts_with("proposal_review_po:$.next_action:sha256:")),
+            "blocking conflicts should retain advisory next_action provenance"
+        );
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+        let history = db::repos::workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "repeated blocking evaluations should upsert the same fingerprint"
+        );
+        assert_eq!(history[0].conflict_id, blocked.conflict_id);
+        assert_eq!(
+            history[0].advisory_evidence_refs,
+            blocked.advisory_evidence_refs
+        );
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("blocking conflict should anchor transition cursor");
+        assert_eq!(cursor.current_state_id, "review");
+        assert_eq!(cursor.cursor_status, "awaiting_conflict_resolution");
+        assert_eq!(cursor.resume_policy, "await_conflict_resolution");
+        assert_eq!(
+            cursor.conflict_id.as_deref(),
+            Some(blocked.conflict_id.as_str())
+        );
+        assert_eq!(
+            cursor.conflict_fingerprint.as_deref(),
+            Some(blocked.conflict_fingerprint.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_records_non_blocking_advisory_rejection() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "workflow advisory rejection runtime wiring".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let raw_run_state_path = tmp.path().join("state/run-state.json");
+        std::fs::create_dir_all(raw_run_state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &raw_run_state_path,
+            r#"{"next_stage":"state_3_proposal_drafted","next_action":"revise_proposal"}"#,
+        )
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        db::repos::artifact_contracts::record_run_state_advisory_tx(
+            &mut tx,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: "run_state_projection_v1".into(),
+                canonical_path: "run_state.json".into(),
+                raw_path: raw_run_state_path.to_string_lossy().into_owned(),
+                raw_status: "superseded_advisory".into(),
+                generation_id: "advisory-run-state".into(),
+                source_agent_execution_id: Some("agent-exec-review".into()),
+                source_stage_execution_id: Some(stage.id.to_string()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: domain::agent::AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "true".into(),
+                }],
+                false,
+            ),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage.clone()])
+            .await
+            .unwrap();
+
+        let rejections =
+            db::repos::workflow_conflicts::list_advisory_rejections_for_run(&pool, run_id)
+                .await
+                .unwrap();
+        assert_eq!(rejections.len(), 1);
+        let rejection = &rejections[0];
+        assert_eq!(rejection.stage_execution_id, Some(stage.id.to_string()));
+        assert_eq!(rejection.selected_next_state_id, "refine");
+        assert_eq!(
+            rejection.advisory_next_stage_hint.as_deref(),
+            Some("state_3_proposal_drafted")
+        );
+        assert_eq!(
+            rejection.advisory_next_action.as_deref(),
+            Some("revise_proposal")
+        );
+        assert_eq!(rejection.graph_membership_result, "absent_from_graph");
+        assert!(rejection
+            .advisory_hint_provenance
+            .iter()
+            .any(|hint| hint.advisory_path == "$.next_stage"
+                && hint.superseded_by_projection
+                && hint.source_agent_execution_id.as_deref() == Some("agent-exec-review")));
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected advisory hint must not block graph-authoritative advancement"
+        );
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_state
+                .as_deref(),
+            Some("refine")
+        );
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("legal graph transition should settle through cursor");
+        assert_eq!(cursor.current_state_id, "review");
+        assert_eq!(cursor.cursor_status, "graph_transition_selected");
+        assert_eq!(cursor.resume_policy, "continue_from_selected_transition");
+        assert_eq!(cursor.selected_next_state_id.as_deref(), Some("refine"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_blocks_conflicted_proposal_review_summary() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "aggregate transition truth conflict".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let summary_path = tmp.path().join("reviews/proposal/summary.json");
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &summary_path,
+            r#"{"pass":true,"blocker_count":1,"blocking_issues":[{"id":"B-1"}],"required_changes":["fix authority"],"decision":"pass"}"#,
+        )
+        .unwrap();
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_review_summary".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json".into(),
+        );
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![
+                    CompiledTransition {
+                        to: "approved".into(),
+                        condition: "proposal_review_summary.pass == true".into(),
+                    },
+                    CompiledTransition {
+                        to: "refine".into(),
+                        condition: "proposal_review_summary.pass == false".into(),
+                    },
+                ],
+                false,
+            ),
+        );
+        plan.states.insert(
+            "approved".into(),
+            compiled_state("approved", Vec::new(), true),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("conflicted aggregate truth should block graph advancement");
+        assert_eq!(
+            blocked.reason,
+            WorkflowConflictReason::AggregateTransitionTruthConflicted
+        );
+        assert_eq!(
+            blocked.status,
+            WorkflowConflictStatus::OperatorConfirmationRequired
+        );
+        assert!(blocked.candidate_transitions.iter().any(|candidate| {
+            candidate.result == CandidateTransitionResult::EvaluationError
+                && candidate
+                    .sanitized_diagnostic
+                    .as_deref()
+                    .is_some_and(|diagnostic| diagnostic.contains("pass=true"))
+        }));
+        let stored_run = db::repos::runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_run.status, RunStatus::Blocked);
+        assert_eq!(stored_run.current_state.as_deref(), Some("review"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_persists_terminal_unverifiable_conflict_history() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "terminal unverifiable workflow conflict".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "exists('unknown_artifact')".into(),
+                }],
+                false,
+            ),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal_unverifiable conflicts remain history, not current unresolved conflicts"
+        );
+        let history = db::repos::workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].reason,
+            WorkflowConflictReason::WorkflowConflictUnverifiable
+        );
+        assert_eq!(
+            history[0].status,
+            WorkflowConflictStatus::TerminalUnverifiable
+        );
+        assert!(history[0].terminal_failure_reason.is_some());
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("terminal unverifiable conflict should settle cursor");
+        assert_eq!(cursor.current_state_id, "review");
+        assert_eq!(cursor.cursor_status, "terminal_unverifiable");
+        assert_eq!(cursor.resume_policy, "terminal_failure");
+        assert_eq!(
+            cursor.conflict_id.as_deref(),
+            Some(history[0].conflict_id.as_str())
+        );
+        assert!(cursor.terminal_failure_reason.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_resolves_current_conflict_on_later_legal_transition() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "workflow conflict resolution runtime wiring".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let mut blocking_plan = test_plan();
+        blocking_plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "false".into(),
+                }],
+                false,
+            ),
+        );
+        blocking_plan
+            .states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &blocking_plan, &[stage.clone()])
+            .await
+            .unwrap();
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("blocking conflict should exist before legal transition");
+
+        let mut resolving_plan = blocking_plan;
+        resolving_plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "true".into(),
+                }],
+                false,
+            ),
+        );
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &resolving_plan, &[stage])
+            .await
+            .unwrap();
+
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "legal graph advancement should resolve the current blocking conflict"
+        );
+        let history = db::repos::workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].conflict_id, blocked.conflict_id);
+        assert_eq!(history[0].status, WorkflowConflictStatus::Resolved);
+        assert_eq!(
+            history[0]
+                .resolution_record_json
+                .as_ref()
+                .and_then(|value| value.get("selected_next_state_id"))
+                .and_then(|value| value.as_str()),
+            Some("refine")
+        );
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_state
+                .as_deref(),
+            Some("refine")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_candidate_transition_evaluation_classifies_unknown_and_missing_inputs() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = test_run(RunId::new());
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_review_summary".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json".into(),
+        );
+
+        let unknown_exists = orchestrator
+            .evaluate_transition_candidate(
+                0,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "exists('unknown_artifact')".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            unknown_exists.result,
+            CandidateTransitionResult::InvalidExpression
+        );
+        assert_eq!(
+            unknown_exists.required_artifacts,
+            vec!["unknown_artifact".to_string()]
+        );
+
+        let unknown_field = orchestrator
+            .evaluate_transition_candidate(
+                1,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "unknown_artifact.pass == true".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            unknown_field.result,
+            CandidateTransitionResult::InvalidExpression
+        );
+
+        let declared_absent = orchestrator
+            .evaluate_transition_candidate(
+                2,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "exists('proposal_review_summary')".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            declared_absent.result,
+            CandidateTransitionResult::MissingInput
+        );
+        assert_eq!(
+            declared_absent.missing_artifacts,
+            vec!["proposal_review_summary".to_string()]
+        );
+
+        let summary_path = tmp.path().join("reviews/proposal/summary.json");
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        std::fs::write(&summary_path, r#"{"summary":"needs refinement"}"#).unwrap();
+        let missing_field = orchestrator
+            .evaluate_transition_candidate(
+                3,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "proposal_review_summary.pass == false".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            missing_field.result,
+            CandidateTransitionResult::MissingInput
+        );
+        assert_eq!(
+            missing_field.missing_fields,
+            vec!["proposal_review_summary.pass".to_string()]
+        );
+
+        std::fs::write(&summary_path, r#"{"pass":false}"#).unwrap();
+        let matched = orchestrator
+            .evaluate_transition_candidate(
+                4,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "proposal_review_summary.pass == false".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(matched.result, CandidateTransitionResult::Matched);
+        assert_eq!(
+            matched.source_artifact_ids,
+            vec!["proposal_review_summary".to_string()]
         );
     }
 }
