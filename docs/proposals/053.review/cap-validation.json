@@ -1,0 +1,93 @@
+{
+  "schema_version": "p053_cap_validation_v1",
+  "proposal_revision_id": "p053-r12-ui-deferred-to-p069-2026-04-23",
+  "artifact_created_at": "2026-04-23T14:20:00+03:00",
+  "artifact_owner": "codex/p053-manual-merge-1833dd16",
+  "phase_1_exposure_mode": "gate_only_internal",
+  "phase_1_exposure_decision": {
+    "decision": "gate_only_internal",
+    "reason": "P053 control-plane behavior is ready for same-tree gate validation, but production rollout remains blocked until representative production sampling and named security signoff are refreshed on the final merge tree.",
+    "production_shippable": false,
+    "minimal_readback_required_for_production": true
+  },
+  "sampled_execution_ids": [],
+  "source_query_or_extraction_method": "No production execution corpus was queried in this manual merge closeout pass. The artifact records the conservative fallback required by the proposal: keep Phase 1 gate-only/internal and retain the candidate caps already exercised by source-level proposal-053 fixtures.",
+  "production_data_availability_status": "unavailable_for_manual_merge_closeout",
+  "production_data_fallback_decision": {
+    "fallback": "proceed_gate_only_internal_with_conservative_defaults",
+    "accepted_risk": "Production cap tuning is not claimed. Any production exposure must replace or amend this artifact with sampled execution IDs, coverage by workflow/provider, and updated p50/p90/p99 distributions.",
+    "deadline": "before production_exposed P053 rollout"
+  },
+  "sample_coverage_by_workflow_template": {},
+  "sample_coverage_by_agent_provider": {},
+  "coverage_gaps": [
+    "No representative production execution IDs sampled in this manual merge worktree.",
+    "No workflow-template distribution measured from production data.",
+    "No provider-family distribution measured from production data."
+  ],
+  "dependency_readiness": {
+    "P037": {
+      "status": "ready_with_adapter",
+      "evidence": "proposal-053 gate includes ACP startup/no-pre-initialize traversal fixtures and P037 idle boundary is treated as prerequisite for production exposure."
+    },
+    "P050": {
+      "status": "ready_with_adapter",
+      "evidence": "P053 code consumes run.chainworks_meta_root and bounds supplemental discovery to that root."
+    },
+    "P057": {
+      "status": "ready_with_adapter",
+      "evidence": "P053 settlement feeds accepted discovery decisions into the declared artifact contract path."
+    },
+    "P058": {
+      "status": "ready_with_adapter",
+      "evidence": "P053 diagnostics persist alongside P058 runtime facts and settlement readback."
+    }
+  },
+  "dependency_readiness_recorded_within_two_working_days": false,
+  "dependency_escalations": [
+    {
+      "dependency": "production sampling",
+      "status": "deferred",
+      "owner": "release owner before production exposure",
+      "reason": "Manual merge closeout does not have a production corpus extraction step."
+    }
+  ],
+  "narrow_adapter_owner_when_needed": "control-plane P053 merge owner",
+  "excluded_outputs": [],
+  "per_output_bytes_p50": null,
+  "per_output_bytes_p90": null,
+  "per_output_bytes_p99": null,
+  "aggregate_bytes_p50": null,
+  "aggregate_bytes_p90": null,
+  "aggregate_bytes_p99": null,
+  "expected_output_spec_count_p90": null,
+  "chosen_max_expected_output_specs": 200,
+  "chosen_pre_prompt_metadata_timeout_ms": 5000,
+  "chosen_pre_prompt_digest_budget_bytes": 67108864,
+  "chosen_max_exact_output_bytes": 10485760,
+  "chosen_aggregate_acceptance_cap_bytes": 67108864,
+  "chosen_bounded_meta_root_max_files": 500,
+  "chosen_bounded_meta_root_max_file_bytes": 1048576,
+  "chosen_bounded_meta_root_max_total_bytes": 10485760,
+  "chosen_legacy_broad_discovery_timeout_ms": 5000,
+  "chosen_legacy_broad_discovery_max_files": 1000,
+  "chosen_legacy_broad_discovery_max_file_bytes": 1048576,
+  "chosen_legacy_broad_discovery_max_total_bytes": 10485760,
+  "cap_validation_status": "source_fixture_validated_gate_only_internal",
+  "acp_cap_validation_status": "source_fixture_validated_gate_only_internal",
+  "interface_freeze": {
+    "expected_output_spec": true,
+    "pre_prompt_expected_output_metadata": true,
+    "output_discovery_decision": true,
+    "discovery_filesystem_operation_recorder": true,
+    "git_manifest_runner": true,
+    "captured_output_builder": true,
+    "settle_agent_outputs_from_discovery_decisions": true
+  },
+  "reviewer_signoff": {
+    "control_plane_owner": "codex/p053-manual-merge-1833dd16",
+    "security_review_artifact": "docs/proposals/053.review/security-checklist.md",
+    "architecture_review_artifact": "docs/proposals/053-bounded-acp-artifact-discovery-and-startup-latency_IMPLEMENTATION_AUDIT_R1.md",
+    "production_exposure_requires_new_signoff": true
+  }
+}

@@ -914,11 +914,13 @@ Bounded ACP artifact discovery and startup latency gate.
 
 Scope:
 
+- Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/proposals/053.review/`
 - `control-plane` discovery logic (`crates/domain/src/discovery.rs`)
 - engine discovery settlement pipeline
 - `OutputDiscoveryDecision` and `agent_execution_discovery_diagnostics` persistence
 - pre-prompt metadata capture and digest-backed validation
 - bounded meta-root discovery (max 500 files, 10 MiB aggregate)
+- discovery filesystem operation-recorder coverage for bounded traversal and metadata reads
 - legacy broad discovery opt-in policy
 - GraphQL and MCP readback for discovery diagnostics
 
@@ -944,6 +946,7 @@ Important:
 - `p053` is accepted as an alias
 - broad recursive discovery is disabled by default
 - discovery settlement is governed by the engine-owned pipeline, not provider-side heuristics
+- a `gate_only_internal` cap-validation artifact is sufficient for same-tree control-plane validation, but production exposure requires a refreshed production sampling/signoff artifact
 
 ### `proposal-057|p057`
 

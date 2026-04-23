@@ -17,8 +17,8 @@
 use anyhow::{bail, Context, Result};
 use domain::agent::AgentStatus;
 use domain::discovery::{
-    DiscoveryFilesystem, ExpectedOutputSpec, ExpectedPathBaseline, LegacyBroadDiscoverySnapshot,
-    PrePromptExpectedOutputContext, PrePromptExpectedOutputMetadata,
+    DiscoveryFilesystem, ExpectedOutputSpec, ExpectedPathBaseline, ExpectedPathBaselineStatus,
+    LegacyBroadDiscoverySnapshot, PrePromptExpectedOutputContext, PrePromptExpectedOutputMetadata,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::time::timeout;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     AcpCloseDiagnostic, AcpMcpServerPayload, DiscoveredArtifact, DiscoveredArtifactSourceKind,
@@ -1058,7 +1058,15 @@ impl AcpTransportSession {
         } else {
             req.workspace_root.clone()
         };
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_pre_initialize_local_latency_ms = startup_started.elapsed().as_millis() as u64,
+            "P053 ACP pre-initialize local overhead measured"
+        );
         let init_id = next_id!();
+        let initialize_started = Instant::now();
         send_ndjson(
             &mut stdin,
             &serde_json::json!({
@@ -1080,10 +1088,18 @@ impl AcpTransportSession {
         await_response(&mut reader, init_id, handshake_timeout, "initialize")
             .await
             .context("ACP: initialize handshake")?;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64,
+            "P053 ACP initialize latency measured"
+        );
 
         let sn_id = next_id!();
         let sn_params =
             build_session_new_params(req, config).context("ACP: build session/new params")?;
+        let session_new_started = Instant::now();
         {
             send_ndjson(
                 &mut stdin,
@@ -1101,6 +1117,13 @@ impl AcpTransportSession {
         let sn_result = await_response(&mut reader, sn_id, handshake_timeout, "session/new")
             .await
             .context("ACP: session/new handshake")?;
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64,
+            "P053 ACP session/new latency measured"
+        );
 
         let session_id = sn_result["sessionId"]
             .as_str()
@@ -1260,11 +1283,48 @@ impl AcpTransportSession {
             prompt_turn_id: format!("prompt-{prompt_id}"),
             discovery_generation_id: uuid::Uuid::new_v4().to_string(),
         };
+        let pre_prompt_metadata_started = Instant::now();
         let pre_prompt_expected_outputs: Vec<PrePromptExpectedOutputMetadata> =
             DiscoveryFilesystem::capture_bounded_pre_prompt_expected_output_metadata(
                 &req.expected_outputs,
                 &metadata_context,
             );
+        let missing_count = pre_prompt_expected_outputs
+            .iter()
+            .filter(|metadata| metadata.baseline_status == ExpectedPathBaselineStatus::Absent)
+            .count();
+        let stale_or_digest_count = pre_prompt_expected_outputs
+            .iter()
+            .filter(|metadata| {
+                metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured
+            })
+            .count();
+        let rejected_baseline_count = pre_prompt_expected_outputs
+            .iter()
+            .filter(|metadata| {
+                matches!(
+                    metadata.baseline_status,
+                    ExpectedPathBaselineStatus::Oversized
+                        | ExpectedPathBaselineStatus::Unreadable
+                        | ExpectedPathBaselineStatus::NotRegularFile
+                        | ExpectedPathBaselineStatus::SymlinkEscape
+                        | ExpectedPathBaselineStatus::UnauthorizedRoot
+                        | ExpectedPathBaselineStatus::MetadataTimeout
+                        | ExpectedPathBaselineStatus::Uncertain
+                )
+            })
+            .count();
+        info!(
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            provider = %req.provider,
+            acp_pre_prompt_metadata_latency_ms = pre_prompt_metadata_started.elapsed().as_millis() as u64,
+            acp_expected_output_spec_count = req.expected_outputs.len(),
+            acp_expected_outputs_missing_count = missing_count,
+            acp_expected_outputs_stale_count = stale_or_digest_count,
+            acp_expected_outputs_rejected_count = rejected_baseline_count,
+            "P053 pre-prompt expected-output metadata measured"
+        );
         let legacy_broad_discovery_enabled =
             req.legacy_broad_discovery_policy.allows_broad_discovery();
         let broad_baseline = self.baseline_files.clone();

@@ -1409,7 +1409,18 @@ fn bounded_meta_root_artifact_paths(chainworks_meta_root: Option<&str>) -> Vec<S
         warn!("P053 bounded meta-root discovery skipped: chainworks_meta_root absent");
         return Vec::new();
     };
+    let meta_root_started = Instant::now();
     let discovery = DiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
+    info!(
+        chainworks_meta_root = %discovery.root_path,
+        acp_meta_root_discovery_latency_ms = meta_root_started.elapsed().as_millis() as u64,
+        files_visited = discovery.files_visited,
+        total_bytes = discovery.total_bytes,
+        truncated_by_file_cap = discovery.truncated_by_file_cap,
+        truncated_by_file_size = discovery.truncated_by_file_size,
+        truncated_by_total_bytes = discovery.truncated_by_total_bytes,
+        "P053 bounded meta-root discovery measured"
+    );
     if discovery.truncated_by_file_cap
         || discovery.truncated_by_file_size
         || discovery.truncated_by_total_bytes
@@ -3103,6 +3114,7 @@ impl BackgroundExecutor {
                 }
 
                 let declared_output_settlement = if !declared_outputs.is_empty() {
+                    let manifest_started = Instant::now();
                     if let Err(error) = generate_changed_files_manifest_if_declared(
                         &declared_outputs,
                         Some(effective_working_directory.as_str()),
@@ -3118,12 +3130,55 @@ impl BackgroundExecutor {
                             "Failed to generate changed-files manifest"
                         );
                     }
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        acp_control_plane_manifest_latency_ms = manifest_started.elapsed().as_millis() as u64,
+                        acp_git_changed_files_latency_ms = manifest_started.elapsed().as_millis() as u64,
+                        "P053 control-plane manifest generation measured"
+                    );
+                    let exact_output_acceptance_started = Instant::now();
                     let settlement = settle_agent_outputs_from_discovery_decisions(
                         &declared_outputs,
                         &expected_outputs,
                         &result.discovered_artifacts,
                         &result.pre_prompt_expected_outputs,
                     )?;
+                    let found_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
+                        .count();
+                    let missing_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.status == OutputDiscoveryStatus::Missing)
+                        .count();
+                    let stale_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| {
+                            decision.reason == OutputDiscoveryReason::StaleExpectedOutput
+                        })
+                        .count();
+                    let rejected_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.status == OutputDiscoveryStatus::Rejected)
+                        .count();
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        acp_exact_output_acceptance_latency_ms = exact_output_acceptance_started.elapsed().as_millis() as u64,
+                        acp_expected_outputs_found_count = found_count,
+                        acp_expected_outputs_missing_count = missing_count,
+                        acp_expected_outputs_stale_count = stale_count,
+                        acp_expected_outputs_rejected_count = rejected_count,
+                        acp_reconciliation_pending = false,
+                        "P053 exact-output acceptance measured"
+                    );
                     if let Some(idempotency_key) = settlement.idempotency_key.as_deref() {
                         debug!(
                             run_id = %run_id,

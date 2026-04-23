@@ -2390,11 +2390,66 @@ PY
     ;;
   proposal-053|p053)
     log "Proposal 053 control-plane gate: bounded ACP artifact discovery"
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+cap = root / "docs/proposals/053.review/cap-validation.json"
+security = root / "docs/proposals/053.review/security-checklist.md"
+if not cap.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/cap-validation.json")
+if not security.exists():
+    raise SystemExit("proposal-053: missing docs/proposals/053.review/security-checklist.md")
+data = json.loads(cap.read_text())
+required = {
+    "schema_version",
+    "proposal_revision_id",
+    "phase_1_exposure_mode",
+    "dependency_readiness",
+    "chosen_max_expected_output_specs",
+    "chosen_pre_prompt_metadata_timeout_ms",
+    "chosen_pre_prompt_digest_budget_bytes",
+    "chosen_max_exact_output_bytes",
+    "chosen_aggregate_acceptance_cap_bytes",
+    "interface_freeze",
+    "reviewer_signoff",
+}
+missing = sorted(required.difference(data))
+if missing:
+    raise SystemExit(f"proposal-053: cap-validation missing fields: {missing}")
+if data["phase_1_exposure_mode"] not in {"gate_only_internal", "production_exposed"}:
+    raise SystemExit("proposal-053: phase_1_exposure_mode must be gate_only_internal or production_exposed")
+for dep in ["P037", "P050", "P057", "P058"]:
+    if dep not in data["dependency_readiness"]:
+        raise SystemExit(f"proposal-053: dependency_readiness missing {dep}")
+for key in [
+    "expected_output_spec",
+    "pre_prompt_expected_output_metadata",
+    "output_discovery_decision",
+    "discovery_filesystem_operation_recorder",
+    "git_manifest_runner",
+    "captured_output_builder",
+    "settle_agent_outputs_from_discovery_decisions",
+]:
+    if data["interface_freeze"].get(key) is not True:
+        raise SystemExit(f"proposal-053: interface_freeze.{key} must be true")
+text = security.read_text()
+for needle in [
+    "Production exposure | Not approved by this checklist",
+    "operation-recorder evidence",
+    "P053 remains approved only for gate-only/internal control-plane validation",
+]:
+    if needle not in text:
+        raise SystemExit(f"proposal-053: security checklist missing {needle!r}")
+PY
     (
       cd "$ROOT_DIR/control-plane"
       export CARGO_TARGET_DIR=target/proposal-053-gate
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
       cargo test -p domain discovery::tests::generated_state_denylist_matches_p053_roots -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::proposal_053_operation_recorder_observes_bounded_discovery_without_generated_state_reads -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::proposal_053_operation_recorder_orders_metadata_before_file_read -- --exact --nocapture &&
       cargo test -p domain discovery::tests::expected_output_spec_serializes_p053_policy_fields -- --exact --nocapture &&
       cargo test -p domain bounded_pre_prompt_metadata -- --nocapture &&
       cargo test -p domain proposal_053_bounded_meta_root -- --nocapture &&

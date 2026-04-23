@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -19,6 +20,99 @@ const LEGACY_BROAD_DISCOVERY_MAX_FILES: usize = 1000;
 const LEGACY_BROAD_DISCOVERY_MAX_BYTES_PER_FILE: u64 = 1024 * 1024;
 const LEGACY_BROAD_DISCOVERY_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024;
 const LEGACY_BROAD_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryOperationKind {
+    SnapshotFiles,
+    LegacyBroadDiscovery,
+    CaptureExpectedPathBaseline,
+    CapturePrePromptMetadata,
+    BoundedPrePromptMetadata,
+    BoundedMetaRootDiscovery,
+    ReadDir,
+    SymlinkMetadata,
+    Canonicalize,
+    ReadFile,
+    GeneratedStateDirSkipped,
+    GeneratedStateFileSkipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryOperation {
+    pub kind: DiscoveryOperationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
+    #[serde(default)]
+    pub details: BTreeMap<String, String>,
+}
+
+impl DiscoveryOperation {
+    pub fn new(kind: DiscoveryOperationKind) -> Self {
+        Self {
+            kind,
+            path: None,
+            output_name: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn path(kind: DiscoveryOperationKind, path: impl AsRef<Path>) -> Self {
+        let mut operation = Self::new(kind);
+        operation.path = Some(path.as_ref().to_string_lossy().into_owned());
+        operation
+    }
+
+    pub fn output(kind: DiscoveryOperationKind, spec: &ExpectedOutputSpec) -> Self {
+        let mut operation = Self::path(kind, Path::new(&spec.target_path));
+        operation.output_name = Some(spec.output_name.clone());
+        operation
+    }
+
+    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.details.insert(key.into(), value.into());
+        self
+    }
+}
+
+pub trait DiscoveryOperationRecorder: Send + Sync {
+    fn record(&self, operation: DiscoveryOperation);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopDiscoveryOperationRecorder;
+
+impl DiscoveryOperationRecorder for NoopDiscoveryOperationRecorder {
+    fn record(&self, _operation: DiscoveryOperation) {}
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecordingDiscoveryOperationRecorder {
+    operations: Arc<Mutex<Vec<DiscoveryOperation>>>,
+}
+
+impl RecordingDiscoveryOperationRecorder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn operations(&self) -> Vec<DiscoveryOperation> {
+        self.operations
+            .lock()
+            .map(|operations| operations.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl DiscoveryOperationRecorder for RecordingDiscoveryOperationRecorder {
+    fn record(&self, operation: DiscoveryOperation) {
+        if let Ok(mut operations) = self.operations.lock() {
+            operations.push(operation);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -448,24 +542,61 @@ pub struct DiscoveryFilesystem;
 
 impl DiscoveryFilesystem {
     pub fn snapshot_files(root: impl AsRef<Path>) -> HashSet<String> {
+        let recorder = NoopDiscoveryOperationRecorder;
+        Self::snapshot_files_with_recorder(root, &recorder)
+    }
+
+    pub fn snapshot_files_with_recorder(
+        root: impl AsRef<Path>,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> HashSet<String> {
         let mut files = HashSet::new();
-        collect_files(root.as_ref(), &mut files);
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::SnapshotFiles,
+            root.as_ref(),
+        ));
+        collect_files(root.as_ref(), &mut files, recorder);
         files
     }
 
     pub fn snapshot_legacy_broad_discovery(root: impl AsRef<Path>) -> LegacyBroadDiscoverySnapshot {
-        snapshot_legacy_broad_discovery(root.as_ref())
+        let recorder = NoopDiscoveryOperationRecorder;
+        Self::snapshot_legacy_broad_discovery_with_recorder(root, &recorder)
+    }
+
+    pub fn snapshot_legacy_broad_discovery_with_recorder(
+        root: impl AsRef<Path>,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> LegacyBroadDiscoverySnapshot {
+        snapshot_legacy_broad_discovery(root.as_ref(), recorder)
     }
 
     pub fn capture_expected_path_baseline(path: impl AsRef<Path>) -> ExpectedPathBaseline {
-        capture_expected_path_baseline(path.as_ref(), DEFAULT_EXACT_PATH_READ_CAP_BYTES)
+        let recorder = NoopDiscoveryOperationRecorder;
+        Self::capture_expected_path_baseline_with_recorder(path, &recorder)
+    }
+
+    pub fn capture_expected_path_baseline_with_recorder(
+        path: impl AsRef<Path>,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> ExpectedPathBaseline {
+        capture_expected_path_baseline(path.as_ref(), DEFAULT_EXACT_PATH_READ_CAP_BYTES, recorder)
     }
 
     pub fn capture_pre_prompt_expected_output_metadata(
         spec: &ExpectedOutputSpec,
         context: &PrePromptExpectedOutputContext,
     ) -> PrePromptExpectedOutputMetadata {
-        capture_pre_prompt_expected_output_metadata(spec, context, None, None)
+        let recorder = NoopDiscoveryOperationRecorder;
+        Self::capture_pre_prompt_expected_output_metadata_with_recorder(spec, context, &recorder)
+    }
+
+    pub fn capture_pre_prompt_expected_output_metadata_with_recorder(
+        spec: &ExpectedOutputSpec,
+        context: &PrePromptExpectedOutputContext,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> PrePromptExpectedOutputMetadata {
+        capture_pre_prompt_expected_output_metadata(spec, context, None, None, recorder)
     }
 
     pub fn capture_bounded_pre_prompt_expected_output_metadata(
@@ -484,12 +615,26 @@ impl DiscoveryFilesystem {
         context: &PrePromptExpectedOutputContext,
         bounds: PrePromptMetadataBounds,
     ) -> Vec<PrePromptExpectedOutputMetadata> {
-        capture_bounded_pre_prompt_expected_output_metadata(specs, context, bounds)
+        let recorder = NoopDiscoveryOperationRecorder;
+        Self::capture_bounded_pre_prompt_expected_output_metadata_with_bounds_and_recorder(
+            specs, context, bounds, &recorder,
+        )
+    }
+
+    pub fn capture_bounded_pre_prompt_expected_output_metadata_with_bounds_and_recorder(
+        specs: &[ExpectedOutputSpec],
+        context: &PrePromptExpectedOutputContext,
+        bounds: PrePromptMetadataBounds,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> Vec<PrePromptExpectedOutputMetadata> {
+        capture_bounded_pre_prompt_expected_output_metadata(specs, context, bounds, recorder)
     }
 
     pub fn expected_path_has_current_content(baseline: &ExpectedPathBaseline) -> bool {
         let path = Path::new(&baseline.target_path);
-        let current = capture_expected_path_baseline(path, DEFAULT_EXACT_PATH_READ_CAP_BYTES);
+        let recorder = NoopDiscoveryOperationRecorder;
+        let current =
+            capture_expected_path_baseline(path, DEFAULT_EXACT_PATH_READ_CAP_BYTES, &recorder);
         match (&baseline.status, &current.status) {
             (
                 ExpectedPathBaselineStatus::Absent,
@@ -514,7 +659,9 @@ impl DiscoveryFilesystem {
         ) {
             return false;
         }
-        let current = capture_pre_prompt_expected_output_metadata(spec, context, None, None);
+        let recorder = NoopDiscoveryOperationRecorder;
+        let current =
+            capture_pre_prompt_expected_output_metadata(spec, context, None, None, &recorder);
         match (&baseline.baseline_status, &current.baseline_status) {
             (
                 ExpectedPathBaselineStatus::Absent,
@@ -565,7 +712,15 @@ impl DiscoveryFilesystem {
     pub fn discover_bounded_meta_root_artifacts(
         root: impl AsRef<Path>,
     ) -> BoundedMetaRootDiscovery {
-        discover_bounded_meta_root_artifacts(root.as_ref())
+        let recorder = NoopDiscoveryOperationRecorder;
+        Self::discover_bounded_meta_root_artifacts_with_recorder(root, &recorder)
+    }
+
+    pub fn discover_bounded_meta_root_artifacts_with_recorder(
+        root: impl AsRef<Path>,
+        recorder: &dyn DiscoveryOperationRecorder,
+    ) -> BoundedMetaRootDiscovery {
+        discover_bounded_meta_root_artifacts(root.as_ref(), recorder)
     }
 }
 
@@ -574,8 +729,13 @@ fn capture_pre_prompt_expected_output_metadata(
     context: &PrePromptExpectedOutputContext,
     digest_budget_remaining: Option<u64>,
     deadline: Option<Instant>,
+    recorder: &dyn DiscoveryOperationRecorder,
 ) -> PrePromptExpectedOutputMetadata {
     let target = Path::new(&spec.target_path);
+    recorder.record(DiscoveryOperation::output(
+        DiscoveryOperationKind::CapturePrePromptMetadata,
+        spec,
+    ));
     let mut metadata = PrePromptExpectedOutputMetadata {
         output_name: spec.output_name.clone(),
         target_path: spec.target_path.clone(),
@@ -599,6 +759,10 @@ fn capture_pre_prompt_expected_output_metadata(
         discovery_generation_id: context.discovery_generation_id.clone(),
     };
 
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::SymlinkMetadata,
+        target,
+    ));
     let Ok(link_metadata) = std::fs::symlink_metadata(target) else {
         return metadata;
     };
@@ -617,6 +781,10 @@ fn capture_pre_prompt_expected_output_metadata(
         "other".to_string()
     };
 
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::Canonicalize,
+        target,
+    ));
     let canonical = match std::fs::canonicalize(target) {
         Ok(path) => path,
         Err(_) => {
@@ -666,6 +834,10 @@ fn capture_pre_prompt_expected_output_metadata(
         return metadata;
     }
 
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::ReadFile,
+        &canonical,
+    ));
     match std::fs::read(&canonical) {
         Ok(content) => {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -687,7 +859,20 @@ fn capture_bounded_pre_prompt_expected_output_metadata(
     specs: &[ExpectedOutputSpec],
     context: &PrePromptExpectedOutputContext,
     bounds: PrePromptMetadataBounds,
+    recorder: &dyn DiscoveryOperationRecorder,
 ) -> Vec<PrePromptExpectedOutputMetadata> {
+    recorder.record(
+        DiscoveryOperation::new(DiscoveryOperationKind::BoundedPrePromptMetadata)
+            .with_detail("spec_count", specs.len().to_string())
+            .with_detail(
+                "max_expected_output_specs",
+                bounds.max_expected_output_specs.to_string(),
+            )
+            .with_detail(
+                "aggregate_digest_read_budget_bytes",
+                bounds.aggregate_digest_read_budget_bytes.to_string(),
+            ),
+    );
     let deadline = Instant::now()
         .checked_add(bounds.timeout)
         .unwrap_or_else(Instant::now);
@@ -709,6 +894,7 @@ fn capture_bounded_pre_prompt_expected_output_metadata(
             context,
             Some(digest_budget_remaining),
             Some(deadline),
+            recorder,
         );
         if metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured {
             if let Some(size_bytes) = metadata.size_bytes {
@@ -783,14 +969,29 @@ fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn discover_bounded_meta_root_artifacts(root: &Path) -> BoundedMetaRootDiscovery {
+fn discover_bounded_meta_root_artifacts(
+    root: &Path,
+    recorder: &dyn DiscoveryOperationRecorder,
+) -> BoundedMetaRootDiscovery {
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::BoundedMetaRootDiscovery,
+        root,
+    ));
     let root_path = root.to_string_lossy().into_owned();
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::SymlinkMetadata,
+        root,
+    ));
     let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
         return BoundedMetaRootDiscovery::skipped(root_path, "chainworks_meta_root_absent");
     };
     if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
         return BoundedMetaRootDiscovery::skipped(root_path, "chainworks_meta_root_not_directory");
     }
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::Canonicalize,
+        root,
+    ));
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return BoundedMetaRootDiscovery::skipped(root_path, "chainworks_meta_root_unreadable");
     };
@@ -808,6 +1009,10 @@ fn discover_bounded_meta_root_artifacts(root: &Path) -> BoundedMetaRootDiscovery
     let mut stack = vec![canonical_root.clone()];
 
     while let Some(dir) = stack.pop() {
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::ReadDir,
+            &dir,
+        ));
         let Ok(entries) = std::fs::read_dir(&dir) else {
             result
                 .warnings
@@ -818,6 +1023,10 @@ fn discover_bounded_meta_root_artifacts(root: &Path) -> BoundedMetaRootDiscovery
         entries.sort();
 
         for path in entries {
+            recorder.record(DiscoveryOperation::path(
+                DiscoveryOperationKind::SymlinkMetadata,
+                &path,
+            ));
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 result
                     .warnings
@@ -830,8 +1039,16 @@ fn discover_bounded_meta_root_artifacts(root: &Path) -> BoundedMetaRootDiscovery
 
             if metadata.is_dir() {
                 if should_skip_bounded_meta_root_dir(&path) {
+                    recorder.record(DiscoveryOperation::path(
+                        DiscoveryOperationKind::GeneratedStateDirSkipped,
+                        &path,
+                    ));
                     continue;
                 }
+                recorder.record(DiscoveryOperation::path(
+                    DiscoveryOperationKind::Canonicalize,
+                    &path,
+                ));
                 let Ok(canonical_dir) = std::fs::canonicalize(&path) else {
                     result
                         .warnings
@@ -861,6 +1078,10 @@ fn discover_bounded_meta_root_artifacts(root: &Path) -> BoundedMetaRootDiscovery
                 result.truncated_by_total_bytes = true;
                 return result;
             }
+            recorder.record(DiscoveryOperation::path(
+                DiscoveryOperationKind::Canonicalize,
+                &path,
+            ));
             let Ok(canonical_file) = std::fs::canonicalize(&path) else {
                 result
                     .warnings
@@ -881,14 +1102,29 @@ fn discover_bounded_meta_root_artifacts(root: &Path) -> BoundedMetaRootDiscovery
     result
 }
 
-fn snapshot_legacy_broad_discovery(root: &Path) -> LegacyBroadDiscoverySnapshot {
+fn snapshot_legacy_broad_discovery(
+    root: &Path,
+    recorder: &dyn DiscoveryOperationRecorder,
+) -> LegacyBroadDiscoverySnapshot {
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::LegacyBroadDiscovery,
+        root,
+    ));
     let root_path = root.to_string_lossy().into_owned();
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::SymlinkMetadata,
+        root,
+    ));
     let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
         return LegacyBroadDiscoverySnapshot::skipped(root_path, "legacy_root_absent");
     };
     if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
         return LegacyBroadDiscoverySnapshot::skipped(root_path, "legacy_root_not_directory");
     }
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::Canonicalize,
+        root,
+    ));
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return LegacyBroadDiscoverySnapshot::skipped(root_path, "legacy_root_unreadable");
     };
@@ -914,6 +1150,10 @@ fn snapshot_legacy_broad_discovery(root: &Path) -> LegacyBroadDiscoverySnapshot 
             result.timed_out = true;
             return result;
         }
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::ReadDir,
+            &dir,
+        ));
         let Ok(entries) = std::fs::read_dir(&dir) else {
             result
                 .warnings
@@ -928,6 +1168,10 @@ fn snapshot_legacy_broad_discovery(root: &Path) -> LegacyBroadDiscoverySnapshot 
                 result.timed_out = true;
                 return result;
             }
+            recorder.record(DiscoveryOperation::path(
+                DiscoveryOperationKind::SymlinkMetadata,
+                &path,
+            ));
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 result
                     .warnings
@@ -940,8 +1184,16 @@ fn snapshot_legacy_broad_discovery(root: &Path) -> LegacyBroadDiscoverySnapshot 
 
             if metadata.is_dir() {
                 if DiscoveryFilesystem::should_skip_generated_state_dir(&path) {
+                    recorder.record(DiscoveryOperation::path(
+                        DiscoveryOperationKind::GeneratedStateDirSkipped,
+                        &path,
+                    ));
                     continue;
                 }
+                recorder.record(DiscoveryOperation::path(
+                    DiscoveryOperationKind::Canonicalize,
+                    &path,
+                ));
                 let Ok(canonical_dir) = std::fs::canonicalize(&path) else {
                     result
                         .warnings
@@ -958,6 +1210,10 @@ fn snapshot_legacy_broad_discovery(root: &Path) -> LegacyBroadDiscoverySnapshot 
                 continue;
             }
             if DiscoveryFilesystem::should_skip_generated_state_file(&path) {
+                recorder.record(DiscoveryOperation::path(
+                    DiscoveryOperationKind::GeneratedStateFileSkipped,
+                    &path,
+                ));
                 continue;
             }
             result.files_visited += 1;
@@ -975,6 +1231,10 @@ fn snapshot_legacy_broad_discovery(root: &Path) -> LegacyBroadDiscoverySnapshot 
                 result.truncated_by_total_bytes = true;
                 return result;
             }
+            recorder.record(DiscoveryOperation::path(
+                DiscoveryOperationKind::Canonicalize,
+                &path,
+            ));
             let Ok(canonical_file) = std::fs::canonicalize(&path) else {
                 result
                     .warnings
@@ -1019,8 +1279,16 @@ fn should_skip_bounded_meta_root_dir(path: &Path) -> bool {
         })
 }
 
-fn capture_expected_path_baseline(path: &Path, max_bytes: u64) -> ExpectedPathBaseline {
+fn capture_expected_path_baseline(
+    path: &Path,
+    max_bytes: u64,
+    recorder: &dyn DiscoveryOperationRecorder,
+) -> ExpectedPathBaseline {
     let target_path = path.to_string_lossy().into_owned();
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::CaptureExpectedPathBaseline,
+        path,
+    ));
     let Ok(metadata) = std::fs::metadata(path) else {
         return ExpectedPathBaseline {
             target_path,
@@ -1042,6 +1310,10 @@ fn capture_expected_path_baseline(path: &Path, max_bytes: u64) -> ExpectedPathBa
             content: None,
         };
     }
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::ReadFile,
+        path,
+    ));
     match std::fs::read(path) {
         Ok(content) => ExpectedPathBaseline {
             target_path,
@@ -1056,7 +1328,11 @@ fn capture_expected_path_baseline(path: &Path, max_bytes: u64) -> ExpectedPathBa
     }
 }
 
-fn collect_files(dir: &Path, out: &mut HashSet<String>) {
+fn collect_files(dir: &Path, out: &mut HashSet<String>, recorder: &dyn DiscoveryOperationRecorder) {
+    recorder.record(DiscoveryOperation::path(
+        DiscoveryOperationKind::ReadDir,
+        dir,
+    ));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1067,15 +1343,23 @@ fn collect_files(dir: &Path, out: &mut HashSet<String>) {
         }
         if path.is_dir() {
             if DiscoveryFilesystem::should_skip_generated_state_dir(&path) {
+                recorder.record(DiscoveryOperation::path(
+                    DiscoveryOperationKind::GeneratedStateDirSkipped,
+                    &path,
+                ));
                 continue;
             }
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') {
                 continue;
             }
-            collect_files(&path, out);
+            collect_files(&path, out, recorder);
         } else if path.is_file() {
             if DiscoveryFilesystem::should_skip_generated_state_file(&path) {
+                recorder.record(DiscoveryOperation::path(
+                    DiscoveryOperationKind::GeneratedStateFileSkipped,
+                    &path,
+                ));
                 continue;
             }
             if let Some(s) = path.to_str() {
@@ -1100,10 +1384,11 @@ fn ends_with_components(path: &Path, expected: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorizedRoot, DiscoveryFilesystem, ExpectedOutputRole, ExpectedOutputSpec,
-        ExpectedPathBaselineStatus, OutputDiscoveryDecision, OutputDiscoveryProvenance,
-        OutputDiscoveryReason, OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass,
-        PrePromptExpectedOutputContext, PrePromptMetadataBounds, SourceGenerationOwner,
+        AuthorizedRoot, DiscoveryFilesystem, DiscoveryOperationKind, ExpectedOutputRole,
+        ExpectedOutputSpec, ExpectedPathBaselineStatus, OutputDiscoveryDecision,
+        OutputDiscoveryProvenance, OutputDiscoveryReason, OutputDiscoveryStatus, OutputReusePolicy,
+        OutputRootClass, PrePromptExpectedOutputContext, PrePromptMetadataBounds,
+        RecordingDiscoveryOperationRecorder, SourceGenerationOwner,
     };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -1147,6 +1432,102 @@ mod tests {
         assert!(!DiscoveryFilesystem::should_skip_generated_state_file(
             Path::new("logs/app.sqlite")
         ));
+    }
+
+    #[test]
+    fn proposal_053_operation_recorder_observes_bounded_discovery_without_generated_state_reads() {
+        let root = temp_test_dir("operation-recorder");
+        let logs = root.join("logs");
+        let target = root.join("target");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(logs.join("report.json"), br#"{"status":"ok"}"#).unwrap();
+        std::fs::write(target.join("build.log"), b"skip").unwrap();
+        let recorder = RecordingDiscoveryOperationRecorder::new();
+
+        let discovery = DiscoveryFilesystem::discover_bounded_meta_root_artifacts_with_recorder(
+            &root, &recorder,
+        );
+
+        assert_eq!(discovery.artifact_paths.len(), 1);
+        let operations = recorder.operations();
+        assert!(operations
+            .iter()
+            .any(|op| op.kind == DiscoveryOperationKind::BoundedMetaRootDiscovery));
+        assert!(operations.iter().any(|op| {
+            op.kind == DiscoveryOperationKind::GeneratedStateDirSkipped
+                && op
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("target"))
+        }));
+        assert!(!operations.iter().any(|op| {
+            op.kind == DiscoveryOperationKind::ReadDir
+                && op
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("target"))
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proposal_053_operation_recorder_orders_metadata_before_file_read() {
+        let root = temp_test_dir("operation-recorder-metadata");
+        let output = root.join("proposal_review.json");
+        std::fs::write(&output, br#"{"status":"green"}"#).unwrap();
+        let spec = ExpectedOutputSpec {
+            output_name: "proposal_review".to_string(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: output.to_string_lossy().into_owned(),
+            companion_of: None,
+            display_label: "Proposal review".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 10 * 1024 * 1024,
+            aggregate_acceptance_cap_bytes: 64 * 1024 * 1024,
+            authorized_roots: vec![AuthorizedRoot {
+                root_class: OutputRootClass::ChainworksMetaRoot,
+                root_path: root.to_string_lossy().into_owned(),
+            }],
+            source_generation_owner: SourceGenerationOwner::Agent,
+        };
+        let context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "turn-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let recorder = RecordingDiscoveryOperationRecorder::new();
+
+        let metadata =
+            DiscoveryFilesystem::capture_pre_prompt_expected_output_metadata_with_recorder(
+                &spec, &context, &recorder,
+            );
+
+        assert_eq!(
+            metadata.baseline_status,
+            ExpectedPathBaselineStatus::RegularContentCaptured
+        );
+        let operations = recorder.operations();
+        let metadata_index = operations
+            .iter()
+            .position(|op| op.kind == DiscoveryOperationKind::CapturePrePromptMetadata)
+            .expect("metadata operation recorded");
+        let read_index = operations
+            .iter()
+            .position(|op| op.kind == DiscoveryOperationKind::ReadFile)
+            .expect("file read operation recorded");
+        assert!(
+            metadata_index < read_index,
+            "metadata operation must be recorded before file read"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
