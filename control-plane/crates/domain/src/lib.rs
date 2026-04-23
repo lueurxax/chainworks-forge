@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod artifact_contracts;
 pub mod capabilities;
 pub mod commands;
+pub mod discovery;
 pub mod events;
 pub mod idea;
 pub mod ids;

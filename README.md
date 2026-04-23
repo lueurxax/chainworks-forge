@@ -124,6 +124,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
 - artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`
+  - `bounded artifact discovery and settlement optimization (P053)`
   - report/export surfaces
 - provider platform slices:
   - provider settings
@@ -246,6 +247,7 @@ Start here:
 Implemented-system references:
 
 - [`docs/reference/workflow-execution-engine.md`](docs/reference/workflow-execution-engine.md)
+- [`docs/reference/artifact-discovery-and-settlement-optimization.md`](docs/reference/artifact-discovery-and-settlement-optimization.md)
 - [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
 - [`docs/reference/execution-truth-and-recovery.md`](docs/reference/execution-truth-and-recovery.md)
 - [`docs/reference/output-contracts-failure-evidence-and-recovery.md`](docs/reference/output-contracts-failure-evidence-and-recovery.md)

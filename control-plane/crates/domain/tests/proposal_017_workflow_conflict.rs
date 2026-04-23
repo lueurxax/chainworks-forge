@@ -403,7 +403,10 @@ fn proposal_017_conflict_hashes_are_stable_and_fingerprint_sorts_advisory_refs()
 #[test]
 fn proposal_017_phase0_fixture_inventory_names_required_groups() {
     let i: Value = serde_json::from_str(FIXTURE_INVENTORY).unwrap();
-    assert_eq!(i["schema_version"], "proposal_017_phase0_fixture_inventory_v1");
+    assert_eq!(
+        i["schema_version"],
+        "proposal_017_phase0_fixture_inventory_v1"
+    );
 
     let b = i["blocking_conflict_fixtures"].as_array().unwrap();
     for r in [
@@ -471,7 +474,10 @@ fn proposal_017_phase0_fixture_inventory_names_required_groups() {
 
     let u = i["unknown_transition_input_fixtures"].as_array().unwrap();
     for e in [
-        ["exists_unknown_artifact_invalid_expression", "invalid_expression"],
+        [
+            "exists_unknown_artifact_invalid_expression",
+            "invalid_expression",
+        ],
         ["declared_absent_artifact_missing_input", "missing_input"],
     ] {
         assert!(u.iter().any(|f| {

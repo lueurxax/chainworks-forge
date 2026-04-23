@@ -635,7 +635,9 @@ impl McpServer {
             tools::runs::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("approvals.") {
             tools::approvals::execute(tool_name, params, pool, cmd, principal).await
-        } else if tool_name.starts_with("stages.") {
+        } else if tool_name.starts_with("stages.")
+            || tool_name == "legacy_discovery_override_create"
+        {
             tools::stages::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("reports.") {
             tools::reports::execute(tool_name, params, pool, cmd, principal).await
@@ -879,6 +881,7 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
+            "legacy_discovery_override_create",
             "reports.get",
             "steward.run_analysis",
             "steward.list_analyses",
@@ -911,6 +914,7 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
+            "legacy_discovery_override_create",
             "runs.cancel",
             "steward.run_analysis",
             "steward.list_analyses",
@@ -943,6 +947,7 @@ mod p029_capability_tests {
             "runs.cancel",
             "approvals.resolve",
             "stages.retry",
+            "legacy_discovery_override_create",
             "steward.run_analysis",
         ] {
             assert!(
@@ -962,6 +967,7 @@ mod p029_capability_tests {
         assert!(!tools_call_allowed(&ob, "runs.start"));
         assert!(!tools_call_allowed(&ob, "approvals.resolve"));
         assert!(!tools_call_allowed(&ob, "runs.cancel"));
+        assert!(!tools_call_allowed(&ob, "legacy_discovery_override_create"));
 
         // Unknown tool name also denied (capability_id_for returns None).
         let op = Principal::new("op", PrincipalClass::Operator);

@@ -10,11 +10,12 @@ use db::repos::{
     workflow_conflicts,
 };
 use domain::commands::{
-    ApproveStageCmd, CallerContext, CancelRunCmd, Command, RejectStageCmd, RetryStageCmd,
-    StartRunCmd,
+    ApproveStageCmd, CallerContext, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd,
+    RejectStageCmd, RetryStageCmd, StartRunCmd,
 };
+use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::events::DomainEvent;
-use domain::ids::{IdeaId, RunId};
+use domain::ids::{IdeaId, RunId, StageExecutionId};
 use domain::lifecycle::DaemonStatus;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
@@ -70,6 +71,16 @@ fn require_operator_or_observer_read(ctx: &Context<'_>) -> Result<()> {
     Ok(())
 }
 
+fn parse_legacy_broad_discovery_policy(value: &str) -> Result<LegacyBroadDiscoveryPolicy> {
+    match value {
+        "workflow_opt_in" => Ok(LegacyBroadDiscoveryPolicy::WorkflowOptIn),
+        "disabled" => Ok(LegacyBroadDiscoveryPolicy::Disabled),
+        _ => Err(Error::new(format!(
+            "unknown legacy_discovery_override_policy: {value}"
+        ))),
+    }
+}
+
 async fn run_from_projection_or_canonical(
     pool: &SqlitePool,
     run_id: RunId,
@@ -106,6 +117,8 @@ async fn enrich_run_with_artifact_contracts(
         let overrides = db::repos::artifact_contracts::list_overrides(pool, run_id).await?;
         gql.operator_overrides_json = Some(serde_json::to_string(&overrides)?);
     }
+    let legacy_overrides = db::repos::legacy_discovery_overrides::list_by_run(pool, run_id).await?;
+    gql.legacy_discovery_overrides_json = Some(serde_json::to_string(&legacy_overrides)?);
     gql.implementation_self_assessment_summary =
         artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
             .await?
@@ -514,6 +527,7 @@ pub enum MutationName {
     ApproveStage,
     RejectStage,
     RetryStage,
+    OverrideLegacyDiscoveryPolicy,
     CancelRun,
 }
 
@@ -523,7 +537,9 @@ pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
         MutationName::ApproveStage | MutationName::RejectStage => {
             domain::CapabilityToolId::ApprovalsResolve
         }
-        MutationName::RetryStage => domain::CapabilityToolId::StagesRetry,
+        MutationName::RetryStage | MutationName::OverrideLegacyDiscoveryPolicy => {
+            domain::CapabilityToolId::StagesRetry
+        }
         MutationName::CancelRun => domain::CapabilityToolId::RunsCancel,
     }
 }
@@ -619,6 +635,13 @@ pub struct RejectStagePayload {
 #[derive(SimpleObject)]
 pub struct RetryStagePayload {
     pub retried: bool,
+    pub journal_id: ID,
+    pub legacy_discovery_override_id: Option<ID>,
+}
+
+#[derive(SimpleObject)]
+pub struct OverrideLegacyDiscoveryPolicyPayload {
+    pub override_id: ID,
     pub journal_id: ID,
 }
 
@@ -795,6 +818,8 @@ impl MutationRoot {
         run_id: ID,
         stage_id: String,
         consume_quota_budget_now: Option<bool>,
+        legacy_discovery_override_policy: Option<String>,
+        legacy_discovery_override_reason: Option<String>,
     ) -> Result<RetryStagePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
@@ -818,11 +843,81 @@ impl MutationRoot {
             stage_id,
             consume_quota_budget_now: consume_quota_budget_now.unwrap_or(false),
             agent_execution_id: None,
+            legacy_discovery_override_policy: legacy_discovery_override_policy
+                .as_deref()
+                .map(parse_legacy_broad_discovery_policy)
+                .transpose()?,
+            legacy_discovery_override_reason,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
+        let legacy_discovery_override_id = match &commanded.result {
+            engine::command_handler::CommandResult::StageRetryScheduled {
+                legacy_discovery_override_id,
+                ..
+            } => legacy_discovery_override_id
+                .as_ref()
+                .map(|id| ID::from(id.clone())),
+            _ => None,
+        };
         Ok(RetryStagePayload {
             retried: true,
+            journal_id: ID::from(commanded.journal_id),
+            legacy_discovery_override_id,
+        })
+    }
+
+    async fn override_legacy_discovery_policy(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+        stage_id: String,
+        target_stage_execution_id: ID,
+        target_attempt_number: i64,
+        legacy_discovery_override_policy: String,
+        legacy_discovery_override_reason: String,
+    ) -> Result<OverrideLegacyDiscoveryPolicyPayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        if !mutation_allowed(&principal, MutationName::OverrideLegacyDiscoveryPolicy) {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller =
+            graphql_caller_with_request_id(ctx, &principal, "overrideLegacyDiscoveryPolicy");
+
+        let rid: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let target_stage_execution_id: StageExecutionId = target_stage_execution_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+
+        let cmd = Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
+            run_id: rid,
+            stage_id,
+            target_stage_execution_id,
+            target_attempt_number,
+            legacy_discovery_override_policy: parse_legacy_broad_discovery_policy(
+                &legacy_discovery_override_policy,
+            )?,
+            legacy_discovery_override_reason,
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let override_id = match commanded.result {
+            engine::command_handler::CommandResult::LegacyDiscoveryOverrideCreated {
+                override_id,
+            } => override_id,
+            _ => return Err(Error::new("Unexpected command result")),
+        };
+        Ok(OverrideLegacyDiscoveryPolicyPayload {
+            override_id: ID::from(override_id),
             journal_id: ID::from(commanded.journal_id),
         })
     }
@@ -1158,6 +1253,10 @@ mod tests {
         );
         assert_eq!(
             capability_id_for(MutationName::RetryStage),
+            domain::CapabilityToolId::StagesRetry
+        );
+        assert_eq!(
+            capability_id_for(MutationName::OverrideLegacyDiscoveryPolicy),
             domain::CapabilityToolId::StagesRetry
         );
         assert_eq!(

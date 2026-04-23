@@ -1,10 +1,12 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -17,8 +19,9 @@ use crate::release::{
 };
 use acp::AcpRuntimeManager;
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    artifacts, ideas, projections, scheduler, sessions, stages, validation, work_items,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
+    agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, legacy_discovery_overrides,
+    projections, scheduler, sessions, stages, validation, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind};
 use domain::agent::{
@@ -32,6 +35,13 @@ use domain::artifact_contracts::{
     SourceGenerationImportDecision, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
+use domain::discovery::{
+    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
+    ExpectedOutputSpec, ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy,
+    OutputDiscoveryDecision, OutputDiscoveryProvenance, OutputDiscoveryReason,
+    OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass, PrePromptExpectedOutputMetadata,
+    SourceGenerationOwner, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+};
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
 use domain::run::DeliveryConfiguration;
@@ -39,11 +49,13 @@ use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
 use crate::contracts::{
     artifact_format_for_companion_output, artifact_format_for_machine_output,
-    build_validation_failure_record, load_declared_output_bytes, validate_task_outputs,
-    DeclaredOutput, TaskValidationSummary,
+    build_captured_outputs_from_discovery_decisions, build_expected_output_specs,
+    build_validation_failure_record, validate_task_outputs, CapturedOutput, DeclaredOutput,
+    TaskValidationSummary,
 };
 use crate::event_bus::EventSender;
 use crate::failure_classifier::{classify_observation, observation_from_acp_error_message};
+use crate::git_manifest::generate_changed_files_manifest_if_declared;
 use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
 use crate::orchestrator::Orchestrator;
 use crate::recovery::RecoveryService;
@@ -829,7 +841,10 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
             .acp
             .execute(acp::ExecutionRequest {
                 run_id: RunId::new(),
+                stage_execution_id: None,
                 stage_id: format!("steward_{}", agent.id),
+                attempt_number: 1,
+                agent_execution_id: None,
                 agent_id: agent.id.clone(),
                 provider,
                 model: profile.model.clone(),
@@ -843,6 +858,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 worktree_write_enabled: false,
                 worktree_strategy: None,
                 expected_output_paths,
+                expected_outputs: Vec::new(),
                 keep_session_alive: false,
                 reuse_existing_session: false,
                 session_generation_id: None,
@@ -854,6 +870,8 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                         .to_string_lossy()
                         .into_owned(),
                 ),
+                legacy_broad_discovery_policy:
+                    domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -876,13 +894,182 @@ fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn materialize_declared_outputs_from_discovered_artifacts(
-    declared_outputs: &[DeclaredOutput],
+struct DeclaredOutputDiscoverySettlement {
+    decisions: Vec<OutputDiscoveryDecision>,
+    accepted_payloads: HashMap<String, Vec<u8>>,
+    idempotency_key: Option<String>,
+    accepted_aggregate_bytes: u64,
+    aggregate_cap_hit: bool,
+}
+
+fn build_declared_output_discovery_settlement(
+    expected_outputs: &[ExpectedOutputSpec],
     discovered_artifacts: &[acp::DiscoveredArtifact],
-) -> Result<()> {
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+) -> DeclaredOutputDiscoverySettlement {
+    let mut decisions = Vec::with_capacity(expected_outputs.len());
+    let mut accepted_payloads = HashMap::new();
+    let mut accepted_aggregate_bytes = 0u64;
+    let mut aggregate_cap_hit = false;
+
+    for spec in expected_outputs {
+        let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
+        let exact_path = find_exact_path_artifact_for_spec(discovered_artifacts, spec);
+        let candidate = if let Some(artifact) = envelope {
+            Some((
+                OutputDiscoveryReason::ProviderEnvelope,
+                OutputDiscoveryProvenance::ProviderEnvelope,
+                Some(artifact.source_kind),
+                provider_envelope_payload_ref(&spec.output_name),
+                artifact.content.clone(),
+                None,
+                None,
+            ))
+        } else if spec.source_generation_owner == SourceGenerationOwner::ControlPlane {
+            read_control_plane_generated_output(spec)
+        } else if let Some(artifact) = exact_path {
+            Some((
+                OutputDiscoveryReason::ExactPathChanged,
+                OutputDiscoveryProvenance::ExactPath,
+                Some(artifact.source_kind),
+                exact_path_payload_ref(&spec.output_name),
+                artifact.content.clone(),
+                artifact.source_path.clone(),
+                Some(ExpectedPathBaselineStatus::RegularContentCaptured),
+            ))
+        } else if spec.reuse_policy == OutputReusePolicy::AllowUnchangedExisting {
+            read_declared_reuse_policy_output(spec, pre_prompt_expected_outputs)
+        } else {
+            None
+        };
+
+        let Some((
+            reason,
+            provenance,
+            source_kind,
+            payload_ref,
+            bytes,
+            source_path,
+            baseline_status,
+        )) = candidate
+        else {
+            decisions.push(missing_output_decision(spec));
+            continue;
+        };
+
+        if matches!(
+            provenance,
+            OutputDiscoveryProvenance::ExactPath | OutputDiscoveryProvenance::DeclaredReusePolicy
+        ) {
+            if let Some((reason, baseline_status)) =
+                exact_path_rejection_for_spec(spec, source_path.as_deref())
+            {
+                decisions.push(rejected_output_decision(
+                    spec,
+                    reason,
+                    Some(provenance),
+                    source_path,
+                    Some(baseline_status),
+                    Some(bytes.len() as u64),
+                    Some(spec.max_bytes),
+                    None,
+                ));
+                continue;
+            }
+        }
+
+        if bytes.len() as u64 > spec.max_bytes {
+            decisions.push(rejected_output_decision(
+                spec,
+                oversized_reason_for_provenance(provenance, source_kind),
+                Some(provenance),
+                source_path,
+                baseline_status,
+                Some(bytes.len() as u64),
+                Some(spec.max_bytes),
+                None,
+            ));
+            continue;
+        }
+
+        let aggregate_after = accepted_aggregate_bytes.saturating_add(bytes.len() as u64);
+        if aggregate_after > spec.aggregate_acceptance_cap_bytes {
+            aggregate_cap_hit = true;
+            decisions.push(rejected_output_decision(
+                spec,
+                OutputDiscoveryReason::AggregateExactOutputCap,
+                Some(provenance),
+                source_path,
+                baseline_status,
+                Some(bytes.len() as u64),
+                Some(spec.max_bytes),
+                Some(accepted_aggregate_bytes),
+            ));
+            continue;
+        }
+
+        accepted_aggregate_bytes = aggregate_after;
+        let digest = sha256_digest(&bytes);
+        accepted_payloads.insert(payload_ref.clone(), bytes.clone());
+        decisions.push(OutputDiscoveryDecision {
+            output_name: spec.output_name.clone(),
+            output_role: spec.output_role,
+            target_path: spec.target_path.clone(),
+            companion_of: spec.companion_of.clone(),
+            status: OutputDiscoveryStatus::Accepted,
+            reason,
+            provenance: Some(provenance),
+            canonical_path: canonical_path_for_decision(source_path.as_deref(), &spec.target_path),
+            root_class: spec.authorized_roots.first().map(|root| root.root_class),
+            baseline_status,
+            size_bytes: Some(bytes.len() as u64),
+            content_digest: Some(digest.clone()),
+            max_bytes_applied: Some(spec.max_bytes),
+            aggregate_bytes_after_acceptance: Some(aggregate_after),
+            accepted_payload_ref: Some(payload_ref),
+            accepted_bytes_sha256: Some(digest),
+            generated_by: (spec.source_generation_owner == SourceGenerationOwner::ControlPlane)
+                .then_some("control_plane".to_string()),
+            diagnostics: Default::default(),
+            decision_at: chrono::Utc::now(),
+        });
+    }
+
+    DeclaredOutputDiscoverySettlement {
+        decisions,
+        accepted_payloads,
+        idempotency_key: discovery_settlement_idempotency_key(pre_prompt_expected_outputs),
+        accepted_aggregate_bytes,
+        aggregate_cap_hit,
+    }
+}
+
+fn discovery_settlement_idempotency_key(
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+) -> Option<String> {
+    pre_prompt_expected_outputs.first().map(|metadata| {
+        format!(
+            "{}:{}",
+            metadata.agent_execution_id, metadata.discovery_generation_id
+        )
+    })
+}
+
+fn settle_agent_outputs_from_discovery_decisions(
+    declared_outputs: &[DeclaredOutput],
+    expected_outputs: &[ExpectedOutputSpec],
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+) -> Result<DeclaredOutputDiscoverySettlement> {
+    let settlement = build_declared_output_discovery_settlement(
+        expected_outputs,
+        discovered_artifacts,
+        pre_prompt_expected_outputs,
+    );
     for declared in declared_outputs {
-        if let Some(artifact) = find_discovered_artifact_for_output(
+        if let Some(artifact) = find_accepted_provider_artifact_for_output(
             discovered_artifacts,
+            &settlement.decisions,
             &declared.output_name,
             &declared.target_path,
         ) {
@@ -893,8 +1080,9 @@ fn materialize_declared_outputs_from_discovered_artifacts(
             declared.companion_output_name.as_deref(),
             declared.companion_path.as_deref(),
         ) {
-            if let Some(artifact) = find_discovered_artifact_for_output(
+            if let Some(artifact) = find_accepted_provider_artifact_for_output(
                 discovered_artifacts,
+                &settlement.decisions,
                 companion_name,
                 companion_path,
             ) {
@@ -903,7 +1091,382 @@ fn materialize_declared_outputs_from_discovered_artifacts(
         }
     }
 
-    Ok(())
+    Ok(settlement)
+}
+
+fn exact_path_rejection_for_spec(
+    spec: &ExpectedOutputSpec,
+    source_path: Option<&str>,
+) -> Option<(OutputDiscoveryReason, ExpectedPathBaselineStatus)> {
+    let source_path = source_path?;
+    let source = Path::new(source_path);
+    let source_metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return Some((
+                OutputDiscoveryReason::ReadError,
+                ExpectedPathBaselineStatus::Unreadable,
+            ));
+        }
+    };
+    let source_is_symlink = source_metadata.file_type().is_symlink();
+    let canonical_source = match std::fs::canonicalize(source) {
+        Ok(path) => path,
+        Err(_) => {
+            return Some((
+                OutputDiscoveryReason::ReadError,
+                ExpectedPathBaselineStatus::Unreadable,
+            ));
+        }
+    };
+    if !canonical_source.is_file() {
+        return Some((
+            OutputDiscoveryReason::NotRegularFile,
+            ExpectedPathBaselineStatus::NotRegularFile,
+        ));
+    }
+
+    if authorized_root_class_for_canonical_path(spec, &canonical_source).is_some() {
+        return None;
+    }
+
+    if source_is_symlink {
+        return Some((
+            OutputDiscoveryReason::SymlinkEscape,
+            ExpectedPathBaselineStatus::SymlinkEscape,
+        ));
+    }
+
+    if spec
+        .authorized_roots
+        .iter()
+        .any(|root| root.root_class == OutputRootClass::ChainworksMetaRoot)
+        && path_mentions_chainworks_run(&canonical_source)
+    {
+        return Some((
+            OutputDiscoveryReason::WrongRunMetaRoot,
+            ExpectedPathBaselineStatus::UnauthorizedRoot,
+        ));
+    }
+
+    Some((
+        OutputDiscoveryReason::UnauthorizedRoot,
+        ExpectedPathBaselineStatus::UnauthorizedRoot,
+    ))
+}
+
+fn authorized_root_class_for_canonical_path(
+    spec: &ExpectedOutputSpec,
+    canonical_path: &Path,
+) -> Option<OutputRootClass> {
+    spec.authorized_roots.iter().find_map(|root| {
+        let root_path = Path::new(&root.root_path);
+        let canonical_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| {
+            if root_path.is_absolute() {
+                root_path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(root_path))
+                    .unwrap_or_else(|_| root_path.to_path_buf())
+            }
+        });
+        canonical_path
+            .starts_with(&canonical_root)
+            .then_some(root.root_class)
+    })
+}
+
+fn path_mentions_chainworks_run(path: &Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    components
+        .windows(2)
+        .any(|window| window == [".chainworks", "runs"])
+}
+
+fn declared_output_has_accepted_discovery_decision(
+    decisions: Option<&[OutputDiscoveryDecision]>,
+    output_name: &str,
+    output_role: domain::discovery::ExpectedOutputRole,
+) -> bool {
+    decisions.map_or(true, |decisions| {
+        decisions.iter().any(|decision| {
+            decision.output_name == output_name
+                && decision.output_role == output_role
+                && decision.status == OutputDiscoveryStatus::Accepted
+        })
+    })
+}
+
+fn find_provider_envelope_for_spec<'a>(
+    discovered_artifacts: &'a [acp::DiscoveredArtifact],
+    spec: &ExpectedOutputSpec,
+) -> Option<&'a acp::DiscoveredArtifact> {
+    discovered_artifacts.iter().find(|artifact| {
+        artifact.source_path.is_none()
+            && matches!(
+                artifact.source_kind,
+                acp::DiscoveredArtifactSourceKind::ProviderEnvelope
+                    | acp::DiscoveredArtifactSourceKind::ChainworksOutput
+            )
+            && (artifact.name == spec.output_name || artifact.name == spec.target_path)
+    })
+}
+
+fn find_exact_path_artifact_for_spec<'a>(
+    discovered_artifacts: &'a [acp::DiscoveredArtifact],
+    spec: &ExpectedOutputSpec,
+) -> Option<&'a acp::DiscoveredArtifact> {
+    discovered_artifacts.iter().find(|artifact| {
+        artifact
+            .source_path
+            .as_deref()
+            .is_some_and(|source_path| source_path == spec.target_path)
+    })
+}
+
+fn read_control_plane_generated_output(
+    spec: &ExpectedOutputSpec,
+) -> Option<(
+    OutputDiscoveryReason,
+    OutputDiscoveryProvenance,
+    Option<acp::DiscoveredArtifactSourceKind>,
+    String,
+    Vec<u8>,
+    Option<String>,
+    Option<ExpectedPathBaselineStatus>,
+)> {
+    let metadata = std::fs::metadata(&spec.target_path).ok()?;
+    if metadata.len() > spec.max_bytes {
+        return None;
+    }
+    let bytes = std::fs::read(&spec.target_path).ok()?;
+    Some((
+        OutputDiscoveryReason::ControlPlaneGenerated,
+        OutputDiscoveryProvenance::ControlPlaneGenerated,
+        None,
+        control_plane_payload_ref(&spec.output_name),
+        bytes,
+        Some(spec.target_path.clone()),
+        Some(ExpectedPathBaselineStatus::RegularContentCaptured),
+    ))
+}
+
+fn read_declared_reuse_policy_output(
+    spec: &ExpectedOutputSpec,
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+) -> Option<(
+    OutputDiscoveryReason,
+    OutputDiscoveryProvenance,
+    Option<acp::DiscoveredArtifactSourceKind>,
+    String,
+    Vec<u8>,
+    Option<String>,
+    Option<ExpectedPathBaselineStatus>,
+)> {
+    let metadata = pre_prompt_expected_outputs.iter().find(|metadata| {
+        metadata.output_name == spec.output_name
+            && metadata.target_path == spec.target_path
+            && metadata.baseline_status == ExpectedPathBaselineStatus::RegularContentCaptured
+    })?;
+    let pre_prompt_digest = metadata.content_digest.as_deref()?;
+    if exact_path_rejection_for_spec(spec, Some(&spec.target_path)).is_some() {
+        return None;
+    }
+    if std::fs::metadata(&spec.target_path)
+        .ok()
+        .is_none_or(|metadata| metadata.len() > spec.max_bytes)
+    {
+        return None;
+    }
+    let bytes = std::fs::read(&spec.target_path).ok()?;
+    if sha256_digest(&bytes) != pre_prompt_digest {
+        return None;
+    }
+    Some((
+        OutputDiscoveryReason::DeclaredReusePolicy,
+        OutputDiscoveryProvenance::DeclaredReusePolicy,
+        None,
+        declared_reuse_policy_payload_ref(&spec.output_name),
+        bytes,
+        Some(spec.target_path.clone()),
+        Some(metadata.baseline_status),
+    ))
+}
+
+fn find_accepted_provider_artifact_for_output<'a>(
+    discovered_artifacts: &'a [acp::DiscoveredArtifact],
+    decisions: &[OutputDiscoveryDecision],
+    output_name: &str,
+    target_path: &str,
+) -> Option<&'a acp::DiscoveredArtifact> {
+    let decision = decisions.iter().find(|decision| {
+        decision.output_name == output_name
+            && decision.status == OutputDiscoveryStatus::Accepted
+            && decision.provenance == Some(OutputDiscoveryProvenance::ProviderEnvelope)
+    })?;
+    let payload_ref = decision.accepted_payload_ref.as_deref()?;
+    (payload_ref == provider_envelope_payload_ref(output_name)).then(|| {
+        find_discovered_artifact_for_output(discovered_artifacts, output_name, target_path)
+            .filter(|artifact| artifact.source_path.is_none())
+    })?
+}
+
+fn missing_output_decision(spec: &ExpectedOutputSpec) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: spec.output_name.clone(),
+        output_role: spec.output_role,
+        target_path: spec.target_path.clone(),
+        companion_of: spec.companion_of.clone(),
+        status: OutputDiscoveryStatus::Missing,
+        reason: OutputDiscoveryReason::MissingAfterPrompt,
+        provenance: None,
+        canonical_path: None,
+        root_class: spec.authorized_roots.first().map(|root| root.root_class),
+        baseline_status: None,
+        size_bytes: None,
+        content_digest: None,
+        max_bytes_applied: Some(spec.max_bytes),
+        aggregate_bytes_after_acceptance: None,
+        accepted_payload_ref: None,
+        accepted_bytes_sha256: None,
+        generated_by: None,
+        diagnostics: Default::default(),
+        decision_at: chrono::Utc::now(),
+    }
+}
+
+fn rejected_output_decision(
+    spec: &ExpectedOutputSpec,
+    reason: OutputDiscoveryReason,
+    provenance: Option<OutputDiscoveryProvenance>,
+    source_path: Option<String>,
+    baseline_status: Option<ExpectedPathBaselineStatus>,
+    size_bytes: Option<u64>,
+    max_bytes_applied: Option<u64>,
+    aggregate_bytes_after_acceptance: Option<u64>,
+) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: spec.output_name.clone(),
+        output_role: spec.output_role,
+        target_path: spec.target_path.clone(),
+        companion_of: spec.companion_of.clone(),
+        status: OutputDiscoveryStatus::Rejected,
+        reason,
+        provenance,
+        canonical_path: canonical_path_for_decision(source_path.as_deref(), &spec.target_path),
+        root_class: spec.authorized_roots.first().map(|root| root.root_class),
+        baseline_status,
+        size_bytes,
+        content_digest: None,
+        max_bytes_applied,
+        aggregate_bytes_after_acceptance,
+        accepted_payload_ref: None,
+        accepted_bytes_sha256: None,
+        generated_by: None,
+        diagnostics: Default::default(),
+        decision_at: chrono::Utc::now(),
+    }
+}
+
+fn oversized_reason_for_provenance(
+    provenance: OutputDiscoveryProvenance,
+    source_kind: Option<acp::DiscoveredArtifactSourceKind>,
+) -> OutputDiscoveryReason {
+    match (provenance, source_kind) {
+        (
+            OutputDiscoveryProvenance::ProviderEnvelope,
+            Some(acp::DiscoveredArtifactSourceKind::ChainworksOutput),
+        ) => OutputDiscoveryReason::ChainworksOutputOversized,
+        (OutputDiscoveryProvenance::ProviderEnvelope, _) => {
+            OutputDiscoveryReason::ProviderEnvelopeOversized
+        }
+        _ => OutputDiscoveryReason::Oversized,
+    }
+}
+
+fn canonical_path_for_decision(source_path: Option<&str>, target_path: &str) -> Option<String> {
+    let path = source_path.unwrap_or(target_path);
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn provider_envelope_payload_ref(output_name: &str) -> String {
+    format!("provider_envelope:{output_name}")
+}
+
+fn exact_path_payload_ref(output_name: &str) -> String {
+    format!("exact_path:{output_name}")
+}
+
+fn declared_reuse_policy_payload_ref(output_name: &str) -> String {
+    format!("declared_reuse_policy:{output_name}")
+}
+
+fn control_plane_payload_ref(output_name: &str) -> String {
+    format!("control_plane:{output_name}")
+}
+
+fn bounded_meta_root_artifact_paths(
+    chainworks_meta_root: Option<&str>,
+) -> domain::discovery::BoundedMetaRootDiscovery {
+    let Some(meta_root) = chainworks_meta_root.filter(|root| !root.trim().is_empty()) else {
+        warn!("P053 bounded meta-root discovery skipped: chainworks_meta_root absent");
+        return domain::discovery::BoundedMetaRootDiscovery {
+            root_path: String::new(),
+            artifact_paths: Vec::new(),
+            files_visited: 0,
+            total_bytes: 0,
+            latency_ms: None,
+            truncated_by_file_cap: false,
+            truncated_by_file_size: false,
+            truncated_by_total_bytes: false,
+            warnings: vec!["meta_root_absent".to_string()],
+        };
+    };
+    let meta_root_started = Instant::now();
+    let mut discovery = DiscoveryFilesystem::discover_bounded_meta_root_artifacts(meta_root);
+    let latency_ms = meta_root_started.elapsed().as_millis() as u64;
+    discovery.latency_ms = Some(latency_ms);
+    info!(
+        chainworks_meta_root = %discovery.root_path,
+        acp_meta_root_discovery_latency_ms = latency_ms,
+        files_visited = discovery.files_visited,
+        total_bytes = discovery.total_bytes,
+        truncated_by_file_cap = discovery.truncated_by_file_cap,
+        truncated_by_file_size = discovery.truncated_by_file_size,
+        truncated_by_total_bytes = discovery.truncated_by_total_bytes,
+        "P053 bounded meta-root discovery measured"
+    );
+    if discovery.truncated_by_file_cap
+        || discovery.truncated_by_file_size
+        || discovery.truncated_by_total_bytes
+    {
+        warn!(
+            chainworks_meta_root = %discovery.root_path,
+            files_visited = discovery.files_visited,
+            total_bytes = discovery.total_bytes,
+            truncated_by_file_cap = discovery.truncated_by_file_cap,
+            truncated_by_file_size = discovery.truncated_by_file_size,
+            truncated_by_total_bytes = discovery.truncated_by_total_bytes,
+            "P053 bounded meta-root discovery hit caps"
+        );
+    }
+    for warning in &discovery.warnings {
+        warn!(
+            chainworks_meta_root = %discovery.root_path,
+            warning = %warning,
+            "P053 bounded meta-root discovery warning"
+        );
+    }
+    discovery
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn degraded_policy_allows_valid_failed_outputs(
@@ -1033,6 +1596,147 @@ fn runtime_facts_for_execution_result(
         );
     }
     facts
+}
+
+struct ExecutionDiscoveryMetrics {
+    acp_pre_initialize_local_latency_ms: Option<u64>,
+    acp_initialize_latency_ms: Option<u64>,
+    acp_session_new_latency_ms: Option<u64>,
+    acp_prompt_duration_ms: Option<u64>,
+    acp_pre_prompt_metadata_latency_ms: Option<u64>,
+    acp_pre_prompt_metadata_timeout: bool,
+    acp_pre_prompt_metadata_digest_bytes: u64,
+    acp_expected_output_spec_count: usize,
+    acp_control_plane_manifest_latency_ms: Option<u64>,
+    acp_git_changed_files_latency_ms: Option<u64>,
+    acp_git_manifest_status: Option<String>,
+    acp_exact_output_acceptance_latency_ms: Option<u64>,
+    acp_exact_output_acceptance_timeout: bool,
+    acp_exact_output_aggregate_bytes: u64,
+    acp_exact_output_aggregate_cap_hit: bool,
+    acp_legacy_broad_discovery_policy: String,
+    acp_legacy_broad_discovery_used: bool,
+    acp_discovery_override_status: String,
+    acp_legacy_broad_discovery_truncation_reason: Option<String>,
+    acp_resume_discovery_warning: Option<String>,
+    acp_cap_validation_sample_size: Option<u64>,
+    acp_cap_validation_p90_output_bytes: Option<u64>,
+    acp_cap_validation_p90_aggregate_bytes: Option<u64>,
+}
+
+fn discovery_diagnostics_for_execution_result(
+    agent_exec_id: domain::ids::AgentExecutionId,
+    decisions: &[OutputDiscoveryDecision],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    bounded_meta_root_discovery: Option<domain::discovery::BoundedMetaRootDiscovery>,
+    metrics: ExecutionDiscoveryMetrics,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AgentExecutionDiscoveryDiagnostics {
+    let acp_meta_root_discovery_latency_ms = bounded_meta_root_discovery
+        .as_ref()
+        .and_then(|discovery| discovery.latency_ms);
+    let payload = DiscoveryDiagnosticsV1 {
+        schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
+        agent_execution_id: agent_exec_id.to_string(),
+        decisions: decisions.to_vec(),
+        pre_prompt_expected_outputs: pre_prompt_expected_outputs.to_vec(),
+        legacy_broad_discovery_used: metrics.acp_legacy_broad_discovery_used,
+        bounded_meta_root_discovery,
+        git_manifest_status: metrics.acp_git_manifest_status.clone(),
+        resume_warnings: metrics
+            .acp_resume_discovery_warning
+            .iter()
+            .cloned()
+            .collect(),
+        warnings: Vec::new(),
+        generated_at: now,
+        acp_pre_initialize_local_latency_ms: metrics.acp_pre_initialize_local_latency_ms,
+        acp_initialize_latency_ms: metrics.acp_initialize_latency_ms,
+        acp_session_new_latency_ms: metrics.acp_session_new_latency_ms,
+        acp_prompt_duration_ms: metrics.acp_prompt_duration_ms,
+        acp_pre_prompt_metadata_latency_ms: metrics.acp_pre_prompt_metadata_latency_ms,
+        acp_pre_prompt_metadata_timeout: Some(metrics.acp_pre_prompt_metadata_timeout),
+        acp_pre_prompt_metadata_digest_bytes: Some(metrics.acp_pre_prompt_metadata_digest_bytes),
+        acp_expected_output_spec_count: Some(metrics.acp_expected_output_spec_count as u64),
+        acp_control_plane_manifest_latency_ms: metrics.acp_control_plane_manifest_latency_ms,
+        acp_exact_output_acceptance_latency_ms: metrics.acp_exact_output_acceptance_latency_ms,
+        acp_meta_root_discovery_latency_ms,
+        acp_git_changed_files_latency_ms: metrics.acp_git_changed_files_latency_ms,
+        acp_expected_outputs_found_count: None,
+        acp_expected_outputs_missing_count: None,
+        acp_expected_outputs_stale_count: None,
+        acp_expected_outputs_rejected_count: None,
+        acp_meta_discovery_truncated: None,
+        acp_meta_discovery_truncation_reason: None,
+        acp_legacy_broad_discovery_policy: Some(metrics.acp_legacy_broad_discovery_policy),
+        acp_legacy_broad_discovery_used: Some(metrics.acp_legacy_broad_discovery_used),
+        acp_git_manifest_status: metrics.acp_git_manifest_status,
+        acp_resume_discovery_warning: metrics.acp_resume_discovery_warning,
+        acp_discovery_schema_version: Some(DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string()),
+        acp_discovery_override_status: Some(metrics.acp_discovery_override_status),
+        acp_missing_required_output_count: None,
+        acp_rejected_output_count: None,
+        acp_stale_output_count: None,
+        acp_exact_output_acceptance_timeout: Some(metrics.acp_exact_output_acceptance_timeout),
+        acp_exact_output_aggregate_bytes: Some(metrics.acp_exact_output_aggregate_bytes),
+        acp_exact_output_aggregate_cap_hit: Some(metrics.acp_exact_output_aggregate_cap_hit),
+        acp_cap_validation_sample_size: metrics.acp_cap_validation_sample_size,
+        acp_cap_validation_p90_output_bytes: metrics.acp_cap_validation_p90_output_bytes,
+        acp_cap_validation_p90_aggregate_bytes: metrics.acp_cap_validation_p90_aggregate_bytes,
+        acp_legacy_broad_discovery_timeout_ms: Some(5_000),
+        acp_legacy_broad_discovery_truncation_reason:
+            metrics.acp_legacy_broad_discovery_truncation_reason,
+        acp_reconciliation_pending: Some(false),
+    };
+    AgentExecutionDiscoveryDiagnostics::from_payload(payload, now)
+}
+
+fn legacy_broad_discovery_policy_name(
+    policy: domain::discovery::LegacyBroadDiscoveryPolicy,
+) -> String {
+    match policy {
+        domain::discovery::LegacyBroadDiscoveryPolicy::Disabled => "disabled".to_string(),
+        domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn => {
+            "workflow_opt_in".to_string()
+        }
+    }
+}
+
+fn legacy_broad_discovery_truncation_reason(
+    snapshot: Option<&domain::discovery::LegacyBroadDiscoverySnapshot>,
+) -> Option<String> {
+    let snapshot = snapshot?;
+    if snapshot.timed_out {
+        Some("timeout".to_string())
+    } else if snapshot.truncated_by_file_cap {
+        Some("file_cap".to_string())
+    } else if snapshot.truncated_by_file_size {
+        Some("per_file_bytes".to_string())
+    } else if snapshot.truncated_by_total_bytes {
+        Some("total_bytes".to_string())
+    } else {
+        None
+    }
+}
+
+fn load_p053_cap_validation_metrics(
+    workspace_root: &str,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let path = std::path::Path::new(workspace_root)
+        .join("docs/proposals/053.review/cap-validation.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (None, None, None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None, None);
+    };
+    (
+        value["sampled_execution_ids"]
+            .as_array()
+            .map(|items| items.len() as u64),
+        value["per_output_bytes_p90"].as_u64(),
+        value["aggregate_bytes_p90"].as_u64(),
+    )
 }
 
 fn session_reuse_reason_for_policy_decision(decision: &SessionPolicyDecision) -> String {
@@ -1882,6 +2586,13 @@ impl BackgroundExecutor {
                 let worktree_write_enabled =
                     payload["worktree_write_enabled"].as_bool().unwrap_or(false);
                 let worktree_strategy = payload["worktree_strategy"].as_str().map(String::from);
+                let mut legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy = payload
+                    .get("legacy_broad_discovery_policy")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("parse legacy_broad_discovery_policy: {e}"))?
+                    .unwrap_or_default();
                 let session_reuse_scope = payload["session_reuse_scope"].as_str().map(String::from);
                 let session_family_id = payload["session_family_id"].as_str().map(String::from);
                 let declared_outputs: Vec<DeclaredOutput> = match payload
@@ -1902,6 +2613,13 @@ impl BackgroundExecutor {
                             .chain(declared.companion_path.clone().into_iter())
                     })
                     .collect();
+                let expected_outputs = build_expected_output_specs(
+                    &declared_outputs,
+                    &run.workspace_root,
+                    run.worktree_root.as_deref(),
+                    run.chainworks_meta_root.as_deref(),
+                    worktree_write_enabled,
+                );
 
                 let effective_working_directory = if worktree_write_enabled
                     || matches!(
@@ -2262,11 +2980,55 @@ impl BackgroundExecutor {
                         .await;
                 }
 
+                let stage_attempt_number = stages::find_by_id(&self.pool, stage_execution_id)
+                    .await?
+                    .map(|stage| stage.attempt_number)
+                    .unwrap_or(1);
+                let mut discovery_override_status = if legacy_broad_discovery_policy
+                    .allows_broad_discovery()
+                {
+                    "workflow_opt_in".to_string()
+                } else {
+                    "not_requested".to_string()
+                };
+                if !legacy_broad_discovery_policy.allows_broad_discovery() {
+                    let mut tx = db::pool::begin_immediate_with_retry(
+                        &self.pool,
+                        "executor.consume_legacy_discovery_override",
+                    )
+                    .await?;
+                    if let Some(override_row) =
+                        legacy_discovery_overrides::consume_pending_for_stage_tx(
+                            &mut tx,
+                            run_id,
+                            &stage_id,
+                            stage_execution_id,
+                            stage_attempt_number,
+                        )
+                        .await?
+                    {
+                        legacy_broad_discovery_policy = override_row.requested_policy;
+                        discovery_override_status = "consumed".to_string();
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            stage_execution_id = %stage_execution_id,
+                            attempt = stage_attempt_number,
+                            override_id = %override_row.override_id,
+                            "P053 legacy broad discovery override consumed for this prompt"
+                        );
+                    }
+                    tx.commit().await?;
+                }
+
                 let estimated_prompt_tokens =
                     std::cmp::max(1_i64, (prompt.chars().count() as i64) / 4);
                 let mut req = acp::ExecutionRequest {
                     run_id,
+                    stage_execution_id: Some(stage_execution_id.to_string()),
                     stage_id: stage_id.clone(),
+                    attempt_number: u32::try_from(stage_attempt_number).unwrap_or(1),
+                    agent_execution_id: Some(agent_exec_id.to_string()),
                     agent_id: agent_id.clone(),
                     provider: provider.clone(),
                     model: model.clone(),
@@ -2277,6 +3039,7 @@ impl BackgroundExecutor {
                     worktree_write_enabled,
                     worktree_strategy,
                     expected_output_paths,
+                    expected_outputs: expected_outputs.clone(),
                     keep_session_alive: policy_decision.is_some(),
                     reuse_existing_session: policy_decision
                         .as_ref()
@@ -2290,6 +3053,7 @@ impl BackgroundExecutor {
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
                     mcp_servers: mcp_resolution.payloads,
                     chainworks_meta_root: run.chainworks_meta_root.clone(),
+                    legacy_broad_discovery_policy,
                 };
                 // Runtime event: session starting
                 let _ = self
@@ -2496,12 +3260,113 @@ impl BackgroundExecutor {
                     .await?;
                 }
 
-                if !declared_outputs.is_empty() {
-                    materialize_declared_outputs_from_discovered_artifacts(
+                let mut acp_control_plane_manifest_latency_ms: Option<u64> = None;
+                let mut acp_git_changed_files_latency_ms: Option<u64> = None;
+                let mut acp_git_manifest_status: Option<String> = None;
+                let mut acp_exact_output_acceptance_latency_ms: Option<u64> = None;
+                let mut acp_resume_discovery_warning: Option<String> = None;
+                let declared_output_settlement = if !declared_outputs.is_empty() {
+                    let manifest_started = Instant::now();
+                    match generate_changed_files_manifest_if_declared(
                         &declared_outputs,
+                        Some(effective_working_directory.as_str()),
+                        worktree_write_enabled,
+                    )
+                    .await
+                    {
+                        Ok(status) => {
+                            acp_git_manifest_status = status.map(|status| {
+                                serde_json::to_value(status)
+                                    .ok()
+                                    .and_then(|value| value.as_str().map(str::to_string))
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            });
+                        }
+                        Err(error) => {
+                            acp_git_manifest_status = Some("command_failed".to_string());
+                            acp_resume_discovery_warning =
+                                Some("git_manifest_generation_failed".to_string());
+                            error!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                error = %error,
+                                "Failed to generate changed-files manifest"
+                            );
+                        }
+                    }
+                    let manifest_latency_ms = manifest_started.elapsed().as_millis() as u64;
+                    acp_control_plane_manifest_latency_ms = Some(manifest_latency_ms);
+                    acp_git_changed_files_latency_ms = Some(manifest_latency_ms);
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        acp_control_plane_manifest_latency_ms = manifest_latency_ms,
+                        acp_git_changed_files_latency_ms = manifest_latency_ms,
+                        acp_git_manifest_status = acp_git_manifest_status.as_deref().unwrap_or("unknown"),
+                        "P053 control-plane manifest generation measured"
+                    );
+                    let exact_output_acceptance_started = Instant::now();
+                    let settlement = settle_agent_outputs_from_discovery_decisions(
+                        &declared_outputs,
+                        &expected_outputs,
                         &result.discovered_artifacts,
+                        &result.pre_prompt_expected_outputs,
                     )?;
-                }
+                    let found_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
+                        .count();
+                    let missing_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.status == OutputDiscoveryStatus::Missing)
+                        .count();
+                    let stale_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| {
+                            decision.reason == OutputDiscoveryReason::StaleExpectedOutput
+                        })
+                        .count();
+                    let rejected_count = settlement
+                        .decisions
+                        .iter()
+                        .filter(|decision| decision.status == OutputDiscoveryStatus::Rejected)
+                        .count();
+                    let exact_output_acceptance_latency_ms =
+                        exact_output_acceptance_started.elapsed().as_millis() as u64;
+                    acp_exact_output_acceptance_latency_ms =
+                        Some(exact_output_acceptance_latency_ms);
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        acp_exact_output_acceptance_latency_ms = exact_output_acceptance_latency_ms,
+                        acp_expected_outputs_found_count = found_count,
+                        acp_expected_outputs_missing_count = missing_count,
+                        acp_expected_outputs_stale_count = stale_count,
+                        acp_expected_outputs_rejected_count = rejected_count,
+                        acp_exact_output_aggregate_bytes = settlement.accepted_aggregate_bytes,
+                        acp_exact_output_aggregate_cap_hit = settlement.aggregate_cap_hit,
+                        acp_reconciliation_pending = false,
+                        "P053 exact-output acceptance measured"
+                    );
+                    if let Some(idempotency_key) = settlement.idempotency_key.as_deref() {
+                        debug!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            discovery_settlement_idempotency_key = %idempotency_key,
+                            "P053 discovery settlement completed"
+                        );
+                    }
+                    Some(settlement)
+                } else {
+                    None
+                };
 
                 if let (Some(decision), Some(provider_session_id)) = (
                     policy_decision.as_ref(),
@@ -2577,6 +3442,9 @@ impl BackgroundExecutor {
                 }
                 let declared_artifacts = self.prepare_declared_output_artifacts(
                     &declared_outputs,
+                    declared_output_settlement
+                        .as_ref()
+                        .map(|settlement| settlement.decisions.as_slice()),
                     run_id,
                     &stage_id,
                     &agent_id,
@@ -2601,7 +3469,17 @@ impl BackgroundExecutor {
                     .await?;
                 persisted_artifacts.extend(undeclared_artifacts);
 
-                for path in &result.artifact_paths {
+                let supplemental_meta_root_artifact_paths =
+                    bounded_meta_root_artifact_paths(run.chainworks_meta_root.as_deref());
+                let supplemental_meta_root_discovery =
+                    (!supplemental_meta_root_artifact_paths.root_path.is_empty()
+                        || !supplemental_meta_root_artifact_paths.warnings.is_empty())
+                    .then_some(supplemental_meta_root_artifact_paths.clone());
+                for path in result
+                    .artifact_paths
+                    .iter()
+                    .chain(supplemental_meta_root_artifact_paths.artifact_paths.iter())
+                {
                     if persisted_paths.contains(path) {
                         continue;
                     }
@@ -2622,9 +3500,68 @@ impl BackgroundExecutor {
                     }
                 }
 
+                let captured_declared_outputs = declared_output_settlement
+                    .as_ref()
+                    .map(|settlement| {
+                        build_captured_outputs_from_discovery_decisions(
+                            &declared_outputs,
+                            &settlement.decisions,
+                            &settlement.accepted_payloads,
+                        )
+                    })
+                    .unwrap_or_default();
+                let (acp_cap_validation_sample_size, acp_cap_validation_p90_output_bytes, acp_cap_validation_p90_aggregate_bytes) =
+                    load_p053_cap_validation_metrics(&run.workspace_root);
+                let discovery_diagnostics = declared_output_settlement.as_ref().map(|settlement| {
+                    discovery_diagnostics_for_execution_result(
+                        agent_exec_id,
+                        &settlement.decisions,
+                        &result.pre_prompt_expected_outputs,
+                        supplemental_meta_root_discovery.clone(),
+                        ExecutionDiscoveryMetrics {
+                            acp_pre_initialize_local_latency_ms: result
+                                .acp_pre_initialize_local_latency_ms,
+                            acp_initialize_latency_ms: result.acp_initialize_latency_ms,
+                            acp_session_new_latency_ms: result.acp_session_new_latency_ms,
+                            acp_prompt_duration_ms: result.acp_prompt_duration_ms,
+                            acp_pre_prompt_metadata_latency_ms: result
+                                .acp_pre_prompt_metadata_latency_ms,
+                            acp_pre_prompt_metadata_timeout: result
+                                .acp_pre_prompt_metadata_timeout,
+                            acp_pre_prompt_metadata_digest_bytes: result
+                                .acp_pre_prompt_metadata_digest_bytes,
+                            acp_expected_output_spec_count: expected_outputs.len(),
+                            acp_control_plane_manifest_latency_ms,
+                            acp_git_changed_files_latency_ms,
+                            acp_git_manifest_status: acp_git_manifest_status.clone(),
+                            acp_exact_output_acceptance_latency_ms,
+                            acp_exact_output_acceptance_timeout: false,
+                            acp_exact_output_aggregate_bytes: settlement
+                                .accepted_aggregate_bytes,
+                            acp_exact_output_aggregate_cap_hit: settlement.aggregate_cap_hit,
+                            acp_legacy_broad_discovery_policy: legacy_broad_discovery_policy_name(
+                                req.legacy_broad_discovery_policy,
+                            ),
+                            acp_legacy_broad_discovery_used: req
+                                .legacy_broad_discovery_policy
+                                .allows_broad_discovery(),
+                            acp_discovery_override_status: discovery_override_status.clone(),
+                            acp_legacy_broad_discovery_truncation_reason:
+                                legacy_broad_discovery_truncation_reason(
+                                    result.legacy_broad_discovery_snapshot.as_ref(),
+                                ),
+                            acp_resume_discovery_warning: acp_resume_discovery_warning.clone(),
+                            acp_cap_validation_sample_size,
+                            acp_cap_validation_p90_output_bytes,
+                            acp_cap_validation_p90_aggregate_bytes,
+                        },
+                        completed_at,
+                    )
+                });
                 let import_result = self
                     .import_declared_contract_outputs(
                         &declared_outputs,
+                        &captured_declared_outputs,
                         &persisted_artifacts,
                         &declared_artifacts,
                         stage_execution_id,
@@ -2638,6 +3575,7 @@ impl BackgroundExecutor {
                             result.transcript_text.as_deref(),
                         ),
                         result.close_diagnostic.as_ref(),
+                        discovery_diagnostics.as_ref(),
                         &stage_degraded_output_policy,
                         completed_at,
                     )
@@ -3337,6 +4275,7 @@ impl BackgroundExecutor {
     fn prepare_declared_output_artifacts(
         &self,
         declared_outputs: &[DeclaredOutput],
+        discovery_decisions: Option<&[OutputDiscoveryDecision]>,
         run_id: RunId,
         stage_id: &str,
         agent_id: &str,
@@ -3348,25 +4287,31 @@ impl BackgroundExecutor {
         let mut artifacts_out = Vec::new();
         for declared in declared_outputs {
             let default_contract_id = format!("{}.output", provider);
-            if let Some(artifact) = self.prepare_artifact_if_present(
-                &declared.target_path,
-                run_id,
-                stage_id,
-                agent_id,
-                declared_machine_artifact_name(declared),
-                declared
-                    .schema
-                    .as_ref()
-                    .map(|schema| schema.contract_id.as_str())
-                    .unwrap_or(default_contract_id.as_str()),
-                artifact_format_for_machine_output(declared.schema.as_ref()),
-                provider,
-                model.clone(),
-                None,
-                created_at,
-            )? {
-                persisted_paths.insert(declared.target_path.clone());
-                artifacts_out.push(artifact);
+            if declared_output_has_accepted_discovery_decision(
+                discovery_decisions,
+                &declared.output_name,
+                domain::discovery::ExpectedOutputRole::Machine,
+            ) {
+                if let Some(artifact) = self.prepare_artifact_if_present(
+                    &declared.target_path,
+                    run_id,
+                    stage_id,
+                    agent_id,
+                    declared_machine_artifact_name(declared),
+                    declared
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.contract_id.as_str())
+                        .unwrap_or(default_contract_id.as_str()),
+                    artifact_format_for_machine_output(declared.schema.as_ref()),
+                    provider,
+                    model.clone(),
+                    None,
+                    created_at,
+                )? {
+                    persisted_paths.insert(declared.target_path.clone());
+                    artifacts_out.push(artifact);
+                }
             }
 
             if let (Some(companion_name), Some(companion_path), Some(schema)) = (
@@ -3374,21 +4319,27 @@ impl BackgroundExecutor {
                 declared.companion_path.as_deref(),
                 declared.schema.as_ref(),
             ) {
-                if let Some(artifact) = self.prepare_artifact_if_present(
-                    companion_path,
-                    run_id,
-                    stage_id,
-                    agent_id,
+                if declared_output_has_accepted_discovery_decision(
+                    discovery_decisions,
                     companion_name,
-                    &schema.contract_id,
-                    artifact_format_for_companion_output(schema),
-                    provider,
-                    model.clone(),
-                    None,
-                    created_at,
-                )? {
-                    persisted_paths.insert(companion_path.to_string());
-                    artifacts_out.push(artifact);
+                    domain::discovery::ExpectedOutputRole::Companion,
+                ) {
+                    if let Some(artifact) = self.prepare_artifact_if_present(
+                        companion_path,
+                        run_id,
+                        stage_id,
+                        agent_id,
+                        companion_name,
+                        &schema.contract_id,
+                        artifact_format_for_companion_output(schema),
+                        provider,
+                        model.clone(),
+                        None,
+                        created_at,
+                    )? {
+                        persisted_paths.insert(companion_path.to_string());
+                        artifacts_out.push(artifact);
+                    }
                 }
             }
         }
@@ -3398,6 +4349,7 @@ impl BackgroundExecutor {
     async fn import_declared_contract_outputs(
         &self,
         declared_outputs: &[DeclaredOutput],
+        captured_outputs: &[CapturedOutput],
         persisted_artifacts: &[Artifact],
         declared_artifacts_to_insert: &[Artifact],
         stage_execution_id: domain::ids::StageExecutionId,
@@ -3408,15 +4360,14 @@ impl BackgroundExecutor {
         result_status: AgentStatus,
         observed_failure_kind: Option<AgentFailureKind>,
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
+        discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
         completed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<DeclaredContractImportResult> {
         let validation_summary = if declared_outputs.is_empty() {
             None
         } else {
-            Some(validate_task_outputs(&load_declared_output_bytes(
-                declared_outputs,
-            )?))
+            Some(validate_task_outputs(captured_outputs))
         };
         let validation_failed = validation_summary
             .as_ref()
@@ -3594,6 +4545,10 @@ impl BackgroundExecutor {
                 runtime_facts.ignored_late_output_count += 1;
                 runtime_facts.valid_required_outputs = false;
             }
+        }
+        if let Some(discovery_diagnostics) = discovery_diagnostics {
+            agent_execution_discovery_diagnostics::upsert_tx(&mut tx, discovery_diagnostics)
+                .await?;
         }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
         if session_generation_id.is_some() {
@@ -4439,6 +5394,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_root = tmp.path().join("run-meta");
+        let target_dir = meta_root.join("target");
+        let logs_dir = meta_root.join("logs");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let log_path = logs_dir.join("agent.log");
+        let build_path = target_dir.join("build.log");
+        std::fs::write(&log_path, b"operator-visible log").unwrap();
+        std::fs::write(&build_path, b"generated build output").unwrap();
+
+        let paths = bounded_meta_root_artifact_paths(Some(meta_root.to_str().unwrap()));
+
+        assert_eq!(paths.artifact_paths.len(), 1);
+        assert!(paths.artifact_paths[0].ends_with("logs/agent.log"));
+    }
+
+    #[test]
     fn proposal_057_degraded_policy_allows_only_valid_declared_contract_outputs() {
         let policy = workflow::plan::DegradedOutputPolicy {
             mode: "allow_valid_contract_outputs".into(),
@@ -4565,6 +5539,7 @@ mod tests {
             output_name: "proposal_review".to_string(),
             target_path: machine_path.to_string_lossy().into_owned(),
             schema: None,
+            reuse_policy: None,
             companion_output_name: Some("proposal_review_raw".to_string()),
             companion_path: Some(companion_path.to_string_lossy().into_owned()),
         };
@@ -4573,16 +5548,24 @@ mod tests {
                 name: "proposal_review".to_string(),
                 content: br#"{"status":"green"}"#.to_vec(),
                 source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
             },
             acp::DiscoveredArtifact {
                 name: "proposal_review_raw".to_string(),
                 content: b"# Review\n".to_vec(),
                 source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
             },
         ];
-
-        materialize_declared_outputs_from_discovered_artifacts(&[declared], &discovered)
-            .expect("envelope-derived outputs should be materialized to canonical paths");
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        settle_agent_outputs_from_discovery_decisions(&[declared], &specs, &discovered, &[])
+            .expect("accepted envelope-derived outputs should be materialized to canonical paths");
 
         assert_eq!(
             std::fs::read_to_string(machine_path).unwrap(),
@@ -4602,6 +5585,7 @@ mod tests {
             output_name: "implementation_self_assessment".to_string(),
             target_path: machine_path.to_string_lossy().into_owned(),
             schema: None,
+            reuse_policy: None,
             companion_output_name: None,
             companion_path: None,
         };
@@ -4609,14 +5593,487 @@ mod tests {
             name: machine_path.to_string_lossy().into_owned(),
             content: br#"{"seemingly_complete":true}"#.to_vec(),
             source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
         }];
-
-        materialize_declared_outputs_from_discovered_artifacts(&[declared], &discovered)
-            .expect("path-keyed JSON envelope outputs should materialize to canonical paths");
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        settle_agent_outputs_from_discovery_decisions(&[declared], &specs, &discovered, &[])
+            .expect(
+                "accepted path-keyed JSON envelope outputs should materialize to canonical paths",
+            );
 
         assert_eq!(
             std::fs::read_to_string(machine_path).unwrap(),
             r#"{"seemingly_complete":true}"#
         );
+    }
+
+    #[test]
+    fn proposal_053_settlement_boundary_records_idempotency_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let machine_path = tmp.path().join("proposal_review.json");
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+        let pre_prompt_metadata = vec![PrePromptExpectedOutputMetadata {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            canonical_path: None,
+            root_class: OutputRootClass::Workspace,
+            existed: false,
+            file_type: "absent".to_string(),
+            size_bytes: None,
+            content_digest: None,
+            mtime_ns: None,
+            baseline_status: ExpectedPathBaselineStatus::Absent,
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 2,
+            session_generation_id: "session-gen-1".to_string(),
+            prompt_turn_id: "turn-1".to_string(),
+            discovery_generation_id: "discovery-gen-1".to_string(),
+        }];
+
+        let settlement = settle_agent_outputs_from_discovery_decisions(
+            &[declared],
+            &specs,
+            &discovered,
+            &pre_prompt_metadata,
+        )
+        .expect("named settlement boundary should accept provider payload");
+
+        assert_eq!(
+            settlement.idempotency_key.as_deref(),
+            Some("agent-exec-1:discovery-gen-1")
+        );
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            std::fs::read_to_string(machine_path).unwrap(),
+            r#"{"status":"green"}"#
+        );
+    }
+
+    #[test]
+    fn proposal_053_oversized_provider_payload_does_not_validate_stale_target_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let machine_path = tmp.path().join("proposal_review.json");
+        std::fs::write(&machine_path, br#"{"summary":"stale","status":"green"}"#).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let mut specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        specs[0].max_bytes = 8;
+        specs[0].aggregate_acceptance_cap_bytes = 64;
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"summary":"new","status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Rejected
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ProviderEnvelopeOversized
+        );
+        assert!(!validation.raw_output_exists);
+        assert_eq!(
+            validation.failure_class,
+            Some(domain::validation::ValidationFailureClass::NoOutputProduced)
+        );
+    }
+
+    #[test]
+    fn proposal_053_oversized_chainworks_output_uses_specific_rejection_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let machine_path = tmp.path().join("proposal_review.json");
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let mut specs = build_expected_output_specs(
+            &[declared],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        specs[0].max_bytes = 8;
+        specs[0].aggregate_acceptance_cap_bytes = 64;
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"summary":"new","status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Rejected
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ChainworksOutputOversized
+        );
+    }
+
+    #[test]
+    fn proposal_053_aggregate_cap_rejects_later_declared_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_path = tmp.path().join("first.json");
+        let second_path = tmp.path().join("second.json");
+        let declared = vec![
+            DeclaredOutput {
+                output_name: "first".to_string(),
+                target_path: first_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "second".to_string(),
+                target_path: second_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let mut specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        for spec in &mut specs {
+            spec.max_bytes = 64;
+            spec.aggregate_acceptance_cap_bytes = 10;
+        }
+        let discovered = vec![
+            acp::DiscoveredArtifact {
+                name: "first".to_string(),
+                content: b"12345".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+            },
+            acp::DiscoveredArtifact {
+                name: "second".to_string(),
+                content: b"123456".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+            },
+        ];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[1].status,
+            OutputDiscoveryStatus::Rejected
+        );
+        assert_eq!(
+            settlement.decisions[1].reason,
+            OutputDiscoveryReason::AggregateExactOutputCap
+        );
+        assert!(settlement
+            .accepted_payloads
+            .contains_key(&provider_envelope_payload_ref("first")));
+        assert!(!settlement
+            .accepted_payloads
+            .contains_key(&provider_envelope_payload_ref("second")));
+    }
+
+    #[test]
+    fn proposal_053_allow_unchanged_existing_accepts_declared_reuse_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let machine_path = tmp.path().join("proposal_review.json");
+        let content = br#"{"summary":"reused","status":"green"}"#;
+        std::fs::write(&machine_path, content).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: Some(OutputReusePolicy::AllowUnchangedExisting),
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        let metadata_context = domain::discovery::PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![
+            DiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
+                &specs[0],
+                &metadata_context,
+            ),
+        ];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &[], &pre_prompt_metadata);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::DeclaredReusePolicy
+        );
+        assert_eq!(
+            settlement.decisions[0].provenance,
+            Some(OutputDiscoveryProvenance::DeclaredReusePolicy)
+        );
+        assert!(settlement
+            .accepted_payloads
+            .contains_key(&declared_reuse_policy_payload_ref("proposal_review")));
+    }
+
+    #[test]
+    fn proposal_053_must_produce_does_not_accept_unchanged_existing_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let machine_path = tmp.path().join("proposal_review.json");
+        std::fs::write(&machine_path, br#"{"summary":"stale","status":"green"}"#).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        let metadata_context = domain::discovery::PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![
+            DiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
+                &specs[0],
+                &metadata_context,
+            ),
+        ];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &[], &pre_prompt_metadata);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Missing
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::MissingAfterPrompt
+        );
+        assert!(settlement.accepted_payloads.is_empty());
+    }
+
+    #[test]
+    fn proposal_053_exact_path_rejects_unauthorized_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed_root = tmp.path().join("allowed");
+        let disallowed_root = tmp.path().join("disallowed");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        std::fs::create_dir_all(&disallowed_root).unwrap();
+        let machine_path = disallowed_root.join("proposal_review.json");
+        std::fs::write(&machine_path, br#"{"summary":"new","status":"green"}"#).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let mut specs = build_expected_output_specs(
+            &[declared],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        specs[0].authorized_roots = vec![domain::discovery::AuthorizedRoot {
+            root_class: OutputRootClass::Worktree,
+            root_path: allowed_root.to_string_lossy().into_owned(),
+        }];
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"summary":"new","status":"green"}"#.to_vec(),
+            source_path: Some(machine_path.to_string_lossy().into_owned()),
+            source_kind: acp::DiscoveredArtifactSourceKind::ExactPath,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Rejected
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::UnauthorizedRoot
+        );
+        assert!(settlement.accepted_payloads.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proposal_053_exact_path_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed_root = tmp.path().join("allowed");
+        let outside_root = tmp.path().join("outside");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let outside_file = outside_root.join("proposal_review.json");
+        std::fs::write(&outside_file, br#"{"summary":"new","status":"green"}"#).unwrap();
+        let symlink_path = allowed_root.join("proposal_review.json");
+        std::os::unix::fs::symlink(&outside_file, &symlink_path).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: symlink_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let mut specs = build_expected_output_specs(
+            &[declared],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        specs[0].authorized_roots = vec![domain::discovery::AuthorizedRoot {
+            root_class: OutputRootClass::Worktree,
+            root_path: allowed_root.to_string_lossy().into_owned(),
+        }];
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"summary":"new","status":"green"}"#.to_vec(),
+            source_path: Some(symlink_path.to_string_lossy().into_owned()),
+            source_kind: acp::DiscoveredArtifactSourceKind::ExactPath,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Rejected
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::SymlinkEscape
+        );
+        assert!(settlement.accepted_payloads.is_empty());
+    }
+
+    #[test]
+    fn proposal_053_declared_artifact_persistence_requires_accepted_decision() {
+        let decisions = vec![OutputDiscoveryDecision {
+            output_name: "proposal_review".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/proposal_review.json".to_string(),
+            companion_of: None,
+            status: OutputDiscoveryStatus::Rejected,
+            reason: OutputDiscoveryReason::StaleExpectedOutput,
+            provenance: Some(OutputDiscoveryProvenance::ExactPath),
+            canonical_path: None,
+            root_class: Some(OutputRootClass::ChainworksMetaRoot),
+            baseline_status: Some(ExpectedPathBaselineStatus::RegularContentCaptured),
+            size_bytes: Some(32),
+            content_digest: None,
+            max_bytes_applied: Some(10 * 1024 * 1024),
+            aggregate_bytes_after_acceptance: None,
+            accepted_payload_ref: None,
+            accepted_bytes_sha256: None,
+            generated_by: None,
+            diagnostics: Default::default(),
+            decision_at: chrono::Utc::now(),
+        }];
+
+        assert!(!declared_output_has_accepted_discovery_decision(
+            Some(&decisions),
+            "proposal_review",
+            domain::discovery::ExpectedOutputRole::Machine
+        ));
+        assert!(declared_output_has_accepted_discovery_decision(
+            None,
+            "proposal_review",
+            domain::discovery::ExpectedOutputRole::Machine
+        ));
     }
 }

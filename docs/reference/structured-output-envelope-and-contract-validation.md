@@ -45,12 +45,24 @@ ACP responses may contain named structured output blocks:
 <<<END_CHAINWORKS_OUTPUT>>>
 ```
 
-The transport layer extracts these blocks into named discovered artifacts. They are not inferred from filesystem diffs, log files, or basename guesses.
+The transport layer extracts these blocks into named discovered artifacts.
+
+#### Output Caps and Rejection (P053)
+
+Declared-output byte caps and aggregate caps now apply to both provider envelopes and `CHAINWORKS_OUTPUT` payloads. Over-cap outputs are rejected with explicit reasons (e.g., `oversized_rejection`), preventing parser-buffer exhaustion and unbounded storage growth.
+
+#### Discovery Settlement Pipeline (P053)
+
+P053 replaces implicit artifact inference with an engine-owned discovery settlement pipeline. Outputs are no longer guessed from basename heuristics alone. Instead, the pipeline uses:
+
+- typed `ExpectedOutputSpec`,
+- bounded pre-prompt metadata,
+- and explicit `OutputDiscoveryDecision` records.
 
 If the same canonical output name appears in both:
 
 - an extracted envelope, and
-- a filesystem-diff discovery,
+- a bounded filesystem discovery,
 
 the envelope-owned discovery wins.
 

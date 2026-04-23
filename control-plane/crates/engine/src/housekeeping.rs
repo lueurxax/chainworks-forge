@@ -414,7 +414,10 @@ mod tests {
                     status: "running".into(),
                     workspace_root: workspace.to_path_buf(),
                     worktree_root: Some(
-                        workspace.join(".chainworks").join("worktrees").join("active-run"),
+                        workspace
+                            .join(".chainworks")
+                            .join("worktrees")
+                            .join("active-run"),
                     ),
                 },
                 RunCleanupCandidate {
@@ -422,7 +425,10 @@ mod tests {
                     status: "blocked".into(),
                     workspace_root: workspace.to_path_buf(),
                     worktree_root: Some(
-                        workspace.join(".chainworks").join("worktrees").join("blocked-run"),
+                        workspace
+                            .join(".chainworks")
+                            .join("worktrees")
+                            .join("blocked-run"),
                     ),
                 },
             ],
@@ -443,7 +449,10 @@ mod tests {
     fn terminal_run_cleanup_preserves_worktree_sources_artifacts_and_databases() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path();
-        let worktree = workspace.join(".chainworks").join("worktrees").join("done-run");
+        let worktree = workspace
+            .join(".chainworks")
+            .join("worktrees")
+            .join("done-run");
         let target = worktree.join("control-plane").join("target");
         let source_file = worktree.join("control-plane").join("src").join("main.rs");
         let artifact = workspace
@@ -479,9 +488,18 @@ mod tests {
         assert_eq!(report.worktree_target_dirs_removed, 1);
         assert!(!target.exists());
         assert!(worktree.exists(), "housekeeping must not delete worktrees");
-        assert!(source_file.exists(), "housekeeping must not delete source files");
-        assert!(artifact.exists(), "housekeeping must not delete run artifacts");
-        assert!(db_file.exists(), "housekeeping must not delete SQLite database files");
+        assert!(
+            source_file.exists(),
+            "housekeeping must not delete source files"
+        );
+        assert!(
+            artifact.exists(),
+            "housekeeping must not delete run artifacts"
+        );
+        assert!(
+            db_file.exists(),
+            "housekeeping must not delete SQLite database files"
+        );
     }
 
     #[test]

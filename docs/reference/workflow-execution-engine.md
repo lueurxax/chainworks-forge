@@ -129,8 +129,7 @@ protocol AgentExecutor: Sendable {
 }
 ```
 
-Executors return `[String: Data]` (in-memory), never file URLs. The
-`ArtifactManager` is the sole disk writer (ARCH-030).
+Executors return `[String: Data]` (in-memory) or write to disk via the discovery settlement pipeline (P053). The `ArtifactManager` is the primary disk writer for in-memory results and the metadata authority for all artifacts (ARCH-030).
 
 The executor path consumes:
 
@@ -156,14 +155,15 @@ configurable delay. Thread-safe task tracking for test assertions.
 Live executor using the selected ACP runtime transport. Per-execution flow:
 
 1. Validate workspace boundaries.
-2. Create an isolated session via `RuntimeSessionBridge`.
-3. Stream execution events through `ExecutionEventBridge`.
-4. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-5. Read declared output files from the workspace artifact directory.
-6. Validate required outputs -- missing outputs fail the stage.
+2. Capture pre-prompt metadata (P053 per-execution baseline).
+3. Create an isolated session via `RuntimeSessionBridge`.
+4. Stream execution events through `ExecutionEventBridge`.
+5. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
+6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline (P053).
+7. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
-before the transport closed.
+before the transport closed, governed by the discovery settlement policy.
 
 ### Artifact Manager (`ArtifactManager.swift`)
 

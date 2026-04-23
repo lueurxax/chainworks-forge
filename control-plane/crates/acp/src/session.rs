@@ -43,8 +43,22 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
-        let (status, artifact_paths, discovered_artifacts, transcript_text, usage) =
-            self.transport.prompt(req).await?;
+        let (
+            status,
+            artifact_paths,
+            discovered_artifacts,
+            pre_prompt_expected_outputs,
+            transcript_text,
+            usage,
+            acp_pre_initialize_local_latency_ms,
+            acp_initialize_latency_ms,
+            acp_session_new_latency_ms,
+            acp_prompt_duration_ms,
+            acp_pre_prompt_metadata_latency_ms,
+            acp_pre_prompt_metadata_timeout,
+            acp_pre_prompt_metadata_digest_bytes,
+            legacy_broad_discovery_snapshot,
+        ) = self.transport.prompt(req).await?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
             .as_ref()
@@ -59,6 +73,7 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
+            pre_prompt_expected_outputs,
             transcript_text,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,
@@ -70,6 +85,14 @@ impl AcpSession {
             actual_mcp_runtime_ids,
             mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
             close_diagnostic: None,
+            acp_pre_initialize_local_latency_ms: Some(acp_pre_initialize_local_latency_ms),
+            acp_initialize_latency_ms: Some(acp_initialize_latency_ms),
+            acp_session_new_latency_ms: Some(acp_session_new_latency_ms),
+            acp_prompt_duration_ms: Some(acp_prompt_duration_ms),
+            acp_pre_prompt_metadata_latency_ms: Some(acp_pre_prompt_metadata_latency_ms),
+            acp_pre_prompt_metadata_timeout,
+            acp_pre_prompt_metadata_digest_bytes,
+            legacy_broad_discovery_snapshot,
         })
     }
 

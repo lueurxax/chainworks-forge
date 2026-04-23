@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,10 @@ use domain::artifact_contracts::{
     parse_implementation_self_assessment_v2, ContractParseContext,
     ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+};
+use domain::discovery::{
+    AuthorizedRoot, ExpectedOutputRole, ExpectedOutputSpec, OutputDiscoveryDecision,
+    OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass, SourceGenerationOwner,
 };
 use domain::validation::{
     ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
@@ -25,6 +30,8 @@ pub struct DeclaredOutput {
     pub output_name: String,
     pub target_path: String,
     pub schema: Option<OutputSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_policy: Option<OutputReusePolicy>,
     pub companion_output_name: Option<String>,
     pub companion_path: Option<String>,
 }
@@ -35,6 +42,9 @@ pub struct CapturedOutput {
     pub machine_bytes: Option<Vec<u8>>,
     pub companion_bytes: Option<Vec<u8>>,
 }
+
+const DEFAULT_EXPECTED_OUTPUT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_AGGREGATE_ACCEPTANCE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct TaskValidationSummary {
@@ -358,24 +368,202 @@ pub fn build_validation_failure_record(
     })
 }
 
-pub fn load_declared_output_bytes(
+pub fn build_expected_output_specs(
     declared_outputs: &[DeclaredOutput],
-) -> Result<Vec<CapturedOutput>> {
+    workspace_root: &str,
+    worktree_root: Option<&str>,
+    chainworks_meta_root: Option<&str>,
+    worktree_write_enabled: bool,
+) -> Vec<ExpectedOutputSpec> {
+    declared_outputs
+        .iter()
+        .flat_map(|declared| {
+            let machine = expected_output_spec(
+                &declared.output_name,
+                ExpectedOutputRole::Machine,
+                &declared.target_path,
+                None,
+                declared
+                    .schema
+                    .as_ref()
+                    .map(|schema| schema.contract_id.clone()),
+                declared.reuse_policy,
+                workspace_root,
+                worktree_root,
+                chainworks_meta_root,
+                worktree_write_enabled,
+            );
+            let companion = declared
+                .companion_output_name
+                .as_ref()
+                .zip(declared.companion_path.as_ref())
+                .map(|(name, path)| {
+                    expected_output_spec(
+                        name,
+                        ExpectedOutputRole::Companion,
+                        path,
+                        Some(declared.output_name.clone()),
+                        declared
+                            .schema
+                            .as_ref()
+                            .map(|schema| schema.contract_id.clone()),
+                        declared.reuse_policy,
+                        workspace_root,
+                        worktree_root,
+                        chainworks_meta_root,
+                        worktree_write_enabled,
+                    )
+                });
+            std::iter::once(machine).chain(companion)
+        })
+        .collect()
+}
+
+fn expected_output_spec(
+    output_name: &str,
+    output_role: ExpectedOutputRole,
+    target_path: &str,
+    companion_of: Option<String>,
+    contract_id: Option<String>,
+    reuse_policy: Option<OutputReusePolicy>,
+    workspace_root: &str,
+    worktree_root: Option<&str>,
+    chainworks_meta_root: Option<&str>,
+    worktree_write_enabled: bool,
+) -> ExpectedOutputSpec {
+    ExpectedOutputSpec {
+        output_name: output_name.to_string(),
+        output_role,
+        target_path: target_path.to_string(),
+        companion_of,
+        display_label: output_name.replace('_', " "),
+        contract_id,
+        required: true,
+        reuse_policy: reuse_policy.unwrap_or(OutputReusePolicy::MustProduce),
+        max_bytes: DEFAULT_EXPECTED_OUTPUT_MAX_BYTES,
+        aggregate_acceptance_cap_bytes: DEFAULT_AGGREGATE_ACCEPTANCE_CAP_BYTES,
+        authorized_roots: vec![authorized_root_for_output(
+            target_path,
+            workspace_root,
+            worktree_root,
+            chainworks_meta_root,
+            worktree_write_enabled,
+        )],
+        source_generation_owner: if output_name == "changed_files_manifest" {
+            SourceGenerationOwner::ControlPlane
+        } else {
+            SourceGenerationOwner::Agent
+        },
+    }
+}
+
+fn authorized_root_for_output(
+    target_path: &str,
+    workspace_root: &str,
+    worktree_root: Option<&str>,
+    chainworks_meta_root: Option<&str>,
+    worktree_write_enabled: bool,
+) -> AuthorizedRoot {
+    let meta_root = chainworks_meta_root.map(|root| absolute_root(root, workspace_root));
+    if let Some(meta_root) = meta_root.as_ref() {
+        if path_is_under(target_path, meta_root) {
+            return AuthorizedRoot {
+                root_class: OutputRootClass::ChainworksMetaRoot,
+                root_path: meta_root.to_string_lossy().into_owned(),
+            };
+        }
+    }
+
+    let worktree_root = worktree_root.map(|root| absolute_root(root, workspace_root));
+    if worktree_write_enabled {
+        if let Some(worktree_root) = worktree_root.as_ref() {
+            return AuthorizedRoot {
+                root_class: OutputRootClass::Worktree,
+                root_path: worktree_root.to_string_lossy().into_owned(),
+            };
+        }
+    }
+
+    if let Some(worktree_root) = worktree_root.as_ref() {
+        if path_is_under(target_path, worktree_root) {
+            return AuthorizedRoot {
+                root_class: OutputRootClass::Worktree,
+                root_path: worktree_root.to_string_lossy().into_owned(),
+            };
+        }
+    }
+
+    AuthorizedRoot {
+        root_class: OutputRootClass::Workspace,
+        root_path: absolute_root(workspace_root, workspace_root)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+fn absolute_root(root: &str, workspace_root: &str) -> PathBuf {
+    let root_path = Path::new(root);
+    if root_path.is_absolute() {
+        root_path.to_path_buf()
+    } else {
+        Path::new(workspace_root).join(root_path)
+    }
+}
+
+fn path_is_under(path: &str, root: &Path) -> bool {
+    Path::new(path).starts_with(root)
+}
+
+pub fn build_captured_outputs_from_discovery_decisions(
+    declared_outputs: &[DeclaredOutput],
+    decisions: &[OutputDiscoveryDecision],
+    accepted_payloads: &HashMap<String, Vec<u8>>,
+) -> Vec<CapturedOutput> {
     declared_outputs
         .iter()
         .map(|declared| {
-            let machine_bytes = std::fs::read(&declared.target_path).ok();
-            let companion_bytes = declared
-                .companion_path
-                .as_ref()
-                .and_then(|path| std::fs::read(path).ok());
-            Ok(CapturedOutput {
+            let machine_bytes = accepted_decision_payload(
+                decisions,
+                &declared.output_name,
+                ExpectedOutputRole::Machine,
+                accepted_payloads,
+            );
+            let companion_bytes =
+                declared
+                    .companion_output_name
+                    .as_deref()
+                    .and_then(|companion_name| {
+                        accepted_decision_payload(
+                            decisions,
+                            companion_name,
+                            ExpectedOutputRole::Companion,
+                            accepted_payloads,
+                        )
+                    });
+
+            CapturedOutput {
                 declared: declared.clone(),
                 machine_bytes,
                 companion_bytes,
-            })
+            }
         })
         .collect()
+}
+
+fn accepted_decision_payload(
+    decisions: &[OutputDiscoveryDecision],
+    output_name: &str,
+    output_role: ExpectedOutputRole,
+    accepted_payloads: &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let decision = decisions.iter().find(|decision| {
+        decision.output_name == output_name && decision.output_role == output_role
+    })?;
+    if decision.status != OutputDiscoveryStatus::Accepted {
+        return None;
+    }
+    let payload_ref = decision.accepted_payload_ref.as_ref()?;
+    accepted_payloads.get(payload_ref).cloned()
 }
 
 pub fn declared_output_paths(declared_outputs: &[DeclaredOutput]) -> HashMap<String, String> {
@@ -411,11 +599,118 @@ mod tests {
     }
 
     #[test]
+    fn expected_output_specs_include_machine_and_companion_policy() {
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposal_review.json".to_string(),
+            schema: Some(structured_schema()),
+            reuse_policy: None,
+            companion_output_name: Some("proposal_review_raw".to_string()),
+            companion_path: Some(
+                "/workspace/.chainworks/runs/run-1/proposal_review.md".to_string(),
+            ),
+        };
+
+        let specs = build_expected_output_specs(
+            &[declared],
+            "/workspace",
+            Some("/workspace/.chainworks/worktrees/impl"),
+            Some(".chainworks/runs/run-1"),
+            true,
+        );
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].output_name, "proposal_review");
+        assert_eq!(specs[0].output_role, ExpectedOutputRole::Machine);
+        assert_eq!(specs[0].contract_id.as_deref(), Some("proposal_review_v1"));
+        assert!(specs[0].required);
+        assert_eq!(specs[0].reuse_policy, OutputReusePolicy::MustProduce);
+        assert_eq!(specs[0].max_bytes, 10 * 1024 * 1024);
+        assert_eq!(specs[0].aggregate_acceptance_cap_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            specs[0].authorized_roots[0].root_class,
+            OutputRootClass::ChainworksMetaRoot
+        );
+        assert_eq!(
+            specs[0].authorized_roots[0].root_path,
+            "/workspace/.chainworks/runs/run-1"
+        );
+        assert_eq!(specs[1].output_role, ExpectedOutputRole::Companion);
+        assert_eq!(specs[1].companion_of.as_deref(), Some("proposal_review"));
+    }
+
+    #[test]
+    fn expected_output_specs_authorize_write_enabled_worktree_outputs() {
+        let declared = DeclaredOutput {
+            output_name: "changed_files_manifest".to_string(),
+            target_path: "/workspace/.chainworks/worktrees/impl/changed-files.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+
+        let specs = build_expected_output_specs(
+            &[declared],
+            "/workspace",
+            Some("/workspace/.chainworks/worktrees/impl"),
+            Some(".chainworks/runs/run-1"),
+            true,
+        );
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].authorized_roots[0].root_class,
+            OutputRootClass::Worktree
+        );
+        assert_eq!(
+            specs[0].authorized_roots[0].root_path,
+            "/workspace/.chainworks/worktrees/impl"
+        );
+        assert_eq!(
+            specs[0].source_generation_owner,
+            SourceGenerationOwner::ControlPlane
+        );
+    }
+
+    #[test]
+    fn expected_output_specs_freeze_declared_reuse_policy() {
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposal_review.json".to_string(),
+            schema: Some(structured_schema()),
+            reuse_policy: Some(OutputReusePolicy::AllowUnchangedExisting),
+            companion_output_name: Some("proposal_review_raw".to_string()),
+            companion_path: Some(
+                "/workspace/.chainworks/runs/run-1/proposal_review.md".to_string(),
+            ),
+        };
+
+        let specs = build_expected_output_specs(
+            &[declared],
+            "/workspace",
+            Some("/workspace/.chainworks/worktrees/impl"),
+            Some(".chainworks/runs/run-1"),
+            false,
+        );
+
+        assert_eq!(
+            specs[0].reuse_policy,
+            OutputReusePolicy::AllowUnchangedExisting
+        );
+        assert_eq!(
+            specs[1].reuse_policy,
+            OutputReusePolicy::AllowUnchangedExisting
+        );
+    }
+
+    #[test]
     fn validate_task_outputs_requires_companion_for_companion_mode() {
         let declared = DeclaredOutput {
             output_name: "proposal_review".to_string(),
             target_path: "/tmp/proposal_review.json".to_string(),
             schema: Some(structured_schema()),
+            reuse_policy: None,
             companion_output_name: Some("proposal_review_raw".to_string()),
             companion_path: Some("/tmp/proposal_review.md".to_string()),
         };
@@ -432,11 +727,115 @@ mod tests {
     }
 
     #[test]
+    fn discovery_decision_builder_does_not_reread_rejected_target_path() {
+        let target_path = std::env::temp_dir().join(format!(
+            "chainworks-p053-rejected-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&target_path, br#"{"summary":"stale","status":"green"}"#)
+            .expect("write stale target");
+
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: target_path.to_string_lossy().into_owned(),
+            schema: Some(structured_schema()),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let decisions = vec![domain::discovery::OutputDiscoveryDecision {
+            output_name: declared.output_name.clone(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: declared.target_path.clone(),
+            companion_of: None,
+            status: domain::discovery::OutputDiscoveryStatus::Rejected,
+            reason: domain::discovery::OutputDiscoveryReason::StaleExpectedOutput,
+            provenance: Some(domain::discovery::OutputDiscoveryProvenance::ExactPath),
+            canonical_path: Some(declared.target_path.clone()),
+            root_class: Some(domain::discovery::OutputRootClass::ChainworksMetaRoot),
+            baseline_status: Some(
+                domain::discovery::ExpectedPathBaselineStatus::RegularContentCaptured,
+            ),
+            size_bytes: Some(36),
+            content_digest: Some("sha256:unchanged".to_string()),
+            max_bytes_applied: Some(10 * 1024 * 1024),
+            aggregate_bytes_after_acceptance: None,
+            accepted_payload_ref: None,
+            accepted_bytes_sha256: None,
+            generated_by: None,
+            diagnostics: Default::default(),
+            decision_at: chrono::Utc::now(),
+        }];
+
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &decisions,
+            &HashMap::new(),
+        );
+        let summary = validate_task_outputs(&captured);
+
+        assert!(!summary.raw_output_exists);
+        assert_eq!(
+            summary.failure_class,
+            Some(ValidationFailureClass::NoOutputProduced)
+        );
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[test]
+    fn discovery_decision_builder_uses_only_accepted_payload_refs() {
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: "/tmp/proposal_review.json".to_string(),
+            schema: Some(structured_schema()),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let decisions = vec![domain::discovery::OutputDiscoveryDecision {
+            output_name: declared.output_name.clone(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: declared.target_path.clone(),
+            companion_of: None,
+            status: domain::discovery::OutputDiscoveryStatus::Accepted,
+            reason: domain::discovery::OutputDiscoveryReason::ProviderEnvelope,
+            provenance: Some(domain::discovery::OutputDiscoveryProvenance::ProviderEnvelope),
+            canonical_path: None,
+            root_class: Some(domain::discovery::OutputRootClass::ChainworksMetaRoot),
+            baseline_status: None,
+            size_bytes: Some(33),
+            content_digest: None,
+            max_bytes_applied: Some(10 * 1024 * 1024),
+            aggregate_bytes_after_acceptance: Some(33),
+            accepted_payload_ref: Some("provider:proposal_review".to_string()),
+            accepted_bytes_sha256: Some("sha256:accepted".to_string()),
+            generated_by: None,
+            diagnostics: Default::default(),
+            decision_at: chrono::Utc::now(),
+        }];
+        let accepted_payloads = HashMap::from([(
+            "provider:proposal_review".to_string(),
+            br#"{"summary":"ok","status":"green"}"#.to_vec(),
+        )]);
+
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &decisions,
+            &accepted_payloads,
+        );
+        let summary = validate_task_outputs(&captured);
+
+        assert!(summary.raw_output_exists);
+        assert_eq!(summary.failure_class, None);
+    }
+
+    #[test]
     fn build_validation_failure_record_uses_operator_inspection_for_missing_output() {
         let declared = DeclaredOutput {
             output_name: "proposal_review".to_string(),
             target_path: "/tmp/proposal_review.json".to_string(),
             schema: Some(structured_schema()),
+            reuse_policy: None,
             companion_output_name: Some("proposal_review_raw".to_string()),
             companion_path: Some("/tmp/proposal_review.md".to_string()),
         };

@@ -27,6 +27,7 @@ At the current baseline, the product includes:
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
+- bounded artifact discovery and engine-owned settlement pipeline (P053),
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
@@ -52,6 +53,7 @@ Use these reference docs as the current source of truth:
 | Persistence model | [domain-model.md](domain-model.md) |
 | YAML and catalog parsing | [yaml-dsl-parser.md](yaml-dsl-parser.md) |
 | Execution engine | [workflow-execution-engine.md](workflow-execution-engine.md) |
+| Artifact discovery and settlement | [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) |
 | Frozen runtime and resume truth | [runtime-contract.md](runtime-contract.md) |
 | Skill resolution and runtime injection | [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) |
 | Per-agent MCP policy and runtime validation | [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) |

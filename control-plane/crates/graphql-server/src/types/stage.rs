@@ -1,4 +1,5 @@
 use async_graphql::*;
+use db::repos::agent_execution_discovery_diagnostics;
 use db::repos::agent_execution_runtime_facts;
 use db::repos::projections::StageSummaryRow;
 use db::repos::sessions;
@@ -232,6 +233,16 @@ impl GqlAgentExecution {
                 chrono::Utc::now(),
             )
         });
+        let mut facts = facts;
+        if agent_execution_discovery_diagnostics::find_readback_by_execution_id(
+            pool,
+            agent_execution_id,
+        )
+        .await?
+        .is_some_and(|readback| readback.reconciliation_pending)
+        {
+            facts.valid_required_outputs = false;
+        }
         Ok(GqlAgentExecutionRuntimeFacts::from_facts_and_execution(
             facts,
             self,
@@ -239,6 +250,46 @@ impl GqlAgentExecution {
             generation.as_ref(),
             include_operator_debug,
         ))
+    }
+
+    #[graphql(name = "discoveryDiagnostics")]
+    async fn discovery_diagnostics(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<Json<serde_json::Value>>> {
+        let pool = ctx.data::<sqlx::SqlitePool>()?;
+        let agent_execution_id: domain::ids::AgentExecutionId = self
+            .id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let diagnostics = agent_execution_discovery_diagnostics::find_readback_by_execution_id(
+            pool,
+            agent_execution_id,
+        )
+        .await?;
+        Ok(diagnostics.map(|readback| {
+            let payload = readback.projected_payload();
+            let diagnostics = &readback.diagnostics;
+            Json(serde_json::json!({
+                "agent_execution_id": diagnostics.agent_execution_id.clone(),
+                "discovery_schema_version": diagnostics.discovery_schema_version.clone(),
+                "legacy_broad_discovery_used": diagnostics.legacy_broad_discovery_used,
+                "missing_required_output_count": diagnostics.missing_required_output_count,
+                "rejected_output_count": diagnostics.rejected_output_count,
+                "stale_output_count": diagnostics.stale_output_count,
+                "meta_discovery_truncated": diagnostics.meta_discovery_truncated,
+                "git_manifest_status": diagnostics.git_manifest_status.clone(),
+                "resume_warning_count": diagnostics.resume_warning_count,
+                "reconciliation_pending": readback.reconciliation_pending,
+                "reconciliation_warnings": readback.reconciliation_warnings.clone(),
+                "runtime_facts_present": readback.runtime_facts_present,
+                "matching_active_artifact_generation_count": readback.matching_active_artifact_generation_count,
+                "payload": payload,
+                "created_at": diagnostics.created_at.to_rfc3339(),
+                "updated_at": diagnostics.updated_at.to_rfc3339(),
+            }))
+        }))
     }
 }
 

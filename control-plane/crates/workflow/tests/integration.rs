@@ -715,6 +715,204 @@ agents:
 }
 
 #[test]
+fn proposal_053_output_policies_compile_reuse_policy() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+          outputs:
+            - proposal_review
+          output_policies:
+            proposal_review:
+              reuse_policy: allow_unchanged_existing
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+    outputs:
+      - proposal_review
+"#,
+    );
+
+    let task = &plan.states["start"].tasks[0];
+    assert_eq!(
+        task.output_policies["proposal_review"].reuse_policy,
+        workflow::plan::OutputReusePolicy::AllowUnchangedExisting
+    );
+}
+
+#[test]
+fn proposal_053_output_policies_reject_unknown_output_keys() {
+    let err = compile_result_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+          outputs:
+            - proposal_review
+          output_policies:
+            stale_review:
+              reuse_policy: allow_unchanged_existing
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+    outputs:
+      - proposal_review
+"#,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("output_policies key 'stale_review'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn proposal_053_output_policies_reject_unknown_reuse_policy_values() {
+    let err = compile_result_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+    run:
+      sequence:
+        - agent: reviewer
+          task: write_review
+          outputs:
+            - proposal_review
+          output_policies:
+            proposal_review:
+              reuse_policy: sometimes_reuse
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+    outputs:
+      - proposal_review
+"#,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("loading workflow definition"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn proposal_053_legacy_broad_discovery_policy_defaults_disabled() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+"#,
+    );
+
+    assert_eq!(
+        plan.legacy_broad_discovery_policy,
+        workflow::plan::LegacyBroadDiscoveryPolicy::Disabled
+    );
+}
+
+#[test]
+fn proposal_053_legacy_broad_discovery_policy_compiles_workflow_opt_in() {
+    let plan = compile_from_strings(
+        r#"
+discovery:
+  legacy_broad_discovery_policy: workflow_opt_in
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+"#,
+    );
+
+    assert_eq!(
+        plan.legacy_broad_discovery_policy,
+        workflow::plan::LegacyBroadDiscoveryPolicy::WorkflowOptIn
+    );
+}
+
+#[test]
+fn proposal_053_legacy_broad_discovery_policy_rejects_unknown_values() {
+    let err = compile_result_from_strings(
+        r#"
+discovery:
+  legacy_broad_discovery_policy: always
+initial_state: start
+states:
+  start:
+    label: Start
+    owner: reviewer
+"#,
+        r#"
+backend_profiles:
+  review_profile:
+    provider: codex_acp
+agents:
+  - id: reviewer
+    backend_profile: review_profile
+"#,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("loading workflow definition"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn test_multi_output_agent_output_contract_only_binds_matching_output() {
     let plan = compile_from_strings(
         r#"

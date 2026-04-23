@@ -275,7 +275,7 @@ Artifact truth must describe both dimensions of an ACP execution:
 - and what happened to the declared outputs.
 
 The Rust control plane records the second dimension as `AgentOutputSettlement`.
-The stable values are:
+The stable values (updated in P053) are:
 
 - `none`
 - `valid_outputs_from_completed_execution`
@@ -284,8 +284,8 @@ The stable values are:
 - `invalid_required_outputs`
 - `ignored_late_outputs`
 
-This settlement is stored on runtime facts and copied into artifact-contract generation
-evidence. It must not be collapsed into `AgentFailureKind`; for example,
+This settlement is derived from `OutputDiscoveryDecision` records built by the engine discovery pipeline (P053), stored on runtime facts, and copied into artifact-contract generation
+evidence. The raw bounded meta-root and exact-path discovery logs live in `agent_execution_discovery_diagnostics`. It must not be collapsed into `AgentFailureKind`; for example,
 `ignored_late_outputs` is output ownership truth, not a provider failure reason.
 
 ### Source-generation claims own active artifact writes

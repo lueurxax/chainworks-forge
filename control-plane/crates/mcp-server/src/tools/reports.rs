@@ -3,8 +3,9 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, sessions,
-    validation, workflow_conflicts,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
+    artifact_contracts, artifacts, legacy_discovery_overrides, sessions, validation,
+    workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -116,6 +117,7 @@ pub async fn execute(
                     "active_index": projection.active_index_json,
                     "run_state_projection": projection.run_state_json,
                     "operator_overrides": overrides,
+                    "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
                 }));
             }
 
@@ -160,18 +162,59 @@ pub(crate) async fn execution_mcp_truth_json(
             (execution_id, facts)
         })
         .collect::<HashMap<_, _>>();
+    let discovery_diagnostics =
+        agent_execution_discovery_diagnostics::list_readback_by_run(pool, run_id).await?;
+    let discovery_diagnostics_by_execution_id: HashMap<_, _> = discovery_diagnostics
+        .into_iter()
+        .map(|readback| (readback.diagnostics.agent_execution_id.clone(), readback))
+        .collect::<HashMap<_, _>>();
     let mut items = Vec::with_capacity(executions.len());
     for execution in executions.into_iter() {
         let execution_id = execution.id.to_string();
+        let discovery_diagnostics_readback =
+            discovery_diagnostics_by_execution_id.get(&execution_id);
+        let reconciliation_pending =
+            discovery_diagnostics_readback.is_some_and(|readback| readback.reconciliation_pending);
         let runtime_facts = match runtime_facts_by_execution_id.get(&execution_id) {
             Some(facts) => {
-                runtime_facts_json(pool, &execution, facts, include_operator_debug).await?
-            }
-            None => {
-                let facts =
-                    AgentExecutionRuntimeFacts::defaults_for(execution.id, chrono::Utc::now());
+                let mut facts = facts.clone();
+                if reconciliation_pending {
+                    facts.valid_required_outputs = false;
+                }
                 runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
             }
+            None => {
+                let mut facts =
+                    AgentExecutionRuntimeFacts::defaults_for(execution.id, chrono::Utc::now());
+                if reconciliation_pending {
+                    facts.valid_required_outputs = false;
+                }
+                runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
+            }
+        };
+        let discovery_diagnostics = match discovery_diagnostics_readback {
+            Some(readback) => {
+                let diagnostics = &readback.diagnostics;
+                serde_json::json!({
+                "agent_execution_id": diagnostics.agent_execution_id.clone(),
+                "discovery_schema_version": diagnostics.discovery_schema_version.clone(),
+                "legacy_broad_discovery_used": diagnostics.legacy_broad_discovery_used,
+                "missing_required_output_count": diagnostics.missing_required_output_count,
+                "rejected_output_count": diagnostics.rejected_output_count,
+                "stale_output_count": diagnostics.stale_output_count,
+                "meta_discovery_truncated": diagnostics.meta_discovery_truncated,
+                "git_manifest_status": diagnostics.git_manifest_status.clone(),
+                "resume_warning_count": diagnostics.resume_warning_count,
+                "reconciliation_pending": readback.reconciliation_pending,
+                "reconciliation_warnings": readback.reconciliation_warnings.clone(),
+                "runtime_facts_present": readback.runtime_facts_present,
+                "matching_active_artifact_generation_count": readback.matching_active_artifact_generation_count,
+                "payload": readback.projected_payload(),
+                "created_at": diagnostics.created_at.to_rfc3339(),
+                "updated_at": diagnostics.updated_at.to_rfc3339(),
+                })
+            }
+            None => serde_json::Value::Null,
         };
         items.push(serde_json::json!({
             "agent_execution_id": execution_id,
@@ -191,6 +234,7 @@ pub(crate) async fn execution_mcp_truth_json(
             "actual_mcp_observation_json": execution.actual_mcp_observation_json,
             "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
             "runtime_facts": runtime_facts,
+            "discovery_diagnostics": discovery_diagnostics,
         }));
     }
     Ok(serde_json::Value::Array(items))
