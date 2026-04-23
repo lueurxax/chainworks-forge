@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${CHAINWORKS_TEST_GATE_ROOT_DIR:-}" ]]; then
+  ROOT_DIR="$(cd "$CHAINWORKS_TEST_GATE_ROOT_DIR" && pwd)"
+else
+  ROOT_DIR="$DEFAULT_ROOT_DIR"
+fi
 PROJECT_PATH="$ROOT_DIR/Chainworks Forge.xcodeproj"
 SCHEME_NAME="Chainworks Forge"
 DESTINATION="platform=macOS"
@@ -185,6 +190,18 @@ PROPOSAL_044_TESTS=(
   "test_post_approval_retry_requires_fresh_approval"
   "test_simple_manual_gate_no_regression"
   "test_state_11_to_state_12_happy_path"
+)
+
+P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
+PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
+PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
+  "proposal-060-baseline|proposal-review-baseline.v1.json|proposal_review_baseline_v1"
+  "proposal-060-storage|storage-compatibility-matrix.v1.json|storage_compatibility_matrix_v1"
+  "proposal-060-router-fixtures|routing-contract-fixtures.v1.json|routing_contract_fixtures_v1"
+  "proposal-060-snapshot-inventory|frozen-snapshot-helper-inventory.v1.json|frozen_snapshot_helper_inventory_v1"
+  "proposal-060-fixed-quartet|fixed-quartet-inventory.v1.json|hardcoded_fixed_quartet_inventory_v1"
+  "proposal-060-ticket-map|implementation-ticket-map.v1.json|implementation_ticket_map_v1"
+  "proposal-060-calibration|routing-calibration-report.v1.json|routing_calibration_report_v1"
 )
 
 # PROPOSAL_029_MCP_TESTS must be the *exact* inventory from P029 §9.1 — no
@@ -979,6 +996,85 @@ if errors:
 PY
 }
 
+proposal060_canonical_gate_name() {
+  case "${1:-}" in
+    proposal-060|p060) printf '%s\n' "proposal-060" ;;
+    proposal-060-baseline|p060-baseline) printf '%s\n' "proposal-060-baseline" ;;
+    proposal-060-storage|p060-storage) printf '%s\n' "proposal-060-storage" ;;
+    proposal-060-router-fixtures|p060-router-fixtures) printf '%s\n' "proposal-060-router-fixtures" ;;
+    proposal-060-snapshot-inventory|p060-snapshot-inventory) printf '%s\n' "proposal-060-snapshot-inventory" ;;
+    proposal-060-fixed-quartet|p060-fixed-quartet) printf '%s\n' "proposal-060-fixed-quartet" ;;
+    proposal-060-ticket-map|p060-ticket-map) printf '%s\n' "proposal-060-ticket-map" ;;
+    proposal-060-calibration|p060-calibration) printf '%s\n' "proposal-060-calibration" ;;
+    *) return 1 ;;
+  esac
+}
+
+proposal060_control_artifact_spec_for_gate() {
+  local canonical_gate="$1"
+  local spec gate
+  for spec in "${PROPOSAL_060_CONTROL_ARTIFACT_SPECS[@]}"; do
+    gate="${spec%%|*}"
+    if [[ "$gate" == "$canonical_gate" ]]; then
+      printf '%s\n' "$spec"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_proposal060_control_artifact_gate() {
+  local gate_name canonical_gate spec filename expected_schema artifact_path filename_and_schema
+  gate_name="$1"
+  canonical_gate="$(proposal060_canonical_gate_name "$gate_name")" || die "unknown Proposal 060 gate: $gate_name"
+  spec="$(proposal060_control_artifact_spec_for_gate "$canonical_gate")" || die "no Proposal 060 artifact spec for gate: $canonical_gate"
+
+  filename_and_schema="${spec#*|}"
+  filename="${filename_and_schema%%|*}"
+  expected_schema="${filename_and_schema#*|}"
+  artifact_path="$ROOT_DIR/$PROPOSAL_060_CONTROL_ARTIFACT_DIR/$filename"
+
+  if [[ ! -f "$artifact_path" ]]; then
+    die "$canonical_gate: missing control artifact $artifact_path"
+  fi
+
+  run_proposal060_validate_control_artifact_gate "$canonical_gate"
+}
+
+run_proposal060_validate_control_artifact_gate() {
+  local gate_name canonical_gate spec filename expected_schema artifact_path validator_path filename_and_schema
+  gate_name="$1"
+  canonical_gate="$(proposal060_canonical_gate_name "$gate_name")" || die "unknown Proposal 060 gate: $gate_name"
+  spec="$(proposal060_control_artifact_spec_for_gate "$canonical_gate")" || die "no Proposal 060 artifact spec for gate: $canonical_gate"
+
+  filename_and_schema="${spec#*|}"
+  filename="${filename_and_schema%%|*}"
+  expected_schema="${filename_and_schema#*|}"
+  artifact_path="$ROOT_DIR/$PROPOSAL_060_CONTROL_ARTIFACT_DIR/$filename"
+  validator_path="$DEFAULT_ROOT_DIR/scripts/proposal060_control_artifact_gate.py"
+
+  log "Proposal 060 control artifact gate: $canonical_gate"
+  if [[ ! -f "$artifact_path" ]]; then
+    die "$canonical_gate: missing control artifact $artifact_path"
+  fi
+  if [[ ! -f "$validator_path" ]]; then
+    die "Proposal 060 validator helper missing: $validator_path"
+  fi
+
+  python3 "$validator_path" "$artifact_path" "$expected_schema" "$P060_PROPOSAL_REVISION_ID" "$canonical_gate"
+  log "Proposal 060 control artifact gate passed: $canonical_gate"
+}
+
+run_proposal060_all_control_artifacts() {
+  local spec gate
+  log "Proposal 060 wrapper gate: Phase 0a/0b control artifacts"
+  for spec in "${PROPOSAL_060_CONTROL_ARTIFACT_SPECS[@]}"; do
+    gate="${spec%%|*}"
+    run_proposal060_control_artifact_gate "$gate"
+  done
+  log "Proposal 060 wrapper gate passed"
+}
+
 make_stamp() {
   date +"%Y%m%d-%H%M%S"
 }
@@ -1519,6 +1615,21 @@ Available gates:
   proposal-050    Proposal 050 per-run workspace isolation gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
   proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
+  proposal-060|p060  Proposal 060 Phase 0a/0b control artifact wrapper gate
+  proposal-060-baseline|p060-baseline
+                  Proposal 060 proposal-review baseline control artifact gate
+  proposal-060-storage|p060-storage
+                  Proposal 060 storage compatibility control artifact gate
+  proposal-060-router-fixtures|p060-router-fixtures
+                  Proposal 060 routing contract fixtures control artifact gate
+  proposal-060-snapshot-inventory|p060-snapshot-inventory
+                  Proposal 060 frozen snapshot inventory control artifact gate
+  proposal-060-fixed-quartet|p060-fixed-quartet
+                  Proposal 060 fixed quartet inventory control artifact gate
+  proposal-060-ticket-map|p060-ticket-map
+                  Proposal 060 implementation ticket map control artifact gate
+  proposal-060-calibration|p060-calibration
+                  Proposal 060 routing calibration control artifact gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -2260,6 +2371,12 @@ for item in required:
         raise SystemExit(f"proposal-058: docs/reference/test-gates.md missing {item}")
 PY
     log "Proposal 058 control-plane gate passed"
+    ;;
+  proposal-060|p060)
+    run_proposal060_all_control_artifacts
+    ;;
+  proposal-060-baseline|p060-baseline|proposal-060-storage|p060-storage|proposal-060-router-fixtures|p060-router-fixtures|proposal-060-snapshot-inventory|p060-snapshot-inventory|proposal-060-fixed-quartet|p060-fixed-quartet|proposal-060-ticket-map|p060-ticket-map|proposal-060-calibration|p060-calibration)
+    run_proposal060_control_artifact_gate "$GATE"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"
