@@ -2487,7 +2487,18 @@ for needle in [
     if needle not in text:
         raise SystemExit(f"proposal-053: security checklist missing {needle!r}")
 for path, required_needles in [
-    (manual_latency, ["# P053 Manual Latency Spot-Check", "Result:", "pre-`initialize`"]),
+    (
+        manual_latency,
+        [
+            "# P053 Manual Latency Spot-Check",
+            "Reference Workspace Measurement",
+            "8.9 GB",
+            "126,643",
+            "acp_pre_initialize_local_latency_ms=0",
+            "Result:",
+            "pre-`initialize`",
+        ],
+    ),
     (operator_clarity, ["# P053 Operator Clarity Evidence", "Result:", "provider latency"]),
     (retrospective, ["# P053 Phase 1 Retrospective", "Decision:", "P069"]),
 ]:

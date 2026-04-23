@@ -917,7 +917,7 @@ Scope:
 - Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/proposals/053.review/`
 - full Phase 0 cap-validation schema, including sampled execution IDs, readiness timing, envelope/aggregate cap selections, and discovery ownership
 - Phase 1 evidence pack:
-  - `manual-latency-spot-check.md`
+  - `manual-latency-spot-check.md`, including the manual reference-workspace measurement and observed `acp_pre_initialize_local_latency_ms`
   - `operator-clarity-evidence.md`
   - `phase-1-retrospective.md`
 - `control-plane` discovery logic (`crates/domain/src/discovery.rs`)

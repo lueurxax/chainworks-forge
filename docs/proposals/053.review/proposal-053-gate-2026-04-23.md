@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Command | `./scripts/test-gate.sh proposal-053` |
-| Worktree | `.chainworks/worktrees/codex-p053-manual-merge-1833dd16` |
-| Branch | `codex/p053-manual-merge-1833dd16` |
+| Worktree | `/Users/user/Documents/Chainworks Forge` |
+| Branch | `main` |
 | Result | Passed |
-| Completed at | 2026-04-23 20:09 Asia/Nicosia |
+| Completed at | 2026-04-23 21:40 Asia/Nicosia |
 
 ## Covered Slices
 
@@ -26,3 +26,15 @@
 This is same-tree control-plane validation. It does not claim production exposure; `docs/proposals/053.review/cap-validation.json` records `phase_1_exposure_mode = gate_only_internal`.
 
 The current recorded rerun includes the ACP fixture observation `acp_pre_initialize_local_latency_ms=0`, which is also captured in `docs/proposals/053.review/manual-latency-spot-check.md`.
+
+The manual reference-workspace check also passed on `main` using:
+
+```bash
+CARGO_TARGET_DIR=target/proposal-053-gate CHAINWORKS_P053_REFERENCE_WORKSPACE_ROOT='/Users/user/Documents/Chainworks Forge' cargo test -p acp p053_manual_reference_workspace_pre_initialize_latency --test integration -- --ignored --exact --nocapture
+```
+
+Observed output:
+
+```text
+p053_manual_reference_workspace=/Users/user/Documents/Chainworks Forge acp_pre_initialize_local_latency_ms=0
+```

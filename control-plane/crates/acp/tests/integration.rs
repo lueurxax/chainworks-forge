@@ -795,9 +795,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
     let pre_initialize_latency_ms = result
         .acp_pre_initialize_local_latency_ms
         .expect("P053 fixture must report pre-initialize local latency");
-    println!(
-        "observed acp_pre_initialize_local_latency_ms={pre_initialize_latency_ms}"
-    );
+    println!("observed acp_pre_initialize_local_latency_ms={pre_initialize_latency_ms}");
     assert!(
         result.artifact_paths[0].ends_with("result.json"),
         "discovered artifact must be result.json, got: {:?}",
@@ -905,6 +903,72 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         result.artifact_paths.is_empty(),
         "implicit broad discovery must be disabled unless the frozen policy opts in: {:?}",
         result.artifact_paths
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "manual P053 reference-workspace latency spot-check; set CHAINWORKS_P053_REFERENCE_WORKSPACE_ROOT"]
+async fn p053_manual_reference_workspace_pre_initialize_latency() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let workspace_root = std::env::var("CHAINWORKS_P053_REFERENCE_WORKSPACE_ROOT")
+        .expect("set CHAINWORKS_P053_REFERENCE_WORKSPACE_ROOT to the reference workspace root");
+    assert!(
+        std::path::Path::new(&workspace_root).is_dir(),
+        "reference workspace root must be a directory: {workspace_root}"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_noop_prompt_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "p053_manual_reference_workspace".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: workspace_root.clone(),
+        prompt: "P053 manual reference workspace latency spot-check".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result.artifact_paths.is_empty(),
+        "manual reference check must not infer artifacts through broad discovery: {:?}",
+        result.artifact_paths
+    );
+    let pre_initialize_latency_ms = result
+        .acp_pre_initialize_local_latency_ms
+        .expect("P053 manual check must report pre-initialize local latency");
+    println!(
+        "p053_manual_reference_workspace={workspace_root} acp_pre_initialize_local_latency_ms={pre_initialize_latency_ms}"
+    );
+    assert!(
+        pre_initialize_latency_ms < 1000,
+        "P053 pre-initialize local latency should stay below the reference target"
     );
 }
 
