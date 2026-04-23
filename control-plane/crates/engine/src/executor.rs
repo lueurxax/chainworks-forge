@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -15,8 +15,11 @@ use crate::release::{
     receipt::DeliveryReceiptBuilder,
 };
 use acp::AcpRuntimeManager;
-use db::repos::{agent_executions, artifacts, ideas, projections, sessions, stages, validation};
-use db::work_item::{WorkItem, WorkItemKind};
+use db::repos::{
+    agent_execution_runtime_facts, agent_executions, artifact_contracts, artifacts, ideas,
+    projections, sessions, stages, validation, work_items,
+};
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::AgentStatus;
 use domain::artifact::ArtifactFormat;
 use domain::ids::RunId;
@@ -51,6 +54,384 @@ impl acp::XcodeRuntimeObservationSink for DbXcodeRuntimeObservationSink {
         agent_executions::append_xcode_runtime_observation(&self.pool, agent_execution_id, update)
             .await
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedInvokeAgentStart {
+    pub work_item_id: String,
+    pub source_work_item_id: String,
+    pub run_id: domain::ids::RunId,
+    pub stage_execution_id: domain::ids::StageExecutionId,
+    pub agent_execution_id: domain::ids::AgentExecutionId,
+    pub session_generation_id: String,
+    pub artifact_claim_key: domain::artifact_contracts::ArtifactSourceGenerationClaimKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvokeAgentCapacityConfig {
+    pub max_active_total: usize,
+    pub max_active_per_run: usize,
+    pub provider_caps: std::collections::HashMap<String, usize>,
+}
+
+impl InvokeAgentCapacityConfig {
+    fn unbounded() -> Self {
+        Self {
+            max_active_total: usize::MAX,
+            max_active_per_run: usize::MAX,
+            provider_caps: std::collections::HashMap::new(),
+        }
+    }
+}
+
+pub async fn claim_next_invoke_agent_with_start(
+    pool: &SqlitePool,
+) -> Result<Option<ClaimedInvokeAgentStart>> {
+    Ok(
+        claim_next_invoke_agent_with_start_internal(pool, &InvokeAgentCapacityConfig::unbounded())
+            .await?
+            .map(|(claimed, _)| claimed),
+    )
+}
+
+pub async fn claim_next_invoke_agent_with_start_with_capacity(
+    pool: &SqlitePool,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<Option<ClaimedInvokeAgentStart>> {
+    Ok(claim_next_invoke_agent_with_start_internal(pool, capacity)
+        .await?
+        .map(|(claimed, _)| claimed))
+}
+
+pub async fn has_capacity_eligible_pending_invoke_agent_for_start(
+    pool: &SqlitePool,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<bool> {
+    let candidates =
+        work_items::select_pending_invoke_agents_for_start(pool, chrono::Utc::now(), 128).await?;
+    for item in candidates {
+        if invoke_item_has_start_capacity(pool, &item, capacity).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn claim_next_invoke_agent_with_start_internal(
+    pool: &SqlitePool,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
+    let candidates =
+        work_items::select_pending_invoke_agents_for_start(pool, chrono::Utc::now(), 128).await?;
+    for item in candidates {
+        if !invoke_item_has_start_capacity(pool, &item, capacity).await? {
+            continue;
+        }
+        if let Some(claimed) = claim_invoke_agent_work_item_with_start(pool, item).await? {
+            return Ok(Some(claimed));
+        }
+    }
+    Ok(None)
+}
+
+async fn invoke_item_has_start_capacity(
+    pool: &SqlitePool,
+    item: &WorkItem,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<bool> {
+    let payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
+    let provider = payload
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if provider.is_empty() {
+        return Ok(false);
+    }
+
+    let running_status = AgentStatus::Running.to_string();
+    let total_active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = ?1")
+            .bind(&running_status)
+            .fetch_one(pool)
+            .await?;
+    if total_active as usize >= capacity.max_active_total {
+        return Ok(false);
+    }
+
+    if let Some(run_id) = item.run_id {
+        let run_active: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+               WHERE ae.status = ?1 AND se.run_id = ?2"#,
+        )
+        .bind(&running_status)
+        .bind(run_id.to_string())
+        .fetch_one(pool)
+        .await?;
+        if run_active as usize >= capacity.max_active_per_run {
+            return Ok(false);
+        }
+    }
+
+    if let Some(provider_cap) = capacity.provider_caps.get(provider) {
+        let provider_active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_executions WHERE status = ?1 AND provider = ?2",
+        )
+        .bind(&running_status)
+        .bind(provider)
+        .fetch_one(pool)
+        .await?;
+        if provider_active as usize >= *provider_cap {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+async fn claim_invoke_agent_work_item_with_start(
+    pool: &SqlitePool,
+    item: WorkItem,
+) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
+    let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
+    if payload
+        .get("session_reuse_scope")
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
+        work_items::fail(
+            pool,
+            &item.id,
+            "InvokeAgent payload missing session_reuse_scope; refusing legacy sessionless ACP fallback",
+        )
+        .await?;
+        return Ok(None);
+    }
+
+    if let Some(existing) = payload.get("p058_claimed") {
+        let claimed = claimed_invoke_agent_start_from_payload(&item, existing)?;
+        mark_invoke_work_item_running(pool, &item.id).await?;
+        let mut running_item = item;
+        running_item.status = WorkItemStatus::Running;
+        running_item.attempt_count += 1;
+        return Ok(Some((claimed, running_item)));
+    }
+
+    let run_id = item
+        .run_id
+        .ok_or_else(|| anyhow::anyhow!("InvokeAgent work item missing run_id"))?;
+    let stage_execution_id: domain::ids::StageExecutionId = payload
+        .get("stage_execution_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing stage_execution_id"))?
+        .parse()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let stage_id = payload
+        .get("stage_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing stage_id"))?
+        .to_string();
+    let agent_id = payload
+        .get("agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&stage_id)
+        .to_string();
+    let provider = payload
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
+        .to_string();
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let session_reuse_scope = payload
+        .get("session_reuse_scope")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let session_family_id = payload
+        .get("session_family_id")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let task_name = payload
+        .get("task_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&stage_id)
+        .to_string();
+    let now = chrono::Utc::now();
+    let agent_execution_id = domain::ids::AgentExecutionId::new();
+    let session_generation_id = uuid::Uuid::new_v4().to_string();
+    let owner_execution_lineage_id = stage_execution_id.to_string();
+    let run_id_str = run_id.to_string();
+    let invocation_owner_key = invocation_owner_key(&InvocationOwnerKeyInput {
+        run_id: &run_id_str,
+        agent_id: &agent_id,
+        stage_lineage_id: &stage_id,
+        task_name: &task_name,
+        owner_execution_lineage_id: &owner_execution_lineage_id,
+    });
+
+    agent_executions::insert(
+        pool,
+        &domain::agent::AgentExecution {
+            id: agent_execution_id,
+            stage_execution_id,
+            agent_id,
+            provider,
+            model,
+            status: AgentStatus::Running,
+            started_at: now,
+            completed_at: None,
+            owner_execution_lineage_id: Some(owner_execution_lineage_id),
+            session_lineage_id: Some(session_generation_id.clone()),
+            session_generation_id: Some(session_generation_id.clone()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some(invocation_owner_key),
+            session_reuse_scope,
+            session_family_id,
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+        },
+    )
+    .await?;
+
+    let mut facts =
+        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.session_reuse_reason = Some("legacy_unknown".into());
+    agent_execution_runtime_facts::upsert(pool, &facts).await?;
+
+    let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+        run_id,
+        stage_execution_id,
+        agent_execution_id,
+        source_work_item_id: item.id.clone(),
+    };
+    artifact_contracts::insert_source_generation_claim(
+        pool,
+        domain::artifact_contracts::ArtifactSourceGenerationClaim {
+            key: artifact_claim_key.clone(),
+            current_session_generation_id: Some(session_generation_id.clone()),
+            claim_state: domain::agent::ArtifactSourceClaimState::Active,
+            superseding_work_item_id: None,
+            superseded_by_agent_execution_id: None,
+            supersession_journal_id: None,
+            superseded_at: None,
+            closed_at: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    let claimed = ClaimedInvokeAgentStart {
+        work_item_id: item.id.clone(),
+        source_work_item_id: item.id.clone(),
+        run_id,
+        stage_execution_id,
+        agent_execution_id,
+        session_generation_id,
+        artifact_claim_key,
+    };
+    payload["p058_claimed"] = serde_json::json!({
+        "agent_execution_id": claimed.agent_execution_id.to_string(),
+        "artifact_claim_key": claimed.artifact_claim_key,
+        "session_generation_id": claimed.session_generation_id,
+        "session_policy_decision": {
+            "generation": {
+                "id": claimed.session_generation_id
+            }
+        }
+    });
+    let payload_json = serde_json::to_string(&payload)?;
+    update_invoke_work_item_claimed_payload_and_running(pool, &item.id, &payload_json).await?;
+    let mut running_item = item;
+    running_item.status = WorkItemStatus::Running;
+    running_item.payload_json = payload_json;
+    running_item.attempt_count += 1;
+    Ok(Some((claimed, running_item)))
+}
+
+fn claimed_invoke_agent_start_from_payload(
+    item: &WorkItem,
+    claimed: &serde_json::Value,
+) -> Result<ClaimedInvokeAgentStart> {
+    let artifact_claim_key: domain::artifact_contracts::ArtifactSourceGenerationClaimKey =
+        serde_json::from_value(
+            claimed
+                .get("artifact_claim_key")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("p058_claimed missing artifact_claim_key"))?,
+        )?;
+    let agent_execution_id: domain::ids::AgentExecutionId = claimed
+        .get("agent_execution_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("p058_claimed missing agent_execution_id"))?
+        .parse()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let session_generation_id = claimed
+        .pointer("/session_policy_decision/generation/id")
+        .or_else(|| claimed.get("session_generation_id"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("p058_claimed missing session generation id"))?
+        .to_string();
+    Ok(ClaimedInvokeAgentStart {
+        work_item_id: item.id.clone(),
+        source_work_item_id: artifact_claim_key.source_work_item_id.clone(),
+        run_id: artifact_claim_key.run_id,
+        stage_execution_id: artifact_claim_key.stage_execution_id,
+        agent_execution_id,
+        session_generation_id,
+        artifact_claim_key,
+    })
+}
+
+async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE work_items SET status = ?1, attempt_count = attempt_count + 1 WHERE id = ?2 AND status = ?3",
+    )
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(work_item_id)
+    .bind(WorkItemStatus::Pending.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("claim/start CAS failed for InvokeAgent work item {work_item_id}");
+    }
+    Ok(())
+}
+
+async fn update_invoke_work_item_claimed_payload_and_running(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    payload_json: &str,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE work_items SET payload_json = ?1, status = ?2, attempt_count = attempt_count + 1 WHERE id = ?3 AND status = ?4",
+    )
+    .bind(payload_json)
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(work_item_id)
+    .bind(WorkItemStatus::Pending.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("claim/start CAS failed for InvokeAgent work item {work_item_id}");
+    }
+    Ok(())
 }
 
 pub struct BackgroundExecutor {
@@ -170,6 +551,19 @@ fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     }
     std::fs::write(path_obj, content)?;
     Ok(())
+}
+
+fn raw_status_from_artifact_path(path: &str) -> String {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(|status| status.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn materialize_declared_outputs_from_discovered_artifacts(
@@ -374,6 +768,59 @@ impl BackgroundExecutor {
         }
     }
 
+    pub async fn persist_implementation_self_assessment_summary_if_applicable(
+        &self,
+        artifact: &domain::artifact::Artifact,
+    ) -> Result<()> {
+        if artifact.contract_id
+            != domain::artifact_contracts::IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID
+            && artifact.name != "implementation_self_assessment"
+            && artifact.name != "implementation_self_assessment_v2"
+        {
+            return Ok(());
+        }
+
+        let bytes = std::fs::read(&artifact.file_path).with_context(|| {
+            format!(
+                "read implementation self-assessment artifact {}",
+                artifact.file_path
+            )
+        })?;
+        let context = domain::artifact_contracts::ContractParseContext {
+            run_id: artifact.run_id.to_string(),
+            declared_contract_id: Some(artifact.contract_id.clone()),
+            canonical_artifact_path:
+                domain::artifact_contracts::IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(artifact.file_path.clone()),
+            artifact_created_at: Some(artifact.created_at),
+            v2_generation_seen_for_run: true,
+            ..domain::artifact_contracts::ContractParseContext::default()
+        };
+        let summary = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => {
+                domain::artifact_contracts::parse_implementation_self_assessment_v2(&value, context)
+            }
+            Err(error) => {
+                domain::artifact_contracts::invalid_implementation_self_assessment_summary(
+                    context,
+                    "malformed_json",
+                    format!("artifact is not valid JSON: {error}"),
+                    "",
+                )
+            }
+        };
+        artifact_contracts::persist_implementation_self_assessment_summary(
+            &self.pool,
+            artifact.run_id,
+            artifact.id,
+            &artifact.contract_id,
+            &summary,
+            artifact.created_at,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Start the background loop. Returns a JoinHandle.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -401,7 +848,29 @@ impl BackgroundExecutor {
                     }
                 }
             }
-            None => Ok(false),
+            None => {
+                match claim_next_invoke_agent_with_start_internal(
+                    &self.pool,
+                    &InvokeAgentCapacityConfig::unbounded(),
+                )
+                .await?
+                {
+                    Some((claimed, item)) => {
+                        let item_id = claimed.work_item_id.clone();
+                        match self.process_item(item).await {
+                            Ok(()) => {
+                                self.work_queue.complete(&item_id).await?;
+                                Ok(true)
+                            }
+                            Err(error) => {
+                                self.work_queue.fail(&item_id, &error.to_string()).await?;
+                                Err(error)
+                            }
+                        }
+                    }
+                    None => Ok(false),
+                }
+            }
         }
     }
 
@@ -608,7 +1077,14 @@ impl BackgroundExecutor {
                     crate::mcp::xcode_broker_contract_hash(&mcp_resolution.payloads);
                 let resolved_model = model.clone().unwrap_or_else(|| "default".into());
                 let now = chrono::Utc::now();
-                let agent_exec_id = domain::ids::AgentExecutionId::new();
+                let preclaimed_start = payload
+                    .get("p058_claimed")
+                    .map(|claimed| claimed_invoke_agent_start_from_payload(&item, claimed))
+                    .transpose()?;
+                let agent_exec_id = preclaimed_start
+                    .as_ref()
+                    .map(|claimed| claimed.agent_execution_id)
+                    .unwrap_or_else(domain::ids::AgentExecutionId::new);
                 let owner_execution_lineage_id = stage_execution_id.to_string();
                 let policy_input = SessionPolicyInput {
                     run_id: run_id.to_string(),
@@ -658,7 +1134,7 @@ impl BackgroundExecutor {
                 };
 
                 let mut policy_decision: Option<SessionPolicyDecision> =
-                    if session_reuse_scope.is_some() {
+                    if preclaimed_start.is_none() && session_reuse_scope.is_some() {
                         Some(ensure_policy(&self.pool, policy_input.clone()).await?)
                     } else {
                         None
@@ -725,56 +1201,60 @@ impl BackgroundExecutor {
                     .await?;
                 }
 
-                let agent_exec = domain::agent::AgentExecution {
-                    id: agent_exec_id,
-                    stage_execution_id,
-                    agent_id: agent_id.clone(),
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    status: domain::agent::AgentStatus::Running,
-                    started_at: now,
-                    completed_at: None,
-                    owner_execution_lineage_id: Some(owner_execution_lineage_id),
-                    session_lineage_id: policy_decision
-                        .as_ref()
-                        .map(|decision| decision.lineage.id.clone()),
-                    session_generation_id: policy_decision
-                        .as_ref()
-                        .map(|decision| decision.generation.id.clone()),
-                    rehydrated_from_checkpoint_artifact_id: policy_decision.as_ref().and_then(
-                        |decision| {
-                            decision
-                                .generation
-                                .rehydrated_from_checkpoint_artifact_id
-                                .clone()
-                        },
-                    ),
-                    invocation_owner_key: policy_decision
-                        .as_ref()
-                        .map(|decision| decision.generation.invocation_owner_key.clone()),
-                    session_reuse_scope: session_reuse_scope.clone(),
-                    session_family_id: session_family_id.clone(),
-                    session_reuse_disposition: policy_decision.as_ref().and_then(|decision| {
-                        serde_json::to_value(&decision.disposition)
-                            .ok()
-                            .and_then(|value| value.as_str().map(String::from))
-                    }),
-                    session_reset_reason: policy_decision
-                        .as_ref()
-                        .and_then(|decision| decision.session_reset_reason.clone()),
-                    backend_profile_id: backend_profile_id.clone(),
-                    requested_mcp_extensions_json: Some(requested_mcp_extensions_json.clone()),
-                    predicted_mcp_extensions_json: Some(predicted_mcp_extensions_json.clone()),
-                    predicted_mcp_runtime_ids_json: Some(predicted_mcp_runtime_ids_json.clone()),
-                    actual_mcp_extensions_json: None,
-                    actual_mcp_runtime_ids_json: None,
-                    denied_mcp_extensions_json: Some(denied_mcp_extensions_json.clone()),
-                    mcp_blocking_issues_json: Some(mcp_blocking_issues_json.clone()),
-                    actual_mcp_observation_json: None,
-                    actual_xcode_runtime_observation_json: None,
-                    mcp_session_startup_latency_ms: None,
-                };
-                agent_executions::insert(&self.pool, &agent_exec).await?;
+                if preclaimed_start.is_none() {
+                    let agent_exec = domain::agent::AgentExecution {
+                        id: agent_exec_id,
+                        stage_execution_id,
+                        agent_id: agent_id.clone(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        status: domain::agent::AgentStatus::Running,
+                        started_at: now,
+                        completed_at: None,
+                        owner_execution_lineage_id: Some(owner_execution_lineage_id),
+                        session_lineage_id: policy_decision
+                            .as_ref()
+                            .map(|decision| decision.lineage.id.clone()),
+                        session_generation_id: policy_decision
+                            .as_ref()
+                            .map(|decision| decision.generation.id.clone()),
+                        rehydrated_from_checkpoint_artifact_id: policy_decision.as_ref().and_then(
+                            |decision| {
+                                decision
+                                    .generation
+                                    .rehydrated_from_checkpoint_artifact_id
+                                    .clone()
+                            },
+                        ),
+                        invocation_owner_key: policy_decision
+                            .as_ref()
+                            .map(|decision| decision.generation.invocation_owner_key.clone()),
+                        session_reuse_scope: session_reuse_scope.clone(),
+                        session_family_id: session_family_id.clone(),
+                        session_reuse_disposition: policy_decision.as_ref().and_then(|decision| {
+                            serde_json::to_value(&decision.disposition)
+                                .ok()
+                                .and_then(|value| value.as_str().map(String::from))
+                        }),
+                        session_reset_reason: policy_decision
+                            .as_ref()
+                            .and_then(|decision| decision.session_reset_reason.clone()),
+                        backend_profile_id: backend_profile_id.clone(),
+                        requested_mcp_extensions_json: Some(requested_mcp_extensions_json.clone()),
+                        predicted_mcp_extensions_json: Some(predicted_mcp_extensions_json.clone()),
+                        predicted_mcp_runtime_ids_json: Some(
+                            predicted_mcp_runtime_ids_json.clone(),
+                        ),
+                        actual_mcp_extensions_json: None,
+                        actual_mcp_runtime_ids_json: None,
+                        denied_mcp_extensions_json: Some(denied_mcp_extensions_json.clone()),
+                        mcp_blocking_issues_json: Some(mcp_blocking_issues_json.clone()),
+                        actual_mcp_observation_json: None,
+                        actual_xcode_runtime_observation_json: None,
+                        mcp_session_startup_latency_ms: None,
+                    };
+                    agent_executions::insert(&self.pool, &agent_exec).await?;
+                }
 
                 if !mcp_resolution.report.blocking_issues.is_empty() {
                     let completed_at = chrono::Utc::now();
@@ -1035,6 +1515,8 @@ impl BackgroundExecutor {
                         &declared_outputs,
                         run_id,
                         &stage_id,
+                        stage_execution_id,
+                        agent_exec_id,
                         &agent_id,
                         &provider,
                         model.clone(),
@@ -1693,6 +2175,8 @@ impl BackgroundExecutor {
         declared_outputs: &[DeclaredOutput],
         run_id: RunId,
         stage_id: &str,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_exec_id: domain::ids::AgentExecutionId,
         agent_id: &str,
         provider: &str,
         model: Option<String>,
@@ -1718,6 +2202,8 @@ impl BackgroundExecutor {
                     provider,
                     model.clone(),
                     None,
+                    Some(stage_execution_id),
+                    Some(agent_exec_id),
                     created_at,
                 )
                 .await?
@@ -1743,6 +2229,8 @@ impl BackgroundExecutor {
                         provider,
                         model.clone(),
                         None,
+                        Some(stage_execution_id),
+                        Some(agent_exec_id),
                         created_at,
                     )
                     .await?
@@ -1872,6 +2360,8 @@ impl BackgroundExecutor {
             provider,
             model,
             None,
+            None,
+            None,
             created_at,
         )
         .await
@@ -1889,6 +2379,8 @@ impl BackgroundExecutor {
         provider: &str,
         model: Option<String>,
         report_kind: Option<&str>,
+        source_stage_execution_id: Option<domain::ids::StageExecutionId>,
+        source_agent_execution_id: Option<domain::ids::AgentExecutionId>,
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<domain::artifact::Artifact>> {
         let artifact_path = std::path::Path::new(path);
@@ -1915,6 +2407,29 @@ impl BackgroundExecutor {
             report_version: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
+        if domain::artifact_contracts::known_contract_id(contract_id) {
+            artifact_contracts::upsert_generation_and_rebuild(
+                &self.pool,
+                domain::artifact_contracts::ActiveArtifactGenerationInput {
+                    run_id,
+                    artifact_id: artifact.id,
+                    contract_id: contract_id.to_string(),
+                    canonical_path: path.to_string(),
+                    raw_path: path.to_string(),
+                    raw_status: raw_status_from_artifact_path(path),
+                    generation_id: artifact.id.to_string(),
+                    source_agent_execution_id: source_agent_execution_id.map(|id| id.to_string()),
+                    source_stage_execution_id: source_stage_execution_id.map(|id| id.to_string()),
+                    source_session_generation_id: None,
+                    source_work_item_id: None,
+                    supersedes_generation_id: None,
+                    output_settlement: domain::agent::AgentOutputSettlement::None,
+                    partial: false,
+                    warnings: Vec::new(),
+                },
+            )
+            .await?;
+        }
         let _ = self
             .events
             .send(domain::events::DomainEvent::ArtifactCreated {

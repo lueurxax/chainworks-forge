@@ -65,6 +65,7 @@ import SwiftData
     var deniedMCPExtensionsJSON: Data?
     var mcpSessionStartupLatencyMilliseconds: Int?
     var mcpServerTelemetryJSON: Data?
+    var actualXcodeRuntimeObservationJSON: Data?
 
     /// Proposal 026: Actual runtime profile used for this execution attempt.
     var runtimeProfileID: String?

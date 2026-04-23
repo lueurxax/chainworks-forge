@@ -114,6 +114,7 @@ final class WorkflowMapProjectionService {
         let occurrences = stages.flatMap(\.occurrences)
         let edges = stages.flatMap { $0.handoffs + $0.transitions }
         let loops = stages.compactMap(\.loopTelemetry)
+        let xcodeRuntimeObservations = buildXcodeRuntimeObservations(from: projectionStages)
 
         let activeOccurrences = occurrences.filter { $0.state == .thinking }.count
         let completedOccurrences = occurrences.filter { $0.state == .completed }.count
@@ -142,7 +143,8 @@ final class WorkflowMapProjectionService {
             edges: edges,
             loops: loops,
             liveTimeline: liveTimeline,
-            persistedTimeline: persistedTimeline
+            persistedTimeline: persistedTimeline,
+            xcodeRuntimeObservations: xcodeRuntimeObservations
         )
     }
 

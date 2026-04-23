@@ -3394,6 +3394,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
+                xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
             })
         }
@@ -3483,6 +3484,8 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "fixture",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "fixture-agent",
                 "declared_outputs": [{
                     "output_name": "prepush_review_report",
                     "target_path": target_path.to_string_lossy(),
@@ -3580,6 +3583,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
+                xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
             })
         }
@@ -7365,6 +7369,7 @@ fn test_artifact_field_reads_per_run_meta_root() {
 #[test]
 fn test_execution_request_carries_chainworks_meta_root() {
     let req = acp::ExecutionRequest {
+        agent_execution_id: None,
         run_id: RunId::new(),
         stage_id: "test".into(),
         agent_id: "test".into(),

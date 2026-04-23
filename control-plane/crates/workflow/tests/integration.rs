@@ -112,6 +112,38 @@ fn test_parse_agent_catalog() {
 }
 
 #[test]
+fn p051_example_catalogs_explicitly_mark_xcode_required_tools_for_host_execution() {
+    for relative_path in ["agents/agents.yaml", "agents/agents_mcp_profiles_v2.yaml"] {
+        let cat_path = format!("{}/{}", fixtures_dir(), relative_path);
+        let cat = workflow::catalog::load(&cat_path).expect("should parse agent catalog YAML");
+        let agents = cat.agents.as_ref().expect("has agents");
+        let missing: Vec<String> = agents
+            .iter()
+            .filter(|agent| {
+                let has_xcode_required_tool = agent
+                    .required_tools
+                    .as_ref()
+                    .map(|tools| tools.iter().any(|tool| declares_xcode_host_tool(tool)))
+                    .unwrap_or(false);
+                has_xcode_required_tool && agent.requires_xcode_host_execution != Some(true)
+            })
+            .map(|agent| agent.id.clone())
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "{relative_path} agents with Xcode required_tools must explicitly set requires_xcode_host_execution: true: {missing:?}"
+        );
+    }
+}
+
+fn declares_xcode_host_tool(command: &str) -> bool {
+    ["xcodebuild", "simctl", "xcrun"]
+        .iter()
+        .any(|tool| command.contains(tool))
+}
+
+#[test]
 fn test_compile_full_mvp_live_plan() {
     let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
     let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
@@ -275,6 +307,301 @@ agents:
     assert!(
         error.contains("p051_absolute_xcode_tool_path"),
         "absolute xcodebuild path should be rejected: {error}"
+    );
+}
+
+#[test]
+fn p051_catalog_lint_rejects_unknown_xcrun_flags() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    required_tools:
+      - xcrun --diagnose simctl list devices
+"#,
+    );
+
+    assert!(
+        error.contains("P051 direct-command catalog lint failed"),
+        "compile should fail through the P051 scanner: {error}"
+    );
+    assert!(
+        error.contains("p051_xcrun_unknown_flag"),
+        "unknown xcrun flags should be rejected: {error}"
+    );
+}
+
+#[test]
+fn p051_workflow_run_task_sets_xcode_signals_for_invoked_agent() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    run:
+      sequence:
+        - agent: builder
+          task: xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from workflow task instructions."
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "workflow run-block Xcode commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "workflow run-block Xcode commands must route through host execution"
+    );
+}
+
+#[test]
+fn p051_workflow_run_task_rejects_direct_mcpbridge_bypass() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    run:
+      sequence:
+        - agent: builder
+          task: xcrun mcpbridge
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from workflow task instructions."
+"#,
+    );
+
+    assert!(
+        error.contains("states.start.run.sequence[0].task"),
+        "workflow run-block task path should be reported: {error}"
+    );
+    assert!(
+        error.contains("p051_direct_mcpbridge_command"),
+        "direct mcpbridge use should fail closed: {error}"
+    );
+}
+
+#[test]
+fn p051_agent_adapter_raw_commands_set_xcode_signals_for_agent() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from adapter-specific launch instructions."
+    codex:
+      launch:
+        commands:
+          - xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "adapter-specific raw Xcode commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "adapter-specific raw Xcode commands must route through host execution"
+    );
+}
+
+#[test]
+fn p051_agent_adapter_raw_commands_reject_direct_mcpbridge_bypass() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from adapter-specific launch instructions."
+    gemini:
+      session_new:
+        args:
+          - xcrun mcpbridge
+"#,
+    );
+
+    assert!(
+        error.contains("agents.builder.gemini.session_new.args[0]"),
+        "adapter-specific raw command path should include the owning agent id: {error}"
+    );
+    assert!(
+        error.contains("p051_direct_mcpbridge_command"),
+        "adapter-specific direct mcpbridge use should fail closed: {error}"
+    );
+}
+
+#[test]
+fn p051_agent_allowed_commands_set_xcode_signals_for_agent() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from declared allowed commands."
+    allowed_commands:
+      - xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "allowed_commands Xcode declarations must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "allowed_commands Xcode declarations must route through host execution"
+    );
+}
+
+#[test]
+fn p051_workflow_state_raw_shell_commands_set_xcode_signals_for_owner() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    tools:
+      shell:
+        commands:
+          - xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from state-owned shell commands."
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "state-owned raw workflow shell commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "state-owned raw workflow shell commands must route through host execution"
+    );
+}
+
+#[test]
+fn p051_workflow_state_raw_shell_commands_reject_direct_mcpbridge_bypass() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    tools:
+      shell:
+        commands:
+          - xcrun mcpbridge
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from state-owned shell commands."
+"#,
+    );
+
+    assert!(
+        error.contains("states.start.tools.shell.commands[0]"),
+        "state-owned raw workflow command path should be reported: {error}"
+    );
+    assert!(
+        error.contains("p051_direct_mcpbridge_command"),
+        "state-owned direct mcpbridge use should fail closed: {error}"
     );
 }
 

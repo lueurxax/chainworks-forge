@@ -41,6 +41,22 @@ struct FailedStageEvidencePanel: View {
                     .textSelection(.enabled)
             }
 
+            if let friendlyFailure = XcodeRuntimeFriendlyFailure.first(in: evidencePacket.failureSummary) {
+                GroupBox("Xcode Recovery") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(friendlyFailure.title, systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.orange)
+                        Text(friendlyFailure.suggestedAction)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .accessibilityIdentifier("xcode-friendly-failure")
+            }
+
             // Validation failure details (if present)
             if let validationFailure = evidencePacket.validationFailure {
                 DisclosureGroup("Validation Details", isExpanded: $showFullValidation) {

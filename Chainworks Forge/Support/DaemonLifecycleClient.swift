@@ -96,6 +96,33 @@ struct FailureReason: Codable, Sendable, Equatable {
     }
 }
 
+enum XcodeBrokerHealthState: String, Codable, Sendable {
+    case disabled
+    case healthy
+    case degraded
+    case failed
+}
+
+struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
+    let state: XcodeBrokerHealthState
+    let poolID: String
+    let activeLeases: Int
+    let queuedLeases: Int
+    let maxActiveLeases: Int
+    let maxQueuedLeases: Int
+    let brokerDisabled: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case poolID = "pool_id"
+        case activeLeases = "active_leases"
+        case queuedLeases = "queued_leases"
+        case maxActiveLeases = "max_active_leases"
+        case maxQueuedLeases = "max_queued_leases"
+        case brokerDisabled = "broker_disabled"
+    }
+}
+
 /// Wire shape for `/health`, `/ready`, and `daemonStatus.json`.
 struct DaemonStatus: Codable, Sendable, Equatable {
     let state: DaemonLifecycleState
@@ -108,6 +135,7 @@ struct DaemonStatus: Codable, Sendable, Equatable {
     let failure: FailureReason?
     let restartCountSinceBoot: Int
     let pid: Int
+    let xcodeBrokerHealth: XcodeBrokerHealthSnapshot?
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -120,6 +148,7 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         case failure
         case restartCountSinceBoot = "restart_count_since_boot"
         case pid
+        case xcodeBrokerHealth = "xcode_broker_health"
     }
 
     init(from decoder: Decoder) throws {
@@ -134,6 +163,10 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         failure = try c.decodeIfPresent(FailureReason.self, forKey: .failure)
         restartCountSinceBoot = try c.decode(Int.self, forKey: .restartCountSinceBoot)
         pid = try c.decode(Int.self, forKey: .pid)
+        xcodeBrokerHealth = try c.decodeIfPresent(
+            XcodeBrokerHealthSnapshot.self,
+            forKey: .xcodeBrokerHealth
+        )
     }
 
     init(
@@ -146,7 +179,8 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         degraded: [DegradedReason],
         failure: FailureReason?,
         restartCountSinceBoot: Int,
-        pid: Int
+        pid: Int,
+        xcodeBrokerHealth: XcodeBrokerHealthSnapshot? = nil
     ) {
         self.state = state
         self.schemaVersion = schemaVersion
@@ -158,6 +192,7 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         self.failure = failure
         self.restartCountSinceBoot = restartCountSinceBoot
         self.pid = pid
+        self.xcodeBrokerHealth = xcodeBrokerHealth
     }
 }
 

@@ -9,6 +9,7 @@ use db::repos::{
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
 use domain::ids::RunId;
+use domain::xcode_runtime::XcodeRuntimeObservation;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
@@ -167,11 +168,21 @@ pub(crate) async fn execution_mcp_truth_json(
             "denied_mcp_extensions_json": execution.denied_mcp_extensions_json,
             "mcp_blocking_issues_json": execution.mcp_blocking_issues_json,
             "actual_mcp_observation_json": execution.actual_mcp_observation_json,
+            "xcode_runtime_observation": xcode_runtime_observation_json(
+                execution.actual_xcode_runtime_observation_json.as_deref()
+            ),
             "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
             "runtime_facts": runtime_facts,
         }));
     }
     Ok(serde_json::Value::Array(items))
+}
+
+fn xcode_runtime_observation_json(raw_json: Option<&str>) -> serde_json::Value {
+    raw_json
+        .and_then(|raw| serde_json::from_str::<XcodeRuntimeObservation>(raw).ok())
+        .and_then(|observation| serde_json::to_value(observation.redacted_for_surface()).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 async fn runtime_facts_json(
@@ -631,6 +642,48 @@ mod tests {
                 actual_mcp_observation_json: Some(
                     r#"{"source":"provider_session_new_response"}"#.into(),
                 ),
+                actual_xcode_runtime_observation_json: Some(
+                    serde_json::json!({
+                        "version": 1,
+                        "mcp_broker_observations": [{
+                            "source": "xcode_mcp_broker",
+                            "backend_start_disposition": "lease_reserved",
+                            "pool_id": "pool-1",
+                            "lease_id": "lease-1",
+                            "xcode_pid": "1234",
+                            "backend_process_id": 5678,
+                            "http_endpoint": "127.0.0.1:<redacted>",
+                            "xcode_home_disposition": "host_user_home",
+                            "xcode_tmpdir_disposition": "host_user_tmpdir",
+                            "simulator_selection": {
+                                "mode": "explicit_uuid",
+                                "simulator_id": "SIM-1"
+                            },
+                            "sibling_leases_at_spawn": 1,
+                            "backend_initialize_wait_ms": 42,
+                            "backend_startup_latency_ms": 73,
+                            "http_session_startup_latency_ms": 17,
+                            "backend_failure_class": null,
+                            "originating_execution_id": agent_execution_id.to_string(),
+                            "prompt_cycle_index": 0,
+                            "status_update": null
+                        }],
+                        "xcode_shim_events": [],
+                        "xcode_host_executor_events": [],
+                        "storage": {
+                            "max_events": 1000,
+                            "max_bytes": 1048576,
+                            "truncated": false,
+                            "total_events_dropped": 0,
+                            "mcp_broker_observations_dropped": 0,
+                            "xcode_shim_events_dropped": 0,
+                            "xcode_host_executor_events_dropped": 0,
+                            "corrupt_json_recovery_count": 0,
+                            "corrupt_json_quarantined_bytes": 0
+                        }
+                    })
+                    .to_string(),
+                ),
                 mcp_session_startup_latency_ms: Some(17),
             },
         )
@@ -647,6 +700,78 @@ mod tests {
 
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[test]
+    fn xcode_runtime_observation_readback_redacts_raw_stored_tokens() {
+        let raw = serde_json::json!({
+            "version": 1,
+            "mcp_broker_observations": [{
+                "source": "xcode_mcp_broker",
+                "backend_start_disposition": "lease_reserved",
+                "pool_id": "pool-1",
+                "lease_id": "lease-1",
+                "xcode_pid": "1234",
+                "backend_process_id": 5678,
+                "http_endpoint": "http://127.0.0.1:4000/xcode-mcp/lease-1?token=raw-report-token",
+                "xcode_home_disposition": "host_user_home",
+                "xcode_tmpdir_disposition": "host_user_tmpdir",
+                "simulator_selection": null,
+                "sibling_leases_at_spawn": 1,
+                "backend_initialize_wait_ms": 42,
+                "backend_startup_latency_ms": 73,
+                "http_session_startup_latency_ms": 17,
+                "backend_failure_class": null,
+                "originating_execution_id": "execution-1",
+                "prompt_cycle_index": 0,
+                "status_update": "forwarded Bearer raw-report-bearer"
+            }],
+            "xcode_shim_events": [{
+                "kind": "warning",
+                "ts": "2026-04-21T12:00:00Z",
+                "policy_reason": "residual_absolute_path",
+                "source_field": "session_update",
+                "matched_substring": "bearer_token=raw-report-warning-token",
+                "excerpt": "provider mentioned xcode-lease-raw-report-shim-token"
+            }],
+            "xcode_host_executor_events": [{
+                "ts": "2026-04-21T12:00:01Z",
+                "tool": "simctl",
+                "argv": ["simctl", "token=raw-report-host-token"],
+                "cwd": "/workspace?access_token=raw-report-cwd-token",
+                "host_env_disposition": "allowlist_applied",
+                "env_allowlist_applied": ["SCHEME"],
+                "env_dropped_from_provider": ["TOKEN"],
+                "selected_simulator_id": "SIM-123",
+                "exit_status": 0,
+                "duration_ms": 120
+            }],
+            "storage": {
+                "max_events": 1000,
+                "max_bytes": 1048576,
+                "truncated": false,
+                "total_events_dropped": 0,
+                "mcp_broker_observations_dropped": 0,
+                "xcode_shim_events_dropped": 0,
+                "xcode_host_executor_events_dropped": 0,
+                "corrupt_json_recovery_count": 0,
+                "corrupt_json_quarantined_bytes": 0
+            }
+        })
+        .to_string();
+
+        let readback = xcode_runtime_observation_json(Some(&raw));
+        let serialized = readback.to_string();
+
+        assert!(!serialized.contains("raw-report-token"));
+        assert!(!serialized.contains("raw-report-bearer"));
+        assert!(!serialized.contains("raw-report-warning-token"));
+        assert!(!serialized.contains("raw-report-shim-token"));
+        assert!(!serialized.contains("raw-report-host-token"));
+        assert!(!serialized.contains("raw-report-cwd-token"));
+        assert!(serialized.contains("token=<redacted>"));
+        assert!(serialized.contains("Bearer <redacted>"));
+        assert!(serialized.contains("xcode-lease-<redacted>"));
     }
 
     fn make_run(id: RunId, idea_id: IdeaId) -> domain::run::Run {
@@ -978,6 +1103,20 @@ mod tests {
         assert_eq!(
             execution["actual_mcp_runtime_ids_json"],
             serde_json::json!(r#"["fs-runtime"]"#)
+        );
+        assert_eq!(
+            execution["xcode_runtime_observation"]["mcp_broker_observations"][0]["lease_id"],
+            serde_json::json!("lease-1")
+        );
+        assert_eq!(
+            execution["xcode_runtime_observation"]["mcp_broker_observations"][0]["http_endpoint"],
+            serde_json::json!("127.0.0.1:<redacted>")
+        );
+        assert!(
+            !execution["xcode_runtime_observation"]
+                .to_string()
+                .contains("Bearer "),
+            "reports.get must expose only the persisted redacted observation payload"
         );
     }
 

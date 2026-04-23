@@ -397,14 +397,24 @@ pub trait AcpAdapter: Send + Sync {
     /// should be registered on `resources`.
     fn prepare_launch_spec(
         &self,
-        req: &ExecutionRequest,
-        resources: &mut LaunchResourceGuard,
-    ) -> Result<AcpLaunchSpec>;
+        _req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
+        bail!(
+            "ACP adapter '{}' does not provide process launch specs",
+            self.provider_name()
+        )
+    }
 
     /// Prepare provider-specific `session/new` params independently from
     /// process launch. Broker/capability code can inspect this without owning
     /// subprocess lifecycle.
-    fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec>;
+    fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
+        bail!(
+            "ACP adapter '{}' does not provide session/new specs",
+            self.provider_name()
+        )
+    }
 
     /// Whether this adapter is in the P051 supported set for live HTTP MCP
     /// capability probing. Unsupported adapters fail before subprocess launch
@@ -501,6 +511,14 @@ pub trait AcpAdapter: Send + Sync {
     ) -> Result<AcpSessionHandle> {
         let mut command = Command::new(&launch_spec.binary_path);
         launch_spec.verify_capability_fingerprint()?;
+        if let Some(meta_root) = chainworks_meta_root_env_value(req) {
+            launch_spec
+                .env
+                .retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
+            launch_spec
+                .env
+                .push(("CHAINWORKS_META_ROOT".to_string(), meta_root));
+        }
         command
             .args(&launch_spec.args)
             .envs(launch_spec.env.drain(..))
@@ -570,11 +588,31 @@ pub trait AcpAdapter: Send + Sync {
     /// Execute an agent session and return the result.
     async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
         let session = self.open_session(&req).await?;
-        let mut result = session.prompt(&req).await?;
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = session.close().await;
+                return Err(err);
+            }
+        };
         session.close().await?;
         result.session_generation_id = None;
         Ok(result)
     }
+}
+
+fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
+    let meta_root = req.chainworks_meta_root.as_ref()?;
+    let meta_root_path = Path::new(meta_root);
+    if meta_root_path.is_absolute() {
+        return Some(meta_root.clone());
+    }
+    Some(
+        Path::new(&req.workspace_root)
+            .join(meta_root_path)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::sync::RwLock;
 
 use anyhow::{bail, Result};
 use domain::xcode_runtime::{
-    McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate,
+    McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate, XcodeShimEvent,
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -128,6 +128,13 @@ impl AcpRuntimeManager {
         *guard = sink;
     }
 
+    pub fn xcode_runtime_observation_sink(&self) -> Arc<dyn XcodeRuntimeObservationSink> {
+        self.xcode_runtime_observation_sink
+            .read()
+            .expect("xcode runtime observation sink lock poisoned")
+            .clone()
+    }
+
     pub fn set_xcode_broker_lease_attacher(&self, attacher: Arc<dyn XcodeBrokerLeaseAttacher>) {
         let mut guard = self
             .xcode_broker_lease_attacher
@@ -144,16 +151,17 @@ impl AcpRuntimeManager {
     }
 
     async fn live_session(&self, generation_id: &str) -> Result<AcpSessionHandle> {
-        self.live_sessions
-            .lock()
-            .await
-            .get(generation_id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No live ACP session registered for generation id '{generation_id}'"
-                )
-            })
+        let session = { self.live_sessions.lock().await.get(generation_id).cloned() };
+        let Some(session) = session else {
+            bail!("No live ACP session registered for generation id '{generation_id}'");
+        };
+        if session.is_live().await {
+            return Ok(session);
+        }
+        self.live_sessions.lock().await.remove(generation_id);
+        let cleanup = self.live_xcode_leases.lock().await.remove(generation_id);
+        self.release_xcode_leases(cleanup).await;
+        bail!("No live ACP session registered for generation id '{generation_id}'")
     }
 
     pub async fn has_live_session(
@@ -168,6 +176,12 @@ impl AcpRuntimeManager {
         let Some(session) = session else {
             return false;
         };
+        if !session.is_live().await {
+            self.live_sessions.lock().await.remove(generation_id);
+            let cleanup = self.live_xcode_leases.lock().await.remove(generation_id);
+            self.release_xcode_leases(cleanup).await;
+            return false;
+        }
         match provider_session_id {
             Some(expected) => session.provider_session_id().await == expected,
             None => true,
@@ -185,7 +199,18 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: starting session"
         );
 
-        let opened = self.open_ordered_session(adapter, &req).await?;
+        let opened = match self.open_ordered_session(adapter.clone(), &req).await {
+            Ok(opened) => opened,
+            Err(err)
+                if req.brokered_xcode_intents().is_empty()
+                    && err
+                        .to_string()
+                        .contains("does not provide process launch specs") =>
+            {
+                return adapter.execute(req).await;
+            }
+            Err(err) => return Err(err),
+        };
         let session = opened.session;
         let session_req = opened.session_req;
         let lease_cleanup = opened.lease_cleanup;
@@ -214,6 +239,8 @@ impl AcpRuntimeManager {
             }
             result.session_generation_id = Some(generation_id);
             result.reused_existing_session = false;
+            self.record_xcode_prompt_observations(&session_req, &result)
+                .await;
             return Ok(result);
         }
 
@@ -222,6 +249,8 @@ impl AcpRuntimeManager {
         close_result?;
         result.session_generation_id = None;
         result.reused_existing_session = false;
+        self.record_xcode_prompt_observations(&session_req, &result)
+            .await;
         Ok(result)
     }
 
@@ -334,6 +363,7 @@ impl AcpRuntimeManager {
         let mut result = session.prompt(&req).await?;
         result.session_generation_id = Some(session_generation_id.to_string());
         result.reused_existing_session = true;
+        self.record_xcode_prompt_observations(&req, &result).await;
         Ok(result)
     }
 
@@ -434,6 +464,39 @@ impl AcpRuntimeManager {
         }
     }
 
+    async fn record_xcode_prompt_observations(
+        &self,
+        req: &ExecutionRequest,
+        result: &ExecutionResult,
+    ) {
+        if result.xcode_shim_warning_events.is_empty() {
+            return;
+        }
+        let Some(agent_execution_id) = req.agent_execution_id else {
+            return;
+        };
+        let sink = self
+            .xcode_runtime_observation_sink
+            .read()
+            .expect("xcode runtime observation sink lock poisoned")
+            .clone();
+        for warning in &result.xcode_shim_warning_events {
+            let update = XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
+                warning.clone(),
+            ));
+            if let Err(sink_error) = sink
+                .append_xcode_runtime_observation(agent_execution_id, update)
+                .await
+            {
+                warn!(
+                    agent_execution_id = %agent_execution_id,
+                    error = %sink_error,
+                    "Failed to persist Xcode residual path warning"
+                );
+            }
+        }
+    }
+
     /// Register an additional adapter (useful for testing or future dynamic registration).
     pub fn register(&mut self, adapter: Arc<dyn AcpAdapter>) {
         self.adapters
@@ -496,5 +559,37 @@ fn xcode_failure_class_from_error(error: &anyhow::Error) -> XcodeRuntimeFailureC
 impl Default for AcpRuntimeManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::ids::AgentExecutionId;
+
+    struct FixtureObservationSink;
+
+    #[async_trait::async_trait]
+    impl XcodeRuntimeObservationSink for FixtureObservationSink {
+        async fn append_xcode_runtime_observation(
+            &self,
+            _agent_execution_id: AgentExecutionId,
+            _update: XcodeRuntimeObservationUpdate,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn returns_configured_xcode_runtime_observation_sink() {
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        let sink: Arc<dyn XcodeRuntimeObservationSink> = Arc::new(FixtureObservationSink);
+
+        manager.set_xcode_runtime_observation_sink(sink.clone());
+
+        assert!(Arc::ptr_eq(
+            &sink,
+            &manager.xcode_runtime_observation_sink()
+        ));
     }
 }

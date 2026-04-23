@@ -60,8 +60,14 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
-        let (status, artifact_paths, discovered_artifacts, usage) =
-            self.transport.prompt(req).await?;
+        let (
+            status,
+            artifact_paths,
+            discovered_artifacts,
+            transcript_text,
+            usage,
+            xcode_shim_warning_events,
+        ) = self.transport.prompt(req).await?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
             .as_ref()
@@ -76,7 +82,7 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
-            transcript_text: None,
+            transcript_text,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,
             provider_session_id: Some(self.transport.session_id().to_string()),
@@ -86,6 +92,7 @@ impl AcpSession {
             actual_mcp_extensions,
             actual_mcp_runtime_ids,
             mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
+            xcode_shim_warning_events,
             close_diagnostic: None,
         })
     }
@@ -97,6 +104,10 @@ impl AcpSession {
             cleanup_path(&path);
         }
         Ok(())
+    }
+
+    pub fn is_live(&mut self) -> bool {
+        !self.transport.is_closed() && matches!(self.transport.try_wait(), Ok(None))
     }
 }
 
@@ -135,5 +146,10 @@ impl AcpSessionHandle {
     pub async fn provider_session_id(&self) -> String {
         let session = self.inner.lock().await;
         session.transport.session_id().to_string()
+    }
+
+    pub async fn is_live(&self) -> bool {
+        let mut session = self.inner.lock().await;
+        session.is_live()
     }
 }

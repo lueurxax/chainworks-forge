@@ -178,6 +178,7 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
                 .actual_xcode_runtime_observation_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str::<XcodeRuntimeObservation>(json).ok())
+                .map(XcodeRuntimeObservation::redacted_for_surface)
                 .map(GqlXcodeRuntimeObservation::from),
             mcp_session_startup_latency_ms: execution.mcp_session_startup_latency_ms,
             owner_execution_lineage_id: execution.owner_execution_lineage_id,
@@ -667,5 +668,92 @@ impl From<StageSummaryRow> for GqlStageExecution {
             projection_updated_at: r.projection_updated_at,
             projection_lag: r.projection_lag,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::Utc;
+    use domain::agent::{AgentExecution, AgentStatus};
+    use domain::ids::{AgentExecutionId, StageExecutionId};
+
+    #[test]
+    fn gql_agent_execution_redacts_raw_stored_xcode_runtime_observation() {
+        let raw_observation = serde_json::json!({
+            "version": 1,
+            "mcp_broker_observations": [{
+                "source": "xcode_mcp_broker",
+                "backend_start_disposition": "lease_reserved",
+                "pool_id": "pool-1",
+                "lease_id": "lease-1",
+                "xcode_pid": "1234",
+                "backend_process_id": 5678,
+                "http_endpoint": "http://127.0.0.1:4000/xcode-mcp/lease-1?token=raw-graphql-token",
+                "xcode_home_disposition": "host_user_home",
+                "xcode_tmpdir_disposition": "host_user_tmpdir",
+                "simulator_selection": null,
+                "sibling_leases_at_spawn": 1,
+                "backend_initialize_wait_ms": 42,
+                "backend_startup_latency_ms": 73,
+                "http_session_startup_latency_ms": 17,
+                "backend_failure_class": null,
+                "originating_execution_id": "execution-1",
+                "prompt_cycle_index": 0,
+                "status_update": "forwarded Bearer raw-graphql-bearer"
+            }],
+            "xcode_shim_events": [],
+            "xcode_host_executor_events": []
+        })
+        .to_string();
+        let execution = AgentExecution {
+            id: AgentExecutionId::new(),
+            stage_execution_id: StageExecutionId::new(),
+            agent_id: "code_writer".into(),
+            provider: "codex".into(),
+            model: Some("gpt-5".into()),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status: AgentStatus::Failed,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: None,
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: Some(raw_observation),
+            mcp_session_startup_latency_ms: None,
+        };
+
+        let gql = GqlAgentExecution::from(execution);
+        let observation = gql
+            .actual_xcode_runtime_observation
+            .expect("xcode runtime observation");
+        let broker = observation
+            .mcp_broker_observations
+            .first()
+            .expect("broker observation");
+
+        assert_eq!(
+            broker.http_endpoint.as_deref(),
+            Some("http://127.0.0.1:4000/xcode-mcp/lease-1?token=<redacted>")
+        );
+        assert_eq!(
+            broker.status_update.as_deref(),
+            Some("forwarded Bearer <redacted>")
+        );
     }
 }

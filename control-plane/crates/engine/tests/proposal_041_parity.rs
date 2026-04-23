@@ -1440,6 +1440,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             actual_mcp_extensions: Vec::new(),
             actual_mcp_runtime_ids: Vec::new(),
             mcp_session_startup_latency_ms: Some(0),
+            xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
         })
     }

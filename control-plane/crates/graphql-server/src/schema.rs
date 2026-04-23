@@ -326,6 +326,8 @@ pub struct GqlDaemonStatus {
     pub degraded: Vec<GqlDegradedReason>,
     /// Populated iff `state == FAILED` (P042 §4.1 invariant).
     pub failure: Option<GqlFailureReason>,
+    /// Xcode MCP broker health when the daemon has mounted the broker pool.
+    pub xcode_broker_health: Option<GqlXcodeBrokerHealthSnapshot>,
     /// Canonical JSON per P042 §5.2 (`{state, schema_version, pid,
     /// degraded?, failure?}`). Kept for clients that prefer the
     /// snake-case wire shape identical to `/health`.
@@ -402,6 +404,26 @@ impl From<domain::lifecycle::FailureKind> for GqlFailureKind {
     }
 }
 
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlXcodeBrokerHealthState {
+    Disabled,
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+impl From<domain::lifecycle::XcodeBrokerHealthState> for GqlXcodeBrokerHealthState {
+    fn from(s: domain::lifecycle::XcodeBrokerHealthState) -> Self {
+        use domain::lifecycle::XcodeBrokerHealthState::*;
+        match s {
+            Disabled => Self::Disabled,
+            Healthy => Self::Healthy,
+            Degraded => Self::Degraded,
+            Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct GqlDegradedReason {
     pub kind: GqlDegradedKind,
@@ -441,6 +463,31 @@ impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
     }
 }
 
+#[derive(SimpleObject, Clone)]
+pub struct GqlXcodeBrokerHealthSnapshot {
+    pub state: GqlXcodeBrokerHealthState,
+    pub pool_id: String,
+    pub active_leases: i32,
+    pub queued_leases: i32,
+    pub max_active_leases: i32,
+    pub max_queued_leases: i32,
+    pub broker_disabled: bool,
+}
+
+impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealthSnapshot {
+    fn from(s: domain::lifecycle::XcodeBrokerHealthSnapshot) -> Self {
+        Self {
+            state: s.state.into(),
+            pool_id: s.pool_id,
+            active_leases: s.active_leases as i32,
+            queued_leases: s.queued_leases as i32,
+            max_active_leases: s.max_active_leases as i32,
+            max_queued_leases: s.max_queued_leases as i32,
+            broker_disabled: s.broker_disabled,
+        }
+    }
+}
+
 impl From<DaemonStatus> for GqlDaemonStatus {
     fn from(s: DaemonStatus) -> Self {
         let json = serde_json::to_string(&s).unwrap_or_else(|_| "{}".to_string());
@@ -459,6 +506,9 @@ impl From<DaemonStatus> for GqlDaemonStatus {
                 .map(GqlDegradedReason::from)
                 .collect(),
             failure: s.failure.map(GqlFailureReason::from),
+            xcode_broker_health: s
+                .xcode_broker_health
+                .map(GqlXcodeBrokerHealthSnapshot::from),
             json,
         }
     }

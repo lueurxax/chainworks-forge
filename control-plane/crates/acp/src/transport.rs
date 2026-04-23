@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Context, Result};
 use domain::agent::AgentStatus;
+use domain::xcode_runtime::XcodeShimWarningEvent;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -210,6 +211,15 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
 const OUTPUT_END_MARKER: &str = "<<<END_CHAINWORKS_OUTPUT>>>";
+const RESIDUAL_XCODE_PATH_PATTERNS: &[&str] = &[
+    "/usr/bin/xcodebuild",
+    "/usr/bin/xcrun",
+    "/usr/bin/simctl",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/simctl",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/xcrun",
+    "xcrun mcpbridge",
+];
 
 // ---------------------------------------------------------------------------
 // Workspace snapshot — used for artifact discovery
@@ -331,6 +341,84 @@ fn extract_usage_snapshot(parsed: &Value) -> Option<UsageSnapshot> {
         || snapshot.output_tokens.is_some()
         || snapshot.model_context_window.is_some())
     .then_some(snapshot)
+}
+
+fn residual_xcode_path_warnings_from_update(parsed: &Value) -> Vec<XcodeShimWarningEvent> {
+    if parsed.get("method").and_then(Value::as_str) != Some("session/update") {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if let Some(params) = parsed.get("params") {
+        collect_residual_xcode_path_warnings(params, "/params", &mut warnings);
+    }
+    warnings
+}
+
+fn collect_residual_xcode_path_warnings(
+    value: &Value,
+    source_field: &str,
+    warnings: &mut Vec<XcodeShimWarningEvent>,
+) {
+    match value {
+        Value::String(text) => {
+            let clean = strip_ansi(text);
+            if let Some(matched_substring) = matched_residual_xcode_path(&clean) {
+                warnings.push(XcodeShimWarningEvent {
+                    ts: chrono::Utc::now(),
+                    policy_reason: "p051_residual_xcode_path_warning".to_string(),
+                    source_field: source_field.to_string(),
+                    matched_substring: matched_substring.to_string(),
+                    excerpt: excerpt_around_match(&clean, matched_substring),
+                });
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_residual_xcode_path_warnings(
+                    item,
+                    &format!("{source_field}/{index}"),
+                    warnings,
+                );
+            }
+        }
+        Value::Object(map) => {
+            for (key, nested) in map {
+                collect_residual_xcode_path_warnings(
+                    nested,
+                    &format!("{source_field}/{}", escape_json_pointer_segment(key)),
+                    warnings,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn matched_residual_xcode_path(text: &str) -> Option<&'static str> {
+    RESIDUAL_XCODE_PATH_PATTERNS
+        .iter()
+        .copied()
+        .find(|pattern| text.contains(pattern))
+}
+
+fn excerpt_around_match(text: &str, matched_substring: &str) -> String {
+    const CONTEXT_CHARS: usize = 80;
+    let Some(byte_index) = text.find(matched_substring) else {
+        return text.chars().take(CONTEXT_CHARS * 2).collect();
+    };
+    let match_start_char = text[..byte_index].chars().count();
+    let match_len_chars = matched_substring.chars().count();
+    let start = match_start_char.saturating_sub(CONTEXT_CHARS);
+    let end = match_start_char + match_len_chars + CONTEXT_CHARS;
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn escape_json_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSnapshot) {
@@ -465,7 +553,35 @@ fn extract_output_envelopes(stream_text: &str) -> Vec<DiscoveredArtifact> {
         cursor = content_end + OUTPUT_END_MARKER.len();
     }
 
+    if let Ok(value) = serde_json::from_str::<Value>(stream_text.trim()) {
+        append_json_output_envelopes(&mut artifacts, &value);
+    }
+
     artifacts
+}
+
+fn append_json_output_envelopes(artifacts: &mut Vec<DiscoveredArtifact>, value: &Value) {
+    let Some(outputs) = value
+        .get("CHAINWORKS_OUTPUT")
+        .and_then(|outputs| outputs.as_object())
+    else {
+        return;
+    };
+
+    for (name, content) in outputs {
+        if name.is_empty() || artifacts.iter().any(|artifact| artifact.name == *name) {
+            continue;
+        }
+        let bytes = match content {
+            Value::String(text) => text.as_bytes().to_vec(),
+            _ => serde_json::to_vec(content).unwrap_or_default(),
+        };
+        artifacts.push(DiscoveredArtifact {
+            name: name.clone(),
+            content: bytes,
+            source_path: None,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +989,14 @@ impl AcpTransportSession {
         &self.session_id
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     pub fn mcp_observation(&self) -> Option<McpActualObservation> {
         self.mcp_observation.clone()
     }
@@ -888,7 +1012,9 @@ impl AcpTransportSession {
         AgentStatus,
         Vec<String>,
         Vec<DiscoveredArtifact>,
+        Option<String>,
         Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
     )> {
         self.request_counter += 1;
         let prompt_id = self.request_counter;
@@ -911,6 +1037,8 @@ impl AcpTransportSession {
         let mut last_activity = Instant::now();
         let mut streamed_text = String::new();
         let mut latest_usage_snapshot = None;
+        let mut xcode_shim_warning_events = Vec::new();
+        let mut seen_xcode_warning_keys = HashSet::new();
 
         'streaming: loop {
             let idle = last_activity.elapsed();
@@ -979,6 +1107,15 @@ impl AcpTransportSession {
                     }
                     "session/update" => {
                         debug!(session_id = %self.session_id, "ACP: session/update notification");
+                        for warning in residual_xcode_path_warnings_from_update(&parsed) {
+                            let dedupe_key = format!(
+                                "{}\u{1f}{}\u{1f}{}",
+                                warning.source_field, warning.matched_substring, warning.excerpt
+                            );
+                            if seen_xcode_warning_keys.insert(dedupe_key) {
+                                xcode_shim_warning_events.push(warning);
+                            }
+                        }
                         if let Some(chunk) = extract_text_chunk(&parsed) {
                             streamed_text.push_str(&strip_ansi(&chunk));
                         }
@@ -999,7 +1136,14 @@ impl AcpTransportSession {
                             session_id = %self.session_id,
                             "ACP session/prompt returned error: {err_msg}"
                         );
-                        return Ok((AgentStatus::Failed, vec![], vec![], latest_usage_snapshot));
+                        return Ok((
+                            AgentStatus::Failed,
+                            vec![],
+                            vec![],
+                            non_empty_transcript(streamed_text),
+                            latest_usage_snapshot,
+                            xcode_shim_warning_events,
+                        ));
                     }
                     if let Some(chunk) = extract_text_chunk(&parsed) {
                         streamed_text.push_str(&strip_ansi(&chunk));
@@ -1051,7 +1195,9 @@ impl AcpTransportSession {
             AgentStatus::Completed,
             new_files,
             discovered_artifacts,
+            non_empty_transcript(streamed_text),
             latest_usage_snapshot,
+            xcode_shim_warning_events,
         ))
     }
 
@@ -1109,7 +1255,11 @@ pub async fn run_acp_session(
     config: &AcpSessionConfig<'_>,
 ) -> Result<(AgentStatus, Vec<String>, Vec<DiscoveredArtifact>)> {
     let mut session = AcpTransportSession::start(child, req, config).await?;
-    let (status, paths, artifacts, _usage) = session.prompt(req).await?;
+    let (status, paths, artifacts, _transcript, _usage, _warnings) = session.prompt(req).await?;
     let _ = session.close().await;
     Ok((status, paths, artifacts))
+}
+
+fn non_empty_transcript(text: String) -> Option<String> {
+    (!text.is_empty()).then_some(text)
 }

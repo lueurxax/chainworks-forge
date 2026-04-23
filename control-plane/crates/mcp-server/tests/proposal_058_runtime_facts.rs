@@ -137,6 +137,7 @@ async fn seed_execution(pool: &sqlx::SqlitePool) -> (RunId, StageExecutionId, Ag
             actual_mcp_observation_json: Some(
                 r#"{"source":"provider_session_new_response"}"#.into(),
             ),
+            actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: Some(17),
         },
     )

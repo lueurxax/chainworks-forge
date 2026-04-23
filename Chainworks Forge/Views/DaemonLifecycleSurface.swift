@@ -141,6 +141,16 @@ struct DaemonLifecycleBanner: View {
 
     @ViewBuilder
     private func phaseView(for status: DaemonStatus) -> some View {
+        VStack(spacing: 8) {
+            lifecycleRow(for: status)
+            if let xcodeBrokerHealth = status.xcodeBrokerHealth {
+                xcodeBrokerHealthRow(xcodeBrokerHealth)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func lifecycleRow(for status: DaemonStatus) -> some View {
         switch status.state {
         case .starting, .restarting, .notStarted:
             row(symbol: "hourglass", tint: .gray, text: "Daemon starting…")
@@ -163,6 +173,34 @@ struct DaemonLifecycleBanner: View {
             )
         case .shutdown:
             row(symbol: "power", tint: .gray, text: "Daemon shut down")
+        }
+    }
+
+    private func xcodeBrokerHealthRow(_ health: XcodeBrokerHealthSnapshot) -> some View {
+        let presentation = xcodeBrokerHealthPresentation(health)
+        return row(
+            symbol: presentation.symbol,
+            tint: presentation.tint,
+            text: presentation.text
+        )
+        .accessibilityIdentifier("xcode-broker-health")
+    }
+
+    private func xcodeBrokerHealthPresentation(
+        _ health: XcodeBrokerHealthSnapshot
+    ) -> (symbol: String, tint: Color, text: String) {
+        let leases = "\(health.activeLeases)/\(health.maxActiveLeases) active"
+        let queue = "\(health.queuedLeases)/\(health.maxQueuedLeases) queued"
+        let suffix = "\(leases), \(queue)"
+        switch health.state {
+        case .disabled:
+            return ("pause.circle.fill", .gray, "Xcode Broker disabled — \(suffix)")
+        case .healthy:
+            return ("checkmark.shield.fill", .green, "Xcode Broker healthy — \(suffix)")
+        case .degraded:
+            return ("exclamationmark.triangle.fill", .yellow, "Xcode Broker degraded — \(suffix)")
+        case .failed:
+            return ("xmark.octagon.fill", .red, "Xcode Broker failed — \(suffix)")
         }
     }
 

@@ -163,6 +163,30 @@ pub struct FailureReason {
     pub backup_path: Option<String>,
 }
 
+/// Health state for the daemon-owned Xcode MCP broker. This is carried on
+/// `DaemonStatus` so app clients can render broker readiness without calling
+/// the broker route directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XcodeBrokerHealthState {
+    Disabled,
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+/// Point-in-time Xcode broker pool health.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XcodeBrokerHealthSnapshot {
+    pub state: XcodeBrokerHealthState,
+    pub pool_id: String,
+    pub active_leases: usize,
+    pub queued_leases: usize,
+    pub max_active_leases: usize,
+    pub max_queued_leases: usize,
+    pub broker_disabled: bool,
+}
+
 /// In-process snapshot of daemon status. Emitted on every lifecycle
 /// transition via `engine::event_bus` as `DomainEvent::DaemonStatusChanged`
 /// and surfaced through `/health`, `/ready`, `daemonStatus`, and
@@ -190,6 +214,10 @@ pub struct DaemonStatus {
     /// transition — the daemon does not accumulate failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureReason>,
+    /// Optional Xcode broker health. Omitted until the daemon composition root
+    /// mounts the broker pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xcode_broker_health: Option<XcodeBrokerHealthSnapshot>,
     pub restart_count_since_boot: u32,
     pub pid: u32,
 }
@@ -208,6 +236,7 @@ impl DaemonStatus {
             last_state_change_at: Utc::now(),
             degraded: Vec::new(),
             failure: None,
+            xcode_broker_health: None,
             restart_count_since_boot: 0,
             pid: std::process::id(),
         }

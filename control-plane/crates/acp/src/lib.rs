@@ -3,6 +3,7 @@ pub mod manager;
 pub mod session;
 pub mod transport;
 pub mod xcode_broker;
+pub mod xcode_shim;
 pub mod xcode_target;
 
 pub use manager::{AcpRuntimeManager, BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
@@ -12,6 +13,16 @@ pub use xcode_broker::{
     XcodeBrokerHttpRouteState, XcodeMcpBackend, XcodeMcpBackendRequestContext, XcodeMcpBridgePool,
     XcodeMcpBridgePoolConfig, XcodeMcpLeaseState, XcodeMcpProcessBackend,
     XcodeMcpProcessBackendConfig,
+};
+#[cfg(unix)]
+pub use xcode_shim::handle_xcode_shim_unix_stream;
+pub use xcode_shim::{
+    dispatch_xcode_shim_request, dispatch_xcode_shim_socket_request, XcodeHostExecutorPlan,
+    XcodeHostExecutorPlanError, XcodeHostExecutorPlanInput, XcodeHostExecutorProcessConfig,
+    XcodeHostExecutorProcessOutput, XcodeHostExecutorSimulatorCandidate, XcodeShimCommandPolicy,
+    XcodeShimDispatchAttempt, XcodeShimDispatchAuthorization, XcodeShimDispatchGrant,
+    XcodeShimDispatchOutcome, XcodeShimDispatchRequest, XcodeShimProcessBinding,
+    XcodeShimRouteDecision, XcodeShimSocketDispatchRequest,
 };
 pub use xcode_target::{
     probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,
@@ -24,7 +35,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use domain::agent::AgentStatus;
 use domain::ids::{AgentExecutionId, RunId};
-use domain::xcode_runtime::XcodeRuntimeObservationUpdate;
+use domain::xcode_runtime::{XcodeRuntimeObservationUpdate, XcodeShimWarningEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,6 +168,10 @@ pub struct ExecutionResult {
     pub actual_mcp_runtime_ids: Vec<String>,
     #[serde(default)]
     pub mcp_session_startup_latency_ms: Option<i64>,
+    /// P051 residual Xcode path warnings detected in ACP session/update
+    /// notifications during this prompt turn.
+    #[serde(default)]
+    pub xcode_shim_warning_events: Vec<XcodeShimWarningEvent>,
     /// Nonblocking diagnostics observed while closing a one-shot ACP session
     /// after the provider already returned a prompt result.
     #[serde(default)]

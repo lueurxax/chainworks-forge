@@ -481,6 +481,7 @@ mod tests {
                     },
                 },
             }],
+            chainworks_meta_root: None,
         }
     }
 }

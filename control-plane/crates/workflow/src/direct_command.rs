@@ -4,7 +4,7 @@
 //! declared Xcode command surfaces and fails only on direct bypass forms that
 //! cannot be routed through the later PATH shim boundary.
 
-use crate::catalog;
+use crate::{catalog, definition};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -92,6 +92,7 @@ pub enum DirectCommandPolicyDecision {
 
 pub fn scan_catalog(
     catalog: &catalog::AgentCatalogFile,
+    workflow: &definition::WorkflowFile,
     workflow_raw: &serde_yaml::Value,
     catalog_raw: &serde_yaml::Value,
 ) -> DirectCommandScan {
@@ -99,9 +100,69 @@ pub fn scan_catalog(
     scan_permission_profile_shell_allow(catalog, &mut scan);
     scan_agent_required_tools(catalog, &mut scan);
     scan_agent_prompt_text(catalog, &mut scan);
+    scan_raw_agent_command_like_values(catalog_raw, &mut scan);
+    scan_workflow_run_blocks(workflow, &mut scan);
+    scan_raw_workflow_state_command_like_values(workflow_raw, &mut scan);
     scan_raw_command_like_values("workflow", workflow_raw, &mut scan);
     scan_raw_command_like_values("catalog", catalog_raw, &mut scan);
     scan
+}
+
+fn scan_workflow_run_blocks(workflow: &definition::WorkflowFile, scan: &mut DirectCommandScan) {
+    for (state_id, state) in &workflow.states {
+        if let Some(run) = state.run.as_ref() {
+            scan_run_block(state_id, "run", run, scan);
+        }
+        if let Some(run) = state.run_after_approval.as_ref() {
+            scan_run_block(state_id, "run_after_approval", run, scan);
+        }
+    }
+}
+
+fn scan_run_block(
+    state_id: &str,
+    block_name: &str,
+    run: &definition::RunBlock,
+    scan: &mut DirectCommandScan,
+) {
+    scan_agent_tasks(
+        state_id,
+        block_name,
+        "sequence",
+        run.sequence.as_deref(),
+        scan,
+    );
+    scan_agent_tasks(
+        state_id,
+        block_name,
+        "parallel",
+        run.parallel.as_deref(),
+        scan,
+    );
+    scan_agent_tasks(state_id, block_name, "then", run.then.as_deref(), scan);
+}
+
+fn scan_agent_tasks(
+    state_id: &str,
+    block_name: &str,
+    collection: &str,
+    tasks: Option<&[definition::AgentTask]>,
+    scan: &mut DirectCommandScan,
+) {
+    let Some(tasks) = tasks else {
+        return;
+    };
+    for (idx, task) in tasks.iter().enumerate() {
+        record_command(
+            scan,
+            Some(&task.agent),
+            None,
+            "workflow",
+            format!("states.{state_id}.{block_name}.{collection}[{idx}].task"),
+            "workflow_task",
+            &task.task,
+        );
+    }
 }
 
 fn scan_permission_profile_shell_allow(
@@ -205,6 +266,41 @@ fn scan_agent_prompt_text(catalog: &catalog::AgentCatalogFile, scan: &mut Direct
     }
 }
 
+fn scan_raw_agent_command_like_values(
+    catalog_raw: &serde_yaml::Value,
+    scan: &mut DirectCommandScan,
+) {
+    let Some(agents) = mapping_get(catalog_raw, "agents").and_then(|v| v.as_sequence()) else {
+        return;
+    };
+
+    for agent in agents {
+        let Some(agent_id) = mapping_get(agent, "id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let mut strings = BTreeMap::new();
+        collect_yaml_strings(agent, format!("agents.{agent_id}"), &mut strings);
+        for (source_path, value) in strings {
+            if is_typed_agent_command_field(&source_path)
+                || !is_command_like_path(&source_path)
+                || !mentions_xcode_tool_or_path(&value)
+            {
+                continue;
+            }
+            record_command(
+                scan,
+                Some(agent_id),
+                None,
+                "catalog",
+                source_path,
+                "adapter_raw_command",
+                &value,
+            );
+        }
+    }
+}
+
 fn scan_raw_command_like_values(
     source_document: &str,
     raw: &serde_yaml::Value,
@@ -226,6 +322,45 @@ fn scan_raw_command_like_values(
             &value,
         );
     }
+}
+
+fn scan_raw_workflow_state_command_like_values(
+    workflow_raw: &serde_yaml::Value,
+    scan: &mut DirectCommandScan,
+) {
+    let Some(states) = mapping_get(workflow_raw, "states").and_then(|v| v.as_mapping()) else {
+        return;
+    };
+
+    for (state_id, state) in states {
+        let Some(state_id) = state_id.as_str() else {
+            continue;
+        };
+        let Some(owner) = mapping_get(state, "owner").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let mut strings = BTreeMap::new();
+        collect_yaml_strings(state, format!("states.{state_id}"), &mut strings);
+        for (source_path, value) in strings {
+            if !is_command_like_path(&source_path) || !mentions_xcode_tool_or_path(&value) {
+                continue;
+            }
+            record_command(
+                scan,
+                Some(owner),
+                None,
+                "workflow",
+                source_path,
+                "state_raw_command",
+                &value,
+            );
+        }
+    }
+}
+
+fn is_typed_agent_command_field(source_path: &str) -> bool {
+    source_path.contains(".required_tools")
 }
 
 fn record_command(
@@ -310,7 +445,10 @@ fn classify_command(raw: &str) -> CommandClassification {
 }
 
 fn hard_fail_code(raw: &str, argv_tokens: &[String]) -> Option<String> {
-    if raw.contains("/usr/bin/xcrun") || raw.contains("/usr/bin/xcodebuild") {
+    if raw.contains("/usr/bin/xcrun")
+        || raw.contains("/usr/bin/xcodebuild")
+        || raw.contains("/usr/bin/simctl")
+    {
         return Some("p051_absolute_xcode_tool_path".to_string());
     }
     if raw.contains("/Applications/Xcode") && raw.contains("/Contents/Developer/") {
@@ -321,6 +459,12 @@ fn hard_fail_code(raw: &str, argv_tokens: &[String]) -> Option<String> {
     {
         return Some("p051_developer_dir_direct_xcode_command".to_string());
     }
+    if is_xcrun_find_guarded_tool(argv_tokens) {
+        return Some("p051_xcrun_find_guarded_tool".to_string());
+    }
+    if has_unknown_xcrun_flag(argv_tokens) {
+        return Some("p051_xcrun_unknown_flag".to_string());
+    }
     if argv_tokens
         .iter()
         .any(|token| basename(token).as_deref() == Some("mcpbridge"))
@@ -328,6 +472,61 @@ fn hard_fail_code(raw: &str, argv_tokens: &[String]) -> Option<String> {
         return Some("p051_direct_mcpbridge_command".to_string());
     }
     None
+}
+
+fn has_unknown_xcrun_flag(argv_tokens: &[String]) -> bool {
+    if !argv_tokens
+        .first()
+        .and_then(|token| basename(token))
+        .is_some_and(|tool| tool == "xcrun")
+    {
+        return false;
+    }
+
+    let mut idx = 1;
+    while idx < argv_tokens.len() {
+        let token = argv_tokens[idx].as_str();
+        if token == "--" {
+            return false;
+        }
+        if matches!(token, "--sdk" | "-sdk" | "--toolchain" | "-toolchain") {
+            idx += 2;
+            continue;
+        }
+        if token.starts_with("--sdk=") || token.starts_with("--toolchain=") {
+            idx += 1;
+            continue;
+        }
+        if matches!(token, "--find" | "-f" | "--run" | "-r") {
+            return false;
+        }
+        if matches!(
+            token,
+            "--show-sdk-path" | "--show-sdk-version" | "--show-sdk-build-version"
+        ) {
+            idx += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+fn is_xcrun_find_guarded_tool(argv_tokens: &[String]) -> bool {
+    argv_tokens
+        .first()
+        .and_then(|token| basename(token))
+        .is_some_and(|tool| tool == "xcrun")
+        && argv_tokens.windows(2).any(|pair| {
+            matches!(pair[0].as_str(), "--find" | "-f")
+                && matches!(
+                    basename(&pair[1]).as_deref(),
+                    Some("xcodebuild" | "simctl" | "mcpbridge")
+                )
+        })
 }
 
 fn matched_xcode_tool(raw: &str) -> Option<String> {
@@ -364,6 +563,7 @@ fn is_command_like_path(source_path: &str) -> bool {
         || lower.contains(".args")
         || lower.contains(".shell.")
         || lower.contains(".required_tools")
+        || lower.contains(".allowed_commands")
 }
 
 fn collect_yaml_strings(
@@ -492,10 +692,67 @@ mod tests {
             Some("p051_absolute_xcode_tool_path")
         );
 
+        let simctl = classify_command("/usr/bin/simctl list devices");
+        assert_eq!(
+            simctl.error_code.as_deref(),
+            Some("p051_absolute_xcode_tool_path")
+        );
+
         let mcpbridge = classify_command("xcrun mcpbridge");
         assert_eq!(
             mcpbridge.error_code.as_deref(),
             Some("p051_direct_mcpbridge_command")
         );
+    }
+
+    #[test]
+    fn rejects_xcrun_find_for_guarded_tools() {
+        for command in [
+            "xcrun --find xcodebuild",
+            "xcrun -f simctl",
+            "xcrun --find /usr/local/bin/mcpbridge",
+        ] {
+            let classified = classify_command(command);
+            assert_eq!(
+                classified.error_code.as_deref(),
+                Some("p051_xcrun_find_guarded_tool"),
+                "{command}"
+            );
+        }
+
+        let sdk_path = classify_command("xcrun --show-sdk-path --sdk iphonesimulator");
+        assert!(sdk_path.error_code.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_xcrun_flags() {
+        for command in [
+            "xcrun --diagnose simctl list devices",
+            "xcrun --sdk iphonesimulator --unknown simctl list devices",
+            "xcrun -unknown xcodebuild -version",
+        ] {
+            let classified = classify_command(command);
+            assert_eq!(
+                classified.error_code.as_deref(),
+                Some("p051_xcrun_unknown_flag"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_known_xcrun_run_find_and_show_modes() {
+        for command in [
+            "xcrun --sdk iphonesimulator simctl list devices --json",
+            "xcrun --toolchain default --run swift --version",
+            "xcrun --show-sdk-version --sdk=iphoneos",
+        ] {
+            let classified = classify_command(command);
+            assert!(
+                classified.error_code.is_none(),
+                "{command}: {:?}",
+                classified.error_code
+            );
+        }
     }
 }

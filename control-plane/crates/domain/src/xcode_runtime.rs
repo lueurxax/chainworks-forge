@@ -35,8 +35,50 @@ impl Default for XcodeRuntimeObservation {
 }
 
 impl XcodeRuntimeObservation {
+    pub fn redacted_for_surface(mut self) -> Self {
+        for observation in &mut self.mcp_broker_observations {
+            observation.http_endpoint = observation
+                .http_endpoint
+                .take()
+                .map(|value| redact_sensitive_text(&value));
+            observation.status_update = observation
+                .status_update
+                .take()
+                .map(|value| redact_sensitive_text(&value));
+        }
+
+        for event in &mut self.xcode_shim_events {
+            match event {
+                XcodeShimEvent::ShimInvocation(event) => {
+                    event.argv = event
+                        .argv
+                        .drain(..)
+                        .map(|value| redact_sensitive_text(&value))
+                        .collect();
+                    event.cwd = redact_sensitive_text(&event.cwd);
+                    event.policy_reason = redact_sensitive_text(&event.policy_reason);
+                }
+                XcodeShimEvent::Warning(event) => {
+                    event.matched_substring = redact_sensitive_text(&event.matched_substring);
+                    event.excerpt = redact_sensitive_text(&event.excerpt);
+                }
+            }
+        }
+
+        for event in &mut self.xcode_host_executor_events {
+            event.argv = event
+                .argv
+                .drain(..)
+                .map(|value| redact_sensitive_text(&value))
+                .collect();
+            event.cwd = redact_sensitive_text(&event.cwd);
+        }
+
+        self
+    }
+
     pub fn apply_update(&mut self, update: XcodeRuntimeObservationUpdate) {
-        match update {
+        match update.redacted() {
             XcodeRuntimeObservationUpdate::McpBrokerObservation(observation) => {
                 self.mcp_broker_observations.push(observation);
             }
@@ -280,4 +322,102 @@ pub enum XcodeRuntimeObservationUpdate {
     XcodeShimEvent(XcodeShimEvent),
     XcodeHostExecutorEvent(XcodeHostExecutorEvent),
     McpBrokerStatusUpdate(McpBrokerStatusUpdate),
+}
+
+impl XcodeRuntimeObservationUpdate {
+    fn redacted(self) -> Self {
+        match self {
+            Self::McpBrokerObservation(mut observation) => {
+                observation.http_endpoint = observation
+                    .http_endpoint
+                    .map(|value| redact_sensitive_text(&value));
+                observation.status_update = observation
+                    .status_update
+                    .map(|value| redact_sensitive_text(&value));
+                Self::McpBrokerObservation(observation)
+            }
+            Self::XcodeShimEvent(XcodeShimEvent::ShimInvocation(mut event)) => {
+                event.argv = event
+                    .argv
+                    .into_iter()
+                    .map(|value| redact_sensitive_text(&value))
+                    .collect();
+                event.cwd = redact_sensitive_text(&event.cwd);
+                event.policy_reason = redact_sensitive_text(&event.policy_reason);
+                Self::XcodeShimEvent(XcodeShimEvent::ShimInvocation(event))
+            }
+            Self::XcodeShimEvent(XcodeShimEvent::Warning(mut event)) => {
+                event.matched_substring = redact_sensitive_text(&event.matched_substring);
+                event.excerpt = redact_sensitive_text(&event.excerpt);
+                Self::XcodeShimEvent(XcodeShimEvent::Warning(event))
+            }
+            Self::XcodeHostExecutorEvent(mut event) => {
+                event.argv = event
+                    .argv
+                    .into_iter()
+                    .map(|value| redact_sensitive_text(&value))
+                    .collect();
+                event.cwd = redact_sensitive_text(&event.cwd);
+                Self::XcodeHostExecutorEvent(event)
+            }
+            Self::McpBrokerStatusUpdate(mut update) => {
+                update.status_update = redact_sensitive_text(&update.status_update);
+                Self::McpBrokerStatusUpdate(update)
+            }
+        }
+    }
+}
+
+fn redact_sensitive_text(input: &str) -> String {
+    let redacted_bearer = redact_after_markers(input, &["Bearer "], "<redacted>");
+    let redacted_lease = redact_after_markers(&redacted_bearer, &["xcode-lease-"], "<redacted>");
+    redact_after_markers(
+        &redacted_lease,
+        &[
+            "token=",
+            "access_token=",
+            "bearer_token=",
+            "authorization=",
+            "Authorization=",
+        ],
+        "<redacted>",
+    )
+}
+
+fn redact_after_markers(input: &str, markers: &[&str], replacement: &str) -> String {
+    let mut output = input.to_string();
+    for marker in markers {
+        output = redact_after_marker(&output, marker, replacement);
+    }
+    output
+}
+
+fn redact_after_marker(input: &str, marker: &str, replacement: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let marker_lowercase = marker.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while let Some(relative_start) = lowercase[cursor..].find(&marker_lowercase) {
+        let marker_start = cursor + relative_start;
+        let secret_start = marker_start + marker.len();
+        output.push_str(&input[cursor..secret_start]);
+
+        let secret_end = input[secret_start..]
+            .char_indices()
+            .find_map(|(offset, ch)| is_secret_delimiter(ch).then_some(secret_start + offset))
+            .unwrap_or(input.len());
+
+        if secret_end > secret_start {
+            output.push_str(replacement);
+        }
+        cursor = secret_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn is_secret_delimiter(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ']' | '}' | '&')
 }

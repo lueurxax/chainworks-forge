@@ -35,12 +35,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{error, info, warn};
 
-use acp::AcpRuntimeManager;
+use acp::{AcpRuntimeManager, XcodeMcpBridgePool, XcodeMcpBridgePoolConfig};
 use daemon::failed_serve;
 use daemon::packaging::{self, DaemonMode, ModePaths};
 use daemon::supervisor::{self, CrashBudgetDecision, PidLockOutcome};
 use db::migrate::{self, MigrationError, MigrationOutcome};
-use domain::lifecycle::{DaemonLifecycleState, FailureKind};
+use domain::lifecycle::{
+    DaemonLifecycleState, FailureKind, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
+};
 use engine::command_handler::CommandHandler;
 use engine::event_bus::new_bus;
 use engine::executor::BackgroundExecutor;
@@ -255,9 +257,6 @@ async fn main() -> Result<()> {
         events.clone(),
         steward_runtime_inputs.clone(),
     ));
-    let _executor_handle = executor.start();
-    info!("BackgroundExecutor started");
-
     // Startup recovery: repair any run left mid-flight by a previous crash.
     let recovery = RecoveryService::new(pool.clone(), work_queue.clone(), events.clone());
     let summary = recovery.run_startup_repair().await?;
@@ -276,6 +275,8 @@ async fn main() -> Result<()> {
     // mode has no HTTP bind, so `Ready` fires before `run_stdio` there.
     match mode {
         DaemonMode::Mcp => {
+            let _executor_handle = executor.start();
+            info!("BackgroundExecutor started");
             reporter.set_state(DaemonLifecycleState::Ready);
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
@@ -310,6 +311,26 @@ async fn main() -> Result<()> {
             // GraphQL server takes the socket.
             let (listener, port) = packaging::bind_with_fallback(&paths).await?;
             info!(port, "bound HTTP listener; handing off to graphql-server");
+
+            let xcode_broker_pool = Arc::new(XcodeMcpBridgePool::new_with_sink(
+                XcodeMcpBridgePoolConfig {
+                    base_url: format!("http://127.0.0.1:{port}/xcode-mcp"),
+                    broker_disabled: std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED")
+                        .map(|value| value == "1")
+                        .unwrap_or(false),
+                    use_local_host_probe: true,
+                    ..Default::default()
+                },
+                acp.xcode_runtime_observation_sink(),
+            ));
+            acp.set_xcode_broker_lease_attacher(xcode_broker_pool.clone());
+            reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
+                xcode_broker_pool.health_snapshot().await,
+            ));
+            spawn_xcode_broker_health_publisher(reporter.clone(), xcode_broker_pool.clone());
+
+            let _executor_handle = executor.start();
+            info!("BackgroundExecutor started");
 
             // §5.1: Ready only AFTER HTTP bind so a client receiving
             // `state=ready` is guaranteed it can connect.
@@ -373,10 +394,12 @@ async fn main() -> Result<()> {
             };
 
             let serve_fut = async {
+                let extra_routes =
+                    mcp_routes.merge(daemon::xcode_broker_http::routes(xcode_broker_pool.clone()));
                 graphql_server::server::serve_with_listener_until(
                     schema,
                     listener,
-                    mcp_routes,
+                    extra_routes,
                     principal_table,
                     reporter.clone(),
                     shutdown_signal,
@@ -405,6 +428,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_xcode_broker_health_publisher(reporter: LifecycleReporter, pool: Arc<XcodeMcpBridgePool>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
+                pool.health_snapshot().await,
+            ));
+        }
+    });
+}
+
+fn xcode_broker_health_for_lifecycle(
+    health: acp::XcodeBrokerHealthSnapshot,
+) -> XcodeBrokerHealthSnapshot {
+    XcodeBrokerHealthSnapshot {
+        state: match health.state {
+            acp::XcodeBrokerHealthState::Disabled => XcodeBrokerHealthState::Disabled,
+            acp::XcodeBrokerHealthState::Healthy => XcodeBrokerHealthState::Healthy,
+            acp::XcodeBrokerHealthState::Degraded => XcodeBrokerHealthState::Degraded,
+            acp::XcodeBrokerHealthState::Failed => XcodeBrokerHealthState::Failed,
+        },
+        pool_id: health.pool_id,
+        active_leases: health.active_leases,
+        queued_leases: health.queued_leases,
+        max_active_leases: health.max_active_leases,
+        max_queued_leases: health.max_queued_leases,
+        broker_disabled: health.broker_disabled,
+    }
 }
 
 /// P042 §6.3 drain deadline. Supervisor sends SIGTERM → daemon flips to

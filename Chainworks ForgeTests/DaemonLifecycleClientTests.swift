@@ -36,6 +36,41 @@ final class DaemonLifecycleClientTests: XCTestCase {
         XCTAssertNil(status.failure)
     }
 
+    func test_DaemonStatus_decodes_xcode_broker_health_snapshot_when_reported() throws {
+        let json = """
+        {
+          "state": "ready",
+          "schema_version": 14,
+          "binary_schema_version": 14,
+          "build_sha": "abc123",
+          "started_at": "2026-04-18T10:00:00Z",
+          "last_state_change_at": "2026-04-18T10:00:00Z",
+          "restart_count_since_boot": 0,
+          "pid": 42831,
+          "xcode_broker_health": {
+            "state": "degraded",
+            "pool_id": "host-user-xcode",
+            "active_leases": 8,
+            "queued_leases": 2,
+            "max_active_leases": 8,
+            "max_queued_leases": 16,
+            "broker_disabled": false
+          }
+        }
+        """
+        let status = try daemonJSONDecoder().decode(
+            DaemonStatus.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(status.xcodeBrokerHealth?.state, .degraded)
+        XCTAssertEqual(status.xcodeBrokerHealth?.poolID, "host-user-xcode")
+        XCTAssertEqual(status.xcodeBrokerHealth?.activeLeases, 8)
+        XCTAssertEqual(status.xcodeBrokerHealth?.queuedLeases, 2)
+        XCTAssertEqual(status.xcodeBrokerHealth?.maxActiveLeases, 8)
+        XCTAssertEqual(status.xcodeBrokerHealth?.maxQueuedLeases, 16)
+        XCTAssertEqual(status.xcodeBrokerHealth?.brokerDisabled, false)
+    }
+
     func test_DaemonStatus_decodes_degraded_reasons_array() throws {
         let json = """
         {

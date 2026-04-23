@@ -22,6 +22,7 @@ pub use commands::PrincipalClass;
 // P042: daemon lifecycle types are the canonical readback contract.
 pub use lifecycle::{
     DaemonLifecycleState, DaemonStatus, DegradedKind, DegradedReason, FailureKind, FailureReason,
+    XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
 };
 
 #[cfg(test)]

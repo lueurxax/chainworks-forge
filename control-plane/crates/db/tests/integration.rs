@@ -1,7 +1,8 @@
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifacts, ideas, projections, runs, stages, steward, validation,
+    agent_executions, approvals, artifact_contracts as artifact_contract_repos, artifacts, ideas,
+    projections, runs, stages, steward, validation,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
@@ -75,6 +76,7 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(pool, &run).await.unwrap();
 
@@ -212,6 +214,7 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -350,6 +353,7 @@ async fn steward_run_metadata_and_project_key_roundtrip() {
         catalog_snapshot_json: Some(r#"{"agents":[]}"#.into()),
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -463,6 +467,7 @@ async fn steward_analysis_schema_roundtrips_p049_contract() {
             catalog_snapshot_json: Some("{}".into()),
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await
@@ -567,6 +572,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -710,6 +716,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -863,6 +870,7 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1188,6 +1196,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1451,6 +1460,7 @@ async fn test_run_insert_and_find() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -1504,6 +1514,7 @@ async fn test_run_status_update() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     runs::update_status(&pool, run.id, RunStatus::Running)
@@ -1567,6 +1578,7 @@ async fn test_projection_parity_after_rebuild() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1731,6 +1743,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -1896,6 +1909,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2096,6 +2110,7 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2180,6 +2195,7 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
         catalog_snapshot_json: None,
         drift_detected_at: None,
         drift_details_json: None,
+        chainworks_meta_root: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2333,6 +2349,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             catalog_snapshot_json: None,
             drift_detected_at: None,
             drift_details_json: None,
+            chainworks_meta_root: None,
         },
     )
     .await

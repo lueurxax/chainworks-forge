@@ -31,7 +31,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
     let catalog_raw =
         load_raw_yaml_value(catalog_path).context("loading raw catalog YAML for P051 lint")?;
     let direct_command_scan =
-        crate::direct_command::scan_catalog(&cat, &workflow_raw, &catalog_raw);
+        crate::direct_command::scan_catalog(&cat, &wf, &workflow_raw, &catalog_raw);
     direct_command_scan.ensure_no_errors()?;
     let workflow_family = wf
         .workflow

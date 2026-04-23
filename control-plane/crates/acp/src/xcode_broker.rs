@@ -29,6 +29,8 @@ use crate::{
     ResolvedMcpServerTransport, XcodeRuntimeObservationSink,
 };
 
+const XCODE_MCP_ACTION_REQUIRED_AFTER: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
 pub struct XcodeMcpBridgePoolConfig {
     pub pool_id: String,
@@ -199,6 +201,13 @@ impl XcodeMcpProcessBackend {
         sessions.insert(context.lease_id.clone(), session.clone());
         Ok(session)
     }
+
+    async fn remove_session_after_failure(&self, lease_id: &str) {
+        let session = self.sessions.lock().await.remove(lease_id);
+        if let Some(session) = session {
+            let _ = session.lock().await.close().await;
+        }
+    }
 }
 
 #[async_trait]
@@ -209,17 +218,22 @@ impl XcodeMcpBackend for XcodeMcpProcessBackend {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let session = self.session_for(&context).await?;
-        let mut session = session.lock().await;
-        match tokio::time::timeout(self.config.request_timeout, session.forward(request)).await {
-            Ok(result) => result,
-            Err(_) => {
-                bail!(
+        let result = {
+            let mut session = session.lock().await;
+            match tokio::time::timeout(self.config.request_timeout, session.forward(request)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
                     "xcode_mcp_initialize_timeout: timed out after {:?} waiting for backend response for lease '{}'",
                     self.config.request_timeout,
                     context.lease_id
-                )
+                )),
             }
+        };
+        if result.is_err() {
+            self.remove_session_after_failure(&context.lease_id).await;
         }
+        result
     }
 
     async fn backend_process_id(&self, lease_id: &str) -> Option<i64> {
@@ -678,25 +692,68 @@ impl XcodeMcpBridgePool {
         let lock_key = initialize_lock_key(&context);
         let lock = self.initialize_lock_for(&lock_key).await;
         let wait_started = Instant::now();
-        let lock_guard = match tokio::time::timeout(self.config.spawn_init_timeout, lock.lock())
-            .await
-        {
-            Ok(lock_guard) => lock_guard,
-            Err(_) => {
-                let observation = self.initialize_observation(
-                    &context,
-                    "initialize_lock_timeout",
-                    Some(XcodeRuntimeFailureClass::XcodeMcpInitializeTimeout),
-                    self.config.spawn_init_timeout.as_millis() as i64,
-                    format!("Timed out waiting for Xcode MCP initialize lock '{lock_key}'"),
-                );
-                self.record_observation(context.agent_execution_id, observation)
-                    .await;
-                bail!(
+        let lock_guard = if self.config.spawn_init_timeout <= XCODE_MCP_ACTION_REQUIRED_AFTER {
+            match tokio::time::timeout(self.config.spawn_init_timeout, lock.lock()).await {
+                Ok(lock_guard) => lock_guard,
+                Err(_) => {
+                    let observation = self.initialize_observation(
+                        &context,
+                        "initialize_lock_timeout",
+                        Some(XcodeRuntimeFailureClass::XcodeMcpInitializeTimeout),
+                        self.config.spawn_init_timeout.as_millis() as i64,
+                        format!("Timed out waiting for Xcode MCP initialize lock '{lock_key}'"),
+                    );
+                    self.record_observation(context.agent_execution_id, observation)
+                        .await;
+                    bail!(
                         "xcode_mcp_initialize_timeout: timed out after {:?} waiting for initialize lock '{}'",
                         self.config.spawn_init_timeout,
                         lock_key
                     );
+                }
+            }
+        } else {
+            tokio::select! {
+                lock_guard = lock.lock() => lock_guard,
+                _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                    let wait_ms = wait_started.elapsed().as_millis() as i64;
+                    let observation = self.initialize_observation(
+                        &context,
+                        "initialize_action_required",
+                        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                        wait_ms,
+                        format!(
+                            "Action Required: Check Xcode after waiting {} ms for initialize lock '{}'",
+                            wait_ms, lock_key
+                        ),
+                    );
+                    self.record_observation(context.agent_execution_id, observation)
+                        .await;
+
+                    let remaining = self
+                        .config
+                        .spawn_init_timeout
+                        .saturating_sub(wait_started.elapsed());
+                    match tokio::time::timeout(remaining, lock.lock()).await {
+                        Ok(lock_guard) => lock_guard,
+                        Err(_) => {
+                            let observation = self.initialize_observation(
+                                &context,
+                                "initialize_lock_timeout",
+                                Some(XcodeRuntimeFailureClass::XcodeMcpInitializeTimeout),
+                                self.config.spawn_init_timeout.as_millis() as i64,
+                                format!("Timed out waiting for Xcode MCP initialize lock '{lock_key}'"),
+                            );
+                            self.record_observation(context.agent_execution_id, observation)
+                                .await;
+                            bail!(
+                                "xcode_mcp_initialize_timeout: timed out after {:?} waiting for initialize lock '{}'",
+                                self.config.spawn_init_timeout,
+                                lock_key
+                            );
+                        }
+                    }
+                }
             }
         };
 

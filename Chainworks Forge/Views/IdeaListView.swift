@@ -3479,6 +3479,12 @@ struct IdeaDetailView: View {
             workflowMapProjectionService.projection(for: run)
         }
 
+        private var xcodeBridgeProgressStatus: WorkflowMapXcodeBridgeProgressStatus? {
+            workflowMapProjection.map {
+                latestXcodeBridgeProgressStatus(in: $0.xcodeRuntimeObservations)
+            } ?? nil
+        }
+
         private var currentStageSummary: WorkflowMapCurrentStageSummary? {
             workflowMapProjectionService.currentStageSummary(for: run)
         }
@@ -3586,6 +3592,10 @@ struct IdeaDetailView: View {
         }
 
         private var nextActionText: String {
+            if let xcodeBridgeProgressStatus {
+                return xcodeBridgeProgressStatus.label
+            }
+
             switch effectiveRunStatus {
             case .waitingApproval:
                 return "Approve or reject the current proposal."
@@ -3738,6 +3748,15 @@ struct IdeaDetailView: View {
                         Label(sessionID, systemImage: "lanyardcard")
                             .lineLimit(1)
                             .truncationMode(.middle)
+                    }
+                    if let xcodeBridgeProgressStatus {
+                        Label(
+                            xcodeBridgeProgressStatus.label,
+                            systemImage: xcodeBridgeProgressStatus.kind == .actionRequired
+                                ? "exclamationmark.triangle.fill" : "hammer"
+                        )
+                        .lineLimit(1)
+                        .accessibilityIdentifier("run-progress-xcode-bridge-status")
                     }
                 }
                 .font(.caption)
@@ -3961,6 +3980,16 @@ struct IdeaDetailView: View {
                             } ?? "0"
                         )
                         LabeledContent("Active Agents", value: "\(activeAgents.count)")
+                        if let xcodeBridgeProgressStatus {
+                            LabeledContent("Xcode Bridge", value: xcodeBridgeProgressStatus.label)
+                                .accessibilityIdentifier("run-progress-xcode-bridge-status")
+                            if !xcodeBridgeProgressStatus.detail.isEmpty {
+                                Text(xcodeBridgeProgressStatus.detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
                         if activeAgents.isEmpty == false {
                             VStack(alignment: .leading, spacing: 6) {
                                 ForEach(activeAgents) { agent in

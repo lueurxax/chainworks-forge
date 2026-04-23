@@ -1517,6 +1517,8 @@ Available gates:
   proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
   proposal-049    Proposal 049 steward analysis system gate
   proposal-050    Proposal 050 per-run workspace isolation gate
+  p051-scaffold   Proposal 051 scaffold gate with source-proposal stale-guidance precheck
+  proposal-051|p051  Proposal 051 shared Xcode MCP bridge pool gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
   proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
@@ -2188,6 +2190,70 @@ PY
       printf 'P050 full workspace regression log: %s\n' "$workspace_log"
     )
     log "Proposal 050 control-plane gate passed"
+    ;;
+  p051-scaffold)
+    log "Proposal 051 scaffold gate: shared Xcode MCP bridge pool substrate"
+    python3 - <<'PY'
+from pathlib import Path
+
+source = Path("docs/proposals/051-shared-xcode-mcp-bridge-pool.md")
+if not source.exists():
+    raise SystemExit(f"p051-scaffold: missing source proposal {source}")
+
+text = source.read_text().lower()
+stale_checks = [
+    ("no SwiftUI changes", ["no swiftui changes", "no swift app ui changes", "no ui changes"]),
+    ("debug_assert-only capability enforcement", ["debug_assert"]),
+    ("path+mtime+size-only binary fingerprinting", ["path+mtime+size", "path, mtime, and size", "path mtime size"]),
+    ("drop-on-corrupt observation behavior", ["drop-on-corrupt", "drop on corrupt", "drop corrupt"]),
+    ("direct pgrep newest-Xcode selection", ["pgrep", "newest xcode"]),
+    ("unbound same-uid-only shim authorization", ["same-uid-only", "same uid only"]),
+]
+stale = []
+for label, needles in stale_checks:
+    if any(needle in text for needle in needles):
+        stale.append(label)
+
+if stale:
+    raise SystemExit(
+        "p051-scaffold: docs/proposals/051-shared-xcode-mcp-bridge-pool.md still contains "
+        "stale contrary guidance: " + ", ".join(stale)
+    )
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-051-scaffold-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p workflow --test integration p051_ -- --nocapture &&
+      cargo test -p db --test integration proposal_051_xcode_runtime_observation -- --nocapture &&
+      cargo test -p acp --test integration brokered_xcode_probe_accepts_http_but_requires_lease_conversion -- --exact --nocapture &&
+      cargo test -p acp --test integration xcode_mcp_bridge_pool_ -- --nocapture &&
+      cargo test -p acp --test integration runtime_manager_attaches_brokered_xcode_http_lease_before_session_new -- --exact --nocapture &&
+      cargo test -p engine --test integration xcode_broker_fail_closed_observation_is_persisted_from_acp_sink -- --exact --nocapture &&
+      cargo check -p graphql-server &&
+      cargo check -p mcp-server
+    )
+    log "Proposal 051 scaffold gate passed"
+    ;;
+  proposal-051|p051)
+    log "Proposal 051 gate: shared Xcode MCP bridge pool"
+    "$0" p051-scaffold
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-051-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain --test artifact_contracts -- --nocapture &&
+      cargo test -p workflow --test integration p051_ -- --nocapture &&
+      cargo test -p db --test integration proposal_051_xcode_runtime_observation -- --nocapture &&
+      cargo test -p acp --test integration xcode_mcp_bridge_pool_ -- --nocapture &&
+      cargo test -p engine --test integration xcode_broker_fail_closed_observation_is_persisted_from_acp_sink -- --exact --nocapture &&
+      cargo check -p graphql-server &&
+      cargo check -p mcp-server
+    )
+    run_targeted_tests "proposal-051-swift" \
+      "Chainworks ForgeTests/RunTimelineInspectorViewTests" \
+      "Chainworks ForgeTests/DaemonLifecycleClientTests"
+    log "Proposal 051 gate passed"
     ;;
   proposal-057|p057)
     log "Proposal 057 control-plane gate: canonical artifact contracts and run-state projection"
