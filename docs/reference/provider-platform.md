@@ -44,7 +44,7 @@ prevent saturation and ensure scheduling fairness:
 |---|---|
 | `claude` | 8 |
 | `gemini` | 4 |
-| `codex` | 3 |
+| `codex` | 10 |
 | `auggie` | 1 |
 | `junie` | 1 |
 

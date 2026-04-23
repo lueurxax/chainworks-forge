@@ -291,7 +291,7 @@ work rather than by adding external infrastructure:
 - 10 active runs are allowed only when executor backpressure keeps active agent executions bounded.
 - Active run count is not active agent execution count; surplus agent work remains queued.
 - Active execution target: 20 total.
-- Default provider caps: Gemini 4, Codex 3, Claude 8, Auggie 1, Junie 1.
+- Default provider caps: Gemini 4, Codex 10, Claude 8, Auggie 1, Junie 1.
 - Provider aliases are normalized to canonical families: `claude`, `gemini`, `codex`, `auggie`, `junie`.
 - Capacity pressure leaves work pending/backpressured; capacity alone must not mark work failed.
 - Capacity state is durable, visible to operators, and supports backpressure alerts via GraphQL subscriptions and MCP notifications.
@@ -392,7 +392,7 @@ The executor uses a capacity-aware claim/start gate for `InvokeAgent`: it checks
 provider, and per-run active execution caps before mutating ownership, and leaves
 capacity-blocked work pending. 
 
-- **Default Caps**: Global 20, per-run 4, Claude 8, Gemini 4, Codex 3, Auggie 1, Junie 1.
+- **Default Caps**: Global 20, per-run 4, Claude 8, Gemini 4, Codex 10, Auggie 1, Junie 1.
 - **Backpressure Visibility**: Blocked work remains `pending` and is exposed via 
   `scheduler_queue_summaries` and `scheduler_health_snapshots` projections.
 - **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion 

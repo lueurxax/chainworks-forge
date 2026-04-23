@@ -510,7 +510,7 @@ Target state intentionally остаётся **локальным**.
 
 - глобальный лимит активных agent executions: 20;
 - per-run лимит активных agent executions: 4;
-- provider caps по умолчанию: Gemini 4, Codex 3, Claude 8, Auggie 1, Junie 1.
+- provider caps по умолчанию: Gemini 4, Codex 10, Claude 8, Auggie 1, Junie 1.
 - ACP provider subprocess запускается в отдельной process group; `session/close` вызывается даже после transport error в `session/prompt`, чтобы не оставлять MCP/plugin descendants после idle timeout.
 - Sleep/wake ноутбука и смена Wi-Fi/network path считаются host interruption epoch: running ACP executions, пересёкшие такой epoch, должны закрываться, классифицироваться как retryable host interruption, и переочередиться с jitter/backoff под теми же capacity caps, а не превращаться в массовые permanent provider failures.
 
