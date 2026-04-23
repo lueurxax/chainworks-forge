@@ -17,6 +17,7 @@ dependencies = [
  "chrono",
  "dirs",
  "domain",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

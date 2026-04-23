@@ -14,8 +14,6 @@ pub use xcode_broker::{
     XcodeMcpBridgePoolConfig, XcodeMcpLeaseState, XcodeMcpProcessBackend,
     XcodeMcpProcessBackendConfig,
 };
-#[cfg(unix)]
-pub use xcode_shim::handle_xcode_shim_unix_stream;
 pub use xcode_shim::{
     dispatch_xcode_shim_request, dispatch_xcode_shim_socket_request, XcodeHostExecutorPlan,
     XcodeHostExecutorPlanError, XcodeHostExecutorPlanInput, XcodeHostExecutorProcessConfig,
@@ -23,6 +21,12 @@ pub use xcode_shim::{
     XcodeShimDispatchAttempt, XcodeShimDispatchAuthorization, XcodeShimDispatchGrant,
     XcodeShimDispatchOutcome, XcodeShimDispatchRequest, XcodeShimProcessBinding,
     XcodeShimRouteDecision, XcodeShimSocketDispatchRequest,
+};
+#[cfg(unix)]
+pub use xcode_shim::{
+    handle_xcode_shim_unix_stream, handle_xcode_shim_unix_stream_with_peer_credentials,
+    xcode_shim_peer_credentials, DefaultXcodeShimProcessInspector, XcodeShimPeerCredentials,
+    XcodeShimProcessInspector,
 };
 pub use xcode_target::{
     probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,

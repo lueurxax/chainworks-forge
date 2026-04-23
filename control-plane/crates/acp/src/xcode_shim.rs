@@ -1,3 +1,4 @@
+use anyhow::Context;
 use chrono::Utc;
 use domain::ids::AgentExecutionId;
 use domain::xcode_runtime::{
@@ -6,6 +7,8 @@ use domain::xcode_runtime::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -40,6 +43,41 @@ pub struct XcodeShimProcessBinding {
     pub start_time_fingerprint: Option<String>,
     #[serde(default)]
     pub executable_fingerprint: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XcodeShimPeerCredentials {
+    pub pid: u32,
+    pub uid: u32,
+}
+
+#[cfg(unix)]
+pub trait XcodeShimProcessInspector: Send + Sync {
+    fn inspect_peer(
+        &self,
+        credentials: XcodeShimPeerCredentials,
+    ) -> anyhow::Result<XcodeShimProcessBinding>;
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultXcodeShimProcessInspector;
+
+#[cfg(unix)]
+impl XcodeShimProcessInspector for DefaultXcodeShimProcessInspector {
+    fn inspect_peer(
+        &self,
+        credentials: XcodeShimPeerCredentials,
+    ) -> anyhow::Result<XcodeShimProcessBinding> {
+        Ok(XcodeShimProcessBinding {
+            pid: credentials.pid,
+            uid: credentials.uid,
+            parent_pid: None,
+            start_time_fingerprint: None,
+            executable_fingerprint: None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +623,86 @@ pub async fn handle_xcode_shim_unix_stream(
         .await?;
     writer.write_all(b"\n").await?;
     Ok(response_outcome)
+}
+
+#[cfg(unix)]
+pub async fn handle_xcode_shim_unix_stream_with_peer_credentials(
+    stream: UnixStream,
+    grant: XcodeShimDispatchGrant,
+    config: &XcodeHostExecutorProcessConfig,
+    observation_sink: &dyn crate::XcodeRuntimeObservationSink,
+    process_inspector: &dyn XcodeShimProcessInspector,
+) -> anyhow::Result<XcodeShimDispatchOutcome> {
+    let credentials = xcode_shim_peer_credentials(&stream)?;
+    let peer_process = process_inspector.inspect_peer(credentials)?;
+    handle_xcode_shim_unix_stream(stream, grant, peer_process, config, observation_sink).await
+}
+
+#[cfg(unix)]
+pub fn xcode_shim_peer_credentials(
+    stream: &UnixStream,
+) -> anyhow::Result<XcodeShimPeerCredentials> {
+    peer_credentials_from_fd(stream.as_raw_fd())
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn peer_credentials_from_fd(fd: std::os::fd::RawFd) -> anyhow::Result<XcodeShimPeerCredentials> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("xcode_shim_peer_credentials_failed");
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(XcodeShimPeerCredentials {
+        pid: u32::try_from(credentials.pid).context("xcode_shim_peer_pid_out_of_range")?,
+        uid: credentials.uid,
+    })
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn peer_credentials_from_fd(fd: std::os::fd::RawFd) -> anyhow::Result<XcodeShimPeerCredentials> {
+    let mut uid = 0 as libc::uid_t;
+    let mut gid = 0 as libc::gid_t;
+    let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("xcode_shim_peer_uid_lookup_failed");
+    }
+
+    const SOL_LOCAL: libc::c_int = 0;
+    const LOCAL_PEERPID: libc::c_int = 2;
+    let mut pid = 0 as libc::pid_t;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("xcode_shim_peer_pid_lookup_failed");
+    }
+
+    Ok(XcodeShimPeerCredentials {
+        pid: u32::try_from(pid).context("xcode_shim_peer_pid_out_of_range")?,
+        uid,
+    })
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn peer_credentials_from_fd(_fd: std::os::fd::RawFd) -> anyhow::Result<XcodeShimPeerCredentials> {
+    anyhow::bail!("xcode_shim_peer_credentials_unsupported_platform")
 }
 
 async fn record_shim_invocation(
@@ -1150,6 +1268,23 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    struct StaticPeerInspector {
+        expected_credentials: XcodeShimPeerCredentials,
+        peer_process: XcodeShimProcessBinding,
+    }
+
+    #[cfg(unix)]
+    impl XcodeShimProcessInspector for StaticPeerInspector {
+        fn inspect_peer(
+            &self,
+            credentials: XcodeShimPeerCredentials,
+        ) -> anyhow::Result<XcodeShimProcessBinding> {
+            assert_eq!(credentials, self.expected_credentials);
+            Ok(self.peer_process.clone())
+        }
+    }
+
     #[test]
     fn routes_xcodebuild_and_simctl_to_host_executor() {
         for tool in ["xcodebuild", "/usr/bin/simctl"] {
@@ -1589,6 +1724,120 @@ mod tests {
                 assert_eq!(event.claimed_provider_pid, 42);
                 assert!(!event.peer_pid_mismatch);
                 assert_eq!(event.exit_status, 4);
+            }
+            other => panic!("expected shim invocation event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_dispatch_can_derive_peer_process_from_unix_credentials() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut input = host_input();
+        input.cwd = ".".to_string();
+        input.workspace_root = workspace.path().to_string_lossy().into_owned();
+        input.args = args(&["-c", "printf credential-stdout; exit 5"]);
+        let request = XcodeShimSocketDispatchRequest {
+            agent_execution_id: Some(AgentExecutionId::new()),
+            token_id: "token-live".to_string(),
+            token_secret: "secret-live".to_string(),
+            now_epoch_ms: 1_500,
+            active_prompt: true,
+            plan_input: input,
+        };
+        let sink = Arc::new(CapturingObservationSink::default());
+
+        #[cfg(unix)]
+        {
+            let (client, server) = UnixStream::pair().expect("unix stream pair");
+            let credentials = xcode_shim_peer_credentials(&server).expect("peer credentials");
+            assert!(credentials.pid > 0);
+            assert_eq!(credentials.uid, unsafe { libc::getuid() });
+
+            let peer_process = XcodeShimProcessBinding {
+                pid: credentials.pid,
+                uid: credentials.uid,
+                parent_pid: Some(77),
+                start_time_fingerprint: Some("live-start".to_string()),
+                executable_fingerprint: Some("live-executable".to_string()),
+            };
+            let grant = XcodeShimDispatchGrant::new(
+                "token-live",
+                "secret-live",
+                "lease-live",
+                peer_process.clone(),
+                1_000,
+                2_000,
+            );
+            let config = process_config("/bin/sh");
+            let handler_sink = sink.clone();
+            let handler = tokio::spawn(async move {
+                let inspector = StaticPeerInspector {
+                    expected_credentials: credentials,
+                    peer_process,
+                };
+                handle_xcode_shim_unix_stream_with_peer_credentials(
+                    server,
+                    grant,
+                    &config,
+                    &*handler_sink,
+                    &inspector,
+                )
+                .await
+            });
+
+            let (client_reader, mut client_writer) = client.into_split();
+            let mut payload = serde_json::to_value(&request).expect("request json");
+            payload["peer_process"] = serde_json::json!({
+                "pid": 999,
+                "uid": 999,
+                "parent_pid": 999,
+                "start_time_fingerprint": "forged",
+                "executable_fingerprint": "forged"
+            });
+            client_writer
+                .write_all(serde_json::to_string(&payload).expect("payload").as_bytes())
+                .await
+                .expect("write payload");
+            client_writer.write_all(b"\n").await.expect("write newline");
+            client_writer
+                .shutdown()
+                .await
+                .expect("shutdown client write");
+
+            let mut response_line = String::new();
+            let mut reader = BufReader::new(client_reader);
+            reader
+                .read_line(&mut response_line)
+                .await
+                .expect("read response");
+            let response: XcodeShimDispatchOutcome =
+                serde_json::from_str(&response_line).expect("response json");
+            let handler_outcome = handler
+                .await
+                .expect("handler task")
+                .expect("handler result");
+
+            assert!(response.authorization.allowed);
+            assert_eq!(response.exit_status, 5);
+            assert_eq!(handler_outcome.exit_status, 5);
+            assert_eq!(
+                response
+                    .process_output
+                    .as_ref()
+                    .map(|output| output.stdout.as_str()),
+                Some("credential-stdout")
+            );
+        }
+
+        let updates = sink.updates();
+        assert_eq!(updates.len(), 2);
+        match &updates[0] {
+            XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::ShimInvocation(
+                event,
+            )) => {
+                assert_eq!(event.policy_reason, "host_executor");
+                assert_eq!(event.exit_status, 5);
+                assert!(!event.peer_pid_mismatch);
             }
             other => panic!("expected shim invocation event, got {other:?}"),
         }
