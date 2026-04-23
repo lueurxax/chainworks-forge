@@ -674,6 +674,19 @@ struct SchedulerQueueSummaryPayload: Decodable, Sendable, Equatable, Identifiabl
     let isStale: Bool
 }
 
+struct SchedulerHealthBannerIssue: Sendable, Equatable {
+    enum Kind: String, Sendable {
+        case sustainedBackpressure
+        case staleProjection
+        case dbWriterPressure
+    }
+
+    let kind: Kind
+    let title: String
+    let detail: String
+    let systemImage: String
+}
+
 private struct SchedulerReadbackEnvelope: Decodable {
     let data: SchedulerReadbackData?
     let errors: [GraphQLError]?
@@ -712,9 +725,66 @@ final class SchedulerHealthViewModel: ObservableObject {
             client: DaemonLifecycleClient(endpoint: .operatorDefault())
         )
     }
+
+    var bannerIssue: SchedulerHealthBannerIssue? {
+        SchedulerHealthPresentation.bannerIssue(for: readback)
+    }
 }
 
 enum SchedulerHealthPresentation {
+    static func bannerIssue(for readback: SchedulerHealthReadback?) -> SchedulerHealthBannerIssue? {
+        guard let health = readback?.health else { return nil }
+        if health.isStale {
+            return SchedulerHealthBannerIssue(
+                kind: .staleProjection,
+                title: "Scheduler projection stale",
+                detail: "Open Scheduler Health",
+                systemImage: "clock.badge.exclamationmark"
+            )
+        }
+        if isSustainedBackpressure(health) {
+            return SchedulerHealthBannerIssue(
+                kind: .sustainedBackpressure,
+                title: "System Busy - queued agents",
+                detail: "\(health.queuedCount) queued, oldest \(durationLabel(milliseconds: health.oldestQueuedAgeMs))",
+                systemImage: "hourglass.circle"
+            )
+        }
+        if let wait = health.dbWriterWaitP95Ms, wait > 0 {
+            return SchedulerHealthBannerIssue(
+                kind: .dbWriterPressure,
+                title: "Database writer busy",
+                detail: "p95 wait \(wait) ms",
+                systemImage: "externaldrive.badge.exclamationmark"
+            )
+        }
+        return nil
+    }
+
+    private static func isSustainedBackpressure(_ health: SchedulerHealthSummaryPayload) -> Bool {
+        guard health.queuedCount > 0 else { return false }
+        let state = health.sustainedBackpressureState
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !["", "none", "clear", "healthy", "idle"].contains(state) {
+            return true
+        }
+        return health.oldestQueuedAgeMs >= 5 * 60 * 1000
+    }
+
+    static func durationLabel(milliseconds: Int) -> String {
+        if milliseconds <= 0 {
+            return "0s"
+        }
+        let seconds = milliseconds / 1000
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        return remainder == 0 ? "\(minutes)m" : "\(minutes)m \(remainder)s"
+    }
+
     static func reasonLabel(_ reason: String) -> String {
         switch reason {
         case "run_capacity": return "Run at agent limit"
