@@ -76,7 +76,7 @@ The implemented `Runs Home` pane contract is:
 
 `Artifacts` owns the canonical hierarchy browser plus promoted artifacts.
 
-`Diagnostics` owns lower-frequency receipts, anomalies, recovery evidence, and other deep technical inspection paths.
+`Diagnostics` owns lower-frequency receipts, anomalies, recovery evidence, discovery settlement logs (P053), and other deep technical inspection paths.
 
 ### `Idea` owns the operation-first pane set
 

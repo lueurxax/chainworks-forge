@@ -144,6 +144,8 @@ artifact, and cost infrastructure as stage-owned executions.
 - `quota_ledger_id`,
 - creation and update timestamps.
 
+`agent_execution_discovery_diagnostics` is a related durable table that owns detailed P053 discovery pipeline execution decisions (exact paths, provider envelopes, meta-root bounding). `agent_execution_runtime_facts` projects those decisions into scalar `output_settlement` truth but does not store the full payload.
+
 Current `AgentFailureKind` values include:
 
 - `provider_quota`

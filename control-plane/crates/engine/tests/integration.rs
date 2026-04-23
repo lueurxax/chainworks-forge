@@ -8,11 +8,12 @@ use db::repos::{
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
-use domain::commands::{
-    ApproveStageCmd, CallerContext, Command, RejectStageCmd, RetryStageCmd, RunStewardAnalysisCmd,
-    StartRunCmd,
-};
 use domain::artifact::{Artifact, ArtifactFormat};
+use domain::commands::{
+    ApproveStageCmd, CallerContext, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
+    RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+};
+use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
@@ -365,7 +366,10 @@ async fn proposal_017_startup_repair_respects_conflict_cursor_resume_policy() {
         "startup repair must not enqueue AdvanceRun while conflict resolution is awaited"
     );
     assert!(
-        work_items::list_by_run(&pool, run_id).await.unwrap().is_empty(),
+        work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .is_empty(),
         "no catchup work item should be created for a cursor-blocked run"
     );
     let stored = workflow_conflicts::get_transition_cursor(&pool, run_id)
@@ -427,7 +431,10 @@ async fn proposal_017_startup_repair_respects_terminal_failure_cursor() {
         "startup repair must not enqueue AdvanceRun after terminal-unverifiable settlement"
     );
     assert!(
-        work_items::list_by_run(&pool, run_id).await.unwrap().is_empty(),
+        work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .is_empty(),
         "terminal cursor must not create catchup work"
     );
     let stored = workflow_conflicts::get_transition_cursor(&pool, run_id)
@@ -975,6 +982,8 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
                 stage_id: "flaky_stage".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1024,6 +1033,134 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
 }
 
 #[tokio::test]
+async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no_journal() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "retry_stage".into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let error = match handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "retry_stage".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: Some(LegacyBroadDiscoveryPolicy::WorkflowOptIn),
+                legacy_discovery_override_reason: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+    {
+        Ok(_) => panic!("invalid legacy discovery override retry should fail before journaling"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        error.contains("legacy_discovery_override_reason is required"),
+        "unexpected retry validation error: {error}"
+    );
+
+    let journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        journal_count, 0,
+        "failed retry override validation must not leave a dangling command journal row"
+    );
+
+    let override_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_discovery_overrides")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(override_count, 0);
+}
+
+#[tokio::test]
+async fn test_override_legacy_discovery_policy_rolls_back_journal_on_duplicate_failure() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Pending);
+    stage.stage_id = "retry_stage".into();
+    stage.attempt_number = 2;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let cmd = OverrideLegacyDiscoveryPolicyCmd {
+        run_id,
+        stage_id: "retry_stage".into(),
+        target_stage_execution_id: stage_exec_id,
+        target_attempt_number: 2,
+        legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        legacy_discovery_override_reason: "legacy workflow fallback".into(),
+    };
+
+    handler
+        .handle(
+            Command::OverrideLegacyDiscoveryPolicy(cmd.clone()),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+    let duplicate = match handler
+        .handle(
+            Command::OverrideLegacyDiscoveryPolicy(cmd),
+            CallerContext::test_fixture(),
+        )
+        .await
+    {
+        Ok(_) => panic!("duplicate legacy discovery override should fail"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        duplicate.contains("already exists"),
+        "unexpected duplicate override error: {duplicate}"
+    );
+
+    let journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'OverrideLegacyDiscoveryPolicy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        journal_count, 1,
+        "failed duplicate override must not leave a dangling command journal row"
+    );
+
+    let override_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_discovery_overrides")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(override_count, 1);
+}
+
+#[tokio::test]
 async fn test_retry_stage_targets_latest_matching_attempt() {
     let pool = test_pool().await;
 
@@ -1057,6 +1194,8 @@ async fn test_retry_stage_targets_latest_matching_attempt() {
                 stage_id: "flaky_stage".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1109,6 +1248,8 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
                 stage_id: "blocked_stage".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1203,6 +1344,8 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
                 stage_id: "review".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: Some(failed_lead_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1326,6 +1469,8 @@ async fn test_retry_stage_with_dead_target_generation_falls_back_to_stage_retry(
                 stage_id: "review".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: Some(failed_lead_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1473,6 +1618,8 @@ async fn test_retry_stage_rejects_active_latest_attempt() {
                 stage_id: "flaky_stage".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1548,6 +1695,8 @@ agents:
                 stage_id: "build".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -4057,7 +4206,9 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                     name: "prepush_review_report".into(),
                     content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
                     source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
+                pre_prompt_expected_outputs: Vec::new(),
                 transcript_text: Some(
                     r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"PASS_WITH_NOTES"}<<<END_CHAINWORKS_OUTPUT>>>"#
                         .into(),
@@ -4244,7 +4395,9 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                     name: "prepush_review_report".into(),
                     content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
                     source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
+                pre_prompt_expected_outputs: Vec::new(),
                 transcript_text: Some(
                     "provider quota limit reached after producing valid structured output".into(),
                 ),
@@ -7162,6 +7315,8 @@ async fn test_post_approval_retry_requires_fresh_approval() {
                 stage_id: "state_11_manual_release".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -8023,7 +8178,10 @@ fn test_artifact_field_reads_per_run_meta_root() {
 fn test_execution_request_carries_chainworks_meta_root() {
     let req = acp::ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test".into(),
         provider: "claude".into(),
         model: None,
@@ -8034,12 +8192,14 @@ fn test_execution_request_carries_chainworks_meta_root() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: vec![],
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

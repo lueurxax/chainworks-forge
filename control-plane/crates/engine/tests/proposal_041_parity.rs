@@ -1418,8 +1418,10 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
                     }))
                     .expect("fixture artifact payload serializes"),
                     source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 })
                 .collect(),
+            pre_prompt_expected_outputs: Vec::new(),
             transcript_text: None,
             cost_cents: None,
             usage: None,

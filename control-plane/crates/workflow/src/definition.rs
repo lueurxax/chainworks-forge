@@ -13,6 +13,8 @@ use std::collections::HashMap;
 pub struct WorkflowFile {
     pub schema_version: Option<u32>,
     pub workflow: Option<WorkflowMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryDef>,
     pub variables: Option<HashMap<String, serde_yaml::Value>>,
     pub initial_state: String,
     pub states: HashMap<String, WorkflowState>,
@@ -33,6 +35,19 @@ pub struct WorkflowMeta {
     pub required_providers: Option<Vec<String>>,
     pub execution: Option<serde_yaml::Value>,
     pub idea_input: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DiscoveryDef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_broad_discovery_policy: Option<LegacyBroadDiscoveryPolicyDef>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyBroadDiscoveryPolicyDef {
+    Disabled,
+    WorkflowOptIn,
 }
 
 /// A single state in the workflow state machine.
@@ -95,6 +110,21 @@ pub struct AgentTask {
     pub task: String,
     pub inputs: Option<Vec<String>>,
     pub outputs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_policies: Option<HashMap<String, OutputPolicyDef>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct OutputPolicyDef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_policy: Option<OutputReusePolicyDef>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputReusePolicyDef {
+    MustProduce,
+    AllowUnchangedExisting,
 }
 
 /// A transition to another state, guarded by a condition.

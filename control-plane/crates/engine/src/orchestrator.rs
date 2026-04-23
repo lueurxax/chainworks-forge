@@ -1141,7 +1141,10 @@ impl Orchestrator {
                         approved_proposal_artifact_id = Some(artifact.id.to_string());
                         approved_proposal_digest = artifact.checksum_sha256.clone();
                     }
-                    if !persisted_artifacts.iter().any(|existing| existing.id == artifact.id) {
+                    if !persisted_artifacts
+                        .iter()
+                        .any(|existing| existing.id == artifact.id)
+                    {
                         persisted_artifacts.push(artifact);
                     }
                 }
@@ -1315,7 +1318,10 @@ impl Orchestrator {
             let source_path = Self::absolute_artifact_path(&source.file_path, &run.workspace_root);
             if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
-                    format!("create approved_proposal handoff directory {}", parent.display())
+                    format!(
+                        "create approved_proposal handoff directory {}",
+                        parent.display()
+                    )
                 })?;
             }
             std::fs::copy(&source_path, &target_path).with_context(|| {
@@ -1534,6 +1540,7 @@ impl Orchestrator {
                     "total_tasks": total_tasks,
                     "worktree_write_enabled": task.agent.worktree_write_enabled,
                     "worktree_strategy": effective_worktree_strategy_for_task(task),
+                    "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
                     "session_reuse_scope": task.agent.session_reuse_scope,
                     "session_family_id": task.agent.session_family_id,
                     "declared_outputs": declared_outputs,
@@ -1606,6 +1613,7 @@ impl Orchestrator {
                     "total_tasks": total_tasks,
                     "worktree_write_enabled": agent.worktree_write_enabled,
                     "worktree_strategy": agent.worktree_strategy,
+                    "legacy_broad_discovery_policy": workflow::plan::LegacyBroadDiscoveryPolicy::Disabled,
                     "session_reuse_scope": agent.session_reuse_scope,
                     "session_family_id": agent.session_family_id,
                     "declared_outputs": Vec::<crate::contracts::DeclaredOutput>::new(),
@@ -3526,6 +3534,16 @@ fn build_declared_outputs(
                 output_name: output_name.clone(),
                 target_path,
                 schema,
+                reuse_policy: task.output_policies.get(output_name).map(|policy| {
+                    match policy.reuse_policy {
+                        workflow::plan::OutputReusePolicy::MustProduce => {
+                            domain::discovery::OutputReusePolicy::MustProduce
+                        }
+                        workflow::plan::OutputReusePolicy::AllowUnchangedExisting => {
+                            domain::discovery::OutputReusePolicy::AllowUnchangedExisting
+                        }
+                    }
+                }),
                 companion_output_name,
                 companion_path,
             }
@@ -4249,6 +4267,7 @@ mod tests {
             workflow_family: None,
             risk_class: None,
             stack: None,
+            legacy_broad_discovery_policy: workflow::plan::LegacyBroadDiscoveryPolicy::Disabled,
             workflow_snapshot_hash: "workflow".into(),
             catalog_snapshot_hash: "catalog".into(),
             workflow_snapshot_json: "{}".into(),
@@ -4297,6 +4316,7 @@ mod tests {
             task_name: "review_proposal_as_product_owner".into(),
             inputs: Vec::new(),
             outputs: vec!["proposal_review_po".into()],
+            output_policies: HashMap::new(),
             output_schemas,
             parallel: true,
             phase: 0,
@@ -4808,7 +4828,10 @@ mod tests {
         assert_eq!(cursor.current_state_id, "review");
         assert_eq!(cursor.cursor_status, "awaiting_conflict_resolution");
         assert_eq!(cursor.resume_policy, "await_conflict_resolution");
-        assert_eq!(cursor.conflict_id.as_deref(), Some(blocked.conflict_id.as_str()));
+        assert_eq!(
+            cursor.conflict_id.as_deref(),
+            Some(blocked.conflict_id.as_str())
+        );
         assert_eq!(
             cursor.conflict_fingerprint.as_deref(),
             Some(blocked.conflict_fingerprint.as_str())
@@ -5173,7 +5196,10 @@ mod tests {
             history[0].reason,
             WorkflowConflictReason::WorkflowConflictUnverifiable
         );
-        assert_eq!(history[0].status, WorkflowConflictStatus::TerminalUnverifiable);
+        assert_eq!(
+            history[0].status,
+            WorkflowConflictStatus::TerminalUnverifiable
+        );
         assert!(history[0].terminal_failure_reason.is_some());
         assert_eq!(
             db::repos::runs::find_by_id(&pool, run_id)
@@ -5190,7 +5216,10 @@ mod tests {
         assert_eq!(cursor.current_state_id, "review");
         assert_eq!(cursor.cursor_status, "terminal_unverifiable");
         assert_eq!(cursor.resume_policy, "terminal_failure");
-        assert_eq!(cursor.conflict_id.as_deref(), Some(history[0].conflict_id.as_str()));
+        assert_eq!(
+            cursor.conflict_id.as_deref(),
+            Some(history[0].conflict_id.as_str())
+        );
         assert!(cursor.terminal_failure_reason.is_some());
     }
 

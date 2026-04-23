@@ -50,6 +50,7 @@ pub struct GqlRun {
     pub operator_overrides_json: Option<String>,
     pub workflow_conflict: Option<GqlWorkflowConflict>,
     pub implementation_handoff_status_json: Option<Json<serde_json::Value>>,
+    pub legacy_discovery_overrides_json: Option<String>,
     pub implementation_self_assessment_summary: Option<GqlImplementationSelfAssessmentSummary>,
 }
 
@@ -92,6 +93,7 @@ impl From<Run> for GqlRun {
             operator_overrides_json: None,
             workflow_conflict: None,
             implementation_handoff_status_json: None,
+            legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
         }
     }
@@ -153,6 +155,7 @@ impl From<RunProjectionRow> for GqlRun {
             operator_overrides_json: None,
             workflow_conflict: None,
             implementation_handoff_status_json: None,
+            legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
         }
     }

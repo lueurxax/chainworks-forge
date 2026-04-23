@@ -1,13 +1,19 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, ideas, runs,
-    sessions, stages,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
+    agent_retry_budget_ledger, ideas, runs, sessions, stages,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
+};
+use domain::discovery::{
+    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, ExpectedOutputRole,
+    OutputDiscoveryDecision, OutputDiscoveryReason, OutputDiscoveryStatus,
+    DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
@@ -198,6 +204,30 @@ fn make_command_handler(pool: sqlx::SqlitePool) -> CommandHandler {
     CommandHandler::new(pool.clone(), events.clone(), WorkQueue::new(pool))
 }
 
+fn accepted_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: "implementation_self_assessment".into(),
+        output_role: ExpectedOutputRole::Machine,
+        target_path: "implementation/self-assessment.json".into(),
+        companion_of: None,
+        status: OutputDiscoveryStatus::Accepted,
+        reason: OutputDiscoveryReason::ExactPathNew,
+        provenance: None,
+        canonical_path: Some("/tmp/artifacts/implementation/self-assessment.json".into()),
+        root_class: None,
+        baseline_status: None,
+        size_bytes: Some(128),
+        content_digest: Some("sha256:accepted".into()),
+        max_bytes_applied: Some(10 * 1024 * 1024),
+        aggregate_bytes_after_acceptance: Some(128),
+        accepted_payload_ref: Some("provider_envelope:implementation_self_assessment".into()),
+        accepted_bytes_sha256: Some("accepted".into()),
+        generated_by: Some(agent_execution_id.to_string()),
+        diagnostics: BTreeMap::new(),
+        decision_at: Utc::now(),
+    }
+}
+
 #[tokio::test]
 async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -376,4 +406,74 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         serde_json::json!(true)
     );
     assert_eq!(resource_runtime_facts["quota_ledger_id"], ledger.id);
+}
+
+#[tokio::test]
+async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
+    let now = Utc::now();
+    let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(
+        DiscoveryDiagnosticsV1 {
+            schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
+            agent_execution_id: agent_execution_id.to_string(),
+            decisions: vec![accepted_discovery_decision(agent_execution_id)],
+            pre_prompt_expected_outputs: Vec::new(),
+            legacy_broad_discovery_used: false,
+            bounded_meta_root_discovery: None,
+            git_manifest_status: None,
+            resume_warnings: Vec::new(),
+            warnings: Vec::new(),
+            generated_at: now,
+        },
+        now,
+    );
+    agent_execution_discovery_diagnostics::upsert(&pool, &diagnostics)
+        .await
+        .unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    let payload = mcp_server::tools::reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &make_command_handler(pool.clone()),
+        &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+    )
+    .await
+    .unwrap();
+
+    let canonical = payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
+        .expect("mcp execution truth report");
+    let execution = &canonical["agent_executions"][0];
+    assert_eq!(
+        execution["discovery_diagnostics"]["reconciliation_pending"],
+        true
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["payload"]["resume_warnings"],
+        serde_json::json!(["reconciliation_pending"])
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["runtime_facts_present"],
+        true
+    );
+    assert_eq!(
+        execution["discovery_diagnostics"]["matching_active_artifact_generation_count"],
+        0
+    );
+    assert_eq!(
+        execution["runtime_facts"]["output_settlement"],
+        "valid_outputs_from_completed_execution"
+    );
+    assert_eq!(execution["runtime_facts"]["valid_required_outputs"], false);
 }

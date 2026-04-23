@@ -1,3 +1,4 @@
+pub mod agent_execution_discovery_diagnostics;
 pub mod agent_execution_runtime_facts;
 pub mod agent_executions;
 pub mod agent_retry_budget_ledger;
@@ -6,6 +7,7 @@ pub mod artifact_contracts;
 pub mod artifacts;
 pub mod command_journal;
 pub mod ideas;
+pub mod legacy_discovery_overrides;
 pub mod projections;
 pub mod runs;
 pub mod scheduler;

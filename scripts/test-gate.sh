@@ -1643,6 +1643,7 @@ Available gates:
   proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
   proposal-049    Proposal 049 steward analysis system gate
   proposal-050    Proposal 050 per-run workspace isolation gate
+  proposal-053    Proposal 053 bounded ACP artifact discovery gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
   proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
   proposal-060|p060  Proposal 060 Phase 0a/0b control artifact wrapper gate
@@ -2386,6 +2387,33 @@ for item in required:
         raise SystemExit(f"proposal-057: docs/reference/test-gates.md missing {item}")
 PY
     log "Proposal 057 control-plane gate passed"
+    ;;
+  proposal-053|p053)
+    log "Proposal 053 control-plane gate: bounded ACP artifact discovery"
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-053-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain discovery::tests::generated_state_denylist_matches_p053_roots -- --exact --nocapture &&
+      cargo test -p domain discovery::tests::expected_output_spec_serializes_p053_policy_fields -- --exact --nocapture &&
+      cargo test -p domain bounded_pre_prompt_metadata -- --nocapture &&
+      cargo test -p domain proposal_053_bounded_meta_root -- --nocapture &&
+      cargo test -p domain proposal_053_legacy_broad_discovery -- --nocapture &&
+      cargo test -p db proposal_053_discovery_diagnostics --test proposal_053_discovery_diagnostics -- --nocapture &&
+      cargo test -p workflow proposal_053_output_policies -- --nocapture &&
+      cargo test -p workflow proposal_053_legacy_broad_discovery_policy -- --nocapture &&
+      cargo test -p acp caps_declared_payload_before_settlement -- --nocapture &&
+      cargo test -p acp test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default --test integration -- --nocapture &&
+      cargo test -p acp test_claude_adapter_executes_subprocess_and_returns_artifacts --test integration -- --nocapture &&
+      cargo test -p engine expected_output_specs -- --nocapture &&
+      cargo test -p engine proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only --lib -- --nocapture &&
+      cargo test -p engine proposal_053_git_manifest_runner -- --nocapture &&
+      cargo test -p engine proposal_053_declared_manifest_preserves_agent_authored_file -- --nocapture &&
+      cargo test -p engine test_retry_stage_legacy_discovery_override_validation_failure_leaves_no_journal --test integration -- --nocapture &&
+      cargo test -p graphql-server proposal_053_agent_execution_projects_discovery_reconciliation_pending --test proposal_058_runtime_facts -- --nocapture &&
+      cargo test -p mcp-server proposal_053_reports_get_projects_discovery_reconciliation_pending --test proposal_058_runtime_facts -- --nocapture
+    )
+    log "Proposal 053 control-plane gate passed"
     ;;
   proposal-058|p058)
     log "Proposal 058 control-plane gate: ACP provider failure classification and session artifact ownership"

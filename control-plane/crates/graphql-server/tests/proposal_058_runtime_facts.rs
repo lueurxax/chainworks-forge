@@ -1,17 +1,23 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_graphql::Request;
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    artifacts, ideas, runs, sessions, stages,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
+    agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, runs, sessions, stages,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
 };
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::ActiveArtifactGenerationInput;
+use domain::discovery::{
+    AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, ExpectedOutputRole,
+    OutputDiscoveryDecision, OutputDiscoveryReason, OutputDiscoveryStatus,
+    DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
@@ -215,6 +221,30 @@ fn make_schema(pool: sqlx::SqlitePool) -> graphql_server::schema::AppSchema {
     )
 }
 
+fn accepted_discovery_decision(agent_execution_id: AgentExecutionId) -> OutputDiscoveryDecision {
+    OutputDiscoveryDecision {
+        output_name: "implementation_self_assessment".into(),
+        output_role: ExpectedOutputRole::Machine,
+        target_path: "implementation/self-assessment.json".into(),
+        companion_of: None,
+        status: OutputDiscoveryStatus::Accepted,
+        reason: OutputDiscoveryReason::ExactPathNew,
+        provenance: None,
+        canonical_path: Some("/tmp/artifacts/implementation/self-assessment.json".into()),
+        root_class: None,
+        baseline_status: None,
+        size_bytes: Some(128),
+        content_digest: Some("sha256:accepted".into()),
+        max_bytes_applied: Some(10 * 1024 * 1024),
+        aggregate_bytes_after_acceptance: Some(128),
+        accepted_payload_ref: Some("provider_envelope:implementation_self_assessment".into()),
+        accepted_bytes_sha256: Some("accepted".into()),
+        generated_by: Some(agent_execution_id.to_string()),
+        diagnostics: BTreeMap::new(),
+        decision_at: Utc::now(),
+    }
+}
+
 #[tokio::test]
 async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenance() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -378,6 +408,87 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
     assert_eq!(
         data["stage"]["executions"][0]["runtimeFacts"]["createdAt"],
         now.to_rfc3339()
+    );
+}
+
+#[tokio::test]
+async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
+        seed_execution(&pool).await;
+    let now = Utc::now();
+    let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(
+        DiscoveryDiagnosticsV1 {
+            schema_version: DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION.to_string(),
+            agent_execution_id: agent_execution_id.to_string(),
+            decisions: vec![accepted_discovery_decision(agent_execution_id)],
+            pre_prompt_expected_outputs: Vec::new(),
+            legacy_broad_discovery_used: false,
+            bounded_meta_root_discovery: None,
+            git_manifest_status: None,
+            resume_warnings: Vec::new(),
+            warnings: Vec::new(),
+            generated_at: now,
+        },
+        now,
+    );
+    agent_execution_discovery_diagnostics::upsert(&pool, &diagnostics)
+        .await
+        .unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    let schema = make_schema(pool);
+    let response = schema
+        .execute(
+            Request::new(format!(
+                r#"{{
+                    stage(id: "{}") {{
+                        executions {{
+                            runtimeFacts {{
+                                outputSettlement
+                                validRequiredOutputs
+                            }}
+                            discoveryDiagnostics
+                        }}
+                    }}
+                }}"#,
+                stage_execution_id
+            ))
+            .data(auth::Principal::new(
+                "operator",
+                auth::PrincipalClass::Operator,
+            )),
+        )
+        .await;
+
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
+    let data = response.data.into_json().unwrap();
+    let execution = &data["stage"]["executions"][0];
+    assert_eq!(
+        execution["runtimeFacts"]["outputSettlement"],
+        "VALID_OUTPUTS_FROM_COMPLETED_EXECUTION"
+    );
+    assert_eq!(execution["runtimeFacts"]["validRequiredOutputs"], false);
+    assert_eq!(
+        execution["discoveryDiagnostics"]["reconciliation_pending"],
+        true
+    );
+    assert_eq!(
+        execution["discoveryDiagnostics"]["payload"]["resume_warnings"],
+        serde_json::json!(["reconciliation_pending"])
+    );
+    assert_eq!(
+        execution["discoveryDiagnostics"]["runtime_facts_present"],
+        true
     );
 }
 

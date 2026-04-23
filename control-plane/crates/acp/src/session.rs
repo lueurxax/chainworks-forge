@@ -42,8 +42,14 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
-        let (status, artifact_paths, discovered_artifacts, transcript_text, usage) =
-            self.transport.prompt(req).await?;
+        let (
+            status,
+            artifact_paths,
+            discovered_artifacts,
+            pre_prompt_expected_outputs,
+            transcript_text,
+            usage,
+        ) = self.transport.prompt(req).await?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
             .as_ref()
@@ -58,6 +64,7 @@ impl AcpSession {
             status,
             artifact_paths,
             discovered_artifacts,
+            pre_prompt_expected_outputs,
             transcript_text,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,

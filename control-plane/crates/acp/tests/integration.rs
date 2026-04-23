@@ -320,6 +320,115 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server script that leaves an existing declared
+    /// output untouched during `session/prompt`.
+    pub fn create_noop_prompt_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_noop_prompt.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-noop"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Write a fixture ACP server script that creates one file during
+    /// initialize and one file during the prompt. The initialize-time file
+    /// must be part of the post-handshake baseline, not a prompt artifact.
+    pub fn create_initialize_artifact_script(
+        tmpdir: &std::path::Path,
+        initialize_artifact: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_initialize_artifact.py");
+        let initialize_artifact = initialize_artifact.to_string_lossy();
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, os
+
+INITIALIZE_ARTIFACT = {initialize_artifact:?}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+with open(INITIALIZE_ARTIFACT, "w") as f:
+    f.write('{{"phase": "initialize"}}\n')
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {{}}).get("cwd", "/tmp")
+session_id = "fixture-session-initialize-artifact"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+with open(os.path.join(cwd, "prompt_created.json"), "w") as f:
+    f.write('{{"phase": "prompt"}}\n')
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+sys.exit(0)
+"#
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that emits a CHAINWORKS_OUTPUT
     /// envelope over `session/update` without writing any filesystem artifact.
     pub fn create_envelope_only_script(tmpdir: &std::path::Path) -> String {
@@ -646,7 +755,10 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
 
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -658,12 +770,14 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -687,15 +801,27 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn mcp_servers_session_new_serialization_tests() {
-    use acp::transport::{build_session_new_params, AcpSessionConfig};
-    use acp::{AcpMcpServerPayload, ExecutionRequest, ResolvedMcpServerTransport};
+async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on_first_prompt() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
     use domain::ids::RunId;
 
     let tmp = tempfile::tempdir().unwrap();
+    let stale = tmp.path().join("stale.json");
+    std::fs::write(&stale, "{\"stale\": true}\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    let script = fixture::create_success_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+
     let req = ExecutionRequest {
         run_id: RunId::new(),
-        stage_id: "stage_test".into(),
+        stage_execution_id: None,
+        stage_id: "stage_legacy_post_prompt_only".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -706,6 +832,101 @@ async fn mcp_servers_session_new_serialization_tests() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(
+        result.artifact_paths.len(),
+        1,
+        "legacy broad discovery should report only files modified by the prompt: {:?}",
+        result.artifact_paths
+    );
+    assert!(result.artifact_paths[0].ends_with("result.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_success_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_default_no_broad".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result.artifact_paths.is_empty(),
+        "implicit broad discovery must be disabled unless the frozen policy opts in: {:?}",
+        result.artifact_paths
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_servers_session_new_serialization_tests() {
+    use acp::transport::{build_session_new_params, AcpSessionConfig};
+    use acp::{AcpMcpServerPayload, ExecutionRequest, ResolvedMcpServerTransport};
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
@@ -722,6 +943,7 @@ async fn mcp_servers_session_new_serialization_tests() {
             },
         }],
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -753,7 +975,10 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_fail".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -764,12 +989,14 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -800,7 +1027,10 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_prompt_transport_error".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -811,12 +1041,14 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let error = adapter
@@ -869,7 +1101,10 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
 
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "gemini_stage".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "gemini-agent".into(),
         provider: "gemini".into(),
         model: None,
@@ -880,12 +1115,14 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -912,7 +1149,10 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_overwrite".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -923,12 +1163,14 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: vec![existing.to_string_lossy().into_owned()],
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -939,6 +1181,217 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
             .iter()
             .any(|path| path.ends_with("canonical.json")),
         "expected overwritten canonical output to be reported: {:?}",
+        result.artifact_paths
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let existing = tmp.path().join("canonical.json");
+    std::fs::write(&existing, "{\"stale\": true}\n").unwrap();
+
+    let script = fixture::create_noop_prompt_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_stale_expected_output".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "leave canonical output untouched".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: vec![existing.to_string_lossy().into_owned()],
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result.artifact_paths.is_empty(),
+        "unchanged expected output path should not be reported as current prompt output: {:?}",
+        result.artifact_paths
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::discovery::{
+        AuthorizedRoot, ExpectedOutputRole, ExpectedOutputSpec, ExpectedPathBaselineStatus,
+        OutputReusePolicy, OutputRootClass, SourceGenerationOwner,
+    };
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let stale_legacy_path = tmp.path().join("legacy-stale.json");
+    std::fs::write(&stale_legacy_path, "{\"stale\": true}\n").unwrap();
+    let typed_path = tmp.path().join("result.json");
+    std::fs::write(&typed_path, "{\"ok\": false}\n").unwrap();
+
+    let script = fixture::create_success_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let typed_path_string = typed_path.to_string_lossy().into_owned();
+    let stale_legacy_path_string = stale_legacy_path.to_string_lossy().into_owned();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: Some("stage-exec-typed".into()),
+        stage_id: "stage_typed_expected_outputs".into(),
+        attempt_number: 2,
+        agent_execution_id: Some("agent-exec-typed".into()),
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: workspace_root.clone(),
+        prompt: "overwrite typed expected output".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: vec![stale_legacy_path_string.clone()],
+        expected_outputs: vec![ExpectedOutputSpec {
+            output_name: "result".to_string(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: typed_path_string.clone(),
+            companion_of: None,
+            display_label: "result".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 10 * 1024 * 1024,
+            aggregate_acceptance_cap_bytes: 64 * 1024 * 1024,
+            authorized_roots: vec![AuthorizedRoot {
+                root_class: OutputRootClass::Workspace,
+                root_path: workspace_root,
+            }],
+            source_generation_owner: SourceGenerationOwner::Agent,
+        }],
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result.artifact_paths.iter().any(|path| path == &typed_path_string),
+        "changed typed expected output should be reported even when the legacy path list is stale: {:?}",
+        result.artifact_paths
+    );
+    assert!(
+        !result
+            .artifact_paths
+            .iter()
+            .any(|path| path == &stale_legacy_path_string),
+        "unchanged legacy-only path should not be reported: {:?}",
+        result.artifact_paths
+    );
+    assert_eq!(result.pre_prompt_expected_outputs.len(), 1);
+    assert_eq!(result.pre_prompt_expected_outputs[0].output_name, "result");
+    assert_eq!(result.pre_prompt_expected_outputs[0].attempt_number, 2);
+    assert_eq!(
+        result.pre_prompt_expected_outputs[0].agent_execution_id,
+        "agent-exec-typed"
+    );
+    assert_eq!(
+        result.pre_prompt_expected_outputs[0].stage_execution_id,
+        "stage-exec-typed"
+    );
+    assert_eq!(
+        result.pre_prompt_expected_outputs[0].baseline_status,
+        ExpectedPathBaselineStatus::RegularContentCaptured
+    );
+    assert!(result.pre_prompt_expected_outputs[0]
+        .content_digest
+        .as_deref()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifacts() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let initialize_artifact = tmp.path().join("initialize_created.json");
+    let script = fixture::create_initialize_artifact_script(tmp.path(), &initialize_artifact);
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_initialize_artifact".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "create prompt artifact".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result
+            .artifact_paths
+            .iter()
+            .any(|path| path.ends_with("prompt_created.json")),
+        "prompt-created artifact should still be reported: {:?}",
+        result.artifact_paths
+    );
+    assert!(
+        !result
+            .artifact_paths
+            .iter()
+            .any(|path| path.ends_with("initialize_created.json")),
+        "initialize-created artifact must be part of the post-handshake baseline: {:?}",
         result.artifact_paths
     );
 }
@@ -957,7 +1410,10 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_envelope".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -968,12 +1424,14 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1006,7 +1464,10 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_json_envelope".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1017,12 +1478,14 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1070,7 +1533,10 @@ async fn test_runtime_manager_reuses_live_session_handle() {
 
     let first_req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_first".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "reuse-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1081,12 +1547,14 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: true,
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -1105,7 +1573,10 @@ async fn test_runtime_manager_reuses_live_session_handle() {
 
     let second_req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_second".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "reuse-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1116,12 +1587,14 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -1163,7 +1636,10 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
 
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_one_shot".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "one-shot-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1174,12 +1650,14 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: Some(generation_id.into()),
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: Default::default(),
     };
 
     let execution = {
@@ -1234,7 +1712,10 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
 
     let first_req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_first".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "reuse-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1245,12 +1726,14 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: true,
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -1270,7 +1753,10 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
 
     let reuse_req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_second".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "reuse-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1281,12 +1767,14 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id),
         provider_session_id,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -1313,7 +1801,10 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
 
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_usage".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "usage-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1324,12 +1815,14 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1402,7 +1895,10 @@ sys.exit(0)
     let adapter = ClaudeAgentAdapter::new_with_binary(script.to_str().unwrap());
     let req = ExecutionRequest {
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "env_probe".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "env-probe-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -1413,12 +1909,14 @@ sys.exit(0)
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: vec![],
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/env-test-run".into()),
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
     };
 
     let _ = adapter.execute(req).await;
