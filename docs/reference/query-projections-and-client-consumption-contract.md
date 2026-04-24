@@ -8,12 +8,13 @@ This document is the implemented GraphQL read contract for the thin macOS client
 | Readiness | Ready with Risks |
 | Contract schema | `p043-read-contract-v1` |
 | Gate | `./scripts/test-gate.sh proposal-043` |
-| Alias | `./scripts/test-gate.sh p043`, `./scripts/test-gate.sh p031` |
+| Alias | `./scripts/test-gate.sh p043` |
+| Composed downstream gate | `./scripts/test-gate.sh p031` |
 | Governing proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
 | Scope | Rust control-plane GraphQL **read** contract for P031 client consumption. Command/control (MCP mutations) is explicitly NOT part of this contract. |
 | Downstream owner | P031 thin macOS UI rewrite (**read-only** consumer, per r18 scope narrowing). |
 
-### Scope boundary (r18 narrowing)
+### Scope boundary (r8 correction)
 
 P031's thin macOS UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations. 
 

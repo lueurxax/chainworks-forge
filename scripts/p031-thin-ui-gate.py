@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -19,6 +20,16 @@ REQUIRED_SCHEMA_VERSION = "p031-thin-ui-inventory-v1"
 REQUIRED_WRITE_PATH_GUIDE_SCHEMA_VERSION = "p031-operator-write-path-guide-v1"
 LEGACY_MODE_ENVIRONMENT = "CHAINWORKS_THIN_UI_MODE=legacy"
 GRAPHQL_DOCUMENT_GLOBS = ("**/*.graphql", "**/*.gql")
+EXCLUDED_REPO_FILE_PREFIXES = (
+    ".build/",
+    ".chainworks/",
+    ".git/",
+    ".swiftpm/",
+    "chainworks/",
+    "control-plane/target/",
+    "reports/",
+    "tmp/",
+)
 
 REQUIRED_TOP_LEVEL_KEYS = {
     "schema_version",
@@ -161,9 +172,7 @@ DEFAULT_FORBIDDEN_PATTERNS = {
         r"\bCommandLegality\b",
     ],
     "raw_truth_probing": [
-        r"\bFileManager\.default\b",
         r"\bcontentsOfDirectory\b",
-        r"\bData\s*\(\s*contentsOf\s*:",
         r"\bString\s*\(\s*contentsOf\s*:",
         r"\bRunPlanFile\b",
         r"\brawArtifact",
@@ -348,10 +357,32 @@ def extra_patterns_by_group(entries: Any) -> dict[str, list[str]]:
 
 def repo_files(repo_root: Path, glob: str) -> set[str]:
     files: set[str] = set()
+    if glob in GRAPHQL_DOCUMENT_GLOBS:
+        suffix = Path(glob).suffix
+        for dirpath, dirnames, filenames in os.walk(repo_root):
+            rel_dir = normalize_path(Path(dirpath).relative_to(repo_root).as_posix())
+            if rel_dir == ".":
+                rel_dir = ""
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not normalize_path(f"{rel_dir}/{dirname}".lstrip("/")).startswith(
+                    tuple(prefix.rstrip("/") for prefix in EXCLUDED_REPO_FILE_PREFIXES)
+                )
+                and dirname != "target"
+            ]
+            for filename in filenames:
+                if not filename.endswith(suffix):
+                    continue
+                rel = normalize_path((Path(dirpath) / filename).relative_to(repo_root).as_posix())
+                if not rel.startswith(EXCLUDED_REPO_FILE_PREFIXES) and "/target/" not in f"/{rel}/":
+                    files.add(rel)
+        return files
+
     for path in repo_root.glob(glob):
         if path.is_file():
             rel = normalize_path(path.relative_to(repo_root).as_posix())
-            if "/target/" not in f"/{rel}/" and not rel.startswith("reports/"):
+            if not rel.startswith(EXCLUDED_REPO_FILE_PREFIXES) and "/target/" not in f"/{rel}/":
                 files.add(rel)
     return files
 
@@ -1043,9 +1074,7 @@ class P031ThinUIGateTests(unittest.TestCase):
 
     def test_raw_truth_probing_patterns_fail(self) -> None:
         snippets = [
-            ("file_manager", "FileManager.default.fileExists(atPath: path)"),
             ("contents_of_directory", "try contentsOfDirectory(atPath: path)"),
-            ("data_contents", "try Data(contentsOf: url)"),
             ("string_contents", "try String(contentsOf: url)"),
             ("run_plan_file", "let plan: RunPlanFile"),
             ("raw_artifact", "let rawArtifactPath = path"),
@@ -1061,6 +1090,15 @@ class P031ThinUIGateTests(unittest.TestCase):
                     any("forbidden P031 raw_truth_probing pattern" in error for error in result.errors),
                     result.errors,
                 )
+
+    def test_bundled_resource_data_load_is_not_raw_truth_probing(self) -> None:
+        root = self.make_repo()
+        (root / "Chainworks Forge/Views/RunsHomeView.swift").write_text(
+            "let data = url.flatMap { try? Data(contentsOf: $0) }\n"
+        )
+        self.write_inventory(root)
+
+        self.assertTrue(validate_inventory(root).ok)
 
     def test_generated_graphql_mutation_output_fails(self) -> None:
         root = self.make_repo()
@@ -1165,6 +1203,20 @@ class P031ThinUIGateTests(unittest.TestCase):
             any(generated_path in error and "forbidden P031 graphql_mutations pattern" in error for error in result.errors),
             result.errors,
         )
+
+    def test_provider_toolchain_graphql_cache_is_not_repo_surface(self) -> None:
+        root = self.make_repo()
+        cache_path = (
+            root
+            / "chainworks/toolchains/providers/codex/session/rust/cargo/registry/src/"
+            / "async-graphql/tests/services/minimal.graphql"
+        )
+        cache_path.parent.mkdir(parents=True)
+        cache_path.write_text("query ThirdPartyFixture { __typename }\n")
+        (root / "Chainworks Forge/Views/RunsHomeView.swift").write_text("struct RunsHomeView {}\n")
+        self.write_inventory(root)
+
+        self.assertTrue(validate_inventory(root).ok)
 
 
 def main() -> int:

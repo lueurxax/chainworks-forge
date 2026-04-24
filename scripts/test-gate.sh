@@ -2239,19 +2239,19 @@ PY
     log "Proposal 043 control-plane gate passed"
     ;;
   proposal-031|p031)
-    log "Proposal 031 gate: thin GraphQL-only UI rewrite"
-    # 1. Run the static inventory and write-path guide gate
+    log "Proposal 031 gate: GraphQL-only thin UI inventory/static guard/write-path guide"
+    "$0" proposal-043
+
     python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
-    
-    # 2. Run the server-side authorization and read-model tests
+
     (
-      cd "$ROOT_DIR"
-      cd control-plane
+      cd "$ROOT_DIR/control-plane"
       CARGO_TARGET_DIR=target/proposal-031-gate cargo test -p graphql-server --lib proposal_031_ -- --test-threads=1 --nocapture
       CARGO_TARGET_DIR=target/proposal-031-gate cargo test -p graphql-server --test proposal_031_authorization -- --test-threads=1 --nocapture
+    )
+
+    (
       cd "$ROOT_DIR"
-      
-      # 3. Validate Phase 0 artifact manifest and references
       python3 - <<'PY'
 from pathlib import Path
 import json
@@ -2432,21 +2432,22 @@ from datetime import datetime
 from pathlib import Path
 
 root = Path.cwd()
-cap = root / "docs/proposals/053.review/cap-validation.json"
-security = root / "docs/proposals/053.review/security-checklist.md"
-manual_latency = root / "docs/proposals/053.review/manual-latency-spot-check.md"
-operator_clarity = root / "docs/proposals/053.review/operator-clarity-evidence.md"
-retrospective = root / "docs/proposals/053.review/phase-1-retrospective.md"
+evidence = root / "docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency"
+cap = evidence / "cap-validation.json"
+security = evidence / "security-checklist.md"
+manual_latency = evidence / "manual-latency-spot-check.md"
+operator_clarity = evidence / "operator-clarity-evidence.md"
+retrospective = evidence / "phase-1-retrospective.md"
 if not cap.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/cap-validation.json")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/cap-validation.json")
 if not security.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/security-checklist.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/security-checklist.md")
 if not manual_latency.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/manual-latency-spot-check.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/manual-latency-spot-check.md")
 if not operator_clarity.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/operator-clarity-evidence.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/operator-clarity-evidence.md")
 if not retrospective.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/phase-1-retrospective.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/phase-1-retrospective.md")
 data = json.loads(cap.read_text())
 required = {
     "schema_version",
