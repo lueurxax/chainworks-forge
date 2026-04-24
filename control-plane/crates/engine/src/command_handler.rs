@@ -1336,8 +1336,8 @@ impl CommandHandler {
                                     &mut tx,
                                     &domain::session::SessionEvent {
                                         id: uuid::Uuid::new_v4().to_string(),
-                                        lineage_id: lineage_id.clone(),
-                                        generation_id: generation_id.clone(),
+                                        lineage_id: lineage_id.to_string(),
+                                        generation_id: generation_id.to_string(),
                                         event_type:
                                             domain::session::SessionEventType::OperatorReset,
                                         recorded_at: now,

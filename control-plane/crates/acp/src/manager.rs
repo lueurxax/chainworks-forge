@@ -14,10 +14,13 @@ use crate::adapters::claude::ClaudeAgentAdapter;
 use crate::adapters::codex::CodexAdapter;
 use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
-use crate::adapters::{AcpAdapter, LaunchResourceGuard, ProviderCapabilityCache};
+use crate::adapters::{
+    AcpAdapter, LaunchResourceGuard, ProviderCapabilityCache, XcodeShimLaunchRuntime,
+};
 use crate::session::AcpSessionHandle;
 use crate::{
-    ExecutionRequest, ExecutionResult, NoopXcodeRuntimeObservationSink, XcodeRuntimeObservationSink,
+    ExecutionRequest, ExecutionResult, NoopXcodeRuntimeObservationSink,
+    XcodeRuntimeObservationSink, XcodeShimGrantStore,
 };
 
 #[derive(Debug)]
@@ -79,6 +82,14 @@ pub struct AcpRuntimeManager {
     provider_capability_cache: ProviderCapabilityCache,
     xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
     xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
+    xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
+}
+
+#[derive(Clone)]
+struct XcodeShimRuntimeConfig {
+    store: Arc<dyn XcodeShimGrantStore>,
+    socket_path: String,
+    shim_dir: String,
 }
 
 impl AcpRuntimeManager {
@@ -112,6 +123,7 @@ impl AcpRuntimeManager {
             provider_capability_cache: ProviderCapabilityCache::default(),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
+            xcode_shim_runtime: RwLock::new(None),
         }
     }
 
@@ -141,6 +153,23 @@ impl AcpRuntimeManager {
             .write()
             .expect("xcode broker lease attacher lock poisoned");
         *guard = attacher;
+    }
+
+    pub fn set_xcode_shim_runtime(
+        &self,
+        store: Arc<dyn XcodeShimGrantStore>,
+        socket_path: impl Into<String>,
+        shim_dir: impl Into<String>,
+    ) {
+        let mut guard = self
+            .xcode_shim_runtime
+            .write()
+            .expect("xcode shim runtime lock poisoned");
+        *guard = Some(XcodeShimRuntimeConfig {
+            store,
+            socket_path: socket_path.into(),
+            shim_dir: shim_dir.into(),
+        });
     }
 
     async fn adapter_for(&self, provider: &str) -> Result<Arc<dyn AcpAdapter>> {
@@ -286,6 +315,7 @@ impl AcpRuntimeManager {
             lease_ids: attachment.lease_ids.clone(),
         });
         let session_req = attachment.request;
+        self.attach_xcode_shim_runtime_if_needed(&session_req, &mut launch_spec)?;
 
         if let Err(err) = adapter.reject_unconverted_broker_intents(&session_req) {
             self.release_xcode_leases(lease_cleanup).await;
@@ -315,6 +345,39 @@ impl AcpRuntimeManager {
             session_req,
             lease_cleanup,
         })
+    }
+
+    fn attach_xcode_shim_runtime_if_needed(
+        &self,
+        req: &ExecutionRequest,
+        launch_spec: &mut crate::adapters::AcpLaunchSpec,
+    ) -> Result<()> {
+        if !req.xcode_shim_injection_signal && !req.requires_xcode_host_execution {
+            return Ok(());
+        }
+        let config = self
+            .xcode_shim_runtime
+            .read()
+            .expect("xcode shim runtime lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "p051_xcode_shim_runtime_unavailable: provider requested Xcode shim injection but daemon did not configure a shim socket"
+                )
+            })?;
+        let token_id = uuid::Uuid::new_v4().to_string();
+        let token_secret = uuid::Uuid::new_v4().to_string();
+        launch_spec.attach_xcode_shim_runtime(XcodeShimLaunchRuntime {
+            token_id: token_id.clone(),
+            token_secret,
+            lease_id: format!("xcode-shim-{token_id}"),
+            socket_path: config.socket_path,
+            shim_dir: config.shim_dir,
+            workspace_root: req.workspace_root.clone(),
+            agent_execution_id: req.agent_execution_id,
+            store: config.store,
+        });
+        Ok(())
     }
 
     async fn release_xcode_leases(&self, cleanup: Option<BrokeredXcodeLeaseCleanup>) {
@@ -538,6 +601,7 @@ impl AcpRuntimeManager {
             provider_capability_cache: ProviderCapabilityCache::default(),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
+            xcode_shim_runtime: RwLock::new(None),
         }
     }
 }

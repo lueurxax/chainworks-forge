@@ -8351,7 +8351,6 @@ fn test_artifact_field_reads_per_run_meta_root() {
 #[test]
 fn test_execution_request_carries_chainworks_meta_root() {
     let req = acp::ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "test".into(),
@@ -8375,6 +8374,8 @@ fn test_execution_request_carries_chainworks_meta_root() {
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

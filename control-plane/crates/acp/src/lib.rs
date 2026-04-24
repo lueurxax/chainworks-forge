@@ -14,19 +14,21 @@ pub use xcode_broker::{
     XcodeMcpBridgePoolConfig, XcodeMcpLeaseState, XcodeMcpProcessBackend,
     XcodeMcpProcessBackendConfig,
 };
+#[cfg(unix)]
+pub use xcode_shim::{
+    current_process_uid, handle_xcode_shim_unix_stream,
+    handle_xcode_shim_unix_stream_with_grant_resolver,
+    handle_xcode_shim_unix_stream_with_peer_credentials, xcode_shim_peer_credentials,
+    DefaultXcodeShimProcessInspector, XcodeShimGrantResolver, XcodeShimPeerCredentials,
+    XcodeShimProcessInspector, XcodeShimResolvedDispatch,
+};
 pub use xcode_shim::{
     dispatch_xcode_shim_request, dispatch_xcode_shim_socket_request, XcodeHostExecutorPlan,
     XcodeHostExecutorPlanError, XcodeHostExecutorPlanInput, XcodeHostExecutorProcessConfig,
     XcodeHostExecutorProcessOutput, XcodeHostExecutorSimulatorCandidate, XcodeShimCommandPolicy,
     XcodeShimDispatchAttempt, XcodeShimDispatchAuthorization, XcodeShimDispatchGrant,
-    XcodeShimDispatchOutcome, XcodeShimDispatchRequest, XcodeShimProcessBinding,
-    XcodeShimRouteDecision, XcodeShimSocketDispatchRequest,
-};
-#[cfg(unix)]
-pub use xcode_shim::{
-    handle_xcode_shim_unix_stream, handle_xcode_shim_unix_stream_with_peer_credentials,
-    xcode_shim_peer_credentials, DefaultXcodeShimProcessInspector, XcodeShimPeerCredentials,
-    XcodeShimProcessInspector,
+    XcodeShimDispatchOutcome, XcodeShimDispatchRequest, XcodeShimGrantRecord, XcodeShimGrantStore,
+    XcodeShimProcessBinding, XcodeShimRouteDecision, XcodeShimSocketDispatchRequest,
 };
 pub use xcode_target::{
     probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,
@@ -63,11 +65,6 @@ pub struct ExecutionRequest {
     /// this to keep retry baselines distinct from earlier attempts.
     #[serde(default = "default_attempt_number")]
     pub attempt_number: u32,
-    /// Durable agent execution UUID when this request originates from the
-    /// orchestrator. Adapter-level tests and legacy serialized requests fall
-    /// back to `agent_id`.
-    #[serde(default)]
-    pub agent_execution_id: Option<String>,
     pub agent_id: String,
     pub provider: String,
     pub model: Option<String>,
@@ -124,6 +121,14 @@ pub struct ExecutionRequest {
     /// disabled unless the frozen run plan or audited retry override enables it.
     #[serde(default)]
     pub legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy,
+    /// P051 direct Xcode command guard. When true, the runtime injects
+    /// session-scoped PATH shims and dispatch credentials into the provider.
+    #[serde(default)]
+    pub xcode_shim_injection_signal: bool,
+    /// P051 host execution policy bit. Treated as requiring shim credentials
+    /// and included in session reuse/fingerprint decisions by the engine.
+    #[serde(default)]
+    pub requires_xcode_host_execution: bool,
 }
 
 fn default_attempt_number() -> u32 {

@@ -18,16 +18,76 @@ use tokio::process::Command;
 
 use crate::session::AcpSessionHandle;
 use crate::transport::AcpSessionConfig;
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::{ExecutionRequest, ExecutionResult, XcodeShimGrantRecord, XcodeShimGrantStore};
 
 /// Process launch details prepared independently from `session/new` params.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AcpLaunchSpec {
     pub binary_path: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cleanup_paths: Vec<PathBuf>,
+    pub xcode_shim_runtime: Option<XcodeShimLaunchRuntime>,
     expected_capability_fingerprint: Option<CapabilitySliceFingerprint>,
+}
+
+impl std::fmt::Debug for AcpLaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpLaunchSpec")
+            .field("binary_path", &self.binary_path)
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .field("cleanup_paths", &self.cleanup_paths)
+            .field("xcode_shim_runtime", &self.xcode_shim_runtime)
+            .field(
+                "expected_capability_fingerprint",
+                &self.expected_capability_fingerprint,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct XcodeShimLaunchRuntime {
+    pub token_id: String,
+    pub token_secret: String,
+    pub lease_id: String,
+    pub socket_path: String,
+    pub shim_dir: String,
+    pub workspace_root: String,
+    pub agent_execution_id: Option<domain::ids::AgentExecutionId>,
+    pub store: std::sync::Arc<dyn XcodeShimGrantStore>,
+}
+
+impl std::fmt::Debug for XcodeShimLaunchRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XcodeShimLaunchRuntime")
+            .field("token_id", &self.token_id)
+            .field("lease_id", &self.lease_id)
+            .field("socket_path", &self.socket_path)
+            .field("shim_dir", &self.shim_dir)
+            .field("workspace_root", &self.workspace_root)
+            .field("agent_execution_id", &self.agent_execution_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub struct XcodeShimGrantCleanup {
+    token_id: String,
+    store: std::sync::Arc<dyn XcodeShimGrantStore>,
+}
+
+impl XcodeShimGrantCleanup {
+    pub fn set_active_prompt(&self, active_prompt: bool) {
+        let _ = self
+            .store
+            .set_xcode_shim_grant_active_prompt(&self.token_id, active_prompt);
+    }
+
+    pub fn remove(&self) {
+        let _ = self.store.remove_xcode_shim_grant(&self.token_id);
+    }
 }
 
 impl AcpLaunchSpec {
@@ -37,6 +97,7 @@ impl AcpLaunchSpec {
             args: Vec::new(),
             env: Vec::new(),
             cleanup_paths: Vec::new(),
+            xcode_shim_runtime: None,
             expected_capability_fingerprint: None,
         }
     }
@@ -88,6 +149,85 @@ impl AcpLaunchSpec {
             );
         }
         Ok(())
+    }
+
+    pub fn attach_xcode_shim_runtime(&mut self, runtime: XcodeShimLaunchRuntime) {
+        self.env.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "CHAINWORKS_XCODE_SHIM_TOKEN_ID"
+                    | "CHAINWORKS_XCODE_SHIM_TOKEN"
+                    | "CHAINWORKS_XCODE_SHIM_SOCKET"
+                    | "CHAINWORKS_XCODE_SHIM_AGENT_EXECUTION_ID"
+                    | "CHAINWORKS_XCODE_SHIM_WORKSPACE_ROOT"
+                    | "CHAINWORKS_XCODE_SHIM_DIR"
+            )
+        });
+        self.env.push((
+            "CHAINWORKS_XCODE_SHIM_TOKEN_ID".into(),
+            runtime.token_id.clone(),
+        ));
+        self.env.push((
+            "CHAINWORKS_XCODE_SHIM_TOKEN".into(),
+            runtime.token_secret.clone(),
+        ));
+        self.env.push((
+            "CHAINWORKS_XCODE_SHIM_SOCKET".into(),
+            runtime.socket_path.clone(),
+        ));
+        self.env.push((
+            "CHAINWORKS_XCODE_SHIM_WORKSPACE_ROOT".into(),
+            runtime.workspace_root.clone(),
+        ));
+        self.env
+            .push(("CHAINWORKS_XCODE_SHIM_DIR".into(), runtime.shim_dir.clone()));
+        if let Some(agent_execution_id) = runtime.agent_execution_id {
+            self.env.push((
+                "CHAINWORKS_XCODE_SHIM_AGENT_EXECUTION_ID".into(),
+                agent_execution_id.to_string(),
+            ));
+        }
+        prepend_path_env(&mut self.env, &runtime.shim_dir);
+        self.xcode_shim_runtime = Some(runtime);
+    }
+
+    pub fn register_xcode_shim_grant_for_child(
+        &self,
+        child: &tokio::process::Child,
+    ) -> Result<Option<XcodeShimGrantCleanup>> {
+        let Some(runtime) = &self.xcode_shim_runtime else {
+            return Ok(None);
+        };
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("p051_xcode_shim_provider_pid_unavailable"))?;
+        let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+        let grant = crate::XcodeShimDispatchGrant::new(
+            runtime.token_id.clone(),
+            &runtime.token_secret,
+            runtime.lease_id.clone(),
+            crate::XcodeShimProcessBinding {
+                pid,
+                #[cfg(unix)]
+                uid: crate::current_process_uid(),
+                #[cfg(not(unix))]
+                uid: 0,
+                parent_pid: None,
+                ancestor_pids: Vec::new(),
+                start_time_fingerprint: None,
+                executable_fingerprint: None,
+            },
+            now_epoch_ms,
+            now_epoch_ms + 6 * 60 * 60 * 1000,
+        );
+        runtime.store.insert_xcode_shim_grant(XcodeShimGrantRecord {
+            grant,
+            active_prompt: false,
+        });
+        Ok(Some(XcodeShimGrantCleanup {
+            token_id: runtime.token_id.clone(),
+            store: runtime.store.clone(),
+        }))
     }
 }
 
@@ -165,7 +305,7 @@ impl CapabilitySliceFingerprint {
     ) -> Self {
         let binary_fingerprint = BinaryFingerprint::from_binary_path(&launch_spec.binary_path);
         let ordered_launch_args_sha256 = sha256_json(&launch_spec.args);
-        let mut env = launch_spec.env.clone();
+        let mut env = capability_env(&launch_spec.env);
         env.sort();
         let capability_env_sha256 = sha256_json(&env);
         let adapter_settings_sha256 = adapter_settings_fingerprint
@@ -194,6 +334,54 @@ impl CapabilitySliceFingerprint {
 fn sha256_json<T: Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).expect("capability fingerprint value should serialize");
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn capability_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    let shim_dir = env
+        .iter()
+        .find(|(name, _)| name == "CHAINWORKS_XCODE_SHIM_DIR")
+        .map(|(_, value)| value.clone());
+    env.iter()
+        .filter_map(|(name, value)| {
+            if name.starts_with("CHAINWORKS_XCODE_SHIM_") {
+                return None;
+            }
+            if name == "PATH" {
+                let value = strip_path_prefix(value, shim_dir.as_deref());
+                return Some((name.clone(), value));
+            }
+            Some((name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+fn strip_path_prefix(path_value: &str, prefix: Option<&str>) -> String {
+    let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) else {
+        return path_value.to_string();
+    };
+    if path_value == prefix {
+        return String::new();
+    }
+    path_value
+        .strip_prefix(&format!("{prefix}:"))
+        .unwrap_or(path_value)
+        .to_string()
+}
+
+fn prepend_path_env(env: &mut Vec<(String, String)>, prefix: &str) {
+    let current = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    env.retain(|(name, _)| name != "PATH");
+    let next = if current.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}:{current}")
+    };
+    env.push(("PATH".to_string(), next));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -547,13 +735,23 @@ pub trait AcpAdapter: Send + Sync {
                 return Err(err).with_context(|| spawn_context);
             }
         };
+        let xcode_shim_grant = match launch_spec.register_xcode_shim_grant_for_child(&child) {
+            Ok(grant) => grant,
+            Err(err) => {
+                for path in launch_spec.cleanup_paths.drain(..) {
+                    cleanup_path(&path);
+                }
+                return Err(err);
+            }
+        };
 
         let config = session_new_spec.as_config();
-        let session = crate::session::AcpSession::start_with_cleanup_paths(
+        let session = crate::session::AcpSession::start_with_cleanup_paths_and_xcode_shim_grants(
             child,
             req,
             &config,
             launch_spec.cleanup_paths,
+            xcode_shim_grant.into_iter().collect(),
         )
         .await?;
         Ok(AcpSessionHandle::new(session))

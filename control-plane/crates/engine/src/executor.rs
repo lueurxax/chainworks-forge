@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::release::{
     connect::ConnectPublishService,
@@ -22,7 +23,7 @@ use db::repos::{
     agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, legacy_discovery_overrides,
     projections, scheduler, sessions, stages, validation, work_items,
 };
-use db::work_item::{WorkItem, WorkItemKind};
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{
     AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
     OperatorActionHint,
@@ -96,6 +97,19 @@ pub struct InvokeAgentCapacityConfig {
     pub max_active_total: usize,
     pub max_active_per_run: usize,
     pub provider_caps: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug)]
+struct DeclaredContractImportResult {
+    validation_summary: Option<TaskValidationSummary>,
+    final_agent_status: AgentStatus,
+    degraded_outputs_satisfy_stage: bool,
+}
+
+#[derive(Debug)]
+enum PreparedDeclaredContractImport {
+    RunStateAdvisory(ActiveArtifactGenerationInput),
+    ContractGeneration(ActiveArtifactGenerationInput),
 }
 
 impl InvokeAgentCapacityConfig {
@@ -533,7 +547,6 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 stage_execution_id: None,
                 stage_id: format!("steward_{}", agent.id),
                 attempt_number: 1,
-                agent_execution_id: None,
                 agent_id: agent.id.clone(),
                 provider,
                 model: profile.model.clone(),
@@ -561,6 +574,8 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 ),
                 legacy_broad_discovery_policy:
                     domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+                xcode_shim_injection_signal: false,
+                requires_xcode_host_execution: false,
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -1711,6 +1726,40 @@ fn declared_machine_artifact_name<'a>(declared: &'a DeclaredOutput) -> &'a str {
         .unwrap_or(declared.output_name.as_str())
 }
 
+fn extract_contract_status_from_file(contract_id: &str, path: &str) -> Result<Option<String>> {
+    let bytes = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if contract_id == IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID {
+        let summary = parse_implementation_self_assessment_v2(
+            &value,
+            ContractParseContext {
+                declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+                canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+                raw_artifact_path: Some(path.to_string()),
+                ..ContractParseContext::default()
+            },
+        );
+        return Ok(Some(summary.status.to_string()));
+    }
+    let field_name = if contract_id == "audit_report_v1" {
+        "implementation_status"
+    } else {
+        "status"
+    };
+    Ok(value
+        .get(field_name)
+        .or_else(|| value.get("status"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string))
+}
+
+fn raw_status_from_artifact_path(path: &str) -> String {
+    extract_contract_status_from_file("", path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn infer_artifact_format_from_content(content: &[u8]) -> (ArtifactFormat, &'static str) {
     if serde_json::from_slice::<serde_json::Value>(content).is_ok() {
         (ArtifactFormat::Json, "json")
@@ -2158,8 +2207,13 @@ impl BackgroundExecutor {
                 let requires_xcode_host_execution = payload["requires_xcode_host_execution"]
                     .as_bool()
                     .unwrap_or(false);
+                let xcode_shim_required =
+                    xcode_shim_injection_signal || requires_xcode_host_execution;
                 let declared_outputs: Vec<DeclaredOutput> =
                     serde_json::from_value(payload["declared_outputs"].clone()).unwrap_or_default();
+                let stage_degraded_output_policy: workflow::plan::DegradedOutputPolicy =
+                    serde_json::from_value(payload["stage_degraded_output_policy"].clone())
+                        .unwrap_or_default();
                 let expected_output_paths: Vec<String> = declared_outputs
                     .iter()
                     .flat_map(|declared| {
@@ -2256,12 +2310,15 @@ impl BackgroundExecutor {
                     }),
                 };
 
-                let mut policy_decision: Option<SessionPolicyDecision> =
-                    if preclaimed_start.is_none() && session_reuse_scope.is_some() {
-                        Some(ensure_policy(&self.pool, policy_input.clone()).await?)
-                    } else {
-                        None
-                    };
+                let mut policy_decision: Option<SessionPolicyDecision> = if preclaimed_start
+                    .is_none()
+                    && session_reuse_scope.is_some()
+                    && !xcode_shim_required
+                {
+                    Some(ensure_policy(&self.pool, policy_input.clone()).await?)
+                } else {
+                    None
+                };
                 if let Some(decision) = policy_decision.as_ref() {
                     if decision.should_reuse_live_session
                         && !self
@@ -2555,7 +2612,6 @@ impl BackgroundExecutor {
                     stage_execution_id: Some(stage_execution_id.to_string()),
                     stage_id: stage_id.clone(),
                     attempt_number: u32::try_from(stage_attempt_number).unwrap_or(1),
-                    agent_execution_id: Some(agent_exec_id.to_string()),
                     agent_id: agent_id.clone(),
                     provider: provider.clone(),
                     model: model.clone(),
@@ -2567,11 +2623,12 @@ impl BackgroundExecutor {
                     worktree_strategy,
                     expected_output_paths,
                     expected_outputs: expected_outputs.clone(),
-                    keep_session_alive: policy_decision.is_some(),
+                    keep_session_alive: policy_decision.is_some() && !xcode_shim_required,
                     reuse_existing_session: policy_decision
                         .as_ref()
                         .map(|decision| decision.should_reuse_live_session)
-                        .unwrap_or(false),
+                        .unwrap_or(false)
+                        && !xcode_shim_required,
                     session_generation_id: policy_decision
                         .as_ref()
                         .map(|decision| decision.generation.id.clone()),
@@ -2580,7 +2637,9 @@ impl BackgroundExecutor {
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
                     mcp_servers: mcp_resolution.payloads,
                     chainworks_meta_root: run.chainworks_meta_root.clone(),
-                    legacy_broad_discovery_policy,
+                    legacy_broad_discovery_policy: legacy_broad_discovery_policy.clone(),
+                    xcode_shim_injection_signal,
+                    requires_xcode_host_execution,
                 };
                 // Runtime event: session starting
                 let _ = self
@@ -2779,18 +2838,34 @@ impl BackgroundExecutor {
 
                 let completed_at = chrono::Utc::now();
                 let mut persisted_paths = std::collections::HashSet::new();
-                let mut persisted_artifacts = self
-                    .persist_declared_output_artifacts(
-                        &declared_outputs,
+                let mut persisted_artifacts = Vec::new();
+                let artifact_claim_key = preclaimed_start
+                    .as_ref()
+                    .map(|claimed| claimed.artifact_claim_key.clone())
+                    .unwrap_or_else(|| ArtifactSourceGenerationClaimKey {
                         run_id,
-                        &stage_id,
                         stage_execution_id,
-                        agent_exec_id,
+                        agent_execution_id: agent_exec_id,
+                        source_work_item_id: item.id.clone(),
+                    });
+                let source_session_generation_id = preclaimed_start
+                    .as_ref()
+                    .map(|claimed| claimed.session_generation_id.as_str())
+                    .or_else(|| {
+                        policy_decision
+                            .as_ref()
+                            .map(|decision| decision.generation.id.as_str())
+                    });
+                let transcript_artifact = self
+                    .persist_transcript_artifact_if_present(
+                        &run,
+                        &stage_id,
                         &agent_id,
                         &provider,
                         model.clone(),
+                        agent_exec_id,
                         completed_at,
-                        &mut persisted_paths,
+                        result.transcript_text.as_deref(),
                     )
                     .await?;
                 let transcript_exists = transcript_artifact.is_some();
@@ -2898,10 +2973,9 @@ impl BackgroundExecutor {
                             acp_exact_output_aggregate_bytes: settlement.accepted_aggregate_bytes,
                             acp_exact_output_aggregate_cap_hit: settlement.aggregate_cap_hit,
                             acp_legacy_broad_discovery_policy: legacy_broad_discovery_policy_name(
-                                req.legacy_broad_discovery_policy,
+                                legacy_broad_discovery_policy.clone(),
                             ),
-                            acp_legacy_broad_discovery_used: req
-                                .legacy_broad_discovery_policy
+                            acp_legacy_broad_discovery_used: legacy_broad_discovery_policy
                                 .allows_broad_discovery(),
                             acp_discovery_override_status: discovery_override_status.clone(),
                             acp_legacy_broad_discovery_truncation_reason:
@@ -2926,7 +3000,7 @@ impl BackgroundExecutor {
                         agent_exec_id,
                         &item.id,
                         &artifact_claim_key,
-                        agent_exec.session_generation_id.as_deref(),
+                        source_session_generation_id,
                         result.status.clone(),
                         observed_failure_kind_for_execution_result(
                             &result.status,
@@ -3534,14 +3608,12 @@ impl BackgroundExecutor {
             .map_err(|e| anyhow::anyhow!("Invalid delivery_configuration_json: {}", e))
     }
 
-    async fn persist_declared_output_artifacts(
+    fn prepare_declared_output_artifacts(
         &self,
         declared_outputs: &[DeclaredOutput],
         discovery_decisions: Option<&[OutputDiscoveryDecision]>,
         run_id: RunId,
         stage_id: &str,
-        stage_execution_id: domain::ids::StageExecutionId,
-        agent_exec_id: domain::ids::AgentExecutionId,
         agent_id: &str,
         provider: &str,
         model: Option<String>,
@@ -3923,6 +3995,74 @@ impl BackgroundExecutor {
         Ok(artifacts_out)
     }
 
+    async fn persist_transcript_artifact_if_present(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        created_at: chrono::DateTime<chrono::Utc>,
+        transcript_text: Option<&str>,
+    ) -> Result<Option<domain::artifact::Artifact>> {
+        if std::env::var("CHAINWORKS_PERSIST_ACP_TRANSCRIPTS")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Ok(None);
+        }
+        let Some(transcript_text) = transcript_text.filter(|text| !text.trim().is_empty()) else {
+            return Ok(None);
+        };
+        if transcript_text.contains("\"CHAINWORKS_OUTPUT\"")
+            || transcript_text.contains("<<<CHAINWORKS_OUTPUT")
+        {
+            return Ok(None);
+        }
+
+        let artifact_id = domain::ids::ArtifactId::new();
+        let path = std::path::Path::new(&run.artifact_root)
+            .join("session_transcripts")
+            .join(stage_id)
+            .join(format!("{agent_id}-{agent_execution_id}.md"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("create transcript artifact dir {}: {}", parent.display(), e)
+            })?;
+        }
+        std::fs::write(&path, transcript_text)
+            .map_err(|e| anyhow::anyhow!("write transcript artifact {}: {}", path.display(), e))?;
+
+        let artifact = domain::artifact::Artifact {
+            id: artifact_id,
+            run_id: run.id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: format!("{agent_id}_transcript"),
+            contract_id: "acp_transcript_v1".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: path.to_string_lossy().into_owned(),
+            checksum_sha256: None,
+            size_bytes: Some(path.metadata().map(|meta| meta.len() as i64).unwrap_or(0)),
+            provider: provider.to_string(),
+            model,
+            created_at,
+            is_pinned: false,
+            report_kind: Some("agent_transcript".to_string()),
+            report_version: Some(1),
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
+        Ok(Some(artifact))
+    }
+
     async fn persist_generic_artifact(
         &self,
         path: &str,
@@ -4035,6 +4175,46 @@ impl BackgroundExecutor {
                 run_id,
                 artifact_id: artifact.id,
             });
+        Ok(Some(artifact))
+    }
+
+    fn prepare_artifact_if_present(
+        &self,
+        path: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        name: &str,
+        contract_id: &str,
+        format: ArtifactFormat,
+        provider: &str,
+        model: Option<String>,
+        report_kind: Option<&str>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<domain::artifact::Artifact>> {
+        let artifact_path = std::path::Path::new(path);
+        if !artifact_path.is_file() {
+            return Ok(None);
+        }
+        let size_bytes = artifact_path.metadata().ok().map(|meta| meta.len() as i64);
+        let artifact = domain::artifact::Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            contract_id: contract_id.to_string(),
+            format,
+            file_path: path.to_string(),
+            checksum_sha256: None,
+            size_bytes,
+            provider: provider.to_string(),
+            model,
+            created_at,
+            is_pinned: false,
+            report_kind: report_kind.map(str::to_string),
+            report_version: None,
+        };
         Ok(Some(artifact))
     }
 

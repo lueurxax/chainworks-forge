@@ -35,10 +35,18 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{error, info, warn};
 
-use acp::{AcpRuntimeManager, XcodeMcpBridgePool, XcodeMcpBridgePoolConfig};
+use acp::{
+    AcpRuntimeManager, DefaultXcodeShimProcessInspector, XcodeHostExecutorProcessConfig,
+    XcodeMcpBridgePool, XcodeMcpBridgePoolConfig,
+};
 use daemon::failed_serve;
 use daemon::packaging::{self, DaemonMode, ModePaths};
 use daemon::supervisor::{self, CrashBudgetDecision, PidLockOutcome};
+#[cfg(unix)]
+use daemon::xcode_shim_socket::{
+    bind_xcode_shim_listener, ensure_xcode_shim_dir, spawn_xcode_shim_socket_service,
+    XcodeShimGrantRegistry,
+};
 use db::migrate::{self, MigrationError, MigrationOutcome};
 use domain::lifecycle::{
     DaemonLifecycleState, FailureKind, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
@@ -328,6 +336,31 @@ async fn main() -> Result<()> {
                 xcode_broker_pool.health_snapshot().await,
             ));
             spawn_xcode_broker_health_publisher(reporter.clone(), xcode_broker_pool.clone());
+
+            #[cfg(unix)]
+            let _xcode_shim_socket_handle = {
+                let shim_registry = Arc::new(XcodeShimGrantRegistry::default());
+                let shim_socket_path = XcodeShimGrantRegistry::socket_path(&paths.app_support_dir);
+                let shim_dir = ensure_xcode_shim_dir(&paths.app_support_dir)?;
+                let listener = bind_xcode_shim_listener(&shim_socket_path)?;
+                acp.set_xcode_shim_runtime(
+                    shim_registry.clone(),
+                    shim_socket_path.to_string_lossy().into_owned(),
+                    shim_dir.to_string_lossy().into_owned(),
+                );
+                info!(
+                    socket_path = %shim_socket_path.display(),
+                    shim_dir = %shim_dir.display(),
+                    "Xcode shim dispatch socket bound"
+                );
+                spawn_xcode_shim_socket_service(
+                    listener,
+                    shim_registry,
+                    Arc::new(XcodeHostExecutorProcessConfig::default()),
+                    acp.xcode_runtime_observation_sink(),
+                    Arc::new(DefaultXcodeShimProcessInspector),
+                )
+            };
 
             let _executor_handle = executor.start();
             info!("BackgroundExecutor started");

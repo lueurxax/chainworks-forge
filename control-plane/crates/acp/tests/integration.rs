@@ -266,6 +266,75 @@ if close_msg and close_msg.get("method") == "session/close":
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server that enters `session/prompt` and waits for
+    /// `session/close` instead of sending a terminal prompt response.
+    pub fn create_close_during_prompt_script(
+        tmpdir: &std::path::Path,
+        prompt_marker_path: &std::path::Path,
+        close_marker_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_close_during_prompt.py");
+        let prompt_marker = prompt_marker_path.to_string_lossy();
+        let close_marker = close_marker_path.to_string_lossy();
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json
+
+PROMPT_MARKER = {prompt_marker:?}
+CLOSE_MARKER = {close_marker:?}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-close-during-prompt"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+with open(PROMPT_MARKER, "w") as f:
+    f.write("prompt-started\n")
+
+while True:
+    close_msg = recv()
+    if close_msg is None:
+        break
+    if close_msg.get("method") == "session/close":
+        with open(CLOSE_MARKER, "w") as f:
+            f.write("close-seen\n")
+        break
+
+sys.exit(0)
+"#
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that overwrites a pre-existing
     /// canonical output file instead of creating a brand-new one.
     pub fn create_overwrite_script(tmpdir: &std::path::Path) -> String {
@@ -861,9 +930,11 @@ sys.exit(0)
 #[cfg(unix)]
 fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::ExecutionRequest {
     acp::ExecutionRequest {
-        agent_execution_id: None,
         run_id: domain::ids::RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_xcode".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "xcode-agent".into(),
         provider: provider.into(),
         model: None,
@@ -874,6 +945,7 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
@@ -896,6 +968,9 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
             },
         }],
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     }
 }
 
@@ -915,7 +990,6 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
 
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_test".into(),
@@ -940,6 +1014,8 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1006,6 +1082,8 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1057,6 +1135,8 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1113,6 +1193,8 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1143,7 +1225,6 @@ async fn mcp_servers_session_new_serialization_tests() {
 
     let tmp = tempfile::tempdir().unwrap();
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_test".into(),
@@ -1177,6 +1258,8 @@ async fn mcp_servers_session_new_serialization_tests() {
         }],
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1201,9 +1284,11 @@ async fn http_mcp_servers_session_new_serialization_tests() {
 
     let tmp = tempfile::tempdir().unwrap();
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "codex".into(),
         model: None,
@@ -1214,6 +1299,7 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
@@ -1229,6 +1315,9 @@ async fn http_mcp_servers_session_new_serialization_tests() {
             },
         }],
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1252,9 +1341,11 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
 
     let tmp = tempfile::tempdir().unwrap();
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "codex".into(),
         model: Some("gpt-5.4/high".into()),
@@ -1265,12 +1356,16 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -1328,9 +1423,11 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let missing_binary = tmp.path().join("missing-codex-acp");
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
+        stage_execution_id: None,
         stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
         agent_id: "test-agent".into(),
         provider: "codex".into(),
         model: Some("gpt-5.4".into()),
@@ -1341,12 +1438,16 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         worktree_write_enabled: false,
         worktree_strategy: None,
         expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
         keep_session_alive: false,
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -3191,7 +3292,6 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
 
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_fail".into(),
@@ -3215,6 +3315,8 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3244,7 +3346,6 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
 
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_prompt_transport_error".into(),
@@ -3268,6 +3369,8 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let error = adapter
@@ -3319,7 +3422,6 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
     let adapter = GeminiCliAdapter::new_with_binary(wrapper.to_str().unwrap());
 
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "gemini_stage".into(),
@@ -3343,6 +3445,8 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3368,7 +3472,6 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
     let script = fixture::create_overwrite_script(tmp.path());
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_overwrite".into(),
@@ -3392,6 +3495,8 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3445,6 +3550,8 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3480,12 +3587,13 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
     let workspace_root = tmp.path().to_string_lossy().into_owned();
     let typed_path_string = typed_path.to_string_lossy().into_owned();
     let stale_legacy_path_string = stale_legacy_path.to_string_lossy().into_owned();
+    let agent_execution_id = domain::ids::AgentExecutionId::new();
     let req = ExecutionRequest {
         run_id: RunId::new(),
         stage_execution_id: Some("stage-exec-typed".into()),
         stage_id: "stage_typed_expected_outputs".into(),
         attempt_number: 2,
-        agent_execution_id: Some("agent-exec-typed".into()),
+        agent_execution_id: Some(agent_execution_id),
         agent_id: "test-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -3520,6 +3628,8 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3595,6 +3705,8 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3630,7 +3742,6 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
     let script = fixture::create_envelope_only_script(tmp.path());
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_envelope".into(),
@@ -3654,6 +3765,8 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3685,7 +3798,6 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
     let script = fixture::create_json_object_envelope_script(tmp.path());
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_json_envelope".into(),
@@ -3709,6 +3821,8 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3755,7 +3869,6 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         AcpRuntimeManager::new_with_adapters(vec![Arc::new(adapter) as Arc<dyn AcpAdapter>]);
 
     let first_req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_first".into(),
@@ -3779,6 +3892,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -3796,7 +3911,6 @@ async fn test_runtime_manager_reuses_live_session_handle() {
     );
 
     let second_req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_second".into(),
@@ -3820,6 +3934,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -3883,6 +3999,8 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: Default::default(),
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let execution = {
@@ -3936,7 +4054,6 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         AcpRuntimeManager::new_with_adapters(vec![Arc::new(adapter) as Arc<dyn AcpAdapter>]);
 
     let first_req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_first".into(),
@@ -3960,6 +4077,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -3978,7 +4097,6 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
     );
 
     let reuse_req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_second".into(),
@@ -4002,6 +4120,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -4027,7 +4147,6 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
     let adapter = ClaudeAgentAdapter::new_with_binary(script);
 
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "stage_usage".into(),
@@ -4051,6 +4170,8 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4122,7 +4243,6 @@ sys.exit(0)
 
     let adapter = ClaudeAgentAdapter::new_with_binary(script.to_str().unwrap());
     let req = ExecutionRequest {
-        agent_execution_id: None,
         run_id: RunId::new(),
         stage_execution_id: None,
         stage_id: "env_probe".into(),
@@ -4146,6 +4266,8 @@ sys.exit(0)
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/env-test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
 
     let _ = adapter.execute(req).await;

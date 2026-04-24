@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
+use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{XcodeRuntimeObservation, XcodeRuntimeObservationUpdate};
 
 const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
@@ -16,10 +17,27 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 actual_xcode_runtime_observation_json,
                 mcp_session_startup_latency_ms"#;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunningAgentExecution {
+    pub id: AgentExecutionId,
+    pub run_id: RunId,
+    pub stage_id: String,
+    pub stage_execution_id: StageExecutionId,
+    pub provider_family: Option<String>,
+    pub session_generation_id: Option<String>,
+}
+
 pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_tx(&mut tx, exec).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) -> Result<()> {
     sqlx::query(
         "INSERT INTO agent_executions
-         (id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
+         (id, stage_execution_id, agent_id, provider, provider_family, model, status, started_at, completed_at,
           owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
           invocation_owner_key, session_reuse_scope, session_family_id,
           session_reuse_disposition, session_reset_reason,
@@ -28,12 +46,13 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
           denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
           actual_xcode_runtime_observation_json,
           mcp_session_startup_latency_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
     .bind(exec.stage_execution_id.to_string())
     .bind(&exec.agent_id)
     .bind(&exec.provider)
+    .bind(ProviderFamily::canonicalize_known_alias(&exec.provider))
     .bind(&exec.model)
     .bind(exec.status.to_string())
     .bind(exec.started_at.to_rfc3339())
@@ -58,7 +77,7 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
     .bind(&exec.actual_mcp_observation_json)
     .bind(&exec.actual_xcode_runtime_observation_json)
     .bind(exec.mcp_session_startup_latency_ms)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -79,11 +98,23 @@ pub async fn update_completed(
     status: AgentStatus,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    update_completed_tx(&mut tx, id, status, completed_at).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn update_completed_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: AgentExecutionId,
+    status: AgentStatus,
+    completed_at: DateTime<Utc>,
+) -> Result<()> {
     sqlx::query("UPDATE agent_executions SET status = ?, completed_at = ? WHERE id = ?")
         .bind(status.to_string())
         .bind(completed_at.to_rfc3339())
         .bind(id.to_string())
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }
@@ -241,6 +272,21 @@ pub async fn find_by_stage(
     rows.iter().map(parse_agent_execution_row).collect()
 }
 
+pub async fn find_by_stage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    stage_execution_id: StageExecutionId,
+) -> Result<Vec<AgentExecution>> {
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM agent_executions WHERE stage_execution_id = ? ORDER BY started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(stage_execution_id.to_string())
+        .fetch_all(&mut **tx)
+        .await?;
+
+    rows.iter().map(parse_agent_execution_row).collect()
+}
+
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentExecution>> {
     let prefixed_select_cols = SELECT_COLS
         .split(',')
@@ -257,6 +303,30 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentEx
     let rows = sqlx::query(&query)
         .bind(run_id.to_string())
         .fetch_all(pool)
+        .await?;
+
+    rows.iter().map(parse_agent_execution_row).collect()
+}
+
+pub async fn list_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<Vec<AgentExecution>> {
+    let prefixed_select_cols = SELECT_COLS
+        .split(',')
+        .map(|col| format!("ae.{}", col.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {prefixed_select_cols}
+         FROM agent_executions ae
+         INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+         WHERE se.run_id = ?
+         ORDER BY ae.started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(run_id.to_string())
+        .fetch_all(&mut **tx)
         .await?;
 
     rows.iter().map(parse_agent_execution_row).collect()
@@ -281,6 +351,108 @@ pub async fn cancel_running_by_run(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn cancel_running_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    completed_at: DateTime<Utc>,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE agent_executions
+         SET status = ?, completed_at = ?
+         WHERE status = ? AND stage_execution_id IN (
+             SELECT id FROM stage_executions WHERE run_id = ?
+         )",
+    )
+    .bind(AgentStatus::Cancelled.to_string())
+    .bind(completed_at.to_rfc3339())
+    .bind(AgentStatus::Running.to_string())
+    .bind(run_id.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn cancel_running_by_stage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    stage_execution_id: StageExecutionId,
+    completed_at: DateTime<Utc>,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE agent_executions
+         SET status = ?, completed_at = ?
+         WHERE status = ? AND stage_execution_id = ?",
+    )
+    .bind(AgentStatus::Cancelled.to_string())
+    .bind(completed_at.to_rfc3339())
+    .bind(AgentStatus::Running.to_string())
+    .bind(stage_execution_id.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn list_running_across_interval(
+    pool: &SqlitePool,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Result<Vec<RunningAgentExecution>> {
+    let mut tx = pool.begin().await?;
+    let executions = list_running_across_interval_tx(&mut tx, started_at, ended_at).await?;
+    tx.commit().await?;
+    Ok(executions)
+}
+
+pub async fn list_running_across_interval_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Result<Vec<RunningAgentExecution>> {
+    let rows = sqlx::query(
+        r#"SELECT ae.id AS id,
+                  se.run_id AS run_id,
+                  se.stage_id AS stage_id,
+                  ae.stage_execution_id AS stage_execution_id,
+                  COALESCE(ae.provider_family, ae.provider) AS provider_family,
+                  ae.session_generation_id AS session_generation_id
+           FROM agent_executions ae
+           INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+           WHERE ae.status = ?1
+             AND ae.started_at <= ?2
+             AND (ae.completed_at IS NULL OR ae.completed_at >= ?3)
+           ORDER BY ae.started_at ASC, ae.id ASC"#,
+    )
+    .bind(AgentStatus::Running.to_string())
+    .bind(ended_at.to_rfc3339())
+    .bind(started_at.to_rfc3339())
+    .fetch_all(&mut **tx)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| parse_running_agent_execution_row(&row))
+        .collect()
+}
+
+fn parse_running_agent_execution_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<RunningAgentExecution> {
+    let id: String = row.get("id");
+    let run_id: String = row.get("run_id");
+    let stage_execution_id: String = row.get("stage_execution_id");
+    let raw_provider_family: Option<String> = row.get("provider_family");
+    Ok(RunningAgentExecution {
+        id: id.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
+        run_id: run_id.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
+        stage_id: row.get("stage_id"),
+        stage_execution_id: stage_execution_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{}", e))?,
+        provider_family: raw_provider_family
+            .as_deref()
+            .and_then(ProviderFamily::canonicalize_known_alias),
+        session_generation_id: row.get("session_generation_id"),
+    })
 }
 
 fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecution> {

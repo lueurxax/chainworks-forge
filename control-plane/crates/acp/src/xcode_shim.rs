@@ -40,6 +40,8 @@ pub struct XcodeShimProcessBinding {
     #[serde(default)]
     pub parent_pid: Option<u32>,
     #[serde(default)]
+    pub ancestor_pids: Vec<u32>,
+    #[serde(default)]
     pub start_time_fingerprint: Option<String>,
     #[serde(default)]
     pub executable_fingerprint: Option<String>,
@@ -61,6 +63,12 @@ pub trait XcodeShimProcessInspector: Send + Sync {
 }
 
 #[cfg(unix)]
+#[async_trait::async_trait]
+pub trait XcodeShimGrantResolver: Send + Sync {
+    async fn resolve_grant(&self, token_id: &str) -> anyhow::Result<XcodeShimResolvedDispatch>;
+}
+
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultXcodeShimProcessInspector;
 
@@ -70,14 +78,24 @@ impl XcodeShimProcessInspector for DefaultXcodeShimProcessInspector {
         &self,
         credentials: XcodeShimPeerCredentials,
     ) -> anyhow::Result<XcodeShimProcessBinding> {
+        let parent_pid = lookup_parent_pid(credentials.pid)?;
+        let ancestor_pids = process_ancestor_pids(credentials.pid)?;
         Ok(XcodeShimProcessBinding {
             pid: credentials.pid,
             uid: credentials.uid,
-            parent_pid: None,
+            parent_pid,
+            ancestor_pids,
             start_time_fingerprint: None,
             executable_fingerprint: None,
         })
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct XcodeShimResolvedDispatch {
+    pub grant: XcodeShimDispatchGrant,
+    pub active_prompt: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +108,18 @@ pub struct XcodeShimDispatchGrant {
     pub expires_at_epoch_ms: i64,
     #[serde(default = "default_active_prompt_required")]
     pub active_prompt_required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XcodeShimGrantRecord {
+    pub grant: XcodeShimDispatchGrant,
+    pub active_prompt: bool,
+}
+
+pub trait XcodeShimGrantStore: Send + Sync {
+    fn insert_xcode_shim_grant(&self, record: XcodeShimGrantRecord);
+    fn set_xcode_shim_grant_active_prompt(&self, token_id: &str, active_prompt: bool) -> bool;
+    fn remove_xcode_shim_grant(&self, token_id: &str) -> Option<XcodeShimGrantRecord>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,21 +324,23 @@ impl XcodeShimDispatchGrant {
         if self.provider_process.uid != attempt.peer_process.uid {
             return reject("p051_shim_peer_uid_mismatch");
         }
-        if self.provider_process.pid != attempt.peer_process.pid {
+        if !self.peer_process_matches_bound_provider(&attempt.peer_process) {
             return reject("p051_shim_peer_pid_mismatch");
         }
-        if self.provider_process.parent_pid != attempt.peer_process.parent_pid {
-            return reject("p051_shim_process_tree_mismatch");
-        }
-        if self.provider_process.start_time_fingerprint
-            != attempt.peer_process.start_time_fingerprint
-        {
-            return reject("p051_shim_process_start_mismatch");
-        }
-        if self.provider_process.executable_fingerprint
-            != attempt.peer_process.executable_fingerprint
-        {
-            return reject("p051_shim_process_fingerprint_mismatch");
+        if self.provider_process.pid == attempt.peer_process.pid {
+            if self.provider_process.parent_pid != attempt.peer_process.parent_pid {
+                return reject("p051_shim_process_tree_mismatch");
+            }
+            if self.provider_process.start_time_fingerprint
+                != attempt.peer_process.start_time_fingerprint
+            {
+                return reject("p051_shim_process_start_mismatch");
+            }
+            if self.provider_process.executable_fingerprint
+                != attempt.peer_process.executable_fingerprint
+            {
+                return reject("p051_shim_process_fingerprint_mismatch");
+            }
         }
 
         XcodeShimDispatchAuthorization {
@@ -316,6 +348,60 @@ impl XcodeShimDispatchGrant {
             reason_code: None,
         }
     }
+
+    fn peer_process_matches_bound_provider(&self, peer_process: &XcodeShimProcessBinding) -> bool {
+        self.provider_process.pid == peer_process.pid
+            || peer_process.parent_pid == Some(self.provider_process.pid)
+            || peer_process
+                .ancestor_pids
+                .iter()
+                .any(|ancestor_pid| *ancestor_pid == self.provider_process.pid)
+    }
+}
+
+#[cfg(unix)]
+pub fn current_process_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(unix)]
+fn process_ancestor_pids(pid: u32) -> anyhow::Result<Vec<u32>> {
+    let mut ancestors = Vec::new();
+    let mut current = pid;
+    for _ in 0..16 {
+        let Some(parent) = lookup_parent_pid(current)? else {
+            break;
+        };
+        if parent == 0 || parent == current || ancestors.contains(&parent) {
+            break;
+        }
+        ancestors.push(parent);
+        if parent == 1 {
+            break;
+        }
+        current = parent;
+    }
+    Ok(ancestors)
+}
+
+#[cfg(unix)]
+fn lookup_parent_pid(pid: u32) -> anyhow::Result<Option<u32>> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .context("xcode_shim_parent_pid_lookup_failed")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parent_pid = trimmed
+        .parse::<u32>()
+        .context("xcode_shim_parent_pid_parse_failed")?;
+    Ok(Some(parent_pid))
 }
 
 impl XcodeShimCommandPolicy {
@@ -639,6 +725,43 @@ pub async fn handle_xcode_shim_unix_stream_with_peer_credentials(
 }
 
 #[cfg(unix)]
+pub async fn handle_xcode_shim_unix_stream_with_grant_resolver(
+    stream: UnixStream,
+    config: &XcodeHostExecutorProcessConfig,
+    observation_sink: &dyn crate::XcodeRuntimeObservationSink,
+    process_inspector: &dyn XcodeShimProcessInspector,
+    grant_resolver: &dyn XcodeShimGrantResolver,
+) -> anyhow::Result<XcodeShimDispatchOutcome> {
+    let credentials = xcode_shim_peer_credentials(&stream)?;
+    let peer_process = process_inspector.inspect_peer(credentials)?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line).await?;
+    if bytes == 0 {
+        anyhow::bail!("xcode_shim_socket_empty_request");
+    }
+
+    let mut request: XcodeShimSocketDispatchRequest = serde_json::from_str(&line)?;
+    let resolved = grant_resolver.resolve_grant(&request.token_id).await?;
+    request.active_prompt = resolved.active_prompt;
+    let outcome = dispatch_xcode_shim_socket_request(
+        request,
+        resolved.grant,
+        peer_process,
+        config,
+        observation_sink,
+    )
+    .await;
+    let response_outcome = outcome.redacted_for_socket_response();
+    writer
+        .write_all(&serde_json::to_vec(&response_outcome)?)
+        .await?;
+    writer.write_all(b"\n").await?;
+    Ok(response_outcome)
+}
+
+#[cfg(unix)]
 pub fn xcode_shim_peer_credentials(
     stream: &UnixStream,
 ) -> anyhow::Result<XcodeShimPeerCredentials> {
@@ -729,7 +852,7 @@ async fn record_shim_invocation(
         derived_peer_pid: attempt.peer_process.pid as i64,
         derived_peer_uid: attempt.peer_process.uid as i64,
         claimed_provider_pid: grant.provider_process.pid as i64,
-        peer_pid_mismatch: grant.provider_process.pid != attempt.peer_process.pid,
+        peer_pid_mismatch: !grant.peer_process_matches_bound_provider(&attempt.peer_process),
         exit_status,
     };
     let _ = observation_sink
@@ -1206,6 +1329,7 @@ mod tests {
             pid: 42,
             uid: 501,
             parent_pid: Some(7),
+            ancestor_pids: Vec::new(),
             start_time_fingerprint: Some("started-at-123".to_string()),
             executable_fingerprint: Some("provider-sha256".to_string()),
         }
@@ -1282,6 +1406,21 @@ mod tests {
         ) -> anyhow::Result<XcodeShimProcessBinding> {
             assert_eq!(credentials, self.expected_credentials);
             Ok(self.peer_process.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    struct StaticGrantResolver {
+        expected_token_id: String,
+        resolved: XcodeShimResolvedDispatch,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl XcodeShimGrantResolver for StaticGrantResolver {
+        async fn resolve_grant(&self, token_id: &str) -> anyhow::Result<XcodeShimResolvedDispatch> {
+            assert_eq!(token_id, self.expected_token_id);
+            Ok(self.resolved.clone())
         }
     }
 
@@ -1757,6 +1896,7 @@ mod tests {
                 pid: credentials.pid,
                 uid: credentials.uid,
                 parent_pid: Some(77),
+                ancestor_pids: Vec::new(),
                 start_time_fingerprint: Some("live-start".to_string()),
                 executable_fingerprint: Some("live-executable".to_string()),
             };
@@ -1841,6 +1981,173 @@ mod tests {
             }
             other => panic!("expected shim invocation event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn socket_dispatch_with_grant_resolver_overrides_client_active_prompt() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut input = host_input();
+        input.cwd = ".".to_string();
+        input.workspace_root = workspace.path().to_string_lossy().into_owned();
+        input.args = args(&["-c", "printf resolver-stdout; exit 6"]);
+        let request = XcodeShimSocketDispatchRequest {
+            agent_execution_id: Some(AgentExecutionId::new()),
+            token_id: "token-live".to_string(),
+            token_secret: "secret-live".to_string(),
+            now_epoch_ms: 1_500,
+            active_prompt: false,
+            plan_input: input,
+        };
+        let sink = Arc::new(CapturingObservationSink::default());
+
+        #[cfg(unix)]
+        {
+            let (client, server) = UnixStream::pair().expect("unix stream pair");
+            let credentials = xcode_shim_peer_credentials(&server).expect("peer credentials");
+            let peer_process = XcodeShimProcessBinding {
+                pid: credentials.pid,
+                uid: credentials.uid,
+                parent_pid: Some(77),
+                ancestor_pids: Vec::new(),
+                start_time_fingerprint: Some("live-start".to_string()),
+                executable_fingerprint: Some("live-executable".to_string()),
+            };
+            let config = process_config("/bin/sh");
+            let handler_sink = sink.clone();
+            let handler = tokio::spawn(async move {
+                let inspector = StaticPeerInspector {
+                    expected_credentials: credentials,
+                    peer_process: peer_process.clone(),
+                };
+                let resolver = StaticGrantResolver {
+                    expected_token_id: "token-live".to_string(),
+                    resolved: XcodeShimResolvedDispatch {
+                        grant: XcodeShimDispatchGrant::new(
+                            "token-live",
+                            "secret-live",
+                            "lease-live",
+                            peer_process,
+                            1_000,
+                            2_000,
+                        ),
+                        active_prompt: true,
+                    },
+                };
+                handle_xcode_shim_unix_stream_with_grant_resolver(
+                    server,
+                    &config,
+                    &*handler_sink,
+                    &inspector,
+                    &resolver,
+                )
+                .await
+            });
+
+            let (client_reader, mut client_writer) = client.into_split();
+            client_writer
+                .write_all(serde_json::to_string(&request).expect("payload").as_bytes())
+                .await
+                .expect("write payload");
+            client_writer.write_all(b"\n").await.expect("write newline");
+            client_writer
+                .shutdown()
+                .await
+                .expect("shutdown client write");
+
+            let mut response_line = String::new();
+            let mut reader = BufReader::new(client_reader);
+            reader
+                .read_line(&mut response_line)
+                .await
+                .expect("read response");
+            let response: XcodeShimDispatchOutcome =
+                serde_json::from_str(&response_line).expect("response json");
+            let handler_outcome = handler
+                .await
+                .expect("handler task")
+                .expect("handler result");
+
+            assert!(response.authorization.allowed);
+            assert_eq!(response.exit_status, 6);
+            assert_eq!(handler_outcome.exit_status, 6);
+        }
+
+        let updates = sink.updates();
+        assert_eq!(updates.len(), 2);
+        match &updates[0] {
+            XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::ShimInvocation(
+                event,
+            )) => {
+                assert_eq!(event.policy_reason, "host_executor");
+                assert_eq!(event.exit_status, 6);
+            }
+            other => panic!("expected shim invocation event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_dispatch_with_grant_resolver_rejects_unknown_token() {
+        let request = XcodeShimSocketDispatchRequest {
+            agent_execution_id: Some(AgentExecutionId::new()),
+            token_id: "missing-token".to_string(),
+            token_secret: "secret-live".to_string(),
+            now_epoch_ms: 1_500,
+            active_prompt: true,
+            plan_input: host_input(),
+        };
+        let sink = Arc::new(CapturingObservationSink::default());
+
+        #[cfg(unix)]
+        {
+            let (client, server) = UnixStream::pair().expect("unix stream pair");
+            let credentials = xcode_shim_peer_credentials(&server).expect("peer credentials");
+            let handler_sink = sink.clone();
+            let handler = tokio::spawn(async move {
+                let inspector = StaticPeerInspector {
+                    expected_credentials: credentials,
+                    peer_process: provider_process(),
+                };
+                struct MissingGrantResolver;
+                #[async_trait]
+                impl XcodeShimGrantResolver for MissingGrantResolver {
+                    async fn resolve_grant(
+                        &self,
+                        _token_id: &str,
+                    ) -> anyhow::Result<XcodeShimResolvedDispatch> {
+                        anyhow::bail!("xcode_shim_unknown_token_id");
+                    }
+                }
+                let resolver = MissingGrantResolver;
+                handle_xcode_shim_unix_stream_with_grant_resolver(
+                    server,
+                    &process_config("/bin/sh"),
+                    &*handler_sink,
+                    &inspector,
+                    &resolver,
+                )
+                .await
+            });
+
+            let (client_reader, mut client_writer) = client.into_split();
+            client_writer
+                .write_all(serde_json::to_string(&request).expect("payload").as_bytes())
+                .await
+                .expect("write payload");
+            client_writer.write_all(b"\n").await.expect("write newline");
+            client_writer
+                .shutdown()
+                .await
+                .expect("shutdown client write");
+            drop(client_reader);
+
+            let error = handler
+                .await
+                .expect("handler task")
+                .expect_err("unknown token should fail");
+            assert!(error.to_string().contains("xcode_shim_unknown_token_id"));
+        }
+
+        assert!(sink.updates().is_empty());
     }
 
     #[tokio::test]
@@ -1977,6 +2284,21 @@ mod tests {
         assert!(authorization.reason_code.is_none());
         assert_eq!(grant().token_sha256.len(), 64);
         assert_ne!(grant().token_sha256, "secret-a");
+    }
+
+    #[test]
+    fn authorizes_descendant_shim_process_during_active_prompt() {
+        let mut attempt = attempt();
+        attempt.peer_process.pid = 99;
+        attempt.peer_process.parent_pid = Some(42);
+        attempt.peer_process.ancestor_pids = vec![42, 7];
+        attempt.peer_process.start_time_fingerprint = None;
+        attempt.peer_process.executable_fingerprint = None;
+
+        let authorization = grant().authorize(&attempt);
+
+        assert!(authorization.allowed);
+        assert!(authorization.reason_code.is_none());
     }
 
     #[test]

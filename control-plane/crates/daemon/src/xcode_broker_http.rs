@@ -154,6 +154,7 @@ mod tests {
     };
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::RunId;
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
@@ -449,7 +450,9 @@ mod tests {
         ExecutionRequest {
             agent_execution_id: None,
             run_id: RunId::new(),
+            stage_execution_id: None,
             stage_id: "stage_xcode".to_string(),
+            attempt_number: 1,
             agent_id: "xcode-agent".to_string(),
             provider: "claude".to_string(),
             model: None,
@@ -460,6 +463,7 @@ mod tests {
             worktree_write_enabled: false,
             worktree_strategy: None,
             expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
             keep_session_alive: false,
             reuse_existing_session: false,
             session_generation_id: None,
@@ -482,6 +486,9 @@ mod tests {
                 },
             }],
             chainworks_meta_root: None,
+            legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
         }
     }
 }

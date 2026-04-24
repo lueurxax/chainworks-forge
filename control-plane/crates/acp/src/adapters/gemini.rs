@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
+use crate::transport::AcpSessionConfig;
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_GEMINI_ACP_BINARY";
@@ -84,9 +85,7 @@ impl AcpAdapter for GeminiCliAdapter {
             extra: None,
             config_options: Vec::new(),
         };
-        let session = AcpSession::start(child, req, &config).await?;
-
-        Ok(AcpSessionHandle::new(session))
+        Ok(AcpSessionNewSpec::from_config(config))
     }
 }
 
@@ -138,6 +137,8 @@ mod tests {
             mcp_servers: Vec::new(),
             chainworks_meta_root: meta_root.map(str::to_string),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
         }
     }
 

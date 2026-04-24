@@ -244,6 +244,20 @@ pub(crate) async fn execution_mcp_truth_json(
     Ok(serde_json::Value::Array(items))
 }
 
+fn xcode_runtime_observation_json(raw: Option<&str>) -> serde_json::Value {
+    let Some(raw) = raw else {
+        return serde_json::Value::Null;
+    };
+    match serde_json::from_str::<XcodeRuntimeObservation>(raw) {
+        Ok(observation) => serde_json::to_value(observation.redacted_for_surface())
+            .unwrap_or(serde_json::Value::Null),
+        Err(error) => serde_json::json!({
+            "parse_error": error.to_string(),
+            "raw_observation_available": true,
+        }),
+    }
+}
+
 async fn runtime_facts_json(
     pool: &SqlitePool,
     execution: &AgentExecution,

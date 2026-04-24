@@ -1,11 +1,12 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::adapters::XcodeShimGrantCleanup;
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
-use crate::{ExecutionRequest, ExecutionResult};
+use crate::{AcpCloseDiagnostic, ExecutionRequest, ExecutionResult};
 use domain::ids::AgentExecutionId;
 
 /// Transport-backed ACP session that can accept multiple prompt turns before
@@ -13,6 +14,7 @@ use domain::ids::AgentExecutionId;
 pub struct AcpSession {
     transport: AcpTransportSession,
     cleanup_paths: Vec<PathBuf>,
+    xcode_shim_grants: Vec<XcodeShimGrantCleanup>,
 }
 
 impl AcpSession {
@@ -45,22 +47,50 @@ impl AcpSession {
         config: &AcpSessionConfig<'_>,
         cleanup_paths: Vec<PathBuf>,
     ) -> Result<Self> {
+        Self::start_with_cleanup_paths_and_xcode_shim_grants(
+            child,
+            req,
+            config,
+            cleanup_paths,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn start_with_cleanup_paths_and_xcode_shim_grants(
+        child: tokio::process::Child,
+        req: &ExecutionRequest,
+        config: &AcpSessionConfig<'_>,
+        cleanup_paths: Vec<PathBuf>,
+        xcode_shim_grants: Vec<XcodeShimGrantCleanup>,
+    ) -> Result<Self> {
         let transport = match AcpTransportSession::start(child, req, config).await {
             Ok(transport) => transport,
             Err(err) => {
                 cleanup_paths.iter().for_each(cleanup_path);
+                xcode_shim_grants
+                    .iter()
+                    .for_each(XcodeShimGrantCleanup::remove);
                 return Err(err);
             }
         };
         Ok(Self {
             transport,
             cleanup_paths,
+            xcode_shim_grants,
         })
     }
 
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
+        self.xcode_shim_grants
+            .iter()
+            .for_each(|grant| grant.set_active_prompt(true));
+        let prompt_result = self.transport.prompt(req).await;
+        self.xcode_shim_grants
+            .iter()
+            .for_each(|grant| grant.set_active_prompt(false));
         let (
             status,
             artifact_paths,
@@ -68,6 +98,7 @@ impl AcpSession {
             pre_prompt_expected_outputs,
             transcript_text,
             usage,
+            xcode_shim_warning_events,
             acp_pre_initialize_local_latency_ms,
             acp_initialize_latency_ms,
             acp_session_new_latency_ms,
@@ -76,7 +107,7 @@ impl AcpSession {
             acp_pre_prompt_metadata_timeout,
             acp_pre_prompt_metadata_digest_bytes,
             legacy_broad_discovery_snapshot,
-        ) = self.transport.prompt(req).await?;
+        ) = prompt_result?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
             .as_ref()
@@ -118,7 +149,7 @@ impl AcpSession {
     /// Close the live ACP session and wait for the subprocess to exit.
     pub async fn close(&mut self) -> Result<Option<AcpCloseDiagnostic>> {
         let close_result = self.transport.close().await;
-        if let Some(path) = self.cleanup_path.take() {
+        for path in self.cleanup_paths.drain(..) {
             if let Err(error) = std::fs::remove_dir_all(&path) {
                 warn!(
                     cleanup_path = %path.display(),
@@ -126,6 +157,9 @@ impl AcpSession {
                     "Failed to remove ACP session cleanup path"
                 );
             }
+        }
+        for grant in self.xcode_shim_grants.drain(..) {
+            grant.remove();
         }
         close_result
     }
@@ -164,7 +198,8 @@ impl AcpSessionHandle {
     /// Close the live session.
     pub async fn close(&self) -> Result<()> {
         let mut session = self.inner.lock().await;
-        session.close().await
+        session.close().await?;
+        Ok(())
     }
 
     pub async fn provider_session_id(&self) -> String {
