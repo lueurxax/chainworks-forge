@@ -213,6 +213,7 @@ The Start Run surface (Diagnostic-only placeholder in P031) exposes:
 - resolved live-agent summary
 - safety framing in product language
 - explicit missing-runtime guidance when live mode cannot start
+- **diagnostic identifiers** for execution via external workflows (CLI / MCP)
 
 ### 7.2 Run Progress
 
@@ -273,7 +274,7 @@ Primary verification files:
 The live slice is proven at two levels:
 
 **Fixture-backed proof:**
-- Start Run sheet launches the live slice from inside the app
+- diagnostic Start Run placeholder is reachable
 - Run progress, approval, and stable outcome are reachable
 - Artifact inspector opens proposal and receipt-style artifacts
 - At least one non-happy path is proven

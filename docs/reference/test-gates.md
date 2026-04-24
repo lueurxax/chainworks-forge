@@ -115,7 +115,7 @@ Scope:
 
 - approval inbox reachability
 - approval gate surface
-- start run sheet
+- diagnostic start run placeholder
 - missing-runtime recovery guidance
 - run progress surface
 

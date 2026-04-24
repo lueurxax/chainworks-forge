@@ -62,6 +62,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Operator experience
 
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
+- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed UI write controls (P031)
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
 - [reference/live-workflow-map.md](live-workflow-map.md) — Workflow topology and agent-activity surface

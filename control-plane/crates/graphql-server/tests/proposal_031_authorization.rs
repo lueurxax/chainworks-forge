@@ -42,6 +42,19 @@ async fn assert_observer_forbidden(schema: &AppSchema, query: &str) {
     );
 }
 
+async fn assert_missing_principal_unauthorized(schema: &AppSchema, query: &str) {
+    let response = schema.execute(Request::new(query)).await;
+
+    assert!(
+        response
+            .errors
+            .iter()
+            .any(|error| error.message == "unauthorized"),
+        "expected unauthorized error, got {:?}",
+        response.errors
+    );
+}
+
 async fn assert_observer_subscription_forbidden(schema: &AppSchema, subscription: &str) {
     let mut stream = schema.execute_stream(Request::new(subscription).data(auth::Principal::new(
         "observer",
@@ -107,6 +120,11 @@ async fn proposal_031_stage_detail_queries_require_operator_read() {
 
     assert_observer_forbidden(
         &schema,
+        "{ approvalInbox { id diagnosticId serverDebugDetail } }",
+    )
+    .await;
+    assert_observer_forbidden(
+        &schema,
         &format!(r#"{{ stage(id: "{stage_execution_id}") {{ id freshnessState }} }}"#),
     )
     .await;
@@ -117,6 +135,36 @@ async fn proposal_031_stage_detail_queries_require_operator_read() {
         ),
     )
     .await;
+}
+
+#[tokio::test]
+async fn proposal_031_queries_require_principal() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let schema = make_schema(pool);
+    let stage_execution_id = "00000000-0000-0000-0000-000000000000";
+    let queries = [
+        "{ ideas { id title body } }".to_string(),
+        r#"{ idea(id: "00000000-0000-0000-0000-000000000000") { id title body } }"#.to_string(),
+        "{ runs { id status freshnessState } }".to_string(),
+        r#"{ run(id: "00000000-0000-0000-0000-000000000000") { id status freshnessState } }"#
+            .to_string(),
+        "{ approvalInbox { id diagnosticId serverDebugDetail } }".to_string(),
+        r#"{ artifacts(runId: "00000000-0000-0000-0000-000000000000") { id name freshnessState } }"#
+            .to_string(),
+        r#"{ stages(runId: "00000000-0000-0000-0000-000000000000") { id freshnessState } }"#
+            .to_string(),
+        format!(r#"{{ stage(id: "{stage_execution_id}") {{ id freshnessState }} }}"#),
+        format!(
+            r#"{{ agentExecutions(stageExecutionId: "{stage_execution_id}") {{ id provider }} }}"#
+        ),
+        "{ stewardAnalyses { id status } }".to_string(),
+        r#"{ stewardAnalysis(id: "analysis-1") { id status } }"#.to_string(),
+        "{ daemonStatus { state } }".to_string(),
+    ];
+
+    for query in queries {
+        assert_missing_principal_unauthorized(&schema, &query).await;
+    }
 }
 
 #[tokio::test]
@@ -150,6 +198,11 @@ async fn proposal_031_sensitive_subscriptions_require_operator_read() {
         &format!(
             r#"subscription {{ runtimeStatusChanged(runId: "{run_id}") {{ runId stageId agentId provider eventKind }} }}"#
         ),
+    )
+    .await;
+    assert_observer_subscription_forbidden(
+        &schema,
+        "subscription { daemonStatusChanged { state } }",
     )
     .await;
 }

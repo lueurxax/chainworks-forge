@@ -1,3 +1,7 @@
+# SUPERSEDED
+
+**NOTICE:** This document has been superseded by the finalized [031-thin-graphql-ui-rewrite.md](031-thin-graphql-ui-rewrite.md). This older draft is preserved for historical review only.
+
 # Proposal 031: Thin GraphQL-Only UI Rewrite Over Server Projections
 
 | Field | Value |

@@ -581,8 +581,8 @@ This section resolves reviewer feedback explicitly. No disagreement is hidden.
 | --- | --- | --- |
 | `OPERATOR-REJECTION-STATE-6-01` | addressed | r7 approval is stale; implementation approval requires aggregate re-review of the corrected GraphQL-only scope. |
 | `ARCH-R9-01`, `LIFT-R9-001` | addressed | P043/P031 reconciliation removes command-completion, command receipts, command correlation, and MCP command-control from P031 UI. |
-| `ARCH-R9-02`, `LIFT-R9-001`, `ARCH-R10-03` | addressed | Schema matrix must become executable GraphQL or explicit disabled/deferred state before affected migration. |
-| `ARCH-R9-03`, `LIFT-R9-001`, `ARCH-R10-04` | addressed | Machine-readable UI inventory is required and consumed by the P031 gate. |
+| `ARCH-R9-02`, `LIFT-R9-003`, `ARCH-R10-03` | addressed | Schema matrix must become executable GraphQL or explicit disabled/deferred state before affected migration. |
+| `ARCH-R9-03`, `LIFT-R9-004`, `ARCH-R10-04` | addressed | Machine-readable UI inventory is required and consumed by the P031 gate. |
 | `ARCH-R9-04`, `UX-R9-01`, `UI-02`, `PO-R9-04`, `LIFT-R9-002`, `LIFT-R9-007` | addressed with explicit deferral | Approval UI is diagnostic-only; interactive decisions move to a separate follow-up transport. |
 | `ARCH-R9-05`, `ARCH-R10-01` | addressed | One checked-in governing artifact must supersede stale GraphQL+MCP handoff text before migration. |
 | `ARCH-R10-02` | addressed | P031 gate registration and P043 reconciliation are Phase 0 blockers. |

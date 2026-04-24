@@ -51,22 +51,11 @@ pub fn build_schema(
 pub struct QueryRoot;
 
 fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
-    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
-        if principal.class != auth::PrincipalClass::Operator {
-            return Err(Error::new("forbidden"));
-        }
-    }
-    Ok(())
-}
-
-fn require_operator_or_observer_read(ctx: &Context<'_>) -> Result<()> {
-    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
-        if !matches!(
-            principal.class,
-            auth::PrincipalClass::Operator | auth::PrincipalClass::Observer
-        ) {
-            return Err(Error::new("forbidden"));
-        }
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    if principal.class != auth::PrincipalClass::Operator {
+        return Err(Error::new("forbidden"));
     }
     Ok(())
 }
@@ -80,6 +69,7 @@ fn parse_legacy_broad_discovery_policy(value: &str) -> Result<LegacyBroadDiscove
         ))),
     }
 }
+
 async fn run_from_projection_or_canonical(
     pool: &SqlitePool,
     run_id: RunId,
@@ -1017,7 +1007,9 @@ impl SubscriptionRoot {
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
-        let filter_run_id: RunId = run_id.parse().unwrap_or_else(|_| RunId::new());
+        let filter_run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let rx = events.subscribe();
         Ok(BroadcastStream::new(rx).filter_map(move |msg| {

@@ -2476,6 +2476,7 @@ enum ApprovalDiagnosticPresenter {
 struct P031PayloadAvailabilityPresentation: Equatable, Sendable {
   let title: String
   let detail: String
+  let symbolName: String
   let canOpenPayload: Bool
   let copyItems: [P031DiagnosticCopyItem]
 }
@@ -2496,28 +2497,34 @@ enum PayloadUnavailableReasonPresenter {
   {
     let title: String
     let detail: String
+    let symbolName: String
     let canOpenPayload: Bool
 
     switch report.payloadAvailabilityState {
     case .available:
-      title = "Available"
+      title = "Payload"
       detail = "Report payload available"
+      symbolName = "doc.text.fill"
       canOpenPayload = true
     case .metadataOnly:
-      title = "Metadata only"
+      title = "Metadata"
       detail = detailForReason(report.payloadUnavailableReasonCode)
+      symbolName = "doc.text"
       canOpenPayload = false
     case .payloadDeferred:
-      title = "Payload deferred"
+      title = "Deferred"
       detail = detailForReason(report.payloadUnavailableReasonCode)
+      symbolName = "clock.badge.exclamationmark"
       canOpenPayload = false
     case .generating:
       title = "Generating"
       detail = "Report payload is still generating"
+      symbolName = "arrow.triangle.2.circlepath"
       canOpenPayload = false
     case .unavailable:
       title = "Unavailable"
       detail = detailForReason(report.payloadUnavailableReasonCode)
+      symbolName = "exclamationmark.triangle"
       canOpenPayload = false
     }
 
@@ -2527,6 +2534,7 @@ enum PayloadUnavailableReasonPresenter {
     return P031PayloadAvailabilityPresentation(
       title: title,
       detail: detail,
+      symbolName: symbolName,
       canOpenPayload: canOpenPayload,
       copyItems: copyItems
     )
@@ -2565,13 +2573,13 @@ enum ReportMetadataRowPresenter {
 
     switch report.payloadAvailabilityState {
     case .available:
-      symbolName = "doc.text"
+      symbolName = "doc.text.fill"
     case .metadataOnly:
-      symbolName = "doc.text.magnifyingglass"
+      symbolName = "doc.text"
     case .payloadDeferred:
       symbolName = "clock.badge.exclamationmark"
     case .generating:
-      symbolName = "hourglass"
+      symbolName = "arrow.triangle.2.circlepath"
     case .unavailable:
       symbolName = "exclamationmark.triangle"
     }
@@ -2678,6 +2686,7 @@ struct P031ArtifactSummaryPresentation: Equatable, Sendable {
   let title: String
   let detailLabel: String
   let payloadAvailabilityLabel: String
+  let payloadAvailabilitySymbolName: String
   let canOpenPayload: Bool
   let diagnosticCopyItems: [P031DiagnosticCopyItem]
   let freshnessState: P031FreshnessState
@@ -3165,6 +3174,7 @@ enum P031ArtifactPresenter {
       title: artifact.name,
       detailLabel: detailLabel,
       payloadAvailabilityLabel: payload.title,
+      payloadAvailabilitySymbolName: payload.symbolName,
       canOpenPayload: payload.canOpenPayload,
       diagnosticCopyItems: payload.copyItems,
       freshnessState: artifact.freshnessState,

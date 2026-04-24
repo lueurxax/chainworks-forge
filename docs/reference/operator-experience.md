@@ -152,20 +152,22 @@ Report content includes:
 
 ### Recovery
 
-The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows:
+The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
+Diagnostic guidance is provided for:
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
 4. `Clone Run`
 
-**Workflow Conflict Actions:**
-- **Request lead mediation**: Escalate a conflict to the system lead for 
-  automated resolution.
-- **Inspect lead mediation**: View sanitized live status updates (queued, 
+**Workflow Conflict Actions (Read-Only):**
+- **Mediation Progress**: View sanitized live status updates (queued, 
   running, validating) while mediation is active.
-- **Manual Resolution**: For terminal conflicts, provides direct actions like 
-  `Clone Run` or `Open editable recovery artifact`.
+- **Diagnostic Details**: For terminal conflicts, provides `run_id` and conflict 
+  identifiers for use in external resolution workflows.
+- **Manual Resolution Guidance**: In-app actions like `Clone Run` or `Open editable 
+  recovery artifact` are replaced with diagnostic identifiers and suggested 
+  external commands.
 
 `RecoverySheet` and diagnostic banners show:
 

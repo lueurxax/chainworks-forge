@@ -1051,6 +1051,30 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(summary.rows.isEmpty)
   }
 
+  @Test("Guide bootstrap loads the machine-readable guide from the repository root")
+  func operatorWritePathGuideBootstrapLoadsRepositoryGuide() throws {
+    let repoRoot = try temporaryRepositoryRoot()
+    defer { try? FileManager.default.removeItem(at: repoRoot) }
+    let guideURL = repoRoot
+      .appendingPathComponent("docs/reference", isDirectory: true)
+      .appendingPathComponent("p031-operator-write-path-guide.json")
+    try FileManager.default.createDirectory(
+      at: guideURL.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    try approvalCLIWritePathGuideData().write(to: guideURL)
+
+    let resource = P031OperatorWritePathGuideBootstrap.load(
+      currentDirectoryPath: repoRoot.path,
+      bundledURL: nil,
+      sourceFilePath: repoRoot
+        .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift").path
+    )
+
+    #expect(resource.url == guideURL)
+    #expect(resource.data == approvalCLIWritePathGuideData())
+  }
+
   @Test("Operator write-path guide resolver fails closed for missing malformed or stale data")
   func operatorWritePathGuideResolverFailsClosedForUnavailableData() {
     let missing = P031OperatorWritePathGuideResolver.resolve(from: nil)
@@ -1351,7 +1375,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         """.utf8))
 
     let presentation = PayloadUnavailableReasonPresenter.presentation(for: report)
-    #expect(presentation.title == "Metadata only")
+    #expect(presentation.title == "Metadata")
     #expect(presentation.detail == "Payload rendering is deferred by P031")
     #expect(!presentation.canOpenPayload)
     #expect(
@@ -1404,14 +1428,15 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     let untitledRow = ReportMetadataRowPresenter.presentation(for: untitled)
 
     #expect(metadataOnlyRow.title == "release summary")
-    #expect(metadataOnlyRow.availabilityLabel == "Metadata only")
-    #expect(metadataOnlyRow.availabilitySymbolName == "doc.text.magnifyingglass")
+    #expect(metadataOnlyRow.availabilityLabel == "Metadata")
+    #expect(metadataOnlyRow.availabilitySymbolName == "doc.text")
     #expect(metadataOnlyRow.payloadIndicatorSlotWidth == 96)
     #expect(!metadataOnlyRow.canOpenPayload)
     #expect(
       metadataOnlyRow.accessibilityLabel
-        == "release summary, Metadata only. Payload rendering is deferred by P031")
-    #expect(availableRow.availabilitySymbolName == "doc.text")
+        == "release summary, Metadata. Payload rendering is deferred by P031")
+    #expect(availableRow.availabilityLabel == "Payload")
+    #expect(availableRow.availabilitySymbolName == "doc.text.fill")
     #expect(availableRow.canOpenPayload)
     #expect(untitledRow.title == "Untitled report")
   }
@@ -1620,11 +1645,11 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(runDetail.approvalRows.map(\.approvalID) == ["approval-1"])
     #expect(runDetail.approvalRows.first?.actionLabel == "Execute via CLI")
     #expect(runDetail.artifactRows.map(\.artifactID) == ["artifact-1"])
-    #expect(runDetail.artifactRows.first?.payloadAvailabilityLabel == "Metadata only")
+    #expect(runDetail.artifactRows.first?.payloadAvailabilityLabel == "Metadata")
     #expect(runDetail.artifactRows.first?.canOpenPayload == false)
     #expect(runDetail.artifactRows.first?.diagnosticCopyItems.map(\.label) == ["diagnostic_id"])
     #expect(runDetail.reportRows.map(\.title) == ["release report"])
-    #expect(runDetail.reportRows.first?.availabilityLabel == "Metadata only")
+    #expect(runDetail.reportRows.first?.availabilityLabel == "Metadata")
     #expect(runDetail.freshness.state == .stale)
     #expect(runDetail.refreshFeedbackText == "Checking latest data")
     #expect(stageDetail.stage?.stageExecutionID == "stage-exec-1")
@@ -1684,11 +1709,11 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
 
     #expect(artifacts.rows.map(\.artifactID) == ["artifact-1"])
-    #expect(artifacts.rows.first?.payloadAvailabilityLabel == "Metadata only")
+    #expect(artifacts.rows.first?.payloadAvailabilityLabel == "Metadata")
     #expect(artifacts.refreshFeedbackText == "Refreshing artifacts")
     #expect(artifacts.freshness.state == .live)
     #expect(reports.rows.map(\.title) == ["release summary"])
-    #expect(reports.rows.first?.availabilityLabel == "Metadata only")
+    #expect(reports.rows.first?.availabilityLabel == "Metadata")
     #expect(reports.rows.first?.payloadIndicatorSlotWidth == 96)
     #expect(reports.freshness.state == .projectionLag)
     #expect(reports.refreshFeedbackText == "Refreshing reports")
@@ -1946,6 +1971,13 @@ private func unavailableGuideRow(
     "operator_notes": NSNull(),
     "validation_status": "pending",
   ]
+}
+
+private func temporaryRepositoryRoot() throws -> URL {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("p031-guide-bootstrap-\(UUID().uuidString)", isDirectory: true)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  return root
 }
 
 private func daemonStatusJSON(state: String) -> String {

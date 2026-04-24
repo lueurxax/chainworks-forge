@@ -37,6 +37,7 @@ impl From<Approval> for GqlApproval {
             freshness_state: GqlFreshnessState::Live,
             disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
             write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
+            // Phase 0 intentionally reuses the approval id as the diagnostic copy token.
             diagnostic_id: Some(diagnostic_id),
             server_debug_detail: None,
         }
@@ -59,6 +60,7 @@ impl From<ApprovalInboxRow> for GqlApproval {
             freshness_state: GqlFreshnessState::Live,
             disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
             write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
+            // Phase 0 intentionally reuses the approval id as the diagnostic copy token.
             diagnostic_id: Some(diagnostic_id),
             server_debug_detail: None,
         }

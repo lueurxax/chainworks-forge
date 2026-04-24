@@ -20,10 +20,7 @@ struct ContentView: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
             }
-            ControlPlaneOnlyPlaceholder(
-                title: "Control-plane UI cutover",
-                message: "SwiftData-backed operator UI has been intentionally removed. Rebuild screens on GraphQL read projections only; command/control remains outside UI-owned database paths."
-            )
+            RunsHomeView()
         }
         .task {
             await daemonStatus.startSnapshotPlusSubscribe()
