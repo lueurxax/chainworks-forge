@@ -1,3 +1,0 @@
-2026-04-22 20:46:16 +0000: Received worker from worker provider: <XCTHTestRunner: 0xbf551a6c0, PID: 0, device: My Mac (00006000-0014108A2E02401E)>
-2026-04-22 20:52:19 +0000: Worker <XCTHTestRunner: 0xbf551a6c0, PID: 41141, device: My Mac (00006000-0014108A2E02401E)> finished with error: Error Domain=XCTHTestOperationCoordinatorErrorDomain Code=14 "The test runner hung before establishing connection." UserInfo={NSLocalizedDescription=The test runner hung before establishing connection.}
-2026-04-22 20:52:19 +0000: Finished executing tests (cancelled: No)

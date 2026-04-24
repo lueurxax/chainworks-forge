@@ -1,4 +1,0 @@
-
-
-*** If you believe this error represents a bug, please attach the result bundle at /Users/user/Documents/Chainworks Forge/.chainworks/worktrees/cw-implement-proposal-031-thin-gr-72409268/tmp/p031-boundary-pass2-unsigned.xcresult
-
