@@ -185,6 +185,8 @@ pub struct XcodeBrokerHealthSnapshot {
     pub max_active_leases: usize,
     pub max_queued_leases: usize,
     pub broker_disabled: bool,
+    pub backend_available: bool,
+    pub observation_persistence_failures: u64,
 }
 
 /// In-process snapshot of daemon status. Emitted on every lifecycle

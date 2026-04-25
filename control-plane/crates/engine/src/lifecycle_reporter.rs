@@ -284,6 +284,8 @@ mod tests {
             max_active_leases: 8,
             max_queued_leases: 16,
             broker_disabled: false,
+            backend_available: true,
+            observation_persistence_failures: 0,
         };
 
         reporter.set_xcode_broker_health(health.clone());

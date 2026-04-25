@@ -54,7 +54,9 @@ final class DaemonLifecycleClientTests: XCTestCase {
             "queued_leases": 2,
             "max_active_leases": 8,
             "max_queued_leases": 16,
-            "broker_disabled": false
+            "broker_disabled": false,
+            "backend_available": true,
+            "observation_persistence_failures": 3
           }
         }
         """
@@ -69,6 +71,8 @@ final class DaemonLifecycleClientTests: XCTestCase {
         XCTAssertEqual(status.xcodeBrokerHealth?.maxActiveLeases, 8)
         XCTAssertEqual(status.xcodeBrokerHealth?.maxQueuedLeases, 16)
         XCTAssertEqual(status.xcodeBrokerHealth?.brokerDisabled, false)
+        XCTAssertEqual(status.xcodeBrokerHealth?.backendAvailable, true)
+        XCTAssertEqual(status.xcodeBrokerHealth?.observationPersistenceFailures, 3)
     }
 
     func test_DaemonStatus_decodes_degraded_reasons_array() throws {

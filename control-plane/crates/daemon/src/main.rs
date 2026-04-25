@@ -37,7 +37,7 @@ use tracing::{error, info, warn};
 
 use acp::{
     AcpRuntimeManager, DefaultXcodeShimProcessInspector, XcodeHostExecutorProcessConfig,
-    XcodeMcpBridgePool, XcodeMcpBridgePoolConfig,
+    XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeRuntimeObservationSink,
 };
 use daemon::failed_serve;
 use daemon::packaging::{self, DaemonMode, ModePaths};
@@ -330,17 +330,8 @@ async fn main() -> Result<()> {
             let (listener, port) = packaging::bind_with_fallback(&paths).await?;
             info!(port, "bound HTTP listener; handing off to graphql-server");
 
-            let xcode_broker_pool = Arc::new(XcodeMcpBridgePool::new_with_sink(
-                XcodeMcpBridgePoolConfig {
-                    base_url: format!("http://127.0.0.1:{port}/xcode-mcp"),
-                    broker_disabled: std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED")
-                        .map(|value| value == "1")
-                        .unwrap_or(false),
-                    use_local_host_probe: true,
-                    ..Default::default()
-                },
-                acp.xcode_runtime_observation_sink(),
-            ));
+            let xcode_broker_pool =
+                new_daemon_xcode_broker_pool(port, acp.xcode_runtime_observation_sink());
             acp.set_xcode_broker_lease_attacher(xcode_broker_pool.clone());
             reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
                 xcode_broker_pool.health_snapshot().await,
@@ -509,6 +500,28 @@ fn spawn_xcode_broker_health_publisher(reporter: LifecycleReporter, pool: Arc<Xc
     });
 }
 
+fn new_daemon_xcode_broker_pool(
+    port: u16,
+    observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
+) -> Arc<XcodeMcpBridgePool> {
+    Arc::new(XcodeMcpBridgePool::new_with_sink_and_process_backend(
+        XcodeMcpBridgePoolConfig {
+            base_url: format!("http://127.0.0.1:{port}/xcode-mcp"),
+            broker_disabled: std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED")
+                .map(|value| value == "1")
+                .unwrap_or(false),
+            tool_allowlists_by_hash: engine::mcp::load_xcode_broker_tool_allowlists()
+                .unwrap_or_else(|err| {
+                    warn!(error = %err, "Failed to load Xcode broker tool allowlists from MCP registry");
+                    Default::default()
+                }),
+            use_local_host_probe: true,
+            ..Default::default()
+        },
+        observation_sink,
+    ))
+}
+
 fn xcode_broker_health_for_lifecycle(
     health: acp::XcodeBrokerHealthSnapshot,
 ) -> XcodeBrokerHealthSnapshot {
@@ -525,6 +538,8 @@ fn xcode_broker_health_for_lifecycle(
         max_active_leases: health.max_active_leases,
         max_queued_leases: health.max_queued_leases,
         broker_disabled: health.broker_disabled,
+        backend_available: health.backend_available,
+        observation_persistence_failures: health.observation_persistence_failures,
     }
 }
 
@@ -796,6 +811,54 @@ async fn serve_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_xcode_broker_pool_has_process_backend() {
+        let pool =
+            new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
+
+        assert!(pool.has_backend());
+    }
+
+    #[test]
+    fn daemon_xcode_broker_pool_installs_registry_tool_allowlists() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let tmp = tempfile::tempdir().unwrap();
+        let registry_path = tmp.path().join("mcp.yaml");
+        std::fs::write(
+            &registry_path,
+            r#"
+mcp:
+  xcode:
+    type: xcode_broker
+    runtime_id: xcode
+    tool_allowlist:
+      - xcode.build
+      - xcode.test
+"#,
+        )
+        .unwrap();
+
+        let previous = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
+        std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+
+        let allowlists = engine::mcp::load_xcode_broker_tool_allowlists().unwrap();
+        let hash = allowlists
+            .keys()
+            .next()
+            .expect("fixture registry should produce a tool allowlist")
+            .clone();
+        let pool =
+            new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
+
+        assert!(pool.has_tool_allowlist_hash(&hash));
+
+        match previous {
+            Some(value) => std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", value),
+            None => std::env::remove_var("CHAINWORKS_CODEX_CONFIG_PATH"),
+        }
+    }
 
     #[test]
     fn map_migration_error_covers_every_variant() {

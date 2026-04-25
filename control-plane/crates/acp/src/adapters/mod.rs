@@ -137,6 +137,14 @@ impl AcpLaunchSpec {
         fingerprint
     }
 
+    pub fn apply_chainworks_meta_root_env(&mut self, req: &ExecutionRequest) {
+        if let Some(meta_root) = chainworks_meta_root_env_value(req) {
+            self.env.retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
+            self.env
+                .push(("CHAINWORKS_META_ROOT".to_string(), meta_root));
+        }
+    }
+
     fn verify_capability_fingerprint(&self) -> Result<()> {
         let Some(expected) = &self.expected_capability_fingerprint else {
             return Ok(());
@@ -702,15 +710,8 @@ pub trait AcpAdapter: Send + Sync {
         session_new_spec: AcpSessionNewSpec,
     ) -> Result<AcpSessionHandle> {
         let mut command = Command::new(&launch_spec.binary_path);
+        launch_spec.apply_chainworks_meta_root_env(req);
         launch_spec.verify_capability_fingerprint()?;
-        if let Some(meta_root) = chainworks_meta_root_env_value(req) {
-            launch_spec
-                .env
-                .retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
-            launch_spec
-                .env
-                .push(("CHAINWORKS_META_ROOT".to_string(), meta_root));
-        }
         command
             .args(&launch_spec.args)
             .envs(launch_spec.env.drain(..))
@@ -777,6 +778,7 @@ pub trait AcpAdapter: Send + Sync {
     ) -> Result<AcpSessionHandle> {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = self.prepare_launch_spec(req, &mut resources)?;
+        launch_spec.apply_chainworks_meta_root_env(req);
         launch_spec.record_capability_fingerprint(None, None);
         self.ensure_brokered_xcode_http_capability(req, &launch_spec, capability_cache)
             .await?;
@@ -910,6 +912,69 @@ mod tests {
         spec.record_capability_fingerprint(Some("profile-a"), None);
         spec.args.push("--changed-after-preflight".to_string());
 
+        let err = spec.verify_capability_fingerprint().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider_launch_spec_capability_drift"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn chainworks_meta_root_is_frozen_before_capability_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("provider-acp");
+        std::fs::write(&binary, "fixture").unwrap();
+
+        let req = crate::ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_meta".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_meta".to_string(),
+            provider: "claude".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+        };
+
+        let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());
+        spec.apply_chainworks_meta_root_env(&req);
+        let expected = spec.record_capability_fingerprint(Some("profile-a"), None);
+
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, _)| name == "CHAINWORKS_META_ROOT"));
+        assert_eq!(
+            expected,
+            spec.capability_fingerprint(Some("profile-a"), None)
+        );
+
+        spec.env.retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
+        spec.env.push((
+            "CHAINWORKS_META_ROOT".to_string(),
+            tmp.path()
+                .join(".chainworks/other")
+                .to_string_lossy()
+                .into_owned(),
+        ));
         let err = spec.verify_capability_fingerprint().unwrap_err();
         assert!(
             err.to_string()

@@ -1643,6 +1643,8 @@ Available gates:
   proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
   proposal-049    Proposal 049 steward analysis system gate
   proposal-050    Proposal 050 per-run workspace isolation gate
+  p051-scaffold   Proposal 051 scaffold gate for shared Xcode MCP bridge pool substrate
+  proposal-051|p051  Proposal 051 shared Xcode MCP bridge pool fixture/readback gate
   proposal-053    Proposal 053 bounded ACP artifact discovery gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
   proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate

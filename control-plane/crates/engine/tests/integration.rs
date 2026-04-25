@@ -3624,19 +3624,13 @@ async fn mcp_resolution_persistence_tests() {
     let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
     let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
     std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
-    let xcode_resolution = engine::mcp::resolve_mcp_servers(
-        &["xcode".to_string()],
-        Some("xcode_profile"),
-        "auggie",
-    );
+    let xcode_resolution =
+        engine::mcp::resolve_mcp_servers(&["xcode".to_string()], Some("xcode_profile"), "auggie");
     assert!(
-        xcode_resolution
-            .payloads
-            .iter()
-            .any(|payload| matches!(
-                payload.transport,
-                acp::ResolvedMcpServerTransport::XcodeBrokerIntent { .. }
-            )),
+        xcode_resolution.payloads.iter().any(|payload| matches!(
+            payload.transport,
+            acp::ResolvedMcpServerTransport::XcodeBrokerIntent { .. }
+        )),
         "fixture registry should resolve xcode to a broker intent"
     );
 
