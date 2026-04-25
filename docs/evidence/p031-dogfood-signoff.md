@@ -1,10 +1,10 @@
 # P031 Dogfood Sign-Off Template
 
-Status: READY
+Status: READY_TEMPLATE_WITH_RUNTIME_PREREQS_ATTACHED
 Owner: P031 release owner
 Blocking Phase: Phase 3
 Template Date: 2026-04-24
-Last Updated: 2026-04-24T20:26:04Z
+Last Updated: 2026-04-25T04:27:00Z
 
 ## Phase 3 Checklist
 - [ ] Run prerequisite gates (P027, P041, P042, P043, P031).
@@ -26,6 +26,8 @@ Attached pre-dogfood evidence:
 - Freshness baseline attached in `docs/evidence/p031-freshness-baseline.md`.
 - Runtime screenshots attached under `docs/evidence/p031-runtime/`.
 - Partial degraded-state restart evidence attached in `docs/evidence/p031-degraded-state-evidence.md`.
+- Report payload metadata-only evidence attached in `docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json`.
+- Current copied DB contains no completed `Full MVP Live` runs; all current run rows are `blocked` or `cancelled`, so this tree cannot honestly claim the two-run dogfood completion criterion from historical data.
 
 Still required for Phase 3 sign-off:
 

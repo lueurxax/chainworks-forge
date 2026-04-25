@@ -1,10 +1,10 @@
 # P031 Freshness Baseline
 
-Status: MEASURED_WITH_DOGFOOD_LIMITATION
+Status: READY_WITH_DOGFOOD_CONFIRMATION_PENDING
 Owner: P031 macOS thin UI owner
 Blocking Phase: Phase 0d
 Blocker Recorded: 2026-04-24
-Last Updated: 2026-04-24T20:25:19Z
+Last Updated: 2026-04-25T04:27:00Z
 
 ## Required Measurements
 

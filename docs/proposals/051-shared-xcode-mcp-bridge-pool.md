@@ -6,7 +6,7 @@
   "review_readiness": {
     "target_score": "aggregate score above 9",
     "why_ready": [
-      "The run proposal is now explicitly the controlling implementation contract until the checked-in source proposal is reconciled, and the scaffold gate must fail stale contrary guidance.",
+      "The checked-in proposal is now explicitly the controlling implementation contract, and the scaffold gate must fail stale contrary guidance.",
       "The three architect blockers now have explicit owner-crate, caller, failure-mode, and acceptance-test contracts.",
       "Product rollout ambiguity is resolved with staged gates, broker enablement states, and a rollback switch that preserves non-Xcode workflows.",
       "UX/UI visibility concerns are resolved by making a narrow read-only UI/readback slice part of acceptance instead of leaving runtime truth in raw JSON only.",
@@ -37,9 +37,9 @@
   "run_id": "43460545-7f6a-4943-811a-dabad0f1c592",
   "source_proposal": "docs/proposals/051-shared-xcode-mcp-bridge-pool.md",
   "implementation_source_of_truth": {
-    "controlling_artifact": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/43460545-7f6a-4943-811a-dabad0f1c592/proposals/current/proposal.md",
-    "source_proposal_status": "Historical source proposal pending reconciliation. Implementers must follow this run proposal when there is disagreement.",
-    "reconciliation_required_before_implementation": "Before any P051 implementation PR begins, sync `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` or replace its stale sections with a pointer to this controlling contract.",
+    "controlling_artifact": "/Users/user/Documents/Chainworks Forge/docs/proposals/051-shared-xcode-mcp-bridge-pool.md",
+    "source_proposal_status": "Canonical source-of-truth is checked in at `docs/proposals/051-shared-xcode-mcp-bridge-pool.md`; the .chainworks run proposal is provenance only.",
+    "reconciliation_required_before_implementation": "Before any P051 implementation PR begins, reconcile `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` with this contract and remove stale implementation-source guidance from the checked-in source.",
     "static_gate_requirement": "`p051-scaffold` fails if the checked-in source proposal still contains stale contrary guidance: no SwiftUI changes, debug_assert-only capability enforcement, path+mtime+size-only binary fingerprinting, drop-on-corrupt-observation behavior, direct pgrep newest-Xcode selection, or unbound same-uid-only shim authorization."
   },
   "research_artifact": "docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md",
@@ -1652,8 +1652,8 @@
     ],
     "rollback": "Set `CHAINWORKS_XCODE_BROKER_DISABLED=1` and restart the daemon to preserve non-Xcode workflows while refusing Xcode broker requests. During rollback, all in-flight and new Xcode-brokered executions fail closed immediately with `xcode_broker_disabled`; this is a rollback switch, not a production fallback for brokered Xcode MCP.",
     "preconditions": [
-      "Before scheduling implementation, complete a dependency audit for P025, P026, P029, P037, and P049. The artifact schema is: proposal id, owner, current implementation gate status, remaining gaps, whether P051 can proceed in parallel, required sequencing, and blocking threshold. P026 or P029 incompleteness blocks the scaffold sprint unless the audit explicitly narrows PR1 to independent work.",
-      "Before the first implementation PR starts, reconcile `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` with this proposal or replace stale sections with an explicit pointer to this controlling contract. This is the first scaffold task, and implementation review fails if a PR begins from stale checked-in proposal text.",
+      "Before scheduling implementation, create `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` with one row per dependency (P025, P026, P029, P037, P049) covering proposal id, canonical evidence link, owner, gate status, remaining gaps, parallel-vs-sequential decision, and blocker threshold. P026 or P029 incompleteness blocks the scaffold sprint unless the audit explicitly narrows PR1 to independent work.",
+      "Before the first implementation PR starts, confirm the checked-in proposal is the controlling source by removing stale source-of-truth guidance. This is the first scaffold task, and implementation review fails if PRs begin from stale checked-in proposal text.",
       "Before the third PR merges, assign a security reviewer for bearer lifecycle, shim token replay, provider process binding, Unix socket peer checks, loopback HTTP surface, cwd policy, env allowlist, token redaction, and diagnostic-mode bypasses."
     ]
   },
@@ -1708,11 +1708,11 @@
     },
     {
       "metric": "Source proposal reconciliation",
-      "threshold": "`p051-scaffold` fails until the checked-in source proposal is reconciled with this contract or explicitly points to it; stale no-UI, debug_assert-only, path+mtime+size-only, drop-on-corrupt, pgrep-newest-Xcode, and same-uid-only shim guidance must be absent. No implementation PR may begin from docs/proposals/051 alone before this passes."
+      "threshold": "`p051-scaffold` fails until checked-in `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` is the canonical implementation source and stale guidance is removed. No implementation PR may begin until no stale no-UI, debug_assert-only, path+mtime+size-only, drop-on-corrupt, pgrep-newest-Xcode, and same-uid-only shim guidance remains."
     },
     {
       "metric": "Dependency audit readiness",
-      "threshold": "Written table for P025/P026/P029/P037/P049 exists before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold; P026 and P029 are marked implemented enough for scaffold or the sprint is not scheduled unless PR1 is explicitly narrowed to independent work."
+      "threshold": "Written table exists at `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold; P026 and P029 are marked implemented enough for scaffold or the sprint is not scheduled unless PR1 is explicitly narrowed to independent work."
     },
     {
       "metric": "Broker policy enforcement",
@@ -1889,14 +1889,14 @@
     },
     {
       "question": "Are P025, P026, P029, P037, and P049 all implemented enough for P051 to start?",
-      "default_for_implementation": "Run a dependency status audit before scheduling P051 implementation; P026 or P029 incompleteness blocks scheduling, while partial status in P025/P037/P049 requires an explicit parallel-vs-sequential plan."
+      "default_for_implementation": "Create a dependency status audit at `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` before scheduling P051 implementation; P026 or P029 incompleteness blocks scheduling, while partial status in P025/P037/P049 requires an explicit parallel-vs-sequential plan."
     }
   ],
   "implementation_handoff": {
     "first_pr": {
       "goal": "Wire-safe substrate with no real Xcode backend spawning yet.",
       "deliverables": [
-        "source proposal reconciliation or explicit pointer to this controlling run proposal",
+        "Checked-in proposal is canonical source-of-truth and stale guidance is removed",
         "static stale-guidance check",
         "domain/db/API nullable observation scaffold",
         "observation sink trait and engine-injected db sink",

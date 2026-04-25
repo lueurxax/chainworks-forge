@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_graphql::futures_util::StreamExt;
@@ -24,6 +25,7 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::GqlArtifact;
 use crate::types::idea::GqlIdea;
+use crate::types::p031::{GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode};
 use crate::types::run::GqlRun;
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
 use crate::types::steward::{
@@ -214,8 +216,20 @@ impl QueryRoot {
     async fn artifacts(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlArtifact>> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
+        let parsed_run_id: RunId = run_id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let run = runs::find_by_id(pool, parsed_run_id).await?;
         let items = projections::list_artifacts_projection(pool, run_id.as_str()).await?;
-        Ok(items.into_iter().map(GqlArtifact::from).collect())
+        Ok(items
+            .into_iter()
+            .map(|row| {
+                let mut artifact = GqlArtifact::from(row.clone());
+                attach_p031_artifact_payload(&row, run.as_ref(), &mut artifact);
+                artifact
+            })
+            .collect())
     }
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
@@ -574,6 +588,89 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         None
     };
     Ok(run)
+}
+
+const P031_ARTIFACT_PAYLOAD_MAX_BYTES: i64 = 1024 * 1024;
+
+fn attach_p031_artifact_payload(
+    row: &db::repos::projections::ArtifactIndexRow,
+    run: Option<&domain::run::Run>,
+    artifact: &mut GqlArtifact,
+) {
+    if artifact.report_kind.is_some() || row.format == "report" {
+        return;
+    }
+
+    if row.size_bytes.unwrap_or(0) > P031_ARTIFACT_PAYLOAD_MAX_BYTES {
+        mark_payload_unavailable(
+            artifact,
+            "Artifact payload is larger than the P031 GraphQL preview limit",
+        );
+        return;
+    }
+
+    let Some(run) = run else {
+        mark_payload_unavailable(artifact, "Run metadata was unavailable for artifact readback");
+        return;
+    };
+
+    let Some(path) = resolve_server_owned_artifact_path(&row.file_path, run) else {
+        mark_payload_unavailable(
+            artifact,
+            "Artifact path is outside the selected run's server-owned roots",
+        );
+        return;
+    };
+
+    match std::fs::read_to_string(path) {
+        Ok(payload) => {
+            artifact.payload_text = Some(payload);
+            artifact.payload_availability_state = GqlPayloadAvailabilityState::Available;
+            artifact.payload_unavailable_reason_code = None;
+            artifact.server_debug_detail = None;
+        }
+        Err(err) => {
+            mark_payload_unavailable(
+                artifact,
+                &format!("Artifact payload readback failed: {err}"),
+            );
+        }
+    }
+}
+
+fn mark_payload_unavailable(artifact: &mut GqlArtifact, detail: &str) {
+    artifact.payload_text = None;
+    artifact.payload_availability_state = GqlPayloadAvailabilityState::Unavailable;
+    artifact.payload_unavailable_reason_code = Some(GqlPayloadUnavailableReasonCode::NotAvailable);
+    artifact.server_debug_detail = Some(detail.to_string());
+}
+
+fn resolve_server_owned_artifact_path(file_path: &str, run: &domain::run::Run) -> Option<PathBuf> {
+    let raw_path = PathBuf::from(file_path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else if !run.artifact_root.is_empty() {
+        PathBuf::from(&run.artifact_root).join(raw_path)
+    } else {
+        PathBuf::from(&run.workspace_root).join(raw_path)
+    };
+    let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
+    let allowed_roots = [
+        Some(run.artifact_root.as_str()),
+        Some(run.workspace_root.as_str()),
+        run.chainworks_meta_root.as_deref(),
+    ];
+    allowed_roots
+        .into_iter()
+        .flatten()
+        .filter(|root| !root.is_empty())
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| path_is_inside(&canonical_candidate, &root))
+        .then_some(canonical_candidate)
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 pub struct MutationRoot;

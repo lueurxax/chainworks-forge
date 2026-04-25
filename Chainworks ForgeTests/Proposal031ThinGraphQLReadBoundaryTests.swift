@@ -541,6 +541,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       artifacts: P031GraphQLDocuments.artifacts,
       reportMetadata: P031GraphQLDocuments.reportMetadata,
       daemonStatus: P031GraphQLDocuments.daemonStatus,
+      ideaTitle: P031GraphQLDocuments.ideaTitle,
       runStatusChanged: P031GraphQLDocuments.runStatusChanged,
       daemonStatusChanged: P031GraphQLDocuments.daemonStatusChanged
     )
@@ -1479,6 +1480,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
           P031RunRowReadModel(
             id: "run-1",
             status: "projection_lag",
+            ideaTitle: "Implement Proposal 017",
             workflowTitle: " Full MVP ",
             freshnessState: .projectionLag,
             totalStages: 4,
@@ -1499,7 +1501,8 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
 
     #expect(presentation.orientation?.externalWritePathLabel == "Open external write-path guide")
     #expect(presentation.rows.map(\.runID) == ["run-1"])
-    #expect(presentation.rows.first?.title == "Full MVP")
+    #expect(presentation.rows.first?.title == "Implement Proposal 017")
+    #expect(presentation.rows.first?.workflowLabel == "Workflow: Full MVP")
     #expect(presentation.rows.first?.statusLabel == "Projection Lag")
     #expect(presentation.rows.first?.progressLabel == "2/4 stages")
     #expect(presentation.rows.first?.pendingApprovalsLabel == "1 approvals pending")
@@ -1560,6 +1563,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     let run = P031RunRowReadModel(
       id: "run-1",
       status: "running",
+      ideaTitle: "Implement Proposal 031",
       workflowTitle: "Full MVP",
       freshnessState: .live,
       totalStages: 2,
@@ -1645,7 +1649,8 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       checkedAt: checked
     )
 
-    #expect(runDetail.title == "Full MVP")
+    #expect(runDetail.title == "Implement Proposal 031")
+    #expect(runDetail.workflowLabel == "Workflow: Full MVP")
     #expect(runDetail.statusLabel == "Running")
     #expect(runDetail.progressLabel == "1/2 stages")
     #expect(runDetail.pendingApprovalsLabel == "1 approvals pending")
@@ -1670,6 +1675,149 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       stageList.rows.first?.badgeLabels == ["Approval pending", "Artifacts", "Projection lag"])
     #expect(stageList.freshness.state == P031FreshnessState.stale)
     #expect(stageList.refreshFeedbackText == "Updating stages")
+  }
+
+  @Test("Thin workflow screen coordinator restores run-centric idea, transition, artifact, and catalog context")
+  func thinWorkflowScreenCoordinatorRestoresRunCentricInspectionContext() async {
+    let checked = Date(timeIntervalSince1970: 58.5)
+    let run = P031RunRowReadModel(
+      id: "run-1",
+      status: "blocked",
+      ideaID: "idea-031",
+      projectKey: "chainworks",
+      workflowTitle: "Full MVP",
+      workflowID: "full_mvp",
+      workflowSnapshotHash: "workflow-sha",
+      catalogSnapshotHash: "catalog-sha",
+      freshnessState: .live,
+      totalStages: 3,
+      completedStages: 1,
+      failedStages: 1,
+      pendingApprovals: 0
+    )
+    let idea = P031IdeaReadModel(
+      id: "idea-031",
+      title: "Implement Proposal 031",
+      body: "Thin GraphQL-only UI restoration",
+      projectKey: "chainworks",
+      status: "active",
+      createdAt: "2026-04-25T00:00:00Z"
+    )
+    let stages = [
+      P031StageReadModel(
+        id: "stage-1",
+        runID: "run-1",
+        stageID: "state_1",
+        label: "Proposal drafted",
+        status: "completed",
+        iteration: 1,
+        attemptNumber: 1,
+        settlementKind: nil,
+        hasArtifacts: true,
+        hasPendingApproval: false,
+        hasValidationFailure: false,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-25T00:00:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+      P031StageReadModel(
+        id: "stage-2",
+        runID: "run-1",
+        stageID: "state_2",
+        label: "Implementation reviewed",
+        status: "blocked",
+        iteration: 2,
+        attemptNumber: 1,
+        settlementKind: "missing_required_outputs",
+        hasArtifacts: true,
+        hasPendingApproval: false,
+        hasValidationFailure: true,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-25T00:00:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+      P031StageReadModel(
+        id: "stage-3",
+        runID: "run-1",
+        stageID: "state_3",
+        label: "Approval required",
+        status: "pending",
+        iteration: 2,
+        attemptNumber: 1,
+        settlementKind: nil,
+        hasArtifacts: false,
+        hasPendingApproval: true,
+        hasValidationFailure: false,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-25T00:00:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+    ]
+    let artifacts = [
+      makeArtifact(
+        id: "artifact-md",
+        name: "proposal.md",
+        format: "markdown",
+        payloadAvailabilityState: .available,
+        payloadUnavailableReasonCode: nil,
+        diagnosticID: nil,
+        payloadText: "# Proposal\n\nReady"
+      ),
+      makeArtifact(
+        id: "artifact-json",
+        name: "report.json",
+        format: "json",
+        payloadAvailabilityState: .available,
+        payloadUnavailableReasonCode: nil,
+        diagnosticID: nil,
+        payloadText: #"{"status":"ready"}"#
+      ),
+      makeArtifact(
+        id: "artifact-report",
+        name: "release report",
+        format: "report",
+        reportKind: "release",
+        payloadAvailabilityState: .metadataOnly,
+        payloadUnavailableReasonCode: .payloadDeferredByP031,
+        diagnosticID: "artifact-report",
+        payloadText: nil
+      ),
+    ]
+    let coordinator = P031ThinWorkflowScreenCoordinator(
+      store: P031InMemoryWorkflowReadStore(
+        ideasByID: ["idea-031": idea],
+        runDetailsByRunID: [
+          "run-1": P031RunDetailReadModel(run: run, stages: stages, artifacts: artifacts)
+        ]
+      )
+    )
+
+    let detail = await coordinator.loadRunDetail(
+      runID: "run-1",
+      currentFreshness: P031FreshnessSnapshot(state: .live),
+      checkedAt: checked
+    )
+
+    #expect(detail.title == "Implement Proposal 031")
+    #expect(detail.ideaContext?.title == "Implement Proposal 031")
+    #expect(detail.ideaContext?.statusLabel == "Active")
+    #expect(detail.ideaContext?.body == "Thin GraphQL-only UI restoration")
+    #expect(detail.ideaContext?.projectKey == "chainworks")
+    #expect(detail.stageTransitions.map(\.stageTitle) == [
+      "Proposal drafted",
+      "Implementation reviewed",
+      "Approval required",
+    ])
+    #expect(detail.stageTransitions.map(\.connectorState) == [.completed, .blocked, .pending])
+    #expect(detail.artifactViewerRows.map(\.renderMode) == [.markdown, .json])
+    #expect(detail.artifactViewerRows.map(\.payloadState) == [.available, .available])
+    #expect(detail.reportRows.map(\.title) == ["release report"])
+    #expect(detail.catalogContext?.workflowID == "full_mvp")
+    #expect(detail.catalogContext?.workflowSnapshotHash == "workflow-sha")
+    #expect(detail.catalogContext?.catalogSnapshotHash == "catalog-sha")
   }
 
   @Test("Thin workflow screen coordinator renders artifacts, reports, and daemon lifecycle")
@@ -2059,9 +2207,12 @@ private func makeStage(
 private func makeArtifact(
   id: String,
   name: String,
+  format: String = "json",
+  reportKind: String? = nil,
   payloadAvailabilityState: P031PayloadAvailabilityState,
   payloadUnavailableReasonCode: P031PayloadUnavailableReasonCode?,
-  diagnosticID: String?
+  diagnosticID: String?,
+  payloadText: String? = nil
 ) -> P031ArtifactReadModel {
   P031ArtifactReadModel(
     id: id,
@@ -2070,15 +2221,16 @@ private func makeArtifact(
     agentID: "agent",
     name: name,
     contractID: "summary",
-    format: "json",
+    format: format,
     isPinned: false,
-    reportKind: nil,
+    reportKind: reportKind,
     reportVersion: nil,
     outputSettlement: nil,
     sourceGenerationVerified: true,
     freshnessState: .live,
     payloadAvailabilityState: payloadAvailabilityState,
     payloadUnavailableReasonCode: payloadUnavailableReasonCode,
+    payloadText: payloadText,
     diagnosticID: diagnosticID,
     serverDebugDetail: nil
   )
@@ -2131,6 +2283,10 @@ private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
   }
 
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
+  func fetchIdea(id: String) async throws -> P031IdeaReadModel? {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
 

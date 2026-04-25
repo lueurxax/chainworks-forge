@@ -1,0 +1,53 @@
+<h2>P031 Run-Centric Thin UI Design</h2>
+<p class="subtitle">Selected direction: B. The first useful surface is a run workspace; ideas and catalogs return as read-only context panels, not as old local-write tabs.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Run workspace: GraphQL-only read model</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:260px 1fr;gap:14px;min-height:560px;">
+      <div class="mock-sidebar">
+        <strong>Runs</strong>
+        <div class="placeholder" style="height:70px;margin-top:12px;">P017 Control Plane<br><small>blocked · 31/38 · live</small></div>
+        <div class="placeholder" style="height:70px;">P031 Thin UI<br><small>cancelled · 68/88 · live</small></div>
+        <div class="placeholder" style="height:70px;">P051 Xcode MCP<br><small>blocked · 56/85 · live</small></div>
+        <hr>
+        <strong>Idea context</strong>
+        <div class="placeholder" style="height:88px;">Selected run's idea title/body/workspace<br><small>read-only GraphQL</small></div>
+        <strong>Catalog context</strong>
+        <div class="placeholder" style="height:70px;">Agent/workflow catalog snapshot<br><small>read-only GraphQL or explicit unavailable</small></div>
+      </div>
+      <div class="mock-content">
+        <strong>Complete P017 Phase B/C control-plane implementation</strong>
+        <div style="display:grid;grid-template-columns:1.2fr .8fr;gap:12px;margin-top:12px;">
+          <div class="placeholder" style="height:90px;">Run summary: status, progress, freshness, approvals</div>
+          <div class="placeholder" style="height:90px;">External write-path guide + diagnostic IDs</div>
+        </div>
+        <div class="placeholder" style="height:150px;margin-top:12px;">Stage transition visualization: completed → reviewed → refined → blocked<br><small>server stage list + workflow snapshot transitions; no local workflow compiler fallback</small></div>
+        <div style="display:grid;grid-template-columns:280px 1fr;gap:12px;margin-top:12px;">
+          <div class="placeholder" style="height:180px;">Artifacts/reports list<br><small>metadata, kind, payload state</small></div>
+          <div class="placeholder" style="height:180px;">Renderer<br><small>Markdown / JSON / diff only when GraphQL payload is available; otherwise explicit metadata-only state</small></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>Implementation slices</h4>
+    <ul>
+      <li>Run identity + detail polish, including idea titles.</li>
+      <li>Stage transition visualization from GraphQL stage/workflow readback.</li>
+      <li>Artifacts/reports list plus Markdown/JSON renderer when server payload readback exists.</li>
+      <li>Idea and catalog context panels as read-only inspectors.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Thin UI constraints</h4>
+    <ul>
+      <li>No SwiftData, no local execution/recovery services, no MCP UI calls.</li>
+      <li>No raw artifact filesystem scans as workflow truth.</li>
+      <li>Missing server read fields become unavailable/deferred UI, or we add GraphQL read-only fields server-side.</li>
+    </ul>
+  </div>
+</div>

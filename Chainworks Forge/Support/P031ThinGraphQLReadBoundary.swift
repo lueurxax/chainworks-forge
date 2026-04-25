@@ -61,7 +61,7 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
   let variables: [String: P031GraphQLVariableValue]
   let operationKind: P031GraphQLOperationKind
 
-  init(
+  nonisolated init(
     operationName: String,
     document: String,
     variables: [String: P031GraphQLVariableValue] = [:]
@@ -101,7 +101,9 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
     self.variables = variables
   }
 
-  private static func operations(in document: String) throws -> [(keyword: String, name: String?)] {
+  nonisolated private static func operations(in document: String) throws
+    -> [(keyword: String, name: String?)]
+  {
     let scanDocument = document.maskingGraphQLIgnoredTextForP031OperationScan()
     var operations: [(keyword: String, name: String?)] = []
     var index = scanDocument.startIndex
@@ -159,7 +161,10 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
     return operations
   }
 
-  private static func operationName(after tokenEnd: String.Index, in document: String) -> String? {
+  nonisolated private static func operationName(
+    after tokenEnd: String.Index,
+    in document: String
+  ) -> String? {
     var index = tokenEnd
     while index < document.endIndex, document[index].isWhitespace {
       index = document.index(after: index)
@@ -175,7 +180,7 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
     return String(document[nameStart..<index])
   }
 
-  private static func isGraphQLNameStart(_ character: Character) -> Bool {
+  nonisolated private static func isGraphQLNameStart(_ character: Character) -> Bool {
     guard let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1 else {
       return false
     }
@@ -184,14 +189,14 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
       || (97...122).contains(scalar.value)
   }
 
-  private static func isGraphQLNameContinue(_ character: Character) -> Bool {
+  nonisolated private static func isGraphQLNameContinue(_ character: Character) -> Bool {
     guard let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1 else {
       return false
     }
     return isGraphQLNameStart(character) || (48...57).contains(scalar.value)
   }
 
-  private static func isForbiddenOperationName(_ operationName: String) -> Bool {
+  nonisolated private static func isForbiddenOperationName(_ operationName: String) -> Bool {
     let lowercase = operationName.lowercased()
     return [
       "mutation",
@@ -216,7 +221,7 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
 }
 
 extension String {
-  fileprivate func maskingGraphQLIgnoredTextForP031OperationScan() -> String {
+  nonisolated fileprivate func maskingGraphQLIgnoredTextForP031OperationScan() -> String {
     var masked = ""
     masked.reserveCapacity(count)
     var index = startIndex
@@ -1076,12 +1081,137 @@ struct P031ReportMetadataReadModel: Decodable, Equatable, Sendable {
 struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let id: String
   let status: String
+  let ideaID: String?
+  let ideaTitle: String?
+  let projectKey: String?
   let workflowTitle: String
+  let workflowID: String?
+  let workflowSnapshotHash: String?
+  let catalogSnapshotHash: String?
   let freshnessState: P031FreshnessState
   let totalStages: Int?
   let completedStages: Int?
   let failedStages: Int?
   let pendingApprovals: Int?
+
+  nonisolated init(
+    id: String,
+    status: String,
+    ideaID: String? = nil,
+    ideaTitle: String? = nil,
+    projectKey: String? = nil,
+    workflowTitle: String,
+    workflowID: String? = nil,
+    workflowSnapshotHash: String? = nil,
+    catalogSnapshotHash: String? = nil,
+    freshnessState: P031FreshnessState,
+    totalStages: Int?,
+    completedStages: Int?,
+    failedStages: Int?,
+    pendingApprovals: Int?
+  ) {
+    self.id = id
+    self.status = status
+    self.ideaID = ideaID
+    self.ideaTitle = ideaTitle
+    self.projectKey = projectKey
+    self.workflowTitle = workflowTitle
+    self.workflowID = workflowID
+    self.workflowSnapshotHash = workflowSnapshotHash
+    self.catalogSnapshotHash = catalogSnapshotHash
+    self.freshnessState = freshnessState
+    self.totalStages = totalStages
+    self.completedStages = completedStages
+    self.failedStages = failedStages
+    self.pendingApprovals = pendingApprovals
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case status
+    case ideaID = "ideaId"
+    case ideaTitle
+    case projectKey
+    case workflowTitle
+    case workflowID = "workflowId"
+    case workflowSnapshotHash
+    case catalogSnapshotHash
+    case freshnessState
+    case totalStages
+    case completedStages
+    case failedStages
+    case pendingApprovals
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(String.self, forKey: .id),
+      status: try container.decode(String.self, forKey: .status),
+      ideaID: try container.decodeIfPresent(String.self, forKey: .ideaID),
+      ideaTitle: try container.decodeIfPresent(String.self, forKey: .ideaTitle),
+      projectKey: try container.decodeIfPresent(String.self, forKey: .projectKey),
+      workflowTitle: try container.decode(String.self, forKey: .workflowTitle),
+      workflowID: try container.decodeIfPresent(String.self, forKey: .workflowID),
+      workflowSnapshotHash: try container.decodeIfPresent(String.self, forKey: .workflowSnapshotHash),
+      catalogSnapshotHash: try container.decodeIfPresent(String.self, forKey: .catalogSnapshotHash),
+      freshnessState: try container.decode(P031FreshnessState.self, forKey: .freshnessState),
+      totalStages: try container.decodeIfPresent(Int.self, forKey: .totalStages),
+      completedStages: try container.decodeIfPresent(Int.self, forKey: .completedStages),
+      failedStages: try container.decodeIfPresent(Int.self, forKey: .failedStages),
+      pendingApprovals: try container.decodeIfPresent(Int.self, forKey: .pendingApprovals)
+    )
+  }
+
+  nonisolated func withIdeaTitle(_ title: String?) -> P031RunRowReadModel {
+    P031RunRowReadModel(
+      id: id,
+      status: status,
+      ideaID: ideaID,
+      ideaTitle: title ?? ideaTitle,
+      projectKey: projectKey,
+      workflowTitle: workflowTitle,
+      workflowID: workflowID,
+      workflowSnapshotHash: workflowSnapshotHash,
+      catalogSnapshotHash: catalogSnapshotHash,
+      freshnessState: freshnessState,
+      totalStages: totalStages,
+      completedStages: completedStages,
+      failedStages: failedStages,
+      pendingApprovals: pendingApprovals
+    )
+  }
+}
+
+struct P031IdeaReadModel: Decodable, Equatable, Sendable {
+  let id: String
+  let title: String
+  let body: String?
+  let workspaceRootPath: String?
+  let projectKey: String?
+  let status: String?
+  let createdAt: String?
+  let archivedAt: String?
+
+  nonisolated init(
+    id: String,
+    title: String,
+    body: String? = nil,
+    workspaceRootPath: String? = nil,
+    projectKey: String? = nil,
+    status: String? = nil,
+    createdAt: String? = nil,
+    archivedAt: String? = nil
+  ) {
+    self.id = id
+    self.title = title
+    self.body = body
+    self.workspaceRootPath = workspaceRootPath
+    self.projectKey = projectKey
+    self.status = status
+    self.createdAt = createdAt
+    self.archivedAt = archivedAt
+  }
 }
 
 struct P031RunStatusChangedReadModel: Decodable, Equatable, Sendable {
@@ -1166,8 +1296,49 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
   let freshnessState: P031FreshnessState
   let payloadAvailabilityState: P031PayloadAvailabilityState
   let payloadUnavailableReasonCode: P031PayloadUnavailableReasonCode?
+  let payloadText: String?
   let diagnosticID: String?
   let serverDebugDetail: String?
+
+  init(
+    id: String,
+    runID: String,
+    stageID: String,
+    agentID: String? = nil,
+    name: String,
+    contractID: String,
+    format: String,
+    isPinned: Bool? = nil,
+    reportKind: String? = nil,
+    reportVersion: Int? = nil,
+    outputSettlement: String? = nil,
+    sourceGenerationVerified: Bool? = nil,
+    freshnessState: P031FreshnessState,
+    payloadAvailabilityState: P031PayloadAvailabilityState,
+    payloadUnavailableReasonCode: P031PayloadUnavailableReasonCode? = nil,
+    payloadText: String? = nil,
+    diagnosticID: String? = nil,
+    serverDebugDetail: String? = nil
+  ) {
+    self.id = id
+    self.runID = runID
+    self.stageID = stageID
+    self.agentID = agentID
+    self.name = name
+    self.contractID = contractID
+    self.format = format
+    self.isPinned = isPinned
+    self.reportKind = reportKind
+    self.reportVersion = reportVersion
+    self.outputSettlement = outputSettlement
+    self.sourceGenerationVerified = sourceGenerationVerified
+    self.freshnessState = freshnessState
+    self.payloadAvailabilityState = payloadAvailabilityState
+    self.payloadUnavailableReasonCode = payloadUnavailableReasonCode
+    self.payloadText = payloadText
+    self.diagnosticID = diagnosticID
+    self.serverDebugDetail = serverDebugDetail
+  }
 
   nonisolated var isReportMetadata: Bool {
     let normalizedFormat = format.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1206,6 +1377,7 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     case freshnessState
     case payloadAvailabilityState
     case payloadUnavailableReasonCode
+    case payloadText
     case diagnosticID = "diagnosticId"
     case serverDebugDetail
   }
@@ -1213,17 +1385,20 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
 
 struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
   let run: P031RunRowReadModel?
+  let idea: P031IdeaReadModel?
   let stages: [P031StageReadModel]
   let artifacts: [P031ArtifactReadModel]
   let approvalInbox: [P031ApprovalReadModel]
 
   nonisolated init(
     run: P031RunRowReadModel?,
+    idea: P031IdeaReadModel? = nil,
     stages: [P031StageReadModel],
     artifacts: [P031ArtifactReadModel],
     approvalInbox: [P031ApprovalReadModel] = []
   ) {
     self.run = run
+    self.idea = idea
     self.stages = stages
     self.artifacts = artifacts
     self.approvalInbox = approvalInbox
@@ -1253,6 +1428,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
 
   enum CodingKeys: String, CodingKey {
     case run
+    case idea
     case stages
     case artifacts
     case approvalInbox
@@ -1261,6 +1437,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     self.run = try container.decodeIfPresent(P031RunRowReadModel.self, forKey: .run)
+    self.idea = try container.decodeIfPresent(P031IdeaReadModel.self, forKey: .idea)
     self.stages =
       try container.decodeIfPresent([P031StageReadModel].self, forKey: .stages) ?? []
     self.artifacts =
@@ -1281,6 +1458,7 @@ struct P031StageDetailReadModel: Decodable, Equatable, Sendable {
 protocol P031WorkflowReadStore: Sendable {
   func fetchRuns() async throws -> [P031RunRowReadModel]
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel
+  func fetchIdea(id: String) async throws -> P031IdeaReadModel?
   func fetchStageDetail(stageExecutionID: String) async throws -> P031StageDetailReadModel
   func fetchStages(runID: String) async throws -> [P031StageReadModel]
   func fetchApprovalInbox() async throws -> [P031ApprovalReadModel]
@@ -1302,6 +1480,7 @@ struct P031GraphQLDocumentSet: Equatable, Sendable {
   let artifacts: String
   let reportMetadata: String
   let daemonStatus: String
+  let ideaTitle: String
   let runStatusChanged: String
   let daemonStatusChanged: String
 }
@@ -1312,7 +1491,12 @@ enum P031GraphQLDocuments {
       runs {
         id
         status
+        ideaId
+        projectKey
+        workflowId
         workflowTitle
+        workflowSnapshotHash
+        catalogSnapshotHash
         freshnessState
         totalStages
         completedStages
@@ -1327,7 +1511,12 @@ enum P031GraphQLDocuments {
       run(id: $runId) {
         id
         status
+        ideaId
+        projectKey
+        workflowId
         workflowTitle
+        workflowSnapshotHash
+        catalogSnapshotHash
         freshnessState
         totalStages
         completedStages
@@ -1367,6 +1556,7 @@ enum P031GraphQLDocuments {
         freshnessState
         payloadAvailabilityState
         payloadUnavailableReasonCode
+        payloadText
         diagnosticId
         serverDebugDetail
       }
@@ -1462,6 +1652,7 @@ enum P031GraphQLDocuments {
         freshnessState
         payloadAvailabilityState
         payloadUnavailableReasonCode
+        payloadText
         diagnosticId
         serverDebugDetail
       }
@@ -1505,6 +1696,21 @@ enum P031GraphQLDocuments {
     }
     """
 
+  static let ideaTitle = """
+    query P031IdeaTitle($ideaId: ID!) {
+      idea(id: $ideaId) {
+        id
+        title
+        body
+        workspaceRootPath
+        projectKey
+        status
+        createdAt
+        archivedAt
+      }
+    }
+    """
+
   static let daemonStatusChanged = """
     subscription P031DaemonStatusChanged {
       daemonStatusChanged {
@@ -1522,6 +1728,7 @@ enum P031GraphQLDocuments {
     artifacts: artifacts,
     reportMetadata: reportMetadata,
     daemonStatus: daemonStatus,
+    ideaTitle: ideaTitle,
     runStatusChanged: runStatusChanged,
     daemonStatusChanged: daemonStatusChanged
   )
@@ -1550,16 +1757,38 @@ struct P031GraphQLWorkflowReadStore<
       operationName: "P031RunsHome",
       document: documents.runsHome
     )
-    return payload.runs
+    return await enrichRunsWithIdeaTitles(payload.runs)
   }
 
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel {
-    try await readClient.execute(
+    let detail = try await readClient.execute(
       P031RunDetailReadModel.self,
       operationName: "P031RunDetail",
       document: documents.runDetail,
       variables: ["runId": .string(runID)]
     )
+    guard let run = detail.run, let ideaID = run.ideaID, run.ideaTitle == nil,
+      let ideaTitle = await fetchIdeaTitle(ideaID: ideaID)
+    else {
+      return detail
+    }
+    return P031RunDetailReadModel(
+      run: run.withIdeaTitle(ideaTitle),
+      idea: detail.idea,
+      stages: detail.stages,
+      artifacts: detail.artifacts,
+      approvalInbox: detail.approvalInbox
+    )
+  }
+
+  func fetchIdea(id: String) async throws -> P031IdeaReadModel? {
+    let payload = try await readClient.execute(
+      IdeaPayload.self,
+      operationName: "P031IdeaTitle",
+      document: documents.ideaTitle,
+      variables: ["ideaId": .string(id)]
+    )
+    return payload.idea
   }
 
   func fetchStageDetail(stageExecutionID: String) async throws -> P031StageDetailReadModel {
@@ -1670,8 +1899,32 @@ struct P031GraphQLWorkflowReadStore<
     }
   }
 
+  private func enrichRunsWithIdeaTitles(_ runs: [P031RunRowReadModel]) async
+    -> [P031RunRowReadModel]
+  {
+    let ideaIDs = Array(Set(runs.compactMap(\.ideaID)))
+    var ideaTitles: [String: String] = [:]
+    for ideaID in ideaIDs {
+      ideaTitles[ideaID] = await fetchIdeaTitle(ideaID: ideaID)
+    }
+    return runs.map { run in
+      guard let ideaID = run.ideaID else {
+        return run
+      }
+      return run.withIdeaTitle(ideaTitles[ideaID])
+    }
+  }
+
+  private func fetchIdeaTitle(ideaID: String) async -> String? {
+    (try? await fetchIdea(id: ideaID))?.title
+  }
+
   private struct RunsPayload: Decodable {
     let runs: [P031RunRowReadModel]
+  }
+
+  private struct IdeaPayload: Decodable {
+    let idea: P031IdeaReadModel?
   }
 
   private struct StagesPayload: Decodable {
@@ -1709,6 +1962,7 @@ struct P031GraphQLWorkflowReadStore<
 
 struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
   let runs: [P031RunRowReadModel]
+  let ideasByID: [String: P031IdeaReadModel]
   let runDetailsByRunID: [String: P031RunDetailReadModel]
   let stageDetailsByStageExecutionID: [String: P031StageDetailReadModel]
   let stagesByRunID: [String: [P031StageReadModel]]
@@ -1721,6 +1975,7 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
 
   init(
     runs: [P031RunRowReadModel] = [],
+    ideasByID: [String: P031IdeaReadModel] = [:],
     runDetailsByRunID: [String: P031RunDetailReadModel] = [:],
     stageDetailsByStageExecutionID: [String: P031StageDetailReadModel] = [:],
     stagesByRunID: [String: [P031StageReadModel]] = [:],
@@ -1732,6 +1987,7 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     daemonStatusEvents: [P031DaemonStatusReadModel] = []
   ) {
     self.runs = runs
+    self.ideasByID = ideasByID
     self.runDetailsByRunID = runDetailsByRunID
     self.stageDetailsByStageExecutionID = stageDetailsByStageExecutionID
     self.stagesByRunID = stagesByRunID
@@ -1749,6 +2005,10 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
 
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel {
     runDetailsByRunID[runID] ?? P031RunDetailReadModel(run: nil, stages: [], artifacts: [])
+  }
+
+  func fetchIdea(id: String) async throws -> P031IdeaReadModel? {
+    ideasByID[id]
   }
 
   func fetchStageDetail(stageExecutionID: String) async throws -> P031StageDetailReadModel {
@@ -2628,6 +2888,7 @@ enum P031FirstRunOrientationPresenter {
 struct P031RunsHomeRowPresentation: Equatable, Sendable {
   let runID: String
   let title: String
+  let workflowLabel: String?
   let statusLabel: String
   let progressLabel: String?
   let pendingApprovalsLabel: String?
@@ -2693,15 +2954,79 @@ struct P031ArtifactSummaryPresentation: Equatable, Sendable {
   let accessibilityLabel: String
 }
 
+struct P031IdeaContextPresentation: Equatable, Sendable {
+  let id: String
+  let title: String
+  let statusLabel: String?
+  let projectKey: String?
+  let body: String?
+  let createdAt: String?
+  let archivedAt: String?
+  let accessibilityLabel: String
+}
+
+enum P031StageConnectorState: Equatable, Sendable {
+  case completed
+  case blocked
+  case running
+  case pending
+  case unavailable
+}
+
+struct P031StageTransitionPresentation: Equatable, Sendable {
+  let stageExecutionID: String
+  let stageTitle: String
+  let statusText: String
+  let attemptText: String?
+  let connectorState: P031StageConnectorState
+  let evidenceLabels: [String]
+  let accessibilityLabel: String
+}
+
+enum P031ArtifactRenderMode: Equatable, Sendable {
+  case markdown
+  case json
+  case diff
+  case plainText
+  case metadataOnly
+  case unavailable
+}
+
+struct P031ArtifactViewerPresentation: Equatable, Sendable {
+  let artifactID: String
+  let title: String
+  let subtitle: String
+  let renderMode: P031ArtifactRenderMode
+  let payloadState: P031PayloadAvailabilityState
+  let payloadText: String?
+  let unavailableReason: String?
+  let freshnessState: P031FreshnessState
+  let accessibilityLabel: String
+}
+
+struct P031CatalogContextPresentation: Equatable, Sendable {
+  let workflowID: String?
+  let workflowTitle: String
+  let workflowSnapshotHash: String?
+  let catalogSnapshotHash: String?
+  let statusText: String
+  let accessibilityLabel: String
+}
+
 struct P031RunDetailPresentation: Equatable, Sendable {
   let title: String
+  let workflowLabel: String?
   let statusLabel: String
   let progressLabel: String?
   let pendingApprovalsLabel: String?
+  let ideaContext: P031IdeaContextPresentation?
   let stageRows: [P031StageSummaryPresentation]
+  let stageTransitions: [P031StageTransitionPresentation]
   let approvalRows: [P031ApprovalInboxRowPresentation]
   let artifactRows: [P031ArtifactSummaryPresentation]
+  let artifactViewerRows: [P031ArtifactViewerPresentation]
   let reportRows: [P031ReportMetadataRowPresentation]
+  let catalogContext: P031CatalogContextPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -2802,8 +3127,15 @@ enum P031RunsHomePresenter {
   nonisolated static func rowPresentation(for run: P031RunRowReadModel)
     -> P031RunsHomeRowPresentation
   {
-    let title = run.workflowTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-    let displayTitle = title.isEmpty ? "Untitled workflow" : title
+    let trimmedIdeaTitle = run.ideaTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let workflowTitle = run.workflowTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    let ideaTitle = trimmedIdeaTitle.flatMap { $0.isEmpty ? nil : $0 }
+    let displayTitle =
+      ideaTitle ?? (workflowTitle.isEmpty ? "Untitled workflow" : workflowTitle)
+    let workflowLabel =
+      ideaTitle != nil && !workflowTitle.isEmpty
+      ? "Workflow: \(workflowTitle)"
+      : nil
     let statusLabel = P031ThinPresentationFormatting.titleCase(run.status)
     let progressLabel: String?
     if let completedStages = run.completedStages, let totalStages = run.totalStages {
@@ -2818,6 +3150,7 @@ enum P031RunsHomePresenter {
       : nil
     let accessibilityParts = [
       displayTitle,
+      workflowLabel,
       statusLabel,
       progressLabel,
       pendingApprovalsLabel,
@@ -2827,6 +3160,7 @@ enum P031RunsHomePresenter {
     return P031RunsHomeRowPresentation(
       runID: run.id,
       title: displayTitle,
+      workflowLabel: workflowLabel,
       statusLabel: statusLabel,
       progressLabel: progressLabel,
       pendingApprovalsLabel: pendingApprovalsLabel,
@@ -2944,10 +3278,13 @@ enum P031RunDetailPresenter {
     writePathGuideState: P031ExternalWritePathGuideState = .unavailable
   ) -> P031RunDetailPresentation {
     let run = detail.run
-    let title = run.map(P031RunsHomePresenter.rowPresentation)?.title ?? "Run unavailable"
+    let runRow = run.map(P031RunsHomePresenter.rowPresentation)
+    let title = runRow?.title ?? "Run unavailable"
+    let workflowLabel = runRow?.workflowLabel
     let statusLabel =
       run.map { P031ThinPresentationFormatting.titleCase($0.status) } ?? "Unavailable"
     let stageRows = detail.stages.map(P031StagePresenter.presentation)
+    let stageTransitions = detail.stages.map(P031StageTransitionPresenter.presentation)
     let approvalRows = detail.approvalsForRun.map {
       P031ApprovalInboxPresenter.rowPresentation(
         for: $0,
@@ -2955,6 +3292,7 @@ enum P031RunDetailPresenter {
       )
     }
     let artifactRows = detail.ordinaryArtifacts.map(P031ArtifactPresenter.presentation)
+    let artifactViewerRows = detail.ordinaryArtifacts.map(P031ArtifactViewerPresenter.presentation)
     let reportRows = detail.reportMetadata.map(ReportMetadataRowPresenter.presentation)
     let progressLabel: String?
     if let completedStages = run?.completedStages, let totalStages = run?.totalStages {
@@ -2974,13 +3312,18 @@ enum P031RunDetailPresenter {
 
     return P031RunDetailPresentation(
       title: title,
+      workflowLabel: workflowLabel,
       statusLabel: statusLabel,
       progressLabel: progressLabel,
       pendingApprovalsLabel: pendingApprovalsLabel,
+      ideaContext: P031IdeaContextPresenter.presentation(for: detail.idea, fallbackRun: run),
       stageRows: stageRows,
+      stageTransitions: stageTransitions,
       approvalRows: approvalRows,
       artifactRows: artifactRows,
+      artifactViewerRows: artifactViewerRows,
       reportRows: reportRows,
+      catalogContext: run.map(P031CatalogContextPresenter.presentation),
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -2999,13 +3342,18 @@ enum P031RunDetailPresenter {
   ) -> P031RunDetailPresentation {
     P031RunDetailPresentation(
       title: "Run unavailable",
+      workflowLabel: nil,
       statusLabel: "Unavailable",
       progressLabel: nil,
       pendingApprovalsLabel: nil,
+      ideaContext: nil,
       stageRows: [],
+      stageTransitions: [],
       approvalRows: [],
       artifactRows: [],
+      artifactViewerRows: [],
       reportRows: [],
+      catalogContext: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
@@ -3094,6 +3442,194 @@ enum P031StagePresenter {
       iterationLabel: iterationLabel,
       badgeLabels: badgeLabels,
       freshnessState: stage.freshnessState,
+      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+    )
+  }
+}
+
+enum P031IdeaContextPresenter {
+  nonisolated static func presentation(
+    for idea: P031IdeaReadModel?,
+    fallbackRun run: P031RunRowReadModel?
+  ) -> P031IdeaContextPresentation? {
+    guard let ideaID = idea?.id ?? run?.ideaID else {
+      return nil
+    }
+    let rawTitle = idea?.title ?? run?.ideaTitle ?? "Idea \(ideaID)"
+    let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? "Idea \(ideaID)"
+      : rawTitle
+    let statusLabel = idea?.status.map(P031ThinPresentationFormatting.titleCase)
+    let projectKey = idea?.projectKey ?? run?.projectKey
+    let accessibilityParts = [
+      title,
+      statusLabel,
+      projectKey.map { "Project \($0)" },
+    ].compactMap { $0 }
+    return P031IdeaContextPresentation(
+      id: ideaID,
+      title: title,
+      statusLabel: statusLabel,
+      projectKey: projectKey,
+      body: idea?.body,
+      createdAt: idea?.createdAt,
+      archivedAt: idea?.archivedAt,
+      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+    )
+  }
+}
+
+enum P031StageTransitionPresenter {
+  nonisolated static func presentation(for stage: P031StageReadModel)
+    -> P031StageTransitionPresentation
+  {
+    let statusText = P031ThinPresentationFormatting.titleCase(stage.status)
+    let attemptText: String?
+    if let iteration = stage.iteration, let attempt = stage.attemptNumber {
+      attemptText = "Iteration \(iteration), attempt \(attempt)"
+    } else if let iteration = stage.iteration {
+      attemptText = "Iteration \(iteration)"
+    } else {
+      attemptText = nil
+    }
+    let evidenceLabels = [
+      stage.hasArtifacts == true ? "Artifacts" : nil,
+      stage.hasPendingApproval == true ? "Approval" : nil,
+      stage.hasValidationFailure == true ? "Validation" : nil,
+      stage.settlementKind.map(P031ThinPresentationFormatting.titleCase),
+    ].compactMap { $0 }
+    let accessibilityParts = [stage.label, statusText, attemptText].compactMap { $0 }
+      + evidenceLabels
+    return P031StageTransitionPresentation(
+      stageExecutionID: stage.id,
+      stageTitle: stage.label,
+      statusText: statusText,
+      attemptText: attemptText,
+      connectorState: connectorState(for: stage),
+      evidenceLabels: P031ThinPresentationFormatting.uniqueLabels(evidenceLabels),
+      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+    )
+  }
+
+  nonisolated private static func connectorState(for stage: P031StageReadModel)
+    -> P031StageConnectorState
+  {
+    let status = stage.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if stage.projectionLag || !stage.projectionPresent {
+      return .unavailable
+    }
+    if status.contains("complete") || status == "succeeded" || status == "approved" {
+      return .completed
+    }
+    if status.contains("block") || status.contains("fail") || stage.hasValidationFailure == true {
+      return .blocked
+    }
+    if status.contains("running") || status.contains("active") || status.contains("in_progress") {
+      return .running
+    }
+    if status.contains("pending") || status.contains("waiting") || stage.hasPendingApproval == true {
+      return .pending
+    }
+    return .pending
+  }
+}
+
+enum P031ArtifactViewerPresenter {
+  nonisolated static func presentation(for artifact: P031ArtifactReadModel)
+    -> P031ArtifactViewerPresentation
+  {
+    let normalizedFormat = artifact.format.trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let payloadText = artifact.payloadText?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hasPayload = payloadText?.isEmpty == false
+    let renderMode: P031ArtifactRenderMode
+    switch artifact.payloadAvailabilityState {
+    case .metadataOnly, .payloadDeferred:
+      renderMode = .metadataOnly
+    case .generating, .unavailable:
+      renderMode = .unavailable
+    case .available:
+      if !hasPayload {
+        renderMode = .unavailable
+      } else if normalizedFormat == "markdown" || normalizedFormat == "md" {
+        renderMode = .markdown
+      } else if normalizedFormat == "json" {
+        renderMode = .json
+      } else if normalizedFormat == "diff" || normalizedFormat == "patch" {
+        renderMode = .diff
+      } else {
+        renderMode = .plainText
+      }
+    }
+    let subtitle = [
+      artifact.contractID,
+      artifact.format,
+      artifact.agentID,
+    ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " / ")
+    let payloadUnavailableReason =
+      artifact.serverDebugDetail
+      ?? artifact.payloadUnavailableReasonCode?.rawValue
+      ?? (hasPayload ? nil : "Payload content is not exposed through GraphQL")
+    let accessibilityParts = [
+      artifact.name,
+      subtitle,
+      P031ThinPresentationFormatting.titleCase(artifact.payloadAvailabilityState.rawValue),
+      payloadUnavailableReason,
+    ].compactMap { $0 }.filter { !$0.isEmpty }
+    return P031ArtifactViewerPresentation(
+      artifactID: artifact.id,
+      title: artifact.name,
+      subtitle: subtitle,
+      renderMode: renderMode,
+      payloadState: artifact.payloadAvailabilityState,
+      payloadText: hasPayload ? payloadText : nil,
+      unavailableReason: unavailableReason(for: renderMode, reason: payloadUnavailableReason),
+      freshnessState: artifact.freshnessState,
+      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+    )
+  }
+
+  nonisolated private static func unavailableReason(
+    for renderMode: P031ArtifactRenderMode,
+    reason: String?
+  ) -> String? {
+    switch renderMode {
+    case .metadataOnly, .unavailable:
+      return reason
+    case .markdown, .json, .diff, .plainText:
+      return nil
+    }
+  }
+}
+
+enum P031CatalogContextPresenter {
+  nonisolated static func presentation(for run: P031RunRowReadModel)
+    -> P031CatalogContextPresentation
+  {
+    let workflowTitle = run.workflowTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? "Workflow unavailable"
+      : run.workflowTitle
+    let statusText: String
+    if run.workflowSnapshotHash == nil && run.catalogSnapshotHash == nil {
+      statusText = "Catalog snapshot content unavailable through GraphQL"
+    } else {
+      statusText = "Snapshot metadata available"
+    }
+    let accessibilityParts = [
+      run.workflowID,
+      workflowTitle,
+      run.workflowSnapshotHash.map { "Workflow snapshot \($0)" },
+      run.catalogSnapshotHash.map { "Catalog snapshot \($0)" },
+      statusText,
+    ].compactMap { $0 }
+    return P031CatalogContextPresentation(
+      workflowID: run.workflowID,
+      workflowTitle: workflowTitle,
+      workflowSnapshotHash: run.workflowSnapshotHash,
+      catalogSnapshotHash: run.catalogSnapshotHash,
+      statusText: statusText,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
     )
   }
@@ -3401,8 +3937,22 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
   ) async -> P031RunDetailPresentation {
     do {
       let detail = try await store.fetchRunDetail(runID: runID)
+      let hydratedDetail: P031RunDetailReadModel
+      if case nil = detail.idea, let ideaID = detail.run?.ideaID {
+        let idea = try? await store.fetchIdea(id: ideaID)
+        let run = detail.run.map { $0.withIdeaTitle(idea?.title) }
+        hydratedDetail = P031RunDetailReadModel(
+          run: run,
+          idea: idea,
+          stages: detail.stages,
+          artifacts: detail.artifacts,
+          approvalInbox: detail.approvalInbox
+        )
+      } else {
+        hydratedDetail = detail
+      }
       return P031RunDetailPresenter.presentation(
-        for: detail,
+        for: hydratedDetail,
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
         writePathGuideState: writePathGuideState

@@ -1,6 +1,6 @@
 {
   "schema_version": "p031-phase-0-artifact-manifest-v1",
-  "status": "implementation_ready_with_phase0d_and_phase3_evidence_pending",
+  "status": "phase0d_runtime_evidence_attached_phase3_dogfood_signoff_pending",
   "entries": [
     {
       "id": "governing_contract",
@@ -48,14 +48,21 @@
       "id": "degraded_state_evidence",
       "path": "docs/evidence/p031-degraded-state-evidence.md",
       "owner_role": "P031 release owner",
-      "validation_status": "pending",
+      "validation_status": "ready_with_scripted_drill_or_waiver_pending",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "degraded_state_sanitized_screenshot",
+      "path": "docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-degraded-sanitized-2026-04-24.png",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready_release_screenshot",
       "blocking_phase": "Phase 0d"
     },
     {
       "id": "freshness_baseline",
       "path": "docs/evidence/p031-freshness-baseline.md",
       "owner_role": "P031 macOS thin UI owner",
-      "validation_status": "pending",
+      "validation_status": "ready_with_dogfood_confirmation_pending",
       "blocking_phase": "Phase 0d"
     },
     {
@@ -66,17 +73,24 @@
       "blocking_phase": "Phase 0d"
     },
     {
+      "id": "report_payload_live_evidence",
+      "path": "docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready_runtime_evidence",
+      "blocking_phase": "Phase 0d"
+    },
+    {
       "id": "ux_accessibility_signoff",
       "path": "docs/evidence/p031-ux-accessibility-signoff.md",
       "owner_role": "P031 macOS thin UI owner",
-      "validation_status": "pending",
+      "validation_status": "validated_with_assistive_access_limitation",
       "blocking_phase": "Phase 0d"
     },
     {
       "id": "dogfood_signoff_template",
       "path": "docs/evidence/p031-dogfood-signoff.md",
       "owner_role": "P031 release owner",
-      "validation_status": "ready",
+      "validation_status": "ready_template_with_runtime_prereqs_attached",
       "blocking_phase": "Phase 3"
     }
   ]

@@ -118,9 +118,11 @@ struct RunsHomeView: View {
             VStack(alignment: .leading, spacing: 20) {
                 if let runDetail = model.runDetail {
                     P031RunDetailSummaryCard(presentation: runDetail)
-                    P031StageListCard(rows: runDetail.stageRows)
+                    P031IdeaContextCard(presentation: runDetail.ideaContext)
+                    P031StageTransitionMapCard(rows: runDetail.stageTransitions)
+                    P031ArtifactViewerCard(rows: runDetail.artifactViewerRows)
+                    P031CatalogContextCard(presentation: runDetail.catalogContext)
                     P031ApprovalInboxCard(presentation: model.approvalInbox)
-                    P031ArtifactListCard(rows: runDetail.artifactRows)
                     P031ReportMetadataCard(rows: runDetail.reportRows)
                 } else {
                     P031CalloutCard(
@@ -372,6 +374,12 @@ private struct P031RunsHomeRowCard: View {
                 Spacer()
                 P031FreshnessBadge(state: row.freshnessState)
             }
+            if let workflowLabel = row.workflowLabel {
+                Text(workflowLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
             Text(row.statusLabel)
                 .font(.subheadline.weight(.medium))
             if let progressLabel = row.progressLabel {
@@ -421,6 +429,7 @@ private struct P031RunDetailSummaryCard: View {
 
     private var detailBody: String {
         [
+            presentation.workflowLabel,
             presentation.statusLabel,
             presentation.progressLabel,
             presentation.pendingApprovalsLabel,
@@ -465,6 +474,126 @@ private struct P031StageListCard: View {
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
                 }
             }
+        }
+    }
+}
+
+private struct P031IdeaContextCard: View {
+    let presentation: P031IdeaContextPresentation?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Idea")
+                .font(.headline)
+            if let presentation {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(presentation.title)
+                            .font(.title3.weight(.semibold))
+                            .lineLimit(2)
+                        Spacer()
+                        if let statusLabel = presentation.statusLabel {
+                            Text(statusLabel)
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.green.opacity(0.12), in: Capsule())
+                        }
+                    }
+                    if let body = presentation.body, !body.isEmpty {
+                        Text(body)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                    }
+                    P031BadgeRow(
+                        labels: [
+                            presentation.projectKey.map { "Project: \($0)" },
+                            presentation.createdAt.map { "Created: \($0)" },
+                            presentation.archivedAt.map { "Archived: \($0)" },
+                        ].compactMap { $0 }
+                    )
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                .accessibilityLabel(presentation.accessibilityLabel)
+            } else {
+                P031EmptySectionRow(
+                    title: "Idea context unavailable",
+                    detail: "The selected run did not include a GraphQL-readable idea reference."
+                )
+            }
+        }
+    }
+}
+
+private struct P031StageTransitionMapCard: View {
+    let rows: [P031StageTransitionPresentation]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Stage transitions")
+                .font(.headline)
+            if rows.isEmpty {
+                P031EmptySectionRow(title: "No transitions", detail: "No stage projections returned.")
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(rows.enumerated()), id: \.element.stageExecutionID) { index, row in
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(spacing: 0) {
+                                Circle()
+                                    .fill(color(for: row.connectorState))
+                                    .frame(width: 12, height: 12)
+                                    .overlay(Circle().stroke(.white.opacity(0.85), lineWidth: 1))
+                                if index < rows.count - 1 {
+                                    Rectangle()
+                                        .fill(color(for: row.connectorState).opacity(0.45))
+                                        .frame(width: 2, height: 42)
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text(row.stageTitle)
+                                        .font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text(row.statusText)
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(color(for: row.connectorState))
+                                }
+                                if let attemptText = row.attemptText {
+                                    Text(attemptText)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if !row.evidenceLabels.isEmpty {
+                                    P031BadgeRow(labels: row.evidenceLabels)
+                                }
+                            }
+                            .padding(.bottom, index < rows.count - 1 ? 16 : 0)
+                        }
+                        .accessibilityLabel(row.accessibilityLabel)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+    }
+
+    private func color(for state: P031StageConnectorState) -> Color {
+        switch state {
+        case .completed:
+            return .green
+        case .blocked:
+            return .red
+        case .running:
+            return .blue
+        case .pending:
+            return .orange
+        case .unavailable:
+            return .secondary
         }
     }
 }
@@ -551,6 +680,205 @@ private struct P031ArtifactListCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
                 }
+            }
+        }
+    }
+}
+
+private struct P031ArtifactViewerCard: View {
+    let rows: [P031ArtifactViewerPresentation]
+    @State private var selectedArtifactID: String?
+
+    private var selectedRow: P031ArtifactViewerPresentation? {
+        if let selectedArtifactID,
+           let row = rows.first(where: { $0.artifactID == selectedArtifactID }) {
+            return row
+        }
+        return rows.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Artifacts")
+                .font(.headline)
+            if rows.isEmpty {
+                P031EmptySectionRow(title: "No artifacts", detail: "No artifact projections returned.")
+            } else {
+                HStack(alignment: .top, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(rows, id: \.artifactID) { row in
+                            Button {
+                                selectedArtifactID = row.artifactID
+                            } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    HStack {
+                                        Text(row.title)
+                                            .font(.caption.weight(.semibold))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                        P031FreshnessBadge(state: row.freshnessState)
+                                    }
+                                    Text(row.subtitle)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                    Label(label(for: row), systemImage: symbol(for: row.renderMode))
+                                        .font(.caption2.weight(.medium))
+                                }
+                                .padding(10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    row.artifactID == selectedRow?.artifactID
+                                        ? Color.accentColor.opacity(0.12)
+                                        : Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 10)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(
+                                            row.artifactID == selectedRow?.artifactID
+                                                ? Color.accentColor.opacity(0.45)
+                                                : Color.clear,
+                                            lineWidth: 1
+                                        )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(row.accessibilityLabel)
+                        }
+                    }
+                    .frame(width: 260)
+
+                    Divider()
+
+                    artifactPreview
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var artifactPreview: some View {
+        if let selectedRow {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(selectedRow.title)
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Label(label(for: selectedRow), systemImage: symbol(for: selectedRow.renderMode))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                if let payloadText = selectedRow.payloadText,
+                   let context = renderContext(for: selectedRow) {
+                    ArtifactContentRenderer(content: payloadText, context: context)
+                        .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
+                } else {
+                    P031EmptySectionRow(
+                        title: "Payload unavailable",
+                        detail: selectedRow.unavailableReason
+                            ?? "GraphQL did not return renderable artifact content."
+                    )
+                }
+            }
+        }
+    }
+
+    private func renderContext(for row: P031ArtifactViewerPresentation) -> ArtifactRenderContext? {
+        switch row.renderMode {
+        case .markdown:
+            return ArtifactRenderContext.explicitNamed(format: .markdown, artifactName: row.title)
+        case .json:
+            return ArtifactRenderContext.explicitNamed(format: .json, artifactName: row.title)
+        case .diff:
+            return ArtifactRenderContext.explicitNamed(format: .diff, artifactName: row.title)
+        case .plainText:
+            return ArtifactRenderContext.explicitNamed(format: .report, artifactName: row.title)
+        case .metadataOnly, .unavailable:
+            return nil
+        }
+    }
+
+    private func label(for row: P031ArtifactViewerPresentation) -> String {
+        switch row.renderMode {
+        case .markdown:
+            return "Markdown"
+        case .json:
+            return "JSON"
+        case .diff:
+            return "Diff"
+        case .plainText:
+            return "Text"
+        case .metadataOnly:
+            return "Metadata"
+        case .unavailable:
+            return "Unavailable"
+        }
+    }
+
+    private func symbol(for mode: P031ArtifactRenderMode) -> String {
+        switch mode {
+        case .markdown:
+            return "doc.richtext"
+        case .json:
+            return "curlybraces"
+        case .diff:
+            return "plusminus"
+        case .plainText:
+            return "doc.text"
+        case .metadataOnly:
+            return "info.circle"
+        case .unavailable:
+            return "exclamationmark.triangle"
+        }
+    }
+}
+
+private struct P031CatalogContextCard: View {
+    let presentation: P031CatalogContextPresentation?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Catalog")
+                .font(.headline)
+            if let presentation {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(presentation.workflowTitle)
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text(presentation.statusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    P031CopyItemsView(
+                        items: [
+                            presentation.workflowID.map {
+                                P031DiagnosticCopyItem(label: "workflow_id", value: $0)
+                            },
+                            presentation.workflowSnapshotHash.map {
+                                P031DiagnosticCopyItem(label: "workflow_snapshot_hash", value: $0)
+                            },
+                            presentation.catalogSnapshotHash.map {
+                                P031DiagnosticCopyItem(label: "catalog_snapshot_hash", value: $0)
+                            },
+                        ].compactMap { $0 }
+                    )
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                .accessibilityLabel(presentation.accessibilityLabel)
+            } else {
+                P031EmptySectionRow(
+                    title: "Catalog unavailable",
+                    detail: "The selected run did not include GraphQL-readable workflow catalog metadata."
+                )
             }
         }
     }

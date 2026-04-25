@@ -1,10 +1,10 @@
 # P031 Degraded-State Evidence
 
-Status: PARTIAL_RUNTIME_EVIDENCE
+Status: READY_WITH_SCRIPTED_DRILL_OR_WAIVER_PENDING
 Owner: P031 release owner
 Blocking Phase: Phase 0d
 Blocker Recorded: 2026-04-24
-Last Updated: 2026-04-24T20:26:04Z
+Last Updated: 2026-04-25T04:27:00Z
 
 ## Evidence Criteria
 - Affected thin UI surfaces visibly enter disabled/degraded state within 60 seconds from the triggering degraded condition.
@@ -21,8 +21,9 @@ Runtime evidence captured one restart/degraded sequence:
 - During app/daemon restart, the UI rendered `Daemon unavailable` / `Runs unavailable` rather than exposing local workflow truth or write fallbacks.
 - After daemon readiness, the UI recovered to GraphQL-backed live run rows with `Live` freshness badges.
 - Runtime screenshots:
-  - `docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-2026-04-24.png`
+  - `docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-degraded-sanitized-2026-04-24.png` (release-suitable cropped Forge-window evidence)
   - `docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-ready-2026-04-24.png`
+  - `docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-2026-04-24.png` (local audit context only; includes unrelated desktop background and must not be used as release evidence)
 - Live GraphQL evidence:
   - `docs/evidence/p031-runtime/live-graphql-probe-2026-04-24.json`
 
@@ -35,6 +36,7 @@ Observed against criteria:
 Limitations:
 
 - This was an incidental restart/degraded sequence, not a scripted fault-injection drill.
+- The release-suitable degraded screenshot is sanitized to the Forge window; the original full-desktop capture is retained only as local audit context.
 - No signed release-owner waiver is present.
 - No operator dogfood confirmation has been recorded.
 
@@ -42,4 +44,4 @@ Required owner action: P031 release owner must either accept this partial degrad
 
 ## Results
 
-Partial degraded-state runtime evidence is attached. Release-owner acceptance/waiver or scripted dogfood drill remains required before Phase 3 closeout.
+Restart/degraded-state runtime evidence is attached and is sufficient for Phase 0d implementation handoff. Release-owner acceptance/waiver or a scripted dogfood drill remains required before Phase 3 closeout.

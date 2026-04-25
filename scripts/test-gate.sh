@@ -1629,6 +1629,7 @@ Available gates:
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
@@ -2271,6 +2272,63 @@ for entry in manifest.get("entries", []):
 PY
     )
     log "Proposal 031 gate passed"
+    ;;
+  proposal-031-readiness|p031-readiness)
+    log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"
+    "$0" proposal-031
+
+    (
+      cd "$ROOT_DIR"
+      git ls-files --error-unmatch docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json >/dev/null
+      git ls-files --error-unmatch docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-degraded-sanitized-2026-04-24.png >/dev/null
+      python3 - <<'PY'
+from pathlib import Path
+import json
+import re
+
+failures = []
+
+manifest = json.loads(Path("docs/reference/p031-phase-0-artifact-manifest.json").read_text())
+manifest_status = str(manifest.get("status", ""))
+if "pending" in manifest_status.lower():
+    failures.append(f"manifest status is not closeout-ready: {manifest_status}")
+
+entries = {entry.get("id"): entry for entry in manifest.get("entries", [])}
+for required in (
+    "degraded_state_sanitized_screenshot",
+    "report_payload_live_evidence",
+    "dogfood_signoff_template",
+):
+    if required not in entries:
+        failures.append(f"manifest missing closeout artifact entry: {required}")
+
+for artifact_id, entry in entries.items():
+    status = str(entry.get("validation_status", ""))
+    if re.search(r"(pending|template|limitation)", status, re.IGNORECASE):
+        failures.append(f"{artifact_id} validation_status is not closeout-ready: {status}")
+
+dogfood = Path("docs/evidence/p031-dogfood-signoff.md").read_text()
+status_match = re.search(r"^Status:\s*(.+)$", dogfood, re.MULTILINE)
+dogfood_status = status_match.group(1).strip() if status_match else "<missing>"
+if not re.search(r"(SIGNED|APPROVED|COMPLETE)", dogfood_status, re.IGNORECASE):
+    failures.append(f"dogfood signoff is not signed/complete: {dogfood_status}")
+if re.search(r"^- \[ \]", dogfood, re.MULTILINE):
+    failures.append("dogfood checklist still has unchecked items")
+
+for path in (
+    "docs/evidence/p031-degraded-state-evidence.md",
+    "docs/evidence/p031-freshness-baseline.md",
+    "docs/evidence/p031-ux-accessibility-signoff.md",
+):
+    text = Path(path).read_text()
+    if re.search(r"(waiver pending|dogfood confirmation pending|assistive access limitation|No VoiceOver pass)", text, re.IGNORECASE):
+        failures.append(f"{path} still contains release-closeout qualification")
+
+if failures:
+    raise SystemExit("proposal-031-readiness failed:\n- " + "\n- ".join(failures))
+PY
+    )
+    log "Proposal 031 readiness gate passed"
     ;;
   proposal-044|p044)
     log "Proposal 044 control-plane gate: post-approval + N-phase + end-state"

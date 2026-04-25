@@ -42,6 +42,7 @@ pub struct GqlArtifact {
     pub freshness_state: GqlFreshnessState,
     pub payload_availability_state: GqlPayloadAvailabilityState,
     pub payload_unavailable_reason_code: Option<GqlPayloadUnavailableReasonCode>,
+    pub payload_text: Option<String>,
     pub diagnostic_id: Option<String>,
     pub server_debug_detail: Option<String>,
 }
@@ -151,6 +152,7 @@ impl From<Artifact> for GqlArtifact {
             } else {
                 None
             },
+            payload_text: None,
             diagnostic_id: is_report.then_some(artifact_id),
             server_debug_detail: is_report.then_some(
                 "P031 exposes report metadata only; payload rendering is deferred".into(),
@@ -202,6 +204,7 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             } else {
                 None
             },
+            payload_text: None,
             diagnostic_id: is_report.then_some(r.id),
             server_debug_detail: is_report.then_some(
                 "P031 exposes report metadata only; payload rendering is deferred".into(),

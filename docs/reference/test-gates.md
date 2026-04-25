@@ -633,6 +633,40 @@ Important:
 - later Phase 0d / Phase 3 evidence entries may remain blocked while implementation is in progress, but the manifest must not mark blocked evidence as `ready`
 - dogfood sign-off evidence is outside this gate; this gate only requires the Phase 3 dogfood checklist artifact to exist
 
+### `proposal-031-readiness|p031-readiness`
+
+Proposal 031 closeout readiness gate.
+
+Scope:
+
+- composes `proposal-031`
+- verifies release evidence files are tracked, including report-payload runtime JSON and sanitized degraded-state screenshot evidence
+- fails while the Phase 0 manifest, degraded-state evidence, freshness evidence, UX/accessibility evidence, or Phase 3 dogfood sign-off still contain pending/template/limitation states
+- fails while the Phase 3 dogfood checklist has unchecked items
+
+Use when:
+
+- deciding whether P031 can be considered implementation-closeout ready
+- re-entering implementation approval after dogfood/sign-off evidence is attached
+
+Host policy:
+
+- same as `proposal-031`
+- no live daemon required
+- expected to fail until Phase 3 dogfood and release-owner sign-off are complete
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-031-readiness
+```
+
+Important:
+
+- this is intentionally stricter than `proposal-031`
+- `proposal-031` passing means the static/API/read-boundary contract is intact
+- `proposal-031-readiness` passing means P031 release/closeout evidence is no longer known-pending
+
 
 Host policy:
 
