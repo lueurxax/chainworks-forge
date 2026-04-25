@@ -11,6 +11,7 @@ xcuserdata/
 build/
 DerivedData/
 DerivedDataCodex/
+.xcode-cloud/
 
 # Swift Package Manager
 .build/
