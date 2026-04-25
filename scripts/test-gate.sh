@@ -907,7 +907,6 @@ for f in sensitive_files:
 
 cwd_sensitive_files = [
     app_root / "Chainworks_ForgeApp.swift",
-    app_root / "Views/UITestDirectSurfaces.swift",
     app_root / "Engine/SampleRunLauncher.swift",
 ]
 forbidden_fragments = [

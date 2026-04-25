@@ -249,7 +249,7 @@ Displayed provenance includes:
 - attempt,
 - runtime trust level.
 
-### Bounded Startup Latency (P053)
+### Bounded Startup Latency
 
 The system enforces bounded artifact discovery to prevent broad local filesystem scanning from delaying ACP session initialization. Operators should notice significantly faster startup times in large workspaces compared to legacy implicit discovery models. Discovery diagnostics are available in the `Diagnostics` pane for technical inspection of settlement decisions.
 

@@ -86,6 +86,9 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::RetryStage(_) => {
             // §8.1: preserve all fields.
         }
+        Command::ResolveWorkflowConflictTransition(_) => {
+            // Operator conflict-resolution selections are audit material.
+        }
         Command::OverrideLegacyDiscoveryPolicy(_) => {
             // P053: preserve typed override fields for operator audit.
         }
@@ -139,7 +142,8 @@ mod tests {
     use super::*;
     use domain::commands::{
         ApproveStageCmd, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
-        ResetSessionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+        ResetSessionCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+        RunStewardAnalysisCmd, StartRunCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -393,6 +397,12 @@ mod tests {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
             }),
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id: RunId::new(),
+                conflict_id: "conflict-1".into(),
+                selected_transition_id: "review__to__refine__0".into(),
+                resolution_reason: "operator selected loop-budget continuation".into(),
+            }),
             Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
                 run_id: RunId::new(),
                 stage_id: "s".into(),
@@ -432,6 +442,7 @@ mod tests {
                 Command::ApproveStage(_) => {}
                 Command::RejectStage(_) => {}
                 Command::RetryStage(_) => {}
+                Command::ResolveWorkflowConflictTransition(_) => {}
                 Command::OverrideLegacyDiscoveryPolicy(_) => {}
                 Command::CancelRun(_) => {}
                 Command::ResetSession(_) => {}

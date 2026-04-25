@@ -1,6 +1,6 @@
 import Foundation
 
-enum ACPProtocolSupport {
+nonisolated enum ACPProtocolSupport {
     static func formatJSONRPCError(
         _ error: [String: Any],
         fallback: String

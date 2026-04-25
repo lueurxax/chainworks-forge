@@ -1072,7 +1072,13 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
 
     #expect(resource.url == guideURL)
-    #expect(resource.data == approvalCLIWritePathGuideData())
+    let data = try #require(resource.data)
+    let loadedGuide = try JSONDecoder().decode(P031OperatorWritePathGuide.self, from: data)
+    let expectedGuide = try JSONDecoder().decode(
+      P031OperatorWritePathGuide.self,
+      from: approvalCLIWritePathGuideData()
+    )
+    #expect(loadedGuide == expectedGuide)
   }
 
   @Test("Operator write-path guide resolver fails closed for missing malformed or stale data")
@@ -1536,6 +1542,9 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(presentation.rows.first?.body == "Managed outside UI")
     #expect(presentation.rows.first?.actionLabel == "Execute via CLI")
     #expect(presentation.rows.first?.followUpID == nil)
+    #expect(
+      presentation.rows.first?.accessibilityLabel
+        == "Approval managed outside UI, Managed outside UI, run-1, stage-1")
     #expect(
       presentation.rows.first?.copyItems.map(\.label) == [
         "approval_id", "run_id", "stage_id", "diagnostic_id",

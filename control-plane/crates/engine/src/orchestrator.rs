@@ -8,6 +8,7 @@ use db::repos::{
     approvals, artifact_contracts, artifacts, ideas, runs, stages, workflow_conflicts,
 };
 use db::work_item::WorkItemKind;
+use domain::agent::AgentOutputSettlement;
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::ImplementationSelfAssessmentStatus;
@@ -1075,6 +1076,30 @@ impl Orchestrator {
             report_version: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
+        artifact_contracts::upsert_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: artifact.id,
+                contract_id: artifact.contract_id.clone(),
+                canonical_path: artifact.name.clone(),
+                raw_path: artifact.file_path.clone(),
+                raw_status: "release_evidence_blocked".to_string(),
+                generation_id: format!("engine-synthesized:{}:{}", stage.id, artifact.id),
+                source_agent_execution_id: None,
+                source_stage_execution_id: Some(stage.id.to_string()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![
+                    "implementation_review_summary was synthesized from active implementation_self_assessment_v2 release-hold truth"
+                        .to_string(),
+                ],
+            },
+        )
+        .await?;
         let _ = self.events.send(DomainEvent::ArtifactCreated {
             run_id,
             artifact_id: artifact.id,
@@ -1709,31 +1734,6 @@ impl Orchestrator {
             None => return Ok(()),
         };
 
-        // Check loop budget. Budget exhaustion must prevent another loop body
-        // from being scheduled, but it must still allow an already-complete
-        // loop state to take its exit transition. This matters for states like
-        // state_8 where the agent can report `complete` on the final allowed
-        // iteration. Cross-state loops such as state_5 -> state_4 are modeled
-        // as unconditional `true` transitions from a loop-configured state, so
-        // those are still treated as budget-consuming loop transitions.
-        let loop_budget_exhausted = state.loop_config.as_ref().map_or(false, |lc| {
-            let iterations = all_stages
-                .iter()
-                .filter(|s| s.stage_id == current_state_id)
-                .count() as u64;
-            iterations >= lc.max
-        });
-
-        if loop_budget_exhausted {
-            info!(
-                run_id = %run_id,
-                state = current_state_id,
-                "Loop budget exhausted — skipping loop transitions"
-            );
-            // Fall through to transition evaluation. Only transitions that
-            // would consume another loop cycle are skipped below.
-        }
-
         // Fetch run for condition evaluation context.
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
@@ -1744,20 +1744,7 @@ impl Orchestrator {
         // before choosing a graph-authoritative transition.
         let mut candidate_evaluations = Vec::new();
         for (transition_index, transition) in state.transitions.iter().enumerate() {
-            if loop_budget_exhausted
-                && transition_consumes_loop_budget(current_state_id, transition)
-            {
-                debug!(
-                    run_id = %run_id,
-                    from = current_state_id,
-                    to = %transition.to,
-                    condition = %transition.condition,
-                    "Skipping budget-consuming loop transition"
-                );
-                continue;
-            }
-
-            let evaluation = self
+            let mut evaluation = self
                 .evaluate_transition_candidate(
                     transition_index,
                     current_state_id,
@@ -1766,6 +1753,26 @@ impl Orchestrator {
                     plan,
                 )
                 .await;
+            if evaluation.result == CandidateTransitionResult::Matched {
+                if let Some(exhaustion) =
+                    loop_budget_exhaustion_for_transition_target(transition, plan, all_stages)
+                {
+                    debug!(
+                        run_id = %run_id,
+                        from = current_state_id,
+                        to = %transition.to,
+                        counter = %exhaustion.counter,
+                        iterations = exhaustion.iterations,
+                        max = exhaustion.max,
+                        "Loop budget exhausted — blocking transition into loop state"
+                    );
+                    evaluation.result = CandidateTransitionResult::NotMatched;
+                    evaluation.sanitized_diagnostic = Some(format!(
+                        "Loop budget exhausted for {}: {}/{} iterations",
+                        exhaustion.counter, exhaustion.iterations, exhaustion.max
+                    ));
+                }
+            }
             candidate_evaluations.push(evaluation);
         }
 
@@ -2587,6 +2594,21 @@ impl Orchestrator {
             Ok(db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
                 contract_id,
             }) => {
+                if is_implementation_self_assessment_alias(artifact_name) {
+                    if let Some(value) = self
+                        .active_implementation_self_assessment_summary_field(run.id, field_name)
+                        .await
+                    {
+                        let rv = self.resolve_value(rhs, run, plan).await;
+                        return if apply_comparison(&value, op, &rv) {
+                            ClassifiedConditionEvaluation::matched()
+                        } else {
+                            ClassifiedConditionEvaluation::not_matched()
+                        }
+                        .with_required_artifact(artifact_name)
+                        .with_source_artifact(artifact_name);
+                    }
+                }
                 return ClassifiedConditionEvaluation::missing_input(format!(
                     "Controlled artifact field {contract_id}.{field_name} is missing canonical DB truth"
                 ))
@@ -2783,17 +2805,10 @@ impl Orchestrator {
         run: &domain::run::Run,
         plan: &workflow::plan::RunPlan,
     ) -> Option<serde_json::Value> {
-        if artifact_name == "implementation_self_assessment_v2"
-            || artifact_name == "implementation_self_assessment"
-        {
-            let active = artifact_contracts::find_active_implementation_self_assessment_summary(
-                &self.pool, run.id,
-            )
-            .await
-            .ok()
-            .flatten()?;
-            let summary_json = serde_json::to_value(&active.summary).ok()?;
-            return extract_json_field(&summary_json, field_name);
+        if is_implementation_self_assessment_alias(artifact_name) {
+            return self
+                .active_implementation_self_assessment_summary_field(run.id, field_name)
+                .await;
         }
 
         // Find the artifact file path
@@ -2832,6 +2847,24 @@ impl Orchestrator {
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
         extract_json_field(&json, field_name)
+    }
+
+    async fn active_implementation_self_assessment_summary_field(
+        &self,
+        run_id: RunId,
+        field_name: &str,
+    ) -> Option<serde_json::Value> {
+        let active = artifact_contracts::find_active_implementation_self_assessment_summary(
+            &self.pool, run_id,
+        )
+        .await
+        .ok()
+        .flatten()?;
+        let summary_json = serde_json::to_value(&active.summary).ok()?;
+        if field_name == "seemingly_complete" {
+            return extract_json_field(&summary_json, "implementation_complete");
+        }
+        extract_json_field(&summary_json, field_name)
     }
 
     // =====================================================================
@@ -3316,20 +3349,34 @@ fn json_value_is_empty_collection(value: &serde_json::Value) -> bool {
     }
 }
 
-fn transition_consumes_loop_budget(
-    current_state_id: &str,
-    transition: &workflow::plan::CompiledTransition,
-) -> bool {
-    if transition.to == current_state_id {
-        return true;
-    }
+struct LoopBudgetExhaustion {
+    counter: String,
+    iterations: u64,
+    max: u64,
+}
 
-    let condition = transition
-        .condition
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'');
-    condition == "true"
+fn loop_budget_exhaustion_for_transition_target(
+    transition: &workflow::plan::CompiledTransition,
+    plan: &workflow::plan::RunPlan,
+    all_stages: &[StageExecution],
+) -> Option<LoopBudgetExhaustion> {
+    let target_state = plan.states.get(&transition.to)?;
+    let loop_config = target_state.loop_config.as_ref()?;
+    let iterations = loop_iterations_for_state(all_stages, &transition.to);
+    (iterations >= loop_config.max).then(|| LoopBudgetExhaustion {
+        counter: loop_config.counter.clone(),
+        iterations,
+        max: loop_config.max,
+    })
+}
+
+fn loop_iterations_for_state(all_stages: &[StageExecution], state_id: &str) -> u64 {
+    all_stages
+        .iter()
+        .filter(|stage| stage.stage_id == state_id)
+        .filter_map(|stage| u64::try_from(stage.iteration).ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Split on a connective keyword, respecting parentheses depth.
@@ -3436,6 +3483,13 @@ fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bo
 
 fn is_inline_runtime_input(input_name: &str) -> bool {
     matches!(input_name, "input.idea" | "idea" | "input.file" | "file")
+}
+
+fn is_implementation_self_assessment_alias(artifact_name: &str) -> bool {
+    matches!(
+        artifact_name,
+        "implementation_self_assessment_v2" | "implementation_self_assessment"
+    )
 }
 
 fn extract_json_field(json: &serde_json::Value, field_name: &str) -> Option<serde_json::Value> {
@@ -4212,8 +4266,8 @@ mod tests {
     use domain::stage::StageStatus;
     use std::collections::HashMap;
     use workflow::plan::{
-        CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy, OutputSchema,
-        ResolvedAgent, RunPlan,
+        CompiledLoop, CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
+        OutputSchema, ResolvedAgent, RunPlan,
     };
 
     fn test_run(run_id: RunId) -> Run {
@@ -4682,6 +4736,275 @@ mod tests {
             CandidateTransitionResult::InvalidExpression,
             "P017 requires unknown catalog artifact references to fail closed"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_budget_allows_final_cross_state_review_after_refinement() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "Loop budget".into(),
+            body: "final refinement should still be reviewed".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.current_state = Some("refine".into());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let mut plan = test_plan();
+        let mut refine = compiled_state(
+            "refine",
+            vec![CompiledTransition {
+                to: "review".into(),
+                condition: "true".into(),
+            }],
+            false,
+        );
+        refine.loop_config = Some(CompiledLoop {
+            counter: "proposal_revision_count".into(),
+            max: 2,
+        });
+        plan.states.insert("refine".into(), refine);
+        plan.states
+            .insert("review".into(), compiled_state("review", Vec::new(), false));
+
+        let first = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(10),
+            completed_at: Some(now - chrono::Duration::seconds(9)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let latest = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 2,
+            attempt_number: 3,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &first).await.unwrap();
+        db::repos::stages::insert(&pool, &latest).await.unwrap();
+
+        orchestrator
+            .evaluate_and_transition(run_id, "refine", &plan, &[first, latest])
+            .await
+            .unwrap();
+
+        let stored = db::repos::runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.current_state.as_deref(), Some("review"));
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "final allowed refinement must transition to review, not block before review"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_budget_blocks_entering_exhausted_loop_state() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "Loop budget".into(),
+            body: "do not enter exhausted loop".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.current_state = Some("review".into());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "true".into(),
+                }],
+                false,
+            ),
+        );
+        let mut refine = compiled_state("refine", Vec::new(), false);
+        refine.loop_config = Some(CompiledLoop {
+            counter: "proposal_revision_count".into(),
+            max: 2,
+        });
+        plan.states.insert("refine".into(), refine);
+
+        let review = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let skipped_retry = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Skipped,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(20),
+            completed_at: Some(now - chrono::Duration::seconds(19)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some("retry superseded prior attempt".into()),
+        };
+        let first = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 2,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(18),
+            completed_at: Some(now - chrono::Duration::seconds(17)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let second = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 2,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(10),
+            completed_at: Some(now - chrono::Duration::seconds(9)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        for stage in [&review, &skipped_retry, &first, &second] {
+            db::repos::stages::insert(&pool, stage).await.unwrap();
+        }
+
+        orchestrator
+            .evaluate_and_transition(
+                run_id,
+                "review",
+                &plan,
+                &[review, skipped_retry, first, second],
+            )
+            .await
+            .unwrap();
+
+        let stored = db::repos::runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, RunStatus::Blocked);
+        assert_eq!(stored.current_state.as_deref(), Some("review"));
+        let conflict = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("exhausted loop entry should record a blocking conflict");
+        assert_eq!(conflict.candidate_transitions.len(), 1);
+        assert_eq!(
+            conflict.candidate_transitions[0].result,
+            CandidateTransitionResult::NotMatched
+        );
+        assert!(conflict.candidate_transitions[0]
+            .sanitized_diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains("Loop budget exhausted")));
     }
 
     #[tokio::test(flavor = "multi_thread")]

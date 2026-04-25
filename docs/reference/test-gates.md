@@ -554,7 +554,7 @@ Scope:
 - fail-closed shadow side-effect policy for stubbed runtime/provider inputs, including correlated `mode=live_shadow` reports under `control-plane/target/parity/shadow/reports/{fixture_id}/`
 - fixture-bound GraphQL run/stage/artifact/projection readback parity via `proposal_041_graphql_readback_parity_surfaces`
 - fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via P041-named tests
-- P031 handoff artifact validation at `docs/proposals/031-thin-ui-rewrite-over-projections-and-mcp.evidence/p041-parity.md`
+- P031 handoff parity readiness is tracked through `docs/reference/p031-phase-0-artifact-manifest.json`; do not use obsolete proposal-local evidence paths.
 
 Use when:
 
@@ -630,6 +630,8 @@ Important:
 
 - `p031` is accepted as an alias
 - the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary or if required Phase 0 artifacts are missing or invalid
+- later Phase 0d / Phase 3 evidence entries may remain blocked while implementation is in progress, but the manifest must not mark blocked evidence as `ready`
+- dogfood sign-off evidence is outside this gate; this gate only requires the Phase 3 dogfood checklist artifact to exist
 
 
 Host policy:
@@ -948,7 +950,7 @@ Bounded ACP artifact discovery and startup latency gate.
 
 Scope:
 
-- Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/proposals/053.review/`
+- Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/`
 - full Phase 0 cap-validation schema, including sampled execution IDs, readiness timing, envelope/aggregate cap selections, and discovery ownership
 - Phase 1 evidence pack:
   - `manual-latency-spot-check.md`, including the manual reference-workspace measurement and observed `acp_pre_initialize_local_latency_ms`
@@ -960,7 +962,7 @@ Scope:
 - pre-prompt metadata capture and digest-backed validation
 - bounded meta-root discovery (max 500 files, 10 MiB aggregate)
 - discovery filesystem operation-recorder coverage for bounded traversal and metadata reads
-- trait-backed `DiscoveryFilesystem` fake coverage for deterministic P053 filesystem tests
+- trait-backed `DiscoveryFilesystem` fake coverage for deterministic bounded-discovery filesystem tests
 - stale-vs-absent required-output settlement and GraphQL/MCP stale-count readback
 - legacy broad discovery opt-in policy
 - GraphQL and MCP readback for discovery diagnostics
@@ -989,7 +991,7 @@ Important:
 - discovery settlement is governed by the engine-owned pipeline, not provider-side heuristics
 - a `gate_only_internal` cap-validation artifact is sufficient for same-tree control-plane validation, but production exposure requires a refreshed production sampling/signoff artifact
 - the gate enforces the full declared Phase 0 cap-validation schema rather than a reduced subset
-- the Phase 1 evidence pack must exist in-tree before P053 closeout
+- the Phase 1 evidence pack must exist in the stable evidence directory before release signoff
 
 ### `proposal-057|p057`
 

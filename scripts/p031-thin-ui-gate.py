@@ -16,9 +16,10 @@ from typing import Any, Iterable
 
 INVENTORY_PATH = Path("docs/reference/p031-thin-ui-inventory.json")
 WRITE_PATH_GUIDE_PATH = Path("docs/reference/p031-operator-write-path-guide.json")
+PHASE0_MANIFEST_PATH = Path("docs/reference/p031-phase-0-artifact-manifest.json")
 REQUIRED_SCHEMA_VERSION = "p031-thin-ui-inventory-v1"
 REQUIRED_WRITE_PATH_GUIDE_SCHEMA_VERSION = "p031-operator-write-path-guide-v1"
-LEGACY_MODE_ENVIRONMENT = "CHAINWORKS_THIN_UI_MODE=legacy"
+REQUIRED_PHASE0_MANIFEST_SCHEMA_VERSION = "p031-phase-0-artifact-manifest-v1"
 GRAPHQL_DOCUMENT_GLOBS = ("**/*.graphql", "**/*.gql")
 EXCLUDED_REPO_FILE_PREFIXES = (
     ".build/",
@@ -35,11 +36,37 @@ REQUIRED_TOP_LEVEL_KEYS = {
     "schema_version",
     "governed_swift_files",
     "governed_graphql_documents",
+    "embedded_graphql_documents",
     "generated_graphql_outputs",
-    "legacy_only_files",
+    "degraded_fail_closed_files",
     "explicit_exclusions",
     "forbidden_pattern_groups",
 }
+
+REQUIRED_MANIFEST_ENTRY_IDS = {
+    "governing_contract",
+    "p043_reconciliation_evidence",
+    "p031_gate_evidence",
+    "ui_inventory",
+    "schema_decision_record",
+    "operator_write_path_guide",
+    "degraded_state_evidence",
+    "freshness_baseline",
+    "report_payload_priority_decision",
+    "ux_accessibility_signoff",
+    "dogfood_signoff_template",
+}
+
+EVIDENCE_BLOCKING_STATUSES = {
+    "blocked",
+    "deferred",
+    "failed",
+    "missing",
+    "not_ready",
+    "pending",
+    "waiver_pending",
+}
+PHASE0_MANIFEST_READY_STATUS = "ready"
 
 REQUIRED_FORBIDDEN_GROUPS = {
     "mcp",
@@ -264,21 +291,23 @@ def collect_paths(entries: Any, key: str, errors: list[str]) -> set[str]:
     return paths
 
 
-def validate_legacy_only_entries(entries: Any, errors: list[str]) -> None:
+def validate_degraded_fail_closed_entries(entries: Any, errors: list[str]) -> None:
     if not isinstance(entries, list):
         return
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             errors.append(
-                f"legacy_only_files[{index}] must be an object tied to {LEGACY_MODE_ENVIRONMENT}"
+                f"degraded_fail_closed_files[{index}] must be an object with a fail-closed contract"
             )
             continue
-        if entry.get("legacy_mode_only") is not True:
-            errors.append(f"legacy_only_files[{index}] must set legacy_mode_only to true")
-        if entry.get("mode_env") != LEGACY_MODE_ENVIRONMENT:
-            errors.append(
-                f"legacy_only_files[{index}] must set mode_env to {LEGACY_MODE_ENVIRONMENT!r}"
-            )
+        if entry.get("degraded_state_only") is not True:
+            errors.append(f"degraded_fail_closed_files[{index}] must set degraded_state_only to true")
+        if entry.get("control_plane_truth_only") is not True:
+            errors.append(f"degraded_fail_closed_files[{index}] must set control_plane_truth_only to true")
+        if entry.get("restores_local_orchestration") is not False:
+            errors.append(f"degraded_fail_closed_files[{index}] must set restores_local_orchestration to false")
+        if entry.get("restores_local_writes") is not False:
+            errors.append(f"degraded_fail_closed_files[{index}] must set restores_local_writes to false")
 
 
 def validate_explicit_exclusion_entries(entries: Any, errors: list[str]) -> None:
@@ -353,6 +382,99 @@ def extra_patterns_by_group(entries: Any) -> dict[str, list[str]]:
         if isinstance(group_id, str) and isinstance(patterns, list):
             extra[group_id] = [pattern for pattern in patterns if isinstance(pattern, str)]
     return extra
+
+
+def allowed_static_guard_matches(entries: Any, errors: list[str]) -> list[dict[str, str]]:
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        errors.append("inventory key allowed_static_guard_matches must be an array when present")
+        return []
+    allowed: list[dict[str, str]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            errors.append(f"allowed_static_guard_matches[{index}] must be an object")
+            continue
+        path = entry.get("path")
+        group_id = entry.get("group_id")
+        line_contains = entry.get("line_contains")
+        reason = entry.get("reason")
+        if not all(non_empty_string(value) for value in [path, group_id, line_contains, reason]):
+            errors.append(
+                f"allowed_static_guard_matches[{index}] must include path, group_id, line_contains, and reason"
+            )
+            continue
+        allowed.append(
+            {
+                "path": normalize_path(path),
+                "group_id": group_id.strip(),
+                "line_contains": line_contains.strip(),
+            }
+        )
+    return allowed
+
+
+def is_allowed_static_match(
+    rel_path: str,
+    group_id: str,
+    line_text: str,
+    allowed_matches: list[dict[str, str]],
+) -> bool:
+    return any(
+        rel_path == entry["path"]
+        and group_id == entry["group_id"]
+        and entry["line_contains"] in line_text
+        for entry in allowed_matches
+    )
+
+
+def validate_embedded_graphql_documents(
+    entries: Any,
+    governed_paths: set[str],
+    repo_root: Path,
+    errors: list[str],
+) -> set[str]:
+    if not isinstance(entries, list):
+        errors.append("inventory key embedded_graphql_documents must be an array")
+        return set()
+    paths: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            errors.append(f"embedded_graphql_documents[{index}] must be an object")
+            continue
+        path = entry_path(entry)
+        owner = entry.get("owner")
+        operation_names = entry.get("operation_names")
+        if not path:
+            errors.append(f"embedded_graphql_documents[{index}] must include path")
+            continue
+        if path not in governed_paths:
+            errors.append(
+                f"embedded_graphql_documents[{index}] path must be governed by inventory: {path}"
+            )
+        if not non_empty_string(owner):
+            errors.append(f"embedded_graphql_documents[{index}] must include owner")
+        if not isinstance(operation_names, list) or not all(
+            non_empty_string(item) for item in operation_names
+        ):
+            errors.append(
+                f"embedded_graphql_documents[{index}] operation_names must be an array of strings"
+            )
+        paths.add(path)
+
+    for rel_path in sorted(governed_paths):
+        path = repo_root / rel_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        if "P031GraphQLDocuments" in text and rel_path not in paths:
+            errors.append(
+                f"P031 embedded GraphQL documents are not inventoried: {rel_path}"
+            )
+    return paths
 
 
 def repo_files(repo_root: Path, glob: str) -> set[str]:
@@ -430,6 +552,9 @@ def scan_forbidden_patterns(
 ) -> None:
     group_ids = collect_group_ids(inventory.get("forbidden_pattern_groups"), errors)
     extra_patterns = extra_patterns_by_group(inventory.get("forbidden_pattern_groups"))
+    allowed_matches = allowed_static_guard_matches(
+        inventory.get("allowed_static_guard_matches"), errors
+    )
     patterns_by_group: dict[str, list[re.Pattern[str]]] = {}
     for group_id in sorted(group_ids):
         raw_patterns = DEFAULT_FORBIDDEN_PATTERNS.get(group_id, []) + extra_patterns.get(group_id, [])
@@ -458,6 +583,11 @@ def scan_forbidden_patterns(
                     match = pattern.search(text)
                     if match:
                         line_number = text.count("\n", 0, match.start()) + 1
+                        line_text = text.splitlines()[line_number - 1] if text.splitlines() else ""
+                        if is_allowed_static_match(
+                            rel_path, group_id, line_text, allowed_matches
+                        ):
+                            continue
                         errors.append(
                             f"{rel_path}:{line_number}: forbidden P031 {group_id} pattern matched {pattern.pattern!r}"
                         )
@@ -498,26 +628,34 @@ def validate_inventory(repo_root: Path) -> GateResult:
     generated_graphql = collect_paths(
         inventory.get("generated_graphql_outputs", []), "generated_graphql_outputs", errors
     )
-    legacy = collect_paths(inventory.get("legacy_only_files", []), "legacy_only_files", errors)
+    degraded = collect_paths(
+        inventory.get("degraded_fail_closed_files", []), "degraded_fail_closed_files", errors
+    )
     exclusions = collect_paths(inventory.get("explicit_exclusions", []), "explicit_exclusions", errors)
-    validate_legacy_only_entries(inventory.get("legacy_only_files", []), errors)
+    validate_degraded_fail_closed_entries(
+        inventory.get("degraded_fail_closed_files", []), errors
+    )
     validate_explicit_exclusion_entries(inventory.get("explicit_exclusions", []), errors)
     validate_category_overlap(
         {
             "governed_swift_files": governed,
             "governed_graphql_documents": graphql_docs,
             "generated_graphql_outputs": generated_graphql,
-            "legacy_only_files": legacy,
+            "degraded_fail_closed_files": degraded,
             "explicit_exclusions": exclusions,
         },
         errors,
     )
-    covered = governed | graphql_docs | generated_graphql | legacy | exclusions
+    covered = governed | graphql_docs | generated_graphql | degraded | exclusions
 
     group_ids = collect_group_ids(inventory.get("forbidden_pattern_groups", []), errors)
     missing_groups = sorted(REQUIRED_FORBIDDEN_GROUPS - group_ids)
     if missing_groups:
         errors.append(f"inventory missing forbidden pattern groups: {', '.join(missing_groups)}")
+
+    validate_embedded_graphql_documents(
+        inventory.get("embedded_graphql_documents", []), governed | generated_graphql, repo_root, errors
+    )
 
     for rel_path in INITIAL_GOVERNED_SURFACES:
         if (repo_root / rel_path).is_file() and rel_path not in governed:
@@ -545,7 +683,7 @@ def validate_inventory(repo_root: Path) -> GateResult:
     for rel_path in uncovered_graphql:
         errors.append(f"GraphQL operation lacks P031 inventory coverage: {rel_path}")
 
-    scan_forbidden_patterns(repo_root, governed | graphql_docs | generated_graphql, inventory, errors)
+    scan_forbidden_patterns(repo_root, governed | graphql_docs | generated_graphql | degraded, inventory, errors)
     return GateResult(errors)
 
 
@@ -706,10 +844,101 @@ def validate_write_path_guide(repo_root: Path) -> GateResult:
     return GateResult(errors)
 
 
+def evidence_status(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        for line in path.read_text().splitlines()[:20]:
+            if line.startswith("Status:"):
+                return line.split(":", 1)[1].strip().lower()
+    except UnicodeDecodeError:
+        return None
+    return None
+
+
+def validate_phase0_manifest(repo_root: Path) -> GateResult:
+    errors: list[str] = []
+    manifest_file = repo_root / PHASE0_MANIFEST_PATH
+    if not manifest_file.is_file():
+        return GateResult(
+            [
+                "proposal-031: missing docs/reference/p031-phase-0-artifact-manifest.json; "
+                "P031 gate fails closed until Phase 0 artifacts are inventoried"
+            ]
+        )
+
+    try:
+        manifest = json.loads(manifest_file.read_text())
+    except json.JSONDecodeError as exc:
+        return GateResult([f"proposal-031: Phase 0 manifest is not valid JSON: {exc}"])
+
+    if not isinstance(manifest, dict):
+        return GateResult(["proposal-031: Phase 0 manifest must be a JSON object"])
+
+    if manifest.get("schema_version") != REQUIRED_PHASE0_MANIFEST_SCHEMA_VERSION:
+        errors.append(
+            "Phase 0 manifest schema_version must be "
+            f"{REQUIRED_PHASE0_MANIFEST_SCHEMA_VERSION!r}, got {manifest.get('schema_version')!r}"
+        )
+
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        errors.append("Phase 0 manifest key entries must be an array")
+        return GateResult(errors)
+
+    entries_by_id: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            errors.append(f"Phase 0 manifest entries[{index}] must be an object")
+            continue
+        entry_id = entry.get("id")
+        if not non_empty_string(entry_id):
+            errors.append(f"Phase 0 manifest entries[{index}] must include id")
+            continue
+        if entry_id in entries_by_id:
+            errors.append(f"Phase 0 manifest duplicate entry id: {entry_id}")
+        entries_by_id[entry_id] = entry
+        for key in ["path", "owner_role", "validation_status", "blocking_phase"]:
+            if not non_empty_string(entry.get(key)):
+                errors.append(f"Phase 0 manifest entry {entry_id} missing {key}")
+        raw_path = entry.get("path")
+        if non_empty_string(raw_path):
+            artifact_path = repo_root / normalize_path(raw_path)
+            if not artifact_path.is_file():
+                errors.append(f"Phase 0 manifest entry {entry_id} points at missing artifact {raw_path}")
+            status = evidence_status(artifact_path)
+            validation_status = normalize_identifier(str(entry.get("validation_status", "")))
+            if status in EVIDENCE_BLOCKING_STATUSES and validation_status == "ready":
+                errors.append(
+                    "Phase 0 manifest entry "
+                    f"{entry_id} is marked ready but evidence status is {status.upper()}"
+                )
+
+    missing_entries = sorted(REQUIRED_MANIFEST_ENTRY_IDS - set(entries_by_id))
+    if missing_entries:
+        errors.append(f"Phase 0 manifest missing required entries: {', '.join(missing_entries)}")
+
+    for entry_id, entry in sorted(entries_by_id.items()):
+        validation_status = normalize_identifier(str(entry.get("validation_status", "")))
+        if validation_status == PHASE0_MANIFEST_READY_STATUS:
+            continue
+        blocking_phase = str(entry.get("blocking_phase", "")).strip().lower()
+        if blocking_phase in {"phase 0d", "phase 3"}:
+            continue
+        else:
+            errors.append(
+                f"Phase 0 manifest entry {entry_id} blocks {entry.get('blocking_phase')}: "
+                f"{entry.get('validation_status')} ({entry.get('path')})"
+            )
+
+    return GateResult(errors)
+
+
 def validate_p031_contracts(repo_root: Path) -> GateResult:
     errors: list[str] = []
     errors.extend(validate_inventory(repo_root).errors)
     errors.extend(validate_write_path_guide(repo_root).errors)
+    errors.extend(validate_phase0_manifest(repo_root).errors)
     return GateResult(errors)
 
 
@@ -737,8 +966,9 @@ class P031ThinUIGateTests(unittest.TestCase):
             "schema_version": REQUIRED_SCHEMA_VERSION,
             "governed_swift_files": ["Chainworks Forge/Views/RunsHomeView.swift"],
             "governed_graphql_documents": [],
+            "embedded_graphql_documents": [],
             "generated_graphql_outputs": [],
-            "legacy_only_files": [],
+            "degraded_fail_closed_files": [],
             "explicit_exclusions": [],
             "forbidden_pattern_groups": sorted(REQUIRED_FORBIDDEN_GROUPS),
         }
@@ -876,28 +1106,220 @@ class P031ThinUIGateTests(unittest.TestCase):
         self.write_inventory(root)
         self.assertTrue(validate_inventory(root).ok)
 
-    def test_legacy_only_entries_must_be_tied_to_legacy_mode(self) -> None:
+    def test_inventory_can_govern_p031_support_boundary_with_explicit_contract_literals(
+        self,
+    ) -> None:
         root = self.make_repo()
-        legacy_path = "Chainworks Forge/Views/LegacyRollbackView.swift"
+        support_path = "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+        (root / "Chainworks Forge/Support").mkdir(parents=True)
         (root / "Chainworks Forge/Views/RunsHomeView.swift").write_text("struct RunsHomeView {}\n")
-        (root / legacy_path).write_text("let service: ExecutionService\n")
+        (root / support_path).write_text(
+            "\n".join(
+                [
+                    "enum P031GraphQLDocuments {",
+                    "  static let runsHome = \"\"\"query P031RunsHome { runs { id } }\"\"\"",
+                    "}",
+                    "let rejectedMessage = \"P031 UI must not execute GraphQL mutation operation\"",
+                    "let removedControlIDs = [\"ideas.create\", \"runs.start\", \"approvals.resolve\"]",
+                ]
+            )
+        )
+        self.write_inventory(
+            root,
+            governed_swift_files=[
+                "Chainworks Forge/Views/RunsHomeView.swift",
+                support_path,
+            ],
+            embedded_graphql_documents=[
+                {
+                    "path": support_path,
+                    "owner": "P031GraphQLDocuments",
+                    "operation_names": ["P031RunsHome"],
+                }
+            ],
+            allowed_static_guard_matches=[
+                {
+                    "path": support_path,
+                    "group_id": "graphql_mutations",
+                    "line_contains": "must not execute GraphQL mutation operation",
+                    "reason": "validator rejection copy names the forbidden operation kind",
+                },
+                {
+                    "path": support_path,
+                    "group_id": "removed_write_controls",
+                    "line_contains": "removedControlIDs",
+                    "reason": "write-path guide contract enumerates removed controls as data",
+                },
+            ],
+        )
 
-        self.write_inventory(root, legacy_only_files=[legacy_path])
+        self.assertTrue(validate_inventory(root).ok)
+
+    def test_manifest_requires_phase0d_and_release_evidence_entries(self) -> None:
+        root = self.make_repo()
+        (root / "Chainworks Forge/Views/RunsHomeView.swift").write_text("struct RunsHomeView {}\n")
+        self.write_inventory(root)
+        self.write_guide(root)
+        (root / "docs/reference/p031-phase-0-artifact-manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "p031-phase-0-artifact-manifest-v1",
+                    "status": "ready",
+                    "entries": [
+                        {
+                            "id": "governing_contract",
+                            "path": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+                            "owner_role": "P031 release owner",
+                            "validation_status": "ready",
+                            "blocking_phase": "Phase 1",
+                        }
+                    ],
+                }
+            )
+        )
+
+        result = validate_p031_contracts(root)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("manifest missing required entries" in error for error in result.errors), result.errors)
+        self.assertTrue(any("degraded_state_evidence" in error for error in result.errors), result.errors)
+
+    def test_manifest_ready_entry_cannot_point_at_blocked_evidence(self) -> None:
+        root = self.make_repo()
+        evidence_path = "docs/evidence/p031-freshness-baseline.md"
+        (root / "docs/evidence").mkdir(parents=True)
+        (root / evidence_path).write_text(
+            "\n".join(
+                [
+                    "# P031 Freshness Baseline",
+                    "",
+                    "Status: BLOCKED",
+                    "Owner: P031 macOS thin UI owner",
+                    "Blocking Phase: Phase 0d",
+                ]
+            )
+        )
+        (root / PHASE0_MANIFEST_PATH).write_text(
+            json.dumps(
+                {
+                    "schema_version": REQUIRED_PHASE0_MANIFEST_SCHEMA_VERSION,
+                    "entries": [
+                        {
+                            "id": "freshness_baseline",
+                            "path": evidence_path,
+                            "owner_role": "P031 macOS thin UI owner",
+                            "validation_status": "ready",
+                            "blocking_phase": "Phase 0d",
+                        }
+                    ],
+                }
+            )
+        )
+
+        result = validate_phase0_manifest(root)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("evidence status is BLOCKED" in error for error in result.errors),
+            result.errors,
+        )
+
+    def test_manifest_allows_later_phase_blockers_when_they_are_not_marked_ready(self) -> None:
+        root = self.make_repo()
+        (root / "docs/evidence").mkdir(parents=True)
+        evidence_path = "docs/evidence/p031-dogfood-signoff.md"
+        (root / evidence_path).write_text(
+            "\n".join(
+                [
+                    "# P031 Dogfood Sign-Off Template",
+                    "",
+                    "Status: BLOCKED",
+                    "Owner: P031 release owner",
+                    "Blocking Phase: Phase 3",
+                ]
+            )
+        )
+        (root / PHASE0_MANIFEST_PATH).write_text(
+            json.dumps(
+                {
+                    "schema_version": REQUIRED_PHASE0_MANIFEST_SCHEMA_VERSION,
+                    "entries": [
+                        {
+                            "id": "dogfood_signoff_template",
+                            "path": evidence_path,
+                            "owner_role": "P031 release owner",
+                            "validation_status": "blocked",
+                            "blocking_phase": "Phase 3",
+                        }
+                    ],
+                }
+            )
+        )
+
+        result = validate_phase0_manifest(root)
+
+        self.assertTrue(
+            all("Phase 0 manifest entry dogfood_signoff_template blocks" not in error for error in result.errors),
+            result.errors,
+        )
+
+    def test_degraded_fail_closed_entries_require_control_plane_truth_contract(self) -> None:
+        root = self.make_repo()
+        degraded_path = "Chainworks Forge/Views/DegradedRunsHomeView.swift"
+        (root / "Chainworks Forge/Views/RunsHomeView.swift").write_text("struct RunsHomeView {}\n")
+        (root / degraded_path).write_text("struct DegradedRunsHomeView {}\n")
+
+        self.write_inventory(root, degraded_fail_closed_files=[degraded_path])
         result = validate_inventory(root)
         self.assertFalse(result.ok)
-        self.assertTrue(any("legacy_only_files[0] must be an object" in error for error in result.errors))
+        self.assertTrue(
+            any("degraded_fail_closed_files[0] must be an object" in error for error in result.errors),
+            result.errors,
+        )
 
         self.write_inventory(
             root,
-            legacy_only_files=[
+            degraded_fail_closed_files=[
                 {
-                    "path": legacy_path,
-                    "legacy_mode_only": True,
-                    "mode_env": LEGACY_MODE_ENVIRONMENT,
+                    "path": degraded_path,
+                    "degraded_state_only": True,
+                    "control_plane_truth_only": True,
+                    "restores_local_orchestration": False,
+                    "restores_local_writes": False,
                 }
             ],
         )
         self.assertTrue(validate_inventory(root).ok)
+
+    def test_degraded_fail_closed_files_are_scanned_for_local_orchestration(self) -> None:
+        root = self.make_repo()
+        degraded_path = "Chainworks Forge/Views/DegradedRunsHomeView.swift"
+        (root / "Chainworks Forge/Views/RunsHomeView.swift").write_text("struct RunsHomeView {}\n")
+        (root / degraded_path).write_text("let service: ExecutionService\n")
+
+        self.write_inventory(
+            root,
+            degraded_fail_closed_files=[
+                {
+                    "path": degraded_path,
+                    "degraded_state_only": True,
+                    "control_plane_truth_only": True,
+                    "restores_local_orchestration": False,
+                    "restores_local_writes": False,
+                }
+            ],
+        )
+
+        result = validate_inventory(root)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any(
+                degraded_path in error and "forbidden P031 local_write_fallback pattern" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
 
     def test_inventory_path_category_overlap_fails_closed(self) -> None:
         root = self.make_repo()

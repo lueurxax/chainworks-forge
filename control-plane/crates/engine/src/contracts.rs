@@ -337,7 +337,7 @@ pub fn build_validation_failure_record(
         ValidationFailureClass::NoOutputProduced | ValidationFailureClass::PersistenceFailure => {
             RecoveryRecommendation {
                 action: "operator_inspection".to_string(),
-                explanation: "Inspect the agent transcript, receipt, and declared output contract before deciding whether to retry.".to_string(),
+                explanation: "Inspect the agent transcript, receipt, and declared output contract before deciding whether to retry; do not perform a blind identical retry after missing required outputs.".to_string(),
             }
         }
         ValidationFailureClass::EmptyOutput | ValidationFailureClass::OutputContractMismatch => {
@@ -864,6 +864,10 @@ mod tests {
         );
         assert!(!record.transcript_exists);
         assert_eq!(record.recovery_recommendation.action, "operator_inspection");
+        assert!(record
+            .recovery_recommendation
+            .explanation
+            .contains("do not perform a blind identical retry"));
     }
 
     #[test]

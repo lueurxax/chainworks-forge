@@ -31,24 +31,6 @@ struct ContentView: View {
     }
 }
 
-struct ControlPlaneOnlyPlaceholder: View {
-    let title: String
-    var message: String = "This legacy SwiftData surface was removed during the control-plane UI cutover."
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.title2.weight(.semibold))
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(24)
-    }
-}
-
 #Preview {
     ContentView()
 }

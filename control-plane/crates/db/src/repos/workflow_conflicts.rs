@@ -89,6 +89,16 @@ pub async fn get_current_blocking_conflict(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Option<WorkflowConflictRecord>> {
+    let mut tx = pool.begin().await?;
+    let record = get_current_blocking_conflict_tx(&mut tx, run_id).await?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+pub async fn get_current_blocking_conflict_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<Option<WorkflowConflictRecord>> {
     let statuses = current_blocking_statuses();
     assert_eq!(
         statuses.len(),
@@ -106,7 +116,7 @@ pub async fn get_current_blocking_conflict(
     .bind(statuses[0].to_string())
     .bind(statuses[1].to_string())
     .bind(statuses[2].to_string())
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .context("get current blocking workflow conflict")?;
 
@@ -204,6 +214,16 @@ pub async fn upsert_transition_cursor(
     pool: &SqlitePool,
     cursor: &WorkflowTransitionCursorRecord,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    upsert_transition_cursor_tx(&mut tx, cursor).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn upsert_transition_cursor_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    cursor: &WorkflowTransitionCursorRecord,
+) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO workflow_transition_cursors
            (run_id, current_state_id, cursor_status, resume_policy, selected_transition_id,
@@ -235,7 +255,7 @@ pub async fn upsert_transition_cursor(
     .bind(&cursor.terminal_failure_reason)
     .bind(cursor.updated_at.to_rfc3339())
     .bind(serde_json::to_string(cursor)?)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("upsert workflow transition cursor")?;
     Ok(())
@@ -271,13 +291,37 @@ pub async fn transition_conflict_status(
     terminal_failure_reason: Option<String>,
     superseded_by_conflict_id: Option<String>,
 ) -> Result<WorkflowConflictRecord> {
+    let mut tx = pool.begin().await?;
+    let record = transition_conflict_status_tx(
+        &mut tx,
+        conflict_id,
+        status,
+        transitioned_at,
+        resolution_record_json,
+        terminal_failure_reason,
+        superseded_by_conflict_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+pub async fn transition_conflict_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conflict_id: &str,
+    status: WorkflowConflictStatus,
+    transitioned_at: DateTime<Utc>,
+    resolution_record_json: Option<serde_json::Value>,
+    terminal_failure_reason: Option<String>,
+    superseded_by_conflict_id: Option<String>,
+) -> Result<WorkflowConflictRecord> {
     let row = sqlx::query(
         r#"SELECT record_json
            FROM workflow_conflicts
            WHERE conflict_id = ?1"#,
     )
     .bind(conflict_id)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
     .context("find workflow conflict for status transition")?;
     let mut record = decode_conflict_row(&row)?;
@@ -296,7 +340,7 @@ pub async fn transition_conflict_status(
     record.terminal_failure_reason = terminal_failure_reason;
     record.superseded_by_conflict_id = superseded_by_conflict_id;
 
-    write_conflict_update_pool(pool, &record).await?;
+    write_conflict_update_tx(tx, &record).await?;
     Ok(record)
 }
 
@@ -429,43 +473,6 @@ async fn write_conflict_update_tx(
         .bind(serde_json::to_string(record)?)
         .bind(&record.conflict_id)
         .execute(&mut **tx)
-        .await
-        .context("update workflow conflict")?;
-    Ok(())
-}
-
-async fn write_conflict_update_pool(
-    pool: &SqlitePool,
-    record: &WorkflowConflictRecord,
-) -> Result<()> {
-    sqlx::query(conflict_update_sql())
-        .bind(&record.conflict_fingerprint)
-        .bind(&record.run_id)
-        .bind(&record.stage_execution_id)
-        .bind(&record.lineage_id)
-        .bind(&record.current_state_id)
-        .bind(record.reason.to_string())
-        .bind(&record.operator_label)
-        .bind(record.status.to_string())
-        .bind(serde_json::to_string(&record.candidate_transitions)?)
-        .bind(&record.candidate_transition_hash)
-        .bind(serde_json::to_string(&record.advisory_evidence_refs)?)
-        .bind(&record.lead_agent_id)
-        .bind(&record.mediation_record_id)
-        .bind(record.updated_at.to_rfc3339())
-        .bind(record.resolved_at.map(|dt| dt.to_rfc3339()))
-        .bind(&record.superseded_by_conflict_id)
-        .bind(
-            record
-                .resolution_record_json
-                .as_ref()
-                .map(ToString::to_string),
-        )
-        .bind(&record.terminal_failure_reason)
-        .bind(&record.diagnostic_redaction_tier)
-        .bind(serde_json::to_string(record)?)
-        .bind(&record.conflict_id)
-        .execute(pool)
         .await
         .context("update workflow conflict")?;
     Ok(())

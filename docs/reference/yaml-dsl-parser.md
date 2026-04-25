@@ -139,11 +139,11 @@ WorkflowDefinition
 └── states: [String: WorkflowState]
 ```
 
-#### `DiscoveryConfig` (P053)
+#### `DiscoveryConfig`
 
 | Field | YAML Key | Type | Notes |
 |---|---|---|---|
-| `legacyBroadDiscoveryPolicy` | `legacy_broad_discovery_policy` | `String?` | `disabled` (default) or `workflow_opt_in` (P053 behavior) |
+| `legacyBroadDiscoveryPolicy` | `legacy_broad_discovery_policy` | `String?` | `disabled` (default) or `workflow_opt_in` |
 
 #### `WorkflowState`
 

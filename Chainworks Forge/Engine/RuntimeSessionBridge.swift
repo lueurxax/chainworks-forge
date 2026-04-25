@@ -1003,7 +1003,7 @@ struct RuntimeSessionExecution: Sendable {
                 let isCancelled = msg.contains("cancelled") || (error as? CancellationError) != nil
 
                 if !isAlreadyClosed && !isCancelled {
-                    await ForgeLogger.bridge.error("Failed to cleanup runtime session \(sessionID): \(msg)")
+                    ForgeLogger.bridge.error("Failed to cleanup runtime session \(sessionID): \(msg)")
                 }
             }
         }

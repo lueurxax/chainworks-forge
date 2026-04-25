@@ -216,10 +216,20 @@ async fn main() -> Result<()> {
     // ── Steward runtime + control-plane wiring ─────────────────────────
     let steward_config_path = std::env::var("STEWARD_CONFIG_PATH")
         .ok()
-        .map(std::path::PathBuf::from);
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            mode.is_packaged()
+                .then(|| packaging::bundled_resource_path("steward_config.yaml"))
+                .flatten()
+        });
     let steward_catalog_path = std::env::var("AGENT_CATALOG_PATH")
         .ok()
-        .map(std::path::PathBuf::from);
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            mode.is_packaged()
+                .then(|| packaging::bundled_resource_path("agents.yaml"))
+                .flatten()
+        });
     let steward_runtime_inputs = Arc::new(
         daemon::steward_runtime::bootstrap_steward_runtime(
             &pool,

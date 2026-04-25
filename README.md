@@ -128,7 +128,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
 - artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`
-  - `bounded artifact discovery and settlement optimization (P053)`
+  - `bounded artifact discovery and settlement optimization`
   - report/export surfaces
 - provider platform slices:
   - provider settings

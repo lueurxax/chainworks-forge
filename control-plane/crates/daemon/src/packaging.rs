@@ -5,7 +5,7 @@
 //! `build-sha.txt` writer the Swift diagnostics bundle reads.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
@@ -226,6 +226,23 @@ pub fn packaged_cwd_target(mode: DaemonMode, home: Option<PathBuf>) -> Option<Pa
     }
 }
 
+/// Resolve a resource bundled next to the packaged daemon.
+///
+/// Xcode copies YAML resources into `Chainworks Forge.app/Contents/Resources`
+/// while the LaunchAgent runs `Contents/MacOS/chainworks-forge-daemon`.
+/// Packaged mode intentionally chdirs to `$HOME`, so daemon-owned defaults
+/// must be rooted at the app bundle rather than at the current directory.
+pub fn bundled_resource_path(resource_name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    bundled_resource_path_from_exe(&exe, resource_name)
+}
+
+pub fn bundled_resource_path_from_exe(exe_path: &Path, resource_name: &str) -> Option<PathBuf> {
+    let contents_dir = exe_path.parent()?.parent()?;
+    let resource_path = contents_dir.join("Resources").join(resource_name);
+    resource_path.exists().then_some(resource_path)
+}
+
 /// Resolve the build SHA that should be stamped into `build-sha.txt`.
 /// Separated from the file-writing call so tests can exercise the
 /// fallback logic without shelling out to a fresh `rustc`.
@@ -437,6 +454,24 @@ mod tests {
     fn packaged_cwd_target_is_none_when_home_is_unknown() {
         assert!(packaged_cwd_target(DaemonMode::PackagedApp, None).is_none());
         assert!(packaged_cwd_target(DaemonMode::PackagedHelper, None).is_none());
+    }
+
+    #[test]
+    fn bundled_resource_path_from_exe_resolves_contents_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos_dir = dir.path().join("Chainworks Forge.app/Contents/MacOS");
+        let resources_dir = dir.path().join("Chainworks Forge.app/Contents/Resources");
+        std::fs::create_dir_all(&macos_dir).unwrap();
+        std::fs::create_dir_all(&resources_dir).unwrap();
+        let exe = macos_dir.join("chainworks-forge-daemon");
+        let catalog = resources_dir.join("agents.yaml");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(&catalog, "agents: []").unwrap();
+
+        assert_eq!(
+            bundled_resource_path_from_exe(&exe, "agents.yaml"),
+            Some(catalog)
+        );
     }
 
     /// Both runtime-override and fallback paths exercised in a single

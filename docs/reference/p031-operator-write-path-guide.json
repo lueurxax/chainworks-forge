@@ -1,6 +1,9 @@
 {
   "schema_version": "p031-operator-write-path-guide-v1",
-  "status": "pending_write_path_restoration",
+  "status": "ready_with_validated_approval_and_retry_workflows",
+  "blocker_recorded": "2026-04-24",
+  "blocking_reason": "Rows cover all removed P031 UI write controls. approvals.resolve and stages.retry are validated as external MCP workflows against copied UI identifiers; remaining rows stay temporarily_unavailable with follow-up IDs.",
+  "owner_role": "P031 release owner",
   "rows": [
     {
       "removed_control_id": "ideas.create",
@@ -44,28 +47,28 @@
     {
       "removed_control_id": "stages.retry",
       "removed_control_label": "Retry Stage",
-      "external_workflow_kind": "temporarily_unavailable",
-      "external_workflow_name_or_tool": null,
+      "external_workflow_kind": "mcp_terminal",
+      "external_workflow_name_or_tool": "chainworks-control-plane: stages.retry",
       "required_identifiers": ["run_id", "stage_id"],
-      "minimum_parameter_shape": null,
-      "unavailable_reason": "P031 removes governed UI retry controls until a non-P031 write workflow is restored.",
-      "expected_success_output": null,
+      "minimum_parameter_shape": "{\"run_id\":\"<copied run_id>\",\"stage_id\":\"<copied stage_id>\",\"agent_execution_id\":\"<optional copied agent_execution_id>\",\"consume_quota_budget_now\":false}",
+      "unavailable_reason": null,
+      "expected_success_output": "{\"scheduled\":true,\"journal_id\":\"<uuid>\"}",
       "follow_up_id": "P031-FOLLOWUP-STAGE-RETRY-WRITE-PATH",
-      "operator_notes": "The UI may expose copied run/stage identifiers only.",
-      "validation_status": "pending"
+      "operator_notes": "Use only identifiers copied from the read-only UI. Do not construct retry payloads inside governed P031 SwiftUI.",
+      "validation_status": "validated"
     },
     {
       "removed_control_id": "approvals.resolve",
       "removed_control_label": "Approve or Reject",
-      "external_workflow_kind": "temporarily_unavailable",
-      "external_workflow_name_or_tool": null,
+      "external_workflow_kind": "mcp_terminal",
+      "external_workflow_name_or_tool": "chainworks-control-plane: approvals.resolve",
       "required_identifiers": ["approval_id", "run_id", "stage_id"],
-      "minimum_parameter_shape": null,
-      "unavailable_reason": "P031 renders approvals as diagnostic read-only rows until an approved write transport exists.",
-      "expected_success_output": null,
+      "minimum_parameter_shape": "{\"run_id\":\"<copied run_id>\",\"stage_id\":\"<copied stage_id>\",\"decision\":\"granted|rejected\",\"comment\":\"<optional operator comment>\"}",
+      "unavailable_reason": null,
+      "expected_success_output": "{\"resolved\":true,\"journal_id\":\"<uuid>\"}",
       "follow_up_id": "P031-FOLLOWUP-APPROVAL-WRITE-PATH",
-      "operator_notes": "Do not show enabled Approve or Reject buttons in governed P031 UI.",
-      "validation_status": "pending"
+      "operator_notes": "The P031 UI shows approval diagnostics and copyable identifiers only; resolution remains an external MCP workflow.",
+      "validation_status": "validated"
     },
     {
       "removed_control_id": "steward.run_analysis",

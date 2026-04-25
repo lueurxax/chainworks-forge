@@ -9,7 +9,7 @@ import Foundation
 /// Model catalog: `gpt-5`, `gpt-5-codex`, `o4-mini` pass through; others default to `gpt-5`.
 /// Mode catalog: `full-access` (repoWritesAllowed), `read-only` (default).
 /// Session params: ACP JSON-RPC with `session/new` using `cwd`, `model`, `mode`. No `_meta` block.
-final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
+nonisolated final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     private struct SessionHandle {
         let subprocess: ACPSubprocessManager
@@ -116,15 +116,15 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         }
 
         // Register the active session and store systemPrompt for later prepending
-        lock.lock()
-        activeSessions[sessionId] = SessionHandle(subprocess: subprocess, runtimeHomeURL: runtimeHomeURL)
-        requestCounters[sessionId] = 2 // initialize=1, session/new=2
-        sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
-        sessionDiagnostics[sessionId] = []
-        if !request.systemPrompt.isEmpty {
-            sessionSystemPrompts[sessionId] = request.systemPrompt
+        withLock {
+            activeSessions[sessionId] = SessionHandle(subprocess: subprocess, runtimeHomeURL: runtimeHomeURL)
+            requestCounters[sessionId] = 2 // initialize=1, session/new=2
+            sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
+            sessionDiagnostics[sessionId] = []
+            if !request.systemPrompt.isEmpty {
+                sessionSystemPrompts[sessionId] = request.systemPrompt
+            }
         }
-        lock.unlock()
         self.startStderrLogging(for: subprocess, prefix: "CodexACP", sessionID: sessionId)
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -153,9 +153,9 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                     return
                 }
 
-                self.lock.lock()
-                let subprocess = self.activeSessions[sessionID]?.subprocess
-                self.lock.unlock()
+                let subprocess = self.withLock {
+                    self.activeSessions[sessionID]?.subprocess
+                }
 
                 guard let subprocess else {
                     continuation.finish(throwing: RuntimeTransportError.streamingFailed(reason: "No active Codex session for ID: \(sessionID)"))
@@ -169,9 +169,9 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                     // ACP session/prompt expects prompt as an array of content items:
                     // [{"type": "text", "text": "..."}]
                     // System prompt is embedded in the prompt content.
-                    self.lock.lock()
-                    let systemPrompt = self.sessionSystemPrompts[sessionID]
-                    self.lock.unlock()
+                    let systemPrompt = self.withLock {
+                        self.sessionSystemPrompts[sessionID]
+                    }
 
                     var fullContent = ""
                     if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -325,13 +325,14 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     }
 
     func closeSession(sessionID: String) async throws {
-        lock.lock()
-        let handle = activeSessions.removeValue(forKey: sessionID)
-        requestCounters.removeValue(forKey: sessionID)
-        sessionSystemPrompts.removeValue(forKey: sessionID)
-        sessionEnabledExtensions.removeValue(forKey: sessionID)
-        sessionDiagnostics.removeValue(forKey: sessionID)
-        lock.unlock()
+        let handle = withLock {
+            let handle = activeSessions.removeValue(forKey: sessionID)
+            requestCounters.removeValue(forKey: sessionID)
+            sessionSystemPrompts.removeValue(forKey: sessionID)
+            sessionEnabledExtensions.removeValue(forKey: sessionID)
+            sessionDiagnostics.removeValue(forKey: sessionID)
+            return handle
+        }
 
         guard let handle else {
             throw RuntimeTransportError.sessionCloseFailed(reason: "No active Codex session for ID: \(sessionID)")
@@ -353,10 +354,12 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     }
 
     func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
-        lock.lock()
-        let handle = activeSessions[sessionID]
-        let enabledExtensions = sessionEnabledExtensions[sessionID] ?? []
-        lock.unlock()
+        let (handle, enabledExtensions) = withLock {
+            (
+                activeSessions[sessionID],
+                sessionEnabledExtensions[sessionID] ?? []
+            )
+        }
 
         guard handle != nil else {
             throw RuntimeTransportError.streamingFailed(reason: "No active Codex session for ID: \(sessionID)")
@@ -561,28 +564,28 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     private func nextRequestID(for sessionID: String?) -> Int {
         let key = sessionID ?? "__global__"
-        lock.lock()
-        let current = (requestCounters[key] ?? 0) + 1
-        requestCounters[key] = current
-        lock.unlock()
-        return current
+        return withLock {
+            let current = (requestCounters[key] ?? 0) + 1
+            requestCounters[key] = current
+            return current
+        }
     }
 
     private func currentRequestID(for sessionID: String) -> Int {
-        lock.lock()
-        let current = requestCounters[sessionID] ?? 0
-        lock.unlock()
-        return current
+        return withLock {
+            requestCounters[sessionID] ?? 0
+        }
     }
 
     private func invalidateSession(sessionID: String) {
-        lock.lock()
-        let handle = activeSessions.removeValue(forKey: sessionID)
-        requestCounters.removeValue(forKey: sessionID)
-        sessionSystemPrompts.removeValue(forKey: sessionID)
-        sessionEnabledExtensions.removeValue(forKey: sessionID)
-        sessionDiagnostics.removeValue(forKey: sessionID)
-        lock.unlock()
+        let handle = withLock {
+            let handle = activeSessions.removeValue(forKey: sessionID)
+            requestCounters.removeValue(forKey: sessionID)
+            sessionSystemPrompts.removeValue(forKey: sessionID)
+            sessionEnabledExtensions.removeValue(forKey: sessionID)
+            sessionDiagnostics.removeValue(forKey: sessionID)
+            return handle
+        }
 
         guard let handle else { return }
         handle.subprocess.terminate()
@@ -690,33 +693,40 @@ final class CodexACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
     }
 
     private func currentDiagnostics(for sessionID: String) -> [RuntimeProviderDiagnostic] {
-        lock.lock()
-        defer { lock.unlock() }
-        return sessionDiagnostics[sessionID] ?? []
+        withLock {
+            sessionDiagnostics[sessionID] ?? []
+        }
     }
 
     private func appendDiagnostic(_ diagnostic: RuntimeProviderDiagnostic, to sessionID: String) {
-        lock.lock()
-        var diagnostics = sessionDiagnostics[sessionID] ?? []
-        diagnostics.append(diagnostic)
-        if diagnostics.count > 32 {
-            diagnostics.removeFirst(diagnostics.count - 32)
+        withLock {
+            var diagnostics = sessionDiagnostics[sessionID] ?? []
+            diagnostics.append(diagnostic)
+            if diagnostics.count > 32 {
+                diagnostics.removeFirst(diagnostics.count - 32)
+            }
+            sessionDiagnostics[sessionID] = diagnostics
         }
-        sessionDiagnostics[sessionID] = diagnostics
-        lock.unlock()
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 }
 
 extension CodexACPTransport: RuntimeTransportTerminationControlling {
     func terminateActiveSessionsForAppShutdown() {
-        lock.lock()
-        let handles = Array(activeSessions.values)
-        activeSessions.removeAll()
-        requestCounters.removeAll()
-        sessionSystemPrompts.removeAll()
-        sessionEnabledExtensions.removeAll()
-        sessionDiagnostics.removeAll()
-        lock.unlock()
+        let handles = withLock {
+            let handles = Array(activeSessions.values)
+            activeSessions.removeAll()
+            requestCounters.removeAll()
+            sessionSystemPrompts.removeAll()
+            sessionEnabledExtensions.removeAll()
+            sessionDiagnostics.removeAll()
+            return handles
+        }
 
         for handle in handles {
             handle.subprocess.terminate()

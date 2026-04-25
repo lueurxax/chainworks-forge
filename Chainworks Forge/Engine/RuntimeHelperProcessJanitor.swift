@@ -13,7 +13,7 @@ struct RuntimeHelperProcessJanitor: RuntimeHelperProcessJanitorProtocol, Sendabl
     }
 
     static let live = RuntimeHelperProcessJanitor()
-    static let staleThreshold: TimeInterval = 300
+    nonisolated static let staleThreshold: TimeInterval = 300
 
     private let listProcesses: @Sendable () throws -> [ProcessSnapshot]
     private let terminateProcess: @Sendable (Int32) -> Void

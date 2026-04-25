@@ -32,7 +32,7 @@ import Foundation
 
 /// Daemon lifecycle phase. Mirrors `DaemonLifecycleState` in the Rust
 /// daemon's `domain::lifecycle` module.
-enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
+nonisolated enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
     case notStarted = "not_started"
     case starting
     case ready
@@ -60,7 +60,7 @@ enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
 }
 
 /// Non-terminal reason the daemon is currently degraded.
-enum DegradedKind: String, Codable, Sendable {
+nonisolated enum DegradedKind: String, Codable, Sendable {
     case backgroundExecutorStalled = "background_executor_stalled"
     case acpRuntimeUnavailable = "acp_runtime_unavailable"
     case staleProjection = "stale_projection"
@@ -69,20 +69,20 @@ enum DegradedKind: String, Codable, Sendable {
 }
 
 /// Terminal failure reason. Every variant requires a daemon restart.
-enum FailureKind: String, Codable, Sendable {
+nonisolated enum FailureKind: String, Codable, Sendable {
     case migrationFailed = "migration_failed"
     case schemaNewerThanBinary = "schema_newer_than_binary"
     case backupFailed = "backup_failed"
     case crashLoopBudgetExhausted = "crash_loop_budget_exhausted"
 }
 
-struct DegradedReason: Codable, Sendable, Equatable {
+nonisolated struct DegradedReason: Codable, Sendable, Equatable {
     let kind: DegradedKind
     let detail: String
     let since: Date
 }
 
-struct FailureReason: Codable, Sendable, Equatable {
+nonisolated struct FailureReason: Codable, Sendable, Equatable {
     let kind: FailureKind
     let detail: String
     let since: Date
@@ -97,7 +97,7 @@ struct FailureReason: Codable, Sendable, Equatable {
 }
 
 /// Wire shape for `/health`, `/ready`, and `daemonStatus.json`.
-struct DaemonStatus: Codable, Sendable, Equatable {
+nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
     let state: DaemonLifecycleState
     let schemaVersion: Int
     let binarySchemaVersion: Int
@@ -186,7 +186,7 @@ func daemonJSONDecoder() -> JSONDecoder {
 
 // MARK: - Port file (§7.3)
 
-enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
+nonisolated enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
     case empty(url: URL)
     case nonUtf8(url: URL)
     case invalid(url: URL, text: String)
@@ -203,7 +203,7 @@ enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-struct DaemonPortFile {
+nonisolated struct DaemonPortFile {
     static let defaultPort: Int = 4000
 
     static func defaultURL() -> URL {

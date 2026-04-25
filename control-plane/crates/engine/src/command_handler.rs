@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use db::repos::{
     agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
     ideas, legacy_discovery_overrides, projections, runs, scheduler, sessions, stages, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::approval::ApprovalDecision;
@@ -19,6 +20,10 @@ use domain::ids::{ApprovalId, RunId};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
+use domain::workflow_conflict::{
+    CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
+    WorkflowTransitionCursorRecord,
+};
 use domain::PrincipalClass;
 
 use crate::cancellation;
@@ -52,6 +57,12 @@ pub enum CommandResult {
         run_id: RunId,
         stage_id: String,
         legacy_discovery_override_id: Option<String>,
+    },
+    WorkflowConflictTransitionSelected {
+        run_id: RunId,
+        conflict_id: String,
+        selected_transition_id: String,
+        selected_next_state_id: String,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -100,6 +111,7 @@ impl CommandJournalEntry {
             Command::ApproveStage(_) => "ApproveStage",
             Command::RejectStage(_) => "RejectStage",
             Command::RetryStage(_) => "RetryStage",
+            Command::ResolveWorkflowConflictTransition(_) => "ResolveWorkflowConflictTransition",
             Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
@@ -113,6 +125,7 @@ impl CommandJournalEntry {
             Command::ApproveStage(c) => Some(c.run_id.to_string()),
             Command::RejectStage(c) => Some(c.run_id.to_string()),
             Command::RetryStage(c) => Some(c.run_id.to_string()),
+            Command::ResolveWorkflowConflictTransition(c) => Some(c.run_id.to_string()),
             Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
@@ -142,6 +155,7 @@ impl CommandJournalEntry {
                 | "ApproveStage"
                 | "RejectStage"
                 | "RetryStage"
+                | "ResolveWorkflowConflictTransition"
                 | "OverrideLegacyDiscoveryPolicy"
                 | "CancelRun"
                 | "ResetSession"
@@ -212,6 +226,28 @@ fn frozen_legacy_broad_discovery_policy(run: &Run) -> Result<LegacyBroadDiscover
             }
         },
     )
+}
+
+fn validate_operator_selected_candidate(candidate: &CandidateTransitionEvaluation) -> Result<()> {
+    match candidate.result {
+        CandidateTransitionResult::Matched => Ok(()),
+        CandidateTransitionResult::NotMatched
+            if candidate
+                .sanitized_diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("Loop budget exhausted")) =>
+        {
+            Ok(())
+        }
+        CandidateTransitionResult::NotMatched => {
+            anyhow::bail!(
+                "operator conflict resolution may select only loop-budget-exhausted not_matched candidates"
+            )
+        }
+        _ => anyhow::bail!(
+            "operator conflict resolution may select only matched candidates or loop-budget-exhausted not_matched candidates"
+        ),
+    }
 }
 
 impl CommandHandler {
@@ -300,6 +336,13 @@ impl CommandHandler {
         {
             anyhow::bail!(
                 "forbidden: RetryStage legacy_discovery_override_policy requires operator principal"
+            );
+        }
+        if matches!(&cmd, Command::ResolveWorkflowConflictTransition(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!(
+                "forbidden: ResolveWorkflowConflictTransition requires operator principal"
             );
         }
         if matches!(&cmd, Command::OverrideLegacyDiscoveryPolicy(_))
@@ -1020,6 +1063,13 @@ impl CommandHandler {
                 self.maybe_inject_retry_stage_failure("settle_old_stage")?;
                 stages::insert_tx(&mut retry_tx, &new_stage).await?;
                 self.maybe_inject_retry_stage_failure("insert_new_stage")?;
+                sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+                    .bind(RunStatus::Running.to_string())
+                    .bind(c.stage_id.clone())
+                    .bind(c.run_id.to_string())
+                    .execute(&mut *retry_tx)
+                    .await?;
+                self.maybe_inject_retry_stage_failure("update_run_for_retry")?;
                 let legacy_discovery_override_id =
                     if let Some(input) = legacy_discovery_override_input.as_ref() {
                         Some(
@@ -1086,6 +1136,211 @@ impl CommandHandler {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
                     legacy_discovery_override_id,
+                })
+            }
+
+            Command::ResolveWorkflowConflictTransition(c) => {
+                if c.resolution_reason.trim().is_empty() {
+                    anyhow::bail!("resolution_reason is required");
+                }
+
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = db::pool::begin_immediate_with_retry(
+                    &self.pool,
+                    "command.ResolveWorkflowConflictTransition",
+                )
+                .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+
+                let run = runs::find_by_id_tx(&mut tx, c.run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                let conflict =
+                    workflow_conflicts::get_current_blocking_conflict_tx(&mut tx, c.run_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("Run {} has no current blocking workflow conflict", c.run_id)
+                        })?;
+                if conflict.conflict_id != c.conflict_id {
+                    anyhow::bail!(
+                        "Conflict {} is not the current blocking conflict for run {}",
+                        c.conflict_id,
+                        c.run_id
+                    );
+                }
+                if !conflict.status.is_current_blocking() {
+                    anyhow::bail!("Conflict {} is not currently blocking", c.conflict_id);
+                }
+                if run.current_state.as_deref() != Some(conflict.current_state_id.as_str()) {
+                    anyhow::bail!(
+                        "Run {} current_state does not match conflict state {}",
+                        c.run_id,
+                        conflict.current_state_id
+                    );
+                }
+
+                let selected_candidate = conflict
+                    .candidate_transitions
+                    .iter()
+                    .find(|candidate| candidate.transition_id == c.selected_transition_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Transition {} is not a candidate for conflict {}",
+                            c.selected_transition_id,
+                            c.conflict_id
+                        )
+                    })?;
+                validate_operator_selected_candidate(selected_candidate)?;
+                let selected_next_state_id = selected_candidate.to_state_id.clone();
+
+                workflow_conflicts::transition_conflict_status_tx(
+                    &mut tx,
+                    &conflict.conflict_id,
+                    WorkflowConflictStatus::Resolved,
+                    now,
+                    Some(serde_json::json!({
+                        "resolution_kind": "operator_selected_candidate_transition",
+                        "selected_transition_id": c.selected_transition_id,
+                        "selected_next_state_id": selected_next_state_id,
+                        "selected_candidate_result": selected_candidate.result.to_string(),
+                        "resolution_reason": c.resolution_reason,
+                        "caller_principal_id": caller.principal_id,
+                        "caller_tool": caller.caller_tool,
+                    })),
+                    None,
+                    None,
+                )
+                .await?;
+
+                let run_stages = stages::list_by_run_tx(&mut tx, c.run_id).await?;
+                let latest_target_stage = run_stages
+                    .iter()
+                    .filter(|stage| stage.stage_id == selected_next_state_id)
+                    .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at));
+                let mut enqueued_stage_id = None;
+                if let Some(previous) = latest_target_stage {
+                    if matches!(
+                        previous.status,
+                        StageStatus::Completed
+                            | StageStatus::Failed
+                            | StageStatus::Blocked
+                            | StageStatus::Skipped
+                    ) {
+                        let next_stage = StageExecution {
+                            id: domain::ids::StageExecutionId::new(),
+                            run_id: c.run_id,
+                            stage_id: previous.stage_id.clone(),
+                            label: previous.label.clone(),
+                            status: StageStatus::Pending,
+                            iteration: previous.iteration + 1,
+                            attempt_number: 1,
+                            settlement_kind: None,
+                            started_at: now,
+                            completed_at: None,
+                            owner_agent: previous.owner_agent.clone(),
+                            provider: previous.provider.clone(),
+                            model: previous.model.clone(),
+                            stage_type: previous.stage_type.clone(),
+                            validation_failure_json: None,
+                            evidence_packet_json: None,
+                            recovery_snapshot_json: None,
+                            retry_reason: Some("operator_conflict_resolution".into()),
+                        };
+                        enqueued_stage_id = Some(next_stage.stage_id.clone());
+                        stages::insert_tx(&mut tx, &next_stage).await?;
+                    }
+                }
+
+                sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+                    .bind(RunStatus::Running.to_string())
+                    .bind(&selected_next_state_id)
+                    .bind(c.run_id.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                workflow_conflicts::upsert_transition_cursor_tx(
+                    &mut tx,
+                    &WorkflowTransitionCursorRecord {
+                        schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+                        run_id: c.run_id.to_string(),
+                        current_state_id: conflict.current_state_id.clone(),
+                        cursor_status: "operator_transition_selected".to_string(),
+                        resume_policy: "continue_from_selected_transition".to_string(),
+                        selected_transition_id: Some(c.selected_transition_id.clone()),
+                        selected_next_state_id: Some(selected_next_state_id.clone()),
+                        conflict_id: Some(conflict.conflict_id.clone()),
+                        conflict_fingerprint: Some(conflict.conflict_fingerprint.clone()),
+                        candidate_transition_hash: Some(conflict.candidate_transition_hash.clone()),
+                        terminal_failure_reason: None,
+                        updated_at: now,
+                    },
+                )
+                .await?;
+                work_items::enqueue_tx(
+                    &mut tx,
+                    &WorkItem {
+                        id: format!(
+                            "operator-transition:{}:{}",
+                            c.conflict_id,
+                            uuid::Uuid::new_v4()
+                        ),
+                        kind: WorkItemKind::AdvanceRun,
+                        payload_json: serde_json::json!({
+                            "run_id": c.run_id.to_string(),
+                            "reason": "operator_conflict_resolution",
+                            "conflict_id": c.conflict_id.clone(),
+                            "selected_transition_id": c.selected_transition_id.clone(),
+                            "to": selected_next_state_id.clone(),
+                        })
+                        .to_string(),
+                        status: WorkItemStatus::Pending,
+                        run_id: Some(c.run_id),
+                        stage_id: enqueued_stage_id
+                            .or_else(|| Some(selected_next_state_id.clone())),
+                        created_at: now,
+                        scheduled_at: now,
+                        attempt_count: 0,
+                        last_error: None,
+                    },
+                )
+                .await?;
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ResolveWorkflowConflictTransition",
+                    0,
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction(
+                    "command.ResolveWorkflowConflictTransition",
+                    tx_started,
+                );
+                self.work_queue
+                    .publish_scheduler_notification(scheduler_refresh);
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
+                Ok(CommandResult::WorkflowConflictTransitionSelected {
+                    run_id: c.run_id,
+                    conflict_id: conflict.conflict_id,
+                    selected_transition_id: c.selected_transition_id,
+                    selected_next_state_id,
                 })
             }
 

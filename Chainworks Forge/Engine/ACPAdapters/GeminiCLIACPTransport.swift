@@ -28,7 +28,7 @@ import Foundation
 /// - Persisted session config truth is weaker than Claude (known from research)
 /// - `fs/read_text_file` callback is live-proven; `fs/write_text_file` is not yet proven
 /// - Usage telemetry under `_meta.quota` rather than top-level `usage`
-final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
+nonisolated final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     // MARK: - Configuration
 
@@ -110,14 +110,14 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         }
 
         // Register the active session
-        lock.lock()
-        activeSessions[sessionId] = subprocess
-        requestCounters[sessionId] = 2 // initialize=1, session/new=2
-        if !request.systemPrompt.isEmpty {
-            sessionSystemPrompts[sessionId] = request.systemPrompt
+        withLock {
+            activeSessions[sessionId] = subprocess
+            requestCounters[sessionId] = 2 // initialize=1, session/new=2
+            if !request.systemPrompt.isEmpty {
+                sessionSystemPrompts[sessionId] = request.systemPrompt
+            }
+            sessionDiagnostics[sessionId] = []
         }
-        sessionDiagnostics[sessionId] = []
-        lock.unlock()
         self.startStderrLogging(for: subprocess, prefix: "GeminiCLIACP", sessionID: sessionId)
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -128,9 +128,9 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
             enabledExtensions = extensions
         }
 
-        lock.lock()
-        sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
-        lock.unlock()
+        withLock {
+            sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
+        }
 
         return RuntimeSessionResponse(
             sessionId: sessionId,
@@ -156,9 +156,9 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                     return
                 }
 
-                self.lock.lock()
-                let subprocess = self.activeSessions[sessionID]
-                self.lock.unlock()
+                let subprocess = self.withLock {
+                    self.activeSessions[sessionID]
+                }
 
                 guard let subprocess else {
                     continuation.finish(throwing: RuntimeTransportError.streamingFailed(reason: "No active Gemini CLI session for ID: \(sessionID)"))
@@ -170,9 +170,9 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
 
                 do {
                     // LOCKED-003: System prompt embedded in prompt content
-                    self.lock.lock()
-                    let systemPrompt = self.sessionSystemPrompts[sessionID]
-                    self.lock.unlock()
+                    let systemPrompt = self.withLock {
+                        self.sessionSystemPrompts[sessionID]
+                    }
 
                     var fullContent = ""
                     if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -283,13 +283,14 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     }
 
     func closeSession(sessionID: String) async throws {
-        lock.lock()
-        let subprocess = activeSessions.removeValue(forKey: sessionID)
-        requestCounters.removeValue(forKey: sessionID)
-        sessionSystemPrompts.removeValue(forKey: sessionID)
-        sessionEnabledExtensions.removeValue(forKey: sessionID)
-        sessionDiagnostics.removeValue(forKey: sessionID)
-        lock.unlock()
+        let subprocess = withLock {
+            let subprocess = activeSessions.removeValue(forKey: sessionID)
+            requestCounters.removeValue(forKey: sessionID)
+            sessionSystemPrompts.removeValue(forKey: sessionID)
+            sessionEnabledExtensions.removeValue(forKey: sessionID)
+            sessionDiagnostics.removeValue(forKey: sessionID)
+            return subprocess
+        }
 
         guard let subprocess else {
             throw RuntimeTransportError.sessionCloseFailed(reason: "No active Gemini CLI session for ID: \(sessionID)")
@@ -299,11 +300,13 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     }
 
     func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
-        lock.lock()
-        let subprocess = activeSessions[sessionID]
-        let enabledExtensions = sessionEnabledExtensions[sessionID] ?? []
-        let diagnostics = sessionDiagnostics[sessionID] ?? []
-        lock.unlock()
+        let (subprocess, enabledExtensions, diagnostics) = withLock {
+            (
+                activeSessions[sessionID],
+                sessionEnabledExtensions[sessionID] ?? [],
+                sessionDiagnostics[sessionID] ?? []
+            )
+        }
 
         guard subprocess != nil else {
             throw RuntimeTransportError.streamingFailed(reason: "No active Gemini CLI session for ID: \(sessionID)")
@@ -336,18 +339,17 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
 
     private func nextRequestID(for sessionID: String?) -> Int {
         let key = sessionID ?? "__global__"
-        lock.lock()
-        let current = (requestCounters[key] ?? 0) + 1
-        requestCounters[key] = current
-        lock.unlock()
-        return current
+        return withLock {
+            let current = (requestCounters[key] ?? 0) + 1
+            requestCounters[key] = current
+            return current
+        }
     }
 
     private func currentRequestID(for sessionID: String) -> Int {
-        lock.lock()
-        let current = requestCounters[sessionID] ?? 0
-        lock.unlock()
-        return current
+        return withLock {
+            requestCounters[sessionID] ?? 0
+        }
     }
 
     // MARK: - Private: Read Next JSON-RPC Result
@@ -438,14 +440,14 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     }
 
     private func appendDiagnostic(_ diagnostic: RuntimeProviderDiagnostic, to sessionID: String) {
-        lock.lock()
-        var diagnostics = sessionDiagnostics[sessionID] ?? []
-        diagnostics.append(diagnostic)
-        if diagnostics.count > 32 {
-            diagnostics.removeFirst(diagnostics.count - 32)
+        withLock {
+            var diagnostics = sessionDiagnostics[sessionID] ?? []
+            diagnostics.append(diagnostic)
+            if diagnostics.count > 32 {
+                diagnostics.removeFirst(diagnostics.count - 32)
+            }
+            sessionDiagnostics[sessionID] = diagnostics
         }
-        sessionDiagnostics[sessionID] = diagnostics
-        lock.unlock()
     }
 
     // MARK: - Private: File-System Proxy
@@ -481,18 +483,25 @@ final class GeminiCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
 
         try? subprocess.sendJSON(response)
     }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
 }
 
 extension GeminiCLIACPTransport: RuntimeTransportTerminationControlling {
     func terminateActiveSessionsForAppShutdown() {
-        lock.lock()
-        let subprocesses = Array(activeSessions.values)
-        activeSessions.removeAll()
-        requestCounters.removeAll()
-        sessionSystemPrompts.removeAll()
-        sessionEnabledExtensions.removeAll()
-        sessionDiagnostics.removeAll()
-        lock.unlock()
+        let subprocesses = withLock {
+            let subprocesses = Array(activeSessions.values)
+            activeSessions.removeAll()
+            requestCounters.removeAll()
+            sessionSystemPrompts.removeAll()
+            sessionEnabledExtensions.removeAll()
+            sessionDiagnostics.removeAll()
+            return subprocesses
+        }
 
         for subprocess in subprocesses {
             subprocess.terminate()

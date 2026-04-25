@@ -8,7 +8,7 @@ import ServiceManagement
 struct Chainworks_ForgeApp: App {
     static let processEnvironment = ProcessInfo.processInfo.environment
     static let isTestHost = processEnvironment["XCTestConfigurationFilePath"] != nil
-    static let isUIAutomationHost = processEnvironment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
+    static let isUIAutomationHost = isUIAutomationHost(for: processEnvironment)
 
     @NSApplicationDelegateAdaptor(AutomationFallbackAppDelegate.self) private var automationFallbackAppDelegate
 
@@ -33,23 +33,48 @@ struct Chainworks_ForgeApp: App {
         }
     }
 
-    private static var shouldDisableWindowRestoration: Bool {
-        processEnvironment["CHAINWORKS_ENABLE_WINDOW_RESTORATION"] != "1"
+    static var shouldDisableWindowRestoration: Bool {
+        shouldDisableWindowRestoration(for: processEnvironment)
+    }
+
+    static func shouldDisableWindowRestoration(for environment: [String: String]) -> Bool {
+        environment["CHAINWORKS_ENABLE_WINDOW_RESTORATION"] != "1"
+    }
+
+    static func isUIAutomationHost(for environment: [String: String]) -> Bool {
+        environment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
     }
 
     private static func clearSavedWindowState() {
         #if os(macOS)
-        NSApp.disableRelaunchOnLogin()
+        NSApplication.shared.disableRelaunchOnLogin()
         #endif
+    }
+
+    static func packagedDaemonAgentPlistURL(
+        in bundleURL: URL,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let url = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+            .appendingPathComponent("com.chainworks.forge.daemon.plist", isDirectory: false)
+        return fileManager.fileExists(atPath: url.path) ? url : nil
     }
 
     private static func registerPackagedDaemonAgentIfAvailable() {
         #if os(macOS)
         let plistName = "com.chainworks.forge.daemon.plist"
-        guard Bundle.main.url(forResource: plistName, withExtension: nil, subdirectory: "Contents/Library/LaunchAgents") != nil else {
+        guard packagedDaemonAgentPlistURL(in: Bundle.main.bundleURL) != nil else {
+            ForgeLogger.app.error("Packaged daemon LaunchAgent plist is missing from Contents/Library/LaunchAgents")
             return
         }
-        try? SMAppService.agent(plistName: plistName).register()
+        do {
+            try SMAppService.agent(plistName: plistName).register()
+        } catch {
+            ForgeLogger.app.error("Failed to register packaged daemon LaunchAgent: \(error.localizedDescription)")
+        }
         #endif
     }
 }

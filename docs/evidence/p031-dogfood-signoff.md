@@ -1,8 +1,10 @@
 # P031 Dogfood Sign-Off Template
 
-Status: PENDING
+Status: READY
 Owner: P031 release owner
-Blocking Phase: Phase 0d
+Blocking Phase: Phase 3
+Template Date: 2026-04-24
+Last Updated: 2026-04-24T20:26:04Z
 
 ## Phase 3 Checklist
 - [ ] Run prerequisite gates (P027, P041, P042, P043, P031).
@@ -11,8 +13,30 @@ Blocking Phase: Phase 0d
 - [ ] Degraded-state recovery and approval diagnostic evidence captured.
 - [ ] UX/Accessibility spot check completed.
 - [ ] Freshness baseline measured (p50/p95).
-- [ ] Rollback drill or waiver attached.
+- [ ] Degraded-state/fail-closed evidence or waiver attached.
 - [ ] Critical write-path readiness or release-owner waiver confirmed.
 
+## Local Evidence Status
+
+This artifact is the Phase 3 sign-off template required before dogfood start. It is not dogfood completion evidence.
+
+Attached pre-dogfood evidence:
+
+- Live packaged daemon restored to the operator DB and serving GraphQL read projections.
+- Freshness baseline attached in `docs/evidence/p031-freshness-baseline.md`.
+- Runtime screenshots attached under `docs/evidence/p031-runtime/`.
+- Partial degraded-state restart evidence attached in `docs/evidence/p031-degraded-state-evidence.md`.
+
+Still required for Phase 3 sign-off:
+
+- Two full-mvp-live dogfood runs.
+- Operator workflow-completion notes.
+- Approval diagnostic comprehension on a run with pending approval rows.
+- Report payload indicator evidence on representative report artifacts.
+- VoiceOver/accessibility spot check.
+- Release-owner acceptance/waiver for degraded-state evidence if no scripted drill is run.
+- Critical write-path readiness or release-owner waiver.
+
 ## Sign-Off
-(To be completed during Phase 3)
+
+Not signed. Complete the checklist with run-specific evidence before Phase 3 closeout.

@@ -144,7 +144,7 @@ artifact, and cost infrastructure as stage-owned executions.
 - `quota_ledger_id`,
 - creation and update timestamps.
 
-`agent_execution_discovery_diagnostics` is a related durable table that owns detailed P053 discovery pipeline execution decisions (exact paths, provider envelopes, meta-root bounding). `agent_execution_runtime_facts` projects those decisions into scalar `output_settlement` truth but does not store the full payload.
+`agent_execution_discovery_diagnostics` is a related durable table that owns detailed discovery pipeline execution decisions (exact paths, provider envelopes, meta-root bounding). `agent_execution_runtime_facts` projects those decisions into scalar `output_settlement` truth but does not store the full payload.
 
 Current `AgentFailureKind` values include:
 
@@ -245,15 +245,15 @@ The run-level transition cursor is the authoritative continuation signal:
 
 ### Implementation Handoff Status
 
-Runs entering implementation (Phase A/B) use `ImplementationHandoffStatus` to 
+Runs entering implementation (Phase A/B) use `ImplementationHandoffStatus` to
 track engine-owned handoff truth (ARCH-038):
-- **Engine-Owned Handoff**: The engine owns the deterministic `approved_proposal` 
+- **Engine-Owned Handoff**: The engine owns the deterministic `approved_proposal`
   snapshot and handoff artifacts.
-- **Durable Readback**: `code_writer_start_status` remains `not_queued` until an 
-  execution is actually claimed. `implementation_handoff_status` distinguishes 
+- **Durable Readback**: `code_writer_start_status` remains `not_queued` until an
+  execution is actually claimed. `implementation_handoff_status` distinguishes
   between `ready`, `blocked_before_code`, and `running`.
-- **Failure Handling**: P053-style timeouts during planning block with 
-  `implementation_handoff_unavailable` without losing the deterministic approved 
+- **Failure Handling**: Implementation-entry planning timeouts block with
+  `implementation_handoff_unavailable` without losing the deterministic approved
   proposal. Retry resumes from the handoff/planning boundary.
 
 ### Recovery uses the narrowest valid next action

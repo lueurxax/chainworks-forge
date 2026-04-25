@@ -688,17 +688,24 @@ async fn invoke_agent_capacity_available(
         return Ok(Err("global_capacity"));
     }
 
-    let provider_family = ProviderFamily::resolve(provider)?;
-    let active_provider: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*)
-           FROM agent_executions
-           WHERE status = ?1 AND provider_family = ?2"#,
-    )
-    .bind(&running_status)
-    .bind(provider_family.as_str())
-    .fetch_one(pool)
-    .await?;
-    let provider_cap = capacity.provider_caps.get(&provider_family).copied();
+    let (active_provider, provider_cap) =
+        if let Ok(provider_family) = ProviderFamily::resolve(provider) {
+            let active_provider: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*)
+               FROM agent_executions
+               WHERE status = ?1 AND provider_family = ?2"#,
+            )
+            .bind(&running_status)
+            .bind(provider_family.as_str())
+            .fetch_one(pool)
+            .await?;
+            (
+                active_provider,
+                capacity.provider_caps.get(&provider_family).copied(),
+            )
+        } else {
+            (0, None)
+        };
     if let Some(provider_cap) = provider_cap {
         if active_provider >= provider_cap as i64 {
             return Ok(Err("provider_capacity"));
@@ -746,17 +753,24 @@ async fn invoke_agent_capacity_available_tx(
         return Ok(Err("global_capacity"));
     }
 
-    let provider_family = ProviderFamily::resolve(provider)?;
-    let active_provider: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*)
-           FROM agent_executions
-           WHERE status = ?1 AND provider_family = ?2"#,
-    )
-    .bind(&running_status)
-    .bind(provider_family.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
-    let provider_cap = capacity.provider_caps.get(&provider_family).copied();
+    let (active_provider, provider_cap) =
+        if let Ok(provider_family) = ProviderFamily::resolve(provider) {
+            let active_provider: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*)
+               FROM agent_executions
+               WHERE status = ?1 AND provider_family = ?2"#,
+            )
+            .bind(&running_status)
+            .bind(provider_family.as_str())
+            .fetch_one(&mut **tx)
+            .await?;
+            (
+                active_provider,
+                capacity.provider_caps.get(&provider_family).copied(),
+            )
+        } else {
+            (0, None)
+        };
     if let Some(provider_cap) = provider_cap {
         if active_provider >= provider_cap as i64 {
             return Ok(Err("provider_capacity"));
@@ -1834,8 +1848,9 @@ fn legacy_broad_discovery_truncation_reason(
 fn load_p053_cap_validation_metrics(
     workspace_root: &str,
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let path =
-        std::path::Path::new(workspace_root).join("docs/proposals/053.review/cap-validation.json");
+    let path = std::path::Path::new(workspace_root).join(
+        "docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/cap-validation.json",
+    );
     let Ok(raw) = std::fs::read_to_string(path) else {
         return (None, None, None);
     };
@@ -3132,8 +3147,34 @@ impl BackgroundExecutor {
                     tx.commit().await?;
                 }
 
+                let execution_prompt = if policy_decision.is_some() || !declared_outputs.is_empty()
+                {
+                    prompt_with_runtime_invocation_contract(
+                        prompt.clone(),
+                        RuntimeInvocationContractInput {
+                            run_id: run_id.to_string(),
+                            stage_id: stage_id.clone(),
+                            stage_execution_id: stage_execution_id.to_string(),
+                            agent_execution_id: agent_exec_id.to_string(),
+                            work_item_id: item.id.clone(),
+                            session_generation_id: policy_decision
+                                .as_ref()
+                                .map(|decision| decision.generation.id.clone()),
+                            session_reuse_disposition: policy_decision.as_ref().and_then(
+                                |decision| {
+                                    serde_json::to_value(&decision.disposition)
+                                        .ok()
+                                        .and_then(|value| value.as_str().map(String::from))
+                                },
+                            ),
+                            declared_outputs: &declared_outputs,
+                        },
+                    )
+                } else {
+                    prompt.clone()
+                };
                 let estimated_prompt_tokens =
-                    std::cmp::max(1_i64, (prompt.chars().count() as i64) / 4);
+                    std::cmp::max(1_i64, (execution_prompt.chars().count() as i64) / 4);
                 let mut req = acp::ExecutionRequest {
                     run_id,
                     stage_execution_id: Some(stage_execution_id.to_string()),
@@ -3145,7 +3186,7 @@ impl BackgroundExecutor {
                     model: model.clone(),
                     effort,
                     workspace_root: run.workspace_root.clone(),
-                    prompt,
+                    prompt: execution_prompt,
                     worktree_root: run.worktree_root.clone(),
                     worktree_write_enabled,
                     worktree_strategy,
@@ -3249,6 +3290,25 @@ impl BackgroundExecutor {
                         req.session_generation_id = Some(fallback_decision.generation.id.clone());
                         req.provider_session_id =
                             fallback_decision.generation.provider_session_id.clone();
+                        req.prompt = prompt_with_runtime_invocation_contract(
+                            prompt.clone(),
+                            RuntimeInvocationContractInput {
+                                run_id: run_id.to_string(),
+                                stage_id: stage_id.clone(),
+                                stage_execution_id: stage_execution_id.to_string(),
+                                agent_execution_id: agent_exec_id.to_string(),
+                                work_item_id: item.id.clone(),
+                                session_generation_id: Some(
+                                    fallback_decision.generation.id.clone(),
+                                ),
+                                session_reuse_disposition: serde_json::to_value(
+                                    &fallback_decision.disposition,
+                                )
+                                .ok()
+                                .and_then(|value| value.as_str().map(String::from)),
+                                declared_outputs: &declared_outputs,
+                            },
+                        );
                         policy_decision = Some(fallback_decision);
                         execution_result = self.acp.execute(req.clone()).await;
                     }
@@ -5501,9 +5561,189 @@ fn normalize_artifacts(
     }
 }
 
+struct RuntimeInvocationContractInput<'a> {
+    run_id: String,
+    stage_id: String,
+    stage_execution_id: String,
+    agent_execution_id: String,
+    work_item_id: String,
+    session_generation_id: Option<String>,
+    session_reuse_disposition: Option<String>,
+    declared_outputs: &'a [DeclaredOutput],
+}
+
+fn prompt_with_runtime_invocation_contract(
+    mut prompt: String,
+    input: RuntimeInvocationContractInput<'_>,
+) -> String {
+    prompt.push_str("\n\n### Runtime Invocation Contract\n");
+    prompt.push_str(
+        "This block is authoritative for the current turn. The provider session may be reused, \
+         but prior session memory must not override these runtime identifiers or output paths.\n",
+    );
+    prompt.push_str(&format!("- Run id: `{}`\n", input.run_id));
+    prompt.push_str(&format!("- Stage id: `{}`\n", input.stage_id));
+    prompt.push_str(&format!(
+        "- Stage execution id: `{}`\n",
+        input.stage_execution_id
+    ));
+    prompt.push_str(&format!(
+        "- Agent execution id: `{}`\n",
+        input.agent_execution_id
+    ));
+    prompt.push_str(&format!("- Work item id: `{}`\n", input.work_item_id));
+    if let Some(session_generation_id) = input.session_generation_id.as_deref() {
+        prompt.push_str(&format!(
+            "- Session generation id: `{session_generation_id}`\n"
+        ));
+    }
+    if let Some(disposition) = input.session_reuse_disposition.as_deref() {
+        prompt.push_str(&format!("- Session reuse disposition: `{disposition}`\n"));
+    }
+
+    if input.declared_outputs.is_empty() {
+        prompt.push_str("- Declared required outputs: none.\n");
+        return prompt;
+    }
+
+    prompt.push_str("\nRequired outputs for this turn:\n");
+    for output in input.declared_outputs {
+        prompt.push_str(&format!(
+            "- `{}` -> `{}`\n",
+            output.output_name, output.target_path
+        ));
+        if let (Some(name), Some(path)) = (
+            output.companion_output_name.as_deref(),
+            output.companion_path.as_deref(),
+        ) {
+            prompt.push_str(&format!("- `{name}` companion -> `{path}`\n"));
+        }
+    }
+    prompt.push_str(
+        "\nOutputs from prior stage executions, prior work items, or prior prompt turns are stale \
+         unless they are explicitly accepted by the current output contract. Return a fresh \
+         `CHAINWORKS_OUTPUT` object for this invocation, using the exact canonical paths above as \
+         keys. You must not finish this turn without `CHAINWORKS_OUTPUT` when required outputs are \
+         listed.\n",
+    );
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_invocation_contract_makes_reused_turn_self_contained() {
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "proposal_current".to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposals/current.md".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Base stable prompt".to_string(),
+            RuntimeInvocationContractInput {
+                run_id: run_id.to_string(),
+                stage_id: "state_5_proposal_refined".to_string(),
+                stage_execution_id: stage_execution_id.to_string(),
+                agent_execution_id: agent_execution_id.to_string(),
+                work_item_id: "p058-invoke:stage:0".to_string(),
+                session_generation_id: Some("generation-1".to_string()),
+                session_reuse_disposition: Some("reused".to_string()),
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        assert!(prompt.contains("Base stable prompt"));
+        assert!(prompt.contains("### Runtime Invocation Contract"));
+        assert!(prompt.contains("provider session may be reused"));
+        assert!(prompt.contains(&stage_execution_id.to_string()));
+        assert!(prompt.contains("p058-invoke:stage:0"));
+        assert!(prompt.contains("proposal_current"));
+        assert!(prompt.contains("/workspace/.chainworks/runs/run-1/proposals/current.md"));
+        assert!(prompt.contains("stale"));
+        assert!(prompt.contains("CHAINWORKS_OUTPUT"));
+        assert!(prompt.contains("must not finish this turn without"));
+    }
+
+    #[test]
+    fn runtime_invocation_contract_does_not_mutate_session_fingerprint_prompt() {
+        let base_prompt = "Base stable prompt".to_string();
+        let declared_outputs = Vec::new();
+        let prompt = prompt_with_runtime_invocation_contract(
+            base_prompt.clone(),
+            RuntimeInvocationContractInput {
+                run_id: "run-1".to_string(),
+                stage_id: "state_5".to_string(),
+                stage_execution_id: "stage-exec-1".to_string(),
+                agent_execution_id: "agent-exec-1".to_string(),
+                work_item_id: "p058-invoke:stage-exec-1:0".to_string(),
+                session_generation_id: Some("generation-1".to_string()),
+                session_reuse_disposition: Some("reused".to_string()),
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        let stable_fingerprint = binding_fingerprint(&BindingFingerprintInput {
+            agent_id: "proposal_writer",
+            provider: "codex",
+            model: Some("gpt-5.4"),
+            effort: None,
+            prompt: &base_prompt,
+            working_directory: "/workspace",
+            workspace_mode: "write_enabled",
+            worktree_write_enabled: true,
+            worktree_strategy: Some("meta_only"),
+            inputs: &[],
+            outputs: &["proposal_current".to_string()],
+            backend_profile: Some("codex_writer_high"),
+            permission_profile: Some("PROPOSAL_WRITE"),
+            mcp_servers: &[],
+            skill_snapshot_hash: None,
+            skill_ref: Some("proposal_writer_core"),
+            skill_role: None,
+            output_contract: None,
+            max_turns: None,
+            temperature: None,
+        });
+        let volatile_fingerprint = binding_fingerprint(&BindingFingerprintInput {
+            prompt: &prompt,
+            ..BindingFingerprintInput {
+                agent_id: "proposal_writer",
+                provider: "codex",
+                model: Some("gpt-5.4"),
+                effort: None,
+                prompt: &base_prompt,
+                working_directory: "/workspace",
+                workspace_mode: "write_enabled",
+                worktree_write_enabled: true,
+                worktree_strategy: Some("meta_only"),
+                inputs: &[],
+                outputs: &["proposal_current".to_string()],
+                backend_profile: Some("codex_writer_high"),
+                permission_profile: Some("PROPOSAL_WRITE"),
+                mcp_servers: &[],
+                skill_snapshot_hash: None,
+                skill_ref: Some("proposal_writer_core"),
+                skill_role: None,
+                output_contract: None,
+                max_turns: None,
+                temperature: None,
+            }
+        });
+
+        assert_ne!(
+            stable_fingerprint, volatile_fingerprint,
+            "including runtime ids in the session fingerprint would force fresh sessions"
+        );
+    }
 
     #[test]
     fn proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only() {

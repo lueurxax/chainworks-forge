@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		CEAPPINT2F95D001006EC77C /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CEAPPINT2F95D000006EC77C /* AppIntents.framework */; };
 		CE8914952F6FFF06006EC77C /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = CE8913712F6FC400006EC77C /* Yams */; };
 		CE8914962F6FFF06006EC77C /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = CE8913722F6FC400006EC77C /* Yams */; };
 		CE8915702F700957006EC77C /* proposal-po-reviewer.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */; };
@@ -49,6 +50,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		CEAPPINT2F95D000006EC77C /* AppIntents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppIntents.framework; path = System/Library/Frameworks/AppIntents.framework; sourceTree = SDKROOT; };
 		CE8913392F6FC308006EC77C /* Chainworks Forge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Chainworks Forge.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE8913482F6FC30A006EC77C /* Chainworks ForgeTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Chainworks ForgeTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE8913522F6FC30A006EC77C /* Chainworks ForgeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Chainworks ForgeUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -97,6 +99,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CEAPPINT2F95D001006EC77C /* AppIntents.framework in Frameworks */,
 				CE8914952F6FFF06006EC77C /* Yams in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

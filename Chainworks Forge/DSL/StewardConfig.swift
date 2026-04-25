@@ -1,6 +1,6 @@
 import Foundation
 
-struct StewardConfig: Codable, Hashable, Sendable {
+nonisolated struct StewardConfig: Codable, Hashable, Sendable {
     let schemaVersion: Int
     let windows: WindowConfig
     let thresholds: [String: ThresholdEntry]
@@ -14,7 +14,7 @@ struct StewardConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct WindowConfig: Codable, Hashable, Sendable {
+nonisolated struct WindowConfig: Codable, Hashable, Sendable {
     let observationWindowSize: Int
     let baselineWindowSize: Int
     let minimumWindowSize: Int
@@ -28,12 +28,12 @@ struct WindowConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct ThresholdEntry: Codable, Hashable, Sendable {
+nonisolated struct ThresholdEntry: Codable, Hashable, Sendable {
     let method: String
     let trigger: Double
 }
 
-struct TriggerConfig: Codable, Hashable, Sendable {
+nonisolated struct TriggerConfig: Codable, Hashable, Sendable {
     let postRunHook: PostRunHookConfig
     let onConfigChange: OnConfigChangeConfig
     let schedule: ScheduleConfig
@@ -45,7 +45,7 @@ struct TriggerConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct PostRunHookConfig: Codable, Hashable, Sendable {
+nonisolated struct PostRunHookConfig: Codable, Hashable, Sendable {
     let enabled: Bool
     let runInterval: Int
 
@@ -55,29 +55,29 @@ struct PostRunHookConfig: Codable, Hashable, Sendable {
     }
 }
 
-struct OnConfigChangeConfig: Codable, Hashable, Sendable {
+nonisolated struct OnConfigChangeConfig: Codable, Hashable, Sendable {
     let enabled: Bool
 }
 
-struct ScheduleConfig: Codable, Hashable, Sendable {
+nonisolated struct ScheduleConfig: Codable, Hashable, Sendable {
     let enabled: Bool
     let cron: String
 }
 
 // MARK: - Context Strategy Profiles
 
-enum StewardHandoffMode: String, Codable, Sendable {
+nonisolated enum StewardHandoffMode: String, Codable, Sendable {
     case selective
     case fullForward = "full_forward"
     case full
 }
 
-enum StewardContextContinuityMode: String, Codable, Sendable {
+nonisolated enum StewardContextContinuityMode: String, Codable, Sendable {
     case familyWithinRun = "family_within_run"
     case none
 }
 
-struct StewardContextStrategyProfile: Codable, Hashable, Sendable {
+nonisolated struct StewardContextStrategyProfile: Codable, Hashable, Sendable {
     let defaultHandoffMode: StewardHandoffMode
     let defaultModelTier: String?
     let escalationModelTier: String?
@@ -91,7 +91,7 @@ struct StewardContextStrategyProfile: Codable, Hashable, Sendable {
     }
 }
 
-struct StewardContextStrategyAgentProfile: Codable, Hashable, Sendable {
+nonisolated struct StewardContextStrategyAgentProfile: Codable, Hashable, Sendable {
     let continuityMode: StewardContextContinuityMode?
     let handoffPolicy: StewardContextHandoffPolicy?
 
@@ -101,7 +101,7 @@ struct StewardContextStrategyAgentProfile: Codable, Hashable, Sendable {
     }
 }
 
-struct StewardContextHandoffPolicy: Codable, Hashable, Sendable {
+nonisolated struct StewardContextHandoffPolicy: Codable, Hashable, Sendable {
     let mandatory: [String]
     let summarized: [String]
     let lazy: [String]

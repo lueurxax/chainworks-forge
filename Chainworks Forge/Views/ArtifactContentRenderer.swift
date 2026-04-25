@@ -1,13 +1,14 @@
 import SwiftUI
 import Foundation
 import AppKit
+import SwiftData
 
-enum ArtifactRenderProvenance: Equatable {
+nonisolated enum ArtifactRenderProvenance: Equatable {
     case artifactBacked
     case explicit
 }
 
-struct ArtifactRenderContext: Equatable {
+nonisolated struct ArtifactRenderContext: Equatable {
     let format: ArtifactFormat
     let artifactName: String?
     let localRoots: [URL]
@@ -62,7 +63,7 @@ struct ArtifactRenderContext: Equatable {
     }
 }
 
-enum MarkdownImageSourcePolicy {
+nonisolated enum MarkdownImageSourcePolicy {
     case v1
 
     private static let allowedRenderableExtensions: Set<String> = [
@@ -196,7 +197,7 @@ enum MarkdownDocumentBlock: Equatable {
     }
 }
 
-enum MarkdownDocumentParser {
+nonisolated enum MarkdownDocumentParser {
     private static let imagePattern = try! NSRegularExpression(
         pattern: #"^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$"#,
         options: []
@@ -1313,5 +1314,97 @@ struct DiffArtifactView: View {
         if line.hasPrefix("+") { return .green.opacity(0.1) }
         if line.hasPrefix("-") { return .red.opacity(0.1) }
         return .clear
+    }
+}
+
+struct WorkflowRunArtifactSnapshot {
+    let latestArtifacts: [Artifact]
+    let approvalContextArtifacts: [Artifact]
+    let latestDebugArtifacts: [Artifact]
+
+    init(artifacts: [Artifact]) {
+        let visibleArtifacts = artifacts.filter { $0.reportKind != "immutable_history" }
+        self.latestArtifacts = visibleArtifacts.sorted { lhs, rhs in
+            if lhs.name == "final_feature_report" && rhs.name != "final_feature_report" {
+                return true
+            }
+            if rhs.name == "final_feature_report" && lhs.name != "final_feature_report" {
+                return false
+            }
+            return lhs.createdAt > rhs.createdAt
+        }
+
+        self.approvalContextArtifacts = visibleArtifacts
+            .filter { artifact in
+                artifact.name == "proposal_review_summary" || artifact.name == "proposal_current"
+            }
+            .sorted { lhs, rhs in
+                Self.approvalContextRank(lhs.name) < Self.approvalContextRank(rhs.name)
+            }
+
+        self.latestDebugArtifacts = visibleArtifacts
+            .filter { artifact in
+                artifact.name.contains("transcript") || artifact.name.contains("receipt")
+            }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    private static func approvalContextRank(_ name: String) -> Int {
+        switch name {
+        case "proposal_review_summary":
+            return 0
+        case "proposal_current":
+            return 1
+        default:
+            return 2
+        }
+    }
+}
+
+enum ArtifactInspectorSkillTruthFormatter {
+    static func compactSummary(_ summary: String) -> String? {
+        let compacted = summary
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !compacted.isEmpty else { return nil }
+        let maxLength = 221
+        guard compacted.count > maxLength else { return compacted }
+        return String(compacted.prefix(maxLength - 1)) + "…"
+    }
+}
+
+enum ArtifactInspectorTraceabilityResolver {
+    static func downstreamConsumers(
+        artifact: Artifact,
+        run: Run,
+        modelContext: ModelContext
+    ) -> [AgentExecution] {
+        let runID = run.id
+        let descriptor = FetchDescriptor<StageExecution>()
+        guard let stages = try? modelContext.fetch(descriptor) else { return [] }
+
+        return stages
+            .filter { $0.run?.id == runID }
+            .flatMap { stage in stage.agentExecutions }
+            .filter { execution in
+                guard let data = execution.inputBindingsJSON,
+                      let bindings = try? JSONDecoder().decode([InputBinding].self, from: data)
+                else { return false }
+                return bindings.contains { binding in
+                    binding.artifactName == artifact.name && binding.producingAgentID == artifact.agentID
+                }
+            }
+    }
+}
+
+enum RunReportSupersedence {
+    static func notice(for artifact: Artifact, run: Run) -> String? {
+        guard artifact.reportKind == "immutable_history",
+              let reportVersion = artifact.reportVersion,
+              reportVersion < run.latestReportVersion
+        else { return nil }
+
+        return "This immutable run report was superseded after the run continued to version \(run.latestReportVersion)."
     }
 }

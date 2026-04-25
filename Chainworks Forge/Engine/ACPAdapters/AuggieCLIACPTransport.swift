@@ -9,7 +9,7 @@ import Foundation
 /// Model catalog: pass through as-is (Auggie uses its own model catalog).
 /// Mode catalog: `autonomous` (repoWritesAllowed), `interactive` (default).
 /// Session params: ACP JSON-RPC with `session/new` using `cwd`, `model`, `mode`. No `_meta` block.
-final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
+nonisolated final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     // MARK: - Configuration
 
@@ -105,13 +105,13 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
         }
 
         // Register the active session and store systemPrompt for later prepending
-        lock.lock()
-        activeSessions[sessionId] = subprocess
-        requestCounters[sessionId] = 2 // initialize=1, session/new=2
-        if !request.systemPrompt.isEmpty {
-            sessionSystemPrompts[sessionId] = request.systemPrompt
+        withLock {
+            activeSessions[sessionId] = subprocess
+            requestCounters[sessionId] = 2 // initialize=1, session/new=2
+            if !request.systemPrompt.isEmpty {
+                sessionSystemPrompts[sessionId] = request.systemPrompt
+            }
         }
-        lock.unlock()
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
 
@@ -121,9 +121,9 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
             enabledExtensions = extensions
         }
 
-        lock.lock()
-        sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
-        lock.unlock()
+        withLock {
+            sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
+        }
 
         return RuntimeSessionResponse(
             sessionId: sessionId,
@@ -149,9 +149,9 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                     return
                 }
 
-                self.lock.lock()
-                let subprocess = self.activeSessions[sessionID]
-                self.lock.unlock()
+                let subprocess = self.withLock {
+                    self.activeSessions[sessionID]
+                }
 
                 guard let subprocess else {
                     continuation.finish(throwing: RuntimeTransportError.streamingFailed(reason: "No active Auggie session for ID: \(sessionID)"))
@@ -165,9 +165,9 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
                     // ACP session/prompt expects prompt as an array of content items:
                     // [{"type": "text", "text": "..."}]
                     // System prompt is embedded in the prompt content.
-                    self.lock.lock()
-                    let systemPrompt = self.sessionSystemPrompts[sessionID]
-                    self.lock.unlock()
+                    let systemPrompt = self.withLock {
+                        self.sessionSystemPrompts[sessionID]
+                    }
 
                     var fullContent = ""
                     if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -290,12 +290,13 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     }
 
     func closeSession(sessionID: String) async throws {
-        lock.lock()
-        let subprocess = activeSessions.removeValue(forKey: sessionID)
-        requestCounters.removeValue(forKey: sessionID)
-        sessionSystemPrompts.removeValue(forKey: sessionID)
-        sessionEnabledExtensions.removeValue(forKey: sessionID)
-        lock.unlock()
+        let subprocess = withLock {
+            let subprocess = activeSessions.removeValue(forKey: sessionID)
+            requestCounters.removeValue(forKey: sessionID)
+            sessionSystemPrompts.removeValue(forKey: sessionID)
+            sessionEnabledExtensions.removeValue(forKey: sessionID)
+            return subprocess
+        }
 
         guard let subprocess else {
             throw RuntimeTransportError.sessionCloseFailed(reason: "No active Auggie session for ID: \(sessionID)")
@@ -315,10 +316,12 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
     }
 
     func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
-        lock.lock()
-        let subprocess = activeSessions[sessionID]
-        let enabledExtensions = sessionEnabledExtensions[sessionID] ?? []
-        lock.unlock()
+        let (subprocess, enabledExtensions) = withLock {
+            (
+                activeSessions[sessionID],
+                sessionEnabledExtensions[sessionID] ?? []
+            )
+        }
 
         guard subprocess != nil else {
             throw RuntimeTransportError.streamingFailed(reason: "No active Auggie session for ID: \(sessionID)")
@@ -348,18 +351,17 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
 
     private func nextRequestID(for sessionID: String?) -> Int {
         let key = sessionID ?? "__global__"
-        lock.lock()
-        let current = (requestCounters[key] ?? 0) + 1
-        requestCounters[key] = current
-        lock.unlock()
-        return current
+        return withLock {
+            let current = (requestCounters[key] ?? 0) + 1
+            requestCounters[key] = current
+            return current
+        }
     }
 
     private func currentRequestID(for sessionID: String) -> Int {
-        lock.lock()
-        let current = requestCounters[sessionID] ?? 0
-        lock.unlock()
-        return current
+        return withLock {
+            requestCounters[sessionID] ?? 0
+        }
     }
 
     // MARK: - Private: Read Next JSON-RPC Result
@@ -432,17 +434,24 @@ final class AuggieCLIACPTransport: RuntimeTransportProtocol, @unchecked Sendable
             }
         }
     }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
 }
 
 extension AuggieCLIACPTransport: RuntimeTransportTerminationControlling {
     func terminateActiveSessionsForAppShutdown() {
-        lock.lock()
-        let subprocesses = Array(activeSessions.values)
-        activeSessions.removeAll()
-        requestCounters.removeAll()
-        sessionSystemPrompts.removeAll()
-        sessionEnabledExtensions.removeAll()
-        lock.unlock()
+        let subprocesses = withLock {
+            let subprocesses = Array(activeSessions.values)
+            activeSessions.removeAll()
+            requestCounters.removeAll()
+            sessionSystemPrompts.removeAll()
+            sessionEnabledExtensions.removeAll()
+            return subprocesses
+        }
 
         for subprocess in subprocesses {
             subprocess.terminate()

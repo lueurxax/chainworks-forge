@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Full Workflow Definition
 
-struct WorkflowDefinition: Codable, Sendable {
+nonisolated struct WorkflowDefinition: Codable, Sendable {
     let schemaVersion: Int
     let workflow: WorkflowMeta
     let discovery: DiscoveryConfig?

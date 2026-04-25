@@ -508,6 +508,8 @@ private struct P031ApprovalInboxCard: View {
                                 P031CopyItemsView(items: row.copyItems)
                             }
                         }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(row.accessibilityLabel)
                     }
                 }
             } else {
@@ -566,13 +568,18 @@ private struct P031ReportMetadataCard: View {
             } else {
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                     VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label(row.title, systemImage: row.availabilitySymbolName)
+                        HStack(alignment: .center, spacing: 12) {
+                            Text(row.title)
                                 .font(.subheadline.weight(.semibold))
-                            Spacer()
-                            Text(row.availabilityLabel)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 8)
+                            Label(row.availabilityLabel, systemImage: row.availabilitySymbolName)
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(row.canOpenPayload ? .primary : .secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(width: CGFloat(row.payloadIndicatorSlotWidth), alignment: .trailing)
                         }
                         P031CopyItemsView(items: row.copyItems)
                     }

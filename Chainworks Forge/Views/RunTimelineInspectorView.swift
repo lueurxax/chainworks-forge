@@ -384,7 +384,7 @@ struct StreamingTimelineTextPresentation: Equatable {
             .map { $0 }
     }
 
-    private static func compactLine(_ line: String) -> String {
+    nonisolated private static func compactLine(_ line: String) -> String {
         let collapsed = line.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
         if collapsed.count > 220 {
             return String(collapsed.prefix(217)) + "..."

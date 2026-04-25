@@ -180,7 +180,7 @@ final class RunCancellationCoordinator {
             return []
         }
 
-        guard let transport = runtimeExecutor.runtimeTransportForCancellation else {
+        guard let transport = await runtimeExecutor.runtimeTransportForCancellation else {
             // No transport — ACP-only run; sessions are subprocess-managed.
             return sessionIDs.map { SessionCloseOutcome(sessionID: $0, attempted: false, succeeded: false) }
         }
@@ -217,7 +217,9 @@ final class RunCancellationCoordinator {
                 return result
             }
         } catch {
-            ForgeLogger.execution.error("Session close failed for \(sessionID): \(error.localizedDescription)")
+            ForgeLogger.execution.error(
+                "Session close failed for \(sessionID): \(error.localizedDescription)"
+            )
             return false
         }
     }

@@ -264,7 +264,7 @@ struct MCPPolicyResolver: Sendable {
         var effectiveExtensions: [String] = []
         var effectiveRuntimeIDs: [String] = []
         var deniedExtensions: [String] = []
-        var warnings: [String] = []
+        let warnings: [String] = []
         var blockingIssues: [String] = []
 
         if runtimeNamespace == nil {

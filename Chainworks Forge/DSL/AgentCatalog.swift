@@ -34,7 +34,7 @@ struct RuntimeProfile: Codable, Sendable {
 
 // MARK: - Agent Catalog (top-level)
 
-struct AgentCatalog: Codable, Sendable {
+nonisolated struct AgentCatalog: Codable, Sendable {
     let schemaVersion: Int
     let app: AppConfig
     let paths: [String: String]
@@ -398,7 +398,7 @@ struct MCPPermissions: Codable, Sendable {
     }
 }
 
-struct MCPPolicyConfig: Codable, Sendable, Equatable {
+nonisolated struct MCPPolicyConfig: Codable, Sendable, Equatable {
     let defaultProfile: String
     let runtimeAuthority: String
     let permissionProfileMCPMode: String

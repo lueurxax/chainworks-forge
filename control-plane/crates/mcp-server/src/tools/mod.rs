@@ -9,7 +9,7 @@ pub mod steward;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 15] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 16] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -20,6 +20,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 15] {
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
+        CapabilityToolId::WorkflowConflictsResolve,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
         CapabilityToolId::ReportsGet,
         CapabilityToolId::ArtifactsOverrideContract,
@@ -40,6 +41,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
+        "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
@@ -65,6 +67,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
             tool_spec_by_name(approvals::tool_specs(), "approvals.resolve")
         }
         CapabilityToolId::StagesRetry => tool_spec_by_name(stages::tool_specs(), "stages.retry"),
+        CapabilityToolId::WorkflowConflictsResolve => {
+            tool_spec_by_name(stages::tool_specs(), "workflow_conflicts.resolve")
+        }
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             tool_spec_by_name(stages::tool_specs(), "legacy_discovery_override_create")
         }
@@ -122,12 +127,20 @@ mod tests {
             Some(CapabilityToolId::LegacyDiscoveryOverrideCreate)
         );
         assert_eq!(
+            super::capability_id_for("workflow_conflicts.resolve"),
+            Some(CapabilityToolId::WorkflowConflictsResolve)
+        );
+        assert_eq!(
             super::mcp_tool_for(CapabilityToolId::StewardGetAnalysis).name,
             "steward.get_analysis"
         );
         assert_eq!(
             super::mcp_tool_for(CapabilityToolId::LegacyDiscoveryOverrideCreate).name,
             "legacy_discovery_override_create"
+        );
+        assert_eq!(
+            super::mcp_tool_for(CapabilityToolId::WorkflowConflictsResolve).name,
+            "workflow_conflicts.resolve"
         );
         assert_eq!(super::capability_id_for("missing.tool"), None);
     }

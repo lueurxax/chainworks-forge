@@ -637,6 +637,7 @@ impl McpServer {
             tools::approvals::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("stages.")
             || tool_name == "legacy_discovery_override_create"
+            || tool_name == "workflow_conflicts.resolve"
         {
             tools::stages::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("reports.") {
@@ -881,6 +882,7 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
+            "workflow_conflicts.resolve",
             "legacy_discovery_override_create",
             "reports.get",
             "steward.run_analysis",

@@ -8,7 +8,7 @@ use db::repos::{
     workflow_conflicts,
 };
 use db::work_item::WorkItemKind;
-use domain::agent::{AgentFailureKind, AgentOutputSettlement};
+use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::Run;
 use domain::stage::StageStatus;
@@ -242,6 +242,49 @@ impl RecoveryService {
     async fn repair_run(&self, run: &Run) -> Result<usize> {
         let run_stages = stages::list_by_run(&self.pool, run.id).await?;
         let mut requeued = 0usize;
+        let now = Utc::now();
+
+        for stage in run_stages
+            .iter()
+            .filter(|stage| stage.status != StageStatus::Running)
+        {
+            let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+            if !executions
+                .iter()
+                .any(|execution| execution.status == AgentStatus::Running)
+            {
+                continue;
+            }
+
+            let tx_started = std::time::Instant::now();
+            let mut tx = db::pool::begin_immediate_with_retry(
+                &self.pool,
+                "recovery.clear_stale_stage_execution",
+            )
+            .await?;
+            let cancelled_executions =
+                agent_executions::cancel_running_by_stage_tx(&mut tx, stage.id, now).await?;
+            let cancelled_work_items =
+                work_items::cancel_pending_or_running_invoke_by_stage_execution_tx(
+                    &mut tx,
+                    run.id,
+                    &stage.id.to_string(),
+                    now,
+                    "stale_stage_execution_startup_repair",
+                )
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("recovery.clear_stale_stage_execution", tx_started);
+
+            warn!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                stage_execution_id = %stage.id,
+                cancelled_executions = cancelled_executions,
+                cancelled_work_items = cancelled_work_items,
+                "Startup repair cleared stale running InvokeAgent state for non-running stage"
+            );
+        }
 
         // Check for stages stuck in Running state — these might be orphaned from a crash
         let running_stages: Vec<_> = run_stages
@@ -249,7 +292,6 @@ impl RecoveryService {
             .filter(|s| s.status == StageStatus::Running)
             .collect();
 
-        let now = Utc::now();
         let mut blocked_running_stages = 0usize;
 
         for stage in &running_stages {

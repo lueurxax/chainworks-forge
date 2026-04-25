@@ -1,0 +1,125 @@
+{
+  "schema_version": "p031-ui-inventory.v2",
+  "proposal_revision": "031-2026-04-24-r19-degraded-state-correction",
+  "governing_contract": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+  "scope_boundary": "graphql_read_only_mac_ui",
+  "generated_at": "2026-04-24",
+  "governed_swift_paths": [
+    {
+      "path": "Chainworks Forge/Views/RunsHomeView.swift",
+      "surface": "runs_home",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/RunProgressView.swift",
+      "surface": "run_detail_and_stage_progress",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/StageDetailView.swift",
+      "surface": "stage_detail",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/ApprovalGateView.swift",
+      "surface": "approval_diagnostics",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/ArtifactInspectorView.swift",
+      "surface": "artifact_viewer",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/RunArtifactHierarchyView.swift",
+      "surface": "artifact_hierarchy",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/RunReportView.swift",
+      "surface": "report_metadata",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/FailedStageEvidencePanel.swift",
+      "surface": "failed_stage_evidence_readback",
+      "allowed_truth_source": "GraphQL read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/DaemonLifecycleSurface.swift",
+      "surface": "daemon_lifecycle",
+      "allowed_truth_source": "GraphQL/lifecycle read model only",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/BlockedRunRecoveryView.swift",
+      "surface": "recovery_diagnostics",
+      "allowed_truth_source": "GraphQL read model only; no local mutation path",
+      "degraded_fail_closed_allowed": true
+    },
+    {
+      "path": "Chainworks Forge/Views/RecoverySheet.swift",
+      "surface": "recovery_diagnostics",
+      "allowed_truth_source": "GraphQL read model only; no local mutation path",
+      "degraded_fail_closed_allowed": true
+    }
+  ],
+  "generated_client_paths": [
+    {
+      "path": "Chainworks Forge/GraphQL",
+      "status": "planned_or_generated_by_phase_1",
+      "rule": "queries and subscriptions only; no mutation definitions"
+    }
+  ],
+  "forbidden_patterns": [
+    {
+      "id": "no_ui_mcp",
+      "pattern": "MCP",
+      "applies_to": "governed_swift_paths",
+      "allow_degraded_fail_closed_only": true
+    },
+    {
+      "id": "no_graphql_mutations",
+      "pattern": "mutation ",
+      "applies_to": "generated_client_paths",
+      "allow_degraded_fail_closed_only": false
+    },
+    {
+      "id": "no_local_recovery_mutation",
+      "pattern": "RecoveryCoordinator",
+      "applies_to": "governed_swift_paths",
+      "allow_degraded_fail_closed_only": true
+    },
+    {
+      "id": "no_local_execution_mutation",
+      "pattern": "ExecutionService",
+      "applies_to": "governed_swift_paths",
+      "allow_degraded_fail_closed_only": true
+    },
+    {
+      "id": "no_local_plan_compile",
+      "pattern": "RunPlanCompiler",
+      "applies_to": "governed_swift_paths",
+      "allow_degraded_fail_closed_only": true
+    },
+    {
+      "id": "no_swiftdata_workflow_truth",
+      "pattern": "@Query",
+      "applies_to": "governed_swift_paths",
+      "allow_degraded_fail_closed_only": true
+    }
+  ],
+  "phase_0_validation": {
+    "validation_status": "ready_for_phase_0_gate",
+    "blocking_phase": "before_swift_screen_migration",
+    "notes": "This legacy-shape inventory is non-canonical. The canonical gate consumes docs/reference/p031-thin-ui-inventory.json; degraded/fail-closed paths must remain read-only and must not restore local orchestration or local UI writes."
+  }
+}

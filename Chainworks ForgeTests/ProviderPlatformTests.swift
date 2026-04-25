@@ -1527,35 +1527,31 @@ struct ProviderPlatformTests {
         #expect(contents.contains { $0.hasSuffix("artifacts/proposal.md") })
     }
 
-    @Test("Provider draft resets generated model when switching from Codex to Claude")
-    mutating func providerDraftResetsGeneratedModelWhenSwitchingFamilies() {
-        var draft = ProviderDraft()
-        let configuration = AppConfiguration.seededDefault()
+    @Test("Provider defaults reset generated model when switching from Codex to Claude")
+    mutating func providerDefaultsResetGeneratedModelWhenSwitchingFamilies() {
+        let transport = ProviderTransport.cli
 
-        draft.applyFamilyDefaults(.codexACP, configuration: configuration)
-        #expect(draft.displayName == "Codex ACP CLI")
-        #expect(draft.defaultModel == "gpt-5")
-
-        draft.applyFamilyDefaults(.claudeACP, configuration: configuration)
-
-        #expect(draft.family == .claudeACP)
-        #expect(draft.displayName == "Claude ACP CLI")
-        #expect(draft.defaultModel == "sonnet")
+        #expect(ProviderDefaults.generatedDisplayName(for: .codexACP, transport: transport) == "Codex ACP CLI")
+        #expect(ProviderDefaults.defaultModel(for: .codexACP) == "gpt-5")
+        #expect(ProviderDefaults.generatedDisplayName(for: .claudeACP, transport: transport) == "Claude ACP CLI")
+        #expect(ProviderDefaults.defaultModel(for: .claudeACP) == "sonnet")
     }
 
-    @Test("Provider draft normalizes cross-family model before save")
-    mutating func providerDraftNormalizesCrossFamilyModelBeforeSave() {
-        var draft = ProviderDraft()
-        draft.family = .claudeACP
-        draft.displayName = "Claude ACP"
-        draft.transport = .cli
-        draft.defaultModel = "gpt-5-codex"
+    @Test("Provider model defaults normalize cross-family values before save")
+    mutating func providerModelDefaultsNormalizeCrossFamilyValuesBeforeSave() {
+        let normalized = ProviderDefaults.canonicalModel(
+            "gpt-5-codex",
+            for: .claudeACP,
+            transport: .cli
+        )
+        let savedModel: String
+        if let normalized, ProviderDefaults.model(normalized, isCompatibleWith: .claudeACP) {
+            savedModel = normalized
+        } else {
+            savedModel = ProviderDefaults.defaultModel(for: .claudeACP)
+        }
 
-        draft.normalizeForSave()
-        let provider = draft.makeProvider()
-
-        #expect(provider.family == .claudeACP)
-        #expect(provider.defaultModel == "sonnet")
+        #expect(savedModel == "sonnet")
     }
 
     @Test("Provider settings store sanitizes stale cross-family provider defaults")

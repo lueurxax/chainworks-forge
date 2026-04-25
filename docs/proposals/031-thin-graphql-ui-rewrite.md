@@ -1,6 +1,6 @@
 # Proposal 031: Thin GraphQL-Only UI Rewrite Over Server Projections
 
-Revision: `031-2026-04-21-run-72409268-r1-r18-restart-review-ready`  
+Revision: `031-2026-04-24-r19-degraded-state-correction`
 Source packet: prior run `8dd01a54-0791-43e0-b526-5ed92c95b34f`, r18  
 Current run: `72409268-9dea-4ece-82f6-6ef29b4a446e`  
 Status: ready for aggregate re-review only. Implementation approval remains rejected/stale until this GraphQL-only scope is reviewed and approved.
@@ -15,7 +15,7 @@ This restart keeps the prior r18 packet as the baseline and converts it into a s
 
 ## Decision Summary
 
-Approve P031 only for Phase 0 contract hardening after aggregate re-review. Do not begin Swift screen migration, dogfood, flag removal, or legacy rollback removal until the phase-specific gates in this proposal pass.
+Approve P031 only for Phase 0 contract hardening after aggregate re-review. Do not begin Swift screen migration, dogfood, or flag removal until the phase-specific gates in this proposal pass.
 
 Hard decisions:
 
@@ -23,8 +23,8 @@ Hard decisions:
 - Governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.
 - Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.
 - Full report payload rendering remains outside P031 and defaults to a P0 follow-up unless Phase 0d evidence proves metadata-only inspection is acceptable.
-- Legacy rollback removal is blocked until critical write-path readiness is merged and gate-green, or a dated release-owner waiver accepts the gap and sets a hard write-restoration deadline.
-- The stale r7 GraphQL+MCP implementation approval is non-authoritative. Re-review of the r8/r18 GraphQL-only scope is required before implementation approval.
+- P031 does not preserve or restore the old Swift-orchestrator path. Fail-closed behavior means disabling or degrading affected thin UI surfaces while the control-plane database and GraphQL projections remain the source of truth; no local workflow writes are restored.
+- The stale r7 GraphQL+MCP implementation approval is non-authoritative. Re-review of the r19 GraphQL-only scope is required before implementation approval.
 
 ## Problem
 
@@ -35,7 +35,7 @@ The macOS operator app still has UI-facing paths that can read or infer workflow
 - The P031 gate and UI ownership inventory need to be executable, not prose-only.
 - New disabled/report/approval/freshness metadata fields must be server-owned or explicitly deferred.
 - Operators need a validated external write workflow while UI writes are removed.
-- Legacy rollback must not disappear before write-path restoration or an explicit waiver.
+- Degraded/fail-closed states must not restore the old local orchestrator, local workflow truth, or local UI writes.
 
 ## Desired State
 
@@ -47,7 +47,7 @@ After P031:
 - Every governed UI file and generated GraphQL location is covered by a machine-readable inventory consumed by the P031 gate.
 - Every removed write control is represented in an operator write-path guide row before dogfood.
 - Dogfood evidence proves both technical compliance and operator workflow viability.
-- Legacy rollback removal depends on critical write-path readiness or a dated waiver.
+- Degraded/fail-closed UI states keep control-plane-owned truth authoritative and never re-enable local UI writes.
 
 ## Goals
 
@@ -63,7 +63,7 @@ After P031:
 - Define a machine-readable P031 UI file/type inventory.
 - Publish a pre-dogfood operator write-path guide mapping every removed UI write control to an external workflow or unavailable follow-up.
 - Capture user-outcome evidence during dogfood, not only static compliance.
-- Define fail-closed rollout modes, rollback drill criteria, freshness measurement, hold criteria, rollback criteria, sign-off authority, and legacy expiry rules.
+- Define fail-closed rollout states, degraded-state evidence, freshness measurement, hold criteria, and sign-off authority.
 
 ## Non-Goals
 
@@ -77,7 +77,7 @@ After P031:
 - P031 does not ship full report payload rendering unless a server-owned GraphQL report payload query lands first and is added to the P031 gate.
 - P031 does not expand non-operator GraphQL read authorization.
 - P031 does not declare external CLI/MCP command recipes complete; it defines the guide schema and blocks dogfood until recipes are named and validated.
-- P031 does not remove legacy rollback solely because a write-path follow-up has started drafting.
+- P031 does not restore the old local-orchestrator UI path as a recovery mechanism.
 
 ## Scope
 
@@ -183,10 +183,10 @@ Inventory requirements:
 
 - Governed Swift views, presenters, reducers, stores, and checked-in GraphQL documents.
 - Generated GraphQL client output locations.
-- Legacy-only files and explicit exclusions.
+- Degraded/fail-closed UI files, if any, and explicit exclusions.
 - Forbidden pattern groups for MCP, GraphQL mutations, command plumbing, local writes, raw truth probing, and enabled removed controls.
 - Fail-closed rule for adding a governed Swift view or GraphQL operation without inventory coverage.
-- Legacy rollback exclusions tied to `CHAINWORKS_THIN_UI_MODE=legacy` and proven unreachable from thin-read and dogfood screens.
+- Degraded/fail-closed exclusions must be explicitly inventoried and must prove they do not restore local workflow truth, local orchestration, local UI writes, MCP UI calls, or GraphQL mutations.
 
 Initial governed surfaces include:
 
@@ -232,7 +232,7 @@ Rules:
 
 Before Swift screen migration, implementation handoff must point to exactly one checked-in governing artifact:
 
-- either a synchronized checked-in P031 proposal containing this r18/r1 contract,
+- either a synchronized checked-in P031 proposal containing this r19 corrected contract,
 - or a checked-in implementation addendum that copies the Phase 0 obligations and explicitly supersedes stale GraphQL+MCP handoff text.
 
 The short checked-in proposal must not be the sole implementation contract while it omits these obligations. Implementation tickets must not mix stale GraphQL+MCP acceptance text with this GraphQL-only scope.
@@ -243,13 +243,13 @@ Phase 0 must create `docs/reference/p031-phase-0-artifact-manifest.json` before 
 
 Required entries:
 
-- `governing_contract`: checked-in r18/r1 synchronized proposal or addendum
+- `governing_contract`: checked-in r19 synchronized proposal or addendum
 - `p043_reconciliation_evidence`: reference and gate language no longer assigning command behavior to P031 UI
 - `p031_gate_evidence`: registered `proposal-031` and `p031` aliases and fail-closed checks
 - `ui_inventory`: gate-consumed UI inventory JSON/YAML
 - `schema_decision_record`: every visible field mapped to GraphQL or disabled/deferred state
 - `operator_write_path_guide`: guide JSON with one row per removed control
-- `rollback_evidence`: drill result or dated waiver
+- `degraded_state_evidence`: fail-closed/degraded-state runtime evidence or dated waiver
 - `report_payload_priority_decision`: default P0 or evidence-backed downgrade
 - `dogfood_signoff_template`: Phase 3 checklist including trigger review and critical write-path readiness or waiver status
 
@@ -321,7 +321,7 @@ Required work:
 - Confirm every visible field has a GraphQL read path or disabled/deferred state.
 - Add or confirm schema fields from the schema matrix.
 - Add operator and unauthorized redaction tests for metadata, diagnostic, payload, and debug fields.
-- Check in the governing r18/r1 implementation addendum or synchronized proposal.
+- Check in the governing r19 implementation addendum or synchronized proposal.
 - Create the Phase 0 artifact manifest.
 
 Exit: P043/P031 conflict is resolved, server read schema/redaction decisions are executable, and one governing artifact is linked before Swift migration.
@@ -336,7 +336,7 @@ Required work:
 - Check in the machine-readable P031 UI inventory.
 - Add static guards for UI MCP imports/calls, GraphQL mutations, local writes, command receipts, command correlation, and identity-to-MCP mapping.
 - Add one negative test per removed write control.
-- Isolate legacy rollback code behind legacy mode and prove it is unreachable from thin-read/dogfood screens.
+- Prove any degraded/fail-closed UI code remains read-only, keeps control-plane-owned truth authoritative, and cannot restore local orchestration or local writes.
 
 Exit: P031 gate fails closed for UI MCP usage, GraphQL mutations, command plumbing, local write fallback, raw truth probing, and out-of-inventory governed surfaces.
 
@@ -353,7 +353,7 @@ Required work:
 
 Exit: Thin-read mode fails closed unless GraphQL read contracts and UI write-removal guards are green.
 
-### Phase 0d: Operator Guide, UX Sign-Off, Rollback Drill, and Freshness Baseline
+### Phase 0d: Operator Guide, UX Sign-Off, Degraded-State Evidence, and Freshness Baseline
 
 Owner: P031 release owner  
 Estimate: 1-1.5 days
@@ -364,11 +364,11 @@ Required work:
 - Validate one approval diagnostic and one non-approval removed-control workflow against copied UI identifiers.
 - Complete UX review of Syncing placement, approval diagnostics, first-run orientation, report payload indicators, density, and accessibility.
 - Measure representative GraphQL projection freshness p50/p95.
-- Execute rollback drill or attach a dated release-owner waiver.
+- Capture fail-closed/degraded-state runtime evidence or attach a dated release-owner waiver.
 - Record report payload priority as default P0 or evidence-backed downgrade.
 - Add the Phase 3 sign-off checklist.
 
-Exit: Operator guide, UX sign-off, freshness measurement, rollback evidence/waiver, and Phase 1 go/no-go are attached.
+Exit: Operator guide, UX sign-off, freshness measurement, degraded-state evidence/waiver, and Phase 1 go/no-go are attached.
 
 ### Phase 1: Read-Only Thin Screens
 
@@ -383,7 +383,7 @@ Required work:
 - Add Reports list payload availability indicators.
 - Replace approval primary buttons with diagnostic banner/callout.
 - Add first-run dogfood orientation banner.
-- Keep legacy path only in legacy mode.
+- Keep any degraded/fail-closed path read-only; do not retain or restore the old local execution path.
 
 Exit: Read surfaces render from GraphQL or are explicitly disabled/deferred; no governed thin-mode screen reads or writes workflow truth locally.
 
@@ -412,11 +412,11 @@ Required work:
 - Run two full-mvp-live dogfood runs in GraphQL-only thin UI mode for the assumed one-to-three-operator internal population.
 - Capture operator workflow-completion notes after each run.
 - Capture degraded-state recovery and approval diagnostic evidence at least once.
-- Capture targeted refresh feedback, Reports payload indicators, metadata inspection, accessibility spot check, projection correctness, freshness, rollback drill result/waiver, and rollback readiness.
+- Capture targeted refresh feedback, Reports payload indicators, metadata inspection, accessibility spot check, projection correctness, freshness, degraded-state evidence/waiver, and fail-closed readiness.
 - Review additional-evidence triggers before sign-off.
-- Do not remove legacy rollback unless critical write-path readiness is available or a dated waiver is attached.
+- Do not treat degraded-state evidence as optional while critical write paths remain outside the macOS UI.
 
-Exit: Release handoff includes gate results, dogfood evidence, operator outcome notes, sign-off, hold/rollback status, metrics, and a legacy removal deadline or extension.
+Exit: Release handoff includes gate results, dogfood evidence, operator outcome notes, sign-off, hold/degraded-state status, metrics, and any dated waiver or follow-up needed for unavailable write workflows.
 
 ## Rollout
 
@@ -424,9 +424,10 @@ Modes:
 
 | Mode | Reads | Writes | Use |
 | --- | --- | --- | --- |
-| `legacy` | Legacy UI read path | Legacy local writes may exist before cutover only | Emergency rollback or pre-cutover default |
 | `thin-read` | GraphQL read models | Removed, hidden, or diagnostic-only | P031 release mode |
 | `dogfood` | GraphQL read models | Same as thin-read | Two-run internal dogfood |
+
+Degraded behavior is a UI state, not a separate truth owner or runtime mode. Affected surfaces may show stale/unavailable diagnostics or hide unavailable controls, but they still treat control-plane-owned GraphQL readback as authoritative and keep writes external or unavailable.
 
 Operator write-path guide:
 
@@ -453,14 +454,14 @@ Dogfood evidence minimum:
 - Reports list payload availability evidence and report metadata inspection.
 - Accessibility spot check.
 - Projection correctness and GraphQL freshness p50/p95.
-- Rollback drill result or dated waiver.
+- Degraded-state/fail-closed evidence or dated waiver.
 - Operator guide rows validated against copied UI identifiers for at least one approval diagnostic and one removed-control workflow.
 - Report payload priority decision.
 - Phase 3 trigger review.
 
 Additional-evidence triggers:
 
-- More than three distinct operators use the thin UI before legacy expiry.
+- More than three distinct operators use the thin UI before Phase 3 sign-off.
 - Dogfood covers more than one workflow family beyond full-mvp-live.
 - A new approval shape, degraded daemon state, report payload state, or projection lag failure appears.
 - Release owner expands availability beyond the initial internal group.
@@ -469,17 +470,17 @@ Hold criteria:
 
 - Any prerequisite P027/P041/P042/reconciled-P043 gate is red on the same tree.
 - P043/P031 reference language still assigns command behavior to P031-owned UI.
-- Governing r18/r1 addendum is not checked in before implementation handoff.
+- Governing r19 addendum or synchronized proposal is not checked in before implementation handoff.
 - Governed UI imports/invokes MCP, defines/executes GraphQL mutation, calls local mutation paths, constructs command plumbing, or probes raw truth.
 - Any removed write control remains enabled without a separate approved transport.
 - Reports list lacks payload availability status.
 - Operator write-path guide is missing before dogfood.
 - UI inventory is missing or not consumed by the gate.
-- Rollback drill has no quantitative result or waiver before dogfood evidence acceptance.
+- Degraded-state/fail-closed evidence has no quantitative result or waiver before dogfood evidence acceptance.
 - Report payload priority is not recorded by Phase 0d.
 - Phase 3 sign-off does not review additional-evidence triggers.
 
-Rollback criteria:
+Degraded-state criteria:
 
 - GraphQL read model diverges from server projection/canonical truth.
 - Daemon lifecycle causes repeated unavailable state on normal launch.
@@ -487,24 +488,25 @@ Rollback criteria:
 - App is continuously unavailable for two minutes in normal dogfood conditions.
 - Targeted read refresh fails to update freshness state or visibly complete under normal daemon conditions.
 - Dogfood run is blocked by missing write-path guidance or misunderstood approval diagnostics.
-- Rollback drill exceeds 60 seconds to visible legacy mode or leaves stale/conflicting truth authoritative.
+- Degraded-state handling exceeds 60 seconds to visible affected-surface disablement/degradation, restores local workflow truth, or leaves stale/conflicting truth authoritative.
 - Copied UI diagnostic identifiers do not match the external workflow guide.
 
-Rollback action: downgrade to legacy mode and disable affected thin UI surfaces. Rollback mode must not write conflicting workflow truth while GraphQL-only thin mode is active.
+Fail-closed action: degrade affected thin UI surfaces, hide unavailable write affordances, preserve last authoritative control-plane/GraphQL readback only when clearly marked stale, and direct operators to the write-path guide or unavailable follow-up. Fail-closed behavior must not restore the old Swift orchestrator, local workflow truth, MCP UI calls, GraphQL mutations, or local UI writes.
 
-Legacy expiry:
+Degraded-state simplification:
 
-- Legacy rollback code may be removed within 10 business days of flag removal only if critical write-path readiness is satisfied or the P031 release owner signs a dated waiver.
+- Degraded/fail-closed behavior may be simplified after Phase 3 sign-off only if dogfood shows affected surfaces fail closed, operators can continue through documented external workflows or explicit unavailable follow-ups, and the P031 release owner records the decision.
 - Critical write-path readiness means merged, reviewed, gate-green restoration or replacement of approval resolution and at least one operationally critical run-control workflow, without using P031-owned UI MCP or GraphQL mutations.
-- A follow-up proposal being drafted is not sufficient.
-- Waiver must name unavailable paths, accept the operator gap, set a hard write-restoration deadline, and set or extend a dated legacy-removal deadline.
+- A follow-up proposal being drafted is not sufficient to claim operator viability.
+- Waiver must name unavailable paths, accept the operator gap, and set a hard write-restoration deadline.
 
-Rollback drill success:
+Degraded-state evidence success:
 
-- Visible legacy mode within 60 seconds from rollback trigger under normal local dogfood conditions.
-- No projection data loss caused by mode switch.
-- No stale GraphQL-only truth remains visible as authoritative after rollback.
-- Participating operator confirms legacy Runs Home/Run Detail path is usable.
+- Affected thin UI surfaces visibly enter disabled/degraded state within 60 seconds from the triggering degraded condition under normal local dogfood conditions.
+- No projection data loss is caused by entering degraded state.
+- No stale GraphQL-only truth remains visible as authoritative after entering degraded state.
+- No local orchestrator, local workflow truth, MCP UI call, GraphQL mutation, or local UI write becomes reachable.
+- Participating operator confirms Runs Home/Run Detail remain usable as read-only/degraded control-plane views or clearly unavailable with actionable external guidance.
 - Failure blocks dogfood sign-off unless a dated waiver and mitigation are attached.
 
 ## Metrics
@@ -537,8 +539,8 @@ Experience quality:
 
 Release safety:
 
-- Rollback drill readiness: drill completes within 60 seconds, passes consistency assertions, and records operator confirmation or has a dated waiver.
-- Legacy expiry safety: 0 legacy rollback removals before critical write-path readiness or dated waiver.
+- Degraded-state readiness: evidence shows affected surfaces degrade within 60 seconds, pass consistency assertions, prove no local orchestration/write path is restored, and record operator confirmation or a dated waiver.
+- Local-orchestrator non-regression: 0 fail-closed paths restore local workflow truth, local UI writes, MCP UI calls, or GraphQL mutations.
 - Report payload priority decision: Phase 0d records default P0 or evidence-backed downgrade.
 - Phase 3 trigger review: 100 percent additional-evidence triggers reviewed at sign-off.
 - Phase 0 artifact manifest completeness: 100 percent required entries have path, owner role, validation status, and blocking phase.
@@ -555,8 +557,8 @@ Release safety:
 | Operators cannot complete write workflows during dogfood | Dogfood validates rendering but not viability | Operator write-path guide maps every removed control and dogfood validates copied identifiers |
 | Report metadata-only behavior is a regression | Operators leave the UI for frequent report inspection | Payload availability visible before drill-in; full payload follow-up defaults to P0 unless evidence supports downgrade |
 | Implementation follows a shorter checked-in proposal | Phase 0 obligations are skipped | One checked-in governing addendum or synchronized proposal is required before handoff |
-| Legacy rollback removed before write-path restoration | Operators lose rollback and in-app writes | Legacy expiry requires critical write-path readiness or dated waiver |
-| Rollback drill becomes a checkbox | Release claims readiness without proof | 60-second target, consistency assertions, and operator confirmation are pass/fail criteria |
+| Degraded state is interpreted as restoring the old Swift orchestrator | App regains a second workflow-truth owner and reintroduces local write risk | P031 defines degraded state as read-only control-plane-owned behavior only; static guards continue to reject local orchestration and UI writes |
+| Degraded-state evidence becomes a checkbox | Release claims readiness without proof | 60-second target, consistency assertions, no-local-write assertions, and operator confirmation are pass/fail criteria |
 | Operator guide rows and UI identifiers drift | External workflows fail in practice | Guide JSON is versioned and validated against copied identifiers |
 | Observer diagnostic scope expands accidentally | Diagnostic/debug data leaks | Diagnostic/debug fields are operator-only by default; observer behavior is deferred to separate auth policy |
 
@@ -570,7 +572,7 @@ This section resolves reviewer feedback explicitly. No disagreement is hidden.
 | --- | --- | --- |
 | Restore UI writes through MCP? | No. P031 UI is GraphQL-read-only. MCP remains outside governed UI. | Operators temporarily use external workflows, but P031 avoids an ambiguous second control surface. |
 | Approval decisions in P031? | Diagnostic-only unless a separately approved non-MCP, non-GraphQL transport lands. | Approval completion is deferred, but the UI no longer teases unavailable actions. |
-| Legacy rollback removal timing? | Block removal until critical write-path readiness or dated waiver. | Legacy code may remain longer, but no no-rollback/no-write window is created by schedule accident. |
+| Does P031 retain an old local execution path after the control-plane DB becomes authoritative? | No. P031 degraded states are read-only behavior over control-plane-owned truth, with external write workflows or explicit unavailable follow-ups. | Operators do not regain old in-app local writes, but the architecture avoids reintroducing a second workflow-truth owner. |
 | Report payload priority? | Full payload rendering is outside P031 but defaults to P0 follow-up unless evidence supports downgrade. | Proposal stays read-migration focused while preventing silent deprioritization. |
 | Observer-visible diagnostics? | Operator-only by default; observer behavior deferred. | Avoids accidental auth expansion; future observer diagnostics need a separate decision. |
 | Prose-only readiness? | No. Phase 0 requires gate-consumed inventory, guide JSON, manifest, and schema decisions. | More Phase 0 artifacts, less implementation drift. |
@@ -589,10 +591,10 @@ This section resolves reviewer feedback explicitly. No disagreement is hidden.
 | `ARCH-R10-05`, `PO-R9-01`, `UX-R9-02`, `PO-R10-04`, `LIFT-R9-005`, `LIFT-R9-008` | addressed with open dependency | Operator guide JSON is a gate-consumed contract; exact external recipes remain OQ-031-01 and block dogfood until authored. |
 | `ARCH-R10-06` | addressed | Diagnostic/debug fields are operator-only by default; observer behavior is deferred. |
 | `PO-R9-02`, `PO-R9-05`, `PO-R10-05`, `LIFT-R9-006` | addressed | Dogfood includes workflow-completion notes, edge coverage, approval comprehension, and trigger review. |
-| `PO-R9-03`, `LIFT-R9-012` | addressed | Follow-ups have priorities and start expectations; legacy expiry still requires readiness or waiver. |
-| `PO-R10-01` | addressed | Legacy expiry requires critical write-path readiness or dated release-owner waiver. |
+| `PO-R9-03`, `LIFT-R9-012` | addressed | Follow-ups have priorities and start expectations; operator viability still requires evidence or waiver. |
+| `PO-R10-01` | addressed | The old local Swift-orchestrator path is removed from scope; degraded states remain control-plane-owned and read-only. |
 | `PO-R10-02` | addressed | Report payload follow-up defaults to P0 unless Phase 0d evidence supports downgrade. |
-| `PO-R10-03` | addressed | Rollback drill has quantitative 60-second, consistency, and operator-confirmation criteria. |
+| `PO-R10-03` | addressed | Degraded-state evidence has quantitative 60-second, consistency, no-local-write, and operator-confirmation criteria. |
 | `UI-01`, `LIFT-R9-009` | addressed | Syncing placement is fixed for list and detail surfaces. |
 | `UI-03`, `LIFT-R9-010` | addressed | Report payload indicators specify SF Symbols, labels, stable width, and truncation rules. |
 | `UX-R10` | addressed | Guide access is clickable/copyable, identifiers align with guide rows, and Reports VoiceOver labels are complete sentences. |
@@ -615,7 +617,7 @@ This section resolves reviewer feedback explicitly. No disagreement is hidden.
 | ID | Priority | Expected Start | Description |
 | --- | --- | --- | --- |
 | `P031-FOLLOWUP-APPROVAL-WRITE-PATH` | P0 immediate next proposal | Before P031 Phase 3 flag removal decision | Define approved non-MCP, non-GraphQL-mutation approval decision transport if interactive approvals must return to macOS UI. |
-| `P031-FOLLOWUP-UI-CONTROL-SURFACE` | P1, with legacy-expiry dependency | Draft before legacy rollback code expiry; removal still requires readiness or waiver | Propose any future start/cancel/retry/create UI control surface with explicit transport and safety model. |
+| `P031-FOLLOWUP-UI-CONTROL-SURFACE` | P1 | Draft before restoring any in-app write affordance | Propose any future start/cancel/retry/create UI control surface with explicit transport and safety model. |
 | `P031-FOLLOWUP-REPORT-PAYLOAD` | P0 by default; downgrade only with Phase 0d evidence | Priority recorded before Phase 0d exit | Add server-owned GraphQL report payload readback and full payload UI rendering. |
 
 ## Acceptance Packets
@@ -629,7 +631,7 @@ Implementation approval re-entry:
 
 Phase 1 Swift migration entry:
 
-- One checked-in r18/r1 addendum or synchronized proposal supersedes stale GraphQL+MCP handoff text.
+- One checked-in r19 addendum or synchronized proposal supersedes stale GraphQL+MCP handoff text.
 - `proposal-031` and `p031` gates are registered, documented, and fail closed.
 - P043/P031 text no longer assigns command behavior to P031 UI.
 - Machine-readable UI inventory is consumed by the gate.
@@ -640,16 +642,16 @@ Dogfood start:
 - Operator guide JSON has 100 percent removed-control coverage and validation status.
 - Approval diagnostics and one non-approval removed-control workflow are validated against copied identifiers.
 - First-run orientation, report indicators, Syncing slots, diagnostic banners, and complete-sentence VoiceOver labels are implemented or explicitly outside the dogfood surface.
-- Rollback drill passes or dated waiver is attached.
+- Degraded-state/fail-closed evidence is attached or a dated waiver exists.
 - Report payload priority is recorded.
 
-Legacy removal:
+Post-dogfood write-path readiness:
 
 - Critical write-path readiness is merged, reviewed, gate-green, and documented for approval resolution plus at least one operationally critical run-control workflow, or a dated waiver exists.
-- Waiver names unavailable paths, accepts the gap, sets a hard write-restoration deadline, and sets or extends legacy-removal deadline.
+- Waiver names unavailable paths, accepts the gap, and sets a hard write-restoration deadline.
 - Phase 3 sign-off reviews all additional-evidence triggers.
-- Phase 0 artifact manifest links sign-off, rollback, report-priority, and readiness/waiver evidence.
+- Phase 0 artifact manifest links sign-off, degraded-state, report-priority, and readiness/waiver evidence.
 
 ## Final Recommendation
 
-Proceed to aggregate re-review for this GraphQL-only r18 restart proposal. Do not request implementation approval until reviewers have evaluated this corrected scope. Do not begin Swift screen migration until Phase 0 produces executable guardrails. Do not start dogfood until operator workflow, rollback, report-priority, and UX/accessibility evidence is ready. Do not remove legacy rollback because of elapsed time or draft follow-ups alone.
+Proceed to aggregate re-review for this GraphQL-only r19 correction proposal. Do not request implementation approval until reviewers have evaluated this corrected scope. Do not begin Swift screen migration until Phase 0 produces executable guardrails. Do not start dogfood until operator workflow, degraded-state, report-priority, and UX/accessibility evidence is ready. Do not restore the old local Swift-orchestrator behavior.

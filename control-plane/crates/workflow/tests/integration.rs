@@ -147,14 +147,29 @@ fn test_compile_full_mvp_live_plan() {
         "codex",
         "architect uses codex"
     );
+    assert_eq!(
+        arch_task.unwrap().agent.requested_mcp_server_ids,
+        vec!["xcode".to_string(), "context7".to_string()],
+        "architect MCP intent comes from codex_architect_high backend_profile"
+    );
 
     // Verify code_writer → codex
     let s7 = &plan.states["state_7_implementation_started"];
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
     assert_eq!(cw_task.unwrap().agent.provider, "codex");
+    assert_eq!(
+        cw_task.unwrap().agent.requested_mcp_server_ids,
+        vec!["context7".to_string(), "xcode".to_string()],
+        "code_writer MCP intent comes from codex_builder_high backend_profile"
+    );
 
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
+    assert_eq!(
+        proposal_writer.requested_mcp_server_ids,
+        vec!["xcode".to_string(), "context7".to_string()],
+        "proposal_writer MCP intent comes from codex_writer_high backend_profile"
+    );
     assert_eq!(
         proposal_writer.session_reuse_scope.as_deref(),
         Some("same_agent_family_within_run")

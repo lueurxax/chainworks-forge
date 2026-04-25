@@ -28,7 +28,7 @@ At the current baseline, the product includes:
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
-- bounded artifact discovery and engine-owned settlement pipeline (P053),
+- bounded artifact discovery and engine-owned settlement pipeline,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,

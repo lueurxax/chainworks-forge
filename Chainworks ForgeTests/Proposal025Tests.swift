@@ -911,7 +911,6 @@ struct Proposal025Tests {
         let repoRoot = testRepositoryRootURL()
         let sensitiveFiles = [
             "Chainworks Forge/Chainworks_ForgeApp.swift",
-            "Chainworks Forge/Views/UITestDirectSurfaces.swift",
             "Chainworks Forge/Engine/SampleRunLauncher.swift"
         ]
         let forbiddenFragments = [
