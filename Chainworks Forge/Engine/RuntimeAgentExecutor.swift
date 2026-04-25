@@ -451,7 +451,7 @@ await sessionInfo.execution.closeSession()
             }
             group.addTask {
                 try await Task.sleep(for: .seconds(timeoutSeconds))
-                await ForgeLogger.session.error("[\(sessionID)] Stream Watchdog Timeout after \(Int(timeoutSeconds))s")
+                ForgeLogger.session.error("[\(sessionID)] Stream Watchdog Timeout after \(Int(timeoutSeconds))s")
                 throw ExecutionError.timeout(agentID: agentID, seconds: Int(timeoutSeconds))
             }
 

@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_graphql::futures_util::StreamExt;
@@ -24,6 +25,7 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::GqlArtifact;
 use crate::types::idea::GqlIdea;
+use crate::types::p031::{GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode};
 use crate::types::run::GqlRun;
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
 use crate::types::steward::{
@@ -51,22 +53,11 @@ pub fn build_schema(
 pub struct QueryRoot;
 
 fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
-    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
-        if principal.class != auth::PrincipalClass::Operator {
-            return Err(Error::new("forbidden"));
-        }
-    }
-    Ok(())
-}
-
-fn require_operator_or_observer_read(ctx: &Context<'_>) -> Result<()> {
-    if let Some(principal) = ctx.data_opt::<auth::Principal>() {
-        if !matches!(
-            principal.class,
-            auth::PrincipalClass::Operator | auth::PrincipalClass::Observer
-        ) {
-            return Err(Error::new("forbidden"));
-        }
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    if principal.class != auth::PrincipalClass::Operator {
+        return Err(Error::new("forbidden"));
     }
     Ok(())
 }
@@ -165,6 +156,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         include_archived: Option<bool>,
     ) -> Result<Vec<GqlIdea>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let include = include_archived.unwrap_or(false);
         let items = ideas::list(pool, include).await?;
@@ -172,6 +164,7 @@ impl QueryRoot {
     }
 
     async fn idea(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlIdea>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let idea_id: IdeaId = id
             .parse()
@@ -201,18 +194,42 @@ impl QueryRoot {
         run_from_projection_or_canonical(pool, run_id).await
     }
 
-    async fn approval_inbox(&self, ctx: &Context<'_>) -> Result<Vec<GqlApproval>> {
+    async fn approval_inbox(
+        &self,
+        ctx: &Context<'_>,
+        run_id: Option<ID>,
+    ) -> Result<Vec<GqlApproval>> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_pending_inbox_projection(pool).await?;
-        Ok(items.into_iter().map(GqlApproval::from).collect())
+        Ok(items
+            .into_iter()
+            .filter(|row| {
+                run_id.as_ref().map_or(true, |requested_run_id| {
+                    row.run_id == requested_run_id.as_str()
+                })
+            })
+            .map(GqlApproval::from)
+            .collect())
     }
 
     async fn artifacts(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlArtifact>> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
+        let parsed_run_id: RunId = run_id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let run = runs::find_by_id(pool, parsed_run_id).await?;
         let items = projections::list_artifacts_projection(pool, run_id.as_str()).await?;
-        Ok(items.into_iter().map(GqlArtifact::from).collect())
+        Ok(items
+            .into_iter()
+            .map(|row| {
+                let mut artifact = GqlArtifact::from(row.clone());
+                attach_p031_artifact_payload(&row, run.as_ref(), &mut artifact);
+                artifact
+            })
+            .collect())
     }
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
@@ -223,7 +240,7 @@ impl QueryRoot {
     }
 
     async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
-        require_operator_or_observer_read(ctx)?;
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = id
             .parse()
@@ -236,7 +253,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<Vec<GqlAgentExecution>> {
-        require_operator_or_observer_read(ctx)?;
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = stage_execution_id
             .parse()
@@ -251,6 +268,7 @@ impl QueryRoot {
         limit: Option<i32>,
         status: Option<String>,
     ) -> Result<Vec<GqlStewardAnalysis>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let parsed_status = status
             .as_deref()
@@ -274,6 +292,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         id: ID,
     ) -> Result<Option<GqlStewardAnalysis>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let item = steward_repo::find_analysis(pool, id.as_str()).await?;
         if let Some(item) = item {
@@ -294,6 +313,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardAnalysisRunLink>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_run_links(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -307,6 +327,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardRecommendation>> {
+        require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_recommendations(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -350,6 +371,8 @@ pub struct GqlDaemonStatus {
     pub degraded: Vec<GqlDegradedReason>,
     /// Populated iff `state == FAILED` (P042 §4.1 invariant).
     pub failure: Option<GqlFailureReason>,
+    /// Xcode MCP broker health when the daemon has mounted the broker pool.
+    pub xcode_broker_health: Option<GqlXcodeBrokerHealthSnapshot>,
     /// Canonical JSON per P042 §5.2 (`{state, schema_version, pid,
     /// degraded?, failure?}`). Kept for clients that prefer the
     /// snake-case wire shape identical to `/health`.
@@ -426,6 +449,26 @@ impl From<domain::lifecycle::FailureKind> for GqlFailureKind {
     }
 }
 
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlXcodeBrokerHealthState {
+    Disabled,
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+impl From<domain::lifecycle::XcodeBrokerHealthState> for GqlXcodeBrokerHealthState {
+    fn from(s: domain::lifecycle::XcodeBrokerHealthState) -> Self {
+        use domain::lifecycle::XcodeBrokerHealthState::*;
+        match s {
+            Disabled => Self::Disabled,
+            Healthy => Self::Healthy,
+            Degraded => Self::Degraded,
+            Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct GqlDegradedReason {
     pub kind: GqlDegradedKind,
@@ -465,6 +508,35 @@ impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
     }
 }
 
+#[derive(SimpleObject, Clone)]
+pub struct GqlXcodeBrokerHealthSnapshot {
+    pub state: GqlXcodeBrokerHealthState,
+    pub pool_id: String,
+    pub active_leases: i32,
+    pub queued_leases: i32,
+    pub max_active_leases: i32,
+    pub max_queued_leases: i32,
+    pub broker_disabled: bool,
+    pub backend_available: bool,
+    pub observation_persistence_failures: i32,
+}
+
+impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealthSnapshot {
+    fn from(s: domain::lifecycle::XcodeBrokerHealthSnapshot) -> Self {
+        Self {
+            state: s.state.into(),
+            pool_id: s.pool_id,
+            active_leases: s.active_leases as i32,
+            queued_leases: s.queued_leases as i32,
+            max_active_leases: s.max_active_leases as i32,
+            max_queued_leases: s.max_queued_leases as i32,
+            broker_disabled: s.broker_disabled,
+            backend_available: s.backend_available,
+            observation_persistence_failures: s.observation_persistence_failures as i32,
+        }
+    }
+}
+
 impl From<DaemonStatus> for GqlDaemonStatus {
     fn from(s: DaemonStatus) -> Self {
         let json = serde_json::to_string(&s).unwrap_or_else(|_| "{}".to_string());
@@ -483,6 +555,9 @@ impl From<DaemonStatus> for GqlDaemonStatus {
                 .map(GqlDegradedReason::from)
                 .collect(),
             failure: s.failure.map(GqlFailureReason::from),
+            xcode_broker_health: s
+                .xcode_broker_health
+                .map(GqlXcodeBrokerHealthSnapshot::from),
             json,
         }
     }
@@ -517,6 +592,89 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         None
     };
     Ok(run)
+}
+
+const P031_ARTIFACT_PAYLOAD_MAX_BYTES: i64 = 1024 * 1024;
+
+fn attach_p031_artifact_payload(
+    row: &db::repos::projections::ArtifactIndexRow,
+    run: Option<&domain::run::Run>,
+    artifact: &mut GqlArtifact,
+) {
+    if artifact.report_kind.is_some() || row.format == "report" {
+        return;
+    }
+
+    if row.size_bytes.unwrap_or(0) > P031_ARTIFACT_PAYLOAD_MAX_BYTES {
+        mark_payload_unavailable(
+            artifact,
+            "Artifact payload is larger than the P031 GraphQL preview limit",
+        );
+        return;
+    }
+
+    let Some(run) = run else {
+        mark_payload_unavailable(artifact, "Run metadata was unavailable for artifact readback");
+        return;
+    };
+
+    let Some(path) = resolve_server_owned_artifact_path(&row.file_path, run) else {
+        mark_payload_unavailable(
+            artifact,
+            "Artifact path is outside the selected run's server-owned roots",
+        );
+        return;
+    };
+
+    match std::fs::read_to_string(path) {
+        Ok(payload) => {
+            artifact.payload_text = Some(payload);
+            artifact.payload_availability_state = GqlPayloadAvailabilityState::Available;
+            artifact.payload_unavailable_reason_code = None;
+            artifact.server_debug_detail = None;
+        }
+        Err(err) => {
+            mark_payload_unavailable(
+                artifact,
+                &format!("Artifact payload readback failed: {err}"),
+            );
+        }
+    }
+}
+
+fn mark_payload_unavailable(artifact: &mut GqlArtifact, detail: &str) {
+    artifact.payload_text = None;
+    artifact.payload_availability_state = GqlPayloadAvailabilityState::Unavailable;
+    artifact.payload_unavailable_reason_code = Some(GqlPayloadUnavailableReasonCode::NotAvailable);
+    artifact.server_debug_detail = Some(detail.to_string());
+}
+
+fn resolve_server_owned_artifact_path(file_path: &str, run: &domain::run::Run) -> Option<PathBuf> {
+    let raw_path = PathBuf::from(file_path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else if !run.artifact_root.is_empty() {
+        PathBuf::from(&run.artifact_root).join(raw_path)
+    } else {
+        PathBuf::from(&run.workspace_root).join(raw_path)
+    };
+    let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
+    let allowed_roots = [
+        Some(run.artifact_root.as_str()),
+        Some(run.workspace_root.as_str()),
+        run.chainworks_meta_root.as_deref(),
+    ];
+    allowed_roots
+        .into_iter()
+        .flatten()
+        .filter(|root| !root.is_empty())
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| path_is_inside(&canonical_candidate, &root))
+        .then_some(canonical_candidate)
+}
+
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 pub struct MutationRoot;
@@ -959,9 +1117,7 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRun>>>> {
         // P029 §4.1.c: principal is injected by on_connection_init during WS handshake.
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -998,13 +1154,13 @@ impl SubscriptionRoot {
         run_id: ID,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>>>
     {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
-        let filter_run_id: RunId = run_id.parse().unwrap_or_else(|_| RunId::new());
+        let filter_run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
         let rx = events.subscribe();
         Ok(BroadcastStream::new(rx).filter_map(move |msg| {
@@ -1036,9 +1192,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1064,9 +1218,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1097,9 +1249,7 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>>>
     {
-        let _principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
+        require_operator_read(ctx)?;
 
         let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
@@ -1403,6 +1553,21 @@ mod tests {
         Arc::new(CommandHandler::new(pool, events, work_queue))
     }
 
+    fn assert_enum_values(json: &serde_json::Value, alias: &str, expected: &[&str]) {
+        let values = json[alias]["enumValues"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{alias} enumValues should be present"));
+        let actual: Vec<&str> = values
+            .iter()
+            .map(|value| {
+                value["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{alias} enum value name should be a string"))
+            })
+            .collect();
+        assert_eq!(actual, expected.to_vec(), "{alias} enum values drifted");
+    }
+
     async fn persist_blocked_implementation_summary(pool: &sqlx::SqlitePool, run_id: RunId) {
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -1521,6 +1686,7 @@ mod tests {
                 actual_mcp_observation_json: Some(
                     r#"{"source":"provider_session_new_response"}"#.into(),
                 ),
+                actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
             },
         )
@@ -2760,6 +2926,562 @@ mod tests {
             json["stage"]["projectionLag"],
             serde_json::json!(false),
             "missing stage projection must not be indistinguishable from normal false flags"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_schema_exposes_required_enum_values() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P031EnumContract {
+                      freshness: __type(name: "FreshnessState") {
+                        enumValues { name }
+                      }
+                      disabledReason: __type(name: "DisabledReasonCode") {
+                        enumValues { name }
+                      }
+                      writePath: __type(name: "WritePathState") {
+                        enumValues { name }
+                      }
+                      payloadAvailability: __type(name: "PayloadAvailabilityState") {
+                        enumValues { name }
+                      }
+                      payloadUnavailableReason: __type(name: "PayloadUnavailableReasonCode") {
+                        enumValues { name }
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 enum contract introspection must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_enum_values(
+            &json,
+            "freshness",
+            &[
+                "live",
+                "refreshing",
+                "projection_lag",
+                "stale",
+                "unavailable",
+                "unauthorized",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "disabledReason",
+            &[
+                "WRITE_PATH_NOT_AVAILABLE",
+                "MANAGED_OUTSIDE_UI",
+                "AMBIGUOUS_APPROVAL_IDENTITY",
+                "STALE_READ",
+                "PROJECTION_LAG",
+                "UNAUTHORIZED",
+                "UNSUPPORTED_ACTION",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "writePath",
+            &[
+                "read_only_diagnostic",
+                "write_path_not_available",
+                "external_transport_required",
+                "hidden",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "payloadAvailability",
+            &[
+                "available",
+                "metadata_only",
+                "payload_deferred",
+                "generating",
+                "unavailable",
+            ],
+        );
+        assert_enum_values(
+            &json,
+            "payloadUnavailableReason",
+            &[
+                "PAYLOAD_DEFERRED_BY_P031",
+                "GENERATING",
+                "NOT_INDEXED",
+                "NOT_AUTHORIZED",
+                "NOT_AVAILABLE",
+                "UNKNOWN",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_freshness_state_is_derived_from_server_projection() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let lagging = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031LaggingFreshness {{
+                      run(id: "{run_id}") {{ freshnessState projectionLag }}
+                      stage(id: "{stage_execution_id}") {{ freshnessState projectionLag }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            lagging.errors.is_empty(),
+            "P031 lagging freshness query must succeed: {lagging:?}"
+        );
+        let lagging_json = lagging.data.into_json().unwrap();
+        assert_eq!(
+            lagging_json["run"]["freshnessState"],
+            serde_json::json!("projection_lag")
+        );
+        assert_eq!(
+            lagging_json["stage"]["freshnessState"],
+            serde_json::json!("projection_lag")
+        );
+
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        let live = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031LiveFreshness {{
+                      run(id: "{run_id}") {{ freshnessState projectionLag }}
+                      stage(id: "{stage_execution_id}") {{ freshnessState projectionLag }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            live.errors.is_empty(),
+            "P031 live freshness query must succeed: {live:?}"
+        );
+        let live_json = live.data.into_json().unwrap();
+        assert_eq!(
+            live_json["run"]["freshnessState"],
+            serde_json::json!("live")
+        );
+        assert_eq!(
+            live_json["stage"]["freshnessState"],
+            serde_json::json!("live")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_approval_inbox_is_diagnostic_read_only() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P031ApprovalDiagnostics {
+                      approvalInbox {
+                        id
+                        freshnessState
+                        disabledReasonCode
+                        writePathState
+                        diagnosticId
+                        serverDebugDetail
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 approval diagnostic query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let approval = &json["approvalInbox"][0];
+        assert_eq!(approval["freshnessState"], serde_json::json!("live"));
+        assert_eq!(
+            approval["disabledReasonCode"],
+            serde_json::json!("WRITE_PATH_NOT_AVAILABLE")
+        );
+        assert_eq!(
+            approval["writePathState"],
+            serde_json::json!("read_only_diagnostic")
+        );
+        assert_eq!(
+            approval["diagnosticId"],
+            serde_json::json!(approval_id.to_string())
+        );
+        assert!(
+            approval["serverDebugDetail"].is_null(),
+            "serverDebugDetail must be null for Phase 0 approval rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_approval_inbox_can_be_scoped_to_run() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let other_run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        let other_approval_id = domain::ids::ApprovalId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        runs::insert(&pool, &make_run(other_run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: other_approval_id,
+                run_id: other_run_id,
+                stage_id: "stage_2".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+        projections::rebuild_approval_inbox(&pool, other_run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031RunScopedApprovalDiagnostics {{
+                      approvalInbox(runId: "{run_id}") {{
+                        id
+                        runId
+                        stageId
+                        writePathState
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 run-scoped approval query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["approvalInbox"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["approvalInbox"][0]["id"],
+            serde_json::json!(approval_id.to_string())
+        );
+        assert_eq!(
+            json["approvalInbox"][0]["runId"],
+            serde_json::json!(run_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_report_artifacts_are_metadata_only_payloads() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "report".into(),
+                agent_id: "release".into(),
+                name: "Release report".into(),
+                contract_id: "release_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(64),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("release".into()),
+                report_version: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ReportPayloadMetadata {{
+                      artifacts(runId: "{run_id}") {{
+                        id
+                        freshnessState
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        diagnosticId
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 report metadata query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifacts"][0];
+        assert_eq!(artifact["freshnessState"], serde_json::json!("live"));
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("metadata_only")
+        );
+        assert_eq!(
+            artifact["payloadUnavailableReasonCode"],
+            serde_json::json!("PAYLOAD_DEFERRED_BY_P031")
+        );
+        assert_eq!(
+            artifact["diagnosticId"],
+            serde_json::json!(artifact_id.to_string())
+        );
+        assert!(
+            artifact["serverDebugDetail"].is_string(),
+            "operator diagnostic detail should explain why report payload rendering is deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_031_diagnostic_metadata_is_operator_only() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let approval_id = domain::ids::ApprovalId::new();
+        let artifact_id = ArtifactId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &domain::approval::Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: domain::approval::ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "report".into(),
+                agent_id: "release".into(),
+                name: "Release report".into(),
+                contract_id: "release_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(64),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("release".into()),
+                report_version: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let approval_response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P031ApprovalDiagnosticsObserverDenied {
+                      approvalInbox {
+                        diagnosticId
+                        serverDebugDetail
+                        disabledReasonCode
+                        writePathState
+                      }
+                    }
+                    "#,
+                )
+                .data(observer_principal()),
+            )
+            .await;
+        assert!(
+            approval_response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "observer principals must not read P031 approval diagnostic metadata: {approval_response:?}"
+        );
+
+        let artifact_response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ReportDiagnosticsObserverDenied {{
+                      artifacts(runId: "{run_id}") {{
+                        diagnosticId
+                        serverDebugDetail
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                      }}
+                    }}
+                    "#
+                ))
+                .data(observer_principal()),
+            )
+            .await;
+        assert!(
+            artifact_response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "observer principals must not read P031 report diagnostic metadata: {artifact_response:?}"
         );
     }
 

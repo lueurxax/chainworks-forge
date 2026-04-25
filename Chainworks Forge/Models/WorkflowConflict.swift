@@ -1,6 +1,6 @@
 import Foundation
 
-struct ImplementationHandoffStatus: Codable, Equatable, Sendable {
+nonisolated struct ImplementationHandoffStatus: Codable, Equatable, Sendable {
     static let schemaVersion = "p017_implementation_handoff_status_v1"
 
     let schemaVersion: String
@@ -273,7 +273,7 @@ struct AdvisoryHintExtraction: Codable, Equatable, Sendable {
     let includedInCandidateTransitionHash: Bool
 }
 
-struct WorkflowConflictBridgeV1: Codable, Sendable {
+nonisolated struct WorkflowConflictBridgeV1: Codable, Sendable {
     var conflicts: [WorkflowConflictRecord] = []
     var advisoryRejections: [WorkflowAdvisoryRejectionRecord] = []
 }

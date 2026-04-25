@@ -35,12 +35,22 @@ use std::sync::Arc;
 use anyhow::Result;
 use tracing::{error, info, warn};
 
-use acp::AcpRuntimeManager;
+use acp::{
+    AcpRuntimeManager, DefaultXcodeShimProcessInspector, XcodeHostExecutorProcessConfig,
+    XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeRuntimeObservationSink,
+};
 use daemon::failed_serve;
 use daemon::packaging::{self, DaemonMode, ModePaths};
 use daemon::supervisor::{self, CrashBudgetDecision, PidLockOutcome};
+#[cfg(unix)]
+use daemon::xcode_shim_socket::{
+    bind_xcode_shim_listener, cleanup_xcode_shim_socket, ensure_xcode_shim_dir,
+    spawn_xcode_shim_socket_service, XcodeShimGrantRegistry,
+};
 use db::migrate::{self, MigrationError, MigrationOutcome};
-use domain::lifecycle::{DaemonLifecycleState, FailureKind};
+use domain::lifecycle::{
+    DaemonLifecycleState, FailureKind, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
+};
 use engine::command_handler::CommandHandler;
 use engine::event_bus::new_bus;
 use engine::executor::BackgroundExecutor;
@@ -216,10 +226,20 @@ async fn main() -> Result<()> {
     // ── Steward runtime + control-plane wiring ─────────────────────────
     let steward_config_path = std::env::var("STEWARD_CONFIG_PATH")
         .ok()
-        .map(std::path::PathBuf::from);
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            mode.is_packaged()
+                .then(|| packaging::bundled_resource_path("steward_config.yaml"))
+                .flatten()
+        });
     let steward_catalog_path = std::env::var("AGENT_CATALOG_PATH")
         .ok()
-        .map(std::path::PathBuf::from);
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            mode.is_packaged()
+                .then(|| packaging::bundled_resource_path("agents.yaml"))
+                .flatten()
+        });
     let steward_runtime_inputs = Arc::new(
         daemon::steward_runtime::bootstrap_steward_runtime(
             &pool,
@@ -234,62 +254,29 @@ async fn main() -> Result<()> {
         "Steward runtime config loaded"
     );
 
-    let invoke_agent_capacity_config =
-        engine::capacity::load_invoke_agent_capacity_config_from_env();
-    let work_queue = WorkQueue::with_events_and_capacity(
-        pool.clone(),
-        events.clone(),
-        invoke_agent_capacity_config.clone(),
-    );
+    let work_queue = WorkQueue::new(pool.clone());
     let acp = Arc::new(AcpRuntimeManager::new());
-    let host_interruption_service =
-        engine::host_interruption::HostInterruptionService::with_capacity_config_and_runtime_cleanup(
-            pool.clone(),
-            work_queue.clone(),
-            invoke_agent_capacity_config.clone(),
-            acp.clone(),
-        );
-    let _host_interruption_monitor = engine::host_interruption::spawn_runtime_heartbeat_monitor(
-        host_interruption_service.clone(),
-    );
-    let _native_host_interruption_monitor =
-        daemon::host_interruption_sources::spawn_native_host_interruption_monitor(
-            host_interruption_service,
-        );
-    info!("Host interruption heartbeat monitor started");
-    let cmd_handler = Arc::new(CommandHandler::new_with_acp_and_capacity(
+    let cmd_handler = Arc::new(CommandHandler::new_with_acp(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
         acp.clone(),
-        invoke_agent_capacity_config.clone(),
     ));
     let orchestrator = Arc::new(Orchestrator::new(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
     ));
-    let executor = Arc::new(
-        BackgroundExecutor::new_with_steward_runtime_inputs_and_capacity(
-            pool.clone(),
-            work_queue.clone(),
-            orchestrator.clone(),
-            acp.clone(),
-            events.clone(),
-            steward_runtime_inputs.clone(),
-            invoke_agent_capacity_config.clone(),
-        ),
-    );
-    let _executor_handle = executor.start();
-    info!("BackgroundExecutor started");
-
-    // Startup recovery: repair any run left mid-flight by a previous crash.
-    let recovery = RecoveryService::new_with_capacity(
+    let executor = Arc::new(BackgroundExecutor::new_with_steward_runtime_inputs(
         pool.clone(),
         work_queue.clone(),
+        orchestrator.clone(),
+        acp.clone(),
         events.clone(),
-        invoke_agent_capacity_config,
-    );
+        steward_runtime_inputs.clone(),
+    ));
+    // Startup recovery: repair any run left mid-flight by a previous crash.
+    let recovery = RecoveryService::new(pool.clone(), work_queue.clone(), events.clone());
     let summary = recovery.run_startup_repair().await?;
     info!(
         runs_inspected = summary.runs_inspected,
@@ -306,25 +293,25 @@ async fn main() -> Result<()> {
     // mode has no HTTP bind, so `Ready` fires before `run_stdio` there.
     match mode {
         DaemonMode::Mcp => {
+            let _executor_handle = executor.start();
+            info!("BackgroundExecutor started");
             reporter.set_state(DaemonLifecycleState::Ready);
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
-            let mcp = mcp_server::server::McpServer::new_with_events(
+            let mcp = mcp_server::server::McpServer::new(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table,
-                events.clone(),
             );
             mcp.run_stdio().await?;
         }
         _ => {
             // Daemon mode: GraphQL + MCP HTTP on the same port.
-            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new_with_events(
+            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table.clone(),
-                events.clone(),
             ));
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
@@ -342,6 +329,45 @@ async fn main() -> Result<()> {
             // GraphQL server takes the socket.
             let (listener, port) = packaging::bind_with_fallback(&paths).await?;
             info!(port, "bound HTTP listener; handing off to graphql-server");
+
+            let xcode_broker_pool =
+                new_daemon_xcode_broker_pool(port, acp.xcode_runtime_observation_sink());
+            acp.set_xcode_broker_lease_attacher(xcode_broker_pool.clone());
+            reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
+                xcode_broker_pool.health_snapshot().await,
+            ));
+            spawn_xcode_broker_health_publisher(reporter.clone(), xcode_broker_pool.clone());
+
+            #[cfg(unix)]
+            let xcode_shim_socket_service = {
+                let shim_registry = Arc::new(XcodeShimGrantRegistry::default());
+                let shim_socket_path = XcodeShimGrantRegistry::socket_path(&paths.app_support_dir);
+                let shim_dir = ensure_xcode_shim_dir(&paths.app_support_dir)?;
+                let listener = bind_xcode_shim_listener(&shim_socket_path)?;
+                acp.set_xcode_shim_runtime(
+                    shim_registry.clone(),
+                    shim_socket_path.to_string_lossy().into_owned(),
+                    shim_dir.to_string_lossy().into_owned(),
+                );
+                info!(
+                    socket_path = %shim_socket_path.display(),
+                    shim_dir = %shim_dir.display(),
+                    "Xcode shim dispatch socket bound"
+                );
+                (
+                    shim_socket_path,
+                    spawn_xcode_shim_socket_service(
+                        listener,
+                        shim_registry,
+                        Arc::new(XcodeHostExecutorProcessConfig::default()),
+                        acp.xcode_runtime_observation_sink(),
+                        Arc::new(DefaultXcodeShimProcessInspector),
+                    ),
+                )
+            };
+
+            let _executor_handle = executor.start();
+            info!("BackgroundExecutor started");
 
             // §5.1: Ready only AFTER HTTP bind so a client receiving
             // `state=ready` is guaranteed it can connect.
@@ -421,10 +447,12 @@ async fn main() -> Result<()> {
             };
 
             let serve_fut = async {
+                let extra_routes =
+                    mcp_routes.merge(daemon::xcode_broker_http::routes(xcode_broker_pool.clone()));
                 graphql_server::server::serve_with_listener_until(
                     schema,
                     listener,
-                    mcp_routes,
+                    extra_routes,
                     principal_table,
                     reporter.clone(),
                     shutdown_signal,
@@ -433,7 +461,12 @@ async fn main() -> Result<()> {
                 .map_err(anyhow::Error::from)
             };
 
-            match run_drain_protocol(serve_fut, drain_rx, SHUTDOWN_DRAIN_DEADLINE).await? {
+            let drain_outcome =
+                run_drain_protocol(serve_fut, drain_rx, SHUTDOWN_DRAIN_DEADLINE).await?;
+            #[cfg(unix)]
+            shutdown_xcode_shim_socket_service(xcode_shim_socket_service).await;
+
+            match drain_outcome {
                 DrainOutcome::ServeReturnedFirst => {
                     info!("HTTP serve returned before shutdown signal; exit 0");
                 }
@@ -453,6 +486,80 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_xcode_broker_health_publisher(reporter: LifecycleReporter, pool: Arc<XcodeMcpBridgePool>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
+                pool.health_snapshot().await,
+            ));
+        }
+    });
+}
+
+fn new_daemon_xcode_broker_pool(
+    port: u16,
+    observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
+) -> Arc<XcodeMcpBridgePool> {
+    Arc::new(XcodeMcpBridgePool::new_with_sink_and_process_backend(
+        XcodeMcpBridgePoolConfig {
+            base_url: format!("http://127.0.0.1:{port}/xcode-mcp"),
+            broker_disabled: std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED")
+                .map(|value| value == "1")
+                .unwrap_or(false),
+            tool_allowlists_by_hash: engine::mcp::load_xcode_broker_tool_allowlists()
+                .unwrap_or_else(|err| {
+                    warn!(error = %err, "Failed to load Xcode broker tool allowlists from MCP registry");
+                    Default::default()
+                }),
+            use_local_host_probe: true,
+            ..Default::default()
+        },
+        observation_sink,
+    ))
+}
+
+fn xcode_broker_health_for_lifecycle(
+    health: acp::XcodeBrokerHealthSnapshot,
+) -> XcodeBrokerHealthSnapshot {
+    XcodeBrokerHealthSnapshot {
+        state: match health.state {
+            acp::XcodeBrokerHealthState::Disabled => XcodeBrokerHealthState::Disabled,
+            acp::XcodeBrokerHealthState::Healthy => XcodeBrokerHealthState::Healthy,
+            acp::XcodeBrokerHealthState::Degraded => XcodeBrokerHealthState::Degraded,
+            acp::XcodeBrokerHealthState::Failed => XcodeBrokerHealthState::Failed,
+        },
+        pool_id: health.pool_id,
+        active_leases: health.active_leases,
+        queued_leases: health.queued_leases,
+        max_active_leases: health.max_active_leases,
+        max_queued_leases: health.max_queued_leases,
+        broker_disabled: health.broker_disabled,
+        backend_available: health.backend_available,
+        observation_persistence_failures: health.observation_persistence_failures,
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_xcode_shim_socket_service(
+    (socket_path, handle): (std::path::PathBuf, tokio::task::JoinHandle<()>),
+) {
+    handle.abort();
+    let _ = handle.await;
+    match cleanup_xcode_shim_socket(&socket_path) {
+        Ok(()) => info!(
+            socket_path = %socket_path.display(),
+            "Xcode shim dispatch socket cleaned up"
+        ),
+        Err(error) => warn!(
+            error = %error,
+            socket_path = %socket_path.display(),
+            "Failed to clean up Xcode shim dispatch socket"
+        ),
+    }
 }
 
 /// P042 §6.3 drain deadline. Supervisor sends SIGTERM → daemon flips to
@@ -706,6 +813,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_xcode_broker_pool_has_process_backend() {
+        let pool =
+            new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
+
+        assert!(pool.has_backend());
+    }
+
+    #[test]
+    fn daemon_xcode_broker_pool_installs_registry_tool_allowlists() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let tmp = tempfile::tempdir().unwrap();
+        let registry_path = tmp.path().join("mcp.yaml");
+        std::fs::write(
+            &registry_path,
+            r#"
+mcp:
+  xcode:
+    type: xcode_broker
+    runtime_id: xcode
+    tool_allowlist:
+      - xcode.build
+      - xcode.test
+"#,
+        )
+        .unwrap();
+
+        let previous = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
+        std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+
+        let allowlists = engine::mcp::load_xcode_broker_tool_allowlists().unwrap();
+        let hash = allowlists
+            .keys()
+            .next()
+            .expect("fixture registry should produce a tool allowlist")
+            .clone();
+        let pool =
+            new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
+
+        assert!(pool.has_tool_allowlist_hash(&hash));
+
+        match previous {
+            Some(value) => std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", value),
+            None => std::env::remove_var("CHAINWORKS_CODEX_CONFIG_PATH"),
+        }
+    }
+
+    #[test]
     fn map_migration_error_covers_every_variant() {
         let (k1, _, b1) = map_migration_error(&MigrationError::ExistingWithoutTracker("x".into()));
         assert_eq!(k1, FailureKind::MigrationFailed);
@@ -832,6 +987,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, DrainOutcome::ServeReturnedFirst);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_xcode_shim_socket_service_removes_socket_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("xcode-shim.sock");
+        std::fs::write(&socket_path, "").expect("write socket placeholder");
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        shutdown_xcode_shim_socket_service((socket_path.clone(), handle)).await;
+
+        assert!(!socket_path.exists());
     }
 
     // ── P042 §9.1 packaged log routing (routing-only; global subscriber

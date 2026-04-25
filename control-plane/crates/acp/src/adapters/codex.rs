@@ -2,13 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::adapters::AcpAdapter;
-use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::{isolate_process_group, AcpSessionConfig};
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
@@ -49,7 +46,11 @@ impl AcpAdapter for CodexAdapter {
         "codex"
     }
 
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
         if self.binary_path.is_empty() {
             bail!(
                 "CodexAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -70,32 +71,17 @@ impl AcpAdapter for CodexAdapter {
         );
 
         // Build environment matching Swift makeSessionEnvironment
-        let env = make_session_environment(&runtime_home);
+        let mut env = make_session_environment(&runtime_home);
+        // Suppress verbose codex_otel/codex_core/rmcp INFO tracing that floods
+        // stderr and causes memory pressure. codex-acp reads RUST_LOG via
+        // EnvFilter::from_default_env(). Only show warnings and errors.
+        env.push(("RUST_LOG".into(), "warn".into()));
 
-        let mut cmd = Command::new(&self.binary_path);
-        isolate_process_group(&mut cmd);
-        cmd.envs(env)
-            // Suppress verbose codex_otel/codex_core/rmcp INFO tracing that
-            // floods stderr and causes memory pressure. codex-acp reads RUST_LOG
-            // via EnvFilter::from_default_env(). Only show warnings and errors.
-            .env("RUST_LOG", "warn");
-        // P050: Inject per-run meta root so YAML ${CHAINWORKS_META_ROOT} resolves correctly.
-        if let Some(ref mr) = req.chainworks_meta_root {
-            let absolute = if mr.starts_with('/') {
-                mr.clone()
-            } else {
-                format!("{}/{}", req.workspace_root, mr)
-            };
-            cmd.env("CHAINWORKS_META_ROOT", &absolute);
-        }
-        let child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn Codex ACP subprocess: {}", self.binary_path))?;
+        resources.add_cleanup_path(runtime_home);
+        Ok(AcpLaunchSpec::new(&self.binary_path).with_envs(env))
+    }
 
+    fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
         // Build the base model id (without /effort suffix) and extract the
         // effort separately. Codex's session/new silently falls back to
         // medium when given a combined "model/effort" string, so we pass a
@@ -114,16 +100,9 @@ impl AcpAdapter for CodexAdapter {
             config_options.push(("reasoning_effort".into(), e.to_string()));
         }
 
-        let config = AcpSessionConfig {
-            model: &base_model,
-            mode: "full-access",
-            extra: None,
-            config_options,
-        };
-        let session =
-            AcpSession::start_with_cleanup(child, req, &config, Some(runtime_home)).await?;
-
-        Ok(AcpSessionHandle::new(session))
+        let mut spec = AcpSessionNewSpec::new(base_model, "full-access");
+        spec.config_options = config_options;
+        Ok(spec)
     }
 }
 
@@ -144,7 +123,7 @@ fn source_codex_home() -> PathBuf {
 }
 
 /// Create an isolated runtime home directory with auth.json and config.toml
-/// copied from the source Codex home. Matches Swift `prepareRuntimeHome`.
+/// copied from the source Codex home.
 fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
     let runtime_home = if workspace_root.is_empty() {
         std::env::temp_dir()
@@ -193,12 +172,11 @@ fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
 }
 
 /// Sanitize config.toml for the isolated runtime.
-/// Matches Swift `sanitizeRuntimeConfig`:
 /// - Strip sandbox settings
 /// - Strip model/effort overrides so session/new model takes priority
-/// - Strip inherited MCP/plugin/skill/project configuration. ACP runtime tool
-///   access must come from the workflow/engine contract, not the operator's
-///   personal Codex config.
+/// - Strip inherited MCP/plugin/marketplace/skill/project configuration. ACP
+///   runtime tool access must come from the workflow/engine contract, not the
+///   operator's personal Codex config.
 fn sanitize_runtime_config(source: &str) -> String {
     let mut current_block_dropped = false;
     let mut kept = Vec::new();
@@ -216,7 +194,7 @@ fn sanitize_runtime_config(source: &str) -> String {
             current_block_dropped = table == "notice.model_migrations"
                 || matches!(
                     root,
-                    "mcp_servers" | "plugins" | "skills" | "projects" | "features"
+                    "mcp_servers" | "plugins" | "marketplaces" | "skills" | "projects" | "features"
                 );
             if current_block_dropped {
                 continue;
@@ -240,15 +218,15 @@ fn sanitize_runtime_config(source: &str) -> String {
         kept.push(line);
     }
 
-    let mut sanitized = kept.join("\n");
-    // Force-write sandbox settings for runtime commands because the Codex seatbelt is
-    // known to deny file writes in provider command execution when inherited defaults
-    // resolve to restrictive profiles. Engine-runner-owned paths already provide the
-    // trust boundary we need for this pipeline, and writable toolchain/cache homes are
-    // required for Rust/Xcode command reliability.
-    if !sanitized.contains("disable_sandbox") {
-        sanitized.push('\n');
-        sanitized.push_str("disable_sandbox = true\n");
+    let sanitized_body = kept.join("\n");
+    // Force-write sandbox settings for runtime commands because Codex ACP no longer
+    // treats the legacy disable_sandbox flag as sufficient on its own. The engine
+    // owns the trust boundary for provider runs, and writable output/temp/toolchain
+    // paths are required for proposal writers and implementation agents.
+    let mut sanitized =
+        String::from("sandbox_mode = \"danger-full-access\"\ndisable_sandbox = true\n");
+    if !sanitized_body.is_empty() {
+        sanitized.push_str(&sanitized_body);
     }
 
     sanitized
@@ -385,6 +363,8 @@ mod tests {
         let source = r#"
 model = "gpt-5.4"
 model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+disable_sandbox = false
 personality = "pragmatic"
 
 [projects."/Users/user/Documents/Chainworks Forge"]
@@ -401,12 +381,21 @@ command = "xcrun"
 args = ["mcpbridge"]
 enabled = true
 
+[mcp_servers.postgres.env]
+DATABASE_URL = "postgres://secret"
+
 [mcp_servers.chainworks-control-plane]
 enabled = true
 url = "http://127.0.0.1:4000/mcp"
 
+[mcp_servers.chainworks-control-plane.http_headers]
+Authorization = "Bearer secret"
+
 [plugins."build-ios-apps@openai-curated"]
 enabled = true
+
+[marketplaces.openai-primary-runtime]
+source = "/Users/user/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime"
 
 [skills.proposal_review]
 path = "/Users/user/.codex/skills/proposal-review-triad"
@@ -421,11 +410,21 @@ multi_agent = true
         assert!(!sanitized.contains("[projects."));
         assert!(!sanitized.contains("[mcp_servers."));
         assert!(!sanitized.contains("[plugins."));
+        assert!(!sanitized.contains("[marketplaces."));
         assert!(!sanitized.contains("[skills."));
         assert!(!sanitized.contains("[features]"));
         assert!(!sanitized.contains("mcpbridge"));
+        assert!(!sanitized.contains("DATABASE_URL"));
+        assert!(!sanitized.contains("Bearer secret"));
+        assert!(!sanitized.contains("codex-primary-runtime"));
         assert!(!sanitized.contains("multi_agent"));
+        assert!(!sanitized.contains("sandbox_mode = \"read-only\""));
+        assert!(!sanitized.contains("disable_sandbox = false"));
+        assert!(sanitized.contains("sandbox_mode = \"danger-full-access\""));
         assert!(sanitized.contains("disable_sandbox = true"));
+        let first_table = sanitized.find('[').expect("kept notice table");
+        assert!(sanitized.find("sandbox_mode").expect("sandbox mode") < first_table);
+        assert!(sanitized.find("disable_sandbox").expect("sandbox flag") < first_table);
         assert!(!sanitized.contains("model_migrations"));
         assert!(sanitized.contains("[notice]"));
         assert!(sanitized.contains("hide_full_access_warning"));

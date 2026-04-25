@@ -30,7 +30,7 @@ Recommended status sets:
 - **Approval**: `pending`, `requested`, `granted`, `rejected`, `expired`
 - **Side effect**: `pending`, `armed`, `running`, `completed`, `failed`, `blocked`
 
-These states should be visible in SwiftData metadata and in the UI.
+These states should be visible in SwiftData metadata and in the UI (read-only from GraphQL projections in P031).
 
 ## 3. Artifact model
 
@@ -90,7 +90,7 @@ Minimum MVP policy:
 - no two write-capable agents may write to the same worktree concurrently in MVP
 - release side effects stay outside general write-capable agents
 
-## 6. Bounded Artifact Discovery (P053)
+## 6. Bounded Artifact Discovery
 
 The system uses a bounded discovery model to minimize startup latency and ensure artifact integrity.
 

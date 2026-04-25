@@ -154,9 +154,9 @@ Shared ACP plumbing lives in:
 - `ACPSubprocessManager`
 - `ACPStreamEventMapper`
 
-#### Bounded Discovery and DiscoveryFilesystem (P053)
+#### Bounded Discovery and DiscoveryFilesystem
 
-P053 removes broad filesystem discovery from the pre-`initialize` path. Instead of implicit inference from the entire repository or worktree, the system now uses a bounded discovery model:
+Broad filesystem discovery is not part of the pre-`initialize` path. Instead of implicit inference from the entire repository or worktree, the system uses a bounded discovery model:
 
 - **DiscoveryFilesystem Ownership**: Shared discovery value-types and filesystem logic live in `domain::discovery`, while policy construction remains engine-owned.
 - **Bounded Discovery**: Discovery is restricted to the run meta-root and explicitly declared expected output paths.

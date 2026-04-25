@@ -1,0 +1,121 @@
+{
+  "schema_version": "p031-live-graphql-probe-v1",
+  "measured_at_utc": "2026-04-24T20:25:19Z",
+  "endpoint": "http://127.0.0.1:4000/graphql",
+  "daemon_ready": {
+    "state": "READY",
+    "binary_schema_version": 26,
+    "schema_version": 26,
+    "build_sha": "8a0d0494"
+  },
+  "database_row_counts": {
+    "runs": 16,
+    "stage_executions": 781,
+    "approvals": 28,
+    "artifacts": 75780
+  },
+  "measurements": {
+    "daemon_status": {
+      "samples": 25,
+      "latency_ms": {
+        "min": 0.64,
+        "p50": 2.24,
+        "p95": 13.96,
+        "max": 17.46
+      },
+      "errors": null,
+      "last_data": {
+        "daemonStatus": {
+          "state": "READY",
+          "binarySchemaVersion": 26,
+          "schemaVersion": 26,
+          "buildSha": "8a0d0494"
+        }
+      }
+    },
+    "runs_home": {
+      "samples": 25,
+      "latency_ms": {
+        "min": 3.48,
+        "p50": 4.25,
+        "p95": 14.45,
+        "max": 17.24
+      },
+      "errors": null,
+      "run_count_returned": 5,
+      "freshness_states": [
+        "live"
+      ],
+      "first_runs": [
+        {
+          "id": "6ad4e80a-8341-42a5-9809-849f98d79779",
+          "status": "blocked",
+          "workflowTitle": "Full MVP Live",
+          "freshnessState": "live",
+          "totalStages": 38,
+          "completedStages": 31,
+          "failedStages": 0,
+          "pendingApprovals": 0
+        },
+        {
+          "id": "51bcc198-31d7-4e91-a0aa-219b207a3435",
+          "status": "blocked",
+          "workflowTitle": "Full MVP Live",
+          "freshnessState": "live",
+          "totalStages": 9,
+          "completedStages": 5,
+          "failedStages": 1,
+          "pendingApprovals": 0
+        },
+        {
+          "id": "c3df8aa3-8575-44ca-9664-30b017838111",
+          "status": "blocked",
+          "workflowTitle": "Full MVP Live",
+          "freshnessState": "live",
+          "totalStages": 49,
+          "completedStages": 34,
+          "failedStages": 0,
+          "pendingApprovals": 0
+        },
+        {
+          "id": "4c5dacfa-6e2a-4696-ab3d-173459e882d6",
+          "status": "blocked",
+          "workflowTitle": "Full MVP Live",
+          "freshnessState": "live",
+          "totalStages": 89,
+          "completedStages": 74,
+          "failedStages": 1,
+          "pendingApprovals": 0
+        },
+        {
+          "id": "43460545-7f6a-4943-811a-dabad0f1c592",
+          "status": "blocked",
+          "workflowTitle": "Full MVP Live",
+          "freshnessState": "live",
+          "totalStages": 85,
+          "completedStages": 56,
+          "failedStages": 1,
+          "pendingApprovals": 0
+        }
+      ]
+    },
+    "approval_inbox": {
+      "samples": 25,
+      "latency_ms": {
+        "min": 0.75,
+        "p50": 0.82,
+        "p95": 1.08,
+        "max": 1.11
+      },
+      "errors": null,
+      "approval_count_returned": 0,
+      "freshness_states": [],
+      "write_path_states": []
+    }
+  },
+  "limitations": [
+    "This is a live local packaged-daemon probe over the restored operator DB.",
+    "GraphQL runs query currently returns the five most relevant rows while the copied DB contains sixteen total runs.",
+    "This evidence is not the Phase 3 two-run dogfood signoff."
+  ]
+}

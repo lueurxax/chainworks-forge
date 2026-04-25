@@ -25,6 +25,7 @@ struct RunStageAgentSnapshot: Identifiable, Sendable {
     let transportErrorKind: TransportErrorKind?
     let outputPresence: OutputPresence?
     let providerStopReason: String?
+    let actualXcodeRuntimeObservationJSON: Data?
 }
 
 struct RunStageSnapshot: Identifiable, Sendable {
@@ -197,7 +198,8 @@ enum RunStageSnapshotLoader {
                     supervisionClassification: agent.supervisionClassification,
                     transportErrorKind: agent.transportErrorKind,
                     outputPresence: agent.outputPresence,
-                    providerStopReason: agent.providerStopReason
+                    providerStopReason: agent.providerStopReason,
+                    actualXcodeRuntimeObservationJSON: agent.actualXcodeRuntimeObservationJSON
                 )
             }
         )

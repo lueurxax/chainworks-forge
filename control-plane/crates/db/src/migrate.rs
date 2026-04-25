@@ -38,6 +38,13 @@ use sqlx::{Row, SqlitePool};
 /// versions.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+const P058_MIGRATION_VERSION: i64 = 16;
+const P058_LEGACY_CHECKSUM: &[u8] = &[
+    0xbb, 0x62, 0x1a, 0x52, 0x2e, 0x2c, 0x14, 0xe0, 0xfa, 0x0a, 0xcc, 0xf7, 0x83, 0xf2, 0x90, 0x2c,
+    0x7d, 0x69, 0x03, 0x8b, 0x16, 0xa3, 0xfa, 0xac, 0xf5, 0x88, 0xce, 0x71, 0x49, 0xae, 0xd2, 0x53,
+    0xd0, 0x9e, 0xba, 0x38, 0x7b, 0x24, 0x7b, 0x5c, 0x54, 0x17, 0x87, 0x4a, 0xa2, 0xe7, 0x80, 0xe4,
+];
+
 /// Classification of a SQLite target at startup time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbState {
@@ -249,6 +256,7 @@ pub async fn run_preflight(
                 let backup_path = write_backup(database_url, subset_max, binary_max, backup_dir)
                     .await?;
                 let pool = open_pool(database_url).await?;
+                reconcile_known_applied_migration_checksums(&pool).await?;
                 let apply_result = apply_under_exclusive_lock(&pool).await;
                 pool.close().await;
                 match apply_result {
@@ -347,6 +355,146 @@ async fn apply_under_exclusive_lock(pool: &SqlitePool) -> Result<(), MigrationEr
             }
         }
     }
+}
+
+async fn reconcile_known_applied_migration_checksums(
+    pool: &SqlitePool,
+) -> Result<(), MigrationError> {
+    let Some(current_checksum) = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == P058_MIGRATION_VERSION)
+        .map(|migration| migration.checksum.as_ref().to_vec())
+    else {
+        return Ok(());
+    };
+
+    let row =
+        sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = ?1 AND success = 1")
+            .bind(P058_MIGRATION_VERSION)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MigrationError::IoError(format!("read migration 16 checksum: {e}")))?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let checksum = row
+        .try_get::<Vec<u8>, _>("checksum")
+        .map_err(|e| MigrationError::IoError(format!("parse migration 16 checksum: {e}")))?;
+    if checksum == current_checksum {
+        return Ok(());
+    }
+    if checksum.as_slice() != P058_LEGACY_CHECKSUM {
+        return Ok(());
+    }
+    if !p058_schema_shape_matches(pool).await? {
+        return Ok(());
+    }
+
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2 AND success = 1")
+        .bind(current_checksum)
+        .bind(P058_MIGRATION_VERSION)
+        .execute(pool)
+        .await
+        .map_err(|e| MigrationError::IoError(format!("repair migration 16 checksum: {e}")))?;
+    Ok(())
+}
+
+async fn p058_schema_shape_matches(pool: &SqlitePool) -> Result<bool, MigrationError> {
+    for (table, columns) in [
+        (
+            "agent_execution_runtime_facts",
+            &[
+                "agent_execution_id",
+                "failure_kind",
+                "failure_kind_raw_debug",
+                "failure_kind_version",
+                "failure_message_redacted",
+                "failure_message_redaction_version",
+                "retry_after",
+                "operator_action_hint",
+                "provider_exit_status",
+                "transport_error_code",
+                "supervision_classification",
+                "output_settlement",
+                "valid_required_outputs",
+                "late_output_count",
+                "ignored_late_output_count",
+                "session_reuse_reason",
+                "quota_ledger_id",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "agent_retry_budget_ledger",
+            &[
+                "id",
+                "run_id",
+                "stage_execution_id",
+                "agent_execution_id",
+                "failure_kind",
+                "retry_after",
+                "normal_budget_consumed",
+                "early_retry_journal_id",
+                "idempotency_key",
+                "state",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "artifact_source_generation_claims",
+            &[
+                "run_id",
+                "stage_execution_id",
+                "agent_execution_id",
+                "source_work_item_id",
+                "current_session_generation_id",
+                "claim_state",
+                "superseding_work_item_id",
+                "superseded_by_agent_execution_id",
+                "supersession_journal_id",
+                "superseded_at",
+                "closed_at",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "artifact_contract_generations",
+            &[
+                "source_stage_execution_id",
+                "source_session_generation_id",
+                "source_work_item_id",
+                "supersedes_generation_id",
+                "output_settlement",
+                "source_generation_verified",
+            ][..],
+        ),
+    ] {
+        if !table_contains_columns(pool, table, columns).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn table_contains_columns(
+    pool: &SqlitePool,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<bool, MigrationError> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MigrationError::IoError(format!("inspect {table} columns: {e}")))?;
+    let columns: BTreeSet<String> = rows
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect();
+    Ok(expected_columns
+        .iter()
+        .all(|column| columns.contains(*column)))
 }
 
 /// Copy the DB file to a timestamped backup and verify the copy is
@@ -571,6 +719,40 @@ mod tests {
         assert_eq!(outcome.classified_as, DbStateKind::TrackedEqual);
         assert!(!outcome.applied_migrations);
         assert!(outcome.backup_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciles_legacy_p058_checksum_when_schema_shape_matches() {
+        let (_dir, _path, url) = new_tmp_db().await;
+        run_preflight(&url, None).await.unwrap();
+
+        let pool = open_pool(&url).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+            .bind(P058_LEGACY_CHECKSUM)
+            .bind(P058_MIGRATION_VERSION)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reconcile_known_applied_migration_checksums(&pool)
+            .await
+            .unwrap();
+
+        let repaired: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?1")
+                .bind(P058_MIGRATION_VERSION)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let expected = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == P058_MIGRATION_VERSION)
+            .unwrap()
+            .checksum
+            .as_ref()
+            .to_vec();
+        assert_eq!(repaired, expected);
+        pool.close().await;
     }
 
     #[tokio::test]

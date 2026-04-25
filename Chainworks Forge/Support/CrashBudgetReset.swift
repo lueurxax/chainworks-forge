@@ -33,7 +33,7 @@ import ServiceManagement
 /// `SMAppService` or the lifecycle view model.
 enum CrashBudgetFiles {
     /// Resolves `~/Library/Application Support/Chainworks Forge`.
-    static func defaultAppSupportDir(
+    nonisolated static func defaultAppSupportDir(
         fileManager: FileManager = .default
     ) -> URL {
         fileManager.homeDirectoryForCurrentUser
@@ -45,7 +45,7 @@ enum CrashBudgetFiles {
 
     /// Resolves the packaged daemon's crash-budget file path. Takes an
     /// explicit `appSupportDir` so tests can target a tempdir.
-    static func crashBudgetURL(appSupportDir: URL) -> URL {
+    nonisolated static func crashBudgetURL(appSupportDir: URL) -> URL {
         appSupportDir.appendingPathComponent("crash-budget.json", isDirectory: false)
     }
 
@@ -55,7 +55,7 @@ enum CrashBudgetFiles {
     /// Missing file is NOT an error: P042 §6.2 documents file-absence
     /// as "clean", and a user who clicks Reset on an already-clean
     /// state deserves a soft confirmation rather than an error dialog.
-    static func deleteCrashBudgetFile(
+    nonisolated static func deleteCrashBudgetFile(
         at url: URL,
         fileManager: FileManager = .default
     ) -> CrashBudgetResetFileOutcome {

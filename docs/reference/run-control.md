@@ -37,6 +37,12 @@ Archive never implies stop, and stop never implies archive.
 
 An active idea must first settle its run into a terminal state before archive becomes eligible.
 
+### External Command Surface (P031-r18)
+
+Per P031-r18, the macOS UI is a **read-only thin client**. Run control actions — `CancelRun`, `StartRun`, `RetryStage` — are **prohibited** within the governed macOS UI. 
+
+Operators must use external workflows (CLI, MCP tools, or automation) to issue these commands. The macOS UI renders the resulting state transitions (`cancelling`, `cancelled`) from GraphQL projections but provides no in-app write affordances.
+
 ## Stop semantics
 
 Stopping an active idea means:
@@ -137,12 +143,12 @@ Run surfaces must distinguish:
 
 A run with `cancellation_requested_at != nil` and `cancellation_settled_at == nil` is not allowed to present as ordinary terminal `cancelled`.
 
-The operator path lives in `Ideas`:
+The operator path for stopping a run (P031 external workflow):
 
-1. open idea,
-2. choose `Stop Run`,
-3. confirm stop,
-4. observe `cancelling`,
+1. open idea in the macOS UI,
+2. copy `run_id` or `diagnosticId` from the diagnostic banner,
+3. execute `CancelRun` via CLI or MCP tool,
+4. observe `cancelling` state in the macOS UI (via GraphQL projection),
 5. later observe settled `cancelled` history.
 
 The confirmation surface must explicitly say that:
@@ -177,7 +183,10 @@ Rules:
 | `control-plane/crates/graphql-server/src/types/run.rs` | `cancellation_settlement_log` and `cancellation_settlement_summary` on `GqlRun` |
 | `control-plane/crates/mcp-server/src/tools/runs.rs` | `runs.get` full log, `runs.list` summary only |
 
-Swift-side owner: `ExecutionService` and `RunCancellationCoordinator`.
+**Ownership:**
+- **Read-plane truth:** GraphQL projections via `GqlRun`.
+- **Governed UI (Read-only):** P031-owned SwiftUI views.
+- **Write-path:** External MCP/CLI (Governed UI has no write ownership).
 
 ## Related Docs
 

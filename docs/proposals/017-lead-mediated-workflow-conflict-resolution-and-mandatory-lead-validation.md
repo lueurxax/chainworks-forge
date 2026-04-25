@@ -60,7 +60,7 @@
       "Product review-pass-4 feedback is resolved by adding measurable Phase B dogfood exit criteria, a concrete external catalog discovery/attestation mechanism, and a minimal operator-approved known-issues migration record schema.",
       "UX review-pass-4 suggestions are resolved by requiring started-at and relative-duration mediation labels plus direct terminal-unverifiable manual-resolution actions.",
       "Architect review-pass-5 handoff specificity feedback is resolved by adding a scoped implementation-entry handoff sub-contract with durable storage owner, source-of-truth fields, northbound latest-summary/MCP/GraphQL shapes, redaction, and fixture expectations.",
-      "Product review-pass-5 feedback is resolved by adding a Phase B readiness checkpoint, allowing intentionally-constructed dogfood scenarios to cover rare conflict types while preserving organic-run evidence, and defining the scope delta if Q-003 approves broader rationale export.",
+      "Product review-pass-5 feedback is resolved by adding a Phase B readiness checkpoint, allowing intentionally-constructed dogfood scenarios to cover rare conflict types while preserving organic-run evidence, and resolving Q-003 to keep full rationale export local-debug-only in P017.",
       "UX review-pass-6 mediation transparency feedback is superseded by the UI DB cutover: sanitized mediation status remains a GraphQL/MCP readback requirement, while concrete UI surfaces move to a future thin-client proposal.",
       "UI feedback is retained as historical review context but is no longer a P017 implementation or audit target after the UI DB cutover."
     ]
@@ -138,8 +138,8 @@
         "Agent-authored next_stage, next_action, run_state.json, and narrative transition hints are advisory evidence only.",
         "A legal declarative transition always beats a conflicting advisory hint.",
         "An advisory next_stage absent from the graph never creates a synthetic state.",
-        "Multiple matched declarative transitions are blocking conflicts unless an explicit tie-break syntax exists in the compiled workflow.",
-        "P017 default for multi-match is to block with a typed conflict; future tie-break syntax is deferred to Q-001."
+        "Multiple matched declarative transitions are blocking conflicts in P017.",
+        "Q-001 is answered by Proposal 071: explicit transition tie-break syntax may be added later through docs/proposals/071-explicit-workflow-transition-tie-break-syntax.md, but P017 must remain fail-closed and treat multi-match as a typed conflict."
       ],
       "candidate_transition_evaluation": {
         "result_enum": [
@@ -562,7 +562,7 @@
             "graphql": "Existing Stage.agentExecutions/GqlAgentExecution remains stage-scoped and non-null for stage_execution_id. A mediation-owned execution must not be serialized through that field. Owner-aware run/report readback uses a new GqlRunAgentExecution or GqlLeadMediationExecution shape with ownerKind, ownerId, nullable stageExecutionId, mediationRecordId, status, provider/model refs, timing, and cost.",
             "runtime_facts": "Runtime facts attach to agent_execution_id independent of owner_kind. Query helpers may filter by owner_kind but do not duplicate fact tables.",
             "artifacts_and_transcripts": "LeadResolutionContract artifacts and lead transcripts are stored in the mediation artifact namespace and linked to the AgentExecution attempt by artifact refs; stage artifact contracts are not mutated.",
-            "reports_and_receipts": "Run reports include mediation execution attempts under workflow_conflict, while release/sign-off receipts summarize mediation status and cost without exposing full debug rationale unless Q-003 permits it."
+            "reports_and_receipts": "Run reports include mediation execution attempts under workflow_conflict, while release/sign-off receipts summarize mediation status and cost without exposing full debug rationale."
           },
           "migration_fixtures": [
             "Existing stage-owned AgentExecution row remains visible in find_by_stage, stage GraphQL readback, stage report sections, runtime facts, artifact refs, and stage-level cost totals after migration.",
@@ -769,7 +769,7 @@
       "redaction": [
       "Raw advisory values are never public tier.",
       "Operator tier receives redacted advisory values and natural-language summaries.",
-      "Full lead rationale and resolution_record_json remain local debug tier until Q-003 privacy review is complete.",
+      "Full lead rationale and resolution_record_json remain local debug tier. Q-003 rejects broader P017 export outside local debug reports.",
       "Live mediation status updates are operator-tier summaries derived from explicit progress events only; they must not expose chain-of-thought, hidden reasoning, provider prompts, or raw transcript text.",
       "Provider prompts, secrets, credentials, and unrelated artifact payload text must not be copied into workflow_conflict fields."
       ],
@@ -876,8 +876,8 @@
         "Emit sanitized mediation progress events in GraphQL/MCP readback without exposing hidden reasoning or raw transcript text."
       ],
       "entry_criteria": [
-        "After Phase A ships, run a Phase B readiness checkpoint that orders owner migration, retry/claim migration, Q-003 privacy review, GraphQL/MCP readback, and dogfood work by dependency, effort, and parallelizable work.",
-        "Q-003 privacy review is complete or default debug-only rationale policy is enforced.",
+        "After Phase A ships, run a Phase B readiness checkpoint that orders owner migration, retry/claim migration, Q-003 debug-only policy enforcement, GraphQL/MCP readback, and dogfood work by dependency, effort, and parallelizable work.",
+        "Q-003 debug-only rationale policy is enforced.",
         "Rust mediation-owned execution migration fixtures pass for list_by_run, find_by_stage, cancel_running_by_run, MCP reports.get, GraphQL mediation readback, runtime facts, artifacts, transcripts, and cost aggregation.",
         "Rust owner-adjacent retry ledger and artifact source-generation claim fixtures pass for mediation-owned provider quota retry, source claim idempotency, LeadResolutionContract validation, and late-output settlement.",
         "Runtime flag default-on decision is blocked until Phase B dogfood exit criteria are met."
@@ -1062,7 +1062,7 @@
     },
     {
       "risk": "Report payloads may expose advisory text or lead rationale.",
-      "mitigation": "Public/operator tiers are redacted and summary-only; full rationale and resolution_record_json remain local debug tier until Q-003 privacy review records a different outcome."
+      "mitigation": "Public/operator tiers are redacted and summary-only; full rationale and resolution_record_json remain local debug tier under the resolved Q-003 policy."
     },
     {
       "risk": "Legacy Swift implementation diverges from control-plane workflow truth.",
@@ -1102,7 +1102,7 @@
     },
     {
       "risk": "Operator demand for live mediation transparency could expose private rationale or hidden reasoning.",
-      "mitigation": "GraphQL/MCP mediation readback exposes only sanitized progress events and timestamps. Full rationale, raw transcript text, prompts, and hidden reasoning remain redacted unless Q-003 explicitly approves a narrower redacted export scope with fixtures."
+      "mitigation": "GraphQL/MCP mediation readback exposes only sanitized progress events and timestamps. Full rationale, raw transcript text, prompts, and hidden reasoning remain redacted under the resolved Q-003 policy."
     }
   ],
   "acceptance_criteria": [
@@ -1256,21 +1256,23 @@
     {
       "id": "Q-001",
       "question": "Should a future proposal add explicit transition tie-break syntax?",
-      "status": "deferred",
-      "default_for_p017": "Treat multi-match as a workflow conflict."
+      "status": "answered",
+      "answer": "Yes, but not in P017. Proposal 071 (docs/proposals/071-explicit-workflow-transition-tie-break-syntax.md) owns explicit, compiled, auditable transition tie-break syntax. P017 must not infer tie-breaks from ordering or agent advice.",
+      "default_for_p017": "Treat every multi-match as multiple_declarative_transitions_matched_without_tie_break and persist a typed workflow conflict."
     },
     {
       "id": "Q-002",
       "question": "Should external legacy catalogs receive a warning window before Phase C fail-closed enforcement?",
-      "status": "resolved_for_p017",
+      "status": "answered",
+      "answer": "Yes, but only for active external legacy catalogs. Bundled workflows must be fixed or covered by explicit known-issues migration records before enforcement.",
       "default_for_p017": "Use a two-release-cycle warning window for active external legacy catalogs. One release cycle means a tagged app/control-plane release carrying validation warnings and release-note migration guidance; two cycles also require at least 60 calendar days. If the Phase C enforcement inventory proves no active external catalogs exist at ship time, waive the window and enforce strict validation immediately."
     },
     {
       "id": "Q-003",
       "question": "Should full lead rationale be exportable outside local debug-tier reports?",
-      "status": "scheduled_phase_b_readiness_gate",
-      "default_for_p017": "No. Public and operator tiers remain summary-only; resolution_record_json and full rationale remain local debug tier unless privacy review approves broader exposure before Phase B readiness closes.",
-      "scope_delta_if_approved": "If privacy review approves broader export, Phase B scope expands only to explicitly-redacted rationale summaries, GraphQL/MCP/report parity fixtures, and updated acceptance criteria proving prompts, secrets, hidden reasoning, and unrelated artifact payloads remain excluded. Provider-backed mediation may still proceed with debug-only default if this expanded scope is not approved or not implemented."
+      "status": "answered",
+      "answer": "No for P017. Full lead rationale, resolution_record_json, raw transcript text, prompts, and hidden reasoning remain local debug tier only. GraphQL/MCP/report surfaces may expose sanitized progress, timestamps, attempt number, resolution_mode, requires_operator_confirmation, validation outcome, and short operator-safe summaries.",
+      "default_for_p017": "Public and operator tiers remain summary-only. Any broader rationale export requires a separate future proposal with redaction rules, report/API parity fixtures, and acceptance criteria proving prompts, secrets, hidden reasoning, raw transcript text, and unrelated artifact payloads remain excluded."
     },
     {
       "id": "Q-004",
@@ -1334,7 +1336,7 @@
     },
     {
       "source": "PO2-003 and SLB-R2-014",
-      "decision": "Q-003 privacy review must complete before Phase B readiness closes; debug-only rationale export remains default."
+      "decision": "Q-003 is answered for P017: full rationale export remains local-debug-only; Phase B readiness must enforce that policy instead of waiting for broader export approval."
     },
     {
       "source": "PO2-004",
@@ -1418,7 +1420,7 @@
     },
     {
       "source": "PO5-003",
-      "decision": "Q-003 now has an explicit scope-delta rule: if broader rationale export is approved, Phase B must add redaction, report/API parity, and acceptance fixtures before exposing it; otherwise debug-only remains default. UI disclosure is future thin-client work."
+      "decision": "Q-003 is resolved as no broader P017 rationale export. Full rationale and resolution_record_json remain local debug tier only; any future redacted rationale export belongs to a separate proposal. UI disclosure is future thin-client work."
     },
     {
       "source": "UX-017-R6-001",
@@ -1437,5 +1439,5 @@
       "decision": "Superseded by the UI DB cutover. Repeated UI findings are retained as historical context only and are not P017 implementation or audit requirements."
     }
   ],
-  "recommendation": "Proceed to implementation-readiness review for the control-plane scope. Phase 0 and Phase A remain implementation-planning ready, now with explicit transition cursor/resume invariants, implementation-entry handoff storage/API contracts, graph authority, advisory rejection truth, field-authority, fail-closed input classification, per-surface report shapes, and rollout thresholds. Broad Phase B provider-backed mediation remains gated on owner_kind/owner_id AgentExecution migration, owner-adjacent retry/claim fixtures, privacy/default-debug policy or approved Q-003 scope delta, GraphQL/MCP readback evidence, readiness-checkpoint sequencing, and dogfood exit evidence. Phase C remains gated on enforcement inventory, external catalog discovery or attestation, release-window evidence, and GraphQL/MCP validation readback."
+  "recommendation": "Proceed to implementation-readiness review for the control-plane scope. Phase 0 and Phase A remain implementation-planning ready, now with explicit transition cursor/resume invariants, implementation-entry handoff storage/API contracts, graph authority, advisory rejection truth, field-authority, fail-closed input classification, per-surface report shapes, and rollout thresholds. Broad Phase B provider-backed mediation remains gated on owner_kind/owner_id AgentExecution migration, owner-adjacent retry/claim fixtures, Q-003 debug-only rationale policy enforcement, GraphQL/MCP readback evidence, readiness-checkpoint sequencing, and dogfood exit evidence. Phase C remains gated on enforcement inventory, external catalog discovery or attestation, release-window evidence, and GraphQL/MCP validation readback."
 }

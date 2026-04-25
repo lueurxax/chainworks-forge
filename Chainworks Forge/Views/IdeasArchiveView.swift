@@ -71,27 +71,7 @@ struct IdeasArchiveView: View {
             } else {
                 List(filteredIdeas) { idea in
                     HStack(alignment: .top, spacing: 12) {
-                        NavigationLink {
-                            IdeaDetailView(idea: idea)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(idea.title)
-                                    .font(.headline)
-                                Text(idea.body)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                                HStack(spacing: 8) {
-                                    IdeaLifecycleBadge(idea: idea)
-                                    if let archivedAt = idea.archivedAt {
-                                        Text("Archived \(archivedAt.formatted(date: .abbreviated, time: .omitted))")
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
+                        archivedIdeaSummary(idea)
                         Spacer(minLength: 12)
                         Button("Restore") {
                             onRestore(idea)
@@ -107,6 +87,25 @@ struct IdeasArchiveView: View {
                     }
                 }
                 .accessibilityIdentifier("ideas-archive-list")
+            }
+        }
+    }
+
+    private func archivedIdeaSummary(_ idea: Idea) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(idea.title)
+                .font(.headline)
+            Text(idea.body)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            HStack(spacing: 8) {
+                IdeaLifecycleBadge(idea: idea)
+                if let archivedAt = idea.archivedAt {
+                    Text("Archived \(archivedAt.formatted(date: .abbreviated, time: .omitted))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }

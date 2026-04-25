@@ -621,22 +621,6 @@ struct RunTests {
         #expect(run.listPresentationStatus == .running)
     }
 
-    @Test func runsHomePresentationEntriesPreferProjectionStatusOverStoredSidebarTruth() throws {
-        let context = try makeContext()
-        let idea = Idea(title: "Test", body: "Body")
-        context.insert(idea)
-        let run = try makeRun(in: context, for: idea)
-        run.status = .blocked
-
-        let entries = buildRunsHomePresentationEntries(for: [run]) { currentRun in
-            #expect(currentRun.id == run.id)
-            return .running
-        }
-
-        #expect(entries.count == 1)
-        #expect(entries.first?.effectiveStatus == .running)
-    }
-
     @Test func sidebarLifecycleStatusLabelUsesLightweightRunTruth() throws {
         let context = try makeContext()
         let idea = Idea(title: "Test", body: "Body")

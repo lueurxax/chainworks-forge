@@ -15,6 +15,7 @@ use chrono::Utc;
 use domain::events::DomainEvent;
 use domain::lifecycle::{
     DaemonLifecycleState, DaemonStatus, DegradedKind, DegradedReason, FailureKind, FailureReason,
+    XcodeBrokerHealthSnapshot,
 };
 use tracing::{info, warn};
 
@@ -79,6 +80,23 @@ impl LifecycleReporter {
     pub fn set_schema_version(&self, schema_version: u32) {
         let mut guard = self.inner.lock().expect("lifecycle reporter lock");
         guard.schema_version = schema_version;
+    }
+
+    /// Publish the latest daemon-owned Xcode broker pool health. Broadcasts
+    /// only when the snapshot changes so subscribers are not spammed by the
+    /// periodic daemon sampler.
+    pub fn set_xcode_broker_health(&self, health: XcodeBrokerHealthSnapshot) {
+        let snapshot = {
+            let mut guard = self.inner.lock().expect("lifecycle reporter lock");
+            if guard.xcode_broker_health.as_ref() == Some(&health) {
+                return;
+            }
+            guard.xcode_broker_health = Some(health);
+            guard.clone()
+        };
+        let _ = self
+            .events
+            .send(DomainEvent::DaemonStatusChanged { status: snapshot });
     }
 
     /// Add a degraded reason and transition to `Degraded` if not already
@@ -253,5 +271,33 @@ mod tests {
         reporter.set_state(DaemonLifecycleState::Ready);
         let snap = reporter.snapshot();
         assert!(snap.failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_xcode_broker_health_updates_snapshot_and_broadcasts_once_per_change() {
+        let (reporter, mut rx) = make();
+        let health = XcodeBrokerHealthSnapshot {
+            state: domain::lifecycle::XcodeBrokerHealthState::Healthy,
+            pool_id: "local-xcode-mcp-pool".to_string(),
+            active_leases: 1,
+            queued_leases: 0,
+            max_active_leases: 8,
+            max_queued_leases: 16,
+            broker_disabled: false,
+            backend_available: true,
+            observation_persistence_failures: 0,
+        };
+
+        reporter.set_xcode_broker_health(health.clone());
+        let event = rx.recv().await.unwrap();
+        match event {
+            DomainEvent::DaemonStatusChanged { status } => {
+                assert_eq!(status.xcode_broker_health, Some(health.clone()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        reporter.set_xcode_broker_health(health);
+        assert!(rx.try_recv().is_err());
     }
 }

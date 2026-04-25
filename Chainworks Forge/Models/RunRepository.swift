@@ -300,7 +300,7 @@ struct RunRepository {
                     try fileManager.removeItem(atPath: path)
                     removedCount += 1
                 } catch {
-                    await ForgeLogger.app.error("Run cleanup failed to remove path \(path): \(error.localizedDescription)")
+                    ForgeLogger.app.error("Run cleanup failed to remove path \(path): \(error.localizedDescription)")
                 }
             }
 

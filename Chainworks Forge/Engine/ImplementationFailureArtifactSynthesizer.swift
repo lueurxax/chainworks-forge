@@ -1,6 +1,6 @@
 import Foundation
 
-struct ImplementationFailureArtifactSynthesizer {
+nonisolated struct ImplementationFailureArtifactSynthesizer {
     static let progressArtifactName = "implementation_progress"
     static let selfAssessmentArtifactName = "implementation_self_assessment"
     static let changedFilesArtifactName = "changed_files_manifest"

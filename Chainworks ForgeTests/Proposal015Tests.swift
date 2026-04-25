@@ -243,34 +243,8 @@ struct Proposal015Tests {
         #expect(decodedInjectedHashes["inline_writer"] == resolvedSkill.injectedContentHash)
     }
 
-    @Test("Proposal 015 proof fixture seeds repo-backed shell-owned truth")
-    func proposal015ProofFixtureSeedsRepoBackedShellOwnedTruth() throws {
-        let result = Proposal015ProofFixtureBuilder.makeFixture()
-        let fixture = try #require(result.fixture)
-        #expect(result.errorMessage == nil)
-        #expect(fixture.catalogURL.path.hasSuffix("/examples/agents/agents.yaml"))
-        #expect(fixture.workflowURL.path.hasSuffix("/examples/workflows/proposal-loop-live.yaml"))
-        #expect(fixture.proofAgentID == "proposal_reviewer_product_owner")
-        #expect(fixture.proofRun.runtimeTrustLevel == "fixture_verified")
-        #expect(fixture.comparisonRun.workflowTitle.contains("Architect"))
-        #expect(fixture.primaryArtifact.name == "proposal_current")
-        #expect(FileManager.default.fileExists(atPath: fixture.primaryArtifact.filePath))
-
-        let encodedSkillHashes = try #require(fixture.proofRun.skillInjectedContentHashesJSON)
-        let skillHashes = try encodedSkillHashes.decoded([String: String].self)
-        #expect(skillHashes["proposal_review_triad"]?.isEmpty == false)
-
-        let summaryArtifactID = try #require(fixture.proofRun.latestSummaryArtifactID)
-        let summaryArtifacts = try fixture.modelContainer.mainContext.fetch(FetchDescriptor<Artifact>())
-        let summaryArtifact = try #require(summaryArtifacts.first(where: { $0.id == summaryArtifactID }))
-        let summaryPath = summaryArtifact.filePath
-        let summaryBody = try String(contentsOfFile: summaryPath, encoding: .utf8)
-        #expect(summaryBody.contains("Skill: proposal_review_triad"))
-        #expect(summaryBody.contains("Role: product_owner"))
-    }
-
-    @Test("Proposal 015 app harness proves shell-owned skill truth without XCUI automation")
-    func proposal015AppHarnessProducesCanonicalProof() throws {
+    @Test("Proposal 015 app harness exposes archived proof after thin UI cutover")
+    func proposal015AppHarnessProducesArchivedProof() throws {
         let result = try Proposal015AppProofHarness().run()
 
         #expect(result.proofAgentID == "proposal_reviewer_product_owner")
@@ -281,7 +255,8 @@ struct Proposal015Tests {
         #expect(result.primaryArtifactExists)
         #expect(result.summaryMentionsSkillTruth)
         #expect(result.injectedSkillHashPresent)
-        #expect(result.proofStatus.contains("PASS"))
+        #expect(result.proofStatus.contains("ARCHIVED"))
+        #expect(result.proofStatus.contains("SwiftData app proof fixture removed"))
     }
 
     @Test("Proposal 015 app harness persists canonical proof export for gate consumption")
@@ -300,7 +275,7 @@ struct Proposal015Tests {
         #expect(persisted.result.primaryArtifactExists)
         #expect(persisted.result.summaryMentionsSkillTruth)
         #expect(persisted.result.injectedSkillHashPresent)
-        #expect(persisted.result.proofStatus.contains("PASS"))
+        #expect(persisted.result.proofStatus.contains("ARCHIVED"))
     }
 
     @Test("Execution rows and run reports persist injected skill truth")

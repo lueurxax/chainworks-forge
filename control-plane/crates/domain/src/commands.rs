@@ -29,6 +29,7 @@ pub enum Command {
     ApproveStage(ApproveStageCmd),
     RejectStage(RejectStageCmd),
     RetryStage(RetryStageCmd),
+    ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd),
     OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd),
     CancelRun(CancelRunCmd),
     ResetSession(ResetSessionCmd),
@@ -81,6 +82,14 @@ pub struct RetryStageCmd {
     pub legacy_discovery_override_policy: Option<LegacyBroadDiscoveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_discovery_override_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolveWorkflowConflictTransitionCmd {
+    pub run_id: RunId,
+    pub conflict_id: String,
+    pub selected_transition_id: String,
+    pub resolution_reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

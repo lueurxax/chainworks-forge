@@ -297,4 +297,4 @@ The snapshot+subscribe contract still has a race: between `daemonStatus` returni
 - Observability (logs rotation, redaction, `request_id` middleware) — owned by the local daemon lifecycle reference.
 - ACP Xcode MCP bridge pooling — owned by P051.
 - Swift client lifecycle UI — owned by the local daemon lifecycle reference for current daemon status behavior; future UI expansion needs its own owner.
-- Deterministic startup latency — owned by P053.
+- Deterministic startup latency — owned by [bounded artifact discovery and settlement optimization](../reference/artifact-discovery-and-settlement-optimization.md).

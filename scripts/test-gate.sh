@@ -882,7 +882,6 @@ for f in sensitive_files:
 
 cwd_sensitive_files = [
     app_root / "Chainworks_ForgeApp.swift",
-    app_root / "Views/UITestDirectSurfaces.swift",
     app_root / "Engine/SampleRunLauncher.swift",
 ]
 forbidden_fragments = [
@@ -1604,6 +1603,8 @@ Available gates:
   proposal-027r   Proposal 027 unified read-only JSON/markdown rendering gate (legacy renderer)
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
+  proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
@@ -1618,6 +1619,8 @@ Available gates:
   proposal-048    Proposal 048 evidence/preflight/MCP resolution gate
   proposal-049    Proposal 049 steward analysis system gate
   proposal-050    Proposal 050 per-run workspace isolation gate
+  p051-scaffold   Proposal 051 scaffold gate for shared Xcode MCP bridge pool substrate
+  proposal-051|p051  Proposal 051 shared Xcode MCP bridge pool fixture/readback gate
   proposal-053    Proposal 053 bounded ACP artifact discovery gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
   proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
@@ -2211,6 +2214,98 @@ PY
     )
     log "Proposal 043 control-plane gate passed"
     ;;
+  proposal-031|p031)
+    log "Proposal 031 gate: GraphQL-only thin UI inventory/static guard/write-path guide"
+    "$0" proposal-043
+
+    python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
+
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-031-gate cargo test -p graphql-server --lib proposal_031_ -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-031-gate cargo test -p graphql-server --test proposal_031_authorization -- --test-threads=1 --nocapture
+    )
+
+    (
+      cd "$ROOT_DIR"
+      python3 - <<'PY'
+from pathlib import Path
+import json
+
+def require_file(path):
+    p = Path(path)
+    if not p.is_file():
+        raise SystemExit(f"proposal-031: missing required artifact {path}")
+
+require_file("docs/reference/p031-thin-ui-inventory.json")
+require_file("docs/reference/p031-operator-write-path-guide.json")
+require_file("docs/reference/p031-phase-0-artifact-manifest.json")
+
+manifest_path = Path("docs/reference/p031-phase-0-artifact-manifest.json")
+manifest = json.loads(manifest_path.read_text())
+for entry in manifest.get("entries", []):
+    require_file(entry["path"])
+PY
+    )
+    log "Proposal 031 gate passed"
+    ;;
+  proposal-031-readiness|p031-readiness)
+    log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"
+    "$0" proposal-031
+
+    (
+      cd "$ROOT_DIR"
+      git ls-files --error-unmatch docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json >/dev/null
+      git ls-files --error-unmatch docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-degraded-sanitized-2026-04-24.png >/dev/null
+      python3 - <<'PY'
+from pathlib import Path
+import json
+import re
+
+failures = []
+
+manifest = json.loads(Path("docs/reference/p031-phase-0-artifact-manifest.json").read_text())
+manifest_status = str(manifest.get("status", ""))
+if "pending" in manifest_status.lower():
+    failures.append(f"manifest status is not closeout-ready: {manifest_status}")
+
+entries = {entry.get("id"): entry for entry in manifest.get("entries", [])}
+for required in (
+    "degraded_state_sanitized_screenshot",
+    "report_payload_live_evidence",
+    "dogfood_signoff_template",
+):
+    if required not in entries:
+        failures.append(f"manifest missing closeout artifact entry: {required}")
+
+for artifact_id, entry in entries.items():
+    status = str(entry.get("validation_status", ""))
+    if re.search(r"(pending|template|limitation)", status, re.IGNORECASE):
+        failures.append(f"{artifact_id} validation_status is not closeout-ready: {status}")
+
+dogfood = Path("docs/evidence/p031-dogfood-signoff.md").read_text()
+status_match = re.search(r"^Status:\s*(.+)$", dogfood, re.MULTILINE)
+dogfood_status = status_match.group(1).strip() if status_match else "<missing>"
+if not re.search(r"(SIGNED|APPROVED|COMPLETE)", dogfood_status, re.IGNORECASE):
+    failures.append(f"dogfood signoff is not signed/complete: {dogfood_status}")
+if re.search(r"^- \[ \]", dogfood, re.MULTILINE):
+    failures.append("dogfood checklist still has unchecked items")
+
+for path in (
+    "docs/evidence/p031-degraded-state-evidence.md",
+    "docs/evidence/p031-freshness-baseline.md",
+    "docs/evidence/p031-ux-accessibility-signoff.md",
+):
+    text = Path(path).read_text()
+    if re.search(r"(waiver pending|dogfood confirmation pending|assistive access limitation|No VoiceOver pass)", text, re.IGNORECASE):
+        failures.append(f"{path} still contains release-closeout qualification")
+
+if failures:
+    raise SystemExit("proposal-031-readiness failed:\n- " + "\n- ".join(failures))
+PY
+    )
+    log "Proposal 031 readiness gate passed"
+    ;;
   proposal-044|p044)
     log "Proposal 044 control-plane gate: post-approval + N-phase + end-state"
     (
@@ -2323,6 +2418,97 @@ PY
     )
     log "Proposal 050 control-plane gate passed"
     ;;
+  p051-scaffold)
+    log "Proposal 051 scaffold gate: shared Xcode MCP bridge pool substrate"
+    python3 - <<'PY'
+from pathlib import Path
+
+source = Path("docs/proposals/051-shared-xcode-mcp-bridge-pool.md")
+if not source.exists():
+    raise SystemExit(f"p051-scaffold: missing source proposal {source}")
+
+lines = source.read_text().splitlines()
+stale_checks = [
+    ("no SwiftUI changes", ["no swiftui changes", "no swift app ui changes", "no ui changes"]),
+    ("debug_assert-only capability enforcement", ["debug_assert"]),
+    ("path+mtime+size-only binary fingerprinting", ["path+mtime+size", "path, mtime, and size", "path mtime size"]),
+    ("drop-on-corrupt observation behavior", ["drop-on-corrupt", "drop on corrupt", "drop corrupt"]),
+    ("direct pgrep newest-Xcode selection", ["pgrep", "newest xcode"]),
+    ("unbound same-uid-only shim authorization", ["same-uid-only", "same uid only"]),
+]
+allowed_context_markers = [
+    "absent",
+    "concern",
+    "fail",
+    "forbid",
+    "not only",
+    "prohibit",
+    "reject",
+    "replace",
+    "required",
+    "resolution",
+    "resolved",
+    "security review",
+    "scope_change",
+    "stale",
+    "strengthened",
+    "threshold",
+    "tightened",
+]
+stale = []
+for label, needles in stale_checks:
+    offending_lines = []
+    for line_number, line in enumerate(lines, start=1):
+        normalized = line.lower()
+        if not any(needle in normalized for needle in needles):
+            continue
+        if any(marker in normalized for marker in allowed_context_markers):
+            continue
+        offending_lines.append(line_number)
+    if offending_lines:
+        stale.append(label)
+
+if stale:
+    raise SystemExit(
+        "p051-scaffold: docs/proposals/051-shared-xcode-mcp-bridge-pool.md still contains "
+        "stale contrary guidance: " + ", ".join(stale)
+    )
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-051-scaffold-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p workflow --test integration p051_ -- --nocapture &&
+      cargo test -p db --test integration proposal_051_xcode_runtime_observation -- --nocapture &&
+      cargo test -p acp --test integration brokered_xcode_probe_accepts_http_but_requires_lease_conversion -- --exact --nocapture &&
+      cargo test -p acp --test integration xcode_mcp_bridge_pool_ -- --nocapture &&
+      cargo test -p acp --test integration runtime_manager_attaches_brokered_xcode_http_lease_before_session_new -- --exact --nocapture &&
+      cargo test -p engine --test integration xcode_broker_fail_closed_observation_is_persisted_from_acp_sink -- --exact --nocapture &&
+      cargo check -p graphql-server &&
+      cargo check -p mcp-server
+    )
+    log "Proposal 051 scaffold gate passed"
+    ;;
+  proposal-051|p051)
+    log "Proposal 051 gate: shared Xcode MCP bridge pool"
+    "$0" p051-scaffold
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-051-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain --test artifact_contracts -- --nocapture &&
+      cargo test -p workflow --test integration p051_ -- --nocapture &&
+      cargo test -p db --test integration proposal_051_xcode_runtime_observation -- --nocapture &&
+      cargo test -p acp --test integration xcode_mcp_bridge_pool_ -- --nocapture &&
+      cargo test -p engine --test integration xcode_broker_fail_closed_observation_is_persisted_from_acp_sink -- --exact --nocapture &&
+      cargo check -p graphql-server &&
+      cargo check -p mcp-server
+    )
+    run_targeted_tests "proposal-051-swift" \
+      "Chainworks ForgeTests/RunTimelineInspectorViewTests" \
+      "Chainworks ForgeTests/DaemonLifecycleClientTests"
+    log "Proposal 051 gate passed"
+    ;;
   proposal-057|p057)
     log "Proposal 057 control-plane gate: canonical artifact contracts and run-state projection"
     mkdir -p "$ROOT_DIR/reports/test-gates"
@@ -2370,21 +2556,22 @@ from datetime import datetime
 from pathlib import Path
 
 root = Path.cwd()
-cap = root / "docs/proposals/053.review/cap-validation.json"
-security = root / "docs/proposals/053.review/security-checklist.md"
-manual_latency = root / "docs/proposals/053.review/manual-latency-spot-check.md"
-operator_clarity = root / "docs/proposals/053.review/operator-clarity-evidence.md"
-retrospective = root / "docs/proposals/053.review/phase-1-retrospective.md"
+evidence = root / "docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency"
+cap = evidence / "cap-validation.json"
+security = evidence / "security-checklist.md"
+manual_latency = evidence / "manual-latency-spot-check.md"
+operator_clarity = evidence / "operator-clarity-evidence.md"
+retrospective = evidence / "phase-1-retrospective.md"
 if not cap.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/cap-validation.json")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/cap-validation.json")
 if not security.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/security-checklist.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/security-checklist.md")
 if not manual_latency.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/manual-latency-spot-check.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/manual-latency-spot-check.md")
 if not operator_clarity.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/operator-clarity-evidence.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/operator-clarity-evidence.md")
 if not retrospective.exists():
-    raise SystemExit("proposal-053: missing docs/proposals/053.review/phase-1-retrospective.md")
+    raise SystemExit("proposal-053: missing docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/phase-1-retrospective.md")
 data = json.loads(cap.read_text())
 required = {
     "schema_version",

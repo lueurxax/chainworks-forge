@@ -13,7 +13,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 ## Execution Engine
 
 - [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service
-- [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, pre-prompt metadata (P053)
+- [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
 - [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, and startup recovery progress readback
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
@@ -25,6 +25,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
+- [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, broker health, and P051 readiness gates
 
 ## Control Plane
 
@@ -37,7 +38,8 @@ If you need a current-head orientation first, start with [current-system-baselin
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
-- [operator-experience.md](operator-experience.md) — Operator shell baseline: Runs Home, reports, recovery, comparison, artifact inspection, notifications, backpressure visibility, and host interruption labels
+- [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs Home, reports, recovery guidance, comparison, artifact inspection, notifications, backpressure visibility, and host interruption labels
+- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed UI write controls (P031)
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces

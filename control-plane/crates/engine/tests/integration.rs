@@ -11,19 +11,50 @@ use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::commands::{
     ApproveStageCmd, CallerContext, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
-    RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+    ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
-use domain::workflow_conflict::{WorkflowConflictReason, WorkflowTransitionCursorRecord};
+use domain::workflow_conflict::{
+    candidate_transition_hash, CandidateTransitionEvaluation, CandidateTransitionResult,
+    WorkflowConflictReason, WorkflowConflictRecord, WorkflowConflictStatus,
+    WorkflowTransitionCursorRecord,
+};
+use domain::PrincipalClass;
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+
+static CODEX_CONFIG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static META_ROOT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvVarRestore {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.as_ref() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
@@ -212,7 +243,42 @@ fn make_agent_execution(
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+    }
+}
+
+fn make_workflow_conflict(
+    run_id: RunId,
+    current_state_id: &str,
+    candidate: CandidateTransitionEvaluation,
+    status: WorkflowConflictStatus,
+) -> WorkflowConflictRecord {
+    let now = Utc::now();
+    let candidate_transitions = vec![candidate];
+    let candidate_hash = candidate_transition_hash(&candidate_transitions);
+    WorkflowConflictRecord {
+        conflict_id: uuid::Uuid::new_v4().to_string(),
+        conflict_fingerprint: format!("sha256:test-{}", uuid::Uuid::new_v4()),
+        run_id: run_id.to_string(),
+        stage_execution_id: None,
+        lineage_id: None,
+        current_state_id: current_state_id.to_string(),
+        reason: WorkflowConflictReason::NoDeclarativeTransitionMatched,
+        operator_label: "No workflow transition matched".into(),
+        status,
+        candidate_transitions,
+        candidate_transition_hash: candidate_hash,
+        advisory_evidence_refs: Vec::new(),
+        lead_agent_id: None,
+        mediation_record_id: None,
+        created_at: now,
+        updated_at: now,
+        resolved_at: None,
+        superseded_by_conflict_id: None,
+        resolution_record_json: None,
+        terminal_failure_reason: None,
+        diagnostic_redaction_tier: "operator_safe".into(),
     }
 }
 
@@ -501,6 +567,215 @@ async fn proposal_017_startup_repair_resumes_selected_transition_cursor() {
     assert_eq!(work.len(), 1);
     assert_eq!(work[0].kind, db::work_item::WorkItemKind::AdvanceRun);
     assert_eq!(work[0].stage_id, None);
+}
+
+#[tokio::test]
+async fn proposal_017_operator_can_select_loop_budget_candidate_transition() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let completed_stage_id = StageExecutionId::new();
+    let current_state_id = "state_8_implementation_continued";
+    let transition_id = "state_8_implementation_continued__to__state_8_implementation_continued__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Completed);
+    completed_stage.stage_id = current_state_id.into();
+    completed_stage.label = "Implementation Continued".into();
+    completed_stage.iteration = 50;
+    stages::insert(&pool, &completed_stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: current_state_id.into(),
+        condition_expression_id: Some("implementation_self_assessment_needs_code_fixes".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["implementation_self_assessment_v2".into()],
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: vec!["implementation_self_assessment_v2".into()],
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some(
+            "Loop budget exhausted for implementation_progress_count: 50/50 iterations".into(),
+        ),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    let conflict_id = conflict.conflict_id.clone();
+    let candidate_hash = conflict.candidate_transition_hash.clone();
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(conflict_id.clone()),
+            conflict_fingerprint: Some(conflict.conflict_fingerprint.clone()),
+            candidate_transition_hash: Some(candidate_hash.clone()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let caller = CallerContext::mcp(
+        "operator-test",
+        &PrincipalClass::Operator,
+        "workflow_conflicts.resolve",
+    );
+    let commanded = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator confirmed one more implementation pass".into(),
+            }),
+            caller,
+        )
+        .await
+        .unwrap();
+
+    assert!(!commanded.journal_id.is_empty());
+    assert!(
+        workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "resolved conflict must no longer block the run"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Running);
+    assert_eq!(stored_run.current_state.as_deref(), Some(current_state_id));
+
+    let cursor = workflow_conflicts::get_transition_cursor(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("selected transition cursor should be recorded");
+    assert_eq!(cursor.cursor_status, "operator_transition_selected");
+    assert_eq!(cursor.resume_policy, "continue_from_selected_transition");
+    assert_eq!(
+        cursor.selected_transition_id.as_deref(),
+        Some(transition_id)
+    );
+    assert_eq!(
+        cursor.selected_next_state_id.as_deref(),
+        Some(current_state_id)
+    );
+    assert_eq!(cursor.conflict_id.as_deref(), Some(conflict_id.as_str()));
+    assert_eq!(
+        cursor.candidate_transition_hash.as_deref(),
+        Some(candidate_hash.as_str())
+    );
+
+    let stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let pending = stages
+        .iter()
+        .find(|stage| stage.status == StageStatus::Pending)
+        .expect("selecting an exhausted loop transition must create the next pending stage");
+    assert_eq!(pending.stage_id, current_state_id);
+    assert_eq!(pending.iteration, 51);
+    assert_eq!(pending.attempt_number, 1);
+
+    let queued = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].kind, db::work_item::WorkItemKind::AdvanceRun);
+    assert_eq!(queued[0].stage_id.as_deref(), Some(current_state_id));
+}
+
+#[tokio::test]
+async fn proposal_017_operator_cannot_select_plain_not_matched_transition() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let current_state_id = "state_4_proposal_reviewed";
+    let transition_id = "state_4_proposal_reviewed__to__state_6_implementation_approval__1";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: "state_6_implementation_approval".into(),
+        condition_expression_id: Some("proposal_review_passed".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["proposal_review_summary".into()],
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: vec!["proposal_review_summary".into()],
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some("condition evaluated to false".into()),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let caller = CallerContext::mcp(
+        "operator-test",
+        &PrincipalClass::Operator,
+        "workflow_conflicts.resolve",
+    );
+    let result = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict.conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "try approving anyway".into(),
+            }),
+            caller,
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("plain not_matched transitions must not be operator-selectable"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("only loop-budget-exhausted not_matched candidates"),
+        "unexpected error: {error}"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    assert!(
+        workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "failed selection must leave conflict blocking"
+    );
 }
 
 #[tokio::test]
@@ -1835,6 +2110,56 @@ agents:
     run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
     run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
     runs::insert(&pool, &run).await.unwrap();
+
+    let artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "loop".into(),
+        agent_id: "worker".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: "implementation_self_assessment_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: meta_root
+            .join("self-assessment.json")
+            .to_string_lossy()
+            .into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+    };
+    artifacts::insert(&pool, &artifact).await.unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&artifact.file_path).unwrap()).unwrap();
+    let summary = domain::artifact_contracts::parse_implementation_self_assessment_v2(
+        &raw,
+        domain::artifact_contracts::ContractParseContext {
+            run_id: run_id.to_string(),
+            run_age: None,
+            declared_contract_id: Some(artifact.contract_id.clone()),
+            canonical_artifact_path:
+                domain::artifact_contracts::IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(artifact.file_path.clone()),
+            source_generation_id: None,
+            artifact_created_at: Some(artifact.created_at),
+            v2_generation_seen_for_run: false,
+            legacy_v1_generation_available: true,
+        },
+    );
+    artifact_contracts::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        artifact.id,
+        &artifact.contract_id,
+        &summary,
+        artifact.created_at,
+    )
+    .await
+    .unwrap();
 
     let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Running);
     completed_stage.stage_id = "loop".into();
@@ -3296,8 +3621,18 @@ async fn mcp_resolution_persistence_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let registry_path = tmp.path().join("mcp-config.yaml");
     std::fs::write(&registry_path, "mcp: {}\n").unwrap();
+    let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
     let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
     std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+    let xcode_resolution =
+        engine::mcp::resolve_mcp_servers(&["xcode".to_string()], Some("xcode_profile"), "auggie");
+    assert!(
+        xcode_resolution.payloads.iter().any(|payload| matches!(
+            payload.transport,
+            acp::ResolvedMcpServerTransport::XcodeBrokerIntent { .. }
+        )),
+        "fixture registry should resolve xcode to a broker intent"
+    );
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -3397,6 +3732,113 @@ async fn mcp_resolution_persistence_tests() {
     assert!(
         settled.evidence_packet_json.is_some(),
         "MCP blocked stage should get failed-stage evidence"
+    );
+}
+
+#[tokio::test]
+async fn xcode_broker_fail_closed_observation_is_persisted_from_acp_sink() {
+    use acp::AcpRuntimeManager;
+    use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservation};
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let registry_path = tmp.path().join("mcp-config.yaml");
+    std::fs::write(
+        &registry_path,
+        r#"
+mcp:
+  xcode:
+    type: xcode_broker
+"#,
+    )
+    .unwrap();
+    let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
+    let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
+    std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "xcode_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new()),
+        events,
+    );
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("xcode_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "xcode_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "xcode-agent",
+                "provider": "auggie",
+                "backend_profile_id": "xcode_profile",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "xcode_profile",
+                "requested_mcp_server_ids": ["xcode"]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let result = executor.process_next_item().await;
+    if let Some(previous_registry) = previous_registry {
+        std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", previous_registry);
+    } else {
+        std::env::remove_var("CHAINWORKS_CODEX_CONFIG_PATH");
+    }
+
+    let error = result.expect_err("unsupported provider should fail closed");
+    assert!(
+        error.to_string().contains("provider_http_mcp_unsupported"),
+        "unexpected error: {error:#}"
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    let execution = executions.first().expect("agent execution should persist");
+    let observation_json = execution
+        .actual_xcode_runtime_observation_json
+        .as_deref()
+        .expect("ACP Xcode sink should persist an observation");
+    let observation: XcodeRuntimeObservation = serde_json::from_str(observation_json).unwrap();
+    assert_eq!(observation.mcp_broker_observations.len(), 1);
+    let broker_observation = &observation.mcp_broker_observations[0];
+    assert_eq!(
+        broker_observation.backend_start_disposition,
+        "failed_closed_before_session_new"
+    );
+    assert_eq!(
+        broker_observation.backend_failure_class,
+        Some(XcodeRuntimeFailureClass::ProviderHttpMcpUnsupported)
+    );
+    assert_eq!(
+        broker_observation.originating_execution_id.as_deref(),
+        Some(execution.id.to_string().as_str())
     );
 }
 
@@ -3697,6 +4139,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
             }),
         )
         .await
@@ -4222,6 +4665,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
+                xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
@@ -4319,6 +4763,8 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "fixture",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "fixture-agent",
                 "declared_outputs": [{
                     "output_name": "prepush_review_report",
                     "target_path": target_path.to_string_lossy(),
@@ -4418,6 +4864,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
+                xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
@@ -5173,6 +5620,7 @@ sys.exit(0)
                 "agent_id": "reuse-agent",
                 "provider": "claude",
                 "prompt": "reuse turn",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
                 "session_reuse_scope": "same_agent_family_within_run",
                 "session_family_id": "proposal-loop",
             }),
@@ -5208,6 +5656,7 @@ sys.exit(0)
                 "agent_id": "reuse-agent",
                 "provider": "claude",
                 "prompt": "reuse turn",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
                 "session_reuse_scope": "same_agent_family_within_run",
                 "session_family_id": "proposal-loop",
             }),
@@ -5462,6 +5911,10 @@ sys.exit(0)
         backend_profile: None,
         permission_profile: None,
         mcp_servers: &Vec::new(),
+        xcode_broker_contract_hash: None,
+        xcode_broker_required: false,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
         skill_snapshot_hash: None,
         skill_ref: None,
         skill_role: None,
@@ -5706,6 +6159,10 @@ sys.exit(0)
         backend_profile: None,
         permission_profile: None,
         mcp_servers: &Vec::new(),
+        xcode_broker_contract_hash: None,
+        xcode_broker_required: false,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
         skill_snapshot_hash: None,
         skill_ref: None,
         skill_role: None,
@@ -5921,6 +6378,7 @@ sys.exit(0)
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &running_exec)
@@ -6293,6 +6751,10 @@ sys.exit(0)
         backend_profile: None,
         permission_profile: None,
         mcp_servers: &Vec::new(),
+        xcode_broker_contract_hash: None,
+        xcode_broker_required: false,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
         skill_snapshot_hash: None,
         skill_ref: None,
         skill_role: None,
@@ -6411,6 +6873,7 @@ sys.exit(0)
                 "agent_id": "reuse-agent",
                 "provider": "claude",
                 "prompt": "fallback after missing live handle",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
                 "session_reuse_scope": "same_agent_family_within_run",
                 "session_family_id": "proposal-loop",
             }),
@@ -6540,6 +7003,10 @@ sys.exit(0)
             backend_profile: None,
             permission_profile: None,
             mcp_servers: &Vec::new(),
+            xcode_broker_contract_hash: None,
+            xcode_broker_required: false,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
             skill_snapshot_hash: None,
             skill_ref: None,
             skill_role: None,
@@ -7518,12 +7985,16 @@ async fn test_state_11_to_state_12_happy_path() {
     use domain::ids::ArtifactId;
     use engine::orchestrator::Orchestrator;
 
+    let _meta_root_env_lock = META_ROOT_ENV_LOCK.lock().await;
     let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
 
     // Isolated workspace + artifact root so exists() lookups hit only our files.
     let tmp = tempfile::tempdir().unwrap();
+    let meta_root = tmp.path().join(".chainworks");
+    std::fs::create_dir_all(&meta_root).unwrap();
+    let _meta_root_env = EnvVarRestore::set("CHAINWORKS_META_ROOT", &meta_root.to_string_lossy());
     let workspace_root = tmp.path().to_string_lossy().into_owned();
     let artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
     std::fs::create_dir_all(&artifact_root).unwrap();
@@ -8216,6 +8687,8 @@ fn test_execution_request_carries_chainworks_meta_root() {
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

@@ -20,6 +20,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -451,6 +452,7 @@ version = "0.1.0"
 dependencies = [
  "acp",
  "anyhow",
+ "async-trait",
  "auth",
  "axum",
  "chrono",

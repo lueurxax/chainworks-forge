@@ -533,6 +533,16 @@ backend_profiles:
       - context7
       - xcode
     runtime_profile: codex_acp
+  claude_builder_high:
+    provider: claude_acp
+    model: sonnet
+    effort: high
+    temperature: 0.1
+    max_turns: 24
+    structured_output: required
+    mcp:
+      - xcode
+    runtime_profile: claude_agent_acp
   codex_audit_high:
     provider: codex_acp
     model: gpt-5.5
@@ -579,7 +589,8 @@ backend_profiles:
     temperature: 0.2
     max_turns: 12
     structured_output: required
-    mcp: []
+    mcp:
+      - xcode
     runtime_profile: claude_agent_acp
   claude_steward_high:
     provider: claude_acp
@@ -646,8 +657,7 @@ backend_profiles:
     temperature: 0.2
     max_turns: 12
     structured_output: required
-    mcp:
-      - xcode
+    mcp: []
   gemini_docs_flash:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
@@ -1178,7 +1188,7 @@ agents:
   - id: code_writer
     title: Code Writer
     mode: implementation
-    backend_profile: codex_builder_high
+    backend_profile: claude_builder_high
     permission_profile: CODE_WRITE
     skill_ref: code_writer_core
     worktree_policy:
@@ -1195,6 +1205,7 @@ agents:
       - swift test
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+    requires_xcode_host_execution: true
     inputs:
       - approved_proposal
       - implementation_plan
@@ -1283,6 +1294,7 @@ agents:
       - swift test
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+    requires_xcode_host_execution: true
     inputs:
       - approved_proposal
       - implementation_progress
@@ -1373,6 +1385,7 @@ agents:
       - swift test
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+    requires_xcode_host_execution: true
     inputs:
       - approved_proposal
       - implementation_progress

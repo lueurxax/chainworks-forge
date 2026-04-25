@@ -50,7 +50,7 @@ It compiles into `RunPlan.requiresProjectAccess`.
 
 Consumers of that one typed answer:
 
-- Start Run
+- Start Run (Diagnostic placeholder in UI; enforced at mutation/MCP start)
 - Preflight
 - Run compilation
 - Resume
@@ -61,9 +61,9 @@ If the YAML field is absent, it defaults to `false`.
 
 When `requiresProjectAccess == true`:
 
-- Start Run blocks if the idea has no valid workspace root,
+- diagnostic Start Run placeholder blocks if the idea has no valid workspace root,
 - preflight includes workspace readiness,
-- the operator must fix the workspace contract before live start.
+- the operator must fix the workspace contract before external live start.
 
 When `requiresProjectAccess == false`:
 

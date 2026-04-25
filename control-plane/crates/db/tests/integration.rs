@@ -1,23 +1,15 @@
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_executions, approvals, artifact_contracts as artifact_contract_repos, artifacts, ideas,
-    projections, runs, scheduler, sessions, stages, steward, validation, work_items,
+    projections, runs, stages, steward, validation,
 };
-use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
-use domain::artifact_contracts::{
-    parse_implementation_self_assessment_v2, ActiveArtifactGenerationInput, ContractParseContext,
-    ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
-};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
-use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::{Run, RunStatus};
-use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::steward::{
     CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
@@ -27,6 +19,11 @@ use domain::validation::{
     ContractValidationMetadata, OutputValidationResult, RecoveryRecommendation,
     ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
 };
+use domain::xcode_runtime::{
+    McpBrokerObservation, XcodeHostExecutorEvent, XcodeRuntimeFailureClass,
+    XcodeRuntimeObservation, XcodeRuntimeObservationUpdate, XcodeShimEvent, XcodeShimWarningEvent,
+    XCODE_RUNTIME_OBSERVATION_MAX_BYTES, XCODE_RUNTIME_OBSERVATION_MAX_EVENTS,
+};
 
 async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
@@ -34,10 +31,10 @@ async fn test_pool() -> sqlx::SqlitePool {
         .expect("in-memory pool failed")
 }
 
-async fn seed_contract_run(pool: &sqlx::SqlitePool) -> RunId {
+async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecutionId {
     let idea = Idea {
         id: IdeaId::new(),
-        title: "Contract idea".into(),
+        title: "Idea".into(),
         body: "body".into(),
         workspace_root_path: None,
         project_key: None,
@@ -51,8 +48,8 @@ async fn seed_contract_run(pool: &sqlx::SqlitePool) -> RunId {
         id: RunId::new(),
         idea_id: idea.id,
         status: RunStatus::Running,
-        workflow_id: "wf-contract".into(),
-        workflow_title: "Contract Workflow".into(),
+        workflow_id: "wf-p051".into(),
+        workflow_title: "P051".into(),
         workspace_root: "/tmp/ws".into(),
         artifact_root: "/tmp/art".into(),
         started_at: Utc::now(),
@@ -60,7 +57,7 @@ async fn seed_contract_run(pool: &sqlx::SqlitePool) -> RunId {
         cancellation_requested_at: None,
         cancellation_settled_at: None,
         cancellation_settlement_log: None,
-        current_state: Some("state_8_implementation".into()),
+        current_state: None,
         workflow_yaml_path: None,
         agent_catalog_yaml_path: None,
         worktree_root: None,
@@ -82,444 +79,19 @@ async fn seed_contract_run(pool: &sqlx::SqlitePool) -> RunId {
         chainworks_meta_root: None,
     };
     runs::insert(pool, &run).await.unwrap();
-    run.id
-}
 
-async fn insert_contract_artifact(
-    pool: &sqlx::SqlitePool,
-    run_id: RunId,
-    contract_id: &str,
-    name: &str,
-) -> ArtifactId {
-    let artifact = Artifact {
-        id: ArtifactId::new(),
-        run_id,
-        stage_id: "state_8_implementation".into(),
-        agent_id: "code_writer".into(),
-        name: name.into(),
-        contract_id: contract_id.into(),
-        format: ArtifactFormat::Json,
-        file_path: format!("/tmp/art/{name}.json"),
-        checksum_sha256: None,
-        size_bytes: None,
-        provider: "codex".into(),
-        model: None,
-        created_at: Utc::now(),
-        is_pinned: false,
-        report_kind: None,
-        report_version: None,
-    };
-    artifacts::insert(pool, &artifact).await.unwrap();
-    artifact.id
-}
-
-fn contract_context(declared_contract_id: Option<&str>) -> ContractParseContext {
-    ContractParseContext {
-        run_id: "run".into(),
-        run_age: None,
-        declared_contract_id: declared_contract_id.map(str::to_string),
-        canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
-        raw_artifact_path: Some(IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into()),
-        source_generation_id: None,
-        artifact_created_at: Some(Utc::now()),
-        v2_generation_seen_for_run: false,
-        legacy_v1_generation_available: false,
-    }
-}
-
-fn valid_v2_handoff_required() -> serde_json::Value {
-    serde_json::json!({
-        "implementation_complete": true,
-        "verification_green": true,
-        "remaining_code_tasks": [],
-        "handoff_tasks": [{
-            "summary": "Collect signed manual smoke evidence.",
-            "owner_class": "manual_evidence",
-            "target_stage": "state_10_release_gate",
-            "blocking_review": true,
-            "evidence": "Manual smoke evidence is intentionally collected after implementation review."
-        }],
-        "known_risks": ["Manual evidence still gates release."],
-        "tests_run": ["cargo test -p domain"],
-        "docs_impacted": []
-    })
-}
-
-#[tokio::test]
-async fn artifact_contract_summary_persists_active_dimensions() {
-    let pool = test_pool().await;
-    let run_id = seed_contract_run(&pool).await;
-    let artifact_id = insert_contract_artifact(
-        &pool,
-        run_id,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
-        "implementation-self-assessment-v2",
-    )
-    .await;
-    let summary = parse_implementation_self_assessment_v2(
-        &valid_v2_handoff_required(),
-        contract_context(Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)),
-    );
-
-    let stored = artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        run_id,
-        artifact_id,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
-        &summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(stored.artifact_id, artifact_id);
-    assert!(stored.is_active);
-    assert_eq!(stored.source_kind, "v2");
-    assert_eq!(
-        stored.summary.status,
-        ImplementationSelfAssessmentStatus::HandoffRequired
-    );
-    assert_eq!(stored.summary.handoff_task_count, Some(1));
-    assert_eq!(stored.summary.blocking_review_handoff_task_count, Some(1));
-    assert_eq!(
-        stored
-            .summary
-            .owner_class_counts
-            .get("manual_evidence")
-            .copied(),
-        Some(1)
-    );
-}
-
-#[tokio::test]
-async fn artifact_contract_summary_active_generation_uses_domain_handoff_required_status() {
-    let pool = test_pool().await;
-    let run_id = seed_contract_run(&pool).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let raw_path = tmp.path().join("implementation/self-assessment.json");
-    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &raw_path,
-        serde_json::to_vec(&valid_v2_handoff_required()).unwrap(),
-    )
-    .unwrap();
-
-    artifact_contract_repos::upsert_generation_and_rebuild(
-        &pool,
-        ActiveArtifactGenerationInput {
-            run_id,
-            artifact_id: ArtifactId::new(),
-            contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
-            canonical_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
-            raw_path: raw_path.to_string_lossy().into_owned(),
-            raw_status: "complete".into(),
-            generation_id: "handoff-generation".into(),
-            source_agent_execution_id: Some("agent-exec-handoff".into()),
-            source_stage_execution_id: None,
-            source_session_generation_id: None,
-            source_work_item_id: None,
-            supersedes_generation_id: None,
-            output_settlement: domain::agent::AgentOutputSettlement::None,
-            partial: false,
-            warnings: vec![],
-        },
-    )
-    .await
-    .unwrap();
-
-    let status = artifact_contract_repos::canonical_contract_field(
-        &pool,
-        run_id,
-        "implementation_self_assessment_v2",
-        "status",
-    )
-    .await
-    .unwrap();
-    assert_eq!(status, Some(serde_json::json!("handoff_required")));
-    let handoff_count = artifact_contract_repos::canonical_contract_field(
-        &pool,
-        run_id,
-        "implementation_self_assessment_v2",
-        "blocking_review_handoff_task_count",
-    )
-    .await
-    .unwrap();
-    assert_eq!(handoff_count, Some(serde_json::json!(1)));
-}
-
-#[tokio::test]
-async fn artifact_contract_summary_prefers_invalid_v2_over_legacy_v1() {
-    let pool = test_pool().await;
-    let run_id = seed_contract_run(&pool).await;
-    let legacy_artifact_id = insert_contract_artifact(
-        &pool,
-        run_id,
-        "implementation_self_assessment_v1",
-        "implementation-self-assessment-v1",
-    )
-    .await;
-    let legacy_summary = parse_implementation_self_assessment_v2(
-        &serde_json::json!({ "seemingly_complete": true }),
-        contract_context(Some("implementation_self_assessment_v1")),
-    );
-    artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        run_id,
-        legacy_artifact_id,
-        "implementation_self_assessment_v1",
-        &legacy_summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-
-    let v2_artifact_id = insert_contract_artifact(
-        &pool,
-        run_id,
-        "raw_output",
-        "implementation-self-assessment-raw-v2",
-    )
-    .await;
-    let invalid_v2_summary = parse_implementation_self_assessment_v2(
-        &valid_v2_handoff_required(),
-        contract_context(None),
-    );
-    let active = artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        run_id,
-        v2_artifact_id,
-        "raw_output",
-        &invalid_v2_summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(active.artifact_id, v2_artifact_id);
-    assert_eq!(active.source_kind, "v2");
-    assert_eq!(
-        active.summary.status,
-        ImplementationSelfAssessmentStatus::Invalid
-    );
-    assert!(active
-        .summary
-        .validation_errors
-        .iter()
-        .any(|issue| issue.code == "raw_only_v2_artifact"));
-}
-
-#[tokio::test]
-async fn artifact_contract_summary_keeps_v2_active_over_later_legacy_same_path() {
-    let pool = test_pool().await;
-    let run_id = seed_contract_run(&pool).await;
-    let v2_artifact_id = insert_contract_artifact(
-        &pool,
-        run_id,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
-        "implementation-self-assessment-v2",
-    )
-    .await;
-    let v2_summary = parse_implementation_self_assessment_v2(
-        &valid_v2_handoff_required(),
-        contract_context(Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)),
-    );
-    artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        run_id,
-        v2_artifact_id,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
-        &v2_summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-
-    let legacy_artifact_id = insert_contract_artifact(
-        &pool,
-        run_id,
-        "implementation_self_assessment_v1",
-        "implementation-self-assessment-v1",
-    )
-    .await;
-    let legacy_summary = parse_implementation_self_assessment_v2(
-        &serde_json::json!({ "seemingly_complete": true }),
-        contract_context(Some("implementation_self_assessment_v1")),
-    );
-    let active = artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        run_id,
-        legacy_artifact_id,
-        "implementation_self_assessment_v1",
-        &legacy_summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-    let legacy_record =
-        artifact_contract_repos::find_implementation_self_assessment_summary_by_artifact(
-            &pool,
-            legacy_artifact_id,
-        )
-        .await
-        .unwrap()
-        .expect("legacy summary should be stored");
-
-    assert_eq!(active.artifact_id, v2_artifact_id);
-    assert!(active.is_active);
-    assert!(!legacy_record.is_active);
-    assert!(legacy_record
-        .summary
-        .warnings
-        .iter()
-        .any(|issue| issue.code == "same_path_contract_conflict"));
-}
-
-#[tokio::test]
-async fn v1_fallback_retirement_check_reports_active_non_terminal_legacy_runs() {
-    let pool = test_pool().await;
-    let active_legacy_run_id = seed_contract_run(&pool).await;
-    let active_legacy_artifact_id = insert_contract_artifact(
-        &pool,
-        active_legacy_run_id,
-        "implementation_self_assessment_v1",
-        "active-legacy-implementation-self-assessment",
-    )
-    .await;
-    let legacy_summary = parse_implementation_self_assessment_v2(
-        &serde_json::json!({ "seemingly_complete": true }),
-        contract_context(Some("implementation_self_assessment_v1")),
-    );
-    artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        active_legacy_run_id,
-        active_legacy_artifact_id,
-        "implementation_self_assessment_v1",
-        &legacy_summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-
-    let terminal_legacy_run_id = seed_contract_run(&pool).await;
-    let terminal_legacy_artifact_id = insert_contract_artifact(
-        &pool,
-        terminal_legacy_run_id,
-        "implementation_self_assessment_v1",
-        "terminal-legacy-implementation-self-assessment",
-    )
-    .await;
-    artifact_contract_repos::persist_implementation_self_assessment_summary(
-        &pool,
-        terminal_legacy_run_id,
-        terminal_legacy_artifact_id,
-        "implementation_self_assessment_v1",
-        &legacy_summary,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-    runs::update_status(&pool, terminal_legacy_run_id, RunStatus::Completed)
-        .await
-        .unwrap();
-
-    let check = artifact_contract_repos::v1_fallback_retirement_check(&pool)
-        .await
-        .unwrap();
-    assert!(!check.safe_to_retire());
-    assert_eq!(check.active_non_terminal_v1_only_run_count(), 1);
-    assert_eq!(
-        check.active_non_terminal_v1_only_run_ids,
-        vec![active_legacy_run_id]
-    );
-
-    runs::update_status(&pool, active_legacy_run_id, RunStatus::Completed)
-        .await
-        .unwrap();
-    let check = artifact_contract_repos::v1_fallback_retirement_check(&pool)
-        .await
-        .unwrap();
-    assert!(check.safe_to_retire());
-    assert_eq!(check.active_non_terminal_v1_only_run_count(), 0);
-}
-
-#[tokio::test]
-async fn sqlite_pool_uses_30_second_busy_timeout() {
-    let pool = test_pool().await;
-
-    let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-    assert_eq!(busy_timeout_ms, 30_000);
-}
-
-#[tokio::test]
-async fn migrations_create_hot_scheduler_indexes() {
-    let pool = test_pool().await;
-
-    let indexes: Vec<String> = sqlx::query_scalar(
-        r#"SELECT name
-           FROM sqlite_master
-           WHERE type = 'index'
-             AND name IN (
-               'idx_work_items_status_kind_scheduled',
-               'idx_agent_executions_status',
-               'idx_agent_executions_status_provider',
-               'idx_agent_executions_status_stage'
-             )
-           ORDER BY name"#,
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(
-        indexes,
-        vec![
-            "idx_agent_executions_status".to_string(),
-            "idx_agent_executions_status_provider".to_string(),
-            "idx_agent_executions_status_stage".to_string(),
-            "idx_work_items_status_kind_scheduled".to_string(),
-        ]
-    );
-}
-
-async fn explain_query_plan(pool: &sqlx::SqlitePool, sql: &str) -> Vec<String> {
-    use sqlx::Row;
-
-    sqlx::query(sql)
-        .fetch_all(pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.get::<String, _>("detail"))
-        .collect()
-}
-
-fn assert_plan_uses_index(plan: &[String], index_name: &str) {
-    assert!(
-        plan.iter().any(|detail| detail.contains(index_name)),
-        "query plan should use {index_name}; plan was {plan:?}"
-    );
-}
-
-#[tokio::test]
-async fn proposal_061_hot_index_query_plans_use_indexes_at_fixture_scale() {
-    let pool = test_pool().await;
-    let run_id = seed_contract_run(&pool).await;
     let stage = StageExecution {
         id: StageExecutionId::new(),
-        run_id,
-        stage_id: "implementation".into(),
-        label: "Implementation".into(),
+        run_id: run.id,
+        stage_id: "stage-p051".into(),
+        label: "Stage P051".into(),
         status: StageStatus::Running,
         iteration: 1,
         attempt_number: 1,
         settlement_kind: None,
         started_at: Utc::now(),
         completed_at: None,
-        owner_agent: Some("code_writer".into()),
+        owner_agent: Some("xcode_agent".into()),
         provider: Some("codex".into()),
         model: None,
         stage_type: None,
@@ -528,520 +100,41 @@ async fn proposal_061_hot_index_query_plans_use_indexes_at_fixture_scale() {
         recovery_snapshot_json: None,
         retry_reason: None,
     };
-    stages::insert(&pool, &stage).await.unwrap();
+    stages::insert(pool, &stage).await.unwrap();
 
-    let scheduled_at = Utc::now() - Duration::minutes(10);
-    for index in 0..1_000 {
-        work_items::enqueue(
-            &pool,
-            &WorkItem {
-                id: format!("p061-hot-pending-{index:04}"),
-                kind: WorkItemKind::InvokeAgent,
-                payload_json: serde_json::json!({
-                    "provider": "codex_cli",
-                    "stage_execution_id": stage.id.to_string()
-                })
-                .to_string(),
-                status: WorkItemStatus::Pending,
-                run_id: Some(run_id),
-                stage_id: Some("implementation".into()),
-                created_at: scheduled_at,
-                scheduled_at,
-                attempt_count: 0,
-                last_error: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    for index in 0..500 {
-        agent_executions::insert(
-            &pool,
-            &AgentExecution {
-                id: AgentExecutionId::new(),
-                stage_execution_id: stage.id,
-                agent_id: format!("codex-agent-{index:03}"),
-                provider: "codex_cli".into(),
-                model: Some("default".into()),
-                started_at: Utc::now(),
-                completed_at: None,
-                status: AgentStatus::Running,
-                owner_execution_lineage_id: Some(stage.id.to_string()),
-                session_lineage_id: None,
-                session_generation_id: None,
-                rehydrated_from_checkpoint_artifact_id: None,
-                invocation_owner_key: None,
-                session_reuse_scope: None,
-                session_family_id: None,
-                session_reuse_disposition: None,
-                session_reset_reason: None,
-                backend_profile_id: None,
-                requested_mcp_extensions_json: None,
-                predicted_mcp_extensions_json: None,
-                predicted_mcp_runtime_ids_json: None,
-                actual_mcp_extensions_json: None,
-                actual_mcp_runtime_ids_json: None,
-                denied_mcp_extensions_json: None,
-                mcp_blocking_issues_json: None,
-                actual_mcp_observation_json: None,
-                mcp_session_startup_latency_ms: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    let pending_plan = explain_query_plan(
-        &pool,
-        r#"EXPLAIN QUERY PLAN
-           SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
-           FROM work_items
-           WHERE status = 'pending'
-             AND (scheduled_at <= '9999-12-31T23:59:59Z'
-                  OR datetime(scheduled_at) <= datetime('9999-12-31T23:59:59Z'))
-             AND kind = 'invoke_agent'
-           ORDER BY scheduled_at ASC, rowid ASC
-           LIMIT 32"#,
-    )
-    .await;
-    assert_plan_uses_index(&pending_plan, "idx_work_items_kind_status_scheduled_at");
-
-    let provider_count_plan = explain_query_plan(
-        &pool,
-        r#"EXPLAIN QUERY PLAN
-           SELECT COUNT(*)
-           FROM agent_executions
-           WHERE status = 'running' AND provider_family = 'codex'"#,
-    )
-    .await;
-    assert_plan_uses_index(
-        &provider_count_plan,
-        "idx_agent_executions_status_provider_family",
-    );
-
-    let run_count_plan = explain_query_plan(
-        &pool,
-        &format!(
-            r#"EXPLAIN QUERY PLAN
-               SELECT COUNT(*)
-               FROM agent_executions ae
-               INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-               WHERE ae.status = 'running' AND se.run_id = '{}'"#,
-            run_id
-        ),
-    )
-    .await;
-    assert_plan_uses_index(&run_count_plan, "idx_agent_executions_status_stage");
-}
-
-#[tokio::test]
-async fn scheduler_refresh_returns_notification_only_at_sustained_backpressure_boundaries() {
-    let pool = test_pool().await;
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let old_scheduled_at = Utc::now() - Duration::minutes(6);
-    let pending = WorkItem {
-        id: "p061-backpressure-pending".into(),
-        kind: WorkItemKind::InvokeAgent,
-        payload_json: serde_json::json!({
-            "provider": "codex",
-            "stage_execution_id": stage_execution_id.to_string()
-        })
-        .to_string(),
-        status: WorkItemStatus::Pending,
-        run_id: Some(run_id),
-        stage_id: Some("implementation".into()),
-        created_at: old_scheduled_at,
-        scheduled_at: old_scheduled_at,
-        attempt_count: 0,
-        last_error: None,
-    };
-    work_items::enqueue(&pool, &pending).await.unwrap();
-
-    let capacity = InvokeAgentCapacityConfig::default();
-    let first = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(first.notification, None);
-    assert_eq!(
-        scheduler::latest_health_snapshot(&pool)
-            .await
-            .unwrap()
-            .unwrap()
-            .sustained_backpressure_state,
-        "pending_active"
-    );
-
-    let active = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap()
-        .notification
-        .expect("second high-pressure snapshot should activate notification");
-    assert_eq!(active.state, "active");
-    assert_eq!(active.top_reason, "queued");
-    assert_eq!(active.queued_count, 1);
-    assert_eq!(active.global_queue_depth, 1);
-
-    sqlx::query("UPDATE work_items SET status = 'completed' WHERE id = ?1")
-        .bind(&pending.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let first_clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(first_clear.notification, None);
-    assert_eq!(
-        scheduler::latest_health_snapshot(&pool)
-            .await
-            .unwrap()
-            .unwrap()
-            .sustained_backpressure_state,
-        "pending_clear"
-    );
-
-    let clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap()
-        .notification
-        .expect("second clear snapshot should clear notification");
-    assert_eq!(clear.state, "clear");
-    assert_eq!(clear.top_reason, "clear");
-    assert_eq!(clear.queued_count, 0);
-    assert_eq!(clear.global_queue_depth, 0);
-}
-
-#[tokio::test]
-async fn scheduler_backpressure_fire_requires_two_consecutive_high_snapshots() {
-    let pool = test_pool().await;
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let old_scheduled_at = Utc::now() - Duration::minutes(6);
-    let pending = WorkItem {
-        id: "p061-backpressure-consecutive-fire".into(),
-        kind: WorkItemKind::InvokeAgent,
-        payload_json: serde_json::json!({
-            "provider": "codex",
-            "stage_execution_id": stage_execution_id.to_string()
-        })
-        .to_string(),
-        status: WorkItemStatus::Pending,
-        run_id: Some(run_id),
-        stage_id: Some("implementation".into()),
-        created_at: old_scheduled_at,
-        scheduled_at: old_scheduled_at,
-        attempt_count: 0,
-        last_error: None,
-    };
-    work_items::enqueue(&pool, &pending).await.unwrap();
-
-    let capacity = InvokeAgentCapacityConfig::default();
-    let first_high = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(first_high.notification, None);
-    let snapshot = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(snapshot.sustained_backpressure_state, "pending_active");
-    assert_eq!(snapshot.fire_consecutive_snapshots, 1);
-
-    let middle_scheduled_at = Utc::now() - Duration::minutes(3);
-    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
-        .bind(middle_scheduled_at.to_rfc3339())
-        .bind(&pending.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let middle = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(middle.notification, None);
-    let snapshot = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(snapshot.sustained_backpressure_state, "clear");
-    assert_eq!(snapshot.fire_consecutive_snapshots, 0);
-
-    let old_scheduled_at = Utc::now() - Duration::minutes(6);
-    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
-        .bind(old_scheduled_at.to_rfc3339())
-        .bind(&pending.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let restarted = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(restarted.notification, None);
-    assert_eq!(
-        scheduler::latest_health_snapshot(&pool)
-            .await
-            .unwrap()
-            .unwrap()
-            .fire_consecutive_snapshots,
-        1
-    );
-
-    let active = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap()
-        .notification
-        .expect("second consecutive high-pressure snapshot should activate notification");
-    assert_eq!(active.state, "active");
-}
-
-#[tokio::test]
-async fn scheduler_backpressure_clear_interruption_does_not_refire_active_notification() {
-    let pool = test_pool().await;
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-    let old_scheduled_at = Utc::now() - Duration::minutes(6);
-    let pending = WorkItem {
-        id: "p061-backpressure-clear-interrupted".into(),
-        kind: WorkItemKind::InvokeAgent,
-        payload_json: serde_json::json!({
-            "provider": "codex",
-            "stage_execution_id": stage_execution_id.to_string()
-        })
-        .to_string(),
-        status: WorkItemStatus::Pending,
-        run_id: Some(run_id),
-        stage_id: Some("implementation".into()),
-        created_at: old_scheduled_at,
-        scheduled_at: old_scheduled_at,
-        attempt_count: 0,
-        last_error: None,
-    };
-    work_items::enqueue(&pool, &pending).await.unwrap();
-
-    let capacity = InvokeAgentCapacityConfig::default();
-    scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    let active = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap()
-        .notification
-        .expect("second high-pressure snapshot should activate notification");
-    assert_eq!(active.state, "active");
-
-    let clear_scheduled_at = Utc::now() - Duration::minutes(1);
-    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
-        .bind(clear_scheduled_at.to_rfc3339())
-        .bind(&pending.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let first_clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(first_clear.notification, None);
-    assert_eq!(
-        scheduler::latest_health_snapshot(&pool)
-            .await
-            .unwrap()
-            .unwrap()
-            .sustained_backpressure_state,
-        "pending_clear"
-    );
-
-    let middle_scheduled_at = Utc::now() - Duration::minutes(3);
-    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
-        .bind(middle_scheduled_at.to_rfc3339())
-        .bind(&pending.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let interrupted_clear = scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    assert_eq!(interrupted_clear.notification, None);
-    let snapshot = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(snapshot.sustained_backpressure_state, "active");
-    assert_eq!(snapshot.clear_consecutive_snapshots, 0);
-}
-
-#[tokio::test]
-async fn invoke_completion_and_failure_refresh_scheduler_projection_in_write_path() {
-    let pool = test_pool().await;
-    let old_scheduled_at = Utc::now() - Duration::minutes(6);
-    let stage_execution_id = StageExecutionId::new();
-    let running_id = "p061-running-refresh";
-    let pending_id = "p061-pending-refresh";
-
-    for (id, status) in [
-        (running_id, WorkItemStatus::Running),
-        (pending_id, WorkItemStatus::Pending),
-    ] {
-        work_items::enqueue(
-            &pool,
-            &WorkItem {
-                id: id.into(),
-                kind: WorkItemKind::InvokeAgent,
-                payload_json: serde_json::json!({
-                    "provider": "codex",
-                    "stage_execution_id": stage_execution_id.to_string()
-                })
-                .to_string(),
-                status,
-                run_id: None,
-                stage_id: Some("implementation".into()),
-                created_at: old_scheduled_at,
-                scheduled_at: old_scheduled_at,
-                attempt_count: 0,
-                last_error: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    let capacity = InvokeAgentCapacityConfig::default();
-    scheduler::refresh_queue_summaries_for_notification(&pool, &capacity)
-        .await
-        .unwrap();
-    let initial = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(initial.queued_count, 1);
-    assert_eq!(initial.active_agent_executions, 1);
-
-    work_items::complete(&pool, running_id).await.unwrap();
-    let after_complete = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after_complete.queued_count, 1);
-    assert_eq!(after_complete.active_agent_executions, 0);
-
-    work_items::fail(&pool, pending_id, "provider failed")
-        .await
-        .unwrap();
-    let after_fail = scheduler::latest_health_snapshot(&pool)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after_fail.queued_count, 0);
-    assert_eq!(after_fail.global_queue_depth, 0);
-    assert!(scheduler::list_queue_summaries(&pool)
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-#[tokio::test]
-async fn completing_invoke_agent_enqueues_post_completion_advance_run() {
-    let pool = test_pool().await;
-    let idea = Idea {
-        id: IdeaId::new(),
-        title: "Idea".into(),
-        body: "body".into(),
-        workspace_root_path: None,
-        project_key: None,
-        status: IdeaStatus::Active,
-        created_at: Utc::now(),
-        archived_at: None,
-    };
-    ideas::insert(&pool, &idea).await.unwrap();
-
-    let run = Run {
-        id: RunId::new(),
-        idea_id: idea.id,
-        status: RunStatus::Running,
-        workflow_id: "wf-invoke-completion".into(),
-        workflow_title: "Invoke Completion".into(),
-        workspace_root: "/tmp/ws".into(),
-        artifact_root: "/tmp/art".into(),
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage.id,
+        agent_id: "xcode_agent".into(),
+        provider: "codex".into(),
+        model: None,
         started_at: Utc::now(),
         completed_at: None,
-        cancellation_requested_at: None,
-        cancellation_settled_at: None,
-        cancellation_settlement_log: None,
-        current_state: Some("state_4_proposal_reviewed".into()),
-        workflow_yaml_path: None,
-        agent_catalog_yaml_path: None,
-        worktree_root: None,
-        base_branch: None,
-        base_revision: None,
-        target_branch: None,
-        delivery_configuration_json: None,
-        delivery_preflight_json: None,
-        workflow_family: None,
-        project_key: None,
-        risk_class: None,
-        stack: None,
-        workflow_snapshot_hash: None,
-        catalog_snapshot_hash: None,
-        workflow_snapshot_json: None,
-        catalog_snapshot_json: None,
-        drift_detected_at: None,
-        drift_details_json: None,
-        chainworks_meta_root: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
     };
-    runs::insert(&pool, &run).await.unwrap();
+    agent_executions::insert(pool, &execution).await.unwrap();
 
-    let now = Utc::now();
-    let invoke_id = "p058-invoke:completion-finalizer-test:0";
-    work_items::enqueue(
-        &pool,
-        &WorkItem {
-            id: invoke_id.into(),
-            kind: WorkItemKind::InvokeAgent,
-            payload_json: serde_json::json!({
-                "run_id": run.id.to_string(),
-                "stage_id": "state_4_proposal_reviewed",
-                "stage_execution_id": StageExecutionId::new().to_string(),
-                "agent_id": "proposal_reviewer_architect",
-                "provider": "codex",
-            })
-            .to_string(),
-            status: WorkItemStatus::Running,
-            run_id: Some(run.id),
-            stage_id: Some("state_4_proposal_reviewed".into()),
-            created_at: now,
-            scheduled_at: now,
-            attempt_count: 1,
-            last_error: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    work_items::complete(&pool, invoke_id).await.unwrap();
-
-    let items = work_items::list_by_run(&pool, run.id).await.unwrap();
-    let invoke = items
-        .iter()
-        .find(|item| item.id == invoke_id)
-        .expect("completed invoke item");
-    assert_eq!(invoke.status, WorkItemStatus::Completed);
-
-    let pending_advances: Vec<_> = items
-        .iter()
-        .filter(|item| {
-            item.kind == WorkItemKind::AdvanceRun && item.status == WorkItemStatus::Pending
-        })
-        .collect();
-    assert_eq!(
-        pending_advances.len(),
-        1,
-        "completion must leave a durable post-completion AdvanceRun wake-up"
-    );
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&pending_advances[0].payload_json).unwrap();
-    assert_eq!(payload["run_id"], run.id.to_string());
-    assert_eq!(payload["completed_invoke_work_item_id"], invoke_id);
-    assert_eq!(payload["reason"], "invoke_agent_completed");
+    execution.id
 }
 
 #[tokio::test]
@@ -1205,134 +298,6 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
     assert_eq!(generation.cumulative_prompt_tokens, 12_000);
     assert_eq!(generation.cumulative_cost_cents, 17);
     assert_eq!(generation.last_activity_at, Some(last_activity_at));
-}
-
-#[tokio::test]
-async fn session_lookup_helpers_read_by_id() {
-    let pool = test_pool().await;
-    let idea = Idea {
-        id: IdeaId::new(),
-        title: "Idea".into(),
-        body: "body".into(),
-        workspace_root_path: None,
-        project_key: None,
-        status: IdeaStatus::Active,
-        created_at: Utc::now(),
-        archived_at: None,
-    };
-    ideas::insert(&pool, &idea).await.unwrap();
-
-    let run = Run {
-        id: RunId::new(),
-        idea_id: idea.id,
-        status: RunStatus::Running,
-        workflow_id: "wf-session-lookup".into(),
-        workflow_title: "Session Lookup".into(),
-        workspace_root: "/tmp/ws".into(),
-        artifact_root: "/tmp/art".into(),
-        started_at: Utc::now(),
-        completed_at: None,
-        cancellation_requested_at: None,
-        cancellation_settled_at: None,
-        cancellation_settlement_log: None,
-        current_state: None,
-        workflow_yaml_path: None,
-        agent_catalog_yaml_path: None,
-        worktree_root: None,
-        base_branch: None,
-        base_revision: None,
-        target_branch: None,
-        delivery_configuration_json: None,
-        delivery_preflight_json: None,
-        workflow_family: None,
-        project_key: None,
-        risk_class: None,
-        stack: None,
-        workflow_snapshot_hash: None,
-        catalog_snapshot_hash: None,
-        workflow_snapshot_json: None,
-        catalog_snapshot_json: None,
-        drift_detected_at: None,
-        drift_details_json: None,
-        chainworks_meta_root: None,
-    };
-    runs::insert(&pool, &run).await.unwrap();
-
-    let lineage = SessionLineage {
-        id: "session-lineage-lookup".into(),
-        run_id: run.id.to_string(),
-        agent_id: "code_writer".into(),
-        lineage_id: "session-family-lookup".into(),
-        session_reuse_scope: "same_agent_family_within_run".into(),
-        session_family_id: Some("family-lookup".into()),
-        active_generation_id: Some("session-generation-lookup".into()),
-        created_at: Utc::now(),
-        closed_at: None,
-    };
-    sessions::insert_lineage(&pool, &lineage).await.unwrap();
-
-    let generation = SessionGeneration {
-        id: "session-generation-lookup".into(),
-        lineage_id: lineage.id.clone(),
-        generation: 3,
-        invocation_owner_key: "owner-key".into(),
-        provider_session_id: Some("provider-session-lookup".into()),
-        binding_fingerprint: "fingerprint-lookup".into(),
-        rehydrated_from_checkpoint_artifact_id: None,
-        working_directory: "/tmp/ws".into(),
-        workspace_mode: "workspace".into(),
-        runtime_provider: "claude".into(),
-        runtime_model: "sonnet".into(),
-        status: SessionGenerationStatus::Closed,
-        turn_count: 4,
-        estimated_input_tokens: 10,
-        latest_cached_input_tokens: Some(2),
-        latest_output_tokens: Some(8),
-        latest_model_context_window: Some(4096),
-        cumulative_prompt_tokens: 11,
-        cumulative_cost_cents: 12,
-        created_at: Utc::now(),
-        last_activity_at: None,
-        ended_at: None,
-        end_reason: Some("completed".into()),
-    };
-    sessions::insert_generation(&pool, &generation)
-        .await
-        .unwrap();
-
-    let found_lineage = sessions::find_lineage_by_id(&pool, &lineage.id)
-        .await
-        .unwrap()
-        .expect("lineage");
-    let found_generation = sessions::find_generation_by_id(&pool, &generation.id)
-        .await
-        .unwrap()
-        .expect("generation");
-
-    assert_eq!(
-        found_lineage.active_generation_id.as_deref(),
-        Some("session-generation-lookup")
-    );
-    assert_eq!(
-        found_generation.provider_session_id.as_deref(),
-        Some("provider-session-lookup")
-    );
-    assert_eq!(found_generation.status, SessionGenerationStatus::Closed);
-    assert_eq!(found_generation.lineage_id, lineage.id);
-}
-
-#[tokio::test]
-async fn session_lookup_helpers_return_none_for_missing_rows() {
-    let pool = test_pool().await;
-
-    assert!(sessions::find_lineage_by_id(&pool, "missing-lineage")
-        .await
-        .unwrap()
-        .is_none());
-    assert!(sessions::find_generation_by_id(&pool, "missing-generation")
-        .await
-        .unwrap()
-        .is_none());
 }
 
 #[tokio::test]
@@ -1660,6 +625,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
@@ -1805,6 +771,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         actual_mcp_observation_json: Some(
             r#"{"source":"not_started_blocked_before_session_new"}"#.into(),
         ),
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: Some(42),
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
@@ -1854,6 +821,332 @@ async fn proposal_048_persistence_fields_round_trip() {
         found_execution.mcp_session_startup_latency_ms,
         execution.mcp_session_startup_latency_ms
     );
+}
+
+#[tokio::test]
+async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
+    let pool = test_pool().await;
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-p051".into(),
+        workflow_title: "P051".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let stage = StageExecution {
+        id: StageExecutionId::new(),
+        run_id: run.id,
+        stage_id: "stage-p051".into(),
+        label: "Stage P051".into(),
+        status: StageStatus::Running,
+        iteration: 1,
+        attempt_number: 1,
+        settlement_kind: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        owner_agent: Some("xcode_agent".into()),
+        provider: Some("codex".into()),
+        model: None,
+        stage_type: None,
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
+    };
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: stage.id,
+        agent_id: "xcode_agent".into(),
+        provider: "codex".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+    };
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+            source: "xcode_mcp_broker".into(),
+            backend_start_disposition: "spawned".into(),
+            pool_id: Some("pool-1".into()),
+            lease_id: Some("lease-1".into()),
+            xcode_pid: Some("77907".into()),
+            backend_process_id: Some(24837),
+            http_endpoint: Some("127.0.0.1:<redacted>".into()),
+            xcode_home_disposition: Some("host_user_home".into()),
+            xcode_tmpdir_disposition: Some("host_user_temp".into()),
+            simulator_selection: None,
+            sibling_leases_at_spawn: Some(1),
+            backend_initialize_wait_ms: Some(420),
+            backend_startup_latency_ms: Some(23031),
+            http_session_startup_latency_ms: Some(42),
+            backend_failure_class: None,
+            originating_execution_id: None,
+            prompt_cycle_index: Some(0),
+            status_update: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
+            XcodeShimWarningEvent {
+                ts: Utc::now(),
+                policy_reason: "xcode_absolute_path_in_prompt".into(),
+                source_field: "agent.prompt".into(),
+                matched_substring: "/usr/bin/xcrun mcpbridge".into(),
+                excerpt: "run /usr/bin/xcrun mcpbridge".into(),
+            },
+        )),
+    )
+    .await
+    .unwrap();
+
+    let found = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let observation: XcodeRuntimeObservation = serde_json::from_str(
+        found
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(observation.version, 1);
+    assert_eq!(observation.mcp_broker_observations.len(), 1);
+    assert_eq!(observation.xcode_shim_events.len(), 1);
+    assert_eq!(
+        observation.mcp_broker_observations[0].lease_id.as_deref(),
+        Some("lease-1")
+    );
+
+    sqlx::query(
+        "UPDATE agent_executions SET actual_xcode_runtime_observation_json = ? WHERE id = ?",
+    )
+    .bind("{not-json")
+    .bind(execution.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::XcodeHostExecutorEvent(XcodeHostExecutorEvent {
+            ts: Utc::now(),
+            tool: "xcodebuild".into(),
+            argv: vec!["build".into()],
+            cwd: "/tmp/ws".into(),
+            host_env_disposition: "host_user_home".into(),
+            env_allowlist_applied: vec!["HOME".into(), "TMPDIR".into()],
+            env_dropped_from_provider: vec!["CODEX_HOME".into()],
+            selected_simulator_id: None,
+            exit_status: 0,
+            duration_ms: 17,
+        }),
+    )
+    .await
+    .unwrap();
+
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        execution.id,
+        XcodeRuntimeObservationUpdate::McpBrokerStatusUpdate(
+            domain::xcode_runtime::McpBrokerStatusUpdate {
+                lease_id: "lease-1".into(),
+                backend_failure_class: XcodeRuntimeFailureClass::PoolPidDrift,
+                status_update: "backend_failed_after_spawn".into(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+
+    let recovered = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let recovered_observation: XcodeRuntimeObservation = serde_json::from_str(
+        recovered
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered_observation.xcode_host_executor_events.len(), 1);
+    assert_eq!(recovered_observation.mcp_broker_observations.len(), 1);
+    assert_eq!(
+        recovered_observation.mcp_broker_observations[0]
+            .status_update
+            .as_deref(),
+        Some("backend_failed_after_spawn")
+    );
+    assert_eq!(recovered_observation.storage.corrupt_json_recovery_count, 1);
+    assert_eq!(
+        recovered_observation.storage.corrupt_json_quarantined_bytes,
+        "{not-json".len()
+    );
+}
+
+#[tokio::test]
+async fn proposal_051_xcode_runtime_observation_append_enforces_event_and_byte_bounds() {
+    let pool = test_pool().await;
+    let execution_id = insert_p051_test_agent_execution(&pool).await;
+
+    for idx in 0..(XCODE_RUNTIME_OBSERVATION_MAX_EVENTS + 2) {
+        agent_executions::append_xcode_runtime_observation(
+            &pool,
+            execution_id,
+            XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+                source: "xcode_mcp_broker".into(),
+                backend_start_disposition: "spawned".into(),
+                pool_id: Some("pool-1".into()),
+                lease_id: Some(format!("lease-{idx}")),
+                xcode_pid: Some("77907".into()),
+                backend_process_id: Some(24837),
+                http_endpoint: Some("127.0.0.1:<redacted>".into()),
+                xcode_home_disposition: Some("host_user_home".into()),
+                xcode_tmpdir_disposition: Some("host_user_temp".into()),
+                simulator_selection: None,
+                sibling_leases_at_spawn: Some(1),
+                backend_initialize_wait_ms: Some(420),
+                backend_startup_latency_ms: Some(23031),
+                http_session_startup_latency_ms: Some(42),
+                backend_failure_class: None,
+                originating_execution_id: None,
+                prompt_cycle_index: Some(idx as i64),
+                status_update: None,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let found = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let observation: XcodeRuntimeObservation = serde_json::from_str(
+        found
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        observation.total_event_count(),
+        XCODE_RUNTIME_OBSERVATION_MAX_EVENTS
+    );
+    assert!(observation.storage.truncated);
+    assert_eq!(observation.storage.total_events_dropped, 2);
+    assert_eq!(observation.storage.mcp_broker_observations_dropped, 2);
+    assert_eq!(
+        observation.mcp_broker_observations[0].lease_id.as_deref(),
+        Some("lease-2")
+    );
+
+    let oversized_execution_id = insert_p051_test_agent_execution(&pool).await;
+    agent_executions::append_xcode_runtime_observation(
+        &pool,
+        oversized_execution_id,
+        XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::Warning(
+            XcodeShimWarningEvent {
+                ts: Utc::now(),
+                policy_reason: "xcode_absolute_path_in_prompt".into(),
+                source_field: "agent.prompt".into(),
+                matched_substring: "/usr/bin/xcrun mcpbridge".into(),
+                excerpt: "x".repeat(XCODE_RUNTIME_OBSERVATION_MAX_BYTES + 1),
+            },
+        )),
+    )
+    .await
+    .unwrap();
+
+    let oversized_found = agent_executions::find_by_id(&pool, oversized_execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let oversized_json = oversized_found
+        .actual_xcode_runtime_observation_json
+        .as_deref()
+        .unwrap();
+    let oversized_observation: XcodeRuntimeObservation =
+        serde_json::from_str(oversized_json).unwrap();
+    assert!(oversized_json.len() <= XCODE_RUNTIME_OBSERVATION_MAX_BYTES);
+    assert!(oversized_observation.storage.truncated);
+    assert_eq!(oversized_observation.total_event_count(), 0);
+    assert_eq!(oversized_observation.storage.total_events_dropped, 1);
+    assert_eq!(oversized_observation.storage.xcode_shim_events_dropped, 1);
 }
 
 #[tokio::test]
@@ -1977,6 +1270,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     let retry_agent_execution = AgentExecution {
@@ -2006,6 +1300,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)

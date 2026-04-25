@@ -912,12 +912,12 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
         let line = "\(taskName) @ \(ISO8601DateFormatter().string(from: Date()))\n"
         if FileManager.default.fileExists(atPath: proofFile.path) {
             if let handle = try? FileHandle(forWritingTo: proofFile) {
-                try? handle.seekToEnd()
-                try? handle.write(contentsOf: Data(line.utf8))
-                try? handle.close()
+                _ = try? handle.seekToEnd()
+                _ = try? handle.write(contentsOf: Data(line.utf8))
+                _ = try? handle.close()
             }
         } else {
-            try? Data(line.utf8).write(to: proofFile)
+            _ = try? Data(line.utf8).write(to: proofFile)
         }
     }
 

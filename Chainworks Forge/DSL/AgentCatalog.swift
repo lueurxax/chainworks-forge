@@ -34,7 +34,7 @@ struct RuntimeProfile: Codable, Sendable {
 
 // MARK: - Agent Catalog (top-level)
 
-struct AgentCatalog: Codable, Sendable {
+nonisolated struct AgentCatalog: Codable, Sendable {
     let schemaVersion: Int
     let app: AppConfig
     let paths: [String: String]
@@ -143,6 +143,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let outputs: [String]
     let outputContract: String?
     let requiresHumanApproval: Bool
+    let xcodeBrokerRequired: Bool?
+    let xcodeShimInjectionSignal: Bool?
+    let requiresXcodeHostExecution: Bool?
     let prompt: String
     let notes: String?
     
@@ -161,6 +164,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         case requiredTools = "required_tools"
         case outputContract = "output_contract"
         case requiresHumanApproval = "requires_human_approval"
+        case xcodeBrokerRequired = "xcode_broker_required"
+        case xcodeShimInjectionSignal = "xcode_shim_injection_signal"
+        case requiresXcodeHostExecution = "requires_xcode_host_execution"
         case sessionReuseScope = "session_reuse_scope"
         case sessionFamilyID = "session_family_id"
     }
@@ -180,6 +186,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         outputs: [String],
         outputContract: String? = nil,
         requiresHumanApproval: Bool,
+        xcodeBrokerRequired: Bool? = nil,
+        xcodeShimInjectionSignal: Bool? = nil,
+        requiresXcodeHostExecution: Bool? = nil,
         prompt: String,
         notes: String? = nil,
         sessionReuseScope: String? = nil,
@@ -199,6 +208,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         self.outputs = outputs
         self.outputContract = outputContract
         self.requiresHumanApproval = requiresHumanApproval
+        self.xcodeBrokerRequired = xcodeBrokerRequired
+        self.xcodeShimInjectionSignal = xcodeShimInjectionSignal
+        self.requiresXcodeHostExecution = requiresXcodeHostExecution
         self.prompt = prompt
         self.notes = notes
         self.sessionReuseScope = sessionReuseScope
@@ -398,7 +410,7 @@ struct MCPPermissions: Codable, Sendable {
     }
 }
 
-struct MCPPolicyConfig: Codable, Sendable, Equatable {
+nonisolated struct MCPPolicyConfig: Codable, Sendable, Equatable {
     let defaultProfile: String
     let runtimeAuthority: String
     let permissionProfileMCPMode: String

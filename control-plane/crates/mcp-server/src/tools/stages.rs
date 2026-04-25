@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use domain::commands::{Command, OverrideLegacyDiscoveryPolicyCmd, RetryStageCmd};
+use domain::commands::{
+    Command, OverrideLegacyDiscoveryPolicyCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+};
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::ids::{RunId, StageExecutionId};
 use engine::command_handler::CommandHandler;
@@ -52,6 +54,27 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "target_attempt_number": { "type": "integer", "minimum": 1 },
                     "legacy_discovery_override_policy": { "type": "string", "enum": ["workflow_opt_in"] },
                     "legacy_discovery_override_reason": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "workflow_conflicts.resolve".to_string(),
+            description:
+                "Resolve a blocking workflow conflict by selecting an existing candidate transition"
+                    .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": [
+                    "run_id",
+                    "conflict_id",
+                    "selected_transition_id",
+                    "resolution_reason"
+                ],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "conflict_id": { "type": "string" },
+                    "selected_transition_id": { "type": "string" },
+                    "resolution_reason": { "type": "string" }
                 }
             }),
         },
@@ -160,6 +183,56 @@ pub async fn execute(
             };
             Ok(serde_json::json!({
                 "override_id": override_id,
+                "journal_id": commanded.journal_id,
+            }))
+        }
+
+        "workflow_conflicts.resolve" => {
+            let run_id: RunId = params["run_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+                .parse()?;
+            let conflict_id = params["conflict_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'conflict_id'"))?
+                .to_string();
+            let selected_transition_id = params["selected_transition_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'selected_transition_id'"))?
+                .to_string();
+            let resolution_reason = params["resolution_reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'resolution_reason'"))?
+                .to_string();
+
+            let caller = mcp_caller(
+                &principal.id,
+                &principal.class,
+                "workflow_conflicts.resolve",
+            );
+            let cmd =
+                Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                    run_id,
+                    conflict_id,
+                    selected_transition_id,
+                    resolution_reason,
+                });
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            let (selected_transition_id, selected_next_state_id) = match &commanded.result {
+                engine::command_handler::CommandResult::WorkflowConflictTransitionSelected {
+                    selected_transition_id,
+                    selected_next_state_id,
+                    ..
+                } => (
+                    selected_transition_id.clone(),
+                    selected_next_state_id.clone(),
+                ),
+                _ => anyhow::bail!("Unexpected command result"),
+            };
+            Ok(serde_json::json!({
+                "resolved": true,
+                "selected_transition_id": selected_transition_id,
+                "selected_next_state_id": selected_next_state_id,
                 "journal_id": commanded.journal_id,
             }))
         }

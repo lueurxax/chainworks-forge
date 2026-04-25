@@ -189,6 +189,30 @@ struct AgentCatalogView: View {
             Section("Permissions") {
                 LabeledContent("Profile", value: agent.permissionProfile)
             }
+            if agent.xcodeBrokerRequired == true
+                || agent.xcodeShimInjectionSignal == true
+                || agent.requiresXcodeHostExecution == true
+            {
+                Section("Infrastructure") {
+                    if let required = agent.xcodeBrokerRequired {
+                        LabeledContent("Xcode Broker Required", value: required ? "Yes" : "No")
+                            .accessibilityIdentifier("infrastructure-xcode-broker-required")
+                    }
+                    if let signal = agent.xcodeShimInjectionSignal {
+                        LabeledContent("Xcode Shim Injection", value: signal ? "Yes" : "No")
+                            .accessibilityIdentifier("infrastructure-xcode-shim-injection-signal")
+                    }
+                    if let hostExecution = agent.requiresXcodeHostExecution {
+                        LabeledContent("Host Xcode Execution", value: hostExecution ? "Yes" : "No")
+                            .accessibilityIdentifier("infrastructure-requires-xcode-host-execution")
+                    }
+                    if agent.xcodeBrokerRequired == true {
+                        Text("First use may require one Xcode consent interaction.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             Section("Skill") {
                 LabeledContent("Ref", value: agent.skillRef)
                 if let role = agent.skillRole {

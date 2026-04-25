@@ -65,6 +65,7 @@ pub struct AgentExecution {
     pub denied_mcp_extensions_json: Option<String>,
     pub mcp_blocking_issues_json: Option<String>,
     pub actual_mcp_observation_json: Option<String>,
+    pub actual_xcode_runtime_observation_json: Option<String>,
     pub mcp_session_startup_latency_ms: Option<i64>,
 }
 

@@ -214,7 +214,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 15] {
+fn all_tool_capabilities() -> [CapabilityToolId; 16] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -225,6 +225,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 15] {
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
+        CapabilityToolId::WorkflowConflictsResolve,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
         CapabilityToolId::ReportsGet,
         CapabilityToolId::ArtifactsOverrideContract,
@@ -251,6 +252,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         }
         CapabilityToolId::ApprovalsResolve => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StagesRetry => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::WorkflowConflictsResolve => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             matches!(class, PrincipalClass::Operator)
         }
@@ -341,6 +343,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
+        "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),

@@ -99,6 +99,18 @@ pub struct ResolvedAgent {
     pub session_reuse_scope: Option<String>,
     /// Session family ID declared in the agent catalog.
     pub session_family_id: Option<String>,
+    /// P051: whether Xcode MCP must use the brokered HTTP path.
+    #[serde(default)]
+    pub xcode_broker_required: bool,
+    /// P051: whether PATH shim injection is expected for the agent.
+    #[serde(default)]
+    pub xcode_shim_injection_signal: bool,
+    /// P051: whether direct Xcode commands must route through host execution.
+    #[serde(default)]
+    pub requires_xcode_host_execution: bool,
+    /// P051: compile-time advisory warnings carried to execution-time observation.
+    #[serde(default)]
+    pub xcode_prompt_lint_warnings: Vec<String>,
 }
 
 /// A resolved skill, ready for prompt injection.

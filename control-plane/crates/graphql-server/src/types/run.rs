@@ -10,6 +10,8 @@ use domain::workflow_conflict::{
     WorkflowConflictRecord, WorkflowConflictStatus,
 };
 
+use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
+
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlRun {
     pub id: ID,
@@ -45,6 +47,7 @@ pub struct GqlRun {
     pub projection_present: bool,
     pub projection_updated_at: Option<String>,
     pub projection_lag: bool,
+    pub freshness_state: GqlFreshnessState,
     pub active_artifact_index_json: Option<String>,
     pub run_state_projection_json: Option<String>,
     pub operator_overrides_json: Option<String>,
@@ -88,6 +91,7 @@ impl From<Run> for GqlRun {
             projection_present: false,
             projection_updated_at: None,
             projection_lag: true,
+            freshness_state: GqlFreshnessState::ProjectionLag,
             active_artifact_index_json: None,
             run_state_projection_json: None,
             operator_overrides_json: None,
@@ -112,6 +116,7 @@ impl GqlRun {
         gql.projection_present = projection.projection_present;
         gql.projection_updated_at = projection.projection_updated_at;
         gql.projection_lag = projection.projection_lag;
+        gql.freshness_state = freshness_from_projection_lag(gql.projection_lag);
         gql
     }
 }
@@ -150,6 +155,7 @@ impl From<RunProjectionRow> for GqlRun {
             projection_present: r.projection_present,
             projection_updated_at: r.projection_updated_at,
             projection_lag: r.projection_lag,
+            freshness_state: freshness_from_projection_lag(r.projection_lag),
             active_artifact_index_json: None,
             run_state_projection_json: None,
             operator_overrides_json: None,

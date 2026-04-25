@@ -20,25 +20,26 @@ Related stable docs:
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 
 ## Scope
 
-This reference covers the read-only and repo-agnostic operator layer:
+This reference covers the **read-only** and repo-agnostic operator layer (per P031-r18):
 
-- `RunsHomeView` as the primary landing surface
+- `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
-- immutable run reports plus mutable latest summaries
-- safe recovery actions for non-destructive run states
-- deterministic run comparison
+- immutable run reports plus mutable latest summaries (metadata inspection only)
+- diagnostic-only guidance for approvals and recovery
+- deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does not define repo-backed write/release recovery. That boundary belongs to [full-mvp-delivery.md](full-mvp-delivery.md).
+It does **NOT** define in-app write/recovery. Every write control (Start, Cancel, Retry, Resolve Approval) is removed or replaced with diagnostic guidance for external workflows.
 
 ## Runs Home
 
-`RunsHomeView` is the operator landing surface.
+`RunsHomeView` is the operator landing surface. It consumes workflow truth exclusively through GraphQL projections.
 
 Runs are grouped into:
 
@@ -58,15 +59,12 @@ Each row shows:
 - last progress timestamp,
 - attention level,
 - queued agent count (when > 0),
-- runtime provenance.
+- runtime provenance,
+- **Freshness state** (Live, Refreshing, Stale, etc.).
 
-Contextual actions are status-aware:
-
-- `Open` is always available
-- `Open gate` appears only for approval-blocked runs
-- `Recover` appears only for blocked or failed runs
-- `Compare` appears only when a compatible target exists
-- `View report` appears only when report artifacts exist
+**Actions are diagnostic-only:**
+- `Open` is available for drill-down.
+- Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
 
 ## Scheduler Health and Backpressure
 
@@ -98,31 +96,85 @@ GroupBox appears immediately after the Blocker Summary. It provides:
 - **Advisory Suggestion**: Redacted summary of the rejected agent hint.
 - **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
 
+If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
+
+## Runtime provenance
+
+Operator surfaces must expose runtime trust instead of hiding it behind generic success/failure labels.
+
+The current trust states are:
+
+- `Fixture / verified baseline`
+- `Legacy / unverified`
+- `Legacy / verified`
+- `Runtime / unverified`
+- `Runtime / verified`
+
+That provenance appears in:
+
+- `RunsHomeView`
+- run reports
+- run comparison
+- artifact metadata
+
+## Reports
+
+Run reporting is intentionally split into immutable history and a movable latest summary.
+
+Every stable checkpoint emits:
+
+- `run_report_v{n}.md`
+- `run_report_v{n}.json`
+- `run_summary_latest.md`
+- `run_summary_latest.json`
+
+Rules:
+
+- immutable reports are never overwritten,
+- recovery and re-arm actions append a new immutable version,
+- latest summary may advance to the newest state,
+- UI must distinguish immutable history from the latest summary.
+
+Report content includes:
+
+- run header and timestamps,
+- elapsed time and total cost,
+- workflow/catalog provenance,
+- runtime trust level,
+- runtime profile / adapter-family truth,
+- skill provenance,
+- MCP requested / predicted / actual / denied truth,
+- stage and approval summary,
+- agent/provider/model/effort usage,
+- pinned artifacts,
+- recovery notes,
+- deterministic outcome.
+
 ### Recovery
 
-The implemented recovery toolkit covers non-destructive paths for the current baseline:
+The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
+Diagnostic guidance is provided for:
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
-4. `Clone Run (Frozen Snapshot)`
-5. `Clone Run (Current Config)`
+4. `Clone Run`
 
-**Workflow Conflict Actions:**
-- **Request lead mediation**: Escalate a conflict to the system lead for 
-  automated resolution.
-- **Inspect lead mediation**: View sanitized live status updates (queued, 
+**Workflow Conflict Actions (Read-Only):**
+- **Mediation Progress**: View sanitized live status updates (queued, 
   running, validating) while mediation is active.
-- **Manual Resolution**: For terminal conflicts, provides direct actions like 
-  `Clone Run` or `Open editable recovery artifact`.
+- **Diagnostic Details**: For terminal conflicts, provides `run_id` and conflict 
+  identifiers for use in external resolution workflows.
+- **Manual Resolution Guidance**: In-app actions like `Clone Run` or `Open editable 
+  recovery artifact` are replaced with diagnostic identifiers and suggested 
+  external commands.
 
-`RecoverySheet` shows:
+`RecoverySheet` and diagnostic banners show:
 
-- blocked reason,
-- most recent stage,
-- trust/provenance summary,
-- suggested safe next action,
-- only the actions allowed for the current run type.
+- `run_id`, `stage_id`, or `approval_id` for copy-paste,
+- suggested CLI / MCP command strings,
+- `writePathState`: `read_only_diagnostic`,
+- `disabledReasonCode`: `WRITE_PATH_NOT_AVAILABLE`.
 
 Out of scope here:
 
@@ -197,7 +249,7 @@ Displayed provenance includes:
 - attempt,
 - runtime trust level.
 
-### Bounded Startup Latency (P053)
+### Bounded Startup Latency
 
 The system enforces bounded artifact discovery to prevent broad local filesystem scanning from delaying ACP session initialization. Operators should notice significantly faster startup times in large workspaces compared to legacy implicit discovery models. Discovery diagnostics are available in the `Diagnostics` pane for technical inspection of settlement decisions.
 

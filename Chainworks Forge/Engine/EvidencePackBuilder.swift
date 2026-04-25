@@ -133,10 +133,10 @@ final class EvidencePackBuilder {
         }
 
         // 7. Agent execution detail
-        let agentDetail = run.stageExecutions
+        let agentDetail: [[String: Any]] = run.stageExecutions
             .sorted { $0.startedAt < $1.startedAt }
-            .flatMap { stage in
-                stage.agentExecutions.map { agent -> [String: Any] in
+            .reduce(into: []) { rows, stage in
+                rows.append(contentsOf: stage.agentExecutions.map { agent -> [String: Any] in
                     [
                         "stageID": stage.stageID,
                         "agentID": agent.agentID,
@@ -148,7 +148,7 @@ final class EvidencePackBuilder {
                         "repoRevisionBefore": agent.repoRevisionBefore ?? "none",
                         "repoRevisionAfter": agent.repoRevisionAfter ?? "none"
                     ] as [String: Any]
-                }
+                })
             }
 
         if let agentData = try? JSONSerialization.data(withJSONObject: agentDetail, options: [.prettyPrinted, .sortedKeys]) {

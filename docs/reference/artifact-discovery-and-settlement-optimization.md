@@ -1,6 +1,6 @@
-# Artifact Discovery and Settlement Optimization (P053)
+# Artifact Discovery and Settlement Optimization
 
-Stable reference for the bounded discovery model, discovery filesystem ownership, pre-prompt metadata capture, and engine-owned settlement pipeline implemented in P053.
+Stable reference for the bounded discovery model, discovery filesystem ownership, pre-prompt metadata capture, and engine-owned settlement pipeline.
 
 ## Purpose
 
@@ -29,17 +29,17 @@ It does not define:
 - lower-layer ACP transport details in [acp-runtime-transport.md](acp-runtime-transport.md),
 - higher-layer orchestrator topology in [workflow-execution-engine.md](workflow-execution-engine.md),
 - operator-facing recovery presentation in [operator-experience.md](operator-experience.md),
-- or macOS operator UI rendering for these diagnostics. P053 UI rendering is deferred to [Proposal 069](../proposals/069-p053-discovery-diagnostics-operator-ui.md), which is blocked by [Proposal 031](../proposals/031-thin-ui-rewrite-over-projections-and-mcp.md).
+- or macOS operator UI rendering for these diagnostics. The UI owner is [Proposal 069](../proposals/069-bounded-discovery-diagnostics-operator-ui.md), which is blocked by [Proposal 031](../proposals/031-thin-graphql-ui-rewrite.md).
 
 ## Operator UI Deferral
 
-The implemented P053 reference truth is the control-plane discovery and settlement model plus durable readback. The macOS operator UI for P053 diagnostics is intentionally not part of P053 closeout.
+The implemented reference truth is the control-plane discovery and settlement model plus durable readback. The macOS operator UI for discovery diagnostics is intentionally owned separately.
 
-P069 owns the future UI surfaces for missing/stale/rejected outputs, discovery mode, startup timing, cap warnings, source changes, Copy Path, Open Location, accessibility labels, and Dynamic Type behavior. P069 must build on the P031 thin UI boundary and consume GraphQL read projections only. The macOS UI must not use MCP, direct SQLite reads, local artifact scanning, or Swift-local workflow truth for P053 diagnostics.
+Proposal 069 owns the UI surfaces for missing/stale/rejected outputs, discovery mode, startup timing, cap warnings, source changes, Copy Path, Open Location, accessibility labels, and Dynamic Type behavior. That UI must build on the P031 thin UI boundary and consume GraphQL read projections only. The macOS UI must not use MCP, direct SQLite reads, local artifact scanning, or Swift-local workflow truth for discovery diagnostics.
 
 ## Bounded Discovery Model
 
-P053 replaces implicit broad discovery with a bounded model. Discovery is no longer a pre-handshake global scan.
+The runtime replaces implicit broad discovery with a bounded model. Discovery is no longer a pre-handshake global scan.
 
 ### DiscoveryFilesystem Ownership
 

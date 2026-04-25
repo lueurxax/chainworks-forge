@@ -258,7 +258,7 @@ When the subprocess sends `session/request_permission`, the transport auto-grant
 
 ### Artifact discovery
 
-P053 bounded discovery replaces broad pre-prompt workspace scanning with an engine-owned settlement pipeline. The transport captures deterministic digest-backed pre-prompt metadata only for declared outputs. After the prompt completes, the engine builds `OutputDiscoveryDecision` records from exact expected paths, provider output envelopes, control-plane generated manifests, and a bounded scan of the current run's `chainworks_meta_root` (maximum 500 files, 10 MiB aggregate size unless sampled defaults are tuned).
+Bounded discovery replaces broad pre-prompt workspace scanning with an engine-owned settlement pipeline. The transport captures deterministic digest-backed pre-prompt metadata only for declared outputs. After the prompt completes, the engine builds `OutputDiscoveryDecision` records from exact expected paths, provider output envelopes, control-plane generated manifests, and a bounded scan of the current run's `chainworks_meta_root` (maximum 500 files, 10 MiB aggregate size unless sampled defaults are tuned).
 
 Legacy recursive broad discovery is post-prompt only, disabled by default, and requires an explicit `discovery.legacy_broad_discovery_policy: workflow_opt_in` in the workflow YAML or an operator `Command::RetryStage` override for frozen runs. Discovery decisions are written to `agent_execution_discovery_diagnostics` and mapped to runtime facts output settlement.
 

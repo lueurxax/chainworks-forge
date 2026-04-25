@@ -11,7 +11,7 @@ import Foundation
 ///
 /// Thread-safety: internal state is guarded by `NSLock`; the class is `@unchecked Sendable`
 /// because `Process` and `Pipe` are not themselves `Sendable`.
-final class ACPSubprocessManager: @unchecked Sendable {
+nonisolated final class ACPSubprocessManager: @unchecked Sendable {
 
     // MARK: - Configuration
 
@@ -54,11 +54,10 @@ final class ACPSubprocessManager: @unchecked Sendable {
     /// Launch the subprocess with stdin/stdout/stderr pipes.
     /// Inherits the current process environment and merges custom environment variables.
     func launch() throws {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard process == nil || process?.isRunning == false else {
-            throw ACPSubprocessError.alreadyRunning
+        try withLock {
+            guard process == nil || process?.isRunning == false else {
+                throw ACPSubprocessError.alreadyRunning
+            }
         }
 
         let proc = Process()
@@ -66,12 +65,12 @@ final class ACPSubprocessManager: @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: resolvedPath)
         proc.arguments = arguments
 
-        // Inherit current environment and merge custom entries
+        // Inherit current environment and merge custom environment variables.
         var mergedEnv = ProcessInfo.processInfo.environment
         for (key, value) in environment {
             mergedEnv[key] = value
         }
-        // Ensure common tool paths are available
+        // Ensure common tool paths are available.
         mergedEnv["PATH"] = Self.enrichedPATH(base: mergedEnv["PATH"])
         proc.environment = mergedEnv
 
@@ -91,10 +90,17 @@ final class ACPSubprocessManager: @unchecked Sendable {
         try proc.run()
         ForgeLogger.acpSubprocess.debug("Launched pid=\(proc.processIdentifier)")
 
-        self.process = proc
-        self.stdinPipe = stdin
-        self.stdoutPipe = stdout
-        self.stderrPipe = stderr
+        try withLock {
+            guard process == nil || process?.isRunning == false else {
+                proc.terminate()
+                throw ACPSubprocessError.alreadyRunning
+            }
+
+            self.process = proc
+            self.stdinPipe = stdin
+            self.stdoutPipe = stdout
+            self.stderrPipe = stderr
+        }
 
         // Avoid process-wide crashes on EPIPE when a runtime closes stdin before Forge sends
         // a best-effort shutdown message.
@@ -105,10 +111,9 @@ final class ACPSubprocessManager: @unchecked Sendable {
     /// Send a JSON-RPC message (dictionary) to the subprocess stdin.
     /// Messages are newline-delimited (ndjson framing).
     func sendJSON(_ message: [String: Any]) throws {
-        lock.lock()
-        let running = process?.isRunning ?? false
-        let pipe = stdinPipe
-        lock.unlock()
+        let (running, pipe) = withLock {
+            (process?.isRunning ?? false, stdinPipe)
+        }
 
         guard running else {
             throw ACPSubprocessError.notRunning
@@ -165,135 +170,131 @@ final class ACPSubprocessManager: @unchecked Sendable {
     /// The reader task is started once on first call; subsequent calls return the same stream.
     /// This prevents multiple tasks from racing on the same stdout FileHandle.
     func readLines() -> AsyncThrowingStream<String, Error> {
-        lock.lock()
-        if let existing = sharedLineStream {
-            lock.unlock()
-            return existing
-        }
-        let pipe = stdoutPipe
-        let stream = AsyncThrowingStream<String, Error> { continuation in
-            self.sharedStreamContinuation = continuation
-
-            guard let pipe else {
-                continuation.finish(throwing: ACPSubprocessError.notRunning)
-                return
+        withLock {
+            if let existing = sharedLineStream {
+                return existing
             }
+            let pipe = stdoutPipe
+            let stream = AsyncThrowingStream<String, Error> { continuation in
+                self.sharedStreamContinuation = continuation
 
-            let readerTask = Task.detached { [weak self] in
-                let handle = pipe.fileHandleForReading
-                var buffer = Data()
-
-                while !Task.isCancelled {
-                    let chunk = handle.availableData
-
-                    if !chunk.isEmpty {
-                        ForgeLogger.acpSubprocess.debug("Read \(chunk.count) bytes from stdout")
-                    }
-                    guard !chunk.isEmpty else {
-                        // EOF — subprocess closed stdout
-                        if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
-                            continuation.yield(line)
-                        }
-                        continuation.finish()
-                        return
-                    }
-
-                    buffer.append(chunk)
-
-                    while let newlineRange = buffer.range(of: Data([0x0A])) {
-                        let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
-                        buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
-
-                        if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
-                            continuation.yield(line)
-                        }
-                    }
-
-                    let running = self?.isRunning ?? false
-                    if !running && buffer.isEmpty {
-                        continuation.finish()
-                        return
-                    }
+                guard let pipe else {
+                    continuation.finish(throwing: ACPSubprocessError.notRunning)
+                    return
                 }
-                continuation.finish()
-            }
 
-            continuation.onTermination = { @Sendable _ in
-                readerTask.cancel()
+                let readerTask = Task.detached { [weak self] in
+                    let handle = pipe.fileHandleForReading
+                    var buffer = Data()
+
+                    while !Task.isCancelled {
+                        let chunk = handle.availableData
+
+                        if !chunk.isEmpty {
+                            ForgeLogger.acpSubprocess.debug("Read \(chunk.count) bytes from stdout")
+                        }
+                        guard !chunk.isEmpty else {
+                            // EOF — subprocess closed stdout
+                            if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
+                                continuation.yield(line)
+                            }
+                            continuation.finish()
+                            return
+                        }
+
+                        buffer.append(chunk)
+
+                        while let newlineRange = buffer.range(of: Data([0x0A])) {
+                            let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+                            buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+                            if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                                continuation.yield(line)
+                            }
+                        }
+
+                        let running = self?.isRunning ?? false
+                        if !running && buffer.isEmpty {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    readerTask.cancel()
+                }
             }
+            sharedLineStream = stream
+            return stream
         }
-        sharedLineStream = stream
-        lock.unlock()
-        return stream
     }
 
     /// Returns a shared stderr line stream for runtime diagnostics.
     /// Transports can drain this to surface provider-side errors that do not appear on stdout.
     func readStderrLines() -> AsyncThrowingStream<String, Error> {
-        lock.lock()
-        if let existing = sharedStderrLineStream {
-            lock.unlock()
-            return existing
-        }
-        let pipe = stderrPipe
-        let stream = AsyncThrowingStream<String, Error> { continuation in
-            self.sharedStderrStreamContinuation = continuation
-
-            guard let pipe else {
-                continuation.finish(throwing: ACPSubprocessError.notRunning)
-                return
+        withLock {
+            if let existing = sharedStderrLineStream {
+                return existing
             }
+            let pipe = stderrPipe
+            let stream = AsyncThrowingStream<String, Error> { continuation in
+                self.sharedStderrStreamContinuation = continuation
 
-            let readerTask = Task.detached {
-                let handle = pipe.fileHandleForReading
-                var buffer = Data()
-
-                while !Task.isCancelled {
-                    let chunk = handle.availableData
-
-                    guard !chunk.isEmpty else {
-                        if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
-                            continuation.yield(line)
-                        }
-                        continuation.finish()
-                        return
-                    }
-
-                    buffer.append(chunk)
-
-                    while let newlineRange = buffer.range(of: Data([0x0A])) {
-                        let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
-                        buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
-
-                        if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
-                            continuation.yield(line)
-                        }
-                    }
+                guard let pipe else {
+                    continuation.finish(throwing: ACPSubprocessError.notRunning)
+                    return
                 }
-                continuation.finish()
-            }
 
-            continuation.onTermination = { @Sendable _ in
-                readerTask.cancel()
+                let readerTask = Task.detached {
+                    let handle = pipe.fileHandleForReading
+                    var buffer = Data()
+
+                    while !Task.isCancelled {
+                        let chunk = handle.availableData
+
+                        guard !chunk.isEmpty else {
+                            if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
+                                continuation.yield(line)
+                            }
+                            continuation.finish()
+                            return
+                        }
+
+                        buffer.append(chunk)
+
+                        while let newlineRange = buffer.range(of: Data([0x0A])) {
+                            let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
+                            buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
+
+                            if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                                continuation.yield(line)
+                            }
+                        }
+                    }
+                    continuation.finish()
+                }
+
+                continuation.onTermination = { @Sendable _ in
+                    readerTask.cancel()
+                }
             }
+            sharedStderrLineStream = stream
+            return stream
         }
-        sharedStderrLineStream = stream
-        lock.unlock()
-        return stream
     }
 
     /// Terminate the subprocess gracefully (SIGTERM), then forcefully (SIGKILL) if needed.
     func terminate() {
-        lock.lock()
-        let proc = process
-        lock.unlock()
+        let proc = withLock { process }
 
         guard let proc, proc.isRunning else { return }
 
         // Close stdin to signal the subprocess
-        lock.lock()
-        try? stdinPipe?.fileHandleForWriting.close()
-        lock.unlock()
+        withLock {
+            try? stdinPipe?.fileHandleForWriting.close()
+        }
 
         proc.terminate() // SIGTERM
 
@@ -312,23 +313,29 @@ final class ACPSubprocessManager: @unchecked Sendable {
 
         proc.waitUntilExit()
 
-        lock.lock()
-        process = nil
-        stdinPipe = nil
-        stdoutPipe = nil
-        stderrPipe = nil
-        sharedLineStream = nil
-        sharedStreamContinuation = nil
-        sharedStderrLineStream = nil
-        sharedStderrStreamContinuation = nil
-        lock.unlock()
+        withLock {
+            process = nil
+            stdinPipe = nil
+            stdoutPipe = nil
+            stderrPipe = nil
+            sharedLineStream = nil
+            sharedStreamContinuation = nil
+            sharedStderrLineStream = nil
+            sharedStderrStreamContinuation = nil
+        }
     }
 
     /// Whether the subprocess is currently running.
     var isRunning: Bool {
+        withLock {
+            process?.isRunning ?? false
+        }
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
         defer { lock.unlock() }
-        return process?.isRunning ?? false
+        return try body()
     }
 
     // MARK: - Private: PATH enrichment

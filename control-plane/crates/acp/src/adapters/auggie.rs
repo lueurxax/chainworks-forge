@@ -1,11 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::info;
 
-use crate::adapters::AcpAdapter;
-use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::{isolate_process_group, AcpSessionConfig};
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_AUGGIE_ACP_BINARY";
@@ -47,7 +44,11 @@ impl AcpAdapter for AuggieAdapter {
         "auggie"
     }
 
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
         if self.binary_path.is_empty() {
             bail!(
                 "AuggieAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -64,33 +65,14 @@ impl AcpAdapter for AuggieAdapter {
             "Spawning Auggie ACP subprocess"
         );
 
-        let mut cmd = Command::new(&self.binary_path);
-        isolate_process_group(&mut cmd);
-        // P050: Inject per-run meta root.
-        if let Some(ref mr) = req.chainworks_meta_root {
-            let absolute = if mr.starts_with('/') {
-                mr.clone()
-            } else {
-                format!("{}/{}", req.workspace_root, mr)
-            };
-            cmd.env("CHAINWORKS_META_ROOT", &absolute);
-        }
-        let child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn Auggie ACP subprocess: {}", self.binary_path))?;
+        Ok(AcpLaunchSpec::new(&self.binary_path))
+    }
 
-        let config = AcpSessionConfig {
-            model: "default",
-            mode: "bypassPermissions",
-            extra: None,
-            config_options: Vec::new(),
-        };
-        let session = AcpSession::start(child, req, &config).await?;
+    fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
+        Ok(AcpSessionNewSpec::new("default", "bypassPermissions"))
+    }
 
-        Ok(AcpSessionHandle::new(session))
+    fn supports_http_mcp_capability_probe(&self) -> bool {
+        false
     }
 }

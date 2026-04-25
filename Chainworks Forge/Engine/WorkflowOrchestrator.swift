@@ -1828,7 +1828,7 @@ final class WorkflowOrchestrator {
 
                     // Proposal 018 REQ-010: Persist enriched session checkpoint (non-success path).
                     if let checkpoint = result.sessionCheckpoint {
-                        try? persistEnrichedCheckpoint(
+                        _ = try? persistEnrichedCheckpoint(
                             checkpoint: checkpoint, artifacts: artifacts, agentExec: agentExec,
                             stageID: state.id, iteration: stageExec.iteration,
                             attemptNumber: stageExec.attemptNumber
@@ -2792,7 +2792,7 @@ final class WorkflowOrchestrator {
                         agentExec.outputEnvelopesJSON = try? JSONEncoder().encode(envelopes)
 
                         if let checkpoint = result.sessionCheckpoint {
-                            try? persistEnrichedCheckpoint(
+                            _ = try? persistEnrichedCheckpoint(
                                 checkpoint: checkpoint,
                                 artifacts: artifacts,
                                 agentExec: agentExec,

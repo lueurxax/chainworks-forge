@@ -7,7 +7,7 @@ import Foundation
 ///
 /// Key principle (§6.2): Validation must never be the point where all
 /// downstream evidence disappears.
-struct FailedStageEvidenceBuilder {
+nonisolated struct FailedStageEvidenceBuilder {
 
     /// Build a complete evidence packet for a failed stage.
     /// This is the canonical reference for recovery UI, reports, and export.

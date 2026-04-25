@@ -19,7 +19,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -86,8 +86,6 @@ pub enum LockError {
 /// process termination.
 #[cfg(unix)]
 pub fn acquire_pid_lock(path: &Path) -> Result<PidLockOutcome, LockError> {
-    use std::os::unix::io::AsRawFd;
-
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

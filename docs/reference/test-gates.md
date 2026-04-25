@@ -115,7 +115,7 @@ Scope:
 
 - approval inbox reachability
 - approval gate surface
-- start run sheet
+- diagnostic start run placeholder
 - missing-runtime recovery guidance
 - run progress surface
 
@@ -554,7 +554,7 @@ Scope:
 - fail-closed shadow side-effect policy for stubbed runtime/provider inputs, including correlated `mode=live_shadow` reports under `control-plane/target/parity/shadow/reports/{fixture_id}/`
 - fixture-bound GraphQL run/stage/artifact/projection readback parity via `proposal_041_graphql_readback_parity_surfaces`
 - fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via P041-named tests
-- P031 handoff artifact validation at `docs/proposals/031-thin-ui-rewrite-over-projections-and-mcp.evidence/p041-parity.md`
+- P031 handoff parity readiness is tracked through `docs/reference/p031-phase-0-artifact-manifest.json`; do not use obsolete proposal-local evidence paths.
 
 Use when:
 
@@ -597,6 +597,76 @@ Use when:
 - changing GraphQL read projections or client consumption rules for the thin macOS client
 - updating the P031 consumption contract for read surfaces, freshness, or deferred UI states
 - reproving the P043 read-contract lane without touching UI or daemon lifecycle implementation
+
+### `proposal-031|p031`
+
+Proposal 031 thin GraphQL-only UI inventory, static guard, and write-path guide gate.
+
+Scope:
+
+- Python script validation (`scripts/p031-thin-ui-gate.py`) for governed UI constraints
+- verification of `docs/reference/p031-thin-ui-inventory.json`, `docs/reference/p031-operator-write-path-guide.json`, and `docs/reference/p031-phase-0-artifact-manifest.json`
+- rust tests for `proposal_031_` prefix in `graphql-server`
+- rust authorization tests `proposal_031_authorization` in `graphql-server`
+
+Use when:
+
+- changing the GraphQL-only thin macOS client boundary
+- updating the UI inventory, operator write-path guide, or Phase 0 artifact manifest
+- modifying GraphQL read/subscription authorization boundaries for P031 UI
+
+Host policy:
+
+- Python 3 and local Rust toolchain required
+- no macOS UI target, simulator, or live daemon required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-031
+```
+
+Important:
+
+- `p031` is accepted as an alias
+- the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary or if required Phase 0 artifacts are missing or invalid
+- later Phase 0d / Phase 3 evidence entries may remain blocked while implementation is in progress, but the manifest must not mark blocked evidence as `ready`
+- dogfood sign-off evidence is outside this gate; this gate only requires the Phase 3 dogfood checklist artifact to exist
+
+### `proposal-031-readiness|p031-readiness`
+
+Proposal 031 closeout readiness gate.
+
+Scope:
+
+- composes `proposal-031`
+- verifies release evidence files are tracked, including report-payload runtime JSON and sanitized degraded-state screenshot evidence
+- fails while the Phase 0 manifest, degraded-state evidence, freshness evidence, UX/accessibility evidence, or Phase 3 dogfood sign-off still contain pending/template/limitation states
+- fails while the Phase 3 dogfood checklist has unchecked items
+
+Use when:
+
+- deciding whether P031 can be considered implementation-closeout ready
+- re-entering implementation approval after dogfood/sign-off evidence is attached
+
+Host policy:
+
+- same as `proposal-031`
+- no live daemon required
+- expected to fail until Phase 3 dogfood and release-owner sign-off are complete
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-031-readiness
+```
+
+Important:
+
+- this is intentionally stricter than `proposal-031`
+- `proposal-031` passing means the static/API/read-boundary contract is intact
+- `proposal-031-readiness` passing means P031 release/closeout evidence is no longer known-pending
+
 
 Host policy:
 
@@ -847,6 +917,82 @@ Command:
 ./scripts/test-gate.sh proposal-049
 ```
 
+### `p051-scaffold`
+
+Proposal 051 scaffold gate for the shared Xcode MCP bridge pool substrate.
+
+Scope:
+
+- static stale-guidance check for the checked-in P051 proposal
+- workflow/catalog P051 field and lint fixtures
+- DB/domain Xcode runtime observation append and persistence fixtures
+- ACP provider capability / brokered Xcode intent fixtures
+- Xcode MCP bridge pool lease, capacity, target-resolution, and observation fixtures
+- engine observation-sink persistence fixture
+- GraphQL and MCP server compile checks for the observation/readback contract
+
+Use when:
+
+- changing brokered Xcode MCP intent resolution, provider HTTP MCP capability checks, or session/new lease attachment
+- changing Xcode runtime observation shape, append semantics, or broker failure classes
+- changing daemon/API scaffolding that must remain compatible with the full P051 gate
+- reproving scaffold readiness before broader live Xcode proof
+
+Host policy:
+
+- local Rust toolchain required
+- no live provider account, Xcode consent interaction, simulator, remote UI host, or live dogfood run required
+- fixture evidence only; this gate does not satisfy P051 pre-ship dogfood/sign-off
+
+Command:
+
+```bash
+./scripts/test-gate.sh p051-scaffold
+```
+
+Important:
+
+- the gate fails if `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` reintroduces stale contrary guidance for the implemented contract
+- P051 dependency/readiness artifacts live under [../evidence/051-shared-xcode-mcp-bridge-pool/](../evidence/051-shared-xcode-mcp-bridge-pool/)
+
+### `proposal-051|p051`
+
+Proposal 051 shared Xcode MCP bridge pool fixture/readback gate.
+
+Scope:
+
+- all `p051-scaffold` checks
+- domain artifact-contract compatibility fixture used by P051 readback
+- repeated workflow/DB/ACP/engine P051 fixture inventory under the full gate target directory
+- GraphQL and MCP server compile checks
+- focused Swift readback tests for timeline inspector and daemon lifecycle broker health consumption
+
+Use when:
+
+- changing implemented shared Xcode MCP bridge pool behavior
+- changing Xcode runtime observation readback in GraphQL, MCP reports, or Swift operator surfaces
+- preparing fixture-level P051 readiness evidence before live dogfood
+
+Host policy:
+
+- local Rust and macOS Swift test toolchains required
+- no remote UI host or app-launched dogfood proof is run by this gate
+- this is a fixture/readback gate, not release-owner sign-off
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-051
+./scripts/test-gate.sh p051
+```
+
+Important:
+
+- `proposal-051` and `p051` are aliases
+- the stable behavior reference is [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md)
+- P051 pre-ship readiness still requires a separate live dogfood/sign-off artifact; do not mark the proposal fully complete from this gate alone
+- the current dogfood stop sign is [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md)
+
 ### `proposal-054|p054`
 
 Implementation completeness and handoff contract gate.
@@ -914,7 +1060,7 @@ Bounded ACP artifact discovery and startup latency gate.
 
 Scope:
 
-- Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/proposals/053.review/`
+- Phase 0 cap-validation and Phase 1 security evidence artifacts under `docs/evidence/053-bounded-acp-artifact-discovery-and-startup-latency/`
 - full Phase 0 cap-validation schema, including sampled execution IDs, readiness timing, envelope/aggregate cap selections, and discovery ownership
 - Phase 1 evidence pack:
   - `manual-latency-spot-check.md`, including the manual reference-workspace measurement and observed `acp_pre_initialize_local_latency_ms`
@@ -926,7 +1072,7 @@ Scope:
 - pre-prompt metadata capture and digest-backed validation
 - bounded meta-root discovery (max 500 files, 10 MiB aggregate)
 - discovery filesystem operation-recorder coverage for bounded traversal and metadata reads
-- trait-backed `DiscoveryFilesystem` fake coverage for deterministic P053 filesystem tests
+- trait-backed `DiscoveryFilesystem` fake coverage for deterministic bounded-discovery filesystem tests
 - stale-vs-absent required-output settlement and GraphQL/MCP stale-count readback
 - legacy broad discovery opt-in policy
 - GraphQL and MCP readback for discovery diagnostics
@@ -955,7 +1101,7 @@ Important:
 - discovery settlement is governed by the engine-owned pipeline, not provider-side heuristics
 - a `gate_only_internal` cap-validation artifact is sufficient for same-tree control-plane validation, but production exposure requires a refreshed production sampling/signoff artifact
 - the gate enforces the full declared Phase 0 cap-validation schema rather than a reduced subset
-- the Phase 1 evidence pack must exist in-tree before P053 closeout
+- the Phase 1 evidence pack must exist in the stable evidence directory before release signoff
 
 ### `proposal-057|p057`
 

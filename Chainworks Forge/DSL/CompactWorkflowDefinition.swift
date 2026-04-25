@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Compact Workflow (inspector-only, not executable)
 
-struct CompactWorkflowDefinition: Codable, Sendable {
+nonisolated struct CompactWorkflowDefinition: Codable, Sendable {
     let version: Int
     let workflow: CompactWorkflowMeta
     /// Explicit alias map for non-mechanical agent ID resolution (ARCH-012).

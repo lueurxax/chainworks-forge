@@ -1,0 +1,76 @@
+{
+  "schema_version": "p031-schema-decision-record.v1",
+  "proposal_revision": "031-2026-04-21-run-72409268-r1-r18-restart-review-ready",
+  "governing_contract": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+  "generated_at": "2026-04-24",
+  "default_authorization": "operator_only",
+  "surfaces": [
+    {
+      "surface": "runs_home",
+      "graphql_source": "runs / list_active_projection / list_by_idea_projection",
+      "status": "implemented",
+      "ui_rule": "Render from GraphQL read model; no SwiftData workflow truth."
+    },
+    {
+      "surface": "run_detail",
+      "graphql_source": "run(id:) with projection fields",
+      "status": "implemented",
+      "ui_rule": "Show projection freshness and server-owned conflict/recovery fields."
+    },
+    {
+      "surface": "stage_list_progress",
+      "graphql_source": "stages(runID:) projection-backed fields",
+      "status": "implemented",
+      "ui_rule": "Use projection flags; do not infer approval, artifact, validation, or retry state locally."
+    },
+    {
+      "surface": "stage_detail",
+      "graphql_source": "stage(id:) plus agentExecutions(stageExecutionID:)",
+      "status": "implemented",
+      "ui_rule": "Canonical details may render only with server-owned projection flags."
+    },
+    {
+      "surface": "approval_inbox",
+      "graphql_source": "approvalInbox",
+      "status": "implemented",
+      "ui_rule": "Diagnostic-only for P031; approval writes are external/non-P031."
+    },
+    {
+      "surface": "artifact_viewer",
+      "graphql_source": "artifacts(runID:)",
+      "status": "implemented",
+      "ui_rule": "Do not scan local artifact directories as workflow truth."
+    },
+    {
+      "surface": "report_viewer",
+      "graphql_source": "artifacts(runID:) report metadata; payload readback deferred unless GraphQL payload query lands",
+      "status": "partial",
+      "ui_rule": "Render metadata and payload availability/unavailable reason."
+    },
+    {
+      "surface": "daemon_lifecycle",
+      "graphql_source": "daemonStatus / daemonStatusChanged",
+      "status": "implemented",
+      "ui_rule": "Show live, refreshing, stale, unavailable, and unauthorized states."
+    },
+    {
+      "surface": "runtime_adapter_health",
+      "graphql_source": null,
+      "status": "deferred",
+      "ui_rule": "Hide or show placeholder only until a server-owned runtime-health contract lands."
+    },
+    {
+      "surface": "experiment_comparison",
+      "graphql_source": null,
+      "status": "deferred",
+      "ui_rule": "Hide or disabled-placeholder only; no local compare execution."
+    }
+  ],
+  "redaction_tests_required": [
+    "operator-only diagnostic/debug fields",
+    "unauthorized read denial or redaction",
+    "report payload unavailable reason without local fallback"
+  ],
+  "validation_status": "ready_for_phase_0_gate",
+  "blocking_phase": "before_swift_screen_migration"
+}

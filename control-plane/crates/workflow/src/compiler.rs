@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::catalog;
 use crate::definition;
+use crate::direct_command::DirectCommandScan;
 use crate::plan::*;
 
 /// Compile a workflow YAML + agent catalog YAML into a `RunPlan`.
@@ -26,6 +27,13 @@ use crate::plan::*;
 pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
     let wf = definition::load(workflow_path).context("loading workflow definition")?;
     let cat = catalog::load(catalog_path).context("loading agent catalog")?;
+    let workflow_raw =
+        load_raw_yaml_value(workflow_path).context("loading raw workflow YAML for P051 lint")?;
+    let catalog_raw =
+        load_raw_yaml_value(catalog_path).context("loading raw catalog YAML for P051 lint")?;
+    let direct_command_scan =
+        crate::direct_command::scan_catalog(&cat, &wf, &workflow_raw, &catalog_raw);
+    direct_command_scan.ensure_no_errors()?;
     let workflow_family = wf
         .workflow
         .as_ref()
@@ -68,7 +76,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
 
-    let agent_lookup = build_agent_lookup(&cat, &catalog_base)?;
+    let agent_lookup = build_agent_lookup(&cat, &catalog_base, &direct_command_scan)?;
     let contract_lookup = build_contract_lookup(&cat);
 
     // Convert variables from serde_yaml::Value to serde_json::Value.
@@ -137,6 +145,10 @@ struct AgentBinding {
     worktree_strategy: Option<String>,
     session_reuse_scope: Option<String>,
     session_family_id: Option<String>,
+    xcode_broker_required: bool,
+    xcode_shim_injection_signal: bool,
+    requires_xcode_host_execution: bool,
+    xcode_prompt_lint_warnings: Vec<String>,
 }
 
 /// Lookup from output artifact name or explicit contract ID → resolved schema.
@@ -270,6 +282,12 @@ fn canonical_json_string<T: serde::Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(&sort_json_value(value)).context("serialize canonical json value")
 }
 
+fn load_raw_yaml_value(path: &str) -> Result<serde_yaml::Value> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading YAML at '{path}'"))?;
+    serde_yaml::from_str(&content).with_context(|| format!("parsing YAML at '{path}'"))
+}
+
 fn sort_json_value(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
@@ -287,6 +305,7 @@ fn sort_json_value(value: serde_json::Value) -> serde_json::Value {
 fn build_agent_lookup(
     cat: &catalog::AgentCatalogFile,
     catalog_base: &Path,
+    direct_command_scan: &DirectCommandScan,
 ) -> Result<HashMap<String, AgentBinding>> {
     let empty_profiles = HashMap::new();
     let profiles = cat.backend_profiles.as_ref().unwrap_or(&empty_profiles);
@@ -322,6 +341,9 @@ fn build_agent_lookup(
         let skill_ref = agent.skill_ref.clone();
         let skill_role = agent.skill_role.clone();
         let requested_mcp_server_ids = profile.mcp.clone().unwrap_or_default();
+        let xcode_signals =
+            direct_command_scan.signals_for_agent(&agent.id, permission_profile.as_deref());
+        let xcode_mcp_requested = requested_mcp_server_ids.iter().any(|id| id == "xcode");
 
         // Resolve skill if referenced.
         let resolved_skill = if let Some(skill_ref) = &agent.skill_ref {
@@ -398,6 +420,13 @@ fn build_agent_lookup(
                 worktree_strategy: wt_strategy,
                 session_reuse_scope,
                 session_family_id,
+                xcode_broker_required: agent.xcode_broker_required.unwrap_or(false)
+                    || xcode_mcp_requested,
+                xcode_shim_injection_signal: agent.xcode_shim_injection_signal.unwrap_or(false)
+                    || xcode_signals.xcode_shim_injection_signal,
+                requires_xcode_host_execution: agent.requires_xcode_host_execution.unwrap_or(false)
+                    || xcode_signals.requires_xcode_host_execution,
+                xcode_prompt_lint_warnings: xcode_signals.xcode_prompt_lint_warnings,
             },
         );
     }
@@ -549,6 +578,10 @@ fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Resu
             worktree_strategy: binding.worktree_strategy.clone(),
             session_reuse_scope: binding.session_reuse_scope.clone(),
             session_family_id: binding.session_family_id.clone(),
+            xcode_broker_required: binding.xcode_broker_required,
+            xcode_shim_injection_signal: binding.xcode_shim_injection_signal,
+            requires_xcode_host_execution: binding.requires_xcode_host_execution,
+            xcode_prompt_lint_warnings: binding.xcode_prompt_lint_warnings.clone(),
         }),
         None => {
             warn!(
@@ -575,6 +608,10 @@ fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Resu
                 worktree_strategy: None,
                 session_reuse_scope: None,
                 session_family_id: None,
+                xcode_broker_required: false,
+                xcode_shim_injection_signal: false,
+                requires_xcode_host_execution: false,
+                xcode_prompt_lint_warnings: Vec::new(),
             })
         }
     }

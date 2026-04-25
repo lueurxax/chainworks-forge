@@ -32,7 +32,7 @@ import Foundation
 
 /// Daemon lifecycle phase. Mirrors `DaemonLifecycleState` in the Rust
 /// daemon's `domain::lifecycle` module.
-enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
+nonisolated enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
     case notStarted = "not_started"
     case starting
     case ready
@@ -60,7 +60,7 @@ enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
 }
 
 /// Non-terminal reason the daemon is currently degraded.
-enum DegradedKind: String, Codable, Sendable {
+nonisolated enum DegradedKind: String, Codable, Sendable {
     case backgroundExecutorStalled = "background_executor_stalled"
     case acpRuntimeUnavailable = "acp_runtime_unavailable"
     case staleProjection = "stale_projection"
@@ -69,20 +69,20 @@ enum DegradedKind: String, Codable, Sendable {
 }
 
 /// Terminal failure reason. Every variant requires a daemon restart.
-enum FailureKind: String, Codable, Sendable {
+nonisolated enum FailureKind: String, Codable, Sendable {
     case migrationFailed = "migration_failed"
     case schemaNewerThanBinary = "schema_newer_than_binary"
     case backupFailed = "backup_failed"
     case crashLoopBudgetExhausted = "crash_loop_budget_exhausted"
 }
 
-struct DegradedReason: Codable, Sendable, Equatable {
+nonisolated struct DegradedReason: Codable, Sendable, Equatable {
     let kind: DegradedKind
     let detail: String
     let since: Date
 }
 
-struct FailureReason: Codable, Sendable, Equatable {
+nonisolated struct FailureReason: Codable, Sendable, Equatable {
     let kind: FailureKind
     let detail: String
     let since: Date
@@ -96,8 +96,55 @@ struct FailureReason: Codable, Sendable, Equatable {
     }
 }
 
+enum XcodeBrokerHealthState: String, Codable, Sendable {
+    case disabled
+    case healthy
+    case degraded
+    case failed
+}
+
+struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
+    let state: XcodeBrokerHealthState
+    let poolID: String
+    let activeLeases: Int
+    let queuedLeases: Int
+    let maxActiveLeases: Int
+    let maxQueuedLeases: Int
+    let brokerDisabled: Bool
+    let backendAvailable: Bool
+    let observationPersistenceFailures: Int
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case poolID = "pool_id"
+        case activeLeases = "active_leases"
+        case queuedLeases = "queued_leases"
+        case maxActiveLeases = "max_active_leases"
+        case maxQueuedLeases = "max_queued_leases"
+        case brokerDisabled = "broker_disabled"
+        case backendAvailable = "backend_available"
+        case observationPersistenceFailures = "observation_persistence_failures"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = try c.decode(XcodeBrokerHealthState.self, forKey: .state)
+        poolID = try c.decode(String.self, forKey: .poolID)
+        activeLeases = try c.decode(Int.self, forKey: .activeLeases)
+        queuedLeases = try c.decode(Int.self, forKey: .queuedLeases)
+        maxActiveLeases = try c.decode(Int.self, forKey: .maxActiveLeases)
+        maxQueuedLeases = try c.decode(Int.self, forKey: .maxQueuedLeases)
+        brokerDisabled = try c.decode(Bool.self, forKey: .brokerDisabled)
+        backendAvailable = try c.decodeIfPresent(Bool.self, forKey: .backendAvailable) ?? true
+        observationPersistenceFailures = try c.decodeIfPresent(
+            Int.self,
+            forKey: .observationPersistenceFailures
+        ) ?? 0
+    }
+}
+
 /// Wire shape for `/health`, `/ready`, and `daemonStatus.json`.
-struct DaemonStatus: Codable, Sendable, Equatable {
+nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
     let state: DaemonLifecycleState
     let schemaVersion: Int
     let binarySchemaVersion: Int
@@ -108,6 +155,7 @@ struct DaemonStatus: Codable, Sendable, Equatable {
     let failure: FailureReason?
     let restartCountSinceBoot: Int
     let pid: Int
+    let xcodeBrokerHealth: XcodeBrokerHealthSnapshot?
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -120,6 +168,7 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         case failure
         case restartCountSinceBoot = "restart_count_since_boot"
         case pid
+        case xcodeBrokerHealth = "xcode_broker_health"
     }
 
     init(from decoder: Decoder) throws {
@@ -134,6 +183,10 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         failure = try c.decodeIfPresent(FailureReason.self, forKey: .failure)
         restartCountSinceBoot = try c.decode(Int.self, forKey: .restartCountSinceBoot)
         pid = try c.decode(Int.self, forKey: .pid)
+        xcodeBrokerHealth = try c.decodeIfPresent(
+            XcodeBrokerHealthSnapshot.self,
+            forKey: .xcodeBrokerHealth
+        )
     }
 
     init(
@@ -146,7 +199,8 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         degraded: [DegradedReason],
         failure: FailureReason?,
         restartCountSinceBoot: Int,
-        pid: Int
+        pid: Int,
+        xcodeBrokerHealth: XcodeBrokerHealthSnapshot? = nil
     ) {
         self.state = state
         self.schemaVersion = schemaVersion
@@ -158,6 +212,7 @@ struct DaemonStatus: Codable, Sendable, Equatable {
         self.failure = failure
         self.restartCountSinceBoot = restartCountSinceBoot
         self.pid = pid
+        self.xcodeBrokerHealth = xcodeBrokerHealth
     }
 }
 
@@ -186,7 +241,7 @@ func daemonJSONDecoder() -> JSONDecoder {
 
 // MARK: - Port file (§7.3)
 
-enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
+nonisolated enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
     case empty(url: URL)
     case nonUtf8(url: URL)
     case invalid(url: URL, text: String)
@@ -203,7 +258,7 @@ enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-struct DaemonPortFile {
+nonisolated struct DaemonPortFile {
     static let defaultPort: Int = 4000
 
     static func defaultURL() -> URL {

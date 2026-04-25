@@ -11,6 +11,13 @@ interruption.
 All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
 `control-plane/crates/engine/` (Rust daemon).
 
+**P031 Thin UI Boundary:**
+Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's 
+state via GraphQL projections. While the Swift engine remains implemented for 
+parity, the governed UI is prohibited from calling mutation paths in 
+`ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and 
+Approval actions move to external CLI/MCP workflows.
+
 **Rust Daemon Implementation:**
 The Rust control-plane daemon implements the same state machine and transition 
 semantics while adding robust capacity-aware scheduling, scheduler fairness, 
@@ -129,7 +136,7 @@ protocol AgentExecutor: Sendable {
 }
 ```
 
-Executors return `[String: Data]` (in-memory) or write to disk via the discovery settlement pipeline (P053). The `ArtifactManager` is the primary disk writer for in-memory results and the metadata authority for all artifacts (ARCH-030).
+Executors return `[String: Data]` (in-memory) or write to disk via the discovery settlement pipeline. The `ArtifactManager` is the primary disk writer for in-memory results and the metadata authority for all artifacts (ARCH-030).
 
 The executor path consumes:
 
@@ -155,11 +162,11 @@ configurable delay. Thread-safe task tracking for test assertions.
 Live executor using the selected ACP runtime transport. Per-execution flow:
 
 1. Validate workspace boundaries.
-2. Capture pre-prompt metadata (P053 per-execution baseline).
+2. Capture pre-prompt metadata for the per-execution baseline.
 3. Create an isolated session via `RuntimeSessionBridge`.
 4. Stream execution events through `ExecutionEventBridge`.
 5. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline (P053).
+6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
 7. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk

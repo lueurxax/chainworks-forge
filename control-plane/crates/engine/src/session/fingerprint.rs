@@ -35,6 +35,10 @@ pub struct BindingFingerprintInput<'a> {
     pub backend_profile: Option<&'a str>,
     pub permission_profile: Option<&'a str>,
     pub mcp_servers: &'a [String],
+    pub xcode_broker_contract_hash: Option<&'a str>,
+    pub xcode_broker_required: bool,
+    pub xcode_shim_injection_signal: bool,
+    pub requires_xcode_host_execution: bool,
     pub skill_snapshot_hash: Option<&'a str>,
     pub skill_ref: Option<&'a str>,
     pub skill_role: Option<&'a str>,
@@ -66,6 +70,10 @@ pub fn binding_fingerprint(input: &BindingFingerprintInput<'_>) -> String {
         "backend_profile": input.backend_profile,
         "permission_profile": input.permission_profile,
         "mcp_servers": mcp_servers,
+        "xcode_broker_contract_hash": input.xcode_broker_contract_hash,
+        "xcode_broker_required": input.xcode_broker_required,
+        "xcode_shim_injection_signal": input.xcode_shim_injection_signal,
+        "requires_xcode_host_execution": input.requires_xcode_host_execution,
         "skill_snapshot_hash": input.skill_snapshot_hash,
         "skill_ref": input.skill_ref,
         "skill_role": input.skill_role,
@@ -147,6 +155,10 @@ mod tests {
             backend_profile: Some("claude_orchestrator_high"),
             permission_profile: Some("read_only"),
             mcp_servers: &mcp,
+            xcode_broker_contract_hash: None,
+            xcode_broker_required: false,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
             skill_snapshot_hash: Some("skill-hash-1"),
             skill_ref: Some("proposal_review_triad"),
             skill_role: Some("writer"),
@@ -169,6 +181,10 @@ mod tests {
             backend_profile: Some("claude_orchestrator_high"),
             permission_profile: Some("read_only"),
             mcp_servers: &mcp,
+            xcode_broker_contract_hash: None,
+            xcode_broker_required: false,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
             skill_snapshot_hash: Some("skill-hash-1"),
             skill_ref: Some("proposal_review_triad"),
             skill_role: Some("writer"),
@@ -177,5 +193,101 @@ mod tests {
             temperature: Some(0.2),
         });
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn binding_fingerprint_changes_when_xcode_broker_contract_or_signals_change() {
+        let inputs = Vec::new();
+        let outputs = Vec::new();
+        let mcp = vec!["xcode".to_string()];
+
+        let base = binding_fingerprint(&BindingFingerprintInput {
+            agent_id: "xcode_reviewer",
+            provider: "codex",
+            model: Some("gpt-5"),
+            effort: Some("high"),
+            prompt: "Review the Xcode project.",
+            working_directory: "/tmp/ws",
+            workspace_mode: "write_enabled",
+            worktree_write_enabled: true,
+            worktree_strategy: Some("shared_implementation_worktree"),
+            inputs: &inputs,
+            outputs: &outputs,
+            backend_profile: Some("codex_xcode"),
+            permission_profile: Some("workspace_write"),
+            mcp_servers: &mcp,
+            xcode_broker_contract_hash: Some("broker-contract-a"),
+            xcode_broker_required: true,
+            xcode_shim_injection_signal: true,
+            requires_xcode_host_execution: true,
+            skill_snapshot_hash: None,
+            skill_ref: None,
+            skill_role: None,
+            output_contract: None,
+            max_turns: None,
+            temperature: None,
+        });
+
+        let changed_contract = binding_fingerprint(&BindingFingerprintInput {
+            xcode_broker_contract_hash: Some("broker-contract-b"),
+            ..BindingFingerprintInput {
+                agent_id: "xcode_reviewer",
+                provider: "codex",
+                model: Some("gpt-5"),
+                effort: Some("high"),
+                prompt: "Review the Xcode project.",
+                working_directory: "/tmp/ws",
+                workspace_mode: "write_enabled",
+                worktree_write_enabled: true,
+                worktree_strategy: Some("shared_implementation_worktree"),
+                inputs: &inputs,
+                outputs: &outputs,
+                backend_profile: Some("codex_xcode"),
+                permission_profile: Some("workspace_write"),
+                mcp_servers: &mcp,
+                xcode_broker_contract_hash: Some("broker-contract-a"),
+                xcode_broker_required: true,
+                xcode_shim_injection_signal: true,
+                requires_xcode_host_execution: true,
+                skill_snapshot_hash: None,
+                skill_ref: None,
+                skill_role: None,
+                output_contract: None,
+                max_turns: None,
+                temperature: None,
+            }
+        });
+        let changed_signal = binding_fingerprint(&BindingFingerprintInput {
+            requires_xcode_host_execution: false,
+            ..BindingFingerprintInput {
+                agent_id: "xcode_reviewer",
+                provider: "codex",
+                model: Some("gpt-5"),
+                effort: Some("high"),
+                prompt: "Review the Xcode project.",
+                working_directory: "/tmp/ws",
+                workspace_mode: "write_enabled",
+                worktree_write_enabled: true,
+                worktree_strategy: Some("shared_implementation_worktree"),
+                inputs: &inputs,
+                outputs: &outputs,
+                backend_profile: Some("codex_xcode"),
+                permission_profile: Some("workspace_write"),
+                mcp_servers: &mcp,
+                xcode_broker_contract_hash: Some("broker-contract-a"),
+                xcode_broker_required: true,
+                xcode_shim_injection_signal: true,
+                requires_xcode_host_execution: true,
+                skill_snapshot_hash: None,
+                skill_ref: None,
+                skill_role: None,
+                output_contract: None,
+                max_turns: None,
+                temperature: None,
+            }
+        });
+
+        assert_ne!(base, changed_contract);
+        assert_ne!(base, changed_signal);
     }
 }

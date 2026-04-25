@@ -26,7 +26,7 @@ import Foundation
 
 /// Result of an export. `sizeBytes` is the final zip's size; fields
 /// starting with `has…` let the UI render which components are present.
-struct DiagnosticsExportResult: Equatable, Sendable {
+nonisolated struct DiagnosticsExportResult: Equatable, Sendable {
     let bundleURL: URL
     let sizeBytes: Int64
     let hasStatusSnapshot: Bool
@@ -48,7 +48,7 @@ struct DiagnosticsExportResult: Equatable, Sendable {
     let buildShaReported: String
 }
 
-enum DiagnosticsBundleError: Error, CustomStringConvertible {
+nonisolated enum DiagnosticsBundleError: Error, CustomStringConvertible {
     case stagingFailed(Error)
     case zipFailed(status: Int32, stderr: String)
     case noComponentsFound
@@ -67,7 +67,7 @@ enum DiagnosticsBundleError: Error, CustomStringConvertible {
 /// Built-in inputs that the app ships today. Callers override any of
 /// these for testing (`DaemonPortFile.appSupportDirectory` can point
 /// into a tmpdir).
-struct DiagnosticsBundleInputs {
+nonisolated struct DiagnosticsBundleInputs {
     /// The last status snapshot observed by `DaemonStatusViewModel`, if any.
     var status: DaemonStatus?
     /// Directory containing `daemon.port`, `build-sha.txt`,
@@ -88,7 +88,7 @@ struct DiagnosticsBundleInputs {
 }
 
 extension DiagnosticsBundleInputs {
-    static func defaults(status: DaemonStatus?) -> DiagnosticsBundleInputs {
+    nonisolated static func defaults(status: DaemonStatus?) -> DiagnosticsBundleInputs {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let logs = home
             .appendingPathComponent("Library", isDirectory: true)
@@ -108,7 +108,7 @@ extension DiagnosticsBundleInputs {
     }
 }
 
-struct DiagnosticsBundleBuilder {
+nonisolated struct DiagnosticsBundleBuilder {
     /// Write a zip containing whichever inputs exist. The caller chooses
     /// `destination` (e.g. `~/Desktop/chainworks-diagnostics-2026-04-18.zip`
     /// from an `NSSavePanel`). Returns the manifest so the UI can show
@@ -404,7 +404,7 @@ struct DiagnosticsBundleBuilder {
 }
 
 private extension DiagnosticsExportResult {
-    var hasAnyComponent: Bool {
+    nonisolated var hasAnyComponent: Bool {
         hasStatusSnapshot
             || hasBuildSha
             || hasDaemonLog
@@ -414,7 +414,7 @@ private extension DiagnosticsExportResult {
             || hasSystemInfo
     }
 
-    func with(
+    nonisolated func with(
         bundleURL: URL? = nil,
         sizeBytes: Int64? = nil,
         hasStatusSnapshot: Bool? = nil,

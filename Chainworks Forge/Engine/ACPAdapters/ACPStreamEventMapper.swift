@@ -25,7 +25,7 @@ import Foundation
 /// - `user_message_chunk`       -> nil (ignored — Forge owns prompt truth)
 /// - Stream end / final result  -> `.finish(reason:, totalTokens:, raw:)`
 /// - Error                      -> `.error(message:)`
-enum ACPStreamEventMapper {
+nonisolated enum ACPStreamEventMapper {
 
     // MARK: - Public API
 

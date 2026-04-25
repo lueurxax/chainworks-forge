@@ -64,6 +64,8 @@ It only changes the idea's lifecycle visibility.
 
 Archive belongs to the `Ideas` flow.
 
+Per P031-r18, idea creation (`ideas.create`) is **prohibited** within the governed macOS UI. Operators must use external CLI or MCP workflows to create new ideas. The macOS UI provides read-only management (Archive, Restore) for existing ideas.
+
 Canonical operator path:
 
 1. `Ideas`

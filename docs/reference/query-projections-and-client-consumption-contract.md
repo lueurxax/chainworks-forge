@@ -1,6 +1,6 @@
 # Query projections and client consumption contract
 
-This document is the implemented GraphQL read contract for the thin macOS client. It replaces Proposal 043 and the former P031 handoff artifact.
+This document is the implemented GraphQL read contract for the thin macOS client. It replaces Proposal 043 and the former P031 handoff artifact. It has been updated to reflect the P031-r18 narrowing to a GraphQL-only read UI.
 
 | Field | Value |
 |---|---|
@@ -9,16 +9,52 @@ This document is the implemented GraphQL read contract for the thin macOS client
 | Contract schema | `p043-read-contract-v1` |
 | Gate | `./scripts/test-gate.sh proposal-043` |
 | Alias | `./scripts/test-gate.sh p043` |
+| Composed downstream gate | `./scripts/test-gate.sh p031` |
+| Governing proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
 | Scope | Rust control-plane GraphQL **read** contract for P031 client consumption. Command/control (MCP mutations) is explicitly NOT part of this contract. |
-| Downstream owner | P031 thin macOS UI rewrite (**read-only** consumer, per r8 scope narrowing — see below). |
+| Downstream owner | P031 thin macOS UI rewrite (**read-only** consumer, per r18 scope narrowing). |
 
 ### Scope boundary (r8 correction)
 
-P031's thin macOS UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations. It does **NOT** issue MCP mutations. MCP command/control — `runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `ideas.create` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in Claude Code / Claude Desktop / scripted clients) or by a future UI proposal. A client that issues MCP mutations ("command UI") is out of scope for P031 and for this reference document; such a client would consume both this read contract AND the separate MCP command surface.
+P031's thin macOS UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations. 
+
+**PROHIBITED ACTIONS for P031 UI:**
+- It does **NOT** issue MCP mutations.
+- It does **NOT** use GraphQL mutations.
+- It does **NOT** use local workflow mutation fallback.
+- It does **NOT** probe raw truth from SwiftData or filesystem (except for authorized artifact display).
+
+MCP command/control — `runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `ideas.create`, `steward.run_analysis` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in CLI / automation / scripted clients) or by separate follow-up transport proposals. A client that issues MCP mutations ("command UI") is out of scope for P031 and for this reference document.
 
 Wherever this document mentions "controls", "actions", "mutations", or "command completion" it refers to the generic client / operator system — not to P031's read-only thin UI. For P031 those rules apply vacuously: no mutation surfaces to enable/disable, no command-completion refresh to perform. Rules that explicitly pin behavior to P031 (freshness rendering, read-only evidence, subscription consumption) remain in force for the thin UI.
 
-The remaining risk scoped to P031 is downstream read-side UI behavior: consuming freshness fields and rendering live/degraded/stale/unavailable/unauthorized states correctly. The server-side GraphQL contract and focused gate are implemented.
+## P031-r18 Schema Contract
+
+Every visible P031 workflow field must have one named GraphQL source or one explicit disabled/deferred state.
+
+### Metadata and Freshness Fields
+
+| Field | GraphQL Type | Semantics |
+| --- | --- | --- |
+| `freshnessState` | `FreshnessState` | `live`, `refreshing`, `projection_lag`, `stale`, `unavailable`, `unauthorized`. |
+| `disabledReasonCode` | `DisabledReasonCode` | `WRITE_PATH_NOT_AVAILABLE`, `MANAGED_OUTSIDE_UI`, `AMBIGUOUS_APPROVAL_IDENTITY`, `STALE_READ`, `PROJECTION_LAG`, `UNAUTHORIZED`, `UNSUPPORTED_ACTION`. |
+| `writePathState` | `WritePathState` | `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
+| `diagnosticId` | `String` | Unique identifier for the row/approval/report used for external write workflows. |
+| `payloadAvailabilityState` | `PayloadAvailabilityState` | `available`, `metadata_only`, `payload_deferred`, `generating`, `unavailable`. |
+| `payloadUnavailableReasonCode` | `PayloadUnavailableReasonCode` | `PAYLOAD_DEFERRED_BY_P031`, `GENERATING`, `NOT_INDEXED`, `NOT_AUTHORIZED`, `NOT_AVAILABLE`, `UNKNOWN`. |
+| `serverDebugDetail` | `String` | Internal debug information for diagnostic copy-paste; not for primary UI display. |
+
+### Field Ownership Matrix
+
+| Field | Source surface | Swift Owner |
+| --- | --- | --- |
+| `freshnessState` | run, stage, approval, artifact, report | `WorkflowFreshnessReducer` |
+| `disabledReasonCode` | approvals and deferred action metadata | `DisabledReasonPresenter` |
+| `writePathState` | approval rows | `ApprovalDiagnosticPresenter` |
+| `diagnosticId` | approvals, reports | `ApprovalDiagnosticPresenter` |
+| `payloadAvailabilityState` | report metadata | `PayloadUnavailableReasonPresenter` |
+| `payloadUnavailableReasonCode` | report metadata | `PayloadUnavailableReasonPresenter` |
+| `serverDebugDetail` | diagnostic extensions | `DiagnosticDetailsPresenter` |
 
 ## Core rules
 
@@ -241,7 +277,7 @@ The current proof lane is:
 ./scripts/test-gate.sh p043
 ```
 
-The gate runs the focused `graphql-server` tests whose names start with `proposal_043_`, then validates this reference document from the repository root.
+The gate runs the focused `graphql-server` tests whose names start with `proposal_043_` and `proposal_031_`, then validates this reference document from the repository root.
 
 The test slice covers:
 
@@ -250,7 +286,8 @@ The test slice covers:
 - missing projection rows surfacing as `projectionPresent=false` and `projectionLag=true`;
 - projection-enriched run and stage subscription payloads;
 - `approvalResolved` subscription availability;
-- operator-only V1 reads.
+- operator-only V1 reads and subscription authorization;
+- sensitive field redaction (diagnosticId, serverDebugDetail) protected by operator-only policies.
 
 The gate fails closed when this reference document omits required surfaces, statuses, freshness budget rows, projection freshness fields, freshness behavior limitations, subscription posture, operator-only V1 policy, projection parity, known gaps, or cutover decision rules.
 

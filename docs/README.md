@@ -26,7 +26,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Execution engine
 
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, and conflict resolution (Proposal 017)
-- [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, pre-prompt metadata (P053)
+- [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, and startup recovery progress
 - [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, write serialization, provider toolchain homes, and generated-state housekeeping
@@ -62,6 +62,8 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Operator experience
 
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
+- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed UI write controls (P031)
+- [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
 - [reference/live-workflow-map.md](live-workflow-map.md) — Workflow topology and agent-activity surface
 - [reference/artifact-content-rendering.md](artifact-content-rendering.md) — Unified read-only markdown/JSON rendering

@@ -2,22 +2,58 @@ pub mod adapters;
 pub mod manager;
 pub mod session;
 pub mod transport;
+pub mod xcode_broker;
+pub mod xcode_shim;
+pub mod xcode_target;
 
-pub use manager::AcpRuntimeManager;
+pub use manager::{AcpRuntimeManager, BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
 pub use session::{AcpSession, AcpSessionHandle};
+pub use xcode_broker::{
+    BrokerMcpPolicy, BrokerMcpPolicyDecision, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
+    XcodeBrokerHttpRouteState, XcodeMcpBackend, XcodeMcpBackendRequestContext, XcodeMcpBridgePool,
+    XcodeMcpBridgePoolConfig, XcodeMcpLeaseState, XcodeMcpProcessBackend,
+    XcodeMcpProcessBackendConfig,
+};
+#[cfg(unix)]
+pub use xcode_shim::{
+    current_process_uid, handle_xcode_shim_unix_stream,
+    handle_xcode_shim_unix_stream_with_grant_resolver,
+    handle_xcode_shim_unix_stream_with_peer_credentials, inspect_xcode_shim_process_binding,
+    xcode_shim_peer_credentials, DefaultXcodeShimProcessInspector, XcodeShimGrantResolver,
+    XcodeShimPeerCredentials, XcodeShimProcessInspector, XcodeShimResolvedDispatch,
+};
+pub use xcode_shim::{
+    dispatch_xcode_shim_request, dispatch_xcode_shim_socket_request, XcodeHostExecutorPlan,
+    XcodeHostExecutorPlanError, XcodeHostExecutorPlanInput, XcodeHostExecutorProcessConfig,
+    XcodeHostExecutorProcessOutput, XcodeHostExecutorSimulatorCandidate, XcodeShimCommandPolicy,
+    XcodeShimDispatchAttempt, XcodeShimDispatchAuthorization, XcodeShimDispatchGrant,
+    XcodeShimDispatchOutcome, XcodeShimDispatchRequest, XcodeShimGrantRecord, XcodeShimGrantStore,
+    XcodeShimProcessBinding, XcodeShimRouteDecision, XcodeShimSocketDispatchRequest,
+};
+pub use xcode_target::{
+    probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,
+    LocalXcodeHostProbeConfig, XcodeProcessCandidate, XcodeTargetResolver,
+    XcodeTargetSelectionConfidence, XcodeTargetSelectionInput, XcodeTargetSnapshot,
+};
 
 use std::collections::BTreeMap;
 
+use anyhow::Result;
 use domain::agent::AgentStatus;
 use domain::discovery::{
     ExpectedOutputSpec, LegacyBroadDiscoveryPolicy, LegacyBroadDiscoverySnapshot,
     PrePromptExpectedOutputMetadata,
 };
 use domain::ids::{AgentExecutionId, RunId};
+use domain::xcode_runtime::{XcodeRuntimeObservationUpdate, XcodeShimWarningEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionRequest {
+    /// Engine-persisted execution id, when this request is owned by a durable
+    /// agent_executions row. ACP uses this only for runtime observation sinks.
+    #[serde(default)]
+    pub agent_execution_id: Option<AgentExecutionId>,
     pub run_id: RunId,
     /// Durable stage execution UUID when this request originates from the
     /// orchestrator. Adapter-level tests and legacy serialized requests fall
@@ -29,11 +65,6 @@ pub struct ExecutionRequest {
     /// this to keep retry baselines distinct from earlier attempts.
     #[serde(default = "default_attempt_number")]
     pub attempt_number: u32,
-    /// Durable agent execution UUID when this request originates from the
-    /// orchestrator. Adapter-level tests and legacy serialized requests fall
-    /// back to `agent_id`.
-    #[serde(default)]
-    pub agent_execution_id: Option<String>,
     pub agent_id: String,
     pub provider: String,
     pub model: Option<String>,
@@ -90,10 +121,56 @@ pub struct ExecutionRequest {
     /// disabled unless the frozen run plan or audited retry override enables it.
     #[serde(default)]
     pub legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy,
+    /// P051 direct Xcode command guard. When true, the runtime injects
+    /// session-scoped PATH shims and dispatch credentials into the provider.
+    #[serde(default)]
+    pub xcode_shim_injection_signal: bool,
+    /// P051 host execution policy bit. Treated as requiring shim credentials
+    /// and included in session reuse/fingerprint decisions by the engine.
+    #[serde(default)]
+    pub requires_xcode_host_execution: bool,
 }
 
 fn default_attempt_number() -> u32 {
     1
+}
+
+impl ExecutionRequest {
+    pub fn brokered_xcode_intents(&self) -> Vec<&BrokeredXcodeMcpIntent> {
+        self.mcp_servers
+            .iter()
+            .filter_map(|server| match &server.transport {
+                ResolvedMcpServerTransport::XcodeBrokerIntent { intent }
+                    if intent.provider_http_required =>
+                {
+                    Some(intent)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+pub trait XcodeRuntimeObservationSink: Send + Sync {
+    async fn append_xcode_runtime_observation(
+        &self,
+        agent_execution_id: AgentExecutionId,
+        update: XcodeRuntimeObservationUpdate,
+    ) -> Result<()>;
+}
+
+pub struct NoopXcodeRuntimeObservationSink;
+
+#[async_trait::async_trait]
+impl XcodeRuntimeObservationSink for NoopXcodeRuntimeObservationSink {
+    async fn append_xcode_runtime_observation(
+        &self,
+        _agent_execution_id: AgentExecutionId,
+        _update: XcodeRuntimeObservationUpdate,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +212,10 @@ pub struct ExecutionResult {
     pub actual_mcp_runtime_ids: Vec<String>,
     #[serde(default)]
     pub mcp_session_startup_latency_ms: Option<i64>,
+    /// P051 residual Xcode path warnings detected in ACP session/update
+    /// notifications during this prompt turn.
+    #[serde(default)]
+    pub xcode_shim_warning_events: Vec<XcodeShimWarningEvent>,
     /// Nonblocking diagnostics observed while closing a one-shot ACP session
     /// after the provider already returned a prompt result.
     #[serde(default)]
@@ -187,6 +268,32 @@ pub enum ResolvedMcpServerTransport {
     Platform {
         provider: String,
     },
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    XcodeBrokerIntent {
+        intent: BrokeredXcodeMcpIntent,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BrokeredXcodeMcpIntent {
+    pub extension_id: String,
+    pub runtime_id: String,
+    pub server_id: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub xcode_pid_selector: Option<String>,
+    #[serde(default)]
+    pub runtime_profile_id: Option<String>,
+    #[serde(default)]
+    pub permission_profile_id: Option<String>,
+    #[serde(default)]
+    pub resolved_tool_allowlist_hash: Option<String>,
+    pub provider_http_required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

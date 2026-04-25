@@ -74,7 +74,7 @@ The V1 packet records:
 
 Some fields remain nullable when Rust has no durable producer for them yet, including agent display title and some transport classification details.
 
-#### Phase 1 Minimal Readback Path (P053)
+#### Minimal Discovery Readback Path
 
 Production-exposed Phase 1 implementations must provide a stable readback route for support and operator diagnosis. The minimal readback owner is the control-plane run evidence path:
 - `settle_agent_outputs_from_discovery_decisions` writes the discovery projection.

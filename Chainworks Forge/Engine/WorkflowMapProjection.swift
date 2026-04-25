@@ -52,6 +52,7 @@ struct WorkflowMapProjection: Sendable {
     let loops: [WorkflowMapLoopTelemetry]
     let liveTimeline: [LiveExecutionTimelineEntry]
     let persistedTimeline: [WorkflowMapPersistedTimelineEntry]
+    let xcodeRuntimeObservations: [WorkflowMapXcodeRuntimeObservation]
 
     var activeOccurrences: [WorkflowMapOccurrenceProjection] {
         occurrences.filter { $0.state == .thinking }
@@ -92,6 +93,491 @@ struct WorkflowMapPersistedTimelineEntry: Identifiable, Sendable {
     let detail: String
     let timestamp: Date
     let sessionID: String?
+}
+
+struct WorkflowMapXcodeRuntimeObservation: Identifiable, Sendable, Equatable {
+    let id: String
+    let stageID: String
+    let stageLabel: String
+    let agentExecutionID: UUID
+    let agentTitle: String
+    let brokerObservations: [WorkflowMapXcodeBrokerObservation]
+    let shimInvocations: [WorkflowMapXcodeShimInvocation]
+    let shimWarnings: [WorkflowMapXcodeShimWarning]
+    let hostExecutorEvents: [WorkflowMapXcodeHostExecutorEvent]
+    let storage: WorkflowMapXcodeRuntimeStorageStatus
+
+    var latestBrokerObservation: WorkflowMapXcodeBrokerObservation? {
+        brokerObservations.last
+    }
+
+    var selectedSimulatorID: String? {
+        brokerObservations.reversed().compactMap(\.simulatorID).first
+            ?? hostExecutorEvents.reversed().compactMap(\.selectedSimulatorID).first
+    }
+
+    var coalescedShimWarnings: [WorkflowMapXcodeShimWarning] {
+        var seenKeys = Set<String>()
+        return shimWarnings.filter { warning in
+            seenKeys.insert(warning.coalescingKey).inserted
+        }
+    }
+
+    var brokerHealthLabel: String? {
+        guard let broker = latestBrokerObservation else { return nil }
+        let detail = [
+            broker.backendFailureClass,
+            broker.statusUpdate,
+            broker.backendStartDisposition
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
+        .lowercased()
+
+        if detail.contains("disabled") {
+            return "Disabled"
+        }
+        if detail.contains("degraded") || detail.contains("observation_persistence") {
+            return "Degraded"
+        }
+        if broker.backendFailureClass != nil
+            || detail.contains("failed")
+            || detail.contains("timeout")
+            || detail.contains("crash")
+        {
+            return "Failed"
+        }
+        return "Healthy"
+    }
+
+    var bridgeProgressStatus: WorkflowMapXcodeBridgeProgressStatus? {
+        brokerObservations.reversed().compactMap {
+            WorkflowMapXcodeBridgeProgressStatus(observation: $0)
+        }.first
+    }
+
+    var hasRenderableEvidence: Bool {
+        !brokerObservations.isEmpty
+            || !shimInvocations.isEmpty
+            || !shimWarnings.isEmpty
+            || !hostExecutorEvents.isEmpty
+            || storage.truncated
+    }
+}
+
+struct WorkflowMapXcodeBrokerObservation: Sendable, Equatable {
+    let source: String
+    let backendStartDisposition: String
+    let poolID: String?
+    let leaseID: String?
+    let xcodePID: String?
+    let backendProcessID: Int?
+    let xcodeHomeDisposition: String?
+    let xcodeTmpdirDisposition: String?
+    let siblingLeasesAtSpawn: Int?
+    let backendInitializeWaitMilliseconds: Int?
+    let backendStartupLatencyMilliseconds: Int?
+    let backendFailureClass: String?
+    let statusUpdate: String?
+    let simulatorSelectionMode: String?
+    let simulatorID: String?
+}
+
+struct WorkflowMapXcodeShimInvocation: Sendable, Equatable {
+    let tool: String
+    let policyDecision: String
+    let policyReason: String
+    let exitStatus: Int
+}
+
+struct WorkflowMapXcodeShimWarning: Sendable, Equatable {
+    let timestamp: Date?
+    let policyReason: String
+    let sourceField: String
+    let matchedSubstring: String
+    let excerpt: String
+
+    var coalescingKey: String {
+        [
+            policyReason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            sourceField.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            matchedSubstring.trimmingCharacters(in: .whitespacesAndNewlines)
+        ].joined(separator: "\u{1F}")
+    }
+}
+
+struct WorkflowMapXcodeHostExecutorEvent: Sendable, Equatable {
+    let tool: String
+    let hostEnvDisposition: String
+    let selectedSimulatorID: String?
+    let exitStatus: Int
+    let durationMilliseconds: Int
+}
+
+struct WorkflowMapXcodeRuntimeStorageStatus: Sendable, Equatable {
+    let truncated: Bool
+    let totalEventsDropped: Int
+    let corruptJSONRecoveryCount: Int
+}
+
+struct WorkflowMapXcodeBridgeProgressStatus: Sendable, Equatable {
+    enum Kind: Sendable, Equatable {
+        case waitingForLock
+        case starting
+        case actionRequired
+    }
+
+    let kind: Kind
+    let label: String
+    let detail: String
+
+    fileprivate init?(observation: WorkflowMapXcodeBrokerObservation) {
+        let detail = [
+            observation.backendFailureClass,
+            observation.statusUpdate,
+            observation.backendStartDisposition
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
+        let normalized = detail.lowercased()
+
+        if normalized.contains("xcode_mcp_action_required")
+            || normalized.contains("action required")
+            || normalized.contains("check xcode")
+            || normalized.contains("consent")
+        {
+            self.kind = .actionRequired
+            self.label = "Action Required: Check Xcode"
+            self.detail = detail
+            return
+        }
+
+        if normalized.contains("queue_waiting")
+            || normalized.contains("waiting for xcode mcp bridge")
+            || normalized.contains("waiting for xcode bridge")
+            || (normalized.contains("waiting") && normalized.contains("lock"))
+        {
+            self.kind = .waitingForLock
+            self.label = "Waiting for Xcode Bridge lock"
+            self.detail = detail
+            return
+        }
+
+        if normalized.contains("lease_reserved")
+            || normalized.contains("reserved brokered xcode mcp lease")
+            || normalized.contains("initialize_lock_acquired")
+            || normalized.contains("forwarding brokered xcode mcp initialize")
+            || normalized.contains("starting")
+        {
+            self.kind = .starting
+            self.label = "Starting Xcode Bridge"
+            self.detail = detail
+            return
+        }
+
+        return nil
+    }
+}
+
+func latestXcodeBridgeProgressStatus(
+    in observations: [WorkflowMapXcodeRuntimeObservation]
+) -> WorkflowMapXcodeBridgeProgressStatus? {
+    observations.reversed().compactMap(\.bridgeProgressStatus).first
+}
+
+func xcodeBridgeProgressLabel(
+    baseProgressLabel: String?,
+    observations: [WorkflowMapXcodeRuntimeObservation]
+) -> String? {
+    latestXcodeBridgeProgressStatus(in: observations)?.label ?? baseProgressLabel
+}
+
+func buildXcodeRuntimeObservations(
+    from persistedStages: [RunStageSnapshot]
+) -> [WorkflowMapXcodeRuntimeObservation] {
+    persistedStages.flatMap { stage in
+        stage.agentExecutions.compactMap { agent in
+            guard let data = agent.actualXcodeRuntimeObservationJSON,
+                  let observation = WorkflowMapXcodeRuntimePayload.decode(
+                    data: data,
+                    stage: stage,
+                    agent: agent
+                  ),
+                  observation.hasRenderableEvidence
+            else {
+                return nil
+            }
+            return observation
+        }
+    }
+}
+
+private func parseWorkflowMapISO8601Date(_ value: String) -> Date? {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) {
+        return date
+    }
+
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    return plain.date(from: value)
+}
+
+private struct WorkflowMapXcodeRuntimePayload: Decodable {
+    let mcpBrokerObservations: [BrokerObservation]
+    let xcodeShimEvents: [ShimEvent]
+    let xcodeHostExecutorEvents: [HostExecutorEvent]
+    let storage: Storage?
+
+    enum CodingKeys: String, CodingKey {
+        case mcpBrokerObservations = "mcp_broker_observations"
+        case xcodeShimEvents = "xcode_shim_events"
+        case xcodeHostExecutorEvents = "xcode_host_executor_events"
+        case storage
+    }
+
+    static func decode(
+        data: Data,
+        stage: RunStageSnapshot,
+        agent: RunStageAgentSnapshot
+    ) -> WorkflowMapXcodeRuntimeObservation? {
+        guard let payload = try? JSONDecoder().decode(Self.self, from: data) else {
+            return nil
+        }
+
+        let shimInvocations = payload.xcodeShimEvents.compactMap { event -> WorkflowMapXcodeShimInvocation? in
+            guard case .shimInvocation(let invocation) = event else { return nil }
+            return WorkflowMapXcodeShimInvocation(
+                tool: invocation.tool,
+                policyDecision: invocation.policyDecision,
+                policyReason: invocation.policyReason,
+                exitStatus: invocation.exitStatus
+            )
+        }
+
+        let shimWarnings = payload.xcodeShimEvents.compactMap { event -> WorkflowMapXcodeShimWarning? in
+            guard case .warning(let warning) = event else { return nil }
+            return WorkflowMapXcodeShimWarning(
+                timestamp: warning.timestamp,
+                policyReason: warning.policyReason,
+                sourceField: warning.sourceField,
+                matchedSubstring: warning.matchedSubstring,
+                excerpt: warning.excerpt
+            )
+        }
+
+        return WorkflowMapXcodeRuntimeObservation(
+            id: "\(stage.stageID)::\(agent.id.uuidString)::xcode-runtime",
+            stageID: stage.stageID,
+            stageLabel: stage.label,
+            agentExecutionID: agent.id,
+            agentTitle: agent.agentTitle,
+            brokerObservations: payload.mcpBrokerObservations.map(\.projection),
+            shimInvocations: shimInvocations,
+            shimWarnings: shimWarnings,
+            hostExecutorEvents: payload.xcodeHostExecutorEvents.map(\.projection),
+            storage: payload.storage?.projection ?? WorkflowMapXcodeRuntimeStorageStatus(
+                truncated: false,
+                totalEventsDropped: 0,
+                corruptJSONRecoveryCount: 0
+            )
+        )
+    }
+
+    struct BrokerObservation: Decodable {
+        let source: String?
+        let backendStartDisposition: String?
+        let poolID: String?
+        let leaseID: String?
+        let xcodePID: String?
+        let backendProcessID: Int?
+        let xcodeHomeDisposition: String?
+        let xcodeTmpdirDisposition: String?
+        let simulatorSelection: SimulatorSelection?
+        let siblingLeasesAtSpawn: Int?
+        let backendInitializeWaitMilliseconds: Int?
+        let backendStartupLatencyMilliseconds: Int?
+        let backendFailureClass: String?
+        let statusUpdate: String?
+
+        enum CodingKeys: String, CodingKey {
+            case source
+            case backendStartDisposition = "backend_start_disposition"
+            case poolID = "pool_id"
+            case leaseID = "lease_id"
+            case xcodePID = "xcode_pid"
+            case backendProcessID = "backend_process_id"
+            case xcodeHomeDisposition = "xcode_home_disposition"
+            case xcodeTmpdirDisposition = "xcode_tmpdir_disposition"
+            case simulatorSelection = "simulator_selection"
+            case siblingLeasesAtSpawn = "sibling_leases_at_spawn"
+            case backendInitializeWaitMilliseconds = "backend_initialize_wait_ms"
+            case backendStartupLatencyMilliseconds = "backend_startup_latency_ms"
+            case backendFailureClass = "backend_failure_class"
+            case statusUpdate = "status_update"
+        }
+
+        var projection: WorkflowMapXcodeBrokerObservation {
+            WorkflowMapXcodeBrokerObservation(
+                source: source ?? "xcode_mcp_broker",
+                backendStartDisposition: backendStartDisposition ?? "unknown",
+                poolID: poolID,
+                leaseID: leaseID,
+                xcodePID: xcodePID,
+                backendProcessID: backendProcessID,
+                xcodeHomeDisposition: xcodeHomeDisposition,
+                xcodeTmpdirDisposition: xcodeTmpdirDisposition,
+                siblingLeasesAtSpawn: siblingLeasesAtSpawn,
+                backendInitializeWaitMilliseconds: backendInitializeWaitMilliseconds,
+                backendStartupLatencyMilliseconds: backendStartupLatencyMilliseconds,
+                backendFailureClass: backendFailureClass,
+                statusUpdate: statusUpdate,
+                simulatorSelectionMode: simulatorSelection?.mode,
+                simulatorID: simulatorSelection?.simulatorID
+            )
+        }
+    }
+
+    struct SimulatorSelection: Decodable {
+        let mode: String
+        let simulatorID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case mode
+            case simulatorID = "simulator_id"
+        }
+    }
+
+    enum ShimEvent: Decodable {
+        case shimInvocation(ShimInvocation)
+        case warning(ShimWarning)
+
+        enum CodingKeys: String, CodingKey {
+            case kind
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let kind = try container.decode(String.self, forKey: .kind)
+            switch kind {
+            case "shim_invocation":
+                self = .shimInvocation(try ShimInvocation(from: decoder))
+            case "warning":
+                self = .warning(try ShimWarning(from: decoder))
+            default:
+                self = .warning(ShimWarning(
+                    timestamp: nil,
+                    policyReason: "Unknown shim event kind: \(kind)",
+                    sourceField: "kind",
+                    matchedSubstring: kind,
+                    excerpt: kind
+                ))
+            }
+        }
+    }
+
+    struct ShimInvocation: Decodable {
+        let tool: String
+        let policyDecision: String
+        let policyReason: String
+        let exitStatus: Int
+
+        enum CodingKeys: String, CodingKey {
+            case tool
+            case policyDecision = "policy_decision"
+            case policyReason = "policy_reason"
+            case exitStatus = "exit_status"
+        }
+    }
+
+    struct ShimWarning: Decodable {
+        let timestamp: Date?
+        let policyReason: String
+        let sourceField: String
+        let matchedSubstring: String
+        let excerpt: String
+
+        enum CodingKeys: String, CodingKey {
+            case timestamp = "ts"
+            case policyReason = "policy_reason"
+            case sourceField = "source_field"
+            case matchedSubstring = "matched_substring"
+            case excerpt
+        }
+
+        init(
+            timestamp: Date?,
+            policyReason: String,
+            sourceField: String,
+            matchedSubstring: String,
+            excerpt: String
+        ) {
+            self.timestamp = timestamp
+            self.policyReason = policyReason
+            self.sourceField = sourceField
+            self.matchedSubstring = matchedSubstring
+            self.excerpt = excerpt
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let timestampString = try container.decodeIfPresent(String.self, forKey: .timestamp)
+            timestamp = timestampString.flatMap(parseWorkflowMapISO8601Date)
+            policyReason = try container.decode(String.self, forKey: .policyReason)
+            sourceField = try container.decode(String.self, forKey: .sourceField)
+            matchedSubstring = try container.decode(String.self, forKey: .matchedSubstring)
+            excerpt = try container.decode(String.self, forKey: .excerpt)
+        }
+    }
+
+    struct HostExecutorEvent: Decodable {
+        let tool: String
+        let hostEnvDisposition: String
+        let selectedSimulatorID: String?
+        let exitStatus: Int
+        let durationMilliseconds: Int
+
+        enum CodingKeys: String, CodingKey {
+            case tool
+            case hostEnvDisposition = "host_env_disposition"
+            case selectedSimulatorID = "selected_simulator_id"
+            case exitStatus = "exit_status"
+            case durationMilliseconds = "duration_ms"
+        }
+
+        var projection: WorkflowMapXcodeHostExecutorEvent {
+            WorkflowMapXcodeHostExecutorEvent(
+                tool: tool,
+                hostEnvDisposition: hostEnvDisposition,
+                selectedSimulatorID: selectedSimulatorID,
+                exitStatus: exitStatus,
+                durationMilliseconds: durationMilliseconds
+            )
+        }
+    }
+
+    struct Storage: Decodable {
+        let truncated: Bool?
+        let totalEventsDropped: Int?
+        let corruptJSONRecoveryCount: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case truncated
+            case totalEventsDropped = "total_events_dropped"
+            case corruptJSONRecoveryCount = "corrupt_json_recovery_count"
+        }
+
+        var projection: WorkflowMapXcodeRuntimeStorageStatus {
+            WorkflowMapXcodeRuntimeStorageStatus(
+                truncated: truncated ?? false,
+                totalEventsDropped: totalEventsDropped ?? 0,
+                corruptJSONRecoveryCount: corruptJSONRecoveryCount ?? 0
+            )
+        }
+    }
 }
 
 struct WorkflowMapStageProjection: Identifiable, Sendable {

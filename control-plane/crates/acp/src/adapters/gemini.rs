@@ -1,11 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tracing::info;
 
-use crate::adapters::AcpAdapter;
-use crate::session::{AcpSession, AcpSessionHandle};
-use crate::transport::{isolate_process_group, AcpSessionConfig};
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
+use crate::transport::AcpSessionConfig;
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_GEMINI_ACP_BINARY";
@@ -51,7 +49,11 @@ impl AcpAdapter for GeminiCliAdapter {
         "gemini"
     }
 
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
         if self.binary_path.is_empty() {
             bail!(
                 "GeminiCliAdapter: binary path is empty — set {BINARY_ENV_VAR} \
@@ -68,27 +70,10 @@ impl AcpAdapter for GeminiCliAdapter {
             "Spawning Gemini ACP subprocess"
         );
 
-        // Gemini CLI requires --acp to enable ACP server mode.
-        let mut cmd = Command::new(&self.binary_path);
-        isolate_process_group(&mut cmd);
-        cmd.args(gemini_args_for_request(req));
-        // P050: Inject per-run meta root.
-        if let Some(ref mr) = req.chainworks_meta_root {
-            let absolute = if mr.starts_with('/') {
-                mr.clone()
-            } else {
-                format!("{}/{}", req.workspace_root, mr)
-            };
-            cmd.env("CHAINWORKS_META_ROOT", &absolute);
-        }
-        let child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn Gemini ACP subprocess: {} --acp", self.binary_path))?;
+        Ok(AcpLaunchSpec::new(&self.binary_path).with_arg("--acp"))
+    }
 
+    fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
         // Gemini uses bypassPermissions mode; no _meta block needed.
         // Pass the model from YAML backend_profile; Gemini CLI accepts
         // its own catalog (e.g. gemini-2.5-pro, gemini-3-pro) and falls
@@ -100,9 +85,7 @@ impl AcpAdapter for GeminiCliAdapter {
             extra: None,
             config_options: Vec::new(),
         };
-        let session = AcpSession::start(child, req, &config).await?;
-
-        Ok(AcpSessionHandle::new(session))
+        Ok(AcpSessionNewSpec::from_config(config))
     }
 }
 
@@ -154,6 +137,8 @@ mod tests {
             mcp_servers: Vec::new(),
             chainworks_meta_root: meta_root.map(str::to_string),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
         }
     }
 

@@ -36,7 +36,7 @@ Goose still matters as legacy and compatibility infrastructure, but it is no lon
 - captures ideas as units of engineering work
 - executes YAML-defined workflows instead of hardcoded chat flows
 - binds specialized agents to providers, models, permissions, and output contracts
-- preserves run state, stage history, approvals, and artifact metadata in SwiftData
+- preserves run state, stage history, approvals, and artifact metadata in the backend (read by the UI via GraphQL projections)
 - stores generated artifacts on disk instead of hiding execution inside chat history
 - supports recovery, comparison, reporting, and approval-driven continuation
 - keeps repo-backed delivery and release work behind explicit gates
@@ -48,6 +48,7 @@ In practice, Chainworks Forge sits between ad hoc AI chats and heavyweight orche
 The current direction is:
 
 - ACP-first runtime transport
+- thin GraphQL-only UI rewrite (P031) over server-owned projections
 - frozen run truth and operator-visible recovery
 - backend-specific agent tuning through catalog-defined workflows
 - local-first execution with explicit provider/runtime diagnostics
@@ -70,11 +71,11 @@ It assumes that workflow truth, artifacts, approvals, and recovery matter more t
 
 ## Current Product Shape
 
-Today the app exposes these top-level operator surfaces:
+Today the app exposes these top-level operator surfaces (thin GraphQL read-only in P031):
 
-- `Runs Home` for active, blocked, running, and completed runs
-- `Ideas` for starting and managing work
-- `Approvals` for pending human decisions
+- `Runs Home` for active, blocked, running, and completed runs (GraphQL-only)
+- `Ideas` for capturing and managing work (Create Idea removed from UI in P031)
+- `Approvals` for pending human decisions (diagnostic-only in P031)
 - `Agent Catalog` for inspecting the resolved agent catalog
 - `Workflow Inspector` for YAML workflow inspection and validation
 - `Pilot Readiness` for readiness and sign-off support
@@ -90,6 +91,7 @@ The current MVP provider set is:
 
 The repository is past the scaffold stage. The implemented system now includes:
 
+- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
 - declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017)
 - operator-facing run, approval, report, recovery, and comparison surfaces
@@ -103,6 +105,8 @@ The repository is past the scaffold stage. The implemented system now includes:
 
 Active proposal work is currently concentrated in:
 
+- [`docs/proposals/031-thin-graphql-ui-rewrite.md`](docs/proposals/031-thin-graphql-ui-rewrite.md)
+- [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
 The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
@@ -124,7 +128,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
 - artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`
-  - `bounded artifact discovery and settlement optimization (P053)`
+  - `bounded artifact discovery and settlement optimization`
   - report/export surfaces
 - provider platform slices:
   - provider settings
