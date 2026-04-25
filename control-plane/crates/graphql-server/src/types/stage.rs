@@ -6,6 +6,10 @@ use db::repos::sessions;
 use domain::ids::StageExecutionId;
 use domain::session::{SessionGeneration, SessionLineage};
 use domain::stage::StageExecution;
+use domain::xcode_runtime::{
+    McpBrokerObservation, XcodeHostExecutorEvent, XcodeRuntimeObservation, XcodeShimEvent,
+    XcodeShimInvocationEvent, XcodeShimWarningEvent,
+};
 
 use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
 
@@ -142,6 +146,7 @@ pub struct GqlAgentExecution {
     pub denied_mcp_extensions_json: Option<String>,
     pub mcp_blocking_issues_json: Option<String>,
     pub actual_mcp_observation_json: Option<String>,
+    pub actual_xcode_runtime_observation: Option<GqlXcodeRuntimeObservation>,
     pub mcp_session_startup_latency_ms: Option<i64>,
     pub owner_execution_lineage_id: Option<String>,
     pub session_lineage_id: Option<String>,
@@ -174,6 +179,12 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
             denied_mcp_extensions_json: execution.denied_mcp_extensions_json,
             mcp_blocking_issues_json: execution.mcp_blocking_issues_json,
             actual_mcp_observation_json: execution.actual_mcp_observation_json,
+            actual_xcode_runtime_observation: execution
+                .actual_xcode_runtime_observation_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<XcodeRuntimeObservation>(json).ok())
+                .map(XcodeRuntimeObservation::redacted_for_surface)
+                .map(GqlXcodeRuntimeObservation::from),
             mcp_session_startup_latency_ms: execution.mcp_session_startup_latency_ms,
             owner_execution_lineage_id: execution.owner_execution_lineage_id,
             session_lineage_id: execution.session_lineage_id,
@@ -185,6 +196,230 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
             session_family_id: execution.session_family_id,
             session_reuse_disposition: execution.session_reuse_disposition,
             session_reset_reason: execution.session_reset_reason,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlXcodeRuntimeObservation {
+    pub version: i64,
+    pub mcp_broker_observations: Vec<GqlMcpBrokerObservation>,
+    pub xcode_shim_events: Vec<GqlXcodeShimEvent>,
+    pub xcode_host_executor_events: Vec<GqlXcodeHostExecutorEvent>,
+    pub storage: GqlXcodeRuntimeObservationStorageStatus,
+}
+
+impl From<XcodeRuntimeObservation> for GqlXcodeRuntimeObservation {
+    fn from(observation: XcodeRuntimeObservation) -> Self {
+        Self {
+            version: observation.version as i64,
+            mcp_broker_observations: observation
+                .mcp_broker_observations
+                .into_iter()
+                .map(GqlMcpBrokerObservation::from)
+                .collect(),
+            xcode_shim_events: observation
+                .xcode_shim_events
+                .into_iter()
+                .map(GqlXcodeShimEvent::from)
+                .collect(),
+            xcode_host_executor_events: observation
+                .xcode_host_executor_events
+                .into_iter()
+                .map(GqlXcodeHostExecutorEvent::from)
+                .collect(),
+            storage: GqlXcodeRuntimeObservationStorageStatus {
+                max_events: observation.storage.max_events as i64,
+                max_bytes: observation.storage.max_bytes as i64,
+                truncated: observation.storage.truncated,
+                total_events_dropped: observation.storage.total_events_dropped as i64,
+                mcp_broker_observations_dropped: observation.storage.mcp_broker_observations_dropped
+                    as i64,
+                xcode_shim_events_dropped: observation.storage.xcode_shim_events_dropped as i64,
+                xcode_host_executor_events_dropped: observation
+                    .storage
+                    .xcode_host_executor_events_dropped
+                    as i64,
+                corrupt_json_recovery_count: observation.storage.corrupt_json_recovery_count as i64,
+                corrupt_json_quarantined_bytes: observation.storage.corrupt_json_quarantined_bytes
+                    as i64,
+            },
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlXcodeRuntimeObservationStorageStatus {
+    pub max_events: i64,
+    pub max_bytes: i64,
+    pub truncated: bool,
+    pub total_events_dropped: i64,
+    pub mcp_broker_observations_dropped: i64,
+    pub xcode_shim_events_dropped: i64,
+    pub xcode_host_executor_events_dropped: i64,
+    pub corrupt_json_recovery_count: i64,
+    pub corrupt_json_quarantined_bytes: i64,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlMcpBrokerObservation {
+    pub source: String,
+    pub backend_start_disposition: String,
+    pub pool_id: Option<String>,
+    pub lease_id: Option<String>,
+    pub xcode_pid: Option<String>,
+    pub backend_process_id: Option<i64>,
+    pub http_endpoint: Option<String>,
+    pub xcode_home_disposition: Option<String>,
+    pub xcode_tmpdir_disposition: Option<String>,
+    pub sibling_leases_at_spawn: Option<i64>,
+    pub backend_initialize_wait_ms: Option<i64>,
+    pub backend_startup_latency_ms: Option<i64>,
+    pub http_session_startup_latency_ms: Option<i64>,
+    pub backend_failure_class: Option<String>,
+    pub originating_execution_id: Option<String>,
+    pub prompt_cycle_index: Option<i64>,
+    pub status_update: Option<String>,
+    pub simulator_selection_mode: Option<String>,
+    pub simulator_id: Option<String>,
+}
+
+impl From<McpBrokerObservation> for GqlMcpBrokerObservation {
+    fn from(observation: McpBrokerObservation) -> Self {
+        let (simulator_selection_mode, simulator_id) = observation
+            .simulator_selection
+            .map(|selection| (Some(selection.mode), selection.simulator_id))
+            .unwrap_or((None, None));
+        Self {
+            source: observation.source,
+            backend_start_disposition: observation.backend_start_disposition,
+            pool_id: observation.pool_id,
+            lease_id: observation.lease_id,
+            xcode_pid: observation.xcode_pid,
+            backend_process_id: observation.backend_process_id,
+            http_endpoint: observation.http_endpoint,
+            xcode_home_disposition: observation.xcode_home_disposition,
+            xcode_tmpdir_disposition: observation.xcode_tmpdir_disposition,
+            sibling_leases_at_spawn: observation.sibling_leases_at_spawn,
+            backend_initialize_wait_ms: observation.backend_initialize_wait_ms,
+            backend_startup_latency_ms: observation.backend_startup_latency_ms,
+            http_session_startup_latency_ms: observation.http_session_startup_latency_ms,
+            backend_failure_class: observation.backend_failure_class.and_then(|class| {
+                serde_json::to_value(class)
+                    .ok()
+                    .and_then(|value| value.as_str().map(String::from))
+            }),
+            originating_execution_id: observation.originating_execution_id,
+            prompt_cycle_index: observation.prompt_cycle_index,
+            status_update: observation.status_update,
+            simulator_selection_mode,
+            simulator_id,
+        }
+    }
+}
+
+#[derive(Union, Clone, Debug)]
+pub enum GqlXcodeShimEvent {
+    ShimInvocation(GqlXcodeShimInvocationEvent),
+    Warning(GqlXcodeShimWarningEvent),
+}
+
+impl From<XcodeShimEvent> for GqlXcodeShimEvent {
+    fn from(event: XcodeShimEvent) -> Self {
+        match event {
+            XcodeShimEvent::ShimInvocation(event) => {
+                GqlXcodeShimEvent::ShimInvocation(GqlXcodeShimInvocationEvent::from(event))
+            }
+            XcodeShimEvent::Warning(event) => {
+                GqlXcodeShimEvent::Warning(GqlXcodeShimWarningEvent::from(event))
+            }
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlXcodeShimInvocationEvent {
+    pub ts: String,
+    pub tool: String,
+    pub via_xcrun: bool,
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub policy_decision: String,
+    pub policy_reason: String,
+    pub derived_peer_pid: i64,
+    pub derived_peer_uid: i64,
+    pub claimed_provider_pid: i64,
+    pub peer_pid_mismatch: bool,
+    pub exit_status: i64,
+}
+
+impl From<XcodeShimInvocationEvent> for GqlXcodeShimInvocationEvent {
+    fn from(event: XcodeShimInvocationEvent) -> Self {
+        Self {
+            ts: event.ts.to_rfc3339(),
+            tool: event.tool,
+            via_xcrun: event.via_xcrun,
+            argv: event.argv,
+            cwd: event.cwd,
+            policy_decision: event.policy_decision,
+            policy_reason: event.policy_reason,
+            derived_peer_pid: event.derived_peer_pid,
+            derived_peer_uid: event.derived_peer_uid,
+            claimed_provider_pid: event.claimed_provider_pid,
+            peer_pid_mismatch: event.peer_pid_mismatch,
+            exit_status: event.exit_status,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlXcodeShimWarningEvent {
+    pub ts: String,
+    pub policy_reason: String,
+    pub source_field: String,
+    pub matched_substring: String,
+    pub excerpt: String,
+}
+
+impl From<XcodeShimWarningEvent> for GqlXcodeShimWarningEvent {
+    fn from(event: XcodeShimWarningEvent) -> Self {
+        Self {
+            ts: event.ts.to_rfc3339(),
+            policy_reason: event.policy_reason,
+            source_field: event.source_field,
+            matched_substring: event.matched_substring,
+            excerpt: event.excerpt,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlXcodeHostExecutorEvent {
+    pub ts: String,
+    pub tool: String,
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub host_env_disposition: String,
+    pub env_allowlist_applied: Vec<String>,
+    pub env_dropped_from_provider: Vec<String>,
+    pub selected_simulator_id: Option<String>,
+    pub exit_status: i64,
+    pub duration_ms: i64,
+}
+
+impl From<XcodeHostExecutorEvent> for GqlXcodeHostExecutorEvent {
+    fn from(event: XcodeHostExecutorEvent) -> Self {
+        Self {
+            ts: event.ts.to_rfc3339(),
+            tool: event.tool,
+            argv: event.argv,
+            cwd: event.cwd,
+            host_env_disposition: event.host_env_disposition,
+            env_allowlist_applied: event.env_allowlist_applied,
+            env_dropped_from_provider: event.env_dropped_from_provider,
+            selected_simulator_id: event.selected_simulator_id,
+            exit_status: event.exit_status,
+            duration_ms: event.duration_ms,
         }
     }
 }
@@ -494,5 +729,92 @@ impl From<StageSummaryRow> for GqlStageExecution {
             projection_lag: r.projection_lag,
             freshness_state: freshness_from_projection_lag(r.projection_lag),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::Utc;
+    use domain::agent::{AgentExecution, AgentStatus};
+    use domain::ids::{AgentExecutionId, StageExecutionId};
+
+    #[test]
+    fn gql_agent_execution_redacts_raw_stored_xcode_runtime_observation() {
+        let raw_observation = serde_json::json!({
+            "version": 1,
+            "mcp_broker_observations": [{
+                "source": "xcode_mcp_broker",
+                "backend_start_disposition": "lease_reserved",
+                "pool_id": "pool-1",
+                "lease_id": "lease-1",
+                "xcode_pid": "1234",
+                "backend_process_id": 5678,
+                "http_endpoint": "http://127.0.0.1:4000/xcode-mcp/lease-1?token=raw-graphql-token",
+                "xcode_home_disposition": "host_user_home",
+                "xcode_tmpdir_disposition": "host_user_tmpdir",
+                "simulator_selection": null,
+                "sibling_leases_at_spawn": 1,
+                "backend_initialize_wait_ms": 42,
+                "backend_startup_latency_ms": 73,
+                "http_session_startup_latency_ms": 17,
+                "backend_failure_class": null,
+                "originating_execution_id": "execution-1",
+                "prompt_cycle_index": 0,
+                "status_update": "forwarded Bearer raw-graphql-bearer"
+            }],
+            "xcode_shim_events": [],
+            "xcode_host_executor_events": []
+        })
+        .to_string();
+        let execution = AgentExecution {
+            id: AgentExecutionId::new(),
+            stage_execution_id: StageExecutionId::new(),
+            agent_id: "code_writer".into(),
+            provider: "codex".into(),
+            model: Some("gpt-5".into()),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status: AgentStatus::Failed,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: None,
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: Some(raw_observation),
+            mcp_session_startup_latency_ms: None,
+        };
+
+        let gql = GqlAgentExecution::from(execution);
+        let observation = gql
+            .actual_xcode_runtime_observation
+            .expect("xcode runtime observation");
+        let broker = observation
+            .mcp_broker_observations
+            .first()
+            .expect("broker observation");
+
+        assert_eq!(
+            broker.http_endpoint.as_deref(),
+            Some("http://127.0.0.1:4000/xcode-mcp/lease-1?token=<redacted>")
+        );
+        assert_eq!(
+            broker.status_update.as_deref(),
+            Some("forwarded Bearer <redacted>")
+        );
     }
 }

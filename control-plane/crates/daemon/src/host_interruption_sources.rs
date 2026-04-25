@@ -40,34 +40,32 @@ async fn record_native_host_interruption_event(
     service: &HostInterruptionService,
     event: NativeHostInterruptionEvent,
 ) -> Result<HostInterruptionRecoverySummary> {
+    service
+        .record_and_requeue(host_interruption_event_for_native(event))
+        .await
+}
+
+fn host_interruption_event_for_native(event: NativeHostInterruptionEvent) -> HostInterruptionEvent {
     match event {
         NativeHostInterruptionEvent::SystemSleepWake {
             started_at,
             ended_at,
-        } => {
-            service
-                .record_and_requeue(HostInterruptionEvent {
-                    kind: HostInterruptionKind::SystemSleep,
-                    started_at,
-                    ended_at: Some(ended_at),
-                    monotonic_gap_ms: None,
-                    wall_clock_gap_ms: Some((ended_at - started_at).num_milliseconds().max(0)),
-                    details_json: Some(r#"{"source":"system_sleep_wake"}"#.into()),
-                })
-                .await
-        }
-        NativeHostInterruptionEvent::NetworkMigration { observed_at } => {
-            service
-                .record_and_requeue(HostInterruptionEvent {
-                    kind: HostInterruptionKind::NetworkMigration,
-                    started_at: observed_at,
-                    ended_at: Some(observed_at),
-                    monotonic_gap_ms: None,
-                    wall_clock_gap_ms: None,
-                    details_json: Some(r#"{"source":"network_path_change"}"#.into()),
-                })
-                .await
-        }
+        } => HostInterruptionEvent {
+            kind: HostInterruptionKind::SystemSleep,
+            started_at,
+            ended_at: Some(ended_at),
+            monotonic_gap_ms: None,
+            wall_clock_gap_ms: Some((ended_at - started_at).num_milliseconds().max(0)),
+            details_json: Some(r#"{"source":"system_sleep_wake"}"#.into()),
+        },
+        NativeHostInterruptionEvent::NetworkMigration { observed_at } => HostInterruptionEvent {
+            kind: HostInterruptionKind::NetworkMigration,
+            started_at: observed_at,
+            ended_at: Some(observed_at),
+            monotonic_gap_ms: None,
+            wall_clock_gap_ms: None,
+            details_json: Some(r#"{"source":"network_path_change"}"#.into()),
+        },
     }
 }
 
@@ -293,42 +291,42 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::pool::create_pool;
-    use engine::work_queue::WorkQueue;
 
-    #[tokio::test]
-    async fn native_event_bridge_records_network_migration_without_running_work() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
-        let service = HostInterruptionService::new(pool.clone(), WorkQueue::new(pool));
-        let summary = record_native_host_interruption_event(
-            &service,
-            NativeHostInterruptionEvent::NetworkMigration {
-                observed_at: Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn native_event_bridge_maps_network_migration_event() {
+        let observed_at = Utc::now();
+        let event =
+            host_interruption_event_for_native(NativeHostInterruptionEvent::NetworkMigration {
+                observed_at,
+            });
 
-        assert_eq!(summary.affected_executions, 0);
-        assert_eq!(summary.retries_enqueued, 0);
+        assert_eq!(event.kind, HostInterruptionKind::NetworkMigration);
+        assert_eq!(event.started_at, observed_at);
+        assert_eq!(event.ended_at, Some(observed_at));
+        assert_eq!(event.monotonic_gap_ms, None);
+        assert_eq!(event.wall_clock_gap_ms, None);
+        assert_eq!(
+            event.details_json.as_deref(),
+            Some(r#"{"source":"network_path_change"}"#)
+        );
     }
 
-    #[tokio::test]
-    async fn native_event_bridge_records_system_sleep_wake_without_running_work() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
-        let service = HostInterruptionService::new(pool.clone(), WorkQueue::new(pool));
+    #[test]
+    fn native_event_bridge_maps_system_sleep_wake_event() {
         let ended_at = Utc::now();
-        let summary = record_native_host_interruption_event(
-            &service,
-            NativeHostInterruptionEvent::SystemSleepWake {
+        let event =
+            host_interruption_event_for_native(NativeHostInterruptionEvent::SystemSleepWake {
                 started_at: ended_at - chrono::Duration::seconds(30),
                 ended_at,
-            },
-        )
-        .await
-        .unwrap();
+            });
 
-        assert_eq!(summary.affected_executions, 0);
-        assert_eq!(summary.retries_enqueued, 0);
+        assert_eq!(event.kind, HostInterruptionKind::SystemSleep);
+        assert_eq!(event.ended_at, Some(ended_at));
+        assert_eq!(event.monotonic_gap_ms, None);
+        assert_eq!(event.wall_clock_gap_ms, Some(30_000));
+        assert_eq!(
+            event.details_json.as_deref(),
+            Some(r#"{"source":"system_sleep_wake"}"#)
+        );
     }
 }

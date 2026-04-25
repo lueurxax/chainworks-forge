@@ -1,0 +1,1 @@
+ALTER TABLE agent_executions ADD COLUMN actual_xcode_runtime_observation_json TEXT;

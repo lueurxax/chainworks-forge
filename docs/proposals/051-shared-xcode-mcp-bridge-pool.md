@@ -1,1941 +1,2026 @@
-# Proposal 051: Shared Xcode MCP Bridge Pool for ACP Sessions
-
-| Field | Value |
-|---|---|
-| Date | 2026-04-17 (revised 2026-04-19 after Phase 0 probes) |
-| Status | Research-gated, scope revised |
-| Author | Andrey Khasanov |
-| Depends on | [025-per-agent-mcp-policy-and-runtime-validation.md](025-per-agent-mcp-policy-and-runtime-validation.md), [026-acp-first-runtime-transport-and-goose-decoupling.md](026-acp-first-runtime-transport-and-goose-decoupling.md), [029-mcp-northbound-control-plane-server.md](029-mcp-northbound-control-plane-server.md), [037-acp-execution-supervision-and-idle-watchdog.md](037-acp-execution-supervision-and-idle-watchdog.md), [049-context-strategy-management-mcp-tools.md](049-context-strategy-management-mcp-tools.md) |
-| Priority | P1 / High |
-| Scope | Implement a Chainworks-owned HTTP streaming Xcode MCP broker that (a) serves provider-facing Xcode MCP via loopback HTTP with per-session bearer tokens, (b) spawns one `xcrun mcpbridge` backend subprocess per HTTP client session under a broker-owned **host-user environment**, (c) serializes bridge spawn + `initialize` per Xcode PID while allowing parallel `tools/*` calls, (d) centralizes simulator UUID selection and policy filtering. The broker is the Xcode host-session execution boundary **for catalog-declared and PATH-based invocations**; P051 does not claim to block LLM-improvised absolute-path invocations at runtime (see §5.1.1 "Scope of guarantee"). |
-| Goal | Eliminate CoreSimulator/`simdiskimaged` failures caused by isolated agent home directories **for catalog-declared and PATH-based Xcode commands** (primary reliability goal — this is the observed operational failure mode), preserve one-modal-per-Xcode-process consent behavior across parallel reviewers, reduce MCP startup latency through pooled lifecycle, and preserve per-agent session isolation, permission policy, MCP capability reporting, and recovery semantics. Prompt-time LLM-improvised absolute-path invocations remain a documented residual with runtime warnings (§5.1.1 mitigation b); closing that residual requires a future libc-audit / sandbox-exec proposal. |
-| Research artifact | [051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md](051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md) — verdict **Proceed with scoped architecture**, Phase 0 probes complete. |
-
-**Gate naming note:** this proposal owns the new canonical gate alias `proposal-051|p051`. It must be added to `scripts/test-gate.sh` and `docs/reference/test-gates.md`; it must not reuse the existing P044, P045, P049, or P050 gates.
-
----
-
-## 1. Context and Motivation
-
-The control-plane can already keep ACP sessions alive and reuse them for later prompts in the same run. That reduces repeat starts on retry/resume. It does not solve the first-start problem for a parallel stage where two or more agents require Xcode MCP at the same time.
-
-Current behavior for a proposal-review stage with Gemini UX and Gemini UI reviewers:
-
-1. The orchestrator enqueues both reviewers in the same phase.
-2. Each ACP provider receives an `mcpServers` entry for `xcode`.
-3. Each provider starts its own `xcrun mcpbridge`.
-4. Xcode may show a modal or permission prompt for each bridge/client connection.
-5. Gemini waits until the operator responds to each modal, so parallel startup becomes manually serialized.
-
-Recent runtime fixes reduce the damage:
-
-- `MCP_XCODE_PID` is injected so bridge startup targets the already-open Xcode process.
-- Gemini + Xcode agents default to `same_agent_family_within_run` session reuse when no explicit reuse scope is present.
-- Retry now rejects active latest stage attempts, preventing duplicate retries while an agent is still running.
-
-Those fixes still leave two unavoidable first starts for two parallel ACP sessions. This proposal addresses that remaining source of friction.
-
-A second, higher-priority reliability issue is now in scope. ACP agents intentionally run with isolated per-session state, including a fake `HOME` such as `.forge-codex-acp/<session-id>`. That is useful for Codex/plugin/cache isolation, but Xcode is not a normal per-run CLI dependency. `xcodebuild`, CoreSimulator, `simdiskimaged`, Xcode MCP bridge prompts, DerivedData, simulator devices, and CloudKit/iCloud state are tied to the macOS GUI user's host session and `~/Library` tree. Running Xcode from a fake home produces a split-brain environment: some Xcode paths resolve under `.forge-codex-acp/.../Library`, while the underlying services still belong to `/Users/user`. Recent failures showed this as CoreSimulator runtime discovery errors, `simdiskimaged` startup failures, and missing CoreSimulator log directories under the fake home.
-
-P051 therefore must not be treated as only a modal-deduplication optimization. It is also the correct boundary for host-session-bound Xcode execution. The target design keeps agent runtime state isolated, but moves Xcode/CoreSimulator access behind a Chainworks-owned bridge that runs with the real macOS user context required by Xcode.
-
----
-
-## 2. Product Questions This Proposal Must Answer
-
-Success is framed around four properties, not bridge-count reduction (Phase 0 confirmed each lease gets its own `mcpbridge` subprocess; P051 no longer claims "one bridge for N clients").
-
-1. **Single host-session consent boundary.** Can a parallel stage with two Xcode-capable ACP sessions complete with at most one Xcode consent modal per Xcode process, regardless of how many `mcpbridge` subprocesses the broker spawns?
-2. **Transport abstraction.** Can each ACP provider consume Xcode MCP through HTTP streaming without knowing that Chainworks is spawning backend `mcpbridge` subprocesses under a host-user environment?
-3. **Modal-prone initialize serialization.** Can the broker serialize the per-Xcode-PID initialize phase so concurrent lease requests never race at Xcode's XPC tool-service setup, while keeping `tools/*` calls parallel?
-4. **Per-lease backend isolation.** Can one stuck, crashed, or cancelled lease release cleanly — closing only its own backend `mcpbridge` subprocess — without affecting sibling leases on the same Xcode PID?
-5. **Policy and capability preservation.** Can the broker preserve per-agent read/write policy, MCP tool-allowlist filtering, and capability reporting when brokering MCP traffic?
-6. **Fail-closed behavior.** Can the system fail closed before lease/port/token allocation when the provider does not advertise `mcpCapabilities.http`, and when the broker cannot start, host-env is unavailable, or Xcode PID drifts?
-7. **Host-session execution boundary.** Can Xcode and CoreSimulator commands run from a stable host-user environment without giving the whole ACP agent process access to the real user `HOME`?
-8. **Direct-command containment (scoped to PATH-based and catalog-declared paths).** Can the runtime prevent direct Xcode execution (`xcodebuild`, `simctl`, `mcpbridge`, via-`xcrun` variants) from isolated fake-home ACP sessions via an enforceable shim for PATH-based invocations plus catalog lint for catalog-declared absolute paths, with an opt-in host-executor route for the narrow set of commands that legitimately need it (excluding `mcpbridge`, which remains broker-only within this enforced boundary)? LLM-improvised absolute paths at prompt time remain a residual risk with post-run warnings — they are outside the enforced boundary and handled by separate mitigations (see §5.1.1 Scope of guarantee).
-9. **Observable evidence.** Can operators and tests prove the above via structured runtime observations (`backend_start_disposition`, `backend_initialize_wait_ms`, `xcode_home_disposition`, `xcode_shim_rejected`/`xcode_shim_routed`, `backend_failure_class`, selected simulator UUID) rather than inferring from log patterns?
-
----
-
-## 3. Scope
-
-This proposal includes:
-
-- A Rust Xcode MCP broker owned by the control-plane process.
-- A mandatory pre-implementation research gate proving whether Codex, Claude, and Gemini ACP providers can consume MCP servers through HTTP streaming in `session/new`.
-- An HTTP streaming MCP endpoint handed to ACP providers in place of direct `xcrun mcpbridge`.
-- A lease model keyed by Xcode PID, workspace root, MCP server id, runtime profile, and permission class.
-- Broker lifecycle management inside `acp::AcpRuntimeManager` or a closely owned ACP runtime service.
-- MCP request routing and response correlation so each HTTP client session drives its own backend bridge subprocess safely, with serialized bridge-spawn + initialize per Xcode PID.
-- Read-only observability for active bridge pools, leases, startup latency, backend PID, and HTTP client session counts.
-- A host-session execution contract for Xcode-bound tools: broker-owned Xcode processes use the real macOS user `HOME`, normal macOS temp/cache directories, explicit simulator identifiers, and `MCP_XCODE_PID`; generic ACP agent processes keep isolated `CODEX_HOME` and fake home state.
-- Focused Rust tests proving parallel Xcode ACP sessions each get an isolated backend bridge while Xcode consent modals remain one-per-Xcode-process and initialize phases serialize cleanly.
-- Canonical proof gate `proposal-051|p051`.
-
-This proposal does **not** include:
-
-- Sharing one ACP language-model session between different reviewers. UX and UI remain separate ACP sessions because they have different roles, prompts, and output contracts.
-- Changing XcodeBuildMCP itself.
-- Removing `MCP_XCODE_PID` injection. The broker still uses it to target the intended Xcode instance.
-- Implementing a stdio proxy compatibility layer as the P051 architecture. If HTTP streaming is not feasible, P051 must return to proposal revision instead of silently falling back to stdio proxying.
-- UI changes in the Swift app.
-- Cross-daemon bridge sharing. The pool is per control-plane daemon process.
-- General pooling for every MCP server. P051 is Xcode-only; other MCP backends can be considered later after this broker proves stable.
-- Broadly disabling per-agent home isolation. P051 must not solve Xcode by launching the entire ACP provider with `/Users/user` as `HOME`.
-- A general-purpose shell command policy engine for every direct `xcodebuild` invocation. P051 may add focused Xcode guards/wrappers only where needed to prevent the broker contract from being bypassed.
-
-### 3.1 Pre-Implementation Research Gate — **COMPLETE (2026-04-19)**
-
-The research artifact is complete and committed:
-
-```text
-docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md
-```
-
-**Verdict: Proceed with scoped architecture** (one `mcpbridge` subprocess per HTTP client session, serialized initialize per Xcode PID). Phase 0 empirical probes confirm concurrent bridge coexistence, per-Xcode-process consent scope, and Gemini CLI v0.38.1 HTTP MCP support.
-
-The artifact answered, with current primary-source or direct local evidence:
-
-1. Do Codex, Claude, and Gemini ACP `session/new` payloads accept MCP servers over HTTP streaming or only stdio?
-2. Which wire shape is supported by each provider: MCP Streamable HTTP, SSE, custom URL entries, or none?
-3. Can the control-plane expose a loopback HTTP streaming MCP endpoint securely to provider subprocesses?
-4. Can the broker authenticate individual provider sessions without leaking cross-agent authority?
-5. Can `xcrun mcpbridge` be used as a backend behind the HTTP broker, or does the broker need a native Xcode MCP implementation?
-6. If one provider lacks HTTP streaming support, must P051 narrow the provider set or stop?
-7. Which exact host-user environment is required for reliable Xcode/CoreSimulator execution on the target macOS/Xcode versions?
-8. Which Xcode entry points must be brokered or guarded in practice: Xcode MCP bridge only, `xcodebuild`, `xcrun simctl`, or all Xcode developer tool invocations?
-9. Can the broker always select explicit simulator UUIDs for Xcode execution evidence, avoiding ambiguous `name + OS` destinations when duplicate devices exist?
-
-The research verdict is one of:
-
-- `Proceed`: all required providers support an HTTP streaming shape that preserves policy and observability.
-- `Proceed with scoped architecture`: backend-sharing model must be revised (per-lease backend rather than per-pool-key shared backend) but HTTP streaming and host-env goals remain viable. **← current verdict**.
-- `Proceed with scoped provider set`: only a named subset supports it; the proposal must be revised to limit scope before implementation.
-- `Do not implement P051 as written`: HTTP streaming is not currently viable; the proposal must be revised or replaced before any implementation starts.
-
-The P051 proof gate includes a **static consistency check** that this research artifact exists, contains a non-placeholder verdict, **and does not contradict the current proposal text**. The check scans the artifact for known stale-guidance patterns and fails sign-off if any are present. The matcher set is maintained alongside the gate script and updated whenever the proposal's contracts change. Current stale-pattern set (not exhaustive — new items added as contracts evolve):
-
-- `mcpbridge` listed in the host-executor allowlist,
-- direct `xcrun mcpbridge` diagnostic fallback or "retained behind a diagnostic flag",
-- "shared backend across leases" or "one backend bridge per pool key shared across multiple leases",
-- direct-command guarding described as "optional", "diagnostic-only", or "follow-up proposal scope" (per P051 current text, direct-command shim + catalog lint are required, not optional),
-- "xcode MCP entry triggers shim injection" (pure Xcode MCP must not be shimmed per the XcodeBrokerRequired vs XcodeShimInjectionSignal split),
-- "probe sends session/new" or "probe sends mcpServers: []" (the probe sends initialize only),
-- "byte-identical ProviderLaunchSpec between probe and session" without the capability-slice qualifier (credential_env intentionally differs),
-- "-l/--log consumes argument" (it is a no-arg mode modifier per xcrun --help),
-- "argv sorted before hashing" for ProbeKey (argv is ordered, positional).
-
-When the proposal revises a contract, the artifact must be updated in the same PR; the gate rejects sign-off otherwise. This prevents an allowed-verdict artifact from silently carrying obsolete guidance that implementers might follow in preference to the proposal body.
-
----
-
-## 4. Problem Statement
-
-### 4.1 ACP session reuse does not reduce first-start parallel bridge count
-
-Session reuse works only after a provider session exists. In a fan-out phase, UX and UI reviewers both need their first session. If each first session spawns a direct `xcrun mcpbridge`, Xcode can present two modal interactions before either agent can make progress.
-
-### 4.2 Direct stdio MCP is not an acceptable P051 architecture
-
-The obvious implementation - pass the same `xcrun mcpbridge` process to multiple ACP providers - is unsafe. MCP over stdio assumes one JSON-RPC client owns stdin/stdout. Two independent providers cannot concurrently write to the same stdio stream without corrupting request/response ordering and lifecycle state.
-
-A second option, wrapping provider-facing stdio with a Chainworks proxy process, is also out of scope for P051. It preserves current provider compatibility, but it keeps the architecture anchored to stdio and leaves several unresolved risks:
-
-- every provider would still believe it owns a local process lifecycle, while Chainworks would hide a shared backend behind it
-- process supervision would now span provider subprocesses, proxy subprocesses, broker state, and backend bridge state
-- permission isolation would rely on proxy correctness rather than a first-class server-side session/auth model
-- future replacement with HTTP streaming would require another transport migration
-
-P051 therefore requires HTTP streaming feasibility research before implementation. If that research does not support HTTP streaming for the required providers, implementation must stop and the proposal must be revised.
-
-### 4.3 Current runtime cannot report bridge sharing
-
-`AgentExecution` records requested/predicted/actual MCP extensions and startup latency, but it does not distinguish:
-
-- direct backend bridge startup
-- HTTP client session startup
-- backend bridge reuse
-- backend bridge restart after Xcode PID drift
-
-Without this evidence, operators cannot prove whether a retry avoided new Xcode bridge starts.
-
-### 4.4 Failure semantics are unclear
-
-If one ACP session is cancelled, times out, or exits after `session/close`, the direct process model kills that session's MCP bridge. With a brokered model (per-lease backend), the runtime must explicitly define when a lease is released and when its backend bridge subprocess is closed without affecting sibling leases that share the same Xcode PID.
-
-### 4.5 Xcode is host-session-bound, not safely fake-home-bound
-
-The existing ACP isolation model gives each provider process its own home-like root. That remains correct for model/client/plugin state. It is not a reliable execution model for Xcode.
-
-Xcode tools depend on host-user state and services:
-
-- CoreSimulator device sets and runtime services under the real user's `~/Library/Developer/CoreSimulator`
-- Xcode DerivedData and test result bundles under `~/Library/Developer/Xcode`
-- launchd/XPC services such as CoreSimulatorService and `simdiskimaged`
-- Xcode MCP bridge authorization and GUI modal prompts tied to the active user session
-- CloudKit/iCloud account availability for tests that initialize CloudKit-backed stores
-
-When an isolated ACP agent runs `xcodebuild` or `xcrun mcpbridge` directly, Xcode observes a fake `HOME`/`TMPDIR` while its services still belong to the real GUI user. That can produce false "no runtimes" and simulator startup failures even though the same host shell can list simulators successfully.
-
-P051 must therefore define Xcode as a host-session-bound capability:
-
-- the ACP provider keeps fake `HOME` and isolated `CODEX_HOME`
-- Xcode/CoreSimulator work is delegated to the broker or a broker-owned host executor
-- broker-owned Xcode subprocesses run with `HOME=/Users/user` or the daemon's configured operator home, `TMPDIR` from `getconf DARWIN_USER_TEMP_DIR`, and normal macOS cache semantics
-- lease tokens and permission filters remain per agent execution
-- the whole ACP provider must not be granted the real home only because it requested Xcode
-
-This makes P051 a reliability and isolation boundary, not only a bridge pooling optimization.
-
----
-
-## 5. Core Behavior
-
-### 5.1 Xcode MCP HTTP streaming broker
-
-The control-plane owns a singleton `XcodeMcpBridgePool` inside the ACP runtime layer.
-
-Pool key:
-
-```text
-xcode_pid + workspace_root + mcp_server_id + runtime_profile_id + permission_profile_id
-```
-
-The broker exposes one HTTP streaming MCP endpoint per ACP session (per lease). ACP providers receive an HTTP streaming MCP server entry in `session/new`; they do not receive a direct `xcrun mcpbridge` command and they do not receive a Chainworks stdio proxy command.
-
-**Backend model (post-research):** `xcrun mcpbridge` is stdio-only and single-client-per-process by design, but Phase 0 probes confirmed that multiple `mcpbridge` subprocesses targeting the same Xcode PID coexist cleanly. The broker therefore spawns **one backend `mcpbridge` subprocess per HTTP client session (per lease)**, not one shared backend across leases:
-
-```bash
-HOME=<host-user-home> TMPDIR=<host-user-temp> MCP_XCODE_PID=<pid> xcrun mcpbridge
-```
-
-**Initialize-phase serialization:** bridges started within ~100 ms of each other race at the Xcode XPC tool-service setup and neither completes `tools/list`. The broker serializes bridge spawn + `initialize` per Xcode PID using a Mutex; the lock is released the moment `initialize` responds. Parallel `tools/call` and `tools/list` requests from sibling leases proceed concurrently.
-
-The pool key still groups leases by policy fingerprint for permission filtering, lifecycle accounting, and observability — but it does not imply a shared backend process across leases. The provider-facing contract for P051 is HTTP streaming only.
-
-### 5.1.2 Provider capability preflight and capability cache
-
-ACP HTTP MCP must not be sent to a provider that has not advertised `mcpCapabilities.http == true` in its `initialize` response. The P051 wire emitter must gate HTTP MCP on a checked capability, and that check must happen **before** engine MCP resolution returns a transport — otherwise `resolve_mcp_servers` could mint an HTTP `ResolvedMcpServerTransport` for a stdio-only provider, a lease would be reserved, and failure would surface late inside `session/new`.
-
-**Capability owner.** `AcpRuntimeManager` owns a `ProviderCapabilityCache: HashMap<ProbeKey, AgentCapabilities>`. The probe key captures **every input that could change what the provider advertises** — not just binary identity, because the same binary can report different capabilities under different launch configurations:
-
-```rust
-struct ProbeKey {
-    adapter_family: AdapterFamily,
-    runtime_profile_id: RuntimeProfileId,
-    binary_fingerprint: BinaryFingerprint,   // path + mtime + size
-    launch_args_fingerprint: sha256,          // ORDERED argv (byte-for-byte, positional); never sorted — order is part of launch contract
-    launch_env_fingerprint: sha256,           // sorted capability-relevant env
-    adapter_settings_fingerprint: sha256,     // AcpSessionConfig.extra / mode / config_options
-}
-```
-
-`launch_args_fingerprint` is computed over the **ordered** argv vector exactly as it will be passed to `execve` — position-preserving, never sorted. Argv order is part of the launch contract: later options can override earlier ones, option-with-arg flags consume the next token positionally, and flag interleaving changes behavior. Sorting argv before hashing would let two different launch orders share a cached `AgentCapabilities` result — e.g., `[--sdk, ios, --toolchain, swift-latest]` and `[--toolchain, swift-latest, --sdk, ios]` would hash identically after sorting even though they are potentially different launch shapes. Serialization: concatenate argv tokens with a NUL byte separator (`'\x00'`) to avoid ambiguity with tokens containing whitespace.
-
-`launch_env_fingerprint` covers the `capability_env` subset of env vars (`PATH` excluding shim-dir prefix, `HOME`, `TMPDIR`, `DEVELOPER_DIR`, `CODEX_HOME`, `GEMINI_API_KEY` presence flag, `CLAUDE_AGENT_*` feature flags, `ACP_EXPERIMENTAL_*`) — sorted before hashing (env is a map, order does not matter), never secret values, only redacted/boolean fingerprints. It does **not** include `credential_env` (shim token, shim socket, shim-dir `PATH` prefix), so rotating the shim token between reuses does not invalidate the capability cache. `adapter_settings_fingerprint` covers the `AcpSessionConfig` knobs that alter provider behavior (mode, config options, structured-output intent). Any change in any fingerprinted input forces a fresh probe.
-
-```rust
-impl ProviderCapabilityProbe {
-    // Probe API takes a launchable spec, not a fingerprint key.
-    // ProbeKey is reserved for cache identity and audit; it cannot spawn a process.
-    pub async fn probe(
-        launch_spec: &ProviderLaunchSpec,
-    ) -> Result<AgentCapabilities, CapabilityProbeError>;
-}
-```
-
-The probe launches the provider binary **from `launch_spec` using its concrete `binary_path`, `launch_args`, `capability_env`, and `adapter_settings`**. ACP `initialize` already returns `AgentCapabilities.mcpCapabilities.http` in its response, so the probe **does not send `session/new`** — it sends `initialize` only, reads the returned `AgentCapabilities`, and closes via stdin EOF (no session was ever created; there is no session id to close). No `session/new` payload is constructed for the probe, which aligns with the §8.1 fail-closed guarantee: "no per-lease state allocated, no `session/new` payload constructed" applies to **all** provider interactions — probe included.
-
-`AcpRuntimeManager::ensure_provider_capabilities(&launch_spec)` computes `launch_spec.probe_key()` for cache lookup, and on miss calls `ProviderCapabilityProbe::probe(launch_spec)` to launch the probe. The manager then caches `AgentCapabilities` by `ProbeKey`. One probe per unique `ProbeKey` per daemon process lifetime; result cached in-memory.
-
-No public API in this module accepts a bare `ProbeKey` to spawn a process — keys are for cache lookup and audit, launches require a full spec.
-
-**Preflight timing.** During `ExecutionRequest` construction, the caller first assembles a `ProviderLaunchSpec` (the exact launch shape a real `session/new` would use — binary path, argv, env, adapter settings, mode, config options), then asks `AcpRuntimeManager::ensure_provider_capabilities(&launch_spec)` for capabilities. The manager computes `ProbeKey::from(&launch_spec)` internally and returns the cached or freshly probed `AgentCapabilities`. This runs **before** `engine::mcp::resolve_mcp_servers` is called.
-
-**Capability env vs credential env.** Shim credentials (`$CHAINWORKS_XCODE_SHIM_TOKEN`, `$XCODE_SHIM_DISPATCH_SOCKET`, shim-dir `PATH` prefix) are minted **per provider session**. A capability probe runs before any provider session exists and before any lease is minted — if the probe were required to carry real shim credentials, we'd have to mint a token for a probe that might be rejected before ever reaching `session/new`, or generate inert placeholders that make the probe diverge from the real session. Both paths break either the lifecycle fail-closed rule or the byte-identical ProbeKey guarantee.
-
-P051 splits the launch env into two disjoint subsets:
-
-- **Capability env** (`capability_env`): env vars that could change provider-advertised capabilities — `PATH` (excluding shim-dir prefix), `HOME`, `TMPDIR`, `DEVELOPER_DIR`, `CODEX_HOME`, `ACP_EXPERIMENTAL_*`, and any other capability-gating variables declared in the adapter's allowlist. This subset is byte-identical between probe and real session, and it is the **only** env contribution to `ProbeKey`.
-- **Credential env** (`credential_env`): session-scoped credentials that do not influence provider capability advertisement — `CHAINWORKS_XCODE_SHIM_TOKEN`, `XCODE_SHIM_DISPATCH_SOCKET`, and the shim-dir `PATH` prefix. Present only in the real session's env; absent from the probe's env. Not fingerprinted in `ProbeKey`.
-
-The probe's actual subprocess env is exactly `capability_env`. The real session's subprocess env is `capability_env ⊕ credential_env` (merged with credential env taking precedence on key collision — only `PATH` would collide, where the shim-dir prefix is prepended).
-
-```rust
-pub struct ProviderLaunchSpec {
-    pub adapter_family: AdapterFamily,
-    pub runtime_profile_id: RuntimeProfileId,
-    pub binary_path: PathBuf,
-    pub launch_args: Vec<String>,
-    pub capability_env: BTreeMap<String, String>,  // byte-identical across probe + session; feeds ProbeKey
-    pub credential_env: BTreeMap<String, String>,  // real-session only; NOT in ProbeKey; empty for probe
-    pub adapter_settings: AcpSessionConfig,        // mode, extra, config_options
-}
-
-impl ProviderLaunchSpec {
-    /// ProbeKey derives fingerprints from capability_env ONLY. credential_env is
-    /// intentionally excluded so shim token rotation across reuses does not
-    /// invalidate the capability cache.
-    pub fn probe_key(&self) -> ProbeKey { /* derive from capability_env + args + settings */ }
-
-    /// The env used to launch the capability-probe subprocess.
-    pub fn probe_env(&self) -> &BTreeMap<String, String> { &self.capability_env }
-
-    /// The env used to launch the real session subprocess.
-    pub fn session_env(&self) -> BTreeMap<String, String> {
-        // Merge credential_env over capability_env; PATH is the only known colliding key.
-        let mut merged = self.capability_env.clone();
-        for (k, v) in &self.credential_env {
-            match k.as_str() {
-                "PATH" => {
-                    // Prepend credential PATH (shim dir) onto capability PATH.
-                    if let Some(cap_path) = merged.get(k) {
-                        merged.insert(k.clone(), format!("{}:{}", v, cap_path));
-                    } else {
-                        merged.insert(k.clone(), v.clone());
-                    }
-                }
-                _ => { merged.insert(k.clone(), v.clone()); }
-            }
-        }
-        merged
-    }
-}
-```
-
-impl AcpRuntimeManager {
-    pub async fn ensure_provider_capabilities(
-        &self,
-        launch_spec: &ProviderLaunchSpec,
-    ) -> Result<AgentCapabilities, CapabilityProbeError>;
-}
-
-fn resolve_mcp_servers(
-    request: &ResolveMcpRequest,
-    provider_caps: &AgentCapabilities,
-) -> Result<Vec<ResolvedMcpServer>, McpResolutionError>;
-```
-
-The `ProviderLaunchSpec` is constructed once per `ExecutionRequest` and reused by both the capability probe **and** the real `session/new` dispatch. This closes the gap where a probe's args/env could diverge from the actual session's, producing a stale capability result.
-
-**Adapter API contract.** The current `AcpAdapter` trait owns binary/env/config construction privately inside `open_session(&ExecutionRequest)`. Without a trait-level change, implementers could add the probe while each adapter's `open_session` continues to derive a different env or config, invalidating the preflight guarantee. P051 splits the adapter contract into two distinct specs and three methods:
-
-- **`ProviderLaunchSpec`** — everything needed to **launch the process**: binary path, argv, `capability_env` (stable), `credential_env` (session-only; empty for probe), adapter settings. The probe consumes `probe_env() = capability_env`; the real session consumes `session_env() = capability_env ⊕ credential_env`. The `ProbeKey`-contributing slice (binary, argv, `capability_env`, adapter_settings) is byte-identical between probe and session; `credential_env` is allowed to differ (empty vs populated) and is explicitly not fingerprinted. No MCP payload fields in `ProviderLaunchSpec`.
-- **`SessionNewSpec`** — everything needed to **construct the `session/new` payload**: resolved `mcpServers` list (with broker HTTP URL + bearer token for Xcode entries), effective cwd, mode, model, `_meta`, config options. Never used by the probe; used only by the real session.
-
-```rust
-pub trait AcpAdapter: Send + Sync {
-    /// Build the process launch spec from the execution request. All env/args/config
-    /// derivation lives here — no side-channel construction inside open_session.
-    /// Produces capability_env, launch_args, binary_path, adapter_settings.
-    /// Does NOT mint shim credentials — credential_env is returned empty at this phase.
-    /// Shim credentials are attached by runtime.attach_session_credentials only after
-    /// capability preflight and MCP resolution both succeed (see two-phase flow).
-    /// Does NOT depend on resolved MCP servers — those are a session/new protocol concern.
-    fn prepare_launch_spec(
-        &self,
-        request: &ExecutionRequest,
-    ) -> Result<ProviderLaunchSpec, AdapterError>;
-
-    /// Build the session/new protocol payload from resolved MCP servers + request.
-    /// This is how resolved Xcode broker HTTP entries (URL + bearer) reach the
-    /// real session. The probe never calls this — capability probing sends
-    /// initialize ONLY, reads AgentCapabilities from the initialize response,
-    /// and closes on stdin EOF. No session/new is constructed by the probe at all.
-    fn prepare_session_new_spec(
-        &self,
-        request: &ExecutionRequest,
-        resolved_servers: &[ResolvedMcpServer],
-    ) -> Result<SessionNewSpec, AdapterError>;
-
-    /// Launch the provider session using the exact launch spec passed to the
-    /// capability probe, then send session/new using session_new_spec. No env/args
-    /// mutation is allowed in this method — the process launch is fully specified
-    /// by launch_spec, and the protocol payload is fully specified by session_new_spec.
-    async fn open_session_with_specs(
-        &self,
-        launch_spec: &ProviderLaunchSpec,
-        session_new_spec: &SessionNewSpec,
-    ) -> Result<AcpSessionHandle, AdapterError>;
-}
-```
-
-The old `open_session(&ExecutionRequest)` method is retired. Callers (the executor in `control-plane/crates/engine/src/executor.rs`) use:
-
-```rust
-let mut launch_spec = adapter.prepare_launch_spec(&request)?; // credential_env empty
-let cap_slice_before = launch_spec.capability_slice();
-let caps = runtime.ensure_provider_capabilities(&launch_spec).await?;
-let servers = resolve_mcp_servers(&request.mcp, &caps)?;
-let session_new_spec = adapter.prepare_session_new_spec(&request, &servers)?;
-runtime.attach_session_credentials(&mut launch_spec, &request).await?;
-debug_assert_eq!(cap_slice_before, launch_spec.capability_slice());
-let handle = adapter
-    .open_session_with_specs(&launch_spec, &session_new_spec)
-    .await?;
-```
-
-**Capability probe vs real session divergence — what is allowed:**
-
-| Field | Capability probe | Real session |
-|---|---|---|
-| `launch_spec.binary_path` | same | same |
-| `launch_spec.launch_args` | same | same |
-| `launch_spec.capability_env` | same (no shim credentials) | same |
-| `launch_spec.credential_env` | empty `{}` | populated (`CHAINWORKS_XCODE_SHIM_TOKEN`, `XCODE_SHIM_DISPATCH_SOCKET`, shim-dir `PATH` prefix) — not fingerprinted |
-| `launch_spec.adapter_settings` | same | same |
-| `session_new_spec.mcpServers` | always `[]` | resolved list (may include broker HTTP entries) |
-| `session_new_spec.cwd` | frozen workspace root | frozen workspace root |
-| `session_new_spec.mode` | same as real | same |
-| `session_new_spec.model`, `_meta`, config | same | same |
-
-The probe sends **only `initialize`** — no `session/new` — and exits on stdin EOF after reading `AgentCapabilities`. The real session later sends `initialize` followed by `session/new` with the resolved `mcpServers` list. The launch spec's **capability slice** (binary, argv, `capability_env`, adapter_settings) is byte-identical between probe and session; `credential_env` is intentionally different (empty vs populated). The `session_new_spec` is used by the real session only — the probe never constructs one.
-
-**Shared config builder.** A single `launch_spec_builder` module (`control-plane/crates/acp/src/launch_spec.rs`) holds the common derivation logic shared across adapters: resolving binary path from runtime profile, composing env from the adapter-specific baseline plus shim injection plus P050 meta-root plus host isolation, deriving adapter_settings from `AcpSessionConfig`. Each adapter's `prepare_launch_spec` calls into this shared builder and adds its adapter-specific overrides (Codex fake-home, Claude mode flags, Gemini `--acp` flag) on top.
-
-**Invariant check (scoped to capability slice, not credential_env).** The whole `ProviderLaunchSpec` cannot be byte-identical between probe and session because `credential_env` intentionally differs. The enforced invariant is that the `CapabilityLaunchSlice` — the subset `(binary_path, launch_args, capability_env, adapter_settings)` that feeds `ProbeKey` — is the same value at both call sites:
-
-```rust
-impl ProviderLaunchSpec {
-    pub fn capability_slice(&self) -> CapabilityLaunchSlice<'_> {
-        CapabilityLaunchSlice {
-            binary_path: &self.binary_path,
-            launch_args: &self.launch_args,
-            capability_env: &self.capability_env,
-            adapter_settings: &self.adapter_settings,
-        }
-    }
-}
-
-// In the executor:
-let slice_before = launch_spec.capability_slice();
-let caps = runtime.ensure_provider_capabilities(&launch_spec).await?;
-// ... resolve_mcp_servers, prepare_session_new_spec ...
-debug_assert_eq!(slice_before, launch_spec.capability_slice());
-let handle = adapter.open_session_with_specs(&launch_spec, &session_new_spec).await?;
-```
-
-In release builds the invariant is enforced structurally — the same `ProviderLaunchSpec` value (moved or borrowed) passes through both call sites; adapters cannot derive a fresh spec inside `open_session_with_specs` because the method receives it as input. `credential_env` is intentionally allowed to differ between `probe_env()` (empty) and `session_env()` (populated) — tests assert the two derived envs **separately**: probe env contains no shim credentials; session env contains shim credentials.
-
-**Adapter tests.** Each adapter (Codex, Claude, Gemini, Auggie, Junie) has a focused test that: constructs an `ExecutionRequest`, calls `prepare_launch_spec`, then launches a fixture provider and inspects the resulting subprocess's env/args (via `/proc/<pid>/environ` on Linux, `ps eww` on macOS, or a fixture that echoes its args/env and exits). The test asserts env and argv match the launch spec field-by-field. Any divergence (additional env var, reordered arg, missed shim env injection) fails the test.
-
-**Fail-closed contract.** If the catalog or broker resolves an MCP entry that requires HTTP transport (Xcode MCP under broker mode) but `provider_caps.mcp_capabilities.http == false`, `resolve_mcp_servers` returns a blocking issue **before any per-lease resources are allocated and before `session/new` is sent**. Note the daemon's shared loopback axum listener for `/mcp`, `/graphql`, and `/xcode-mcp` is always bound by daemon start (see §7 daemon integration) — that is a daemon-lifetime invariant, not a per-request resource. What capability failure prevents is the per-lease state: no `lease_id` is minted, no per-lease bearer token is generated, no `XcodeMcpBridgePool` entry is created, no `mcpbridge` backend subprocess is spawned, no `XcodeShimDispatchLease` is recorded, and no `session/new` payload is constructed. Specifically:
-
-- no `XcodeMcpBridgePool` lease is created,
-- no broker HTTP port or token is minted,
-- `AgentExecution.actual_mcp_observation_json` records `provider_http_mcp_unsupported` with the adapter family and binary fingerprint,
-- the stage settles as `failed_before_output`.
-
-**Cache invalidation.** The cache entry is keyed on the full `ProbeKey` tuple. Any of these invalidates a lookup:
-
-- provider upgrade (binary path, mtime, or size changes),
-- runtime profile change (e.g., switching from `codex-reasoning-high` to `codex-reasoning-medium` where effort-dependent capabilities might differ),
-- launch args change (e.g., Gemini switching between `--acp` and `--experimental-acp`, which happen to be synonyms today but could diverge),
-- launch env change (a capability-gating env var was added/removed/toggled),
-- adapter-settings change (e.g., Codex `mode: full-access` vs `mode: bypassPermissions` affecting advertised tool sets).
-
-A lookup miss triggers a fresh probe, records the fresh result, and proceeds. The cache never returns cross-profile results.
-
-### 5.1.1 Host-user Xcode execution boundary
-
-The broker is the only normal path for Xcode MCP access. It owns the host-session execution boundary for Xcode-bound subprocesses.
-
-Broker-owned Xcode processes must run with:
-
-- `HOME` set to the configured operator home, normally `/Users/user`
-- `TMPDIR` set to the value returned by `getconf DARWIN_USER_TEMP_DIR` for the operator account, not the ACP fake-home temp directory
-- `CODEX_HOME` unset or set only for Codex runtime subprocesses, not used as Xcode's home
-- `MCP_XCODE_PID` set when launching `xcrun mcpbridge`
-- explicit simulator UUIDs whenever a simulator destination is required
-
-ACP provider subprocesses continue to run with isolated per-session home state. The broker must not "fix" Xcode by launching the entire provider with the real user home.
-
-#### Direct Xcode command guard
-
-The reliability goal of P051 is not achieved if the same Xcode-dependent agents still invoke `xcodebuild`, `xcrun simctl`, or `xcrun mcpbridge` directly through their shell tool from a fake-home context — the CoreSimulator / `simdiskimaged` failure mode returns. P051 therefore defines a minimum, enforceable guard rather than leaving direct commands as "diagnostic-only":
-
-**Injection condition — shell-shim is orthogonal to Xcode MCP.** The PATH shim guards **direct shell invocations** of Xcode tools. Pure Xcode MCP agents (catalog requests the `xcode` MCP server but the agent never shells out to `xcodebuild`/`simctl`/`mcpbridge`/`xcrun`) do **not** need the shim — they call MCP tools over the broker's HTTP endpoint and never spawn an Xcode subprocess themselves. Injecting the shim for pure-MCP agents would add no safety and would needlessly forbid session reuse.
-
-P051 therefore separates two orthogonal signals:
-
-- **`XcodeBrokerRequired: bool`** — the agent requested Xcode MCP in its catalog entry. This drives broker lease minting and `session/new.mcpServers` HTTP entry construction, but does **not** trigger shim injection. Fully compatible with session reuse per §5.6.
-- **`XcodeShimInjectionSignal: bool`** — the agent can invoke Xcode shell commands directly. This drives PATH-shim injection and `XcodeShimDispatchLease` minting, and forbids session reuse per §5.3.
-
-Both signals are compile-time booleans attached to `ResolvedAgent` and available pre-resolution. `prepare_launch_spec` reads **`XcodeShimInjectionSignal`** only — it does not depend on `XcodeBrokerRequired` (the broker entry is added later via `session_new_spec`, after capability preflight passes).
-
-**`XcodeShimInjectionSignal` triggers (shell-shim only):**
-
-1. any declared `requires_xcode_host_execution: true` (catalog field, per §7 catalog chain).
-2. any **modeled direct-command declaration** in the agent catalog entry that matches a known Xcode-tool lexeme (`xcodebuild`, `simctl`, `mcpbridge`, `xcrun`, or any absolute path beginning with `/Applications/Xcode.app/Contents/Developer/`). The lint scans **every** field in the catalog entry where direct shell commands can be declared: `run` blocks, `shell_allowlist` entries (current catalog shape), `allowed_commands`, `tools.shell.commands`, and any adapter-specific shell-capability field defined by the catalog schema.
-
-**`XcodeBrokerRequired` triggers:**
-
-1. any **requested** MCP entry in the catalog entry with server id `xcode` or `adapter_family: xcode_*`. The compiled `ResolvedAgent` exposes the requested MCP inventory independent of whether resolution later succeeds.
-
-Detection for both signals is performed by the catalog lint pass, which runs **at run-start compilation**, before `resolve_mcp_servers`. Both signals are static properties of `ResolvedAgent`, not runtime state.
-
-**Four combinations:**
-
-| Agent pattern | `XcodeBrokerRequired` | `XcodeShimInjectionSignal` | Shim injected | Session reuse allowed |
-|---|---|---|---|---|
-| Pure Xcode MCP (no direct shell Xcode) | true | false | no | yes (per §5.6) |
-| Direct `xcodebuild` in shell allowlist, no MCP | false | true | yes | no (per §5.3) |
-| Both Xcode MCP AND direct shell Xcode | true | true | yes | no |
-| Neither | false | false | no | yes (non-Xcode agent; P051 not relevant) |
-
-This cleanly resolves the previous contradiction: pure Xcode MCP can reuse its brokered session and backend bridge across executions (§5.6 gate fixtures apply); shell-shim-enabled agents force fresh sessions to preserve observation truth (§5.3 rule). The two cases never collide because `XcodeBrokerRequired` alone does not trigger the shim.
-
-`prepare_launch_spec` reads `XcodeShimInjectionSignal` from `ExecutionRequest.resolved_agent` but **does not mint any credentials** at this phase — `credential_env` is returned empty. Credentials are attached in a second explicit phase (`attach_session_credentials`) only after capability preflight and MCP resolution both succeed, and only when `XcodeShimInjectionSignal: true`.
-
-**Seven-phase executor flow.** `prepare_launch_spec` runs before capability preflight, so it cannot mint credentials — if it did, an HTTP-incompatible provider would leak per-session state before the fail-closed path runs. Broker lease reservation must happen in an explicit phase so `resolve_mcp_servers` does not hide global broker mutation. The executor calls:
-
-```rust
-// Phase 1: pre-preflight. credential_env is empty. No MCP state yet.
-let mut launch_spec = adapter.prepare_launch_spec(&request)?;
-let cap_slice_before = launch_spec.capability_slice();
-
-// Phase 2: capability preflight.
-let caps = runtime.ensure_provider_capabilities(&launch_spec).await?;
-// On failure (e.g., provider_http_mcp_unsupported): no broker state, no shim
-// state, launch_spec discarded. Fail-closed path returns.
-
-// Phase 3: MCP resolution — pure function over request + caps. Produces
-// ResolvedMcpServer entries with placeholder URL/token for HTTP broker entries.
-// No broker state allocated yet.
-let mut servers = resolve_mcp_servers(&request.mcp, &caps)?;
-
-// Phase 4: broker lease reservation — the single code path that reserves Xcode
-// broker leases (URL + bearer + pool entry + backend mcpbridge placeholder) and
-// fills in the HTTP entries in `servers`. AcpRuntimeManager owns broker state.
-// Returns a LeaseReservationGuard that rolls back all reservations if any later
-// phase returns Err (Drop releases minted state).
-let broker_guard = runtime.attach_broker_leases(&mut servers, &request).await?;
-
-// Phase 5: session/new payload construction from fully-populated servers.
-let session_new_spec = adapter.prepare_session_new_spec(&request, &servers)?;
-
-// Phase 6: shim credential attachment — mints XcodeShimDispatchLease +
-// writes shim env into credential_env. Runs only when XcodeShimInjectionSignal.
-runtime.attach_session_credentials(&mut launch_spec, &request).await?;
-
-// Phase 7: launch real session. Commit broker_guard on success.
-debug_assert_eq!(cap_slice_before, launch_spec.capability_slice());
-let handle = adapter.open_session_with_specs(&launch_spec, &session_new_spec).await?;
-broker_guard.commit(); // broker leases are now owned by the live session
-```
-
-**Ownership of broker state.** `AcpRuntimeManager::attach_broker_leases` is the **sole** code path that reserves `XcodeMcpBridgePool` entries and mints per-lease bearer tokens. It accepts `&mut [ResolvedMcpServer]`, finds HTTP-transport entries needing a broker URL, reserves a lease for each, and writes the final URL and bearer into the entry. The returned `LeaseReservationGuard`:
-
-- On `commit()` (success path after provider session opens): ownership of the reserved leases transfers to the live session; broker state is now canonically associated with the session id.
-- On `Drop` without `commit()` (any phase 5-7 error, or `?` propagation from the executor before commit): all reserved leases are released, backend `mcpbridge` subprocesses are reaped, pool entries are removed. No leaked broker state after a mid-flow failure.
-
-`resolve_mcp_servers` does **not** mutate broker state — it is a pure function that produces placeholder HTTP entries. Broker mutation is concentrated in `attach_broker_leases` with explicit rollback. The resolver signature therefore does not need a runtime handle; the allocator handle is used in the separate phase-4 call.
-
-**What "no per-lease state" means under fail-closed (§8.1 contract):** if capability preflight or MCP resolution fails, **`attach_broker_leases` is never called** — no broker pool entry, no bearer token, no backend `mcpbridge` spawn. If capability and resolution succeed but a later phase (5, 6, 7) fails, the `LeaseReservationGuard` drops and rolls back the broker state that phase 4 reserved. Either way, no leaked state survives a failing request. The debug-assert after phase 6 verifies that `attach_session_credentials` only mutates `credential_env`, never the capability slice.
-
-An agent that uses direct `xcodebuild` but has no Xcode MCP server still receives the shim, the token, and the socket — trigger (2) fires at catalog compilation time (direct-shell lexeme detected). An agent that **only** requests Xcode MCP (no direct-shell Xcode commands, no `requires_xcode_host_execution`) gets `XcodeBrokerRequired: true` but `XcodeShimInjectionSignal: false` — the broker lease and `session/new.mcpServers` HTTP entry are minted after capability preflight succeeds, but no PATH shim is injected. The agent has no way to shell out to Xcode tools anyway, so the shim would be useless overhead; crucially, this keeps pure Xcode MCP eligible for session reuse per §5.6. Agents with zero Xcode signals get no shim; their provider subprocess keeps its unmodified `PATH`.
-
-If capability preflight or MCP resolution **later** fails (e.g., `provider_http_mcp_unsupported`), the run is aborted per §5.1.2 before `attach_session_credentials` is ever called. `credential_env` remains empty on the discarded `launch_spec`, no `XcodeShimDispatchLease` is created, no shim token is minted, no Unix socket binding is allocated. The fail-closed contract is absolute — shim state allocation happens only on the success path, after both capability preflight and MCP resolution pass.
-
-**Guard mechanism — PATH shim + absolute-path catalog lint.** For agents meeting any injection trigger, the broker prepends a daemon-managed shim directory to the provider's `PATH`:
-
-```text
-$XCODE_SHIM_DIR:$ORIGINAL_PATH
-```
-
-The shim directory contains executables named `xcodebuild`, `simctl`, `mcpbridge`, **and `xcrun`** that intercept shell invocations. Each shim is a small Rust binary that:
-
-1. reads the invocation arguments and the current process's effective home (from `$HOME`),
-2. reads a daemon-issued dispatch token from the environment (`CHAINWORKS_XCODE_SHIM_TOKEN`),
-3. connects to the broker's local Unix-domain dispatch socket (`$XCODE_SHIM_DISPATCH_SOCKET`),
-4. dispatches to one of three paths based on agent policy (below).
-
-**`xcrun` shim — mode-aware argv parser.** `xcrun` has three distinct **modes** that change whether the named tool is actually executed. Treating every flag as generic option-with-arg/without-arg (the previous spec) misclassifies mode flags and can consume a tool name as a flag argument (e.g., `xcrun -r mcpbridge` under that model would swallow `mcpbridge` as an arg to `-r`, missing the reject). The shim parser must be mode-aware.
-
-Mode flags from `xcrun --help` (macOS 26.3):
-
-- **Run mode** (default; tool **is executed**): `-r <tool>`, `--run <tool>`, or bare `xcrun <tool>` with no mode flag. In all three forms the named tool is executed via `execve`. For P051 policy: inspect the resolved tool name, apply reject/route/passthrough.
-- **Find mode** (tool **is NOT executed** — `xcrun` prints the resolved path and exits): `-f <tool>`, `--find <tool>`. Previously passed through because no execution happens, but the printed absolute path can then be reused by the same shell-capable agent as `/usr/bin/xcrun mcpbridge` (or direct `/Applications/Xcode.app/.../mcpbridge` invocation) — a find-then-exec chain that bypasses the PATH shim. P051 therefore **rejects Find mode for the three guarded tools** (`mcpbridge`, `xcodebuild`, `simctl`); the shim exits 127 with `policy_reason: "xcrun_find_of_guarded_tool_rejected"`, `tool: <resolved>`, `via_xcrun: true`, and no absolute path is leaked to stdout. `xcrun --find` for any other tool (`dtrace`, `swiftc`, `xar`, etc.) still passes through — those tools are not P051's concern. Agents that need the absolute path of `xcodebuild` or `simctl` for a legitimate use case must declare `requires_xcode_host_execution: true` and invoke the tool via the shim route; agents never need the absolute path of `mcpbridge` because `mcpbridge` is broker-only.
-- **Show modes** (no tool arg): `--show-sdk-path`, `--show-sdk-version`, `--show-sdk-platform-path`, `--show-sdk-platform-version`, `--show-sdk-build-version`. No execution. Pass through silently.
-
-Flag classification (from local `xcrun --help`):
-
-- **Option-with-arg** (consume next token): `--sdk <name>`, `--toolchain <name>`.
-- **No-arg flags** (do not consume next token): `-l` / `--log` (enables logging — **no-arg**, not option-with-arg), `--verbose`, `--no-cache`, `--kill-cache`, `--help` / `-h`, `--version`. Treating `-l`/`--log` as option-with-arg was a bug in an earlier revision — under that model, `xcrun -l mcpbridge` could consume `mcpbridge` as the log argument and pass through unchecked. They are mode modifiers, not options that take a path.
-
-**Parser algorithm:**
-
-```text
-mode := Run  // default
-tool := None
-i := 1
-while i < argv.len():
-  token := argv[i]
-  match token:
-    "-r" | "--run":           mode := Run;  i += 1; tool := argv.get(i); break // tool follows
-    "-f" | "--find":          mode := Find; i += 1; tool := argv.get(i); break
-    t if t.starts_with("--show-sdk-"):  mode := Show; break // no tool
-    "--sdk" | "--toolchain":  i += 2 // consume flag + its arg
-    "-l" | "--log" |
-    "--verbose" | "--no-cache" | "--kill-cache" |
-    "--help" | "-h" | "--version":
-                              i += 1 // no-arg flag
-    t if t.starts_with("-"):  return reject("xcrun_unknown_option")
-    _:                        tool := Some(token); break // positional tool
-
-dispatch according to mode:
-  Show → pass-through (no tool to inspect)
-  Find + tool ∈ {xcodebuild, simctl, mcpbridge} → reject (xcrun_find_of_guarded_tool_rejected)
-  Find + other tool → pass-through (no execution; path just printed for non-guarded tools)
-  Run + tool is None → pass-through (malformed; let xcrun error)
-  Run + tool ∈ {xcodebuild, simctl} → apply reject/route/diagnostic policy
-  Run + tool == mcpbridge → unconditional reject
-  Run + other tool → pass-through (dtrace, xar, notarytool, swiftc, etc.)
-```
-
-Pass-through always uses `execve("/usr/bin/xcrun", argv, envp)` to avoid shim recursion via `PATH`. Pass-through is silent (no observation).
-
-**Absolute-path containment (catalog lint).** PATH shims cannot intercept direct absolute-path invocations like `/usr/bin/xcrun simctl list` or `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild build`. P051 closes this with a **catalog lint step**, not a runtime interceptor, because libc `execve`-level audit requires `DYLD_INSERT_LIBRARIES` (SIP-protected for Apple-signed binaries) or kernel extensions (deprecated). The lint runs at run-start during workflow compilation.
-
-**Lint blast radius — every direct-command declaration field (aligned with shim-signal scope).** The hard-fail lint scans **the same set of fields that can set `XcodeShimInjectionSignal`** — any divergence would let an agent escape the hard-fail lint while still triggering shim injection (or vice versa). Both scans cover:
-
-- `run` block command path and argv,
-- `run` block env values (specifically `DEVELOPER_DIR=…` paired with Xcode tools),
-- `shell_allowlist` entries (current catalog shape),
-- `allowed_commands` entries,
-- `tools.shell.commands` entries,
-- adapter-specific shell-capability fields defined by the catalog schema,
-- required-tool declarations if the catalog schema models them separately.
-
-For each field, the matcher rejects absolute paths matching the patterns listed below. An absolute `/usr/bin/xcrun mcpbridge` in `shell_allowlist` fails run-start with `xcode_absolute_path_forbidden` the same way as the same path in a `run` block.
-
-For each structured field, absolute paths matching the patterns below **fail run-start** with `xcode_absolute_path_forbidden`:
-
-- `/usr/bin/xcrun`, `/usr/bin/xcodebuild`,
-- `/Applications/Xcode.app/Contents/Developer/`,
-- `/Applications/Xcode*.app/Contents/Developer/`,
-- `DEVELOPER_DIR=…xcodebuild`, `DEVELOPER_DIR=…simctl` assignments.
-
-Catalog authors must instead use bare tool names (which the shim can intercept) or opt into `requires_xcode_host_execution: true` with host-executor routing.
-
-**Prompt/system-instruction text — warning only.** Prompt text, system instructions, agent descriptions, and any other free-form narrative fields **do not hard-fail the lint**. P051 documentation itself, internal audit notes, and normal review prompts legitimately quote `/Applications/Xcode…`, `/usr/bin/xcrun`, and `DEVELOPER_DIR=…` as inert evidence. Scanning these would block runs whose context merely discusses the forbidden commands, not runs that execute them.
-
-Instead, prompt-text matches are emitted as a **warning** (`xcode_absolute_path_in_prompt`). Because the catalog lint runs at workflow compilation / run-start (before the executor creates the `AgentExecution` row via its claim path), warnings cannot be written directly to `actual_xcode_runtime_observation_json` — the target row does not exist yet. P051 uses a **two-step carrier**:
-
-1. **Compile-time.** `catalog_lint.rs` produces a `PromptLintWarnings: Vec<PromptLintWarning>` per agent, attached to `ResolvedAgent` alongside `XcodeBrokerRequired` and `XcodeShimInjectionSignal`. Each warning records the match pattern, the source field path (`agent.prompt`, `agent.system_instruction`, `agent.description`, etc.), and a short excerpt for operator review.
-2. **Execution-time.** When the executor creates the `AgentExecution` row for that agent, it reads `ResolvedAgent.prompt_lint_warnings` and appends each entry to `actual_xcode_runtime_observation_json.xcode_shim_events` as a `{tool: null, policy_decision: "prompt_warning", policy_reason: "xcode_absolute_path_in_prompt", source_field, excerpt}` entry. The append is part of the same transaction that writes the `AgentExecution` row, so warnings either both land or neither does — no partial handoff.
-
-This ensures warnings are durable, attributed to the correct `AgentExecution`, and never lost between compilation and execution. Operators see them in reports and may choose to sanitize the prompt; they do not block the run.
-
-**Rationale for the split.** Hard-fail on executable fields, soft-warn on narrative. Executable fields are unambiguous: if they are present, the agent *will* attempt to run that command. Narrative fields are ambiguous: quoting a path in a review prompt is benign, but an LLM later synthesizing a shell command from that text is a residual risk handled by the other mitigations below.
-
-Diagnostic mode (`CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`) skips the hard-fail and warning scans **only for `xcodebuild` and `simctl` paths**. Any structured field whose absolute path resolves to `mcpbridge` (bare `/Applications/Xcode.app/.../mcpbridge`, `/usr/bin/xcrun mcpbridge`, or any option-prefixed `xcrun` variant that ends in `mcpbridge`) still hard-fails run-start with `xcode_absolute_path_forbidden` in diagnostic mode. This preserves the broker-only-mcpbridge contract: PATH shims cannot intercept absolute invocations, so if the lint also stepped aside for `mcpbridge`, an agent shell could run raw stdio MCP bridge via `/usr/bin/xcrun mcpbridge` outside the broker's bearer/filter/observation path. The mcpbridge exclusion is absolute — there is no diagnostic mode override anywhere in P051.
-
-Diagnostic mode logs a WARN at daemon start and an additional WARN each time the lint is skipped for a specific agent's structured field.
-
-**Scope of guarantee.** The containment model is:
-
-- **PATH-based invocations** of `xcodebuild`, `simctl`, `mcpbridge`, and `xcrun <subcommand>`: enforced by shim at runtime.
-- **Absolute-path invocations**: enforced by catalog lint at run-start; not enforced at runtime.
-- **Agent prompt-time improvisation** (an LLM synthesizing an absolute path mid-run): not blocked by P051. This is a residual risk. Mitigations: (a) prompt templates for Xcode-dependent agents include explicit "use bare `xcodebuild`, never absolute paths" instruction; (b) **ACP `session/update` shell-tool argv observer** — a runtime owner in the ACP transport layer captures every tool-call event the provider emits in `session/update` notifications, runs the **residual-path warning matcher** on each tool call's argv and command-string fields, and appends warnings to `actual_xcode_runtime_observation_json.xcode_shim_events`. The matcher covers the full residual surface:
-  - `/Applications/Xcode.app/Contents/Developer/` and `/Applications/Xcode*.app/Contents/Developer/` (any Xcode binary under Developer dir),
-  - `/usr/bin/xcrun` (including `/usr/bin/xcrun mcpbridge`, `/usr/bin/xcrun simctl`, `/usr/bin/xcrun xcodebuild`, and option-prefixed forms — the warning fires on any match to `/usr/bin/xcrun\b`, with a stronger-priority warning if a subsequent token parses to `mcpbridge`, `xcodebuild`, or `simctl` under the same mode-aware parse used by the `xcrun` shim),
-  - `/usr/bin/xcodebuild` (direct absolute-path xcodebuild),
-  - `/usr/bin/simctl` (direct absolute-path simctl),
-  - `DEVELOPER_DIR=` prefixes when paired with any Xcode tool in the same shell command.
-  The warning does not block execution (the residual is out of the enforced boundary) but it **is** emitted even for the highest-risk case (`/usr/bin/xcrun mcpbridge`) so operators have a trail to audit after the fact. (c) A follow-up proposal can add libc audit or sandbox-exec profiles if the residual risk becomes a real failure mode in dogfood.
-
-**ACP session/update observer contract.** The `ACP Stream Event Mapper` (existing module per `control-plane/crates/acp/src/`) gets a new sub-component `XcodeResidualPathObserver` that hooks the ACP `session/update` notification handler for every provider session. On each `session/update` with `type: "tool_use"` or the provider-specific equivalent that carries shell-tool argv, the observer:
-
-1. Extracts the argv or command-string fields the provider surfaced (schema differs per provider — see below).
-2. Runs the residual-path matcher defined above on each token / on the joined command string.
-3. On match: appends a warning entry to the current execution's `actual_xcode_runtime_observation_json.xcode_shim_events` via the same append-only repository path used by shim invocations.
-4. Never blocks or mutates the tool call — observation only.
-
-**Per-provider argv surface in `session/update`:**
-
-- **Claude Agent ACP**: surfaces tool calls including shell tool use in `session/update` notifications with `toolUseBlock.input` containing the shell command string. Observer parses the command string with a POSIX tokenizer before matching.
-- **Codex ACP**: surfaces shell tool calls in `session/update` with argv as a structured array (`input.command`). Observer matches array elements.
-- **Gemini CLI ACP**: surfaces tool-call events with `toolCall.name` and `toolCall.args`. Shell tools expose argv via `toolCall.args.command`. Observer parses the command string.
-- **Auggie / Junie ACP**: to be verified during implementation; if the provider does not emit shell argv in `session/update`, the observer records a daemon-start diagnostic `xcode_residual_observer_unavailable_for: <adapter_family>` warning and the residual is documented as unobserved for that provider family. Dogfooding must include a per-provider smoke test confirming argv visibility.
-
-**Fallback behavior.** If a provider emits shell commands in `session/update` only after execution (post-exec report), the warning fires after the fact — that is still useful for operator audit. If a provider buffers multiple shell calls into one update, the observer fires once per argv entry in the batch. If a provider does not emit shell-tool argv at all (a capability gap), the daemon logs a persistent WARN at provider-session start (`xcode_residual_observer_gap: {provider, session_id}`) and attaches a synthetic `observer_unavailable` marker to the execution's runtime observation envelope so reports show the gap explicitly rather than silently missing warnings.
-
-**Implementation inventory addition (§7).** Add `control-plane/crates/acp/src/xcode_residual_observer.rs` (new module) that owns the `XcodeResidualPathObserver` and is wired into `ACPStreamEventMapper` per-adapter. Per-adapter argv extractors live alongside the existing `AcpSessionConfig` per-adapter logic.
-
-P051 does not claim the residual risk is zero. It claims the enforceable boundary covers **PATH-based commands and catalog-declared absolute paths**, which is the common case observed today.
-
-**Scoped product guarantees.** All "always rejected" and "broker-only" statements elsewhere in P051 (product questions §2, acceptance criteria §11, resolved decisions §13) apply to this enforceable boundary only. Specifically:
-
-- "Direct `mcpbridge` is always rejected" → means rejected **for PATH-based invocations and for catalog-declared structured fields**. An LLM that synthesizes `/usr/bin/xcrun mcpbridge` in a prompt-response shell string at runtime is **not** blocked by the PATH shim (absolute path) and was not scanned by catalog lint (prompt-time, not catalog-time). This residual is handled by mitigation (b) above (post-run warning) and scoped out of the enforced boundary.
-- "Broker is the only code path that spawns `xcrun mcpbridge`" → means the only code path **owned by Chainworks**. It does not claim the OS will prevent any process from spawning `xcrun mcpbridge` — an agent with shell access always has that capability; P051's mechanism is to remove it from catalog-declared and PATH-based paths. A future proposal can add libc/sandbox-exec enforcement for true OS-level rejection.
-
-Acceptance criteria and product questions must be read with this scope. The reliability goal (no more CoreSimulator fake-home failures) is achieved for catalog-authored and PATH-invoked commands — which is the real operational failure mode that prompted P051. LLM-improvised absolute paths mid-prompt are a separate, orthogonal concern with different mitigations.
-
-**Agent policy outcomes.** The agent catalog gains one optional field:
-
-```yaml
-agents:
-  - id: xcode_ux_reviewer
-    requires_xcode_host_execution: false   # default
-```
-
-- `requires_xcode_host_execution: false` (default): shim **rejects** the invocation with structured stderr:
-  ```
-  xcodebuild: direct invocation blocked by Chainworks broker.
-  Agent <id> must use Xcode MCP tools instead of shell commands.
-  Set requires_xcode_host_execution: true in catalog to opt in.
-  ```
-  exit code 127. `actual_xcode_runtime_observation_json.xcode_shim_events` appends an entry with the tool, via_xcrun flag, argv, cwd, and `policy_reason`.
-
-- `requires_xcode_host_execution: true`: shim **routes** the invocation through the broker's host executor over the Unix dispatch socket. The broker runs the actual `/Applications/Xcode.app/Contents/Developer/usr/bin/<tool>` under full host-user environment, streams stdout/stderr/exit back to the shim, appends `policy_decision: "routed"` to `xcode_shim_events`, and appends a matching entry to `actual_xcode_runtime_observation_json.xcode_host_executor_events` with argv, cwd, selected simulator UUID, host-env disposition, env allowlist applied, and exit status.
-
-**Dispatch authority is separate from MCP lease authority.** Shim authentication cannot reuse the broker HTTP MCP bearer token, because:
-
-1. direct-Xcode-only agents have no MCP lease, no HTTP endpoint, and no MCP bearer token — but they still need a dispatch token to reach the broker,
-2. mixing the two authorities would let an MCP lease token be used to request host-executor routing, and vice versa; orthogonal authorities are safer.
-
-P051 introduces a separate **`XcodeShimDispatchToken`** minted by the broker per **provider session** at provider-launch time, whenever the shim is injected (§5.1.1 injection condition — any of the three triggers). It is distinct from any MCP bearer token.
-
-**Token scope: provider-session, not per-execution.** A reused ACP provider session does not relaunch the provider process and therefore cannot receive a new environment variable for a later execution. Binding the token to a single `AgentExecution` would mean: (a) later executions on the same session invoke shims with a stale token whose `agent_execution_id` no longer matches the live execution, (b) frozen workspace/policy data would outlive the execution it was meant to describe. Both are wrong. The token lifetime therefore matches the provider session, not any one execution.
-
-**Current-execution mapping and active-prompt-window model.** The broker owns per-session state:
-
-- `current_execution_id: Option<AgentExecutionId>` — `Some` while a prompt is actively being served, `None` between prompts.
-- `current_prompt_epoch: u64` — monotonically incremented on each `session/prompt`.
-- `active_prompt_started_at: Option<SystemTime>` — timestamp at prompt start; `None` between prompts.
-
-Transitions:
-
-1. **On `session/prompt` send**: increment `current_prompt_epoch`; set `current_execution_id = Some(new_exec)`; set `active_prompt_started_at = Some(now)`.
-2. **On `session/prompt` response or cancel**: set `current_execution_id = None`; set `active_prompt_started_at = None`. The broker considers the prompt window **closed**; `current_prompt_epoch` stays at its last value (for observation).
-
-**Active-prompt-window dispatch rule.** Because the shim is a fresh subprocess spawned by the provider on each shell invocation and reads its env at spawn (env is frozen at provider launch), the shim cannot carry its own "origin epoch" in the dispatch DTO. P051 therefore does not attempt to distinguish "which epoch the shim was spawned for" — it enforces a simpler invariant:
-
-- **Shim dispatch is only valid during an active prompt.** If `current_execution_id.is_some()`, dispatch is attributed to that execution with `dispatch_prompt_epoch: current_prompt_epoch` recorded. This is the in-prompt case.
-- **Shim dispatch during an idle window** (`current_execution_id.is_none()`, i.e., between prompts): rejected with `xcode_shim_no_active_prompt`. The rejection event lands in the lease's `originating_execution_id`'s orphan bucket. This catches delayed subprocesses from a prior prompt that fire after the prompt ends but before the next one starts.
-
-**No cross-prompt attribution — shell-shim-enabled executions do not reuse provider sessions.** A cross-prompt attribution gap would violate P051's per-execution observation truth. Rather than document it as an accepted limitation, P051 eliminates it structurally: **when an execution's `XcodeShimInjectionSignal` is true, the run cannot reuse an existing provider session.** Note this applies only to the shell-shim signal (direct `xcodebuild`/`simctl` via shell). Pure Xcode MCP agents (`XcodeBrokerRequired: true`, `XcodeShimInjectionSignal: false`) have full session reuse as specified in §5.6 — the broker serves them via HTTP MCP, they never shell out, and attribution ambiguity cannot arise.
-
-Reuse-compat check (§5.6) now has an additional rule stacked on top of the existing MCP/policy/workspace matches:
-
-- **Shim-enabled executions force fresh provider sessions.** If either (a) the new execution has `XcodeShimInjectionSignal: true`, or (b) the candidate live session was opened with `XcodeShimInjectionSignal: true`, the P047 `SessionReuseDisposition` is forced to `FreshSessionRequired`. A new provider session is started, a new shim dispatch lease minted, and the new execution is the only one that ever runs on it.
-
-This means shim-enabled agents never share a provider session across executions. There are no cross-prompt dispatches by construction: each provider session serves exactly one `AgentExecution`, so every shim event dispatched on that session's socket belongs to exactly one execution.
-
-**Trade-off.** Shim-enabled agents lose session-reuse savings (no prompt-cycle reuse for them). In return, observation truth is preserved without needing an origin-epoch in the shim dispatch DTO and without any `accepted limitation` caveats. Non-shim-enabled agents (pure Xcode MCP, no direct `xcodebuild` via shell, no `requires_xcode_host_execution`) continue to enjoy full session reuse.
-
-**Future opt-in.** A future proposal (not in P051) can add `allows_shim_dispatch_reuse: true` with a dispatch-tracking mechanism (e.g., broker requires `in_progress_shim_dispatches == 0` before accepting reuse, plus epoch tracking via shim spawn-time socket query) to restore reuse for shim-enabled agents. P051 takes the simpler route: forbid reuse for shim-enabled.
-
-**Dispatch-window model** (still applies within a single provider session, which is now always 1:1 with execution):
-
-- `current_execution_id: Option<AgentExecutionId>` is either `Some(the one execution)` during its prompt or `None` between prompts (only the first prompt matters since there are no later prompts on this session).
-- Shim dispatch during the active prompt: attribute to `current_execution_id`.
-- Shim dispatch during the idle window or after session close: reject with `xcode_shim_no_active_prompt` in the lease's `originating_execution_id` orphan bucket.
-
-This is the narrow case that still supports observation truth: even within one execution, late-firing background dispatches after the prompt completes but before session close → orphan. That's still a clean boundary because the single execution either is the active one or not.
-
-**Dispatch attribution summary:**
-
-| Broker state at dispatch | Behavior |
-|---|---|
-| Active prompt, same session | Attribute to `current_execution_id`; record `dispatch_prompt_epoch` |
-| Idle window (between prompts) | Reject with `xcode_shim_no_active_prompt`; record to `originating_execution_id` orphan bucket with `is_orphan: true` |
-| Provider session closed / lease released | Reject with `xcode_shim_invalid_token` (lease no longer exists) |
-
-Rejected dispatches still produce an observation event, but attributed to a synthetic per-session `orphan` bucket:
-
-```json
 {
-  "xcode_shim_events": [
-    {
-      "tool": "xcodebuild",
-      "policy_decision": "rejected",
-      "policy_reason": "xcode_shim_stale_prompt_epoch",
-      "claimed_execution_id": "<whatever current was at dispatch>",
-      "originating_execution_hint": "<best-effort — last known execution on this lease>",
-      "dispatch_arrived_epoch": 3,
-      "session_current_epoch_at_dispatch": 5
-    }
-  ]
-}
-```
-
-The orphan bucket lives on the provider session's **originating** execution's observation (the one that first opened the lease) with an `is_orphan: true` flag, so operators can trace back delayed events even though they are rejected. This avoids silently losing observability while keeping dispatch attribution strict for live prompts.
-
-**Scope note.** P051 does not support agents that intentionally spawn long-running Xcode processes as background daemons outlasting their prompt — such agents should instead be restructured to keep Xcode work inline. A future proposal can add a `requires_delayed_shim_dispatch: true` opt-in with explicit late-event ownership; P051 fails closed.
-
-The broker owns a per-session mutable pointer `current_execution_id` that is updated **before each `session/prompt` dispatch**:
-
-```rust
-struct XcodeShimDispatchLease {
-    token: String,                              // 32+ random bytes, constant-time compared by broker
-    provider_session_id: ProviderSessionId,     // lifetime owner
-    current_execution_id: Option<AgentExecutionId>, // Some during an active prompt, None between prompts
-    current_prompt_epoch: u64,                  // monotonically incremented on each session/prompt
-    active_prompt_started_at: Option<SystemTime>, // Some during active prompt
-    originating_execution_id: AgentExecutionId, // IMMUTABLE — first execution that opened the lease; owns orphan bucket
-    workspace_root: PathBuf,                    // frozen agent worktree root; set at session/new
-    requires_host_execution: bool,              // frozen at session/new
-    issued_at: SystemTime,
-    expires_at: SystemTime,                     // max = provider session lifetime; typically 24h
-}
-```
-
-Broker-owned state: `HashMap<String /* token */, XcodeShimDispatchLease>`. Minted in memory only; not persisted. Lifetime matches the provider session — released on provider-session close alongside the MCP lease (if any). Tokens are never shared across sessions.
-
-Shim dispatch request handling:
-
-1. `ShimDispatchRequest` arrives at broker with `token`.
-2. Broker looks up lease, validates token (constant-time) and expiry.
-3. Broker reads the current `current_execution_id` — events are appended to **that** execution's `actual_xcode_runtime_observation_json`, not to the execution that originally opened the provider session.
-4. Policy (`requires_host_execution`, `workspace_root` cwd boundary) is read from the frozen lease fields. This is the critical invariant: if a new execution's workspace or policy would differ, the reuse-compat check (below) forces a fresh session instead of mutating frozen fields.
-
-**Reuse-compat extension.** §5.6's compatibility check now also covers shim dispatch authority. A reused session is compatible for a new execution only if **all** of:
-
-- P047 `SessionReuseDisposition` OK,
-- accepted MCP set at `session/new` matches the new request's resolved set (§5.6 original rule),
-- `workspace_root` of the new execution equals the lease's frozen `workspace_root`,
-- `requires_xcode_host_execution` of the new execution's agent equals the lease's frozen flag,
-- the lease itself is not expired,
-- **neither the new execution nor the candidate live session has `XcodeShimInjectionSignal: true`**. Shell-shim-enabled executions are categorically reuse-ineligible per §5.3 — this gate short-circuits the rest of the list; even if all other fields match, a shim-signal on either side forces `FreshSessionRequired`. Pure Xcode MCP (`XcodeShimInjectionSignal: false` on both sides) proceeds through the remaining checks.
-
-Any mismatch forces reuse-incompatible supersession: old provider session closed, old shim lease released, fresh provider session + fresh token + fresh lease minted with the new execution's frozen values.
-
-**Token delivery and visibility (threat model).** The token reaches the shim via `$CHAINWORKS_XCODE_SHIM_TOKEN` in the provider subprocess environment (alongside `$XCODE_SHIM_DISPATCH_SOCKET`). **The token is observable to any shell command the ACP agent runs** — `env`, `printenv`, and reading the env of any subprocess all reveal it. P051 does **not** rely on env-token secrecy.
-
-The token is an **identifier**, not a secret-from-agent. It identifies which provider session's policy/workspace/current-execution state applies to a shim request. All meaningful authorization is **server-side**:
-
-- tool is in the allowlist (`{xcodebuild, simctl}` for route, `mcpbridge` always reject),
-- `requires_host_execution` policy is the frozen lease value (the agent cannot flip it mid-session by forging a different token — a forged token fails constant-time validation),
-- `cwd` must be within the lease's frozen `workspace_root`,
-- the token is not expired,
-- argv is well-formed and matches the tool's known subcommand shape.
-
-A shell-capable agent that reads `$CHAINWORKS_XCODE_SHIM_TOKEN` and issues a crafted `ShimDispatchRequest` directly to the dispatch socket achieves nothing beyond what it could already do by running the shimmed command — the broker still runs the full policy pipeline. The only thing it cannot do is forge a **different** session's token (since tokens are random + constant-time compared) or mint a token for a session that has no lease.
-
-The secrecy we **do** enforce:
-
-- token values are redacted from Chainworks logs, tracing spans, and stored observations (replaced with a hash prefix like `shim-token-a7b2…`),
-- broker-internal HashMap is not exposed to any northbound surface,
-- cross-session tokens cannot be used (each session has its own token; another session's token lookup fails).
-
-What we **do not** claim:
-
-- that an agent cannot read its own `$CHAINWORKS_XCODE_SHIM_TOKEN`,
-- that an agent cannot connect to `$XCODE_SHIM_DISPATCH_SOCKET` directly without going through the shim binary.
-
-**Dispatch DTO.** The shim sends a structured request over the Unix socket (not just argv):
-
-```rust
-struct ShimDispatchRequest {
-    token: String,              // $CHAINWORKS_XCODE_SHIM_TOKEN (XcodeShimDispatchLease.token)
-    tool: ShimTool,             // Xcodebuild | Simctl | Mcpbridge | XcrunPassthrough
-    argv: Vec<String>,          // as received by the shim, minus argv[0]
-    cwd: PathBuf,               // shim captures getcwd() at invocation time
-    provider_env_snapshot: BTreeMap<String, String>, // safe subset (below)
-    claimed_provider_pid: u32,  // client-supplied; broker treats as claim only
-    invocation_ts: SystemTime,
-}
-```
-
-**Peer-credential derivation.** Because a shell-capable agent can connect directly to the dispatch socket with a valid token (see token threat model above), fields supplied in the DTO cannot be trusted as audit identity. The broker independently derives the peer process identity from the Unix socket:
-
-- **macOS**: `getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID)` for pid; `getpeereid(fd, &uid, &gid)` for uid/gid.
-- **Linux** (daemon deployments outside macOS, if any): `getsockopt(fd, SOL_SOCKET, SO_PEERCRED)` for `struct ucred { pid, uid, gid }`.
-
-These yield a `DerivedPeerIdentity { pid, uid, gid }` that the broker records alongside the DTO's `claimed_provider_pid`. The derived identity is authoritative for audit; the claimed pid is preserved as diagnostic evidence of the shim's own view.
-
-**Broker authorization pipeline on receiving `ShimDispatchRequest`:**
-
-1. accept the socket connection; derive peer identity via the platform-appropriate call above. Fail closed with `xcode_shim_peer_cred_unavailable` on platforms where derivation is unsupported.
-2. look up `XcodeShimDispatchLease` by `token`; reject with `xcode_shim_invalid_token` on miss or on constant-time mismatch; reject with `xcode_shim_token_expired` on `SystemTime::now() > expires_at`.
-3. verify the derived `peer_uid` matches the daemon's own uid (the lease is minted for a provider subprocess that inherits the daemon's uid — any other uid is adversarial); reject with `xcode_shim_peer_uid_mismatch`.
-4. resolve `agent_execution_id` from the lease; the broker uses this to append events to the correct `actual_xcode_runtime_observation_json`.
-5. apply `requires_host_execution` policy from the lease (source of truth — not re-read from the agent catalog, to prevent runtime catalog mutation bypassing the decision frozen at provider launch).
-6. apply `workspace_root` cwd check: reject routed `xcodebuild`/`simctl` requests whose `cwd` is outside the lease's `workspace_root`.
-7. dispatch to reject path or host-executor route; append events with both `derived_peer_pid` and `claimed_provider_pid` recorded. If they disagree, emit a `peer_pid_mismatch` warning into the observation (does not reject — a legitimate shim might fork-exec through an intermediate, so the claim may trail by one pid) but the audit record uses the derived value.
-
-**MCP bearer token vs shim dispatch token — non-overlap:**
-
-- An MCP lease's HTTP bearer token authorizes HTTP MCP traffic to the broker's `/xcode-mcp/<lease_id>` endpoint. It cannot be used against the shim dispatch socket.
-- An `XcodeShimDispatchLease.token` authorizes shim dispatch requests on the Unix-domain socket. It cannot be used as an HTTP bearer header.
-- Different tokens, different sockets, different state maps. The broker rejects cross-use by construction (different code paths, different validators).
-
-**cwd handoff.** The shim records `getcwd()` and sends it to the broker. The host executor `chdir`s to this cwd before `execve`ing the real tool — unless the cwd is outside the agent's frozen workspace root (in which case the host executor rejects with `cwd_outside_workspace`). Without cwd propagation, `xcodebuild` run from the agent's working directory (`.chainworks/worktrees/<id>`) would execute in whatever arbitrary directory the broker happened to be running in, breaking workspace-relative invocations.
-
-**Env propagation (allowlist, not pass-through).** The host executor **does not inherit** the provider's env. It constructs the Xcode subprocess env from scratch and selectively merges a narrow allowlist from `provider_env_snapshot`:
-
-| Env var | Policy |
-|---|---|
-| `HOME` | **Overridden** to operator home by host executor. Provider's fake `$HOME` is ignored. |
-| `TMPDIR` | **Overridden** to operator `DARWIN_USER_TEMP_DIR`. Provider's fake `$TMPDIR` is ignored. |
-| `USER`, `LOGNAME` | **Overridden** to operator account name. |
-| `DEVELOPER_DIR` | **Overridden** to `xcode-select -p` value resolved at daemon start. Provider's value is ignored unless the agent declares `xcode_developer_dir_override` (future extension). |
-| `PATH` | **Overridden** to a minimal Xcode-appropriate `PATH`: `/usr/bin:/bin:/usr/sbin:/sbin:<DEVELOPER_DIR>/usr/bin`. Provider's shim-prefixed `PATH` is stripped to avoid shim recursion in the subprocess. |
-| `CODEX_HOME` | **Unset**. Codex fake-home must not leak into Xcode. |
-| `XDG_CACHE_HOME` | **Unset**. Not used by Xcode. |
-| `CHAINWORKS_*` | **Unset**. No control-plane internal env leaks to Xcode subprocess. |
-| `SCHEME`, `CONFIGURATION`, `DESTINATION` | **Propagated** from provider snapshot if present (build-input env). |
-| `CODE_SIGN_STYLE`, `DEVELOPMENT_TEAM` | **Propagated** if present (signing env). |
-| Other env vars | **Dropped by default.** Add to allowlist in host executor config if a legitimate build flow needs them. |
-
-The allowlist is small by design: the host executor is the trust crossing point, so anything not explicitly on the list is untrusted. Agents that need custom env should declare it in the agent catalog `env` block — that declaration is then carried into the snapshot allowlist.
-
-**Workspace root + simulator UUID.** The broker resolves the selected simulator UUID (from `xcrun simctl list --json` at daemon start + per-request resolution if needed) and includes it in the `xcode_host_executor_events` entry. The broker verifies the agent's frozen workspace root matches a known Xcode project/workspace location before running `xcodebuild`; mismatch → reject with `policy_reason: "workspace_mismatch"` in `xcode_shim_events`.
-
-**Streaming contract.** Host executor streams stdout/stderr back to the shim over the same Unix socket as framed chunks (`{stream: "stdout"|"stderr", bytes: <base64>}`) so the agent sees command output interleaved as normal shell would. Exit code delivered as `{exit: <i32>}` terminator. The shim then exits with the same code.
-
-- Diagnostic escape hatch: daemon config `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` (not per-agent — global, for local debugging of `xcodebuild`/`simctl` wrapper edge cases) makes the `xcodebuild`, `simctl`, and `xcrun` (non-mcpbridge branches) shims transparent passthroughs to the real binaries. Logged at WARN level on daemon start if set. Not valid in production deployments.
-- **Diagnostic does NOT bypass the `mcpbridge` guard (within the enforced boundary).** `mcpbridge`, `xcrun mcpbridge`, and option-prefixed variants in **PATH-based invocations and catalog-declared structured fields** remain rejected even with `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`. The broker's MCP policy boundary — bearer tokens, tool-allowlist filtering, request-id rewriting, per-lease observations — is absolute **for the enforced boundary**. It is **not** absolute for LLM-improvised absolute paths at prompt time (`/usr/bin/xcrun mcpbridge` synthesized in a prompt-response shell string): those bypass PATH-shim and catalog-lint by design, receive a runtime warning via the `XcodeResidualPathObserver` (§5.1.1 mitigation (b)), but are **not** blocked. A future proposal can add libc audit or sandbox-exec profiles to close this residual. Engineers debugging Xcode MCP issues can run `xcrun mcpbridge` directly from their own shell outside any ACP agent; there is no scenario where an agent shell should need raw stdio MCP access. If a future operator-approved privileged diagnostic exception is ever required for mcpbridge, it must be a separate flag (not the direct-diagnostic flag), must be authenticated per-use (not a set-and-forget env var), must record an audit event per invocation, and must not be settable by provider-authored shell commands.
-
-**Allowlist scope.** The broker host executor accepts only **`xcodebuild`** and **`simctl`** (whether invoked directly or via `xcrun <subcommand>`). Any other `xcrun`-routed tool (`dtrace`, `xcode-select`, `notarytool`, etc.) is not shimmed and continues to run under the ACP provider's isolated environment — those do not depend on per-user CoreSimulator state.
-
-**`mcpbridge` is never routed through the host executor.** Direct `mcpbridge` or `xcrun mcpbridge` invocations from an ACP provider subprocess are **always rejected by the shim**, regardless of `requires_xcode_host_execution`. Allowing raw `mcpbridge` execution under the operator home would hand the agent a stdio MCP bridge that bypasses the broker's bearer-token lease, per-lease policy filtering, tool-allowlist enforcement, request-id rewriting, and observability. Agents that need Xcode MCP access use the brokered HTTP streaming endpoint delivered through `session/new.mcpServers[]`. The only code path that spawns `xcrun mcpbridge` is the broker itself, internally, one subprocess per lease, never exposed to agent shells.
-
-This keeps the guard narrowly scoped: P051 is not a general "run with real HOME" API, and the host executor is not a back door around the broker's policy boundary.
-
-**Catalog migration.** `examples/agents/agents.yaml` entries that currently include direct `xcodebuild` commands must be updated in the P051 implementation PR:
-
-- agents that should use MCP tools instead: drop the `xcodebuild` allowance, add `requires_xcode_host_execution: false` (explicit).
-- agents that genuinely need direct execution (e.g., release preflight `xcodebuild clean`): add `requires_xcode_host_execution: true`.
-
-The canonical proof gate must include a fixture test that a fake-home agent with `requires_xcode_host_execution: false` gets an explicit shim rejection rather than a CoreSimulator failure deep in the call stack.
-
-### 5.2 Broker as HTTP streaming MCP server facade
-
-For each provider client, the broker exposes a virtual MCP server session over HTTP streaming.
-
-Required minimum MCP methods:
-
-- `initialize`
-- `tools/list`
-- `tools/call`
-- `resources/list` when the backend exposes resources
-- `resources/read` when the backend exposes resources
-- cancellation/close handling if supported by the provider transport
-
-The broker must:
-
-- keep provider-side JSON-RPC ids isolated per HTTP client session
-- rewrite backend request ids to a broker-owned sequence when a backend bridge is used
-- map backend responses back to the originating HTTP client session
-- serialize backend calls unless backend capabilities prove concurrent calls are safe
-- cache `tools/list` after backend initialize, with invalidation on backend restart
-- preserve backend errors without converting them to success responses
-- reject unauthenticated HTTP clients and clients with expired lease tokens
-
-### 5.3 Lease lifecycle
-
-An ACP execution that requests Xcode MCP obtains a lease before `session/new`.
-
-**Ownership model: provider-session-owned leases.** MCP servers are immutable in a provider session — they are established during `session/new` and cannot be replaced while the session is alive. A lease's lifetime therefore must equal the lifetime of the provider session's MCP binding, not the execution that happened to trigger its creation. An Xcode MCP lease is owned by the ACP provider session that received the `session/new` payload referencing it, and survives across multiple `session/prompt` cycles on that session.
-
-Lease states:
-
-- `reserved`: an HTTP streaming endpoint and lease token are created but the provider has not sent `session/new` yet.
-- `active`: provider received `session/new` with the lease's HTTP MCP entry, initialized over HTTP streaming, and is attached to the broker session.
-- `closing`: ACP provider session is ending (normal close / cancel / timeout / crash / session reset / reuse-incompatible supersession) and HTTP stream shutdown has started.
-- `released`: HTTP client session is gone and the backend `mcpbridge` subprocess has exited.
-- `orphaned`: provider process died or the daemon lost the HTTP stream before normal release.
-
-**Release triggers.** A lease transitions from `active` to `closing` only on provider-session-scoped events, not on single-execution success:
-
-- provider session closes normally (ACP `session/close` or stdin EOF),
-- execution is cancelled (cancels the provider session, which in turn releases the lease),
-- provider subprocess exits unexpectedly (crash, kill, timeout),
-- operator-triggered session reset (see [session-lineage-reuse-and-operator-reset.md](../reference/session-lineage-reuse-and-operator-reset.md)),
-- reuse-incompatible supersession: a new execution on the same lineage fails the reuse-compat check (§5.6); the existing provider session is superseded by a fresh session, and the old lease is released as part of that supersession.
-
-Successful completion of an individual execution does **not** release the lease — a subsequent prompt cycle on the same provider session continues to use the same lease and the same backend `mcpbridge` subprocess. This is what makes Xcode MCP session reuse (§5.6) executable.
-
-**Backend liveness (per lease, since each lease owns its own `mcpbridge`):**
-
-- Each lease's backend `mcpbridge` subprocess is alive while the lease is `reserved`, `active`, or `closing`.
-- When the lease transitions to `released`, its backend bridge is closed (stdin close → graceful exit, kill after timeout).
-- When the last lease for a given Xcode PID releases, the broker's per-PID Mutex and any cached Xcode metadata (consent state, `tools/list` snapshot) stay in broker memory for a short grace period (default 60s) so fast retry does not pay re-initialize cost — this is memory state, not a running process.
-- After the grace period elapses with no new lease, the broker drops cached state for that Xcode PID.
-
-There is no long-lived shared backend process to keep warm across unrelated leases.
-
-**HTTP endpoint lifecycle and token model.**
-
-- The endpoint must bind only to loopback or a daemon-owned Unix-domain HTTP listener if supported by the provider.
-- Each lease holds a random bearer token (≥ 32 bytes, constant-time compared).
-
-Tokens are **session-lifetime, not single-use**. Three distinct TTL concerns are modeled explicitly:
-
-| Concern | Field | Behavior |
-|---|---|---|
-| First-connect wait | `first_connect_deadline` | How long the broker waits for the provider to make its initial HTTP MCP connection after the `session/new` payload was delivered. Default 60 s. Exceeding this moves the lease to `orphaned` and releases it. |
-| MCP session binding | `bound_mcp_session_id` (set on first `initialize` response) | After the provider's first `initialize` succeeds, the broker records the `Mcp-Session-Id` header value returned to the provider and considers the lease bound to that MCP session. Subsequent requests must present both the bearer and the same `Mcp-Session-Id`. |
-| Single active stream | `active_stream_count` (integer, guarded by Mutex) | The broker allows **at most one active HTTP stream** on the lease at any time. A second concurrent HTTP connection presenting the same bearer is rejected (`xcode_mcp_concurrent_stream_rejected`) as long as `active_stream_count > 0`. On stream drop (connection close, FIN, timeout), the count is decremented and a reconnect becomes eligible. |
-| Session lifetime | `expires_at` (= provider session's max lifetime, typically 24 h) | The bearer remains valid for the entire provider session, supporting reconnect on transport hiccup. |
-
-**Why no peer-pid / peer-uid check on the HTTP bearer path.** Loopback TCP does not expose `LOCAL_PEERPID` (macOS) or `SO_PEERCRED` (Linux) — those APIs require Unix-domain sockets. All three provider adapters require HTTP streaming MCP via loopback TCP (per the feasibility research), and switching to UDS would break provider compatibility. Peer-credential derivation is therefore only available on the **Unix-domain shim dispatch socket** (§5.1.1), not on the HTTP broker path. The HTTP path relies on a different identity model:
-
-1. **Bearer + MCP session-id binding.** Each request must present the lease's bearer in `Authorization: Bearer <token>` **and** the matching `Mcp-Session-Id` header that was issued at first `initialize`. A replayed bearer without the session-id (or with a forged/different session-id) is rejected by the broker or by MCP's own session-id validation — MCP Streamable HTTP session-ids are unique per `initialize` and the server enforces uniqueness.
-2. **Single-active-stream invariant.** At most one HTTP stream holds the lease at a time. A replay attempting to open a parallel stream with the same bearer is rejected. This collapses the concurrent-replay attack surface: an attacker who somehow observed the bearer (e.g., by also observing `credential_env` as a shell-capable agent) cannot open a second stream while the provider holds its own.
-3. **Lease expiry.** Bearer becomes invalid after `expires_at` or on provider-session close, whichever comes first.
-
-**Reconnect semantics (TCP-compatible):**
-
-- If the provider's HTTP stream drops and no other stream is active, `active_stream_count` falls to 0 and the broker accepts a reconnect that presents the same bearer **and** the same `Mcp-Session-Id`. A new stream is opened, `active_stream_count` becomes 1 again, the backend `mcpbridge` subprocess continues serving.
-- A reconnect that presents the same bearer but a **different** `Mcp-Session-Id` is rejected with `xcode_mcp_session_id_mismatch`. This blocks a replay attacker who learned the bearer but not the original session-id, and it blocks a fresh client accidentally presenting a stale bearer.
-- A reconnect after `expires_at` is rejected with `xcode_mcp_lease_token_expired` regardless of session-id.
-
-**Token is not single-use.** Any §9 wording still claiming single-use tokens is an error — the correct model is "session-lifetime bearer bound to a unique MCP session-id, limited to one active stream at a time."
-
-**Reserved lease expiration** (first-connect failure): if the provider does not send `session/new` + connect within `first_connect_deadline`, the lease moves to `orphaned` and the broker closes any already-spawned `mcpbridge` subprocess.
-
-### 5.4 Xcode PID drift
-
-The pool key includes the current Xcode PID. Xcode PID drift is a **shared-state failure**, not a per-lease event — the old Xcode process is gone or a new one has replaced it, so the XPC tool-service that every stale-pool bridge was bound to is no longer valid. The runtime cannot safely leave those leases running.
-
-If `pgrep -n -x Xcode` returns a different PID from the pool's backend-PID target:
-
-- every lease on the stale pool key receives a terminal MCP error with `backend_failure_class = "pool_pid_drift"`,
-- each stale lease's `mcpbridge` subprocess is closed (stdin close → SIGTERM 3s → SIGKILL 10s),
-- the stale pool key is removed from broker state along with its in-memory cache (Mutex, `tools/list` snapshot, consent-granted flag),
-- new leases use a new pool key tied to the new Xcode PID and start fresh backend bridges,
-- telemetry records `xcode_pid_changed` with `{old_pid, new_pid, closed_lease_count}`.
-
-This is the same termination contract described in §8.2 for shared-state failures — the two sections now agree.
-
-If no Xcode PID is available:
-
-- the runtime falls back to direct fail-closed behavior for Xcode MCP resolution
-- it must not silently start an untargeted bridge
-
-### 5.4.1 Simulator destination stability
-
-Brokered Xcode execution must prefer simulator UUIDs over `platform=iOS Simulator,name=...,OS=...` destination strings. Duplicate simulator names under the same runtime are allowed by CoreSimulator and have been observed in local diagnosis. Name-based destinations are therefore ambiguous and can turn a healthy host into a flaky run.
-
-Recording a selected UUID in observation is not sufficient by itself — the spawned `xcodebuild` subprocess must actually receive the UUID-form destination in its argv, not the original name/OS string. The host executor therefore owns an **argv rewrite contract** for `-destination` arguments:
-
-**Destination parser (`control-plane/crates/acp/src/xcode_host_executor.rs` or equivalent).** Before `execve`ing the real `xcodebuild`, the host executor scans `argv` for `-destination <value>` pairs and `-destination=<value>` forms. For each destination value:
-
-1. **`id=<UUID>` — pass through.** Value already names an explicit device. No rewrite; UUID recorded in observation.
-2. **`platform=...,id=<UUID>[,...]` — pass through.** Platform-prefixed UUID form. No rewrite.
-3. **`platform=iOS Simulator,name=<name>,OS=<os>` or similar name/OS form — resolve.** Host executor calls `xcrun simctl list devices --json` and finds all devices matching the given `name` and `OS`:
-   - exactly one match: **rewrite** argv to `platform=iOS Simulator,id=<UUID>` (drop `name` and `OS`, add `id`). Record the resolved UUID plus the original name/OS in observation.
-   - two or more matches (ambiguous): **reject** with `policy_reason: "simulator_destination_ambiguous"` and record `{name, os, candidate_uuids: [...]}` in the rejection observation. Does not spawn `xcodebuild`.
-   - zero matches: **reject** with `policy_reason: "simulator_destination_not_found"`.
-4. **Bare `platform=macOS`, `platform=OS X`, `generic/platform=iOS Simulator`** — pass through (no simulator selection needed or possible).
-5. **Unparseable destination string** — reject with `policy_reason: "simulator_destination_unparseable"`.
-
-Pass-through paths (1, 2, 4) record the destination verbatim in the `xcode_host_executor_events[]` entry. Rewrite path (3) records both original and rewritten form so operators can see what changed.
-
-**Destination-list caching.** Host executor caches `xcrun simctl list devices --json` output at daemon start and refreshes the cache when a rewrite resolution misses (to catch newly-added simulators). The cache is not persisted.
-
-**Observation fields.** `xcode_host_executor_events[].simulator_selection`:
-
-```json
-{
-  "mode": "explicit_uuid|rewritten_from_name_os|no_simulator|rejected",
-  "simulator_id": "1BFCE41D-127E-495F-807D-55B9083A7AF1",
-  "original_argv_destination": "platform=iOS Simulator,name=iPhone 15,OS=17.4",
-  "rewritten_argv_destination": "platform=iOS Simulator,id=1BFCE41D-127E-495F-807D-55B9083A7AF1"
-}
-```
-
-### 5.5 Permission and policy boundaries
-
-The broker must not become a policy bypass.
-
-Policy rules:
-
-- MCP resolution still owns which agents may request `xcode`.
-- The pool key includes permission profile or an equivalent permission fingerprint.
-- An HTTP lease may only call tools exposed to the originating `ResolvedMcpServer`.
-- The broker must not let a lower-permission agent reuse a higher-permission backend capability set.
-- Backend `tools/list` is filtered per lease before returning to the provider when policies differ.
-
-### 5.6 Session reuse interaction
-
-P051 composes with ACP session reuse (P047) but introduces a **reusable-session compatibility check** for MCP/broker-lease identity. MCP server configuration is established in `session/new` only; a reused session receives `session/prompt` and never receives a new MCP payload. Without the check, an execution requesting Xcode MCP could reuse a provider session that was opened without a broker lease (no `xcode` MCP entry in its `session/new`), and the per-request predicted/resolved MCP truth would be recorded as if the provider accepted it — but the live provider session has no way to call brokered Xcode tools.
-
-**Reuse compatibility rule.** An existing provider session is eligible for reuse for a new execution request only if **all** of:
-
-1. the P047 `SessionReuseDisposition` policy returns `Reused` or `ReusedAfterResume` as before, **and**
-2. the **MCP server set accepted at the live session's `session/new`** equals the MCP server set that the new execution's `resolve_mcp_servers` output requires, **and**
-3. **neither the new execution nor the live session has `XcodeShimInjectionSignal: true`** (shell-shim-enabled executions never reuse — see §5.3 "No cross-prompt attribution" rule and preserve per-execution observation truth by construction). Pure Xcode MCP agents (`XcodeBrokerRequired: true`, `XcodeShimInjectionSignal: false`) are unaffected by this rule and retain full session reuse.
-
-Equality is evaluated on the MCP server inventory that was delivered to `session/new` (server name, transport type, endpoint identity for HTTP, command/args/env for stdio). Because Xcode MCP in broker mode resolves to an HTTP endpoint with a **per-lease bearer token and lease-bound URL**, two different Xcode-MCP requests never compare equal — even for the same agent — once the prior lease has been released. The reused-session MCP set equality therefore means:
-
-- same set of MCP server names (requested set matches),
-- for each name, same transport variant (stdio vs http/sse),
-- for HTTP entries, same **requested broker contract** — the stable inputs that would resolve to a lease: broker-mode boolean, workspace root, `requires_xcode_host_execution` flag, resolved tool allowlist hash, permission profile id, Xcode PID at resolution time. The **random lease token and lease-id are not part of this comparison** — those are runtime state minted after the reuse decision, not inputs to it.
-
-This last condition is the Xcode-specific piece: a live provider session that holds an `active` broker lease for Xcode MCP is reuse-compatible. Because leases are provider-session-owned (§5.3), an alive provider session always has its lease alive — a "released lease while provider alive" only happens on reuse-incompatible supersession (where the lease is released *because* the session is being superseded) or on explicit operator reset. If the provider session itself has closed, there is nothing to reuse and the question is moot — P047 treats that as a fresh start anyway.
-
-**Outcomes.**
-
-- **Reuse-compatible**: the existing provider session is reused; `session/prompt` is sent; the existing lease count continues; no new `mcpbridge` subprocess is spawned for this request.
-- **Reuse-incompatible** (requested Xcode MCP set differs from the live session's accepted set, or the prior lease is no longer `active`): P047 disposition is forced to `FreshSessionRequired`. A fresh provider session is started, a fresh broker lease is acquired, and a fresh `mcpbridge` subprocess is spawned.
-
-**Fingerprint layer vs live-session layer.** P047 binding fingerprints are built at prompt construction, write-once, and must only depend on stable requested-contract inputs — hashing a random per-session lease id is not executable because the lease does not yet exist when the fingerprint is computed. P051 therefore splits compatibility into two layers:
-
-1. **Binding fingerprint layer (persisted, P047 write-once)** — hashes the *requested broker contract* for HTTP MCP entries: `{ broker_mode: bool, workspace_root, requires_xcode_host_execution, resolved_tool_allowlist_hash, permission_profile_id, xcode_pid_at_resolution }`. Any change in these forces `FreshSessionRequired` at the fingerprint-comparison layer.
-2. **Live-session compatibility check (runtime, new for P051)** — run *after* the fingerprint check passes, verifies that the live provider session still holds an `active` broker lease with matching frozen fields. If the fingerprint matches but the lease is gone/expired/invalidated (e.g., mid-run broker degradation previously released it), the runtime check demotes the P047 disposition to `FreshSessionRequired` and a fresh session + fresh lease + fresh token are minted.
-
-This gives the reuse decision two independent gates: persisted-contract hash (fast, pre-lease) and runtime liveness (post-fingerprint, no hashing of volatile ids). Neither gate hashes the lease token.
-
-**Cancellation and cleanup under reuse.** When an ACP provider session is closed (normal close, cancel, crash, timeout, operator reset) its associated broker lease is released — regardless of whether the session was originally fresh or reused, regardless of how many successful executions ran on it. A reused provider session inherits lease ownership from whichever execution first opened the session; subsequent executions borrow the lease without changing its ownership, and none of them release it individually.
-
-**Timeline examples.**
-
-- First prompt in two parallel ACP sessions: each gets its own HTTP streaming lease and its own backend `mcpbridge` subprocess. The broker-held Mutex serializes the brief initialize window per Xcode PID; after that both bridges serve `tools/*` concurrently. Both leases share the same broker-owned host-user Xcode environment and the same already-consented Xcode process (so no duplicate modals).
-- Successful first execution followed by a reused prompt on the same provider session with same MCP set: reuse-compatible. The provider session stays alive, its lease stays `active`, the `mcpbridge` subprocess continues running, and `session/prompt` is sent. No new bridge spawn.
-- Retry/resume after the provider session closed (lease released with the session): not reuse — this is a fresh start. New provider session + new lease + new bridge.
-- New execution on the same lineage that now requires Xcode MCP when the live session was opened **without** Xcode MCP: reuse-incompatible. The live session is superseded with a fresh session; the old lease (if any) is released as part of supersession.
-- New execution on the same lineage whose requested MCP set differs from the live session's accepted set (e.g., Xcode MCP now with different permission fingerprint): reuse-incompatible. Live session superseded, old lease released, fresh session + fresh lease.
-- Retry/resume after ACP session died but broker grace period is still active: provider starts a new ACP session and a new lease; the bridge subprocess for the dead lease is already closed. Grace period exists to suppress Xcode spin-up cost via cached metadata, not to share backend state across leases.
-- Retry/resume after grace expiry: new backend bridge start is allowed and recorded.
-
-### 5.7 Observability
-
-**Envelope field.** Each `AgentExecution` gets a new sibling field alongside `actual_mcp_observation_json` named **`actual_xcode_runtime_observation_json`**. This is a dedicated envelope for everything Xcode-runtime-related so broker MCP truth and direct-command events never overwrite each other, and direct-Xcode-only agents (no MCP server request at all) still have a durable home for their shim evidence.
-
-The envelope shape is append-only-per-execution:
-
-```json
-{
-  "mcp_broker_observations": [          // one entry per brokered Xcode MCP lease
-    {
-      "source": "xcode_mcp_broker",
-      "backend_start_disposition": "spawned|restarted_after_pid_change|reused_existing_provider_session_lease",
-      "pool_id": "...",
-      "lease_id": "...",
-      "xcode_pid": "77907",
-      "backend_process_id": 24837,
-      "http_endpoint": "127.0.0.1:<redacted>",
-      "xcode_home_disposition": "host_user_home",
-      "xcode_tmpdir_disposition": "host_user_temp",
-      "simulator_selection": {
-        "mode": "explicit_uuid",
-        "simulator_id": "1BFCE41D-127E-495F-807D-55B9083A7AF1"
+  "proposal_revision_id": "p051-r30",
+  "source_review_pass_id": "p051-review-pass-r29",
+  "title": "Proposal 051 Implementation Plan: Shared Xcode MCP Bridge Pool",
+  "status": "Ready for implementation planning after R30 precondition enforcement pass",
+  "review_readiness": {
+    "target_score": "aggregate score above 9",
+    "why_ready": [
+      "The run proposal is now explicitly the controlling implementation contract until the checked-in source proposal is reconciled, and the scaffold gate must fail stale contrary guidance.",
+      "The three architect blockers now have explicit owner-crate, caller, failure-mode, and acceptance-test contracts.",
+      "Product rollout ambiguity is resolved with staged gates, broker enablement states, and a rollback switch that preserves non-Xcode workflows.",
+      "UX/UI visibility concerns are resolved by making a narrow read-only UI/readback slice part of acceptance instead of leaving runtime truth in raw JSON only.",
+      "R27 residual implementation risks now have named boundaries: XcodeTargetResolver, provider-process-bound shim dispatch, BrokerMcpPolicy, LaunchResourceGuard, and bounded observation append semantics.",
+      "R28 proceed-with-preconditions feedback is now captured as concrete contracts for direct-command declaration scanning, broker subsystem health, target resolver ownership, observation storage write path, and operator-facing progress propagation.",
+      "R29 proceed-with-preconditions feedback is now captured as mandatory implementation-start controls: source reconciliation is the first scaffold task, dependency audit has a required artifact schema and blocking rules, and observation hot-row pressure has explicit dogfood thresholds.",
+      "Residual risks are named as trade-offs with explicit defaults, metrics, and dogfood evidence rather than hidden behind broad claims."
+    ],
+    "reviewer_specific_checks": [
+      {
+        "reviewer": "architect",
+        "must_confirm": "Source-of-truth policy, observation sink, broker registry intent, Xcode target resolver, release-mode capability fingerprint, capacity policy, ordered request pump, shim process binding, broker MCP policy, launch resource guard, and Xcode signal fields are precise enough to implement without inventing cross-crate ownership."
       },
-      "sibling_leases_at_spawn": 1,
-      "backend_initialize_wait_ms": 420,
-      "backend_startup_latency_ms": 23031,
-      "http_session_startup_latency_ms": 42,
-      "backend_failure_class": null,     // null | "per_lease_backend" | "pool_pid_drift" | "broker_infrastructure" | "host_env_unavailable"
-      // Fields populated only when backend_start_disposition == "reused_existing_provider_session_lease":
-      "originating_execution_id": null,  // AgentExecutionId that first opened this lease (when reused)
-      "prompt_cycle_index": 0            // 0 for the originating execution, 1+ for reused-in prompt cycles
-    }
+      {
+        "reviewer": "product_owner",
+        "must_confirm": "Rollout can proceed in scaffold/full milestones, dogfood has pass/fail evidence, and rollback preserves non-Xcode workflows."
+      },
+      {
+        "reviewer": "ux_designer",
+        "must_confirm": "Operators see waiting/starting states, policy warnings, friendly recovery text, and enough runtime evidence to understand Xcode-specific failures."
+      },
+      {
+        "reviewer": "ui_designer",
+        "must_confirm": "The UI scope maps to existing surfaces and avoids raw JSON dumping while staying narrow enough for P051."
+      }
+    ]
+  },
+  "run_id": "43460545-7f6a-4943-811a-dabad0f1c592",
+  "source_proposal": "docs/proposals/051-shared-xcode-mcp-bridge-pool.md",
+  "implementation_source_of_truth": {
+    "controlling_artifact": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/43460545-7f6a-4943-811a-dabad0f1c592/proposals/current/proposal.md",
+    "source_proposal_status": "Historical source proposal pending reconciliation. Implementers must follow this run proposal when there is disagreement.",
+    "reconciliation_required_before_implementation": "Before any P051 implementation PR begins, sync `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` or replace its stale sections with a pointer to this controlling contract.",
+    "static_gate_requirement": "`p051-scaffold` fails if the checked-in source proposal still contains stale contrary guidance: no SwiftUI changes, debug_assert-only capability enforcement, path+mtime+size-only binary fingerprinting, drop-on-corrupt-observation behavior, direct pgrep newest-Xcode selection, or unbound same-uid-only shim authorization."
+  },
+  "research_artifact": "docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md",
+  "research_verdict": "Proceed with scoped architecture",
+  "primary_surfaces": [
+    "Rust control-plane ACP runtime, engine, daemon, workflow/catalog, DB/domain, GraphQL/MCP reports, and test gates",
+    "Minimal macOS SwiftUI read-only presentation of Xcode runtime observations, failure strings, and catalog infrastructure flags"
   ],
-  "xcode_shim_events": [
-    // Discriminated union — two variants sharing the same array but distinct schemas.
-    // Consumers (GraphQL / MCP / reports) switch on "kind" to select the shape.
-
-    // Variant 1: shim invocation (PATH-shim-intercepted command; may also be emitted for diagnostic WARNs from the lint path)
+  "problem": {
+    "summary": "Parallel Xcode-capable ACP sessions currently fail because provider-owned Xcode processes race Xcode authorization and because fake-home ACP providers run host-bound Xcode tooling outside the real GUI user's Xcode environment.",
+    "details": [
+      "Parallel ACP providers can each start their own direct `xcrun mcpbridge`, causing duplicated Xcode consent or modal handling during the first-start fan-out window.",
+      "ACP providers run in isolated fake-home environments, while Xcode, CoreSimulator, simdiskimaged, DerivedData, and Xcode MCP authorization are tied to the macOS GUI user's real `~/Library` and Darwin temp state.",
+      "Direct `xcodebuild`, `simctl`, or `mcpbridge` execution from fake-home provider processes can produce false runtime discovery failures even when the same command succeeds from the host shell.",
+      "The correct boundary is not to give ACP providers the host home. Providers keep fake-home isolation; Xcode-bound work crosses a narrow Chainworks-owned host-session boundary."
+    ],
+    "positioning": "P051 is a reliability boundary first and a modal-deduplication optimization second."
+  },
+  "goals": [
+    "Serve Xcode MCP to ACP providers through Chainworks-owned HTTP streaming endpoints instead of provider-owned `xcrun mcpbridge` stdio entries.",
+    "Spawn one backend `xcrun mcpbridge` subprocess per provider HTTP lease, under host-user Xcode environment.",
+    "Serialize backend spawn plus MCP `initialize` per Xcode PID, then allow `tools/*` parallelism across independent leases and backends.",
+    "Preserve provider fake-home isolation for ACP/model/client state.",
+    "Fail closed before lease, token, backend process, shim token, or `session/new` payload allocation when the provider does not advertise HTTP MCP capability.",
+    "Guard direct Xcode shell commands through PATH shims and catalog lint for the enforced boundary: PATH-based commands and catalog-declared structured commands.",
+    "Keep `mcpbridge` broker-only inside the enforced boundary, with no diagnostic bypass.",
+    "Preserve per-agent permission policy, session reuse semantics, and recoverability.",
+    "Add durable, typed Xcode runtime observations so operators can prove what happened without log scraping.",
+    "Expose those observations through GraphQL, MCP `reports.get`, and a minimum read-only Forge UI surface.",
+    "Register staged gates `p051-scaffold` and `proposal-051|p051`."
+  ],
+  "non_goals": [
+    "No changes to XcodeBuildMCP itself.",
+    "No provider-facing stdio proxy fallback for brokered Xcode MCP.",
+    "No cross-daemon Xcode bridge sharing.",
+    "No general-purpose pooling for non-Xcode MCP servers.",
+    "No broad removal of fake-home isolation for ACP providers.",
+    "No OS-level prevention of every possible absolute-path command an LLM might invent at prompt time; P051 observes and warns on that residual, and a future libc-audit or sandbox-exec proposal would be needed to block it.",
+    "No broad SwiftUI redesign. P051 includes only the minimum read-only UI/status/error mappings needed to make the new runtime truth actionable."
+  ],
+  "ux_ui_notes": {
+    "scope_change_from_r24": "R24 said no Swift app UI changes. UX and UI review showed that durable observations without in-app presentation are not usable by operators. This revision keeps the Rust control-plane work primary but adds a small UI slice.",
+    "operator_visible_behavior": [
+      "Parallel Xcode-capable reviewers still run as separate ACP sessions and produce separate outputs.",
+      "Each session receives an HTTP Xcode MCP server entry backed by Chainworks.",
+      "The first Xcode process may require one consent interaction; sibling leases against the same Xcode PID should not trigger additional modals.",
+      "Broker, host-environment, capability, shim, simulator-selection, and provider-transport failures are classified separately instead of being presented as generic agent failures.",
+      "Run timeline/status and the high-level `RunProgressView` status string distinguish `Waiting for Xcode Bridge lock` from `Starting Xcode Bridge` so initialize serialization does not look like a hang.",
+      "If bridge startup is blocked for more than five seconds while Xcode consent is plausible, the timeline and high-level progress string show an `Action Required: Check Xcode` state before the initialize timeout fires.",
+      "`Action Required: Check Xcode` includes workspace identity and Xcode PID when available from `XcodeTargetSnapshot`, so operators with multiple Xcode windows know which instance needs attention.",
+      "Parallel DerivedData or build-system contention is identified as Xcode build concurrency, not broker infrastructure failure."
+    ],
+    "minimum_ui_surface": [
+      {
+        "surface": "RunTimelineInspectorView",
+        "content": "Add an `Xcode Runtime` read-only section only when `actual_xcode_runtime_observation_json` is present, showing lease state, backend PID, backend start disposition, host-home disposition, initialize wait, broker health, shim route/reject decisions, and selected simulator UUID when present. Use structured rows rather than raw JSON."
+      },
+      {
+        "surface": "Run timeline or log",
+        "content": "Render Xcode residual path warnings as high-visibility `Policy Warning` timeline events, not only as JSON. Use SF Symbol `exclamationmark.shield`, orange foreground, coalesce repeated identical warnings per execution, and collapse unique residual paths behind a `View all residual paths` disclosure once more than five unique warnings appear for one execution."
+      },
+      {
+        "surface": "FailedStageEvidencePanel and timeline error presentation",
+        "content": "Map P051 technical failure classes to localized friendly strings and suggested actions."
+      },
+      {
+        "surface": "AgentCatalogView",
+        "content": "Add an `Infrastructure` or `Xcode Broker` metadata section that shows `xcode_broker_required`, `xcode_shim_injection_signal`, and `requires_xcode_host_execution` before a run starts. When `xcode_broker_required` is true, show a small first-run note that a one-time Xcode consent interaction may be required."
+      },
+      {
+        "surface": "Daemon lifecycle or diagnostics surface",
+        "content": "Show broker health as Disabled, Healthy, Degraded, or Failed when the daemon reports it."
+      },
+      {
+        "surface": "Accessibility and test hooks",
+        "content": "Add stable identifiers for the minimum UI slice: `xcode-runtime-section`, `xcode-lease-id`, `xcode-backend-pid`, `xcode-policy-warning`, `xcode-friendly-failure`, `infrastructure-xcode-broker-required`, `infrastructure-xcode-shim-injection-signal`, and `infrastructure-requires-xcode-host-execution`."
+      },
+      {
+        "surface": "Visual style",
+        "content": "Use the existing ForgePanel/GroupBox style used by neighboring inspector sections; no raw JSON block, custom dashboard, or new visual system is introduced."
+      }
+    ],
+    "friendly_failure_mapping": [
+      {
+        "class": "provider_http_mcp_unsupported",
+        "title": "Provider does not support HTTP MCP",
+        "suggested_action": "Use Codex ACP, Claude Agent ACP, or Gemini CLI with the verified HTTP MCP version, or mark the provider out of Xcode-broker scope until capability is proven."
+      },
+      {
+        "class": "xcode_mcp_registry_stale_stdio",
+        "title": "Xcode MCP registry entry uses direct stdio",
+        "suggested_action": "Update the machine MCP registry to the brokered Xcode entry or remove stale `xcrun mcpbridge` command fields."
+      },
+      {
+        "class": "xcode_mcp_registry_ambiguous",
+        "title": "Multiple Xcode MCP registry entries match",
+        "suggested_action": "Keep one canonical `xcode` broker entry and remove duplicate or ambiguous entries."
+      },
+      {
+        "class": "host_env_unavailable",
+        "title": "Host Xcode environment unavailable",
+        "suggested_action": "Confirm the daemon runs as the GUI user or configure the operator-home override, then retry the step."
+      },
+      {
+        "class": "pool_pid_drift",
+        "title": "Xcode process changed during run",
+        "suggested_action": "Ensure the intended Xcode workspace is open and retry the failed execution."
+      },
+      {
+        "class": "xcode_mcp_capacity_exhausted",
+        "title": "Xcode bridge capacity reached",
+        "suggested_action": "Wait for active Xcode reviewers to finish, reduce fan-out, or raise the runtime-profile limit deliberately."
+      },
+      {
+        "class": "xcode_mcp_initialize_timeout",
+        "title": "Xcode bridge initialization timed out",
+        "suggested_action": "Check for an Xcode consent modal, confirm Xcode is responsive, and retry."
+      },
+      {
+        "class": "xcode_mcp_action_required",
+        "title": "Check Xcode to continue",
+        "suggested_action": "Bring Xcode to the foreground and respond to any consent or authorization prompt."
+      },
+      {
+        "class": "xcode_mcp_first_connect_timeout",
+        "title": "Provider did not connect to Xcode bridge",
+        "suggested_action": "Retry the execution; if repeated, inspect provider HTTP MCP support and session/new payload logs."
+      },
+      {
+        "class": "xcode_shim_no_active_prompt",
+        "title": "Xcode command ran outside the active prompt",
+        "suggested_action": "Retry the execution; if repeated, disable session reuse for that agent or inspect background shell activity."
+      },
+      {
+        "class": "simulator_destination_ambiguous",
+        "title": "Simulator destination is ambiguous",
+        "suggested_action": "Choose one of the listed simulator UUIDs or remove duplicate simulator name/OS matches."
+      },
+      {
+        "class": "xcode_build_concurrency_contention",
+        "title": "Xcode build resources are busy",
+        "suggested_action": "Retry after sibling builds finish, use a different DerivedData path, or reduce parallel build fan-out for this workflow."
+      }
+    ]
+  },
+  "resolved_reviewer_feedback": [
     {
-      "kind": "shim_invocation",
-      "ts": "2026-04-19T12:34:56.789Z",
-      "tool": "xcodebuild",            // xcodebuild|simctl|mcpbridge (never null for this variant)
-      "via_xcrun": false,
-      "argv": ["-project", "Foo.xcodeproj", "build"],
-      "cwd": "/path/to/agent/worktree",
-      "policy_decision": "rejected",    // rejected|routed
-      "policy_reason": "requires_xcode_host_execution_false",  // ...|mcpbridge_broker_only|xcrun_unknown_option|xcode_shim_invalid_token|xcode_shim_token_expired|xcode_shim_peer_uid_mismatch|...
-      "derived_peer_pid": 48217,
-      "derived_peer_uid": 501,
-      "claimed_provider_pid": 48217,
-      "peer_pid_mismatch": false,
-      "exit_status": 127
+      "issues": [
+        "ARCH-001",
+        "SLB-001"
+      ],
+      "resolution": "Added an explicit observation persistence boundary: domain owns typed observation models, db owns the transactional append repository API, engine owns the concrete sink and injects an async sink handle into acp, while acp calls only the sink trait and never depends on db."
     },
-
-    // Variant 2: warning (prompt-lint or residual-path matcher; no exec intercepted, observation-only)
     {
-      "kind": "warning",
-      "ts": "2026-04-19T12:35:10.123Z",
-      "policy_reason": "xcode_absolute_path_in_prompt", // or "xcode_residual_absolute_path"
-      "source_field": "agent.prompt",                   // or "acp_session_update_tool_use"
-      "matched_substring": "/usr/bin/xcrun mcpbridge",
-      "excerpt": "…run /usr/bin/xcrun mcpbridge to debug the service…"
+      "issues": [
+        "ARCH-002",
+        "SLB-002"
+      ],
+      "resolution": "Added a concrete `BrokeredXcodeMcpIntent` and registry migration contract, including canonical server-id matching, compatibility handling for existing `xcrun mcpbridge` entries, stale/ambiguous fail-closed errors, and redacted predicted/actual MCP truth."
+    },
+    {
+      "issues": [
+        "ARCH-003",
+        "SLB-003"
+      ],
+      "resolution": "Replaced the debug assertion with release-mode `CapabilitySliceFingerprint` enforcement immediately before provider launch. Credential-only env mutations are excluded by construction and covered by tests."
+    },
+    {
+      "issues": [
+        "PO-001",
+        "PO-002",
+        "ARCH-006",
+        "SLB-004"
+      ],
+      "resolution": "Added broker enablement states and `CHAINWORKS_XCODE_BROKER_DISABLED=1` as a rollback switch. Non-Xcode daemon functionality remains available when the broker is disabled or degraded; final brokered Xcode MCP still has no stdio fallback."
+    },
+    {
+      "issues": [
+        "ARCH-004",
+        "SLB-005"
+      ],
+      "resolution": "Added capacity defaults, bounded initialize queue policy, queue timeout, capacity failure class, and required metrics/observations."
+    },
+    {
+      "issues": [
+        "PO-003",
+        "SLB-006"
+      ],
+      "resolution": "Promoted modal dedup to a pre-ship dogfood acceptance criterion with named minimum evidence."
+    },
+    {
+      "issues": [
+        "PO-004",
+        "SLB-007"
+      ],
+      "resolution": "Split delivery into `p051-scaffold` and full `proposal-051|p051` gates."
+    },
+    {
+      "issues": [
+        "UX-001",
+        "UI-001",
+        "SLB-008"
+      ],
+      "resolution": "Added a minimum read-only UI surface for Xcode runtime evidence rather than raw JSON-only exposure."
+    },
+    {
+      "issues": [
+        "UX-003",
+        "UI-002",
+        "SLB-009"
+      ],
+      "resolution": "Added friendly error titles and suggested actions for new broker, shim, registry, and simulator failure classes."
+    },
+    {
+      "issues": [
+        "ARCH-007",
+        "UI-003",
+        "SLB-010",
+        "SLB-015"
+      ],
+      "resolution": "Added exact field names, serde names, defaults, propagation, session fingerprint participation, and Agent Catalog visibility for Xcode broker/shim signals."
+    },
+    {
+      "issues": [
+        "ARCH-005",
+        "SLB-011"
+      ],
+      "resolution": "Clarified that `tools/*` parallelism is cross-lease. Each lease has one stdio backend and therefore uses a per-backend ordered request pump."
+    },
+    {
+      "issues": [
+        "UX-002",
+        "SLB-012"
+      ],
+      "resolution": "Residual path warnings become high-visibility policy warnings in the timeline/log and remain persisted in the observation JSON."
+    },
+    {
+      "issues": [
+        "UX-004",
+        "SLB-013"
+      ],
+      "resolution": "Added explicit progress states for waiting on the per-PID initialize lock."
+    },
+    {
+      "issues": [
+        "PO-005",
+        "SLB-014"
+      ],
+      "resolution": "Added pass/fail thresholds for capability cache fixtures, dogfood scenario size, observation completeness, modal count, and approver evidence."
+    },
+    {
+      "issues": [
+        "ARCH-SUG-004"
+      ],
+      "resolution": "Auggie and Junie are out of P051 launch scope for Xcode MCP until HTTP MCP capability is proven by the initialize-only probe; they fail closed for brokered Xcode MCP and may continue non-Xcode work."
+    },
+    {
+      "issues": [
+        "PO-ASM-004"
+      ],
+      "resolution": "Strengthened provider binary fingerprinting from path+mtime+size to path+size+mtime+content SHA-256 when readable, with explicit fallback observation if hashing is unavailable."
+    },
+    {
+      "issues": [
+        "ARCH-R27-001"
+      ],
+      "resolution": "Declared this run proposal as the controlling implementation source until the checked-in source proposal is reconciled, and expanded the `p051-scaffold` static gate to fail stale contradictory guidance."
+    },
+    {
+      "issues": [
+        "ARCH-R27-002"
+      ],
+      "resolution": "Added an `XcodeTargetResolver` boundary with deterministic Xcode PID/workspace/developer-dir selection and fail-closed ambiguity handling before backend spawning."
+    },
+    {
+      "issues": [
+        "ARCH-R27-003",
+        "PO-R27-003"
+      ],
+      "resolution": "Tightened shim dispatch authority from token plus same-uid to provider process identity binding, with same-uid cross-session replay, stale token, forged PID, and process-tree mismatch fixtures required before host executor merge."
+    },
+    {
+      "issues": [
+        "ARCH-R27-004"
+      ],
+      "resolution": "Added a broker-side `BrokerMcpPolicy` interface at the HTTP facade to filter `tools/list`, deny unauthorized `tools/call`, persist denied truth, and isolate sibling leases."
+    },
+    {
+      "issues": [
+        "ARCH-R27-005"
+      ],
+      "resolution": "Bounded append-heavy observation storage with event/byte limits, retry caps, corrupt-json quarantine behavior, and a normalized-storage escape hatch if limits conflict with evidence completeness."
+    },
+    {
+      "issues": [
+        "ARCH-R27-006"
+      ],
+      "resolution": "Added `LaunchResourceGuard` ownership for fake-home, temp, and generated config resources across probes, real-session transfer, and rollback before lease allocation."
+    },
+    {
+      "issues": [
+        "PO-R27-001"
+      ],
+      "resolution": "Promoted upstream dependency audit for P025, P026, P029, P037, and P049 to a named pre-scheduling and `p051-scaffold` precondition with P026/P029 incompleteness as a scheduling blocker."
+    },
+    {
+      "issues": [
+        "PO-R27-002"
+      ],
+      "resolution": "Clarified rollback behavior: enabling `CHAINWORKS_XCODE_BROKER_DISABLED=1` causes in-flight and new Xcode-brokered executions to fail closed immediately while non-Xcode workflows continue after restart."
+    },
+    {
+      "issues": [
+        "UX-005"
+      ],
+      "resolution": "Added an `Action Required: Check Xcode` state after five seconds of likely modal-blocked bridge startup."
+    },
+    {
+      "issues": [
+        "UX-006"
+      ],
+      "resolution": "Added failure classification and recovery copy for DerivedData/build-system concurrency contention so it is not misdiagnosed as broker failure."
+    },
+    {
+      "issues": [
+        "UX-007",
+        "UI-NB-001",
+        "UI-NB-002",
+        "UI-SUG-001",
+        "UI-SUG-002",
+        "UI-SUG-003"
+      ],
+      "resolution": "Specified conditional Xcode Runtime rendering, structured rows, policy-warning event treatment, coalescing behavior, and required accessibility identifiers."
+    },
+    {
+      "issues": [
+        "ARCH-R27-001"
+      ],
+      "resolution": "Declared this run proposal as the controlling implementation contract until the checked-in source proposal is reconciled, and made stale contradictory source text a `p051-scaffold` failure."
+    },
+    {
+      "issues": [
+        "ARCH-R27-002"
+      ],
+      "resolution": "Added `XcodeTargetResolver` as the deterministic target-selection boundary and prohibited pgrep-newest-Xcode selection for brokered paths."
+    },
+    {
+      "issues": [
+        "ARCH-R27-003",
+        "PO-R27-003"
+      ],
+      "resolution": "Bound shim dispatch authority to the launched provider process identity or tracked descendant set and made targeted security review a third-PR gate."
+    },
+    {
+      "issues": [
+        "ARCH-R27-004"
+      ],
+      "resolution": "Added `BrokerMcpPolicy` at the HTTP facade for tools/list filtering, tools/call denial, denied-observation persistence, and sibling-lease isolation."
+    },
+    {
+      "issues": [
+        "ARCH-R27-005"
+      ],
+      "resolution": "Added observation event/byte bounds, retry limits, corrupt-json recovery, truncation signaling, and late-append refresh semantics."
+    },
+    {
+      "issues": [
+        "ARCH-R27-006"
+      ],
+      "resolution": "Added `LaunchResourceGuard` ownership for fake-home/temp/config resources across probes, real sessions, and rollback."
+    },
+    {
+      "issues": [
+        "PO-R27-001"
+      ],
+      "resolution": "Added dependency-audit precondition before scheduling, with P026/P029 incompleteness blocking scaffold scheduling."
+    },
+    {
+      "issues": [
+        "PO-R27-002"
+      ],
+      "resolution": "Rollback text now states in-flight and new Xcode-brokered executions fail closed immediately while non-Xcode workflows continue."
+    },
+    {
+      "issues": [
+        "UX-005",
+        "UX-SUG-001"
+      ],
+      "resolution": "Added an `Action Required: Check Xcode` operator state when bridge startup is blocked and consent is plausible."
+    },
+    {
+      "issues": [
+        "UX-006"
+      ],
+      "resolution": "Added DerivedData/build-system contention as an explicit friendly failure class separate from broker failures."
+    },
+    {
+      "issues": [
+        "UX-007",
+        "UI-NB-001",
+        "UI-NB-002",
+        "UI-SUG-001",
+        "UI-SUG-002",
+        "UI-SUG-003"
+      ],
+      "resolution": "Specified Policy Warning icon/color/coalescing, conditional Xcode Runtime rendering, structured rows, and accessibility identifiers."
+    },
+    {
+      "issues": [
+        "ARCH-R28-001"
+      ],
+      "resolution": "Added `DirectCommandDeclarationScanner` as the normalized scanner contract over raw workflow/catalog YAML plus typed agent entries, with fixtures for current permission-profile shell allow entries and `agents[].required_tools`."
+    },
+    {
+      "issues": [
+        "ARCH-R28-002"
+      ],
+      "resolution": "Added `XcodeBrokerHealthSnapshot` as subsystem health separate from global daemon readiness, so Disabled/Degraded broker state gates only brokered Xcode requests."
+    },
+    {
+      "issues": [
+        "ARCH-R28-003"
+      ],
+      "resolution": "Clarified `XcodeTargetResolver` as a trait/service boundary with engine-provided selection inputs and acp-owned host-environment probing that returns immutable `XcodeTargetSnapshot`."
+    },
+    {
+      "issues": [
+        "ARCH-R28-004"
+      ],
+      "resolution": "Kept the bounded JSON envelope for P051 but made the append repository API the only write path and documented the normalized event-table migration trigger if dogfood shows hot-row pressure."
+    },
+    {
+      "issues": [
+        "UX-ISS-001"
+      ],
+      "resolution": "`Action Required: Check Xcode` now includes workspace identity and Xcode PID when available from `XcodeTargetSnapshot`."
+    },
+    {
+      "issues": [
+        "UX-ISS-002"
+      ],
+      "resolution": "Bridge initialization states are required in both the timeline/inspector and the high-level `RunProgressView` status string."
+    },
+    {
+      "issues": [
+        "UX-NB-001"
+      ],
+      "resolution": "Unique residual path warnings collapse behind a `View all residual paths` disclosure after more than five unique warnings per execution."
+    },
+    {
+      "issues": [
+        "UX-SUG-001",
+        "UX-SUG-002"
+      ],
+      "resolution": "Agent Catalog shows a first-run Xcode consent note for broker-required agents, and Xcode Runtime UI uses existing ForgePanel/GroupBox styling."
+    },
+    {
+      "issues": [
+        "ARCH-R29-001"
+      ],
+      "resolution": "Made source proposal reconciliation or explicit redirect the first scaffold task and a hard implementation-start precondition; PR review must fail if implementation starts from stale checked-in proposal text."
+    },
+    {
+      "issues": [
+        "ARCH-R29-002"
+      ],
+      "resolution": "Expanded dependency audit into a required pre-scheduling artifact with proposal id, owner, gate status, remaining gaps, and parallel-versus-sequential classification; P026/P029 remain hard blockers unless the audit narrows scaffold to independent work."
+    },
+    {
+      "issues": [
+        "ARCH-R29-003"
+      ],
+      "resolution": "Kept bounded JSON observation storage but defined dogfood hot-row pressure thresholds and normalized event-table migration trigger before broad `shim_enforced` rollout."
     }
   ],
-  "xcode_host_executor_events": [       // one entry per routed host-executor run
+  "reviewer_feedback_resolution_matrix": [
     {
-      "ts": "2026-04-19T12:34:56.789Z",
-      "tool": "xcodebuild|simctl",
-      "argv": ["build", "-scheme", "Foo"],
-      "cwd": "/path/to/agent/worktree",
-      "host_env_disposition": "host_user_home",
-      "env_allowlist_applied": ["HOME", "TMPDIR", "DEVELOPER_DIR", "PATH", "USER", "LOGNAME", "SCHEME", "CONFIGURATION"],
-      "env_dropped_from_provider": ["CODEX_HOME", "XDG_CACHE_HOME", "CHAINWORKS_XCODE_SHIM_TOKEN"],
-      "selected_simulator_id": "1BFCE41D-127E-495F-807D-55B9083A7AF1",
-      "exit_status": 0,
-      "duration_ms": 18234
+      "reviewer": "product_owner",
+      "issue_id": "PO-001",
+      "concern": "Daemon hard-fail on broker mount failure removes all Chainworks functionality.",
+      "proposal_resolution": "Daemon can start in Xcode Broker Disabled or Degraded state while continuing non-Xcode workflows. Only the shared daemon listener failing remains process-fatal.",
+      "where_resolved": [
+        "rollout_plan.enablement_states",
+        "failure_semantics",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-002",
+      "concern": "No rollback gate or kill switch for Xcode brokering.",
+      "proposal_resolution": "`CHAINWORKS_XCODE_BROKER_DISABLED=1` disables broker lease allocation and shim injection while preserving non-Xcode daemon functionality. It is explicitly a rollback switch, not a production stdio fallback.",
+      "where_resolved": [
+        "rollout_plan.rollback",
+        "risks_and_mitigations",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-003",
+      "concern": "Modal-dedup success was metric-only and not an acceptance criterion.",
+      "proposal_resolution": "Dogfood acceptance now requires at most one Xcode consent modal per Xcode process for a parallel Xcode-capable stage.",
+      "where_resolved": [
+        "metrics",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-004",
+      "concern": "Rollout had no intermediate delivery milestones.",
+      "proposal_resolution": "Delivery is split into `p051-scaffold` and full `proposal-051|p051` gates, with first/second/third PR handoff slices.",
+      "where_resolved": [
+        "rollout_plan.milestones",
+        "implementation_handoff"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-005",
+      "concern": "Probe cache and dogfood metrics lacked pass/fail thresholds.",
+      "proposal_resolution": "Metrics now specify cache-hit/miss thresholds, minimum dogfood scenario, modal count, observation completeness, and sign-off evidence.",
+      "where_resolved": [
+        "metrics"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-001",
+      "concern": "Runtime observations were inaccessible to operators in-app.",
+      "proposal_resolution": "A minimum `Xcode Runtime` section in RunTimelineInspectorView and related read-only surfaces are now in scope.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface",
+        "implementation_inventory.swift_ui",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-002",
+      "concern": "Prompt-time residual path soft warnings could be ignored.",
+      "proposal_resolution": "Residual path warnings become high-visibility `Policy Warning` timeline/log events and remain persisted in observations.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface",
+        "architecture.catalog_lint_and_residual_observer"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-003",
+      "concern": "Broker-specific failures lacked recovery guidance.",
+      "proposal_resolution": "P051 failure classes now map to friendly titles and suggested actions for the error presentation layer.",
+      "where_resolved": [
+        "ux_ui_notes.friendly_failure_mapping",
+        "failure_semantics"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-004",
+      "concern": "Initialize serialization could look like a hang.",
+      "proposal_resolution": "Operator status distinguishes `Waiting for Xcode Bridge lock` from `Starting Xcode Bridge`.",
+      "where_resolved": [
+        "ux_ui_notes.operator_visible_behavior",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "ui_designer",
+      "issue_id": "UI-001",
+      "concern": "Dense runtime JSON had no concrete rendering plan.",
+      "proposal_resolution": "UI maps typed observation fields to RunTimelineInspectorView rather than displaying raw JSON.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface",
+        "implementation_inventory.swift_ui"
+      ]
+    },
+    {
+      "reviewer": "ui_designer",
+      "issue_id": "UI-002",
+      "concern": "Technical failure classes lacked human-readable UI mapping.",
+      "proposal_resolution": "Friendly failure mapping covers broker, shim, registry, and simulator classes with suggested actions.",
+      "where_resolved": [
+        "ux_ui_notes.friendly_failure_mapping"
+      ]
+    },
+    {
+      "reviewer": "ui_designer",
+      "issue_id": "UI-003",
+      "concern": "Agent capability signals were not visible in the catalog UI.",
+      "proposal_resolution": "AgentCatalogView shows Xcode infrastructure flags before run start.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface",
+        "architecture.direct_command_guard.domain_fields",
+        "implementation_inventory.swift_ui"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-001",
+      "concern": "Broker-to-persistence ownership was underspecified across acp, engine, db, and daemon.",
+      "proposal_resolution": "Domain owns types, db owns transactional append, engine owns concrete sink and attribution, and acp depends only on an injected sink trait.",
+      "where_resolved": [
+        "architecture.runtime_ownership",
+        "architecture.durable_observation_schema"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-002",
+      "concern": "Brokered Xcode MCP registry/resolution contract was not concrete.",
+      "proposal_resolution": "`BrokeredXcodeMcpIntent` defines canonical registry shape, compatibility migration, stale/ambiguous fail-closed errors, and redacted MCP truth.",
+      "where_resolved": [
+        "architecture.brokered_xcode_mcp_resolution"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-003",
+      "concern": "Probe/session invariant was only a debug assertion.",
+      "proposal_resolution": "`CapabilitySliceFingerprint` is computed after launch-spec preparation and rechecked in release mode immediately before provider launch.",
+      "where_resolved": [
+        "architecture.provider_capability_preflight",
+        "architecture.seven_phase_executor_flow",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-004",
+      "concern": "Per-lease bridge process model lacked capacity and backpressure.",
+      "proposal_resolution": "Defaults and failure classes are specified for active leases, initialize queue, queue timeout, spawn/initialize timeout, and first-connect deadline.",
+      "where_resolved": [
+        "architecture.capacity_and_backpressure",
+        "metrics"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-005",
+      "concern": "`tools/*` parallelism could be misread as concurrent writes to one stdio backend.",
+      "proposal_resolution": "Parallelism is explicitly cross-lease; each backend has an ordered request pump for its stdio process.",
+      "where_resolved": [
+        "architecture.broker_backend_model",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-006",
+      "concern": "Startup and rollout were too all-or-nothing.",
+      "proposal_resolution": "Enablement states and rollback switch allow disabled/degraded operation without non-Xcode downtime while preserving no stdio fallback for final Xcode MCP.",
+      "where_resolved": [
+        "rollout_plan.enablement_states",
+        "failure_semantics"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-007",
+      "concern": "Catalog lint and shim signal propagation needed concrete model fields.",
+      "proposal_resolution": "Exact serde field names, defaults, propagation rules, and session fingerprint inputs are specified.",
+      "where_resolved": [
+        "architecture.direct_command_guard.domain_fields",
+        "architecture.session_reuse"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-008",
+      "concern": "Supplemental artifacts were missing in the earlier review environment.",
+      "proposal_resolution": "Current pass consumed available review corpus, score-lift backlog, fact digest, and scope plan; `run-state.json` remains missing and is recorded explicitly rather than inferred.",
+      "where_resolved": [
+        "revision-summary.missing_inputs",
+        "feedback-coverage.notes"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-001",
+      "concern": "The run proposal and checked-in source proposal disagreed on implementation contracts.",
+      "proposal_resolution": "This run proposal is the controlling implementation source until source reconciliation lands; `p051-scaffold` must fail stale contradictory guidance.",
+      "where_resolved": [
+        "implementation_source_of_truth",
+        "rollout_plan.preconditions",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-002",
+      "concern": "Xcode target selection was implicit and could fall back to newest-process heuristics.",
+      "proposal_resolution": "`XcodeTargetResolver` returns pid, workspace identity, developer dir, confidence, and failure class, and fails closed on no match or ambiguity.",
+      "where_resolved": [
+        "architecture.xcode_target_resolver",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-003",
+      "concern": "Shim dispatch authority was token plus same-uid, which does not isolate sibling provider sessions.",
+      "proposal_resolution": "Dispatch leases bind to launched provider pid/process group/tracked descendants, and same-uid cross-session replay is rejected.",
+      "where_resolved": [
+        "architecture.shim_dispatch_and_host_executor",
+        "security_and_isolation",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-004",
+      "concern": "Broker-side MCP policy enforcement lacked a named interface.",
+      "proposal_resolution": "`BrokerMcpPolicy` at the HTTP facade filters `tools/list`, denies unauthorized `tools/call`, persists denial truth, and keeps sibling leases isolated.",
+      "where_resolved": [
+        "architecture.broker_mcp_policy",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-005",
+      "concern": "Append-heavy observation storage lacked bounds and corrupt-json recovery semantics.",
+      "proposal_resolution": "Observation appends now have event/byte limits, retry caps, corrupt-json quarantine, truncation summaries, and a normalized-storage trigger.",
+      "where_resolved": [
+        "architecture.durable_observation_schema",
+        "risks_and_mitigations",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-006",
+      "concern": "Provider probe and launch resource cleanup was implicit.",
+      "proposal_resolution": "`LaunchResourceGuard` owns probe fake-home/temp/config resources, transfers ownership to real sessions, and rolls back before lease allocation on capability failure.",
+      "where_resolved": [
+        "architecture.provider_capability_preflight",
+        "architecture.seven_phase_executor_flow",
+        "implementation_handoff"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-R27-001",
+      "concern": "Upstream dependency status was not a named scheduling gate.",
+      "proposal_resolution": "Dependency audit is a pre-scheduling and `p051-scaffold` precondition; P026 or P029 incompleteness blocks scheduling.",
+      "where_resolved": [
+        "rollout_plan.preconditions",
+        "open_questions",
+        "implementation_handoff"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-R27-002",
+      "concern": "Rollback did not state what happens to in-flight brokered Xcode executions.",
+      "proposal_resolution": "Rollback now explicitly fails in-flight and new Xcode-brokered executions closed after restart while preserving non-Xcode workflows.",
+      "where_resolved": [
+        "rollout_plan.rollback",
+        "failure_semantics"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-R27-003",
+      "concern": "Security claims remain unaudited.",
+      "proposal_resolution": "A focused security review is required before the host-executor/shim-dispatch PR merges.",
+      "where_resolved": [
+        "rollout_plan.preconditions",
+        "implementation_handoff.third_pr",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-005",
+      "concern": "A single Xcode consent modal could still look like a random timeout.",
+      "proposal_resolution": "Startup blocked for more than five seconds shows `Action Required: Check Xcode` with explicit recovery copy.",
+      "where_resolved": [
+        "ux_ui_notes.operator_visible_behavior",
+        "ux_ui_notes.friendly_failure_mapping"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-006",
+      "concern": "Parallel DerivedData contention could be mistaken for broker failure.",
+      "proposal_resolution": "Build concurrency contention gets a distinct failure class and recovery guidance.",
+      "where_resolved": [
+        "ux_ui_notes.friendly_failure_mapping",
+        "risks_and_mitigations"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-007",
+      "concern": "High-visibility residual path warnings could clutter the timeline.",
+      "proposal_resolution": "Repeated identical policy warnings are coalesced per execution.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface"
+      ]
+    },
+    {
+      "reviewer": "ui_designer",
+      "issue_id": "UI-NB-001/UI-NB-002/UI-SUG-001/UI-SUG-002/UI-SUG-003",
+      "concern": "Policy warning styling, conditional rendering, accessibility IDs, and structured observation rendering needed explicit UI contracts.",
+      "proposal_resolution": "Specified policy-warning symbol/color/event type, conditional Xcode Runtime section, structured rows, and accessibility identifiers.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface",
+        "implementation_inventory.swift_ui"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-001",
+      "concern": "Run proposal and checked-in source proposal disagreed on implementable contracts.",
+      "proposal_resolution": "This run proposal is authoritative until the source proposal is reconciled; stale contrary source guidance fails `p051-scaffold`.",
+      "where_resolved": [
+        "implementation_source_of_truth",
+        "rollout_plan.preconditions",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-002",
+      "concern": "Xcode PID/workspace target selection relied on implicit newest-Xcode assumptions.",
+      "proposal_resolution": "`XcodeTargetResolver` returns pid, workspace identity, developer dir, host env, confidence, and fail-closed classes.",
+      "where_resolved": [
+        "architecture.xcode_target_resolver",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-003",
+      "concern": "Same-uid shim authorization was not enough to isolate sibling provider sessions.",
+      "proposal_resolution": "Shim dispatch leases bind to provider child pid/process group/descendant set and reject cross-session replay or process mismatch.",
+      "where_resolved": [
+        "architecture.shim_dispatch_and_host_executor",
+        "metrics",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-004",
+      "concern": "Broker-side MCP policy enforcement lacked a named boundary.",
+      "proposal_resolution": "`BrokerMcpPolicy` filters tools/list, denies tools/call before forwarding, persists denials, and isolates sibling leases.",
+      "where_resolved": [
+        "architecture.broker_mcp_policy",
+        "metrics",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-005",
+      "concern": "Append-heavy observation storage lacked bounds and corrupt-json semantics.",
+      "proposal_resolution": "Storage bounds, retry cap, corrupt-json recovery, truncation signaling, and late-append refresh are specified.",
+      "where_resolved": [
+        "architecture.durable_observation_schema.storage_bounds",
+        "metrics",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R27-006",
+      "concern": "Probe/session fake-home resources lacked ownership and cleanup semantics.",
+      "proposal_resolution": "`LaunchResourceGuard` owns probe/session resources and defines cleanup, transfer, rollback, and crash cleanup.",
+      "where_resolved": [
+        "architecture.launch_resource_ownership",
+        "implementation_handoff"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-R27-001",
+      "concern": "Dependency audit lacked owner/deadline/blocking threshold.",
+      "proposal_resolution": "Dependency audit is a pre-scheduling precondition; P026/P029 incompleteness blocks the scaffold sprint.",
+      "where_resolved": [
+        "rollout_plan.preconditions",
+        "metrics"
+      ]
+    },
+    {
+      "reviewer": "product_owner",
+      "issue_id": "PO-R27-002",
+      "concern": "Rollback communication omitted in-flight Xcode behavior.",
+      "proposal_resolution": "Rollback states that in-flight and new Xcode-brokered executions fail closed immediately while non-Xcode workflows continue.",
+      "where_resolved": [
+        "rollout_plan.rollback",
+        "failure_semantics"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-005",
+      "concern": "A single consent modal can still feel like a hang.",
+      "proposal_resolution": "Added `Action Required: Check Xcode` state before initialize timeout when consent is plausible.",
+      "where_resolved": [
+        "ux_ui_notes.operator_visible_behavior",
+        "ux_ui_notes.friendly_failure_mapping"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-006",
+      "concern": "Parallel DerivedData contention could be mistaken for broker failure.",
+      "proposal_resolution": "Added Xcode build concurrency contention as a separate operator-visible class.",
+      "where_resolved": [
+        "ux_ui_notes.operator_visible_behavior",
+        "ux_ui_notes.friendly_failure_mapping"
+      ]
+    },
+    {
+      "reviewer": "ui_designer",
+      "issue_id": "UI-NB-001/UI-SUG-001",
+      "concern": "Policy warnings needed distinct visual treatment.",
+      "proposal_resolution": "Specified `exclamationmark.shield`, orange foreground, coalescing, and event type/accessibility hooks.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface",
+        "implementation_inventory.swift_ui"
+      ]
+    },
+    {
+      "reviewer": "ui_designer",
+      "issue_id": "UI-NB-002/UI-SUG-003",
+      "concern": "Xcode UI should avoid empty placeholders and raw envelope dumps.",
+      "proposal_resolution": "Xcode Runtime renders only when observations exist, uses structured rows, and exposes stable accessibility identifiers.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R28-001",
+      "concern": "Direct-command containment needs a scanner contract for current catalog shapes.",
+      "proposal_resolution": "`DirectCommandDeclarationScanner` normalizes raw workflow/catalog YAML and typed agent entries into declarations with source path, tokenization mode, matched tool, policy decision, and shim-signal contribution.",
+      "where_resolved": [
+        "architecture.catalog_lint_and_residual_observer.direct_command_declaration_scanner",
+        "implementation_handoff.second_pr",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R28-002",
+      "concern": "Broker health must not collapse into global daemon readiness.",
+      "proposal_resolution": "`XcodeBrokerHealthSnapshot` is exposed alongside daemon status; global readiness follows shared listener and non-Xcode serve ability while broker health gates only Xcode broker requests.",
+      "where_resolved": [
+        "architecture.runtime_ownership.daemon",
+        "architecture.broker_subsystem_health",
+        "failure_semantics",
+        "metrics"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R28-003",
+      "concern": "XcodeTargetResolver ownership still spanned engine policy and acp host mechanics.",
+      "proposal_resolution": "`XcodeTargetResolver` is a trait/service dependency: engine supplies frozen selection inputs, acp performs host probing, and the immutable `XcodeTargetSnapshot` is used for lease keys, observations, and backend spawn.",
+      "where_resolved": [
+        "architecture.xcode_target_resolver",
+        "implementation_inventory.acp",
+        "implementation_inventory.engine"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R28-004",
+      "concern": "Bounded observation storage remains a hot-row append design.",
+      "proposal_resolution": "P051 keeps the bounded envelope but requires the append repository API as the only write path and keeps a normalized event-table migration trigger if dogfood shows retry exhaustion or truncation pressure.",
+      "where_resolved": [
+        "architecture.durable_observation_schema.storage_bounds",
+        "risks_and_mitigations",
+        "metrics"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-ISS-001",
+      "concern": "`Action Required: Check Xcode` could be ambiguous with multiple Xcode windows.",
+      "proposal_resolution": "Recovery text includes workspace identity and Xcode PID when available from `XcodeTargetSnapshot`.",
+      "where_resolved": [
+        "ux_ui_notes.operator_visible_behavior",
+        "ux_ui_notes.friendly_failure_mapping"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-ISS-002",
+      "concern": "Bridge progress states must be visible outside the inspector.",
+      "proposal_resolution": "`Waiting for Xcode Bridge lock`, `Starting Xcode Bridge`, and `Action Required: Check Xcode` propagate to the high-level `RunProgressView` status string.",
+      "where_resolved": [
+        "ux_ui_notes.operator_visible_behavior",
+        "implementation_inventory.swift_ui"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-NB-001",
+      "concern": "Many unique residual paths can still clutter the timeline.",
+      "proposal_resolution": "After five unique residual path warnings in one execution, the timeline shows a summary plus `View all residual paths` disclosure.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface"
+      ]
+    },
+    {
+      "reviewer": "ux_designer",
+      "issue_id": "UX-SUG-001/UX-SUG-002",
+      "concern": "First-run consent and visual consistency needed explicit UX guidance.",
+      "proposal_resolution": "Agent Catalog shows a one-time consent note for broker-required agents and Xcode Runtime uses existing ForgePanel/GroupBox styling.",
+      "where_resolved": [
+        "ux_ui_notes.minimum_ui_surface"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R29-001",
+      "concern": "Source-of-truth drift remains an implementation-start hazard until the scaffold gate enforces reconciliation.",
+      "proposal_resolution": "Source reconciliation or explicit redirect is the first scaffold task, and implementation PR review must fail if work begins from stale checked-in proposal text without the R30 pointer or sync.",
+      "where_resolved": [
+        "implementation_source_of_truth",
+        "rollout_plan.preconditions",
+        "implementation_handoff.first_pr",
+        "metrics"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R29-002",
+      "concern": "Upstream dependency readiness is declared as a gate but not proven in reviewed artifacts.",
+      "proposal_resolution": "Dependency audit is a required pre-scheduling artifact with owner, gate status, remaining gap, and parallel-versus-sequential classification; P026/P029 are hard prerequisites unless the audit narrows scaffold to independent work.",
+      "where_resolved": [
+        "rollout_plan.preconditions",
+        "metrics",
+        "implementation_handoff.preconditions"
+      ]
+    },
+    {
+      "reviewer": "architect",
+      "issue_id": "ARCH-R29-003",
+      "concern": "The bounded JSON observation envelope is acceptable for P051 but remains a monitored migration risk.",
+      "proposal_resolution": "Dogfood must capture retry exhaustion and truncation counts; sustained pressure triggers a normalized event-table migration before broad `shim_enforced` rollout.",
+      "where_resolved": [
+        "architecture.durable_observation_schema.storage_bounds",
+        "metrics",
+        "risks_and_mitigations"
+      ]
     }
-  ]
+  ],
+  "architecture": {
+    "runtime_ownership": {
+      "daemon": [
+        "Owns the shared loopback listener and mounts the broker router at daemon startup unless `CHAINWORKS_XCODE_BROKER_DISABLED=1` is set.",
+        "Constructs shared broker state and broker health reporting.",
+        "Starts non-Xcode routes even when Xcode broker state is Disabled or Degraded.",
+        "Reports `XcodeBrokerHealthSnapshot` as subsystem health beside, not inside, global daemon readiness."
+      ],
+      "acp_runtime_manager": [
+        "Owns `XcodeMcpBridgePool`, `ProviderCapabilityCache`, lease reservation/rollback guards, shim dispatch lease minting, provider-session lifecycle hooks, and injected observation sink handle.",
+        "Does not depend on db and does not write persistence directly."
+      ],
+      "engine": [
+        "Owns the seven-phase executor flow, current execution attribution, release-mode capability-slice checks, and injection of a concrete observation sink into acp.",
+        "Updates the active prompt window and `current_execution_id` pointer for reusable provider sessions."
+      ],
+      "db_domain_api": [
+        "domain owns `XcodeRuntimeObservation` typed models and serde names.",
+        "db owns migration and transactional append repository API for `agent_executions.actual_xcode_runtime_observation_json`.",
+        "GraphQL and MCP expose typed readback without raw token values."
+      ]
+    },
+    "provider_capability_preflight": {
+      "adapter_api": [
+        "`prepare_launch_spec(&ExecutionRequest) -> ProviderLaunchSpec` derives binary path, ordered argv, capability env, and adapter settings. `credential_env` is empty.",
+        "`prepare_session_new_spec(&ExecutionRequest, &[ResolvedMcpServer]) -> SessionNewSpec` constructs `session/new` only after MCP resolution and lease attachment.",
+        "`open_session_with_specs(&ProviderLaunchSpec, &SessionNewSpec) -> AcpSessionHandle` launches without deriving or mutating env, args, or MCP payloads."
+      ],
+      "launch_resource_guard": [
+        "`ProviderLaunchSpec` carries or references a `LaunchResourceGuard` that owns fake-home, temp, cache, generated config, and provider runtime-home resources created for a probe or session.",
+        "Initialize-only probes use the guard and clean it on probe close or capability failure before any broker lease is allocated.",
+        "Real sessions transfer the guard into `AcpSessionHandle` on successful `open_session_with_specs`; cancellation, launch failure, or prelaunch drift failure drops the guard and removes owned resources.",
+        "Credential-only additions in Phase 6 do not create unmanaged resources outside the guard."
+      ],
+      "probe_key": {
+        "fields": [
+          "adapter_family",
+          "runtime_profile_id",
+          "binary_fingerprint",
+          "ordered launch args fingerprint",
+          "capability env fingerprint",
+          "adapter settings fingerprint"
+        ],
+        "binary_fingerprint": "canonical binary path, file size, mtime, and SHA-256 content hash when readable; if content hashing is unavailable, record `binary_hash_unavailable` and include path+size+mtime only.",
+        "cache_lifetime": "in-memory for daemon lifetime; any component change forces a fresh initialize-only probe"
+      },
+      "release_mode_contract": [
+        "Compute `CapabilitySliceFingerprint` immediately after `prepare_launch_spec`.",
+        "Recompute immediately before `open_session_with_specs`.",
+        "Fail before provider launch with `provider_launch_spec_capability_drift` if binary path, ordered argv, capability env, runtime profile, or adapter settings changed.",
+        "Exclude `credential_env` from the fingerprint and test that shim-token and socket additions do not affect it."
+      ],
+      "unsupported_providers": "Codex ACP, Claude Agent ACP, and Gemini CLI are verified for launch scope. Auggie and Junie fail closed for brokered Xcode MCP until their probes prove HTTP MCP support."
+    },
+    "brokered_xcode_mcp_resolution": {
+      "canonical_registry_contract": {
+        "registry_entry": "The canonical Xcode MCP entry uses server id or runtime id `xcode` and `type: xcode_broker` or `transport: xcode_broker`; it must not contain executable `command` fields in the final migrated shape.",
+        "intent_type": "engine resolves the canonical entry to `BrokeredXcodeMcpIntent`, not directly to stdio.",
+        "intent_fields": [
+          "extension_id",
+          "runtime_id",
+          "server_id",
+          "workspace_root",
+          "xcode_pid_selector",
+          "runtime_profile_id",
+          "permission_profile_id",
+          "resolved_tool_allowlist_hash",
+          "provider_http_required"
+        ]
+      },
+      "compatibility_migration": [
+        "An existing registry entry keyed as `xcode` with `command = xcrun` and first non-option arg `mcpbridge` is accepted only as a migration compatibility trigger and converted to `BrokeredXcodeMcpIntent` with warning `xcode_mcp_registry_stdio_migrated`.",
+        "Any non-canonical direct `xcrun mcpbridge`, direct `mcpbridge`, or absolute-path mcpbridge registry shape fails closed with `xcode_mcp_registry_stale_stdio`.",
+        "Multiple enabled canonical Xcode entries fail closed with `xcode_mcp_registry_ambiguous`.",
+        "Registry entries that request Xcode MCP but lack a canonical broker id fail closed with `xcode_mcp_registry_missing_canonical_id`."
+      ],
+      "resolved_transport": "After capability preflight, `attach_broker_leases` mutates placeholder broker intent into an HTTP MCP server payload with real URL and bearer header. Bearers are never persisted in predicted or actual MCP truth."
+    },
+    "seven_phase_executor_flow": [
+      "Phase 1: `prepare_launch_spec` returns a launch spec with empty `credential_env`, a `LaunchResourceGuard`, and records `CapabilitySliceFingerprint`.",
+      "Phase 2: `ensure_provider_capabilities` probes or reads cache; HTTP false fails closed.",
+      "Phase 3: `resolve_mcp_servers` is pure and returns stdio/platform transports or `BrokeredXcodeMcpIntent` placeholders.",
+      "Phase 4: `attach_broker_leases` is the only broker-state mutation for MCP leases. `LeaseReservationGuard` rolls back on drop until committed.",
+      "Phase 5: `prepare_session_new_spec` constructs the real `session/new` payload.",
+      "Phase 6: `attach_session_credentials` mints shim dispatch token and writes `credential_env` only when `xcode_shim_injection_signal` is true.",
+      "Phase 7: release-mode capability fingerprint is rechecked, provider session opens through `open_session_with_specs`, the launch-resource guard transfers into the session handle, and the lease guard commits only after session open succeeds."
+    ],
+    "http_transport_contract": {
+      "resolved_transport_variant": "`ResolvedMcpServerTransport::Http { url, headers }`",
+      "session_new_shape": {
+        "type": "http",
+        "name": "xcode",
+        "url": "http://127.0.0.1:<daemon-port>/xcode-mcp/<lease_id>",
+        "headers": [
+          {
+            "name": "Authorization",
+            "value": "Bearer <redacted-lease-token>"
+          }
+        ]
+      },
+      "stdio_requirement": "Stdio entries also include `type: stdio` so all providers receive canonical ACP discriminated-union shape."
+    },
+    "broker_backend_model": {
+      "process_model": "One backend `xcrun mcpbridge` subprocess per active provider HTTP lease. Pool keys group policy and lifecycle but do not multiplex one backend process across leases.",
+      "initialize_serialization": "A per-Xcode-PID mutex covers backend spawn plus MCP `initialize`; it releases after initialize responds.",
+      "tools_parallelism": "Default `tools/*` parallelism is cross-lease across independent backend processes. Within one lease, a per-backend ordered request pump serializes writes to the stdio backend, rewrites JSON-RPC ids, correlates responses, handles cancellation, and attributes backend errors.",
+      "host_env": [
+        "`HOME=<operator home from getpwuid(getuid()) or daemon config override>`",
+        "`TMPDIR=<operator Darwin user temp dir>`",
+        "`DEVELOPER_DIR=<xcode-select -p>`",
+        "`USER` and `LOGNAME` for the operator account",
+        "`PATH=/usr/bin:/bin:/usr/sbin:/sbin:<DEVELOPER_DIR>/usr/bin`",
+        "`MCP_XCODE_PID=<target Xcode PID>`",
+        "No `CODEX_HOME`, no `XDG_CACHE_HOME`, no `CHAINWORKS_*`"
+      ],
+      "pid_drift": "Xcode PID drift closes stale leases for the old PID with `pool_pid_drift`; new leases target the new PID."
+    },
+    "capacity_and_backpressure": {
+      "defaults": {
+        "max_active_leases_per_xcode_pid": 8,
+        "max_initialize_queue_per_xcode_pid": 16,
+        "max_initializing_per_xcode_pid": 1,
+        "initialize_queue_timeout_seconds": 45,
+        "backend_spawn_initialize_timeout_seconds": 30,
+        "first_connect_deadline_seconds": 60
+      },
+      "configuration": "Runtime profiles may lower limits; raising limits requires explicit config and is recorded in broker health diagnostics.",
+      "failure_classes": [
+        "xcode_mcp_capacity_exhausted",
+        "xcode_mcp_initialize_queue_timeout",
+        "xcode_mcp_initialize_timeout",
+        "xcode_mcp_first_connect_timeout"
+      ],
+      "observations": "Queued, dequeued, rejected, timed-out, and capacity-limit events are appended to `mcp_broker_observations[]` with wait duration and limit values."
+    },
+    "broker_subsystem_health": {
+      "type": "XcodeBrokerHealthSnapshot",
+      "owner": "daemon owns publishing; acp broker owns state transitions; UI/API read it as Xcode subsystem health.",
+      "states": [
+        "Disabled",
+        "Healthy",
+        "Degraded",
+        "Failed"
+      ],
+      "fields": [
+        "state",
+        "reason_code",
+        "can_acquire_new_xcode_leases",
+        "active_lease_count",
+        "initialize_queue_depth",
+        "last_transition_at",
+        "operator_message"
+      ],
+      "readiness_contract": [
+        "Global `/ready` and daemon Ready remain tied to shared listener health and ability to serve non-Xcode routes.",
+        "Xcode broker Disabled or Degraded does not make non-Xcode readiness fail.",
+        "Brokered Xcode lease acquisition checks `can_acquire_new_xcode_leases` and fails closed with a broker-specific failure class when false.",
+        "SwiftUI and MCP/GraphQL read broker health from the subsystem snapshot instead of inferring it from global daemon state."
+      ]
+    },
+    "lease_and_token_lifecycle": {
+      "ownership": "Leases are provider-session-owned, not execution-owned. A successful execution does not release its lease if the provider session remains reuse-compatible.",
+      "states": [
+        "reserved",
+        "active",
+        "closing",
+        "released",
+        "orphaned"
+      ],
+      "release_triggers": [
+        "ACP `session/close` or provider stdin EOF",
+        "cancellation",
+        "timeout",
+        "provider crash",
+        "operator reset",
+        "reuse-incompatible supersession"
+      ],
+      "http_token_rules": [
+        "Bearer tokens are session-lifetime, not single-use.",
+        "First connect must occur before the deadline.",
+        "After initialize, the lease binds to MCP session id.",
+        "Subsequent requests require bearer plus matching `Mcp-Session-Id`.",
+        "Only one active HTTP stream per lease is allowed.",
+        "Reconnect is allowed only when active stream count is zero and session id matches."
+      ]
+    },
+    "direct_command_guard": {
+      "domain_fields": [
+        {
+          "field": "xcode_broker_required",
+          "type": "bool",
+          "serde": "xcode_broker_required",
+          "default": false,
+          "meaning": "Agent requested Xcode MCP; drives broker lease and HTTP MCP entry only."
+        },
+        {
+          "field": "xcode_shim_injection_signal",
+          "type": "bool",
+          "serde": "xcode_shim_injection_signal",
+          "default": false,
+          "meaning": "Agent can invoke Xcode shell commands directly; drives PATH shim, shim dispatch lease, and FreshSessionRequired."
+        },
+        {
+          "field": "requires_xcode_host_execution",
+          "type": "bool",
+          "serde": "requires_xcode_host_execution",
+          "default": false,
+          "meaning": "Direct Xcode shell commands may be routed through host executor instead of rejected."
+        },
+        {
+          "field": "xcode_prompt_lint_warnings",
+          "type": "Vec<XcodePromptLintWarning>",
+          "serde": "xcode_prompt_lint_warnings",
+          "default": [],
+          "meaning": "Soft warnings for prompt/system/description text."
+        }
+      ],
+      "propagation": "Workflow catalog lint writes these fields into compiled plan/domain `ResolvedAgent`; engine copies them into session fingerprints, reports, recovery truth, and Agent Catalog UI metadata.",
+      "fingerprint_inputs": "Session reuse fingerprint includes `xcode_broker_required`, broker contract hash, permission profile id, resolved tool allowlist hash, and `xcode_shim_injection_signal`. Any shim-enabled execution forces FreshSessionRequired.",
+      "shim_executables": [
+        "xcodebuild",
+        "simctl",
+        "mcpbridge",
+        "xcrun"
+      ],
+      "xcrun_rules": [
+        "Run mode: default, `-r <tool>`, `--run <tool>`.",
+        "Find mode: `-f <tool>`, `--find <tool>`; finding `xcodebuild`, `simctl`, or `mcpbridge` is rejected to prevent find-then-exec bypass.",
+        "Show mode: `--show-sdk-*` passes through.",
+        "`--sdk` and `--toolchain` consume the next token.",
+        "`-l`, `--log`, `--verbose`, `--no-cache`, `--kill-cache`, `--help`, `-h`, and `--version` do not consume the next token.",
+        "Unknown flags fail closed with `xcrun_unknown_option`."
+      ],
+      "diagnostic_mode": "`CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` may passthrough `xcodebuild`, `simctl`, and non-mcpbridge `xcrun` branches for local debugging. `mcpbridge` is never bypassed."
+    },
+    "catalog_lint_and_residual_observer": {
+      "direct_command_declaration_scanner": {
+        "type": "DirectCommandDeclarationScanner",
+        "owner": "workflow/catalog crate",
+        "inputs": [
+          "raw parsed workflow YAML",
+          "raw parsed agent catalog YAML",
+          "typed agent entries",
+          "typed runtime and permission profile ids when available"
+        ],
+        "output_fields": [
+          "source_document",
+          "source_path",
+          "declaration_kind",
+          "tokenization_mode",
+          "raw_value",
+          "argv_tokens",
+          "matched_xcode_tool",
+          "policy_decision",
+          "contributes_to_xcode_shim_injection_signal",
+          "warning_or_error_code"
+        ],
+        "current_fixture_coverage": [
+          "examples/agents/agents.yaml permission profile shell allow entries that mention xcodebuild or simctl",
+          "examples/agents/agents.yaml agents[].required_tools entries that mention Xcode tools",
+          "run block command paths and argv",
+          "tools.shell.commands and adapter-specific shell capability fields represented as raw YAML"
+        ],
+        "contract": "The scanner operates over raw YAML plus typed structs so fields currently stored as serde_yaml::Value cannot escape linting. Catalog compilation consumes scanner output to set `xcode_shim_injection_signal`, emit hard failures, and persist prompt warnings."
+      },
+      "hard_fail_fields": [
+        "run block command path and argv",
+        "run block env values paired with Xcode tools",
+        "shell_allowlist",
+        "allowed_commands",
+        "tools.shell.commands",
+        "adapter-specific shell-capability fields",
+        "required-tool declarations if represented separately"
+      ],
+      "hard_fail_patterns": [
+        "/usr/bin/xcrun",
+        "/usr/bin/xcodebuild",
+        "/Applications/Xcode.app/Contents/Developer/",
+        "/Applications/Xcode*.app/Contents/Developer/",
+        "DEVELOPER_DIR=...xcodebuild",
+        "DEVELOPER_DIR=...simctl",
+        "direct or absolute `mcpbridge`"
+      ],
+      "soft_warning_fields": "Prompt, system instruction, and description text only.",
+      "residual_observer": "`XcodeResidualPathObserver` watches ACP `session/update` shell-tool events and emits warning observations for prompt-time absolute Xcode paths. It does not block execution. If argv is unavailable, it records `observer_unavailable`."
+    },
+    "shim_dispatch_and_host_executor": {
+      "token": "Separate `XcodeShimDispatchToken`, minted per provider session, readable by the agent and treated as a session identifier rather than a secret.",
+      "provider_identity_binding": [
+        "The dispatch lease records the provider child pid returned by `open_session_with_specs`, its process group when available, and a tracked descendant set for shim subprocesses.",
+        "Socket peers must match the recorded provider process, process group, or tracked descendant policy for that session; same uid alone is insufficient.",
+        "Forged claimed provider pid, stale token after close, same-uid cross-session token replay, and process-tree mismatch are rejected before command parsing."
+      ],
+      "socket_authorization": [
+        "Unix-domain socket peer pid/uid/gid verification.",
+        "Peer uid must match daemon uid before token validation.",
+        "Active prompt window is required.",
+        "Workspace root and host-execution policy are frozen at lease creation.",
+        "Cwd outside workspace root is rejected.",
+        "Only `xcodebuild` and `simctl` may route to host executor.",
+        "`mcpbridge` never routes.",
+        "Bind each shim dispatch lease to the launched provider child pid plus tracked process group or descendant set created by `open_session_with_specs`.",
+        "Reject same-uid peers outside that process identity with `xcode_shim_peer_process_mismatch`; do not accept forged claimed provider pid values as warnings-only.",
+        "Fixtures cover same-uid cross-session token replay, stale token after close, forged pid, and process-tree mismatch."
+      ],
+      "host_executor_env": "Build from scratch, override host-sensitive values, drop provider/internal env, and propagate only explicit build-input allowlist values such as `SCHEME`, `CONFIGURATION`, `DESTINATION`, `CODE_SIGN_STYLE`, and `DEVELOPMENT_TEAM`."
+    },
+    "simulator_destination_stability": [
+      "Pass through `id=<UUID>` destinations.",
+      "Rewrite unique `platform=iOS Simulator,name=<name>,OS=<os>` matches to `platform=iOS Simulator,id=<UUID>`.",
+      "Reject ambiguous name/OS matches with candidate UUIDs.",
+      "Reject not-found and unparseable simulator destinations.",
+      "Pass through macOS and generic destinations.",
+      "Record original and rewritten destination in `xcode_host_executor_events[]`."
+    ],
+    "durable_observation_schema": {
+      "migration": "Add nullable `agent_executions.actual_xcode_runtime_observation_json TEXT`; legacy and non-Xcode rows read as GraphQL null.",
+      "envelope": {
+        "mcp_broker_observations": [],
+        "xcode_shim_events": [],
+        "xcode_host_executor_events": []
+      },
+      "ownership_contract": [
+        "domain crate defines typed envelope, event enums, failure-class serde names, redaction model, and version field.",
+        "db crate owns `append_xcode_runtime_observation(agent_execution_id, event)` using transactional read-modify-write and optimistic retry.",
+        "engine crate implements the concrete `XcodeRuntimeObservationSink` using the db repo and injects an async handle into `AcpRuntimeManager`.",
+        "acp crate owns only the sink trait/callback and calls it for broker, shim, host executor, and residual observer events.",
+        "Late async shim events use the active prompt attribution pointer. Idle-window events are rejected and written to an orphan observation bucket when attributable to run/session but not an active execution."
+      ],
+      "persistence_failure_policy": [
+        "Observation append failure never silently drops the event: emit tracing error, increment `xcode_observation_persist_failed_total`, and mark broker health Degraded.",
+        "If the event is tied to an active execution, the engine also appends a best-effort `observation_persistence_degraded` warning through the normal execution failure evidence path.",
+        "Persistence failure does not by itself fail an otherwise successful Xcode command, but the full P051 gate requires persistence success in fixtures."
+      ],
+      "api_readback": [
+        "GraphQL exposes typed `actualXcodeRuntimeObservation`.",
+        "MCP `reports.get` returns the same envelope at `execution.xcode_runtime_observation`.",
+        "No raw bearer token or shim token is stored or returned."
+      ],
+      "storage_bounds": {
+        "max_events_per_execution_default": 1000,
+        "max_bytes_per_execution_default": 1048576,
+        "append_retry_limit": 3,
+        "retry_policy": "optimistic retry with short bounded backoff; exceeding the retry limit emits `observation_persistence_degraded` and increments `xcode_observation_persist_failed_total`",
+        "corrupt_json_recovery": "Do not drop the new event. Preserve the corrupt prior blob in failure evidence when possible, replace the stored envelope with a recovery envelope containing `observation_prior_json_corrupt`, and append the new event after redaction.",
+        "truncation_policy": "When limits are reached, retain summary counters plus the newest events needed for acceptance evidence; emit `xcode_observation_truncated` and expose truncation in GraphQL/MCP/UI.",
+        "late_append_notification": "Late async appends publish an execution update so GraphQL/MCP/UI readback can refresh without requiring log scraping.",
+        "single_write_path": "All writers use the db append repository API; direct whole-column replacement is prohibited outside migration/backfill code.",
+        "normalized_table_escape_hatch": "If dogfood shows sustained pressure, file and prioritize a normalized execution-event table migration before broad `shim_enforced` rollout. Sustained pressure means retry exhaustion in any dogfood run, truncation in more than 1 percent of brokered Xcode executions, or repeated append latency/backoff spikes across two consecutive dogfood runs."
+      }
+    },
+    "session_reuse": [
+      "A live provider session is reuse-compatible only if existing reuse disposition allows reuse, the accepted MCP server set matches, the live Xcode broker lease is active, the broker contract hash matches, and neither side has `xcode_shim_injection_signal = true`.",
+      "Pure Xcode MCP agents can reuse sessions and append a new broker observation with `backend_start_disposition = reused_existing_provider_session_lease`.",
+      "Shim-enabled agents force FreshSessionRequired to preserve per-execution observation truth and avoid cross-prompt attribution ambiguity."
+    ],
+    "xcode_target_resolver": {
+      "owner": "trait/service dependency shared across engine and acp: engine supplies frozen selection inputs from compiled run/runtime truth; acp owns host-env probing and Xcode process inspection; neither side reconstructs the other's state.",
+      "input": [
+        "XcodeTargetSelectionInput from engine: workspace_root, runtime_profile_id, optional configured Xcode app or pid selector, permission_profile_id, broker contract hash",
+        "HostProbeContext from acp: current macOS GUI session, candidate Xcode processes, host user/home/temp/developer-dir probes"
+      ],
+      "output": [
+        "XcodeTargetSnapshot",
+        "xcode_pid",
+        "workspace_identity",
+        "developer_dir",
+        "operator_home",
+        "darwin_tmpdir",
+        "selection_confidence",
+        "failure_class"
+      ],
+      "snapshot_contract": "The immutable `XcodeTargetSnapshot` is stored on the lease, included in lease keys and observations, and passed to backend spawn. acp must not infer workspace/runtime policy from global state after the snapshot is created.",
+      "selection_rules": [
+        "Prefer an explicit runtime-profile Xcode PID or app/workspace binding when configured and verify it is alive.",
+        "When no explicit PID is configured, match visible Xcode processes by workspace identity instead of newest-process heuristics.",
+        "Fail closed with `xcode_target_not_found` when no Xcode process matches the workspace.",
+        "Fail closed with `xcode_target_ambiguous` when multiple live Xcode processes match and no selector disambiguates them.",
+        "Fail closed with `host_env_unavailable` when the selected process does not belong to the expected GUI user or host home cannot be resolved.",
+        "Record target resolver evidence in `mcp_broker_observations[]` before backend spawn."
+      ],
+      "stale_behavior": "Direct `pgrep -n -x Xcode` selection is prohibited for brokered P051 paths and is a stale-guidance pattern in the scaffold static gate."
+    },
+    "broker_mcp_policy": {
+      "owner": "broker HTTP facade in acp; constructed from permission_profile_id and resolved_tool_allowlist_hash",
+      "interface": "BrokerMcpPolicy { filter_tools_list(lease, tools) -> tools; authorize_tools_call(lease, tool_name) -> Allow|Deny }",
+      "rules": [
+        "Filter `tools/list` per lease before returning provider-visible tools.",
+        "Deny `tools/call` for tools outside the resolved allowlist even if the backend advertises them.",
+        "Persist denied calls as broker observations without forwarding them to `mcpbridge`.",
+        "Keep sibling leases isolated: a denial or filtered list for one lease does not mutate another lease policy.",
+        "Redact bearer values while preserving requested, predicted, actual, and denied MCP truth separately."
+      ],
+      "acceptance_fixtures": [
+        "tools_list_filtered_per_lease",
+        "tools_call_denied_without_backend_forward",
+        "denied_observation_persisted",
+        "sibling_lease_policy_isolation"
+      ]
+    },
+    "launch_resource_ownership": {
+      "owner": "ProviderLaunchSpec owns a LaunchResourceGuard for fake-home, temp, cache, and generated provider config resources created before probes or sessions.",
+      "lifecycle": [
+        "Probe path: guard creates resources, initialize-only probe runs, stdin closes, guard cleans up unless cache logic marks reusable immutable resources safe to keep.",
+        "Real session path: guard transfers ownership to AcpSessionHandle only after `open_session_with_specs` succeeds.",
+        "Failure before provider launch: guard drops and removes resources before broker leases or shim credentials are allocated.",
+        "Failure after lease reservation but before session open: LaunchResourceGuard and LeaseReservationGuard both roll back.",
+        "Session close/crash/cancel: AcpSessionHandle cleanup releases resources and broker leases in deterministic order."
+      ],
+      "acceptance_fixtures": [
+        "probe_resource_cleanup",
+        "real_session_resource_transfer",
+        "capability_failure_no_resource_leak",
+        "lease_failure_resource_rollback"
+      ]
+    }
+  },
+  "failure_semantics": [
+    {
+      "failure": "Provider lacks HTTP MCP capability",
+      "behavior": "Fail before lease/token/backend/session-new/shim allocation with `provider_http_mcp_unsupported`."
+    },
+    {
+      "failure": "Broker disabled by kill switch",
+      "behavior": "Daemon serves non-Xcode workflows after restart; in-flight and new Xcode broker requests fail closed with `xcode_broker_disabled` and no stdio fallback."
+    },
+    {
+      "failure": "Broker route or host env unavailable at startup",
+      "behavior": "Daemon global readiness may remain Ready when non-Xcode routes are healthy; `XcodeBrokerHealthSnapshot` becomes Degraded and Xcode lease acquisition fails closed until health recovers."
+    },
+    {
+      "failure": "Shared daemon listener cannot start",
+      "behavior": "Daemon exits non-zero because no workflows can be served."
+    },
+    {
+      "failure": "Capacity exhausted",
+      "behavior": "Reject new lease reservations with `xcode_mcp_capacity_exhausted`; existing leases continue."
+    },
+    {
+      "failure": "Backend bridge crashes",
+      "behavior": "Fail only that lease with per-lease backend failure; siblings continue."
+    },
+    {
+      "failure": "Xcode PID drift",
+      "behavior": "Close stale-PID leases and backends with `pool_pid_drift`; new leases target new PID."
+    },
+    {
+      "failure": "Provider never connects after session-new",
+      "behavior": "First-connect deadline expires; lease becomes orphaned and backend closes."
+    },
+    {
+      "failure": "Xcode consent likely blocking startup",
+      "behavior": "After five seconds in bridge startup, emit `xcode_mcp_action_required`; if the initialize deadline still expires, fail with `xcode_mcp_initialize_timeout`."
+    },
+    {
+      "failure": "Second concurrent HTTP stream on same lease",
+      "behavior": "Reject with `xcode_mcp_concurrent_stream_rejected`."
+    },
+    {
+      "failure": "Broker policy denies MCP tool call",
+      "behavior": "Reject at the HTTP facade with `xcode_mcp_tool_denied`, persist denied MCP truth, and do not forward to backend stdio."
+    },
+    {
+      "failure": "Shim peer process does not match provider session",
+      "behavior": "Reject with `xcode_shim_peer_process_mismatch`; same-uid cross-session requests are not accepted as warnings-only."
+    },
+    {
+      "failure": "Shim dispatch outside active prompt",
+      "behavior": "Reject with `xcode_shim_no_active_prompt` and write orphan observation when attributable."
+    },
+    {
+      "failure": "Simulator name/OS ambiguous",
+      "behavior": "Reject with `simulator_destination_ambiguous` and candidate UUIDs."
+    },
+    {
+      "failure": "Parallel build resource contention",
+      "behavior": "Classify as `xcode_build_concurrency_contention`; do not mark broker health degraded unless broker events also failed."
+    }
+  ],
+  "security_and_isolation": [
+    "ACP provider processes keep fake `HOME`, isolated `CODEX_HOME`, and provider-scoped temp/cache state.",
+    "Only broker-owned Xcode subprocesses receive host-user Xcode environment.",
+    "HTTP MCP uses per-lease bearer, MCP session-id binding, and single-active-stream enforcement.",
+    "Shim dispatch uses a separate Unix socket token, peer uid verification, and provider process/process-group/descendant binding.",
+    "Tokens are redacted in logs, observations, GraphQL, and MCP reports.",
+    "The host executor allowlist is limited to `xcodebuild` and `simctl`.",
+    "`mcpbridge` is never routed to host executor and is never exposed as a provider shell capability inside the enforced boundary.",
+    "Provider env is never passed wholesale to host Xcode subprocesses.",
+    "Permission profile id and resolved tool allowlist hash are part of the broker contract and reuse/fingerprint checks.",
+    "Broker HTTP facade enforces MCP tool policy before backend forwarding so the broker cannot become a transparent policy bypass.",
+    "A focused security review of bearer lifecycle, shim token replay, same-uid socket peers, provider process binding, cwd policy, env allowlist, token redaction, diagnostic mode, and loopback surface is required before the host-executor PR merges."
+  ],
+  "rollout_plan": {
+    "enablement_states": [
+      {
+        "state": "disabled",
+        "meaning": "`CHAINWORKS_XCODE_BROKER_DISABLED=1`; broker lease allocation and shim injection are disabled, non-Xcode workflows continue, and Xcode broker requests fail closed."
+      },
+      {
+        "state": "shadow_observe",
+        "meaning": "Catalog lint and capability probes run and write observations, but Xcode MCP brokering is not required. This is for local dogfood only and cannot satisfy final acceptance."
+      },
+      {
+        "state": "broker_required_for_xcode_mcp",
+        "meaning": "Xcode MCP requests must use brokered HTTP; no stdio fallback."
+      },
+      {
+        "state": "shim_enforced",
+        "meaning": "Direct-command lint, PATH shim, dispatch socket, host executor, and residual observer are enforced."
+      }
+    ],
+    "milestones": [
+      {
+        "gate": "p051-scaffold",
+        "scope": [
+          "schema/domain/API scaffolding behind nullable readback",
+          "adapter API split",
+          "initialize-only capability probe/cache",
+          "release-mode capability fingerprint invariant",
+          "HTTP MCP transport serialization",
+          "broker route construction",
+          "host-user env fixture tests",
+          "registry-to-`BrokeredXcodeMcpIntent` resolution and stale/ambiguous fail-closed fixtures"
+        ]
+      },
+      {
+        "gate": "proposal-051|p051",
+        "scope": [
+          "full broker backend lifecycle",
+          "capacity and backpressure policy",
+          "PATH shims and catalog lint",
+          "shim dispatch socket",
+          "host executor and simulator UUID rewrite",
+          "durable observations with GraphQL/MCP/UI readback",
+          "catalog migration",
+          "dogfood evidence",
+          "static research consistency check"
+        ]
+      }
+    ],
+    "steps": [
+      "Land typed domain models and nullable DB/API readback.",
+      "Add observation sink trait, db append API, and engine-injected sink with persistence-failure handling.",
+      "Add adapter API split, initialize-only probe/cache, stronger binary fingerprinting, and release-mode capability slice check.",
+      "Add `BrokeredXcodeMcpIntent`, registry migration contract, HTTP transport enum, and provider capability fail-closed behavior.",
+      "Add broker route, lease model, enablement states, kill switch, health, and capacity/backpressure policy.",
+      "Add host-user Xcode env builder and backend `mcpbridge` lifecycle with per-PID initialize serialization.",
+      "Add per-backend ordered request pump, id rewriting, cancellation handling, and crash attribution.",
+      "Add direct-command catalog lint, Xcode signals, prompt warnings, PATH shims, and shim dispatch socket.",
+      "Add host executor routing for `xcodebuild`/`simctl` and simulator destination rewrite.",
+      "Add residual path observer and high-visibility UI warning presentation.",
+      "Add RunTimelineInspectorView, FailedStageEvidencePanel, AgentCatalogView, and broker health presentation mappings.",
+      "Migrate example agent catalogs to explicit `requires_xcode_host_execution` where needed.",
+      "Register `p051-scaffold`, `proposal-051`, and `p051` in `scripts/test-gate.sh` and `docs/reference/test-gates.md`.",
+      "Run scaffold gate, full fixture gate, then dogfood on a parallel Gemini UX/UI proposal-review stage."
+    ],
+    "rollback": "Set `CHAINWORKS_XCODE_BROKER_DISABLED=1` and restart the daemon to preserve non-Xcode workflows while refusing Xcode broker requests. During rollback, all in-flight and new Xcode-brokered executions fail closed immediately with `xcode_broker_disabled`; this is a rollback switch, not a production fallback for brokered Xcode MCP.",
+    "preconditions": [
+      "Before scheduling implementation, complete a dependency audit for P025, P026, P029, P037, and P049. The artifact schema is: proposal id, owner, current implementation gate status, remaining gaps, whether P051 can proceed in parallel, required sequencing, and blocking threshold. P026 or P029 incompleteness blocks the scaffold sprint unless the audit explicitly narrows PR1 to independent work.",
+      "Before the first implementation PR starts, reconcile `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` with this proposal or replace stale sections with an explicit pointer to this controlling contract. This is the first scaffold task, and implementation review fails if a PR begins from stale checked-in proposal text.",
+      "Before the third PR merges, assign a security reviewer for bearer lifecycle, shim token replay, provider process binding, Unix socket peer checks, loopback HTTP surface, cwd policy, env allowlist, token redaction, and diagnostic-mode bypasses."
+    ]
+  },
+  "metrics": [
+    {
+      "metric": "p051-scaffold gate",
+      "threshold": "`./scripts/test-gate.sh p051-scaffold` passes."
+    },
+    {
+      "metric": "Full P051 gate",
+      "threshold": "`./scripts/test-gate.sh proposal-051` and `./scripts/test-gate.sh p051` pass."
+    },
+    {
+      "metric": "Provider capability cache correctness",
+      "threshold": "A second call with an identical `ProbeKey` is a cache hit; any binary, argv, capability env, runtime profile, or adapter settings change is a miss."
+    },
+    {
+      "metric": "Unsupported-provider fail-closed behavior",
+      "threshold": "Fixture proves no lease, token, backend, shim token, or `session/new` allocation occurs when HTTP MCP is false."
+    },
+    {
+      "metric": "Parallel Xcode MCP startup",
+      "threshold": "At least two parallel sessions against the same Xcode PID get isolated leases/backends, one-at-a-time initialize, and cross-lease parallel tools after initialize."
+    },
+    {
+      "metric": "Modal dedup dogfood",
+      "threshold": "Dogfood on at least two parallel Gemini Xcode-capable sessions against the same Xcode process shows at most one Xcode consent modal per Xcode process."
+    },
+    {
+      "metric": "Parallel startup latency evidence",
+      "threshold": "Dogfood sign-off records wall-clock time from first provider launch to both sessions initialized, per-session initialize wait, and whether any `Action Required: Check Xcode` state was shown."
+    },
+    {
+      "metric": "Fake-home failures",
+      "threshold": "Zero catalog-declared or PATH-based Xcode fake-home failures in the dogfood run."
+    },
+    {
+      "metric": "Observation completeness",
+      "threshold": "100 percent of brokered Xcode executions have `mcp_broker_observations[]`; 100 percent of shim rejections/routes have `xcode_shim_events[]`; 100 percent of routed commands have `xcode_host_executor_events[]`."
+    },
+    {
+      "metric": "UI visibility",
+      "threshold": "Dogfood evidence includes screenshots or UI proof showing Xcode Runtime details, policy warnings, friendly failure text, and Agent Catalog infrastructure flags."
+    },
+    {
+      "metric": "Token redaction",
+      "threshold": "No raw MCP bearer or shim token appears in logs, tracing, GraphQL, MCP reports, stored observations, or UI."
+    },
+    {
+      "metric": "Dogfood approver",
+      "threshold": "Named operator or release owner signs off with run id, provider versions, Xcode PID, session count, modal count, and observation completeness evidence."
+    },
+    {
+      "metric": "Source proposal reconciliation",
+      "threshold": "`p051-scaffold` fails until the checked-in source proposal is reconciled with this contract or explicitly points to it; stale no-UI, debug_assert-only, path+mtime+size-only, drop-on-corrupt, pgrep-newest-Xcode, and same-uid-only shim guidance must be absent. No implementation PR may begin from docs/proposals/051 alone before this passes."
+    },
+    {
+      "metric": "Dependency audit readiness",
+      "threshold": "Written table for P025/P026/P029/P037/P049 exists before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold; P026 and P029 are marked implemented enough for scaffold or the sprint is not scheduled unless PR1 is explicitly narrowed to independent work."
+    },
+    {
+      "metric": "Broker policy enforcement",
+      "threshold": "Fixtures prove per-lease tools/list filtering, tools/call denial without backend forwarding, denied-observation persistence, and sibling-lease isolation."
+    },
+    {
+      "metric": "Shim dispatch identity binding",
+      "threshold": "Fixtures reject same-uid cross-session token replay, stale token after session close, forged provider pid, and peer process-tree mismatch."
+    },
+    {
+      "metric": "Observation storage bounds",
+      "threshold": "Fixtures cover retry exhaustion, corrupt prior JSON recovery without dropping the new event, truncation signaling, and late-append UI/API refresh."
+    },
+    {
+      "metric": "Dogfood latency evidence",
+      "threshold": "Dogfood sign-off records p50 and max wall-clock startup latency for the parallel Xcode session pair; max startup latency must stay below the configured initialize queue timeout and must be included in release evidence."
+    },
+    {
+      "metric": "Residual path warning ratio",
+      "threshold": "Dogfood reports residual prompt-time absolute-path warnings by provider and agent. If residual warnings dominate Xcode failures, file a sandbox/libc-audit follow-up before enabling shim_enforced broadly."
+    },
+    {
+      "metric": "Direct command scanner coverage",
+      "threshold": "Fixtures prove `DirectCommandDeclarationScanner` detects Xcode commands in permission profile shell allow entries, `agents[].required_tools`, run blocks, tools.shell commands, and adapter-specific raw YAML command fields."
+    },
+    {
+      "metric": "Broker subsystem health separation",
+      "threshold": "Fixture proves Xcode broker Disabled/Degraded changes `XcodeBrokerHealthSnapshot` and Xcode lease behavior without failing global daemon readiness for non-Xcode routes."
+    },
+    {
+      "metric": "Target resolver boundary",
+      "threshold": "Fixture proves engine-provided `XcodeTargetSelectionInput` and acp host probing produce an immutable `XcodeTargetSnapshot`; acp does not reconstruct workspace/runtime selection policy from global state."
+    },
+    {
+      "metric": "Observation hot-row escape trigger",
+      "threshold": "Dogfood report records observation append retry exhaustion, truncation counts, and append backoff/latency spikes. Any retry exhaustion, truncation above 1 percent of brokered Xcode executions, or repeated append pressure across two dogfood runs creates a normalized event-table follow-up before broad `shim_enforced` rollout."
+    }
+  ],
+  "risks_and_mitigations": [
+    {
+      "risk": "Run proposal and checked-in source proposal drift creates two implementation contracts.",
+      "mitigation": "This run proposal is controlling; source reconciliation is a pre-implementation condition and stale contradictory guidance fails `p051-scaffold`."
+    },
+    {
+      "risk": "Providers change HTTP MCP wire shape or capability reporting.",
+      "mitigation": "Probe each unique launch shape, key cache by full capability slice, and fail closed with fixtures for supported providers."
+    },
+    {
+      "risk": "Capability probe diverges from real session launch.",
+      "mitigation": "Adapter API split plus release-mode capability fingerprint check before provider launch."
+    },
+    {
+      "risk": "Per-lease backend model increases process count.",
+      "mitigation": "Default max eight active leases per Xcode PID, bounded initialize queue, explicit capacity failure, and dogfood fan-out proof."
+    },
+    {
+      "risk": "Initialize serialization becomes a bottleneck.",
+      "mitigation": "Lock only spawn plus initialize, report waiting status, record wait time, and keep cross-lease tools parallel."
+    },
+    {
+      "risk": "Host-user env builder picks wrong GUI user.",
+      "mitigation": "Resolve via `getpwuid(getuid())`, allow daemon config override, warn at startup on mismatch, and show `host_env_unavailable` action text."
+    },
+    {
+      "risk": "Multiple Xcode processes or workspaces make target selection ambiguous.",
+      "mitigation": "Use `XcodeTargetResolver` with engine-provided selection inputs and acp host probing, fail closed on ambiguity/no match, record immutable snapshot evidence, and prohibit newest-process production heuristics."
+    },
+    {
+      "risk": "Raw catalog fields or permission profiles hide direct Xcode commands from lint.",
+      "mitigation": "`DirectCommandDeclarationScanner` scans raw YAML plus typed agent entries and fixtures current permission profile shell allow entries and `agents[].required_tools`."
+    },
+    {
+      "risk": "Prompt-time absolute paths still execute outside the enforced boundary.",
+      "mitigation": "Document residual, add high-visibility policy warnings, measure residual frequency in dogfood, and file a sandbox follow-up if warnings dominate failures."
+    },
+    {
+      "risk": "Agents read shim token from env.",
+      "mitigation": "Do not rely on secrecy; enforce server-side token validity, provider process binding, peer uid, workspace root, active prompt, and frozen host-execution policy."
+    },
+    {
+      "risk": "Broker relays MCP calls that policy should deny.",
+      "mitigation": "`BrokerMcpPolicy` filters `tools/list`, denies unauthorized `tools/call` before backend forwarding, and persists denied MCP truth."
+    },
+    {
+      "risk": "Observation writes race under fan-out or parallel shim calls.",
+      "mitigation": "Transactional db append API with optimistic retry, event/byte limits, corrupt-json recovery, truncation summaries, and fixtures for concurrent shim observation appends."
+    },
+    {
+      "risk": "Bounded JSON observation envelope becomes a hot row under dogfood load.",
+      "mitigation": "Append repository API is the only write path; dogfood records retry/truncation pressure and triggers a normalized event-table follow-up before broad rollout if pressure appears."
+    },
+    {
+      "risk": "Xcode broker health degrades global daemon readiness.",
+      "mitigation": "`XcodeBrokerHealthSnapshot` is subsystem health; global readiness remains tied to shared listener and non-Xcode serve ability."
+    },
+    {
+      "risk": "Parallel agents contend on DerivedData or Xcode build resources.",
+      "mitigation": "Classify contention separately from broker failures, expose recovery guidance, and measure in dogfood before tuning parallel fan-out."
+    },
+    {
+      "risk": "Rollout destabilizes non-Xcode workflows.",
+      "mitigation": "Broker disabled/degraded states preserve non-Xcode daemon functionality; rollback switch refuses Xcode broker requests without stdio fallback."
+    },
+    {
+      "risk": "Minimum UI scope expands implementation size.",
+      "mitigation": "Limit UI to read-only existing surfaces: timeline inspector, failed-stage evidence, catalog detail metadata, and broker health indicator."
+    }
+  ],
+  "acceptance_criteria": [
+    "Research artifact exists, has an allowed verdict, and implemented scope matches `Proceed with scoped architecture`.",
+    "`BrokeredXcodeMcpIntent` registry contract is implemented with canonical id matching, stale stdio migration warning, stale/ambiguous fail-closed errors, and redacted predicted/actual MCP truth.",
+    "`ProviderCapabilityCache` and initialize-only probe are implemented and keyed by full `ProbeKey` including strengthened binary fingerprint.",
+    "Adapter API split is complete; old `open_session(&ExecutionRequest)` is retired.",
+    "`CapabilitySliceFingerprint` is enforced in release mode before provider launch.",
+    "Executor follows the seven-phase flow and rolls back reserved state on failure.",
+    "HTTP MCP transport is serialized in canonical ACP discriminated-union shape.",
+    "Provider HTTP unsupported fails before lease/token/backend/session-new/shim allocation.",
+    "Parallel Xcode MCP sessions get isolated leases and backend `mcpbridge` subprocesses; initialize serializes per Xcode PID; `tools/*` runs in parallel across leases.",
+    "Each lease uses a per-backend ordered request pump for the stdio backend.",
+    "Broker capacity and backpressure defaults are enforced and observable.",
+    "Broker enablement states and `CHAINWORKS_XCODE_BROKER_DISABLED=1` rollback behavior are implemented without adding a stdio fallback.",
+    "Broker-owned Xcode subprocesses run with host-user `HOME` and `TMPDIR`; ACP providers keep fake-home isolation.",
+    "PATH shim injection happens only for `xcode_shim_injection_signal`, not for pure `xcode_broker_required`.",
+    "Catalog lint hard-fails structured absolute Xcode paths and soft-warns prompt text.",
+    "Direct `mcpbridge` is rejected for PATH-based and catalog-declared structured invocations regardless of host-execution opt-in or diagnostic mode.",
+    "`XcodeShimDispatchToken` is separate from MCP bearer, provider-session-scoped, and server-side authorized.",
+    "Shim-enabled executions force fresh provider sessions; pure Xcode MCP remains session-reuse-compatible.",
+    "Host executor routes only `xcodebuild` and `simctl`, with cwd boundary, env allowlist, and simulator UUID handling.",
+    "`actual_xcode_runtime_observation_json` exists and exposes typed append-only evidence through DB/domain, GraphQL, MCP reports, and the minimum UI surface.",
+    "Observation sink ownership respects crate boundaries: acp has no db dependency, engine injects sink, db owns transactional append.",
+    "Failure classes have friendly titles and suggested actions in the UI error presentation layer.",
+    "Xcode PID drift, broker infrastructure failure, backend crash, first-connect timeout, capacity exhaustion, and observation persistence failure have deterministic semantics.",
+    "Example catalogs are migrated to explicit `requires_xcode_host_execution` where needed.",
+    "`p051-scaffold`, `proposal-051`, and `p051` are registered in `scripts/test-gate.sh` and `docs/reference/test-gates.md`.",
+    "Dogfood pass on a parallel Xcode-capable stage shows at most one Xcode consent modal per Xcode process, zero enforced-boundary fake-home failures, and 100 percent observation completeness.",
+    "This run proposal is treated as the controlling P051 implementation source until the checked-in source proposal is reconciled; `p051-scaffold` fails on stale contrary source-proposal guidance.",
+    "`XcodeTargetResolver` replaces newest-process pgrep selection for brokered paths and fails closed on no match, ambiguity, GUI-user mismatch, or workspace drift.",
+    "`BrokerMcpPolicy` filters `tools/list`, denies unauthorized `tools/call` before backend forwarding, persists denied observations, and isolates sibling leases.",
+    "`LaunchResourceGuard` owns provider fake-home/temp/config resources across initialize-only probes, real-session transfer, rollback, cancellation, and crash cleanup.",
+    "Shim dispatch authorization binds token use to the launched provider process identity or tracked descendant set, not only same-uid peer credentials.",
+    "Observation append semantics define event/byte bounds, retry limits, corrupt-json recovery, truncation signaling, and late-append readback refresh.",
+    "Run timeline shows `Action Required: Check Xcode` when bridge startup is blocked long enough that an Xcode consent modal is likely.",
+    "Policy warnings use distinct timeline treatment and coalesce repeated identical residual warnings per execution.",
+    "Simulator ambiguity UI exposes candidate UUIDs in operator-usable form rather than only a generic error.",
+    "A targeted security review is assigned before host executor/shim dispatch socket merge.",
+    "`DirectCommandDeclarationScanner` covers raw catalog/workflow YAML and typed agent entries, including permission profile shell allow entries and `agents[].required_tools`.",
+    "`XcodeBrokerHealthSnapshot` is subsystem health separate from global daemon readiness and gates only brokered Xcode lease acquisition.",
+    "`XcodeTargetResolver` uses engine-provided selection inputs plus acp host probing to return immutable `XcodeTargetSnapshot`; acp does not reconstruct runtime/workspace policy from global state.",
+    "Observation writes go only through the append repository API, with dogfood retry/truncation pressure recorded as the trigger for normalized event-table follow-up.",
+    "High-level `RunProgressView` shows bridge lock/start/action-required states, not only the timeline inspector.",
+    "`Action Required: Check Xcode` recovery text includes workspace identity and Xcode PID when available.",
+    "Residual path warnings collapse behind `View all residual paths` after more than five unique warnings per execution.",
+    "Agent Catalog shows a first-run Xcode consent note for broker-required agents and uses existing ForgePanel/GroupBox styling for the runtime section."
+    ,"Source proposal reconciliation or explicit redirect is the first scaffold task; PR review fails if implementation begins from stale checked-in P051 proposal text."
+    ,"Dependency audit artifact exists before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold for P025/P026/P029/P037/P049."
+    ,"Observation dogfood evidence includes retry exhaustion, truncation percentage, and append backoff/latency spikes; sustained pressure triggers normalized event-table follow-up before broad `shim_enforced` rollout."
+  ],
+  "open_questions": [
+    {
+      "question": "Should broker idle grace remain fixed at 60 seconds or become runtime-profile configurable?",
+      "default_for_implementation": "Keep fixed at 60 seconds for scaffold; resolve before final dogfood."
+    },
+    {
+      "question": "Should live broker debug state later be exposed through a northbound status endpoint beyond durable execution observations?",
+      "default_for_implementation": "Not required for P051 acceptance; UI health indicator can use daemon health state."
+    },
+    {
+      "question": "Does Xcode `mcpbridge` expose workspace-sensitive state that requires invalidating `tools/list` on more than PID drift and workspace switch?",
+      "default_for_implementation": "Invalidate on PID drift and workspace switch; add observation for cache invalidation reason."
+    },
+    {
+      "question": "Should policy-separated leases key on permission profile id, resolved tool allowlist hash, or both?",
+      "default_for_implementation": "Both."
+    },
+    {
+      "question": "Are P025, P026, P029, P037, and P049 all implemented enough for P051 to start?",
+      "default_for_implementation": "Run a dependency status audit before scheduling P051 implementation; P026 or P029 incompleteness blocks scheduling, while partial status in P025/P037/P049 requires an explicit parallel-vs-sequential plan."
+    }
+  ],
+  "implementation_handoff": {
+    "first_pr": {
+      "goal": "Wire-safe substrate with no real Xcode backend spawning yet.",
+      "deliverables": [
+        "source proposal reconciliation or explicit pointer to this controlling run proposal",
+        "static stale-guidance check",
+        "domain/db/API nullable observation scaffold",
+        "observation sink trait and engine-injected db sink",
+        "adapter API split",
+        "initialize-only provider probe and cache",
+        "release-mode `CapabilitySliceFingerprint` check",
+        "HTTP MCP transport serialization",
+        "`BrokeredXcodeMcpIntent` registry resolution and fail-closed fixtures",
+        "LaunchResourceGuard for probe/session resources"
+      ],
+      "gate": "p051-scaffold"
+    },
+    "second_pr": {
+      "goal": "Broker lease lifecycle and host-user backend execution under fixture backends.",
+      "deliverables": [
+        "daemon route and broker health states",
+        "lease reservation/commit/rollback",
+        "capacity and backpressure enforcement",
+        "host-user env builder",
+        "backend lifecycle abstraction",
+        "per-backend ordered request pump",
+        "cancellation, crash, first-connect timeout, and PID drift fixtures",
+        "XcodeTargetResolver service boundary with engine-provided selection inputs, acp host probing, immutable snapshot, and fail-closed ambiguity/no-match behavior",
+        "BrokerMcpPolicy tools/list and tools/call enforcement fixtures"
+      ],
+      "gate": "p051-scaffold plus focused broker fixture tests"
+    },
+    "third_pr": {
+      "goal": "Direct-command containment and durable operator evidence.",
+      "deliverables": [
+        "catalog lint and Xcode signal propagation",
+        "DirectCommandDeclarationScanner over raw YAML and typed agent entries",
+        "PATH shims and shim dispatch socket",
+        "host executor for `xcodebuild` and `simctl`",
+        "simulator UUID rewrite",
+        "residual path observer",
+        "typed GraphQL/MCP readback",
+        "minimum SwiftUI read-only surfaces and friendly failure mapping",
+        "provider-process-bound shim dispatch authorization",
+        "bounded observation append/truncation/recovery semantics",
+        "targeted security review evidence"
+      ],
+      "gate": "proposal-051|p051"
+    },
+    "pre_ship": {
+      "goal": "Dogfood and sign-off.",
+      "deliverables": [
+        "parallel Gemini Xcode-capable dogfood run",
+        "modal count evidence",
+        "observation completeness evidence",
+        "no token leakage proof",
+        "operator or release-owner sign-off"
+      ],
+      "gate": "proposal-051|p051 plus dogfood acceptance"
+    },
+    "preconditions": [
+      "Before scheduling implementation, complete a dependency audit for P025, P026, P029, P037, and P049 with owner, implementation gate status, remaining gaps, and parallel-versus-sequential constraint. P026 or P029 incompleteness blocks the scaffold sprint.",
+      "Before the first implementation PR starts, reconcile `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` with this proposal or replace stale sections with an explicit pointer to this controlling contract.",
+      "Before the third PR merges, assign a security reviewer for bearer lifecycle, shim token replay, provider process binding, Unix socket peer checks, loopback HTTP surface, cwd policy, env allowlist, token redaction, and diagnostic-mode bypasses."
+    ]
+  },
+  "implementation_inventory": {
+    "acp": [
+      "manager: broker, capability cache, lease guards, shim credential attachment, injected observation sink",
+      "provider_probe: initialize-only capability probe and ProbeKey",
+      "launch_spec: shared launch spec and CapabilitySliceFingerprint",
+      "xcode_mcp_broker: pool, leases, backend lifecycle, id mapping, per-PID initialize mutex, capacity",
+      "xcode_mcp_http: streamable HTTP facade, bearer middleware, session-id binding",
+      "xcode_host_env: operator home/temp/developer-dir resolution",
+      "xcode_host_dispatch: Unix socket dispatch and peer credential verification",
+      "xcode_host_executor: route/reject policy, env allowlist, simulator destination rewrite",
+      "xcode_shim: shim executables or generated thin binaries",
+      "xcode_residual_observer: ACP session/update residual absolute-path warnings",
+      "transport: canonical ACP MCP server discriminated union serialization",
+      "xcode_target_resolver: host probing half of the resolver service and immutable XcodeTargetSnapshot production",
+      "xcode_broker_health: XcodeBrokerHealthSnapshot subsystem state for lease acquisition and UI/API readback",
+      "broker_mcp_policy: per-lease tools/list filtering and tools/call denial",
+      "launch_resource_guard: fake-home/temp/config lifecycle for probes and sessions"
+    ],
+    "engine": [
+      "mcp: provider capability gating, BrokeredXcodeMcpIntent, registry migration/fail-closed behavior",
+      "executor: seven-phase flow, lease guard commit/rollback, active prompt attribution, observation sink implementation",
+      "xcode_target_selection: frozen XcodeTargetSelectionInput passed to the acp resolver service",
+      "session/fingerprint: broker contract hash and shim-signal reuse constraints",
+      "recovery: invalidate session generations whose live broker leases are gone"
+    ],
+    "workflow_catalog": [
+      "catalog_lint: hard-fail structured absolute paths and soft-warn prompt paths",
+      "direct_command_declaration_scanner: normalized scanner for raw YAML and typed agent entries, including permission profile shell allow entries and agents[].required_tools",
+      "catalog/domain/plan: xcode_broker_required, xcode_shim_injection_signal, requires_xcode_host_execution, xcode_prompt_lint_warnings",
+      "examples/agents: migrate direct Xcode commands to explicit host-execution policy"
+    ],
+    "daemon": [
+      "mount /xcode-mcp/{lease_id}",
+      "construct shared broker state",
+      "set router and dispatch-socket readiness",
+      "expose Disabled/Healthy/Degraded/Failed XcodeBrokerHealthSnapshot without changing global daemon readiness for non-Xcode routes"
+    ],
+    "db_domain_api": [
+      "migration adding actual_xcode_runtime_observation_json",
+      "domain XcodeRuntimeObservation typed envelope",
+      "repository append API",
+      "GraphQL typed projection",
+      "MCP reports.get projection",
+      "bounded observation append semantics, corrupt-json recovery, truncation signaling, late-append refresh event"
+    ],
+    "swift_ui": [
+      "RunTimelineInspectorView Xcode Runtime section",
+      "FailedStageEvidencePanel friendly failure mapping",
+      "Policy Warning treatment for residual paths",
+      "AgentCatalogView infrastructure flags",
+      "Broker health indicator",
+      "Action Required Xcode modal state",
+      "RunProgressView bridge state propagation",
+      "Policy Warning icon/color/coalescing",
+      "View all residual paths disclosure after warning threshold",
+      "AgentCatalogView first-run Xcode consent note",
+      "ForgePanel/GroupBox styling for Xcode Runtime section",
+      "stable accessibility identifiers for Xcode runtime fields"
+    ],
+    "gates_docs": [
+      "scripts/test-gate.sh aliases p051-scaffold, proposal-051, p051",
+      "docs/reference/test-gates.md",
+      "static check for research artifact verdict and stale guidance patterns, including checked-in source-proposal drift from this controlling contract"
+    ]
+  }
 }
-```
-
-**Array semantics.**
-
-- Each array is **append-only within one execution**. Multiple leases → multiple entries in `mcp_broker_observations`. Multiple direct-command invocations → multiple entries in `xcode_shim_events`. Never truncated, never overwritten.
-- An execution with no Xcode MCP request but with direct `xcodebuild` invocation: `mcp_broker_observations: []`, `xcode_shim_events: [...]`.
-- An execution with Xcode MCP and no direct commands: `mcp_broker_observations: [...]`, `xcode_shim_events: []`.
-- A mixed execution records both.
-- Each array entry is immutable once written; updates to lease state (e.g., `backend_failure_class` after a later crash) append a new entry with the same `lease_id` and a `status_update` field rather than mutating the original.
-
-**Reuse observation entries.** When a later `AgentExecution` on the same lineage reuses a provider session and its existing Xcode broker lease, the executor appends an entry to the later execution's `mcp_broker_observations[]` with:
-
-- `backend_start_disposition: "reused_existing_provider_session_lease"`,
-- `lease_id`: same as the originating execution's entry,
-- `backend_process_id`: same `mcpbridge` pid (not restarted),
-- `originating_execution_id`: the `AgentExecutionId` that first opened the lease,
-- `prompt_cycle_index`: incremented from 0 (originating execution records 0; first reuse records 1),
-- `backend_initialize_wait_ms: 0` (no initialize serialization — no new `session/new`),
-- `backend_startup_latency_ms: 0` (no new bridge spawn),
-- `backend_failure_class: null` unless the reuse itself failed.
-
-Every execution therefore has an independent observation entry, so reports, comparison, and readback surfaces can attribute Xcode MCP use to each execution without relying on lineage joins. The acceptance criterion "runtime observations distinguish backend start from backend reuse" is executable on every reused execution, not only the first.
-
-**Northbound projection.** GraphQL `AgentExecution` type exposes `actualXcodeRuntimeObservation` as a structured typed field (arrays of typed records, not opaque JSON strings). MCP `reports.get` returns the same envelope at `execution.xcode_runtime_observation`. Reports and comparison readers must handle the three arrays as independent evidence streams.
-
-**Why a new field rather than extending `actual_mcp_observation_json`.** The existing field is execution-level MCP observation (per `session/new` outcome) — it is not append-only and not scoped to Xcode. Direct-Xcode-only agents have no MCP observation at all, so there is no existing slot for shim events. Rather than overload the MCP field with multiplexed shape, P051 introduces a dedicated Xcode-runtime envelope.
-
-**Structured event log.** In addition to the durable envelope above, the broker emits structured tracing events for live observability:
-
-- `xcode_mcp_lease_acquired`
-- `xcode_mcp_bridge_spawned`
-- `xcode_mcp_initialize_wait_ms`
-- `xcode_mcp_lease_released`
-- `xcode_mcp_bridge_closed`
-- `xcode_mcp_pool_invalidated` (on Xcode PID drift or broker infrastructure failure)
-- `xcode_shim_rejected`, `xcode_shim_routed` (for each shim invocation)
-- `xcode_host_executor_command` (for each routed host-executor run)
-
-These events are transient (stderr/tracing subscriber) and do not replace the durable envelope.
-
----
-
-## 6. User-Facing Behavior
-
-For an operator running a stage with parallel UX/UI Gemini reviewers:
-
-1. The first Xcode MCP-dependent reviewer obtains a lease, the broker spawns its dedicated `mcpbridge` subprocess under host-user environment, and Xcode's one-time consent modal may appear (if not already granted).
-2. The second reviewer obtains its own lease; the broker briefly serializes against the per-Xcode-PID Mutex while the first bridge finishes `initialize`, then spawns a second `mcpbridge` subprocess. Xcode does **not** re-prompt — consent is already granted for this Xcode process.
-3. If Xcode requires first-time operator confirmation, the operator handles exactly one modal for this Xcode process; siblings reuse that consent.
-4. Both reviewers proceed with separate ACP sessions, separate HTTP streaming leases, separate `mcpbridge` subprocesses, and separate output files.
-5. Runtime evidence shows two provider sessions, two brokered bridges under host-user environment, and one already-consented Xcode PID.
-
-The system does not claim "one bridge serves multiple clients." It claims "one Xcode consent covers multiple bridges, and all bridges run under the correct host environment." That is the observed and implementable behavior.
-
-For an operator running Xcode-dependent verification from an isolated ACP agent:
-
-1. The agent remains isolated and does not receive the real user home as its process `HOME`.
-2. Xcode/CoreSimulator access is delegated to the broker or a broker-owned host executor.
-3. Xcode sees the normal macOS user home/temp/cache environment it requires.
-4. Runtime evidence records whether Xcode ran through the host-user boundary and which simulator UUID was selected.
-5. Failures caused by missing Xcode host state are reported as broker/host-executor failures, not misclassified as agent implementation failures.
-
----
-
-## 7. Implementation Inventory
-
-### ACP crate
-
-- `control-plane/crates/acp/src/manager.rs`
-  - Own `XcodeMcpBridgePool`.
-  - Own `ProviderCapabilityCache: HashMap<ProbeKey, AgentCapabilities>` (see §5.1.2 for full `ProbeKey` shape).
-  - Expose `ensure_provider_capabilities(&ProviderLaunchSpec) -> AgentCapabilities` as preflight called before `engine::mcp::resolve_mcp_servers`. The `ProviderLaunchSpec` is the single source of launch truth; implementation must assert the **capability slice** (binary, argv, capability_env, adapter_settings) is unchanged between the probe call and the later `open_session_with_specs` call. `credential_env` is intentionally empty at preflight and populated only after by `attach_session_credentials`.
-  - Expose `attach_broker_leases(&mut [ResolvedMcpServer], &ExecutionRequest) -> LeaseReservationGuard` as the **sole** code path that reserves `XcodeMcpBridgePool` entries, mints per-lease HTTP bearer tokens, and writes final URLs/tokens into the HTTP `ResolvedMcpServer` entries. Runs after capability preflight and MCP resolution both succeed. Returned guard commits on live-session open or drops-with-rollback on any later-phase failure.
-  - Expose `attach_session_credentials(&mut ProviderLaunchSpec, &ExecutionRequest)` as the **sole** code path that mints shim tokens, creates `XcodeShimDispatchLease`, and writes to `credential_env`. Runs only after capability preflight, MCP resolution, and broker lease reservation all succeed. Never called when `provider_http_mcp_unsupported` or any prior fail-closed path fires — guarantees §8.1 "no per-lease state allocated" contract.
-  - Acquire leases before `adapter.open_session`.
-  - Release leases on normal close, provider error, timeout, cancellation, and drop paths.
-  - Refuse broker mode unless the P051 HTTP streaming feasibility research verdict allows the current provider set.
-
-- `control-plane/crates/acp/src/provider_probe.rs` (new)
-  - `ProviderCapabilityProbe::probe(&ProviderLaunchSpec) -> AgentCapabilities` — one-shot `initialize`-only subprocess (no `session/new` ever sent) launched from the spec's concrete `binary_path`/`launch_args`/`capability_env`/`adapter_settings`, records `AgentCapabilities` from the `initialize` response, closes on stdin EOF. `ProbeKey` is computed via `launch_spec.probe_key()` only for cache lookup and audit.
-  - `ProbeKey` composed of `(adapter_family, runtime_profile_id, binary_fingerprint, launch_args_fingerprint, capability_env_fingerprint, adapter_settings_fingerprint)`. `credential_env` is intentionally excluded so rotating session credentials does not invalidate the probe cache.
-  - Binary fingerprinting: path + mtime + size. No signature verification in P051.
-  - Env fingerprint allowlist restricted to capability-gating env vars (never raw secret values; boolean/redacted fingerprint only).
-
-- `control-plane/crates/acp/src/lib.rs`
-  - Add request/result fields only if required for pool observations.
-
-- `control-plane/crates/acp/src/transport.rs`
-  - Ensure session close and force-kill paths release leases.
-  - Add tests for lease release on subprocess startup error and close timeout.
-  - Serialize HTTP streaming MCP server entries into ACP `session/new` only for providers proven compatible by the research gate.
-
-- `control-plane/crates/acp/src/xcode_mcp_broker.rs` (new)
-  - Broker pool, backend `mcpbridge` owner, lease lifecycle, request routing, id correlation, telemetry, per-PID initialize Mutex.
-  - Exposes an `axum::Router` factory `broker_router(state: Arc<XcodeMcpBrokerState>) -> Router` that the daemon mounts. The broker does not bind its own listener — it rides the daemon's loopback listener.
-
-- `control-plane/crates/acp/src/xcode_mcp_http.rs` (new) or equivalent module
-  - Provider-facing MCP HTTP streaming transport shape, bearer token middleware, request/response framing, and per-lease connection lifecycle.
-
-- `control-plane/crates/daemon/src/main.rs` (existing, extended)
-  - **Route mount.** After the existing `/mcp` and `/graphql` routes are composed, the daemon merges the broker router at `/xcode-mcp`:
-    ```rust
-    let app = Router::new()
-        .merge(graphql_routes(gql_state))
-        .merge(mcp_server::http::routes(mcp_state))
-        .merge(xcode_mcp_broker::broker_router(broker_state));
-    ```
-    Mount path for provider-facing streams: `POST /xcode-mcp/{lease_id}` (MCP Streamable HTTP over the per-lease path). Authorization: `Authorization: Bearer <lease_token>` header, validated by middleware before any MCP frame is parsed.
-  - **Shared state.** `XcodeMcpBrokerState` is an `Arc` shared between (a) the router (reads lease state, dispatches MCP frames to backend `mcpbridge` via in-process channels), (b) `AcpRuntimeManager` (writes lease state, spawns backends). The shared state lives in the daemon process for its entire lifetime; dropped on SIGTERM.
-  - **Bind order.** The daemon binds the axum listener first via `packaging::bind_with_fallback()`, then starts `AcpRuntimeManager` — but `AcpRuntimeManager` is **not allowed** to mint a lease URL or token until the daemon's listener is accepting connections. A readiness gate (`broker_state.set_router_ready()` called once the daemon's `axum::serve` future is spawned) blocks `ensure_provider_capabilities` and `resolve_mcp_servers` from producing HTTP MCP entries until the route is live.
-  - **Broker health states.** The broker distinguishes two mid-run unhealthy states with different recovery contracts:
-    - **Degraded** (`broker_state.health() == Degraded`): a non-infrastructure subsystem is unhealthy but the HTTP listener and Unix socket are still live — e.g., capability cache is temporarily unavailable, catalog lint subsystem is stalled, or a transient non-fatal broker internal error. `resolve_mcp_servers` returns `McpResolutionError::BrokerDegraded`; no new lease is minted. **Existing streams continue serving** — bearer validation, `Mcp-Session-Id` binding, and per-lease `mcpbridge` subprocesses are unaffected. Auto-recovers to `Healthy` when the degraded condition clears. This is the "degraded no-new-lease" mode.
-    - **Failed infrastructure** (`broker_state.health() == Failed`): the HTTP listener died, the Unix dispatch socket died, or the broker internal token/lease store is corrupted beyond repair — i.e., existing streams cannot be served correctly. Treated as the `backend_failure_class = "broker_infrastructure"` path from §8.2: all active leases terminally close, `mcpbridge` subprocesses are reaped, `resolve_mcp_servers` returns `McpResolutionError::BrokerFailed` and the daemon flags itself unhealthy. Does not auto-recover mid-run — operator restart is required.
-  - **Startup-time broker failure.** If the broker router fails to mount at daemon start (state construction error, port bind already taken), the daemon fails to start — there is no "start-degraded" mode.
-
-- `control-plane/crates/acp/src/xcode_host_dispatch.rs` (new)
-  - Unix-domain socket listener for `ShimDispatchRequest`. Owns the `XcodeShimDispatchLease` state map. Exposes a similar readiness gate — shim dispatch tokens are not minted until the socket is listening.
-
-- `control-plane/crates/acp/src/xcode_host_env.rs` (new) or equivalent module
-  - Resolve the configured operator home.
-  - Resolve host temp/cache paths for the operator account.
-  - Build the environment used by broker-owned Xcode subprocesses.
-  - Redact host paths and tokens from logs where appropriate.
-
-- `control-plane/crates/acp/src/xcode_host_executor.rs` (new)
-  - Own `XcodeShimDispatchLease` state map (`HashMap<token, lease>`), mint tokens at provider-launch time for any shim-injected execution (whether or not the execution has an Xcode MCP lease), release on provider-session close.
-  - Execute approved Xcode-bound commands (`xcodebuild`, `simctl`) under the host-user environment contract.
-  - Allowlist-bound: rejects any binary not in `{xcodebuild, simctl}`. `mcpbridge` is explicitly **not** in the host-executor allowlist — see §5.1.1 direct-command guard rationale.
-  - Authorize `ShimDispatchRequest` via constant-time token comparison; enforce `workspace_root` cwd check; apply frozen `requires_host_execution` flag from the lease (not re-read from catalog).
-  - Prefer simulator UUIDs and reject ambiguous simulator destinations.
-  - Append observation events to the correct `AgentExecution.actual_xcode_runtime_observation_json` via repository `append_xcode_runtime_observation`.
-  - Expose a Unix-domain dispatch socket consumed by the shim binaries (below).
-
-- `control-plane/crates/acp/src/xcode_shim/` (new crate or module + thin binaries)
-  - Four shim executables under a daemon-managed `$XCODE_SHIM_DIR`:
-    - `xcodebuild`, `simctl` — apply reject/route policy based on agent's `requires_xcode_host_execution` flag.
-    - `mcpbridge` — **always rejects** direct invocation, regardless of `requires_xcode_host_execution`.
-    - `xcrun` — **mode-aware argv parser** distinguishing Run mode (`-r`/`--run` or default — tool executes), Find mode (`-f`/`--find` — tool path printed, not executed, pass-through), Show mode (`--show-sdk-*` — no tool, pass-through). Flag classification: **option-with-arg** (consume next token) is `--sdk`, `--toolchain` only. **No-arg flags** (do not consume next token) include `-l`/`--log`, `--verbose`, `--no-cache`, `--kill-cache`, `--help`/`-h`, `--version` — critically, `-l`/`--log` are no-arg so `xcrun -l mcpbridge` resolves the tool to `mcpbridge`, not consumes `mcpbridge` as a log-file path. After mode + tool extraction: Run + `xcodebuild`/`simctl` → reject/route/diagnostic; Run + `mcpbridge` → unconditional reject; Run + other tool / Find / Show → pass-through via `execve("/usr/bin/xcrun", ...)`. Unknown flag fails closed with `xcrun_unknown_option`.
-  - Each shim: read argv + `$HOME` + `$CHAINWORKS_XCODE_SHIM_TOKEN` + `getcwd()` + capability-relevant env subset, connect to `$XCODE_SHIM_DISPATCH_SOCKET`, dispatch via `ShimDispatchRequest` DTO.
-  - Reject path: exit 127 with structured stderr; emit `xcode_shim_rejected` observation with `{tool, via_xcrun: bool, argv, cwd, policy_reason}`.
-  - Route path: stream stdout/stderr/exit from broker's host executor via framed chunks over the same Unix socket; emit `xcode_shim_routed` observation with argv, cwd, selected simulator UUID, exit status.
-  - Pass-through path (`xcrun` only, non-Xcode subcommands): silent `execve`, no observation.
-  - Diagnostic bypass: `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes `xcodebuild`, `simctl`, and `xcrun` (non-mcpbridge branches) transparent passthroughs, with WARN log at daemon start and per-invocation WARN log per shim. The `mcpbridge` shim (and `xcrun mcpbridge` variants) remains **rejected in diagnostic mode** for PATH-based and catalog-declared invocations — policy boundary is absolute within the enforced scope (see §5.1.1 "Scope of guarantee" for the out-of-scope residual).
-
-- `control-plane/crates/workflow/src/catalog_lint.rs` (new)
-  - Run at run-start during workflow compilation.
-  - **Hard-fail scope (run-blocking)**: scan **every direct-command declaration field** — `run` block command path/argv/env, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields, and required-tool declarations — for Xcode-tool absolute paths (`/usr/bin/xcrun`, `/usr/bin/xcodebuild`, `/Applications/Xcode*.app/Contents/Developer/`) and `DEVELOPER_DIR=...xcodebuild`/`simctl` env assignments. The scan set is **identical** to the `XcodeShimInjectionSignal` trigger scan set — divergence would let an agent escape one while triggering the other. Fail run-start with `xcode_absolute_path_forbidden` unless `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` (which skips only `xcodebuild`/`simctl` paths; `mcpbridge` always hard-fails).
-  - **`mcpbridge` hard-fail is absolute**: structured fields whose path or `xcrun` subcommand resolves to `mcpbridge` fail run-start regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`. Diagnostic mode's bypass covers `xcodebuild`/`simctl` only; `mcpbridge` has no diagnostic exception anywhere in P051.
-  - **Soft-warn scope (advisory, not blocking)**: scan prompt/system-instruction/description free-form text for the same patterns. Emit warnings into `ResolvedAgent.prompt_lint_warnings: Vec<PromptLintWarning>` — a compile-time carrier that travels with the resolved agent through the executor. The executor reads the carrier when creating each `AgentExecution` row and appends entries to `actual_xcode_runtime_observation_json.xcode_shim_events` in the same transaction as the row insert, ensuring durable attribution. Does **not** block run-start. Exists so P051 documentation, review prompts, and evidence quotes are not false-positives.
-  - Produce **two independent compile-time booleans** on `ResolvedAgent`, available pre-resolution: `XcodeBrokerRequired` (triggered by requested Xcode MCP server in catalog entry) and `XcodeShimInjectionSignal` (triggered by (a) `requires_xcode_host_execution: true` or (b) any bare Xcode-tool lexeme in any direct-command declaration field — `run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). Pure Xcode MCP agents get `XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`. `prepare_launch_spec` reads `XcodeShimInjectionSignal` only; **`credential_env` remains empty at this phase** and is populated exclusively by `attach_session_credentials` after capability preflight and MCP resolution both succeed.
-
-- `control-plane/crates/acp/src/launch_spec.rs` (new)
-  - Shared `ProviderLaunchSpec` builder used by every adapter's `prepare_launch_spec`.
-  - Resolves binary path, composes base env from runtime profile, applies P050 meta-root, applies shim env injection when triggers fire, applies host isolation (fake HOME for Codex fake-home pattern), and captures adapter settings from `AcpSessionConfig`.
-  - Each adapter calls into this then overlays adapter-specific overrides.
-
-- `control-plane/crates/acp/src/adapters/mod.rs`
-  - Define `AcpAdapter` trait with three methods:
-    - `prepare_launch_spec(&ExecutionRequest) -> ProviderLaunchSpec` (process-launch only, no MCP payload, `credential_env` empty).
-    - `prepare_session_new_spec(&ExecutionRequest, &[ResolvedMcpServer]) -> SessionNewSpec` (protocol-payload only, carries resolved MCP entries including broker HTTP URL + bearer).
-    - `open_session_with_specs(&ProviderLaunchSpec, &SessionNewSpec) -> AcpSessionHandle`.
-  - Retire old `open_session(&ExecutionRequest)` signature.
-
-- `control-plane/crates/acp/src/adapters/{codex,claude,gemini,auggie,junie}.rs`
-  - Implement `prepare_launch_spec`, `prepare_session_new_spec`, and `open_session_with_specs` per adapter. `prepare_launch_spec` is the only place env/args/config are derived; `prepare_session_new_spec` is the only place mcpServers/cwd/mode/model/_meta are assembled for the protocol payload.
-  - Shim env injection: driven exclusively by `XcodeShimInjectionSignal: true` (which is set only by direct-shell triggers — `requires_xcode_host_execution: true` or bare Xcode-tool lexeme in any direct-command field; **not** by `XcodeBrokerRequired`). When the signal is set, the shared builder prepends `$XCODE_SHIM_DIR` to `PATH` and injects `CHAINWORKS_XCODE_SHIM_TOKEN` and `XCODE_SHIM_DISPATCH_SOCKET` into `credential_env` via `attach_session_credentials` (after successful capability preflight + MCP resolution — never earlier). Adapters do not add shim env independently.
-  - Pure Xcode MCP agents (`XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`) keep their normal `PATH` — they get the HTTP MCP entry in `session_new_spec` without PATH shim env, preserving session reuse per §5.6.
-  - Agents with zero Xcode signals keep their normal `PATH`.
-  - Each adapter gets two focused tests: (1) a fixture provider asserts env/argv match the launch spec field-by-field via `/proc/<pid>/environ` or an argv-echo fixture; (2) the probe sends `initialize` **only** (no `session/new`) while the real session sends both `initialize` and `session/new` with resolved HTTP MCP entries — inspected via an ACP wire-capture fixture that records every JSON-RPC frame the provider sees.
-
-### Engine crate
-
-- `control-plane/crates/engine/src/mcp.rs`
-  - Change `resolve_mcp_servers` signature to accept `&AgentCapabilities` as input.
-  - Resolve `xcode` MCP entries to broker HTTP streaming transport when broker mode is enabled **and** `provider_caps.mcp_capabilities.http == true`.
-  - When broker mode is requested but capabilities say HTTP is unsupported, return `McpResolutionError::ProviderHttpMcpUnsupported { adapter_family, binary_fingerprint }` before lease reservation.
-  - Preserve `MCP_XCODE_PID` targeting.
-  - Preserve isolated ACP provider `HOME`/`CODEX_HOME`; do not make the whole provider host-home-backed only because Xcode MCP is requested.
-  - Direct `xcrun mcpbridge` transport is **not** retained behind a diagnostic flag or runtime config. The broker is the only code path that spawns `xcrun mcpbridge`; engineers debugging Xcode MCP run the tool from their own shell outside any ACP agent.
-  - Do not implement a provider-facing stdio proxy fallback in P051.
-
-- `control-plane/crates/engine/src/executor.rs` (or equivalent ExecutionRequest builder)
-  - Build the `ProviderLaunchSpec` from the resolved runtime profile, binding metadata, and adapter config **once** per request.
-  - Call `AcpRuntimeManager::ensure_provider_capabilities(&launch_spec)` before `resolve_mcp_servers`.
-  - Thread resulting `AgentCapabilities` into MCP resolution.
-  - Pass the **same** `launch_spec` into the adapter's `open_session_with_specs`. Debug-assert **capability-slice** equality between probe call time and session call time — `credential_env` is allowed to differ (empty at probe, populated after `attach_session_credentials`).
-  - Surface `ProviderHttpMcpUnsupported` as a blocking execution error with structured observation.
-
-- `control-plane/crates/engine/src/executor.rs`
-  - Persist broker observation fields into `actual_xcode_runtime_observation_json.mcp_broker_observations[]` (append-only); persist provider capability failures that predate lease creation into `actual_mcp_observation_json` as before.
-  - Persist host-env and simulator-selection observations for brokered Xcode executions.
-  - Keep current Gemini + Xcode session reuse fallback.
-
-- `control-plane/crates/engine/src/recovery.rs`
-  - Ensure startup repair invalidates DB session generations whose live broker leases are gone.
-
-### Domain / DB
-
-P051 adds exactly one durable column — the runtime-observation envelope defined in §5.7. Runtime state (broker pool, leases, bridges, Mutexes, caches, dispatch tokens) remains in-memory and is not persisted.
-
-**Migration** (next sequential migration number in `control-plane/crates/db/migrations/`):
-
-```sql
-ALTER TABLE agent_executions
-  ADD COLUMN actual_xcode_runtime_observation_json TEXT;
--- nullable, no default; legacy rows read back as NULL.
-```
-
-**Domain model** (`control-plane/crates/domain/src/agent.rs`):
-
-```rust
-pub struct AgentExecution {
-    // ...existing fields...
-    pub actual_xcode_runtime_observation_json: Option<String>,
-}
-
-// Typed envelope for serialize/deserialize:
-pub struct XcodeRuntimeObservation {
-    pub mcp_broker_observations: Vec<McpBrokerObservation>,
-    pub xcode_shim_events: Vec<XcodeShimEvent>,
-    pub xcode_host_executor_events: Vec<XcodeHostExecutorEvent>,
-}
-```
-
-**Repository append semantics** (`control-plane/crates/db/src/repos/agent_executions.rs`):
-
-Implement `append_xcode_runtime_observation(execution_id, update: XcodeRuntimeObservationUpdate)` where:
-
-- the update is one of: push `McpBrokerObservation`, push `XcodeShimEvent`, push `XcodeHostExecutorEvent`, or patch an existing `mcp_broker_observations[]` entry identified by `lease_id` (for post-hoc `backend_failure_class` updates after a later crash). The patch path writes a new entry with a `status_update` discriminator rather than mutating the existing one — see §5.7 immutability rule.
-- the write path is read-modify-write within a transaction to preserve atomicity across concurrent appends (fan-out leases, simultaneous shim invocations from parallel tool calls). SQLite WAL handles the concurrent-reader side.
-- serialization failure (e.g., corrupt prior JSON) is logged at ERROR and the update is dropped — the execution does not fail because of observation-write failure, to match the precedent set by `actual_mcp_observation_json`.
-
-**Legacy / null semantics:**
-
-- Rows created before the migration: `actual_xcode_runtime_observation_json = NULL`. GraphQL exposes this as `null` (not as an empty envelope) so clients can distinguish "not instrumented" from "instrumented but no events".
-- Rows created after the migration on executions that never touch Xcode MCP or shim: `actual_xcode_runtime_observation_json = NULL`. Same GraphQL behavior.
-- Rows with any event: `actual_xcode_runtime_observation_json` contains the envelope with the relevant array populated and the other two as `[]`.
-
-**Rationale for in-memory runtime state (unchanged from prior revision):**
-
-- The broker itself is a runtime resource, not run truth.
-- Active leases, bridge subprocesses, Mutexes, `tools/list` caches, and dispatch tokens do not survive daemon restart. On restart, session generations without live handles are already invalidated by existing P047 recovery and new leases are acquired.
-
-If implementation discovers that operator debugging needs persisted bridge history beyond agent-execution observations, add a follow-up proposal for durable runtime telemetry rows instead of expanding P051.
-
-### MCP server / GraphQL
-
-**GraphQL schema addition** (`control-plane/crates/graphql-server/src/types/agent_execution.rs`):
-
-```graphql
-type AgentExecution {
-  # ...existing fields...
-  actualXcodeRuntimeObservation: XcodeRuntimeObservation
-}
-
-type XcodeRuntimeObservation {
-  mcpBrokerObservations: [McpBrokerObservation!]!
-  xcodeShimEvents: [XcodeShimEvent!]!
-  xcodeHostExecutorEvents: [XcodeHostExecutorEvent!]!
-}
-
-type McpBrokerObservation { ... }   # typed fields from §5.7
-
-# Discriminated union — XcodeShimEvent is a union of two concrete types.
-# GraphQL unions require each member to be an object type; clients use __typename
-# to dispatch. The two variants correspond to §5.7 envelope's kind discriminator.
-union XcodeShimEvent = XcodeShimInvocationEvent | XcodeShimWarningEvent
-
-type XcodeShimInvocationEvent {
-  ts: DateTime!
-  tool: XcodeShimTool!                # XCODEBUILD | SIMCTL | MCPBRIDGE
-  viaXcrun: Boolean!
-  argv: [String!]!
-  cwd: String!
-  policyDecision: ShimPolicyDecision! # REJECTED | ROUTED
-  policyReason: String!
-  derivedPeerPid: Int!
-  derivedPeerUid: Int!
-  claimedProviderPid: Int!
-  peerPidMismatch: Boolean!
-  exitStatus: Int!
-}
-
-type XcodeShimWarningEvent {
-  ts: DateTime!
-  policyReason: String!               # "xcode_absolute_path_in_prompt" | "xcode_residual_absolute_path"
-  sourceField: String!                # "agent.prompt" | "acp_session_update_tool_use" | ...
-  matchedSubstring: String!
-  excerpt: String!
-}
-
-type XcodeHostExecutorEvent { ... }
-```
-
-Resolver reads `actual_xcode_runtime_observation_json`, deserializes, and exposes typed arrays. For `xcodeShimEvents`, the JSON `kind` discriminator maps to the GraphQL union member (`shim_invocation` → `XcodeShimInvocationEvent`, `warning` → `XcodeShimWarningEvent`). `null` column yields GraphQL `null` for the top-level field (not empty arrays) so downstream readers can distinguish "not instrumented".
-
-**MCP `reports.get`** projects the same envelope at `execution.xcode_runtime_observation` with identical shape.
-
-No new **mutating** MCP or GraphQL tools are introduced. Optional debug readback may be added behind existing debug surfaces only if the repo already has an internal runtime-status path. It must be read-only and must not expose a way to force-close shared bridges in P051.
-
-### Catalog / compiler / engine chain
-
-`requires_xcode_host_execution` is a new agent-catalog field that must be carried end-to-end so the broker's shim lease reads the correct frozen policy and the binding fingerprint invalidates reuse on change. Every layer in the catalog → compiler → runtime pipeline must know about it:
-
-- **Catalog YAML schema** (`control-plane/crates/workflow/src/catalog.rs` or equivalent): add optional `requires_xcode_host_execution: bool` on the agent-entry struct; default `false`. Parser rejects any other value type.
-- **Compiled `ResolvedAgent`** (`control-plane/crates/workflow/src/plan.rs`): carry `requires_xcode_host_execution: bool` onto the compiled agent struct the compiler produces.
-- **`ExecutionRequest`** (`control-plane/crates/engine/src/executor.rs` or equivalent): thread the flag into the request the ACP runtime receives at lease minting time. `prepare_launch_spec` consumes it for shim-injection env decisions; `XcodeShimDispatchLease` freezes it at lease creation.
-- **Binding fingerprint input** (P047 `BindingFingerprint`, see [session-lineage-reuse-and-operator-reset.md](../reference/session-lineage-reuse-and-operator-reset.md)): the fingerprint hashes the frozen `requires_xcode_host_execution` flag along with other binding components. A change to only this field between executions on the same lineage produces a different fingerprint, which forces `SessionReuseDisposition::FreshSessionRequired` in the P047 policy layer.
-- **Reuse-compat check (§5.6)**: as already specified, the compat check requires the new execution's `requires_xcode_host_execution` to equal the lease's frozen flag. Because this is now part of the binding fingerprint, the compat check is enforced at the fingerprint layer as well — it is defence-in-depth, not redundant coverage.
-
-### Catalog / profiles
-
-- `examples/agents/agents.yaml`
-- `examples/agents/agents_mcp_profiles_v2.yaml`
-
-Keep explicit `session_reuse_scope: same_agent_family_within_run` for Gemini Xcode reviewers. Broker sharing is a backend optimization; catalog reuse remains useful for retries. During migration, annotate each agent that currently invokes `xcodebuild` directly with an explicit `requires_xcode_host_execution` value — `true` where host execution is genuinely needed (release preflight), `false` for agents that should migrate to Xcode MCP tools.
-
-### Gate ownership
-
-- `scripts/test-gate.sh`
-  - Add `proposal-051|p051`.
-  - Add a static preflight that fails if `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md` is missing or lacks an allowed verdict.
-
-- `docs/reference/test-gates.md`
-  - Add `proposal-051|p051` with Rust-only proof inventory.
-
----
-
-## 8. Failure Semantics
-
-### 8.1 Broker cannot start
-
-If the HTTP streaming broker or backend Xcode bridge cannot start:
-
-- MCP resolution or ACP startup fails closed.
-- Agent execution is marked failed with `session_failed`.
-- `actual_xcode_runtime_observation_json.mcp_broker_observations[]` appends an entry with `backend_start_failed` and `backend_failure_class` set.
-- No direct unbrokered fallback and no stdio proxy fallback is attempted. Xcode MCP access is either brokered (per §5.1) or the run fails; there is no diagnostic mode that routes MCP traffic outside the broker. `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` affects only the direct-command shim for `xcodebuild`/`simctl`/`xcrun`-non-`mcpbridge`; it does not touch MCP resolution or broker mode.
-
-### 8.1.1 Host-user environment cannot be resolved
-
-If the broker cannot resolve a valid operator home or host temp directory:
-
-- Xcode MCP resolution fails closed.
-- The agent is not retried with fake-home direct Xcode execution.
-- `actual_xcode_runtime_observation_json.mcp_broker_observations[]` appends an entry with `backend_failure_class: "host_env_unavailable"`.
-- The error message must identify the missing host-env prerequisite without leaking unrelated user-home contents.
-
-### 8.2 HTTP client connects but backend fails mid-call
-
-Because each lease owns its own backend `mcpbridge` subprocess, a single backend failure is **per-lease by default**:
-
-- the failing backend's HTTP stream returns a terminal MCP error to **its own lease only**,
-- that lease moves to `closing` then `released`,
-- the failed `mcpbridge` subprocess is reaped,
-- **sibling leases on the same Xcode PID remain active** and unaffected,
-- the affected agent execution fails through ACP transport handling.
-
-Pool-wide invalidation — terminal closure of all existing leases on the affected pool key — is reserved for **shared-state failure signals where existing bridges cannot continue correctly**:
-
-- **Xcode PID drift** (`pgrep -n -x Xcode` returns a different PID than the pool key): all leases on the stale pool key receive terminal errors; their `mcpbridge` subprocesses are SIGTERM/SIGKILL'd; the pool is invalidated; new leases use a new pool key. `backend_failure_class = "pool_pid_drift"`.
-- **Broker HTTP infrastructure failure** (loopback listener dies, token store corrupted): all active leases receive terminal errors because their provider HTTP streams are no longer reachable; broker marks itself unhealthy. `backend_failure_class = "broker_infrastructure"`.
-
-**Host-env resolution failure is narrower: it is per-lease at the shim-route boundary, not pool-wide.** Already-spawned `mcpbridge` subprocesses were launched under a valid host-env snapshot and their XPC connections to Xcode remain intact; closing them would be gratuitously destructive. Instead:
-
-- new lease acquisitions fail closed with `backend_failure_class = "host_env_unavailable"` because the broker cannot spawn a fresh bridge under an invalid host-env,
-- existing MCP streams continue serving `tools/*` calls as long as the already-spawned `mcpbridge` subprocess is healthy,
-- any shim-route request (routed `xcodebuild`/`simctl`) fails with `xcode_host_executor_events[]` entry recording `exit_status: host_env_unavailable` because the host executor cannot resolve host-env to launch the routed tool,
-- if the operator home recovers, subsequent new leases succeed; existing leases were never disturbed.
-
-`actual_xcode_runtime_observation_json.mcp_broker_observations[].backend_failure_class` distinguishes these: `per_lease_backend` | `pool_pid_drift` | `broker_infrastructure` | `host_env_unavailable` (last one is per-lease-at-acquire, not pool-wide).
-
-### 8.3 One client cancels
-
-If one ACP session is cancelled:
-
-- its lease moves to `closing` then `released`,
-- **its own `mcpbridge` subprocess is closed** (stdin close → graceful exit → SIGTERM after 3s → SIGKILL after 10s),
-- sibling leases on the same Xcode PID are untouched — their backend bridges remain running, their HTTP streams remain connected.
-
-The per-Xcode-PID Mutex and in-memory cache (e.g., cached `tools/list` snapshot, consent-granted flag) remain in broker state while at least one lease exists; those are broker memory constructs, not running processes.
-
-### 8.4 Provider never connects to HTTP broker
-
-Reserved leases have a short connect timeout.
-
-On timeout:
-
-- lease becomes `orphaned`
-- the orphaned lease's own backend `mcpbridge` subprocess (if already spawned during the reservation race) is closed; sibling lease bridges are untouched
-- session startup fails with a clear `xcode_mcp_http_connect_timeout` reason
-
-### 8.5 Broker process crashes
-
-The broker is in-process with the control-plane daemon. If the daemon crashes:
-
-- live ACP sessions are lost
-- startup recovery invalidates missing live sessions
-- later retries acquire fresh broker leases
-
-No attempt is made to reconnect to orphaned provider HTTP streams after daemon restart.
-
----
-
-## 9. Security and Isolation
-
-The broker must not widen access.
-
-Required safeguards:
-
-- Pool keys include permission profile or a policy fingerprint.
-- Tool list responses are filtered per lease, not globally trusted from the backend.
-- HTTP clients cannot request arbitrary pool ids without a broker-issued lease token.
-- Lease tokens are random (≥ 32 bytes, constant-time compared), **session-lifetime** (not single-use), bound to a unique `Mcp-Session-Id` at first `initialize`, and limited to a single active HTTP stream at a time. Reconnects must present both the bearer and the matching session-id. Peer-credential derivation is not available on the loopback TCP path; cross-session replay is blocked by the `Mcp-Session-Id` binding and the single-active-stream invariant rather than by peer pid/uid checks. The Unix-domain shim dispatch socket (a separate authority, see §5.1.1) does use peer credentials.
-- Broker HTTP listener binds to loopback or a daemon-owned local transport proven compatible by research.
-- Lease tokens are delivered only to the intended provider process and are redacted from logs.
-- Logs must include ids and counts, not raw MCP request payloads by default.
-- The real operator home is visible only to broker-owned Xcode subprocesses, not to arbitrary ACP provider shell commands.
-- The host executor, if added, must allow only explicitly modeled Xcode-bound commands. It must not become a general "run with real HOME" API.
-- The fake ACP `CODEX_HOME` remains the storage root for model/client/plugin state; Xcode host-home use must not cause Codex sessions, memories, plugin caches, or shell snapshots to write into `/Users/user`.
-
----
-
-## 10. Test Plan
-
-### Unit tests
-
-Add focused tests for:
-
-- research-gate preflight rejects missing or placeholder HTTP streaming feasibility artifact
-- MCP resolver refuses broker mode for providers not proven compatible by the research verdict
-- **provider capability preflight**: when `ProviderCapabilityCache` records `mcpCapabilities.http = false` for a runtime profile, `resolve_mcp_servers` returns a blocking issue before any per-lease state is allocated — no `lease_id` minted, no per-lease bearer token generated, no broker pool entry created, no backend `mcpbridge` spawned, no `XcodeShimDispatchLease` recorded, no `session/new` payload constructed (neither by the probe — the probe never sends `session/new` at all — nor by the would-be real session), no HTTP MCP server entry emitted into any provider spec. The daemon's shared loopback listener and `/xcode-mcp` route remain bound — those are daemon-lifetime resources covered by the separate daemon-start invariant (see §7 daemon integration), not per-request resources. `actual_mcp_observation_json` records `provider_http_mcp_unsupported`.
-- **probe wire capture**: fixture records every JSON-RPC frame the provider subprocess sees during capability probing and asserts the frame sequence is exactly `{initialize-request, initialize-response, <stdin EOF>}`. Specifically asserts: no `session/new` frame appears in probe traffic, no `mcpServers` field reaches the provider, no `session/prompt`, no `session/close`.
-- capability probe caches `AgentCapabilities` per full `ProbeKey` (adapter family, runtime profile id, binary fingerprint, launch args fingerprint, capability-relevant launch env fingerprint, adapter settings fingerprint) and invalidates on any component change — not only binary upgrade
-- two concurrent Xcode lease requests serialize through the per-PID initialize Mutex and both complete a `tools/list` round-trip without interference
-- parallel `tools/call` requests on sibling leases do not serialize (lock is released after initialize)
-- each lease spawns its own `mcpbridge` subprocess; no backend sharing across leases
-- **backend crash isolation**: fatal MCP error from one lease's backend closes only that lease's subprocess; sibling leases on the same Xcode PID remain active and continue serving `tools/*` calls
-- **pool-wide terminal closure triggers only on shared-state failure**: Xcode PID drift and broker HTTP infrastructure failure — verified by separate fixture tests. Host-env loss is per-lease at acquire/shim-route boundary and does not disturb running MCP streams.
-- different Xcode PIDs create independent broker state (different pool keys, independent Mutexes)
-- different permission fingerprints create different pools (policy is not shared across leases)
-- lease release closes its own backend bridge; sibling leases unaffected
-- broker cached state (consent awareness, tools/list snapshot per PID) is dropped after grace period
-- backend restart after Xcode PID change invalidates cached tool list
-- request routing returns responses to the correct HTTP client session
-- diagnostic config (`CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`) makes `xcodebuild`/`simctl`/`xcrun`-non-`mcpbridge` shims transparent passthroughs for **direct-command shell invocations only**; brokered Xcode MCP and `mcpbridge` shim behavior are unaffected — MCP traffic always flows through the broker, `mcpbridge` remains rejected in structured fields. Fixture asserts: under diagnostic mode, (a) an agent with Xcode MCP still receives the HTTP broker endpoint in `session_new_spec` (no direct `xcrun mcpbridge` transport is substituted), (b) structured `mcpbridge` invocations still hard-fail, (c) only `xcodebuild`/`simctl` PATH-shim entries pass through.
-- host-env builder uses operator home and host temp paths for Xcode subprocesses
-- ACP provider environment remains fake-home-backed while broker-owned Xcode environment is host-home-backed
-- ambiguous simulator name/OS requests are rejected or resolved to a configured UUID with recorded evidence
-
-**Simulator argv rewrite (P2 new)**
-
-- pass-through: `xcodebuild -destination 'platform=iOS Simulator,id=1BFCE41D-...'` is spawned with unchanged argv; `simulator_selection.mode = "explicit_uuid"`
-- rewrite on unique match: `xcodebuild -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.4'` with one matching device is spawned with argv rewritten to `id=<UUID>` form; fixture inspects spawned subprocess argv via `/proc/<pid>/cmdline` or an argv-echo fixture; `simulator_selection.mode = "rewritten_from_name_os"`, both original and rewritten destination strings recorded
-- reject on ambiguity: same name/OS request with two matching devices fails with `simulator_destination_ambiguous`; `xcodebuild` is not spawned; observation records the candidate UUIDs
-- reject on no-match: name/OS not in device list fails with `simulator_destination_not_found`
-- reject on unparseable: malformed `-destination` value fails with `simulator_destination_unparseable`
-- non-simulator passes through: `xcodebuild -destination 'platform=macOS'` argv is unchanged; `simulator_selection.mode = "no_simulator"`
-- **direct Xcode command guard**: fake-home agent with `requires_xcode_host_execution: false` invoking `xcodebuild` or `xcrun simctl` via shell receives an explicit shim rejection (exit 127 with structured stderr) rather than a CoreSimulator failure deep in the call stack; `actual_xcode_runtime_observation_json.xcode_shim_events[]` appends the rejection
-- agent with `requires_xcode_host_execution: true` has its direct Xcode command routed through the broker host executor under host-user environment; both `xcode_shim_events[]` (policy_decision: routed) and `xcode_host_executor_events[]` (argv, cwd, simulator UUID, env allowlist, exit) are appended
-- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes the `xcodebuild`, `simctl`, and `xcrun`-non-`mcpbridge` shims transparent passthroughs; `mcpbridge` and `xcrun mcpbridge` remain rejected (see "mcpbridge hard-fail is absolute"); startup WARN logged
-
-### Integration tests
-
-Add ACP fixture tests for:
-
-- two parallel `ExecutionRequest`s with Xcode MCP each get their own fixture backend; their initialize phases serialize through the broker's per-PID Mutex but complete successfully, and parallel `tools/call` is not serialized
-- provider-side `mcpServers` contains an HTTP streaming Xcode MCP endpoint, not direct `xcrun mcpbridge`, when broker mode is enabled
-- `actual_xcode_runtime_observation_json.mcp_broker_observations[]` records `backend_start_disposition = "spawned"` for each lease and `backend_initialize_wait_ms` for the serialization latency on late-starters
-- reuse observation: a second `AgentExecution` that reuses an existing provider session's Xcode lease appends an `mcp_broker_observations[]` entry with `backend_start_disposition = "reused_existing_provider_session_lease"`, identical `lease_id` and `backend_process_id` to the originating execution, `originating_execution_id` pointing back, and `prompt_cycle_index >= 1`
-- brokered Xcode execution records `xcode_home_disposition = "host_user_home"` and does not expose the real home to the provider environment
-- explicit simulator UUID selection is recorded in broker observation data
-- cancellation of one execution releases only its lease
-- ACP startup failure releases reserved leases
-
-**Catalog field propagation (P1 new)**
-
-- YAML `requires_xcode_host_execution: true` parsed into `AgentCatalogEntry.requires_xcode_host_execution == true`; round-trip fixture
-- compiled `ResolvedAgent.requires_xcode_host_execution` equals the YAML value; fixture asserts no lossy compilation
-- `ExecutionRequest.requires_xcode_host_execution` equals the compiled value; fixture asserts no rewrite
-- `XcodeShimDispatchLease.requires_host_execution` frozen at lease-mint time equals the `ExecutionRequest` value
-- binding fingerprint changes when and only when `requires_xcode_host_execution` changes (with all other inputs held constant); fixture computes fingerprint for `false` and `true` and asserts they differ
-- changing only `requires_xcode_host_execution` between two executions on the same lineage forces `SessionReuseDisposition::FreshSessionRequired`; fixture asserts the second execution gets a fresh provider session, fresh broker lease, and fresh shim token
-
-**Session reuse compatibility**
-
-- reuse-compatible fixture: successful execution on a session with Xcode MCP; a second execution on same lineage with same MCP set reuses the session, its lease, and its `mcpbridge` subprocess. `session/prompt` is sent. Asserts: bridge subprocess PID equals the first execution's, HTTP endpoint/token unchanged, `mcp_broker_observations[]` does not append a new spawn entry
-- lease-lifetime fixture: successful execution does **not** release the lease. After execution returns success, assert the lease is still `active`, bridge subprocess is alive, HTTP endpoint still responds to a probe
-- reuse-incompatible fixture (MCP set differs): live session opened without Xcode MCP, new request adds Xcode MCP → supersession forced; old lease (if any) released, fresh provider session + fresh lease + fresh bridge
-- reuse-incompatible fixture (permission fingerprint differs): same MCP server name but different resolved tool allowlist hash / permission profile id → fingerprint differs → supersession forced at the fingerprint layer, before any lease is consulted
-- supersession cleanup fixture: when supersession releases the old lease, the old `mcpbridge` subprocess is closed (SIGTERM 3s → SIGKILL) before the new lease acquires its bridge
-- provider-session-close fixture: normal `session/close` or stdin EOF from provider releases the lease and closes the bridge
-- cancellation fixture: run cancel releases the lease and closes the bridge regardless of execution success status
-- operator-reset fixture: operator-triggered session reset releases the lease and closes the bridge
-- binding fingerprint hashes the **requested broker contract** (broker_mode, workspace_root, requires_xcode_host_execution, resolved_tool_allowlist_hash, permission_profile_id, xcode_pid_at_resolution) — fixture asserts fingerprint differs when any of these differ and matches when all are equal; random lease tokens/ids are **not** in the input set
-- live-session liveness check (new): fingerprint matches but the prior lease has been released/expired → runtime demotes disposition to `FreshSessionRequired`; fixture forces a mid-run degradation that releases the lease while provider session stays alive, then triggers a new execution on the lineage and asserts fresh lease is minted
-
-**Observation envelope parity**
-
-- direct-Xcode-only execution (no MCP server request at all) receives a valid `XcodeShimDispatchToken`, persists `actual_xcode_runtime_observation_json.xcode_shim_events[]` with rejection evidence; `mcp_broker_observations` is empty `[]`; execution's durable row has non-null envelope
-- mixed execution (brokered Xcode MCP + direct `xcodebuild` with `requires_xcode_host_execution: true`) preserves both `mcp_broker_observations[]` and `xcode_host_executor_events[]` — neither array overwrites the other; MCP bearer token and shim dispatch token are distinct
-- GraphQL `AgentExecution.actualXcodeRuntimeObservation` exposes the three arrays as typed fields; MCP `reports.get` returns the same envelope at `execution.xcode_runtime_observation`
-- repeated shim invocations (three direct `xcodebuild` calls in one execution) produce three entries in `xcode_shim_events`, not one merged entry
-- legacy row (pre-migration): `actualXcodeRuntimeObservation` resolves to GraphQL `null`, not an empty envelope
-- post-migration execution that never touches Xcode: column remains `NULL`, GraphQL resolves to `null`
-
-**Shim dispatch token authority**
-
-- direct-Xcode-only execution: `XcodeShimDispatchToken` minted at provider-launch time; broker authorizes shim dispatch by token→lease lookup and appends events to the correct `AgentExecution`
-- **pure Xcode MCP reused session event ownership**: a single provider session runs two successful executions (E1 then E2) using **pure Xcode MCP only** (no shell `xcodebuild`). Both executions go through the broker's HTTP MCP endpoint to the same backend `mcpbridge` subprocess. Fixture asserts: same `lease_id`, same `backend_process_id`, E1's MCP broker observation has `backend_start_disposition: "spawned"`, E2's has `backend_start_disposition: "reused_existing_provider_session_lease"` with `originating_execution_id` pointing back to E1 and `prompt_cycle_index: 1`. No `xcode_shim_events` on either execution because the shim is not injected for pure Xcode MCP.
-- **shell-shim executions are always fresh** (contrasting fixture): an agent with `XcodeShimInjectionSignal: true` (e.g., direct `xcodebuild` in shell allowlist) runs E1 successfully → provider session 1 closes → E2 on same lineage triggers a **fresh** provider session 2 with a fresh shim token and fresh lease. Fixture asserts two distinct bridge PIDs, two distinct `XcodeShimDispatchLease.token` values, and E1's shim events in E1's observation only, E2's in E2's only — no token or session is shared across executions.
-- **idle-window dispatch rejection**: E1 spawns a background `xcodebuild &`; E1 prompt completes (broker sets `current_execution_id = None`); **before E2 starts**, the backgrounded `xcodebuild` reaches the shim socket. Fixture asserts the late dispatch is rejected with `xcode_shim_no_active_prompt`, the rejection lands in the lease's `originating_execution_id` orphan bucket with `is_orphan: true`, `dispatch_arrived_epoch`, `session_current_epoch_at_dispatch`, and no attribution to any live execution.
-- **shell-shim-enabled reuse is forbidden**: agent with `XcodeShimInjectionSignal: true` (direct `xcodebuild` in shell_allowlist, or `requires_xcode_host_execution: true`) runs E1 → provider session 1 closed → E2 on same lineage → forced fresh provider session 2 with fresh shim lease. Fixture asserts P047 disposition is forced to `FreshSessionRequired` for shim-enabled agents even when MCP/policy/workspace inputs match.
-- **pure Xcode MCP reuses normally**: agent with `XcodeBrokerRequired: true` and `XcodeShimInjectionSignal: false` (only requests Xcode MCP, no shell Xcode commands, no `requires_xcode_host_execution`) runs E1 successfully → E2 on same lineage reuses the provider session, its broker lease, and its backend `mcpbridge` subprocess per §5.6. Same bridge PID, same HTTP endpoint, no new spawn. Fixture asserts reuse works.
-- **both signals true — no reuse**: agent with Xcode MCP AND direct `xcodebuild` → both signals set → shim injected → reuse forbidden per §5.3. Fixture asserts the shim-enabled reuse-forbidden rule wins over the MCP-reuse-allowed rule.
-- **signal split verification**: catalog lint fixture asserts the two signals are produced independently — an agent with only `xcode` MCP entry gets `XcodeBrokerRequired: true, XcodeShimInjectionSignal: false`; an agent with only `shell_allowlist: [xcodebuild]` gets the inverse.
-- **reuse-incompatible on shim authority**: second execution on same lineage has a different `workspace_root` → supersession forced. Old session + old token retired; fresh session + fresh token minted with E2's workspace_root. Fixture asserts E1's shim lease is `released` before E2's is minted.
-- **reuse-incompatible on policy change**: second execution has `requires_xcode_host_execution: true` while the live session was opened with `false` → supersession forced
-- forged token: shim dispatch with a token not in broker's state map is rejected with `xcode_shim_invalid_token`; no event is appended to any execution
-- expired token: shim dispatch with a token past `expires_at` is rejected with `xcode_shim_token_expired`
-- cross-authority attempt: using an MCP bearer token as `$CHAINWORKS_XCODE_SHIM_TOKEN` (or vice versa) fails — different sockets, different validators, never cross-accepted
-- **peer-credential audit**: direct socket connection with a valid token but a forged `claimed_provider_pid` in the DTO is accepted (the token is sufficient for policy), but the recorded event's `derived_peer_pid` reflects the real connecting process's pid (from `LOCAL_PEERPID`/`SO_PEERCRED`), and `peer_pid_mismatch: true` is set in the observation. A fixture runs a test process with pid X that sends a request claiming pid Y; the observation stores X and flags the mismatch.
-- **peer-uid mismatch rejection**: fixture simulates a connection from a different uid (fork + setuid) and asserts the broker rejects with `xcode_shim_peer_uid_mismatch` before token validation even runs.
-- token redaction: fixture asserts token values are redacted in Chainworks logs, tracing spans, and stored observations (replaced with a hash prefix). **The proposal does not claim tokens are unobservable to shell-capable agents** — `env`/`printenv` trivially expose them; P051's threat model treats the token as an identifier, not a secret from the agent
-- server-side policy enforcement: even with a known token value, an agent cannot (a) escalate `requires_host_execution: false` → `true` (lease flag is frozen, forged different-token attempts fail constant-time validation), (b) route `mcpbridge` (not in host-executor allowlist), (c) change `workspace_root` (frozen at `session/new`), (d) ride another session's token (cross-session lookup fails), (e) extend expiry (broker-owned clock)
-- cwd boundary: routed `xcodebuild` with `cwd` outside the lease's `workspace_root` is rejected
-
-### Gate
-
-`./scripts/test-gate.sh proposal-051` should run from the repository root (`scripts/test-gate.sh` is at repo root, not under `control-plane/`). The gate internally `cd`s into `control-plane/` for `cargo` invocations:
-
-```bash
-cargo test -p engine p051_http_streaming_research_gate -- --nocapture
-cargo test -p acp xcode_mcp_broker -- --nocapture
-cargo test -p acp http_streaming_mcp -- --nocapture
-cargo test -p engine xcode_mcp_broker -- --nocapture
-cargo test -p engine broker_observation -- --nocapture
-```
-
-The exact test names may differ, but the gate must prove:
-
-**Core broker behavior**
-
-- two parallel Xcode ACP sessions each spawn their own `mcpbridge` subprocess, both under host-user environment, both complete full MCP round-trip
-- initialize phases serialize per Xcode PID (late-starter's `backend_initialize_wait_ms` > 0)
-- HTTP streaming endpoint shape is used for brokered Xcode MCP
-- policy-separated leases get independent broker state (no cross-lease policy leakage)
-
-**Lease token lifecycle (P2 new)**
-
-- first-connect deadline fixture: provider never connects within `first_connect_deadline` → lease moves to `orphaned`, any already-spawned `mcpbridge` is closed, observation records the expiry
-- MCP session-id binding: provider connects, completes `initialize`, receives an `Mcp-Session-Id`; broker records `bound_mcp_session_id`. A second request with the same bearer but missing or different session-id is rejected with `xcode_mcp_session_id_mismatch`
-- single-active-stream invariant: while a stream holds the lease (`active_stream_count > 0`), a second concurrent HTTP connection with the same bearer is rejected with `xcode_mcp_concurrent_stream_rejected`
-- reconnect-after-hiccup fixture: drop the active HTTP stream; wait for `active_stream_count` to reach 0; reconnect with the same bearer **and** the same `Mcp-Session-Id`; accepted; backend `mcpbridge` subprocess continues serving without restart
-- reconnect-with-wrong-session-id: reconnect presents valid bearer but a fresh/forged `Mcp-Session-Id` → rejected
-- reconnect-after-expiry fixture: force `expires_at` to pass; reconnect is rejected with `xcode_mcp_lease_token_expired` regardless of session-id
-- token is **not** single-use: fixture sends multiple MCP requests on the same stream with the same bearer; all accepted; token is not invalidated by the first use
-- loopback TCP cannot assert peer-pid: fixture does **not** attempt peer-credential derivation on the HTTP bearer path; peer-cred fixtures exist only for the Unix-domain shim dispatch socket (§5.1.1)
-
-**Daemon integration (P1 new)**
-
-- broker router mounts at `POST /xcode-mcp/{lease_id}` on the daemon's loopback listener; fixture sends an MCP frame to the path with a valid `Authorization: Bearer <lease_token>` header and asserts the frame reaches the backend
-- bind-order readiness: fixture asserts `ensure_provider_capabilities` / `resolve_mcp_servers` do not emit an HTTP MCP entry before `broker_state.set_router_ready()` is called (router ready-gate blocks lease minting)
-- broker degraded (fixture sets `broker_state.health() = Degraded`): new `resolve_mcp_servers` calls return `McpResolutionError::BrokerDegraded`; no new lease/HTTP entry minted; existing streams continue serving successfully
-- broker failed infrastructure (fixture sets `health() = Failed`, e.g., forces HTTP listener drop): all active leases receive terminal errors with `backend_failure_class = "broker_infrastructure"`; `mcpbridge` subprocesses are reaped; new `resolve_mcp_servers` returns `McpResolutionError::BrokerFailed`; daemon health flipped to unhealthy
-- auto-recovery: Degraded → Healthy is automatic when the degraded condition clears; Failed does not auto-recover (fixture asserts restart required)
-- daemon start failure when broker router cannot mount (fixture forces state construction error): daemon exits non-zero; no partial startup
-- shim Unix socket readiness: `XcodeShimDispatchLease` tokens are not minted until the dispatch socket is listening
-
-**Capability preflight**
-
-- HTTP-incompatible provider (fixture with `mcpCapabilities.http = false`) fails closed with `provider_http_mcp_unsupported` **before** any per-lease state is allocated — no `lease_id` minted, no bearer token generated, no `XcodeMcpBridgePool` entry created, no `mcpbridge` backend spawned, no `XcodeShimDispatchLease` recorded, no `session/new` payload constructed, `credential_env` is still empty on the discarded `launch_spec`. Fixture asserts `attach_session_credentials` was never called on this path. The daemon's shared loopback listener remains bound (it's a daemon-lifetime resource) — the test asserts no per-lease resources, not that the listener comes down.
-- capability-slice invariance across credential attach: fixture captures `cap_slice_before = launch_spec.capability_slice()`, runs the happy path through `attach_session_credentials`, asserts `cap_slice_before == launch_spec.capability_slice()` afterwards. Only `credential_env` changed.
-- **broker lease reservation ownership**: fixture asserts `resolve_mcp_servers` produces HTTP entries with placeholder URL/token; `attach_broker_leases` is the sole call that writes real URL/token into those entries; `prepare_session_new_spec` consumes the fully-populated entries; broker state is observable only after phase 4.
-- **broker lease rollback on mid-flow failure**: fixture forces phase 5 (`prepare_session_new_spec`) to return `AdapterError` after `attach_broker_leases` succeeds. Asserts the `LeaseReservationGuard` drops without commit, broker `XcodeMcpBridgePool` has no entries for this request, no backend `mcpbridge` subprocess exists, no bearer token is reachable. Same fixture covers phase 6 failure (`attach_session_credentials`) and phase 7 failure (`open_session_with_specs`).
-- **broker lease rollback on fail-closed before phase 4**: fixture forces capability preflight to return `provider_http_mcp_unsupported`. Asserts `attach_broker_leases` was never called, no broker state exists, guard was never constructed (cannot "roll back" what was never minted). This is the base case for the fail-closed contract.
-- capability probe cache hit for a previously-seen full `ProbeKey` (same adapter/profile/binary/args/env/settings) skips the probe subprocess
-- binary fingerprint change (path, mtime, or size) invalidates the cached entry and triggers a fresh probe
-- runtime profile change forces a fresh probe even when the binary is unchanged — fixture: two profiles on the same Codex binary with different `mode` or `config_options` produce independent cache entries
-- launch-env fingerprint change forces a fresh probe — fixture: toggling an `ACP_EXPERIMENTAL_*` env var between probes yields two distinct cache entries
-- launch-args fingerprint change forces a fresh probe — fixture: Gemini switching between `--acp` and `--experimental-acp` produces two distinct cache entries
-- **argv order matters** (P1 new): fixture constructs two launch specs with the same argv multiset in different positional order (e.g., `[--sdk, ios, --toolchain, swift-latest]` vs `[--toolchain, swift-latest, --sdk, ios]`) and asserts they produce different `ProbeKey.launch_args_fingerprint` values. Cache is not shared across the two orders; each triggers a fresh probe.
-- **capability-slice identity**: fixture asserts `launch_spec.capability_slice()` (binary, argv, `capability_env`, `adapter_settings`) is byte-identical at `ensure_provider_capabilities` call time and at `open_session_with_specs` call time. `credential_env` is **not** part of this equality — it is intentionally empty for the probe and populated for the real session. Two additional assertions cover the env split: (a) probe subprocess's actual env does not contain `CHAINWORKS_XCODE_SHIM_TOKEN` or `XCODE_SHIM_DISPATCH_SOCKET` and its `PATH` has no shim-dir prefix; (b) real session subprocess's env does contain these credentials. Debug-assert in the executor panics at test time if the capability slice diverges.
-
-**Per-lease vs pool-wide failure isolation (P1 new)**
-
-- one backend `mcpbridge` crash fails only its lease; a sibling lease on the same Xcode PID continues serving `tools/*` calls and completes successfully
-- Xcode PID drift (simulated by changing `pgrep` output) invalidates the pool, all stale-PID leases receive terminal errors, and new leases use a new pool key; `backend_failure_class = "pool_pid_drift"` recorded
-- broker HTTP infrastructure failure (fixture listener killed) terminally closes all active leases with `backend_failure_class = "broker_infrastructure"`; broker marks itself unhealthy
-- host-env unavailable (fixture with unreadable operator home): **new** lease acquisition fails closed with `backend_failure_class = "host_env_unavailable"`; an **already-running** sibling lease's MCP stream continues serving `tools/*` calls; a routed `xcodebuild` request on that existing lease fails with `exit_status: host_env_unavailable` while the MCP stream remains alive. Fixture explicitly asserts: (1) existing `mcpbridge` subprocess is still running after host-env loss, (2) new lease acquisition returns the error, (3) existing lease's `tools/list` call completes successfully, (4) routed shim request fails per-lease.
-
-**Direct Xcode command guard**
-
-Shim injection:
-
-- **agent with only Xcode MCP entries (no direct `xcodebuild` anywhere)** gets `XcodeBrokerRequired: true, XcodeShimInjectionSignal: false` → broker lease + HTTP MCP entry in `session_new_spec`, **no PATH shim injection**, `credential_env` stays empty. Fixture inspects the spawned provider's env and asserts no `CHAINWORKS_XCODE_SHIM_TOKEN`, no `XCODE_SHIM_DISPATCH_SOCKET`, no shim-dir `PATH` prefix. Session reuse works per §5.6.
-- agent with only a direct `xcodebuild` entry in **`run` block** (no Xcode MCP, no `requires_xcode_host_execution`) gets `XcodeShimInjectionSignal: true` via catalog-lint trigger → shim injected
-- agent with only `shell_allowlist: [xcodebuild, …]` (current catalog shape — no `run` entry, no MCP, no `requires_xcode_host_execution`) gets the shim injected via the expanded lint scope. Fixture uses a real catalog entry shape from `examples/agents/agents.yaml`.
-- agent with `allowed_commands: [xcodebuild, …]` or `tools.shell.commands: [xcodebuild, …]` similarly triggers injection
-- agent with `requires_xcode_host_execution: true` but no other Xcode signal gets the shim injected
-- agent with Xcode MCP + direct `xcodebuild` gets both signals → shim injected (shell trigger wins)
-- agent with zero Xcode signals gets no shim; its `PATH` remains unchanged
-
-Shim enforcement (PATH-based invocations):
-
-- fake-home agent with `requires_xcode_host_execution: false` invoking `xcodebuild -project …` via shell receives exit 127; `xcode_shim_rejected` observation with `{tool: "xcodebuild", via_xcrun: false}`
-- fake-home agent invoking `xcrun xcodebuild build -scheme Foo` receives exit 127 via the xcrun shim's xcodebuild interception; `xcode_shim_rejected` with `{tool: "xcodebuild", via_xcrun: true}`
-- fake-home agent invoking `xcrun --sdk macosx xcodebuild build -scheme Foo` (option-prefixed xcodebuild) is correctly parsed and receives exit 127; `xcode_shim_rejected` with `{tool: "xcodebuild", via_xcrun: true}`
-- fake-home agent invoking `xcrun simctl list` receives exit 127; `xcode_shim_rejected` with `{tool: "simctl", via_xcrun: true}`
-- fake-home agent invoking `xcrun --sdk iphonesimulator simctl list` (option-prefixed form) is correctly parsed by the option-aware `xcrun` shim and receives exit 127; `xcode_shim_rejected` with `{tool: "simctl", via_xcrun: true}`
-- fake-home agent invoking `xcrun mcpbridge` receives exit 127 regardless of `requires_xcode_host_execution` value; `xcode_shim_rejected` with `{tool: "mcpbridge", via_xcrun: true, policy_reason: "mcpbridge_broker_only"}`
-- fake-home agent invoking **`xcrun -r mcpbridge`** (Run mode with short `-r`) resolves tool to `mcpbridge` and is rejected with `xcode_shim_rejected`; fixture explicitly proves the mode-aware parser does not consume `mcpbridge` as an argument to `-r`
-- fake-home agent invoking **`xcrun --run mcpbridge`** (Run mode with long form) same result
-- fake-home agent invoking **`xcrun -l mcpbridge`** (no-arg `-l` flag followed by positional tool) resolves tool to `mcpbridge` and is rejected; fixture proves `-l` is no-arg and does not consume `mcpbridge`
-- fake-home agent invoking **`xcrun --log mcpbridge`** same result
-- fake-home agent invoking **`xcrun --log --verbose mcpbridge`** (two no-arg flags + positional tool) resolves tool to `mcpbridge` and is rejected
-- fake-home agent invoking **`xcrun --find xcodebuild`** (Find mode + guarded tool) is **rejected** with exit 127; `xcode_shim_rejected` with `{tool: "xcodebuild", via_xcrun: true, policy_reason: "xcrun_find_of_guarded_tool_rejected"}`. Fixture asserts no absolute path is printed to stdout — the find-to-exec chain is broken at the find step.
-- fake-home agent invoking **`xcrun --find mcpbridge`** similarly rejected with `tool: "mcpbridge"`
-- fake-home agent invoking **`xcrun -f simctl`** (short form) similarly rejected with `tool: "simctl"`
-- fake-home agent invoking **`xcrun --find dtrace`** (Find mode + non-guarded tool) passes through transparently; dtrace's path is printed. Non-Xcode tools are not P051's concern.
-- fake-home agent invoking **`xcrun --show-sdk-path`** (Show mode, no tool) passes through silently
-- fake-home agent invoking `xcrun dtrace` (Run mode, non-Xcode tool) passes through transparently; no observation emitted
-- fake-home agent invoking `xcrun --toolchain swift-latest swiftc …` (Run mode with non-mode option-with-arg) passes through transparently after option parse
-- fake-home agent invoking `xcrun --bogus-unknown-flag simctl list` receives exit 127 (unknown flag fail-closed); `xcode_shim_rejected` with `policy_reason: "xcrun_unknown_option"`
-
-Absolute-path catalog lint — structured fields (hard-fail):
-
-- catalog with a `run` block command starting with `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` fails run-start with `xcode_absolute_path_forbidden`; run is not created
-- catalog with an env assignment `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` alongside a direct `xcodebuild` invocation fails the lint
-- catalog with bare `xcodebuild` (no absolute path) passes the lint and proceeds to shim-based enforcement
-- **catalog with absolute `/usr/bin/xcrun mcpbridge` in `shell_allowlist` fails run-start** with `xcode_absolute_path_forbidden` — fixture uses the current catalog shape that puts Xcode tools in `shell_allowlist` rather than `run` blocks. Mirrors the shim-signal scan scope.
-- catalog with absolute `/usr/bin/xcodebuild` in `allowed_commands` fails run-start
-- catalog with absolute Xcode path in `tools.shell.commands` fails run-start
-- **lint scope parity fixture**: for every field name in the `XcodeShimInjectionSignal` trigger list, an absolute-path entry fails the hard-fail lint. Guarantees the two scans stay in sync across schema evolution.
-
-Absolute-path catalog lint — prompt text (soft-warn):
-
-- catalog with a prompt that quotes `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` as inert documentation (e.g., a review agent's instructions describing what is blocked) **passes** run-start; fixture asserts (a) run is created, (b) `ResolvedAgent.prompt_lint_warnings` contains the entry at compile time, (c) when the executor creates the `AgentExecution` row, the warning is appended to `actual_xcode_runtime_observation_json.xcode_shim_events` in the same transaction, (d) the entry carries `source_field` and `excerpt` for operator review
-- warning carrier durability: fixture simulates an executor crash between compile and claim — on recovery, the next executor replay reads the same `ResolvedAgent` (which is frozen run truth) and still writes the warning to the new `AgentExecution` row. Warnings are never dropped between compilation and execution.
-
-**Residual-path runtime warnings (P2 new)**
-
-Per-provider `XcodeResidualPathObserver` fixtures — each provider's shell-tool argv surface in `session/update` must be exercised end-to-end:
-
-- **Claude Agent**: fake-home agent (pure Xcode MCP, no direct shell Xcode declared in catalog) executes a shell tool call whose argv is `["/usr/bin/xcrun", "mcpbridge"]` — LLM-improvised at prompt time. Fixture: (a) observer sees the `toolUseBlock` in `session/update`, (b) the command is **not blocked** at runtime (outside enforced boundary), (c) the `mcpbridge` subprocess starts and talks to Xcode (accepting documented trade-off), (d) a warning is **emitted** to `actual_xcode_runtime_observation_json.xcode_shim_events` with `policy_decision: "prompt_warning"`, `policy_reason: "xcode_residual_absolute_path"`, `matched_substring: "/usr/bin/xcrun mcpbridge"`, `source_field: "acp_session_update_tool_use"`.
-- **Codex**: same scenario via Codex `session/update` shell tool call (argv as structured array); fixture asserts the observer extracted argv from `input.command` and emitted the matching warning.
-- **Gemini CLI**: same scenario via Gemini `toolCall.args.command` command string; fixture asserts command-string tokenizer surfaces `/usr/bin/xcrun mcpbridge` and emits the warning.
-- similar per-provider fixtures for `/usr/bin/xcrun xcodebuild`, `/usr/bin/xcrun simctl`, `/usr/bin/xcodebuild`, `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild`, and `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild`. Each emits a warning with the matching `policy_reason`/`matched_substring`.
-- **Negative fixture**: `/usr/bin/xcrun dtrace` (non-Xcode subcommand) does **not** emit a warning — matcher recognizes it's a legitimate xcrun use of a non-Xcode-tool subcommand.
-- **Observer-gap fixture**: provider that emits `session/update` events without shell-tool argv (simulated by a fixture stripping the relevant field). Observer records `xcode_residual_observer_gap` WARN at session start and attaches `observer_unavailable: { adapter_family }` marker to the execution's envelope; fixture asserts the marker appears in `actual_xcode_runtime_observation_json` so operators see the gap explicitly.
-
-**Shim event schema discrimination (P2 new)**
-
-- GraphQL `xcodeShimEvents` returns a `[XcodeShimEvent!]` list of union members; fixture asserts a mixed execution with one rejection + one warning yields two array entries with distinct `__typename` (`XcodeShimInvocationEvent` vs `XcodeShimWarningEvent`) and that each carries the full variant-specific fields (invocation has `derivedPeerPid` etc.; warning has `matchedSubstring`/`excerpt`).
-- MCP `reports.get` returns the same discrimination via the `kind` field on JSON objects; fixture asserts kinds round-trip through serialization without field loss.
-- Storage round-trip: JSON envelope written by the repository with both variants in `xcode_shim_events[]` deserializes back to Rust `XcodeShimEvent::{Invocation, Warning}` enum without silent field drop; fixture asserts equality of serialized/deserialized values.
-- fixture using this P051 proposal text itself as the prompt body compiles cleanly — no false-positive on documentation that quotes the forbidden paths
-- a prompt that contains **both** a quoted path AND a structured `run` block command with the same absolute path: run-start fails on the structured field; the prompt warning is still recorded
-
-Absolute-path catalog lint — diagnostic mode scope:
-
-- diagnostic mode + absolute `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild` in structured `run` block: lint is bypassed with WARN; the shim is also transparent-passthrough (does not route); run proceeds and direct `xcodebuild` executes under the ACP provider's **current environment** (fake-home state — not rehosted), which is the documented trade-off of diagnostic mode. The fixture asserts `$HOME` observed by the `xcodebuild` subprocess matches the provider's fake home, not the operator home. This explicitly accepts the CoreSimulator failure risk for local debugging; diagnostic mode is not valid in production.
-- diagnostic mode + absolute `/usr/bin/xcrun mcpbridge` in structured `run` block: **still hard-fails** with `xcode_absolute_path_forbidden`; fixture asserts run is not created even with `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1`
-- diagnostic mode + absolute `/Applications/Xcode.app/Contents/Developer/usr/bin/mcpbridge` in structured `run` block: still hard-fails
-- diagnostic mode + `xcrun --sdk iphonesimulator mcpbridge` in structured `run` block: still hard-fails after option-aware argv parse
-
-Host executor routing:
-
-- agent with `requires_xcode_host_execution: true` invoking `xcodebuild build -scheme Foo` is routed; `xcode_shim_routed` observation records argv, selected simulator UUID, exit status, host-env disposition, **and `cwd`**
-- routed `xcodebuild` executes with `chdir` to the agent's cwd; fixture confirms build artifact landing in the correct workspace-relative path
-- routed command with cwd outside frozen workspace root is rejected with `cwd_outside_workspace`
-- routed command's subprocess env contains host-user `HOME`/`TMPDIR`/`DEVELOPER_DIR` (via fixture inspection of `/usr/bin/env` output), **not** the provider's fake-home values
-- provider env like `CODEX_HOME`, `XDG_CACHE_HOME`, `CHAINWORKS_*` is absent from routed subprocess env
-- build-input env (`SCHEME`, `CONFIGURATION`, `DESTINATION`) present in provider snapshot is propagated to routed subprocess
-- `mcpbridge` is not routable via the host executor even with `requires_xcode_host_execution: true` — fixture confirms rejection is unconditional
-- `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` makes `xcodebuild`/`simctl`/`xcrun`-non-mcpbridge transparent (catalog lint skipped) with WARN log at daemon start and per invocation; **fixture explicitly asserts that `mcpbridge` and `xcrun mcpbridge` remain rejected in diagnostic mode**
-
-**Catalog migration**
-
-- agent catalog entries with direct `xcodebuild` commands declare explicit `requires_xcode_host_execution` value (either `true` or `false`); missing declaration blocks the lint step
-
-No Xcode UI automation is required for this gate. Use fixture backend processes for deterministic proof.
-
----
-
-## 11. Acceptance Criteria
-
-Implementation is complete when:
-
-- The HTTP streaming feasibility research artifact exists, has an allowed verdict, and the implementation scope matches that verdict.
-- `ProviderCapabilityCache` is populated by a one-shot `initialize` probe keyed on the full `ProbeKey` derived from a `ProviderLaunchSpec`. The executor builds a single `ProviderLaunchSpec` per request and passes it to `ensure_provider_capabilities`, then to `attach_session_credentials` (post-preflight), then to the adapter's `open_session_with_specs`. Debug-assert enforces **capability-slice** equality across these call sites; `credential_env` is empty at probe and populated only after `attach_session_credentials`. `resolve_mcp_servers` fails closed with `provider_http_mcp_unsupported` before lease/port/token allocation when HTTP MCP is unsupported.
-- Parallel ACP sessions that request Xcode MCP each get their own lease and backend `mcpbridge` subprocess; their initialize phases serialize per Xcode PID; their `tools/*` calls run in parallel.
-- ACP providers receive an HTTP streaming MCP endpoint for brokered Xcode access.
-- Single backend crash fails only its lease; sibling leases continue. Xcode PID drift and broker HTTP infrastructure failure terminally close all affected leases with their respective `backend_failure_class`. Host-env loss fails **new lease acquisitions** and **shim-route requests** but does not disturb already-running MCP streams.
-- PATH shim (`xcodebuild`, `simctl`, `mcpbridge`, mode-aware `xcrun`) is injected into an ACP provider subprocess **only** when the compile-time `XcodeShimInjectionSignal` is set. Triggers are direct-shell-only: (1) agent declares `requires_xcode_host_execution: true`, (2) catalog lint detects any bare Xcode-tool lexeme in any direct-command declaration field (`run` blocks, `shell_allowlist`, `allowed_commands`, `tools.shell.commands`, adapter-specific shell-capability fields). A **catalog request for Xcode MCP** sets the orthogonal `XcodeBrokerRequired` flag (which drives broker lease minting and `session/new.mcpServers` HTTP entry) but does **not** trigger shim injection — pure Xcode MCP agents keep their unmodified `PATH` and retain full session reuse per §5.6. Agents with zero Xcode signals also keep their unmodified `PATH`.
-- Absolute-path catalog lint hard-fails run-start with `xcode_absolute_path_forbidden` **only** when a structured executable field (`run` block command path/argv, env assignments of `DEVELOPER_DIR`) contains Xcode-tool absolute paths. Prompt/system-instruction/description text gets a soft `xcode_absolute_path_in_prompt` warning recorded in the runtime observation envelope but does not block run-start. `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` skips the lint **only for `xcodebuild`/`simctl` paths** (structured and prompt). Any structured field whose absolute path resolves to `mcpbridge` (bare, via `/usr/bin/xcrun mcpbridge`, or any option-prefixed `xcrun` variant ending in `mcpbridge`) still hard-fails even in diagnostic mode — the broker-only-mcpbridge boundary has no diagnostic override anywhere in P051.
-- Default shim policy rejects direct `xcodebuild`/`simctl` invocations with exit 127 and `xcode_shim_rejected` observation; `requires_xcode_host_execution: true` opt-in routes through the broker host executor with full `ShimDispatchRequest` DTO (cwd, env allowlist, provider snapshot).
-- Direct `mcpbridge` (bare or via `xcrun mcpbridge`, option-prefixed or not) is **always rejected within the enforced boundary** — PATH-based invocations via the shim, catalog-declared structured-field paths via the lint — regardless of `requires_xcode_host_execution` **and regardless of `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC`**. `mcpbridge` is not routable via the host executor. LLM-improvised absolute `/usr/bin/xcrun mcpbridge` at prompt time is outside the enforced boundary (documented residual, §5.1.1).
-- **Shim dispatch token authority is separate from MCP lease authority and scoped to the provider session, not a single execution.** `XcodeShimDispatchToken` is minted per provider session at provider-launch time for any shim-injected execution (including direct-Xcode-only agents with no MCP lease). The broker maintains a mutable `current_execution_id` pointer updated before each `session/prompt` so shim events always append to the currently-active execution. Reuse-compat check forces supersession if `workspace_root` or `requires_xcode_host_execution` would differ between executions. Tokens are constant-time validated, have explicit expiry, enforce the frozen `workspace_root` cwd boundary, and cannot be cross-used with MCP HTTP bearer tokens. Tokens are **not** assumed secret from shell-capable agents (env delivery is readable via `env`/`printenv`); all authorization is server-side.
-- **Durable schema.** `agent_executions.actual_xcode_runtime_observation_json` column exists (migration added), legacy rows read back as GraphQL `null`, and the repository supports append-only semantics across the three arrays. GraphQL and MCP expose typed envelope.
-- Broker-owned Xcode subprocesses run with host-user `HOME`/`TMPDIR`; ACP providers continue to run with isolated fake-home state.
-- The implementation does not grant the entire ACP provider process the real user home as the normal Xcode fix.
-- Xcode destination handling prefers explicit simulator UUIDs and fails clearly on ambiguous name/OS requests.
-- Direct multi-client sharing of raw `xcrun mcpbridge` stdio is not used.
-- Provider-facing stdio proxying is not implemented as P051's architecture.
-- Broker leases are **provider-session-owned**. A lease is released on provider-session close, cancellation, timeout, provider process death, operator session reset, or reuse-incompatible supersession — **not** on individual execution success. A reused provider session retains its lease and backend `mcpbridge` subprocess across prompt cycles.
-- Runtime observations distinguish backend start from backend reuse.
-- Permission-separated agents get distinct broker state keyed by permission fingerprint; no policy leakage across leases.
-- Existing session reuse behavior still works.
-- `MCP_XCODE_PID` targeting remains active.
-- Xcode host-env, simulator-selection, and shim/host-executor evidence is present in `actual_xcode_runtime_observation_json` as three append-only arrays (`mcp_broker_observations`, `xcode_shim_events`, `xcode_host_executor_events`); direct-Xcode-only executions with no MCP server request still populate the envelope.
-- `proposal-051|p051` is registered in `scripts/test-gate.sh` and `docs/reference/test-gates.md`.
-- The proposal-specific gate passes.
-
----
-
-## 12. Rollout Plan
-
-1. ✅ Produce `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md` — complete 2026-04-19.
-2. ✅ Include host-env feasibility in the same research artifact — covered.
-3. ✅ Current verdict is `Proceed with scoped architecture`; P051 has been revised accordingly (per-lease backend, initialize Mutex, shim + catalog lint, `ProbeKey` cache, host-executor DTO). No further proposal revision is gated on research.
-4. Implement broker behind default-on runtime config for Xcode only.
-5. Implement host-user Xcode environment handling inside the broker or host executor before dogfooding Xcode-dependent agents.
-6. `CHAINWORKS_XCODE_DIRECT_DIAGNOSTIC=1` bypasses only the `xcodebuild`/`simctl`/`xcrun`-non-`mcpbridge` shims. Direct `mcpbridge` and `xcrun mcpbridge` remain rejected — no diagnostic escape hatch for raw `mcpbridge` exists. Engineers debugging Xcode MCP run `xcrun mcpbridge` from their own shell outside any ACP agent; never exposed to provider subprocesses. Do not add a stdio proxy fallback.
-7. Run fixture-based gate.
-8. Dogfood on a proposal-review stage with parallel Gemini UX/UI.
-9. Confirm logs show:
-   - two ACP sessions
-   - two HTTP streaming leases
-   - two backend `mcpbridge` subprocesses spawned, both under host-user environment
-   - second lease's initialize waits briefly on per-PID Mutex (measured in `backend_initialize_wait_ms`)
-   - one Xcode PID, one consent modal total (or zero if already granted)
-   - host-user Xcode env disposition recorded in observation data
-   - explicit simulator UUID when a simulator is selected
-10. Remove or demote the diagnostic direct-mode path only after several successful dogfood runs.
-
----
-
-## 13. Resolved Decisions
-
-These were originally open questions; all were resolved by the research gate or by this revision. Listed here as decision record for implementation.
-
-| Decision | Resolution | Source |
-|---|---|---|
-| ACP providers supporting HTTP MCP in `session/new` | Codex-acp ≥ 0.4.0, Claude Agent ACP ≥ 0.28, Gemini CLI ≥ 0.38.1 — all three confirmed | Research artifact + Phase 0 probe 3 |
-| `session/new.mcpServers[]` wire shape | ACP spec discriminated union: `{"type":"http","name","url","headers":[{"name","value"}]}` | ACP schema |
-| Loopback HTTP + bearer vs Unix-domain | Loopback HTTP with bearer via `headers` array is sufficient for all three providers; UDS not required | Research artifact |
-| Operator home source | `getpwuid(getuid()).pw_dir` at daemon start, with daemon-config override and startup warning if the daemon UID does not match the active GUI user | Research artifact Q7 |
-| Direct Xcode commands in fake-home context | PATH shim for `xcodebuild`/`simctl`/`mcpbridge`/`xcrun` + catalog lint for absolute paths; `requires_xcode_host_execution` opt-in routes `xcodebuild`/`simctl` only; `mcpbridge` always rejected (diagnostic bypass applies to `xcodebuild`/`simctl`/`xcrun`-non-mcpbridge only) | §5.1.1 (this proposal) |
-| Backend-sharing model | Per-lease `mcpbridge` subprocess; serialize spawn+initialize per Xcode PID via Mutex; parallel `tools/*` unserialized | Phase 0 probe 1 |
-| Modal scope | Per-Xcode-process consent; no duplicate modals for sibling bridges under the same Xcode PID | Phase 0 probe 2 |
-
-## 14. Open Questions (non-blocking)
-
-Implementation can proceed with the conservative defaults below; these are tuning knobs for later revisions, not gates.
-
-1. Should broker idle grace be fixed at 60 seconds or configurable per runtime profile?
-2. Should broker debug state be exposed through MCP `runtime.status` later, or is `actual_mcp_observation_json` enough for P051?
-3. Does Xcode mcpbridge expose any server-side session state that makes tool-list caching unsafe after file/project changes? (Conservative default: invalidate cache on any Xcode workspace switch detected via `NSWorkspace` or file-mtime probing.)
-4. Should policy-separated leases be keyed by permission profile name, resolved tool allowlist hash, or both?
-
-**Conservative defaults for implementation:**
-
-- 60-second grace for broker in-memory state (cache, Mutex-owning pool entry) after last lease releases.
-- No new northbound debug MCP tool in P051.
-- Cache only `tools/list` per Xcode PID, invalidate on Xcode PID drift or workspace switch.
-- Lease keyed by resolved tool allowlist hash + permission profile id.

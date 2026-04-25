@@ -16,6 +16,7 @@ pub mod stage;
 pub mod steward;
 pub mod validation;
 pub mod workflow_conflict;
+pub mod xcode_runtime;
 
 // P029: PrincipalClass is canonically defined in domain::commands.
 pub use capabilities::{CapabilityToolId, ResourceTemplateId};
@@ -24,6 +25,7 @@ pub use commands::PrincipalClass;
 // P042: daemon lifecycle types are the canonical readback contract.
 pub use lifecycle::{
     DaemonLifecycleState, DaemonStatus, DegradedKind, DegradedReason, FailureKind, FailureReason,
+    XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
 };
 
 #[cfg(test)]

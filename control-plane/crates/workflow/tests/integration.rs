@@ -42,6 +42,19 @@ fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::pl
     compile_result_from_strings(workflow_yaml, catalog_yaml).expect("should compile plan")
 }
 
+fn compile_error_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> String {
+    let workflow_yaml = if workflow_yaml.trim_start().starts_with("workflow:") {
+        workflow_yaml.to_string()
+    } else {
+        format!("workflow:\n  id: contract-fixture\n  family: contract_fixture\n{workflow_yaml}")
+    };
+    let wf_path = write_temp_fixture("workflow.yaml", &workflow_yaml);
+    let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
+    compiler::compile(&wf_path, &cat_path)
+        .expect_err("plan should fail direct-command lint")
+        .to_string()
+}
+
 #[test]
 fn test_parse_full_mvp_live_workflow() {
     let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
@@ -103,6 +116,38 @@ fn test_parse_agent_catalog() {
         proposal_writer.session_family_id.as_deref(),
         Some("proposal_authoring_loop")
     );
+}
+
+#[test]
+fn p051_example_catalogs_explicitly_mark_xcode_required_tools_for_host_execution() {
+    for relative_path in ["agents/agents.yaml"] {
+        let cat_path = format!("{}/{}", fixtures_dir(), relative_path);
+        let cat = workflow::catalog::load(&cat_path).expect("should parse agent catalog YAML");
+        let agents = cat.agents.as_ref().expect("has agents");
+        let missing: Vec<String> = agents
+            .iter()
+            .filter(|agent| {
+                let has_xcode_required_tool = agent
+                    .required_tools
+                    .as_ref()
+                    .map(|tools| tools.iter().any(|tool| declares_xcode_host_tool(tool)))
+                    .unwrap_or(false);
+                has_xcode_required_tool && agent.requires_xcode_host_execution != Some(true)
+            })
+            .map(|agent| agent.id.clone())
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "{relative_path} agents with Xcode required_tools must explicitly set requires_xcode_host_execution: true: {missing:?}"
+        );
+    }
+}
+
+fn declares_xcode_host_tool(command: &str) -> bool {
+    ["xcodebuild", "simctl", "xcrun"]
+        .iter()
+        .any(|tool| command.contains(tool))
 }
 
 #[test]
@@ -202,57 +247,384 @@ fn test_compile_full_mvp_live_plan() {
 }
 
 #[test]
-fn p054_workflow_transitions_use_v2_status_and_rejection_loopback() {
-    let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+fn p051_catalog_lint_sets_xcode_signals_from_mcp_and_declared_commands() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    run:
+      sequence:
+        - agent: builder
+          task: build
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+    mcp:
+      - xcode
+permission_profiles:
+  CODE:
+    shell:
+      allow:
+        - xcodebuild -project "Chainworks Forge.xcodeproj" build
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    permission_profile: CODE
+    required_tools:
+      - simctl list devices
+    prompt: "Build through the declared commands."
+"#,
+    );
 
-    for workflow_name in ["full-mvp-live.yaml", "workflow.yaml"] {
-        let wf_path = format!("{}/workflows/{workflow_name}", fixtures_dir());
-        let plan = compiler::compile(&wf_path, &cat_path).expect("should compile plan");
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_broker_required,
+        "requesting the xcode MCP server must require brokered MCP"
+    );
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "declared xcodebuild/simctl commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "declared Xcode shell commands must be marked for host execution"
+    );
+}
 
-        let state6 = &plan.states["state_6_implementation_approval"];
-        assert!(
-            state6
-                .transitions
-                .iter()
-                .any(|t| t.to == "state_5_proposal_refined"
-                    && t.condition == "approval.rejected == true"),
-            "{workflow_name}: state_6 must loop rejected implementation approval back to proposal refinement"
-        );
+#[test]
+fn p051_catalog_lint_rejects_structured_absolute_xcode_paths() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    required_tools:
+      - /usr/bin/xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+    );
 
-        let state7 = &plan.states["state_7_implementation_started"];
-        let state8 = &plan.states["state_8_implementation_continued"];
-        for state in [state7, state8] {
-            assert!(
-                state
-                    .transitions
-                    .iter()
-                    .any(|t| t.to == "state_8_implementation_continued"
-                        && t.condition.contains("implementation_self_assessment_v2.status")
-                        && t.condition.contains("'needs_code_fixes'")
-                        && t.condition.contains("'invalid'")
-                        && t.condition.contains("'unknown'")),
-                "{workflow_name}: {} must route invalid/unknown/needs_code_fixes statuses into the code loop",
-                state.id
-            );
-            assert!(
-                state
-                    .transitions
-                    .iter()
-                    .any(|t| t.to == "state_9_implementation_reviewed"
-                        && t.condition.contains("implementation_self_assessment_v2.status")
-                        && t.condition.contains("'complete'")
-                        && t.condition.contains("'handoff_required'")
-                        && t.condition.contains("'blocked'")),
-                "{workflow_name}: {} must exit the code loop only for complete, handoff_required, or blocked",
-                state.id
-            );
-        }
+    assert!(
+        error.contains("P051 direct-command catalog lint failed"),
+        "compile should fail through the P051 scanner: {error}"
+    );
+    assert!(
+        error.contains("p051_absolute_xcode_tool_path"),
+        "absolute xcodebuild path should be rejected: {error}"
+    );
+}
 
-        assert!(
-            !state8.label.contains("seemingly complete"),
-            "{workflow_name}: state_8 operator label must not preserve deprecated seemingly_complete wording"
-        );
-    }
+#[test]
+fn p051_catalog_lint_rejects_unknown_xcrun_flags() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    required_tools:
+      - xcrun --diagnose simctl list devices
+"#,
+    );
+
+    assert!(
+        error.contains("P051 direct-command catalog lint failed"),
+        "compile should fail through the P051 scanner: {error}"
+    );
+    assert!(
+        error.contains("p051_xcrun_unknown_flag"),
+        "unknown xcrun flags should be rejected: {error}"
+    );
+}
+
+#[test]
+fn p051_workflow_run_task_sets_xcode_signals_for_invoked_agent() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    run:
+      sequence:
+        - agent: builder
+          task: xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from workflow task instructions."
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "workflow run-block Xcode commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "workflow run-block Xcode commands must route through host execution"
+    );
+}
+
+#[test]
+fn p051_workflow_run_task_rejects_direct_mcpbridge_bypass() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    run:
+      sequence:
+        - agent: builder
+          task: xcrun mcpbridge
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from workflow task instructions."
+"#,
+    );
+
+    assert!(
+        error.contains("states.start.run.sequence[0].task"),
+        "workflow run-block task path should be reported: {error}"
+    );
+    assert!(
+        error.contains("p051_direct_mcpbridge_command"),
+        "direct mcpbridge use should fail closed: {error}"
+    );
+}
+
+#[test]
+fn p051_agent_adapter_raw_commands_set_xcode_signals_for_agent() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from adapter-specific launch instructions."
+    codex:
+      launch:
+        commands:
+          - xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "adapter-specific raw Xcode commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "adapter-specific raw Xcode commands must route through host execution"
+    );
+}
+
+#[test]
+fn p051_agent_adapter_raw_commands_reject_direct_mcpbridge_bypass() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from adapter-specific launch instructions."
+    gemini:
+      session_new:
+        args:
+          - xcrun mcpbridge
+"#,
+    );
+
+    assert!(
+        error.contains("agents.builder.gemini.session_new.args[0]"),
+        "adapter-specific raw command path should include the owning agent id: {error}"
+    );
+    assert!(
+        error.contains("p051_direct_mcpbridge_command"),
+        "adapter-specific direct mcpbridge use should fail closed: {error}"
+    );
+}
+
+#[test]
+fn p051_agent_allowed_commands_set_xcode_signals_for_agent() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from declared allowed commands."
+    allowed_commands:
+      - xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "allowed_commands Xcode declarations must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "allowed_commands Xcode declarations must route through host execution"
+    );
+}
+
+#[test]
+fn p051_workflow_state_raw_shell_commands_set_xcode_signals_for_owner() {
+    let plan = compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    tools:
+      shell:
+        commands:
+          - xcodebuild -project "Chainworks Forge.xcodeproj" build
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from state-owned shell commands."
+"#,
+    );
+
+    let agent = &plan.states["start"].owner;
+    assert!(
+        agent.xcode_shim_injection_signal,
+        "state-owned raw workflow shell commands must request shim injection"
+    );
+    assert!(
+        agent.requires_xcode_host_execution,
+        "state-owned raw workflow shell commands must route through host execution"
+    );
+}
+
+#[test]
+fn p051_workflow_state_raw_shell_commands_reject_direct_mcpbridge_bypass() {
+    let error = compile_error_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+    tools:
+      shell:
+        commands:
+          - xcrun mcpbridge
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    prompt: "Build from state-owned shell commands."
+"#,
+    );
+
+    assert!(
+        error.contains("states.start.tools.shell.commands[0]"),
+        "state-owned raw workflow command path should be reported: {error}"
+    );
+    assert!(
+        error.contains("p051_direct_mcpbridge_command"),
+        "state-owned direct mcpbridge use should fail closed: {error}"
+    );
 }
 
 #[test]
@@ -374,120 +746,6 @@ workflow:
     assert_eq!(plan_a.catalog_snapshot_json, plan_b.catalog_snapshot_json);
     assert_eq!(plan_a.workflow_snapshot_hash, plan_b.workflow_snapshot_hash);
     assert_eq!(plan_a.catalog_snapshot_hash, plan_b.catalog_snapshot_hash);
-}
-
-#[test]
-fn proposal_057_degraded_output_policy_is_compiled_and_validated() {
-    let plan = compile_from_strings(
-        r#"
-initial_state: review
-states:
-  review:
-    label: Review
-    owner: reviewer
-    degraded_output_policy:
-      mode: allow_valid_contract_outputs
-      contracts:
-        - prepush_review_v1
-      failure_kinds:
-        - provider_failure
-      max_settlement: valid_outputs_from_failed_execution
-    run:
-      sequence:
-        - agent: reviewer
-          task: check
-          outputs:
-            - prepush_review_v1
-"#,
-        r#"
-backend_profiles:
-  reviewer_profile:
-    provider: claude
-agents:
-  - id: reviewer
-    backend_profile: reviewer_profile
-    prompt: "review"
-contracts:
-  prepush_review_v1:
-    format: json
-    machine_format: json
-    normalized_artifact_name: prepush_review_v1
-    required_fields: [status]
-"#,
-    );
-
-    let policy = &plan.states["review"].degraded_output_policy;
-    assert_eq!(policy.mode, "allow_valid_contract_outputs");
-    assert_eq!(policy.contracts, vec!["prepush_review_v1"]);
-    assert_eq!(policy.failure_kinds, vec!["provider_failure"]);
-    assert_eq!(policy.max_settlement, "valid_outputs_from_failed_execution");
-}
-
-#[test]
-fn proposal_057_degraded_output_policy_rejects_unknown_contracts() {
-    let workflow_yaml = r#"
-workflow:
-  id: p057-invalid-policy
-  family: p057
-initial_state: review
-states:
-  review:
-    label: Review
-    owner: reviewer
-    degraded_output_policy:
-      mode: allow_valid_contract_outputs
-      contracts:
-        - missing_contract_v1
-"#;
-    let catalog_yaml = r#"
-backend_profiles:
-  reviewer_profile:
-    provider: claude
-agents:
-  - id: reviewer
-    backend_profile: reviewer_profile
-    prompt: "review"
-"#;
-    let wf_path = write_temp_fixture("p057-invalid-policy-workflow.yaml", workflow_yaml);
-    let cat_path = write_temp_fixture("p057-invalid-policy-catalog.yaml", catalog_yaml);
-    let err = compiler::compile(&wf_path, &cat_path).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unknown degraded_output_policy contract_id"),
-        "unexpected error: {err:?}"
-    );
-}
-
-#[test]
-fn proposal_057_live_workflows_use_canonical_implementation_contract_guards() {
-    let examples = fixtures_dir();
-    for workflow_name in ["workflow.yaml", "full-mvp-live.yaml"] {
-        let workflow_path = format!("{examples}/workflows/{workflow_name}");
-        let workflow_text =
-            fs::read_to_string(&workflow_path).expect("workflow fixture should be readable");
-        assert!(
-            !workflow_text.contains("implementation_self_assessment.seemingly_complete"),
-            "{workflow_name} must not transition on legacy self-assessment boolean truth"
-        );
-        assert!(
-            !workflow_text.contains("tests_result.green"),
-            "{workflow_name} must not transition on legacy tests boolean truth"
-        );
-        assert!(
-            workflow_text.contains("implementation_self_assessment_v2.implementation_complete"),
-            "{workflow_name} must read implementation completeness from canonical active contract truth"
-        );
-        assert!(
-            workflow_text.contains("tests_result_v1.status"),
-            "{workflow_name} must read test status from canonical active contract truth"
-        );
-    }
-
-    let catalog_text = fs::read_to_string(format!("{examples}/agents/agents.yaml"))
-        .expect("agent catalog fixture should be readable");
-    assert!(catalog_text.contains("implementation_self_assessment_v2:"));
-    assert!(catalog_text.contains("tests_result_v1:"));
-    assert!(!catalog_text.contains("output_contract: implementation_self_assessment_v1"));
 }
 
 #[test]

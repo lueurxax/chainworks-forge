@@ -30,6 +30,32 @@ use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
 
+static CODEX_CONFIG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static META_ROOT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvVarRestore {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.as_ref() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
         .await
@@ -217,6 +243,7 @@ fn make_agent_execution(
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     }
 }
@@ -3594,8 +3621,24 @@ async fn mcp_resolution_persistence_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let registry_path = tmp.path().join("mcp-config.yaml");
     std::fs::write(&registry_path, "mcp: {}\n").unwrap();
+    let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
     let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
     std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+    let xcode_resolution = engine::mcp::resolve_mcp_servers(
+        &["xcode".to_string()],
+        Some("xcode_profile"),
+        "auggie",
+    );
+    assert!(
+        xcode_resolution
+            .payloads
+            .iter()
+            .any(|payload| matches!(
+                payload.transport,
+                acp::ResolvedMcpServerTransport::XcodeBrokerIntent { .. }
+            )),
+        "fixture registry should resolve xcode to a broker intent"
+    );
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -3695,6 +3738,113 @@ async fn mcp_resolution_persistence_tests() {
     assert!(
         settled.evidence_packet_json.is_some(),
         "MCP blocked stage should get failed-stage evidence"
+    );
+}
+
+#[tokio::test]
+async fn xcode_broker_fail_closed_observation_is_persisted_from_acp_sink() {
+    use acp::AcpRuntimeManager;
+    use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservation};
+    use engine::executor::BackgroundExecutor;
+    use engine::orchestrator::Orchestrator;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let registry_path = tmp.path().join("mcp-config.yaml");
+    std::fs::write(
+        &registry_path,
+        r#"
+mcp:
+  xcode:
+    type: xcode_broker
+"#,
+    )
+    .unwrap();
+    let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
+    let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
+    std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "xcode_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new()),
+        events,
+    );
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("xcode_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "xcode_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "xcode-agent",
+                "provider": "auggie",
+                "backend_profile_id": "xcode_profile",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "xcode_profile",
+                "requested_mcp_server_ids": ["xcode"]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let result = executor.process_next_item().await;
+    if let Some(previous_registry) = previous_registry {
+        std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", previous_registry);
+    } else {
+        std::env::remove_var("CHAINWORKS_CODEX_CONFIG_PATH");
+    }
+
+    let error = result.expect_err("unsupported provider should fail closed");
+    assert!(
+        error.to_string().contains("provider_http_mcp_unsupported"),
+        "unexpected error: {error:#}"
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    let execution = executions.first().expect("agent execution should persist");
+    let observation_json = execution
+        .actual_xcode_runtime_observation_json
+        .as_deref()
+        .expect("ACP Xcode sink should persist an observation");
+    let observation: XcodeRuntimeObservation = serde_json::from_str(observation_json).unwrap();
+    assert_eq!(observation.mcp_broker_observations.len(), 1);
+    let broker_observation = &observation.mcp_broker_observations[0];
+    assert_eq!(
+        broker_observation.backend_start_disposition,
+        "failed_closed_before_session_new"
+    );
+    assert_eq!(
+        broker_observation.backend_failure_class,
+        Some(XcodeRuntimeFailureClass::ProviderHttpMcpUnsupported)
+    );
+    assert_eq!(
+        broker_observation.originating_execution_id.as_deref(),
+        Some(execution.id.to_string().as_str())
     );
 }
 
@@ -4521,6 +4671,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
+                xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
@@ -4618,6 +4769,8 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "fixture",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "fixture-agent",
                 "declared_outputs": [{
                     "output_name": "prepush_review_report",
                     "target_path": target_path.to_string_lossy(),
@@ -4717,6 +4870,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
+                xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
@@ -5763,6 +5917,10 @@ sys.exit(0)
         backend_profile: None,
         permission_profile: None,
         mcp_servers: &Vec::new(),
+        xcode_broker_contract_hash: None,
+        xcode_broker_required: false,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
         skill_snapshot_hash: None,
         skill_ref: None,
         skill_role: None,
@@ -6007,6 +6165,10 @@ sys.exit(0)
         backend_profile: None,
         permission_profile: None,
         mcp_servers: &Vec::new(),
+        xcode_broker_contract_hash: None,
+        xcode_broker_required: false,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
         skill_snapshot_hash: None,
         skill_ref: None,
         skill_role: None,
@@ -6222,6 +6384,7 @@ sys.exit(0)
         denied_mcp_extensions_json: None,
         mcp_blocking_issues_json: None,
         actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
     };
     agent_executions::insert(&pool, &running_exec)
@@ -6594,6 +6757,10 @@ sys.exit(0)
         backend_profile: None,
         permission_profile: None,
         mcp_servers: &Vec::new(),
+        xcode_broker_contract_hash: None,
+        xcode_broker_required: false,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
         skill_snapshot_hash: None,
         skill_ref: None,
         skill_role: None,
@@ -6842,6 +7009,10 @@ sys.exit(0)
             backend_profile: None,
             permission_profile: None,
             mcp_servers: &Vec::new(),
+            xcode_broker_contract_hash: None,
+            xcode_broker_required: false,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
             skill_snapshot_hash: None,
             skill_ref: None,
             skill_role: None,
@@ -7820,12 +7991,16 @@ async fn test_state_11_to_state_12_happy_path() {
     use domain::ids::ArtifactId;
     use engine::orchestrator::Orchestrator;
 
+    let _meta_root_env_lock = META_ROOT_ENV_LOCK.lock().await;
     let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
 
     // Isolated workspace + artifact root so exists() lookups hit only our files.
     let tmp = tempfile::tempdir().unwrap();
+    let meta_root = tmp.path().join(".chainworks");
+    std::fs::create_dir_all(&meta_root).unwrap();
+    let _meta_root_env = EnvVarRestore::set("CHAINWORKS_META_ROOT", &meta_root.to_string_lossy());
     let workspace_root = tmp.path().to_string_lossy().into_owned();
     let artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
     std::fs::create_dir_all(&artifact_root).unwrap();
@@ -8518,6 +8693,8 @@ fn test_execution_request_carries_chainworks_meta_root() {
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

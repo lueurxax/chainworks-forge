@@ -2384,6 +2384,97 @@ PY
     )
     log "Proposal 050 control-plane gate passed"
     ;;
+  p051-scaffold)
+    log "Proposal 051 scaffold gate: shared Xcode MCP bridge pool substrate"
+    python3 - <<'PY'
+from pathlib import Path
+
+source = Path("docs/proposals/051-shared-xcode-mcp-bridge-pool.md")
+if not source.exists():
+    raise SystemExit(f"p051-scaffold: missing source proposal {source}")
+
+lines = source.read_text().splitlines()
+stale_checks = [
+    ("no SwiftUI changes", ["no swiftui changes", "no swift app ui changes", "no ui changes"]),
+    ("debug_assert-only capability enforcement", ["debug_assert"]),
+    ("path+mtime+size-only binary fingerprinting", ["path+mtime+size", "path, mtime, and size", "path mtime size"]),
+    ("drop-on-corrupt observation behavior", ["drop-on-corrupt", "drop on corrupt", "drop corrupt"]),
+    ("direct pgrep newest-Xcode selection", ["pgrep", "newest xcode"]),
+    ("unbound same-uid-only shim authorization", ["same-uid-only", "same uid only"]),
+]
+allowed_context_markers = [
+    "absent",
+    "concern",
+    "fail",
+    "forbid",
+    "not only",
+    "prohibit",
+    "reject",
+    "replace",
+    "required",
+    "resolution",
+    "resolved",
+    "security review",
+    "scope_change",
+    "stale",
+    "strengthened",
+    "threshold",
+    "tightened",
+]
+stale = []
+for label, needles in stale_checks:
+    offending_lines = []
+    for line_number, line in enumerate(lines, start=1):
+        normalized = line.lower()
+        if not any(needle in normalized for needle in needles):
+            continue
+        if any(marker in normalized for marker in allowed_context_markers):
+            continue
+        offending_lines.append(line_number)
+    if offending_lines:
+        stale.append(label)
+
+if stale:
+    raise SystemExit(
+        "p051-scaffold: docs/proposals/051-shared-xcode-mcp-bridge-pool.md still contains "
+        "stale contrary guidance: " + ", ".join(stale)
+    )
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-051-scaffold-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p workflow --test integration p051_ -- --nocapture &&
+      cargo test -p db --test integration proposal_051_xcode_runtime_observation -- --nocapture &&
+      cargo test -p acp --test integration brokered_xcode_probe_accepts_http_but_requires_lease_conversion -- --exact --nocapture &&
+      cargo test -p acp --test integration xcode_mcp_bridge_pool_ -- --nocapture &&
+      cargo test -p acp --test integration runtime_manager_attaches_brokered_xcode_http_lease_before_session_new -- --exact --nocapture &&
+      cargo test -p engine --test integration xcode_broker_fail_closed_observation_is_persisted_from_acp_sink -- --exact --nocapture &&
+      cargo check -p graphql-server &&
+      cargo check -p mcp-server
+    )
+    log "Proposal 051 scaffold gate passed"
+    ;;
+  proposal-051|p051)
+    log "Proposal 051 gate: shared Xcode MCP bridge pool"
+    "$0" p051-scaffold
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-051-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain --test artifact_contracts -- --nocapture &&
+      cargo test -p workflow --test integration p051_ -- --nocapture &&
+      cargo test -p db --test integration proposal_051_xcode_runtime_observation -- --nocapture &&
+      cargo test -p acp --test integration xcode_mcp_bridge_pool_ -- --nocapture &&
+      cargo test -p engine --test integration xcode_broker_fail_closed_observation_is_persisted_from_acp_sink -- --exact --nocapture &&
+      cargo check -p graphql-server &&
+      cargo check -p mcp-server
+    )
+    run_targeted_tests "proposal-051-swift" \
+      "Chainworks ForgeTests/RunTimelineInspectorViewTests" \
+      "Chainworks ForgeTests/DaemonLifecycleClientTests"
+    log "Proposal 051 gate passed"
+    ;;
   proposal-057|p057)
     log "Proposal 057 control-plane gate: canonical artifact contracts and run-state projection"
     mkdir -p "$ROOT_DIR/reports/test-gates"

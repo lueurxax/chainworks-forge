@@ -1205,6 +1205,7 @@ agents:
       - swift test
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+    requires_xcode_host_execution: true
     inputs:
       - approved_proposal
       - implementation_plan
@@ -1293,6 +1294,7 @@ agents:
       - swift test
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+    requires_xcode_host_execution: true
     inputs:
       - approved_proposal
       - implementation_progress
@@ -1383,6 +1385,7 @@ agents:
       - swift test
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
       - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+    requires_xcode_host_execution: true
     inputs:
       - approved_proposal
       - implementation_progress

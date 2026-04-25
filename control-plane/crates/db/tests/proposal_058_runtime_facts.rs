@@ -136,6 +136,7 @@ async fn seed_execution(
             denied_mcp_extensions_json: None,
             mcp_blocking_issues_json: None,
             actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
         },
     )

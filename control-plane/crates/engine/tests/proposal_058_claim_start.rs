@@ -646,6 +646,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
             denied_mcp_extensions_json: None,
             mcp_blocking_issues_json: None,
             actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
         },
     )
@@ -831,6 +832,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
             denied_mcp_extensions_json: None,
             mcp_blocking_issues_json: None,
             actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
         },
     )

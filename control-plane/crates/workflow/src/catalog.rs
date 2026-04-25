@@ -119,6 +119,12 @@ pub struct AgentEntry {
     pub notes: Option<String>,
     pub worktree_policy: Option<WorktreePolicy>,
     pub required_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub xcode_broker_required: Option<bool>,
+    #[serde(default)]
+    pub xcode_shim_injection_signal: Option<bool>,
+    #[serde(default)]
+    pub requires_xcode_host_execution: Option<bool>,
 }
 
 /// Load and parse an agent catalog YAML file.

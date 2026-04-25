@@ -17,6 +17,10 @@
 //!   variables, and ad-hoc logging statements all serialise tokens this
 //!   way, so §9.2 requires it even when the caller never reached the
 //!   HTTP `Authorization` header.
+//! - **P051 Xcode broker tokens** — raw `xcode-lease-…` bearer values and
+//!   common query/key-value forms (`token=…`, `access_token=…`,
+//!   `bearer_token=…`, `authorization=…`) are scrubbed before daemon
+//!   logs or packaged diagnostics can expose broker lease credentials.
 //! - **Packaged SQLite database path** — the absolute path of the
 //!   packaged control-plane DB is collapsed to `<CHAINWORKS_DB>` so a
 //!   leaked log line cannot betray where the app stores operator state
@@ -56,6 +60,10 @@ pub const HOME_PLACEHOLDER: &str = "~";
 /// through URL-like rendering, so the needle is literal
 /// `principal_token=` followed by the token characters.
 pub const PRINCIPAL_TOKEN_PLACEHOLDER: &str = "principal_token=[REDACTED]";
+/// Replacement for a raw P051 broker lease token.
+pub const XCODE_LEASE_TOKEN_PLACEHOLDER: &str = "xcode-lease-[REDACTED]";
+/// Replacement value for token-like `key=value` log fragments.
+pub const TOKEN_VALUE_PLACEHOLDER: &str = "[REDACTED]";
 /// Stable replacement for the packaged control-plane SQLite path. §9.2
 /// mandates that the on-disk path never appears in logs — neither
 /// absolute (`/Users/op/Library/…/control-plane.db`) nor home-relative
@@ -70,6 +78,8 @@ pub const DB_PATH_PLACEHOLDER: &str = "<CHAINWORKS_DB>";
 pub fn redact_message(raw: &str, home: &str) -> String {
     let mut out = redact_bearer(raw);
     out = redact_principal_token(&out);
+    out = redact_xcode_lease_token(&out);
+    out = redact_token_assignments(&out);
     out = redact_db_path(&out, home);
     if !home.is_empty() {
         out = out.replace(home, HOME_PLACEHOLDER);
@@ -118,6 +128,80 @@ fn ascii_case_insensitive_prefix(haystack: &[u8], needle: &[u8]) -> bool {
         }
     }
     true
+}
+
+fn redact_xcode_lease_token(input: &str) -> String {
+    redact_prefixed_secret(input, "xcode-lease-", XCODE_LEASE_TOKEN_PLACEHOLDER)
+}
+
+fn redact_token_assignments(input: &str) -> String {
+    let mut out = input.to_string();
+    for key in ["token=", "access_token=", "bearer_token=", "authorization="] {
+        out = redact_key_value_secret(&out, key);
+    }
+    out
+}
+
+fn redact_key_value_secret(input: &str, key: &str) -> String {
+    let bytes = input.as_bytes();
+    let key_bytes = key.as_bytes();
+    let replacement = format!("{key}{TOKEN_VALUE_PLACEHOLDER}");
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_key_boundary(bytes, i) && ascii_case_insensitive_prefix(&bytes[i..], key_bytes) {
+            out.push_str(&replacement);
+            i += key_bytes.len();
+
+            if input[i..].starts_with(BEARER_PLACEHOLDER) {
+                i += BEARER_PLACEHOLDER.len();
+            } else if input[i..].starts_with(XCODE_LEASE_TOKEN_PLACEHOLDER) {
+                i += XCODE_LEASE_TOKEN_PLACEHOLDER.len();
+            } else {
+                while i < bytes.len() && !is_secret_boundary(bytes[i]) {
+                    i += 1;
+                }
+            }
+        } else {
+            let c = input[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+fn redact_prefixed_secret(input: &str, prefix: &str, replacement: &str) -> String {
+    let bytes = input.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if ascii_case_insensitive_prefix(&bytes[i..], prefix_bytes) {
+            out.push_str(replacement);
+            i += prefix_bytes.len();
+            while i < bytes.len() && !is_secret_boundary(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            let c = input[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+fn is_secret_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'&' | b',' | b'"' | b'\'' | b']' | b'}')
+}
+
+fn is_key_boundary(bytes: &[u8], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let previous = bytes[index - 1];
+    !previous.is_ascii_alphanumeric() && previous != b'_'
 }
 
 /// Collapse the packaged control-plane DB path — whether written as an
@@ -385,10 +469,34 @@ fn contains_secret(s: &str, home: &str) -> bool {
     if ascii_contains_bearer(s) {
         return true;
     }
+    if ascii_contains_case_insensitive(s, "xcode-lease-")
+        || ascii_contains_key_assignment(s, "token=")
+        || ascii_contains_key_assignment(s, "access_token=")
+        || ascii_contains_key_assignment(s, "bearer_token=")
+        || ascii_contains_key_assignment(s, "authorization=")
+    {
+        return true;
+    }
     if !home.is_empty() && s.contains(home) {
         return true;
     }
     false
+}
+
+#[cfg(debug_assertions)]
+fn ascii_contains_case_insensitive(s: &str, needle: &str) -> bool {
+    let bytes = s.as_bytes();
+    let needle = needle.as_bytes();
+    (0..bytes.len()).any(|start| ascii_case_insensitive_prefix(&bytes[start..], needle))
+}
+
+#[cfg(debug_assertions)]
+fn ascii_contains_key_assignment(s: &str, key: &str) -> bool {
+    let bytes = s.as_bytes();
+    let key = key.as_bytes();
+    (0..bytes.len()).any(|start| {
+        is_key_boundary(bytes, start) && ascii_case_insensitive_prefix(&bytes[start..], key)
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -450,7 +558,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            format!("token={BEARER_PLACEHOLDER} path=~/Library/Logs/x.log")
+            format!("token={TOKEN_VALUE_PLACEHOLDER} path=~/Library/Logs/x.log")
         );
     }
 
@@ -497,6 +605,38 @@ mod tests {
         // must pass through unchanged.
         let out = redact_message("my_principal_token_field was used", "");
         assert_eq!(out, "my_principal_token_field was used");
+    }
+
+    #[test]
+    fn redact_message_strips_xcode_lease_tokens() {
+        let out = redact_message(
+            "lease xcode-lease-abc123 next token=xcode-lease-def456&mode=stream",
+            "",
+        );
+        assert!(!out.contains("abc123"));
+        assert!(!out.contains("def456"));
+        assert_eq!(
+            out,
+            format!("lease {XCODE_LEASE_TOKEN_PLACEHOLDER} next token={TOKEN_VALUE_PLACEHOLDER}&mode=stream")
+        );
+    }
+
+    #[test]
+    fn redact_message_strips_common_token_assignments() {
+        let out = redact_message(
+            "access_token=raw-a bearer_token=raw-b authorization=raw-c token=raw-d,next=yes",
+            "",
+        );
+        assert!(!out.contains("raw-a"));
+        assert!(!out.contains("raw-b"));
+        assert!(!out.contains("raw-c"));
+        assert!(!out.contains("raw-d"));
+        assert_eq!(
+            out,
+            format!(
+                "access_token={TOKEN_VALUE_PLACEHOLDER} bearer_token={TOKEN_VALUE_PLACEHOLDER} authorization={TOKEN_VALUE_PLACEHOLDER} token={TOKEN_VALUE_PLACEHOLDER},next=yes"
+            )
+        );
     }
 
     #[test]
@@ -583,6 +723,14 @@ mod tests {
         // replaces it with `Bearer [REDACTED]`, and the only cost is a
         // stray placeholder in harmless prose. Secrets never leak.
         assert!(ascii_contains_bearer("bearer token"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_visitor_flags_xcode_broker_tokens() {
+        assert!(contains_secret("xcode-lease-raw-value", ""));
+        assert!(contains_secret("callback?access_token=raw", ""));
+        assert!(contains_secret("authorization=raw", ""));
     }
 
     #[cfg(debug_assertions)]
