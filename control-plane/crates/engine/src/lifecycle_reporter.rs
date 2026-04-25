@@ -278,6 +278,12 @@ mod tests {
         let (reporter, mut rx) = make();
         let health = XcodeBrokerHealthSnapshot {
             state: domain::lifecycle::XcodeBrokerHealthState::Healthy,
+            reason_code: "healthy".to_string(),
+            can_acquire_new_xcode_leases: true,
+            active_lease_count: 1,
+            initialize_queue_depth: 0,
+            last_transition_at: "2026-04-18T10:00:00Z".to_string(),
+            operator_message: "Xcode broker healthy".to_string(),
             pool_id: "local-xcode-mcp-pool".to_string(),
             active_leases: 1,
             queued_leases: 0,

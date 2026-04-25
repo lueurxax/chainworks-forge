@@ -925,6 +925,78 @@ sys.exit(0)
         std::fs::set_permissions(&script, p).unwrap();
         script.to_string_lossy().into_owned()
     }
+
+    /// Like `create_broker_attach_session_script`, but keeps the session
+    /// process alive during `session/close` until the test creates
+    /// `allow_close_path`.
+    pub fn create_broker_attach_blocking_close_script(
+        tmpdir: &std::path::Path,
+        close_seen_path: &std::path::Path,
+        allow_close_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_broker_attach_blocking_close.py");
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, pathlib, time
+
+close_seen_path = pathlib.Path({close_seen_path:?})
+allow_close_path = pathlib.Path({allow_close_path:?})
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{
+    "jsonrpc": "2.0",
+    "id": msg["id"],
+    "result": {{
+        "protocolVersion": 1,
+        "serverInfo": {{"name": "broker-attach-blocking-close", "version": "0.0.1"}},
+        "mcpCapabilities": {{"http": True}}
+    }}
+}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-" + str(msg["id"])
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+
+msg = recv()
+if msg is not None and msg.get("method") == "session/close":
+    with close_seen_path.open("a") as f:
+        f.write(session_id + "\n")
+    while not allow_close_path.exists():
+        time.sleep(0.02)
+
+sys.exit(0)
+"#,
+            close_seen_path = close_seen_path.to_string_lossy(),
+            allow_close_path = allow_close_path.to_string_lossy(),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(unix)]
@@ -2310,15 +2382,19 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps({
         "jsonrpc": "2.0",
         "id": request.get("id"),
-        "result": {
-            "received_id": request.get("id"),
-            "method": request.get("method"),
-            "home": os.environ.get("HOME"),
-            "tmpdir": os.environ.get("TMPDIR"),
-            "developer_dir": os.environ.get("DEVELOPER_DIR"),
-            "xcode_pid": os.environ.get("CHAINWORKS_XCODE_PID")
-        }
-    }) + "\n")
+            "result": {
+                "received_id": request.get("id"),
+                "method": request.get("method"),
+                "home": os.environ.get("HOME"),
+                "tmpdir": os.environ.get("TMPDIR"),
+                "developer_dir": os.environ.get("DEVELOPER_DIR"),
+                "user": os.environ.get("USER"),
+                "logname": os.environ.get("LOGNAME"),
+                "path": os.environ.get("PATH"),
+                "mcp_xcode_pid": os.environ.get("MCP_XCODE_PID"),
+                "chainworks_env": sorted([key for key in os.environ if key.startswith("CHAINWORKS_")])
+            }
+        }) + "\n")
     sys.stdout.flush()
 "#;
     std::fs::write(&backend_script, code).unwrap();
@@ -2387,7 +2463,20 @@ for line in sys.stdin:
         initialize["result"]["developer_dir"],
         "/Applications/Xcode.app/Contents/Developer"
     );
-    assert_eq!(initialize["result"]["xcode_pid"], "4242");
+    assert_eq!(initialize["result"]["mcp_xcode_pid"], "4242");
+    assert_eq!(initialize["result"]["user"], "gui");
+    assert_eq!(initialize["result"]["logname"], "gui");
+    assert_eq!(
+        initialize["result"]["path"],
+        "/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Xcode.app/Contents/Developer/usr/bin"
+    );
+    assert_eq!(
+        initialize["result"]["chainworks_env"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 
     let tools = pool
         .forward_json_rpc_request(
@@ -3240,6 +3329,118 @@ async fn runtime_manager_attaches_brokered_xcode_http_lease_before_session_new()
 
 #[cfg(unix)]
 #[tokio::test]
+async fn runtime_manager_close_all_sessions_releases_brokered_xcode_leases_before_blocked_close() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::{
+        AcpMcpServerPayload, AcpRuntimeManager, BrokeredXcodeLeaseAttachment, ExecutionRequest,
+        ResolvedMcpServerTransport, XcodeBrokerLeaseAttacher,
+    };
+    use domain::agent::AgentStatus;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct RecordingLeaseAttacher {
+        released: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeBrokerLeaseAttacher for RecordingLeaseAttacher {
+        async fn attach_brokered_xcode_leases(
+            &self,
+            req: &ExecutionRequest,
+        ) -> anyhow::Result<BrokeredXcodeLeaseAttachment> {
+            let generation_id = req
+                .session_generation_id
+                .as_deref()
+                .unwrap_or("missing-generation");
+            let lease_id = format!("lease-{generation_id}");
+            let mut attached = req.clone();
+            for server in &mut attached.mcp_servers {
+                if let ResolvedMcpServerTransport::XcodeBrokerIntent { intent } = &server.transport
+                {
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "Authorization".to_string(),
+                        format!("Bearer token-{generation_id}"),
+                    );
+                    *server = AcpMcpServerPayload {
+                        id: intent.runtime_id.clone(),
+                        extension_id: intent.extension_id.clone(),
+                        transport: ResolvedMcpServerTransport::Http {
+                            url: format!("http://127.0.0.1:8123/xcode-mcp/{lease_id}"),
+                            headers,
+                        },
+                    };
+                }
+            }
+            Ok(BrokeredXcodeLeaseAttachment {
+                request: attached,
+                lease_ids: vec![lease_id],
+            })
+        }
+
+        async fn release_brokered_xcode_leases(&self, lease_ids: &[String]) -> anyhow::Result<()> {
+            self.released.lock().await.extend_from_slice(lease_ids);
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let close_seen = tmp.path().join("close-seen.txt");
+    let allow_close = tmp.path().join("allow-close.txt");
+    let script =
+        fixture::create_broker_attach_blocking_close_script(tmp.path(), &close_seen, &allow_close);
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script));
+    let manager = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let released = Arc::new(Mutex::new(Vec::new()));
+    manager.set_xcode_broker_lease_attacher(Arc::new(RecordingLeaseAttacher {
+        released: Arc::clone(&released),
+    }));
+
+    for generation_id in ["generation-a", "generation-b"] {
+        let mut req = brokered_xcode_request(&tmp, "claude");
+        req.keep_session_alive = true;
+        req.session_generation_id = Some(generation_id.to_string());
+        let result = manager.start_session(req).await.unwrap();
+        assert_eq!(result.status, AgentStatus::Completed);
+        assert_eq!(result.session_generation_id.as_deref(), Some(generation_id));
+    }
+
+    let close_task = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.close_all_sessions().await })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut released_ids = released.lock().await.clone();
+            released_ids.sort();
+            if released_ids == ["lease-generation-a", "lease-generation-b"] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("close_all_sessions should release leases before blocked session close completes");
+    assert!(
+        !close_task.is_finished(),
+        "session close should still be blocked while leases are already released"
+    );
+
+    std::fs::write(&allow_close, "ok").unwrap();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), close_task)
+        .await
+        .expect("close_all_sessions should finish after close unblocks")
+        .expect("close task should not panic");
+    assert_eq!(closed, 2);
+    let close_lines = std::fs::read_to_string(close_seen).unwrap();
+    assert_eq!(close_lines.lines().count(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn unsupported_brokered_xcode_provider_fails_before_probe_spawn() {
     use acp::adapters::auggie::AuggieAdapter;
     use acp::adapters::AcpAdapter;
@@ -3652,7 +3853,7 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
     assert_eq!(result.pre_prompt_expected_outputs[0].attempt_number, 2);
     assert_eq!(
         result.pre_prompt_expected_outputs[0].agent_execution_id,
-        "agent-exec-typed"
+        agent_execution_id.to_string()
     );
     assert_eq!(
         result.pre_prompt_expected_outputs[0].stage_execution_id,

@@ -5,6 +5,7 @@ pub mod gemini;
 pub mod junie;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -94,10 +95,15 @@ impl XcodeShimGrantCleanup {
 
 impl AcpLaunchSpec {
     pub fn new(binary_path: impl Into<String>) -> Self {
+        let binary_path = binary_path.into();
+        let binary_path = resolve_binary_path(&binary_path)
+            .unwrap_or_else(|| PathBuf::from(&binary_path))
+            .to_string_lossy()
+            .into_owned();
         Self {
-            binary_path: binary_path.into(),
+            binary_path,
             args: Vec::new(),
-            env: Vec::new(),
+            env: vec![("PATH".to_string(), default_provider_path_value())],
             cleanup_paths: Vec::new(),
             xcode_shim_runtime: None,
             expected_capability_fingerprint: None,
@@ -111,6 +117,7 @@ impl AcpLaunchSpec {
 
     pub fn with_envs(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
+        ensure_default_path_env(&mut self.env);
         self
     }
 
@@ -289,14 +296,65 @@ fn resolve_binary_path(binary_path: &str) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    for dir in default_provider_path_dirs(std::env::var_os("PATH"), dirs::home_dir()) {
         let candidate = dir.join(binary_path);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     None
+}
+
+const DEFAULT_PROVIDER_BIN_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
+
+fn default_provider_path_value() -> String {
+    std::env::join_paths(default_provider_path_dirs(
+        std::env::var_os("PATH"),
+        dirs::home_dir(),
+    ))
+    .unwrap_or_else(|_| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+    .to_string_lossy()
+    .into_owned()
+}
+
+fn default_provider_path_dirs(
+    path_var: Option<OsString>,
+    home_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path_var) = path_var {
+        dirs.extend(std::env::split_paths(&path_var));
+    }
+    if let Some(home_dir) = home_dir {
+        dirs.push(home_dir.join(".local/bin"));
+        dirs.push(home_dir.join(".cargo/bin"));
+    }
+    dirs.extend(DEFAULT_PROVIDER_BIN_DIRS.iter().map(PathBuf::from));
+
+    let mut unique = Vec::new();
+    for dir in dirs {
+        if dir.as_os_str().is_empty() || unique.iter().any(|seen| seen == &dir) {
+            continue;
+        }
+        unique.push(dir);
+    }
+    unique
+}
+
+fn ensure_default_path_env(env: &mut Vec<(String, String)>) {
+    if env.iter().any(|(name, _)| name == "PATH") {
+        return;
+    }
+    env.push(("PATH".to_string(), default_provider_path_value()));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -822,8 +880,8 @@ fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpLaunchSpec, ProbeKey, ProviderCapabilities, ProviderCapabilityCache,
-        XcodeShimLaunchRuntime,
+        default_provider_path_dirs, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
+        ProviderCapabilityCache, XcodeShimLaunchRuntime,
     };
     use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
     use std::sync::{Arc, Mutex};
@@ -917,6 +975,46 @@ mod tests {
             err.to_string()
                 .contains("provider_launch_spec_capability_drift"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn launch_spec_default_path_keeps_xcode_shim_attachment_fingerprint_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("provider-acp");
+        std::fs::write(&binary, "fixture").unwrap();
+
+        let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());
+        spec.record_capability_fingerprint(Some("profile-a"), None);
+
+        spec.env.push((
+            "CHAINWORKS_XCODE_SHIM_DIR".to_string(),
+            "/tmp/cw-shim".to_string(),
+        ));
+        super::prepend_path_env(&mut spec.env, "/tmp/cw-shim");
+
+        spec.verify_capability_fingerprint()
+            .expect("shim-only PATH prefix must not invalidate capability fingerprint");
+    }
+
+    #[test]
+    fn provider_path_adds_interactive_tool_dirs_to_launchd_path() {
+        let dirs = default_provider_path_dirs(
+            Some(std::ffi::OsString::from("/usr/bin:/bin:/usr/bin")),
+            Some(std::path::PathBuf::from("/Users/operator")),
+        );
+
+        assert_eq!(dirs[0], std::path::PathBuf::from("/usr/bin"));
+        assert_eq!(dirs[1], std::path::PathBuf::from("/bin"));
+        assert!(dirs.contains(&std::path::PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/usr/local/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/Users/operator/.local/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/Users/operator/.cargo/bin")));
+        assert_eq!(
+            dirs.iter()
+                .filter(|dir| dir.as_path() == std::path::Path::new("/usr/bin"))
+                .count(),
+            1
         );
     }
 

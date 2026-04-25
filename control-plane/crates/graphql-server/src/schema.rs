@@ -511,6 +511,12 @@ impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
 #[derive(SimpleObject, Clone)]
 pub struct GqlXcodeBrokerHealthSnapshot {
     pub state: GqlXcodeBrokerHealthState,
+    pub reason_code: String,
+    pub can_acquire_new_xcode_leases: bool,
+    pub active_lease_count: i32,
+    pub initialize_queue_depth: i32,
+    pub last_transition_at: String,
+    pub operator_message: String,
     pub pool_id: String,
     pub active_leases: i32,
     pub queued_leases: i32,
@@ -525,6 +531,12 @@ impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealth
     fn from(s: domain::lifecycle::XcodeBrokerHealthSnapshot) -> Self {
         Self {
             state: s.state.into(),
+            reason_code: s.reason_code,
+            can_acquire_new_xcode_leases: s.can_acquire_new_xcode_leases,
+            active_lease_count: s.active_lease_count as i32,
+            initialize_queue_depth: s.initialize_queue_depth as i32,
+            last_transition_at: s.last_transition_at,
+            operator_message: s.operator_message,
             pool_id: s.pool_id,
             active_leases: s.active_leases as i32,
             queued_leases: s.queued_leases as i32,
@@ -614,7 +626,10 @@ fn attach_p031_artifact_payload(
     }
 
     let Some(run) = run else {
-        mark_payload_unavailable(artifact, "Run metadata was unavailable for artifact readback");
+        mark_payload_unavailable(
+            artifact,
+            "Run metadata was unavailable for artifact readback",
+        );
         return;
     };
 
@@ -3372,6 +3387,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_031_artifact_payload_text_is_server_owned_readback() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let artifact_root =
+            std::env::temp_dir().join(format!("p031-artifact-payload-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let artifact_path = artifact_root.join("proposal.md");
+        fs::write(&artifact_path, "# Proposal\n\nGraphQL payload").unwrap();
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "proposal".into(),
+                agent_id: "proposal_writer".into(),
+                name: "proposal.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: artifact_path.to_string_lossy().into_owned(),
+                checksum_sha256: None,
+                size_bytes: Some(24),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactPayloadReadback {{
+                      artifacts(runId: "{run_id}") {{
+                        id
+                        format
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        payloadText
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 artifact payload readback query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifacts"][0];
+        assert_eq!(artifact["id"], serde_json::json!(artifact_id.to_string()));
+        assert_eq!(artifact["format"], serde_json::json!("markdown"));
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("available")
+        );
+        assert!(artifact["payloadUnavailableReasonCode"].is_null());
+        assert_eq!(
+            artifact["payloadText"],
+            serde_json::json!("# Proposal\n\nGraphQL payload")
+        );
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
     async fn proposal_031_diagnostic_metadata_is_operator_only() {
         let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
@@ -4591,6 +4697,24 @@ mod tests {
         let reporter = LifecycleReporter::new(14, "cafe-babe", bus.clone());
         reporter.set_state(domain::lifecycle::DaemonLifecycleState::Starting);
         reporter.set_state(domain::lifecycle::DaemonLifecycleState::Ready);
+        reporter.set_xcode_broker_health(domain::lifecycle::XcodeBrokerHealthSnapshot {
+            state: domain::lifecycle::XcodeBrokerHealthState::Degraded,
+            reason_code: "xcode_mcp_capacity_backpressure".to_string(),
+            can_acquire_new_xcode_leases: false,
+            active_lease_count: 2,
+            initialize_queue_depth: 8,
+            last_transition_at: "2026-04-25T09:00:00Z".to_string(),
+            operator_message: "Xcode MCP bridge pool is applying capacity backpressure."
+                .to_string(),
+            pool_id: "pool-test".to_string(),
+            active_leases: 2,
+            queued_leases: 8,
+            max_active_leases: 2,
+            max_queued_leases: 8,
+            broker_disabled: false,
+            backend_available: true,
+            observation_persistence_failures: 0,
+        });
 
         let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
             .data(pool.clone())
@@ -4606,6 +4730,13 @@ mod tests {
                       daemonStatus {
                         state schemaVersion binarySchemaVersion buildSha
                         pid lastStateChangeAt json
+                        xcodeBrokerHealth {
+                          state reasonCode canAcquireNewXcodeLeases
+                          activeLeaseCount initializeQueueDepth lastTransitionAt
+                          operatorMessage poolId activeLeases queuedLeases
+                          maxActiveLeases maxQueuedLeases brokerDisabled
+                          backendAvailable observationPersistenceFailures
+                        }
                       }
                     }"#,
                 )
@@ -4622,11 +4753,38 @@ mod tests {
         assert_eq!(data["daemonStatus"]["state"], "READY");
         assert_eq!(data["daemonStatus"]["binarySchemaVersion"], 14);
         assert_eq!(data["daemonStatus"]["buildSha"], "cafe-babe");
+        let health = &data["daemonStatus"]["xcodeBrokerHealth"];
+        assert_eq!(health["state"], "DEGRADED");
+        assert_eq!(health["reasonCode"], "xcode_mcp_capacity_backpressure");
+        assert_eq!(health["canAcquireNewXcodeLeases"], false);
+        assert_eq!(health["activeLeaseCount"], 2);
+        assert_eq!(health["initializeQueueDepth"], 8);
+        assert_eq!(health["lastTransitionAt"], "2026-04-25T09:00:00Z");
+        assert_eq!(
+            health["operatorMessage"],
+            "Xcode MCP bridge pool is applying capacity backpressure."
+        );
+        assert_eq!(health["poolId"], "pool-test");
+        assert_eq!(health["activeLeases"], 2);
+        assert_eq!(health["queuedLeases"], 8);
+        assert_eq!(health["maxActiveLeases"], 2);
+        assert_eq!(health["maxQueuedLeases"], 8);
+        assert_eq!(health["brokerDisabled"], false);
+        assert_eq!(health["backendAvailable"], true);
+        assert_eq!(health["observationPersistenceFailures"], 0);
         // The json field carries the full P042 §5.2 wire shape (snake_case).
         let json_str = data["daemonStatus"]["json"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(parsed["state"], "ready");
         assert_eq!(parsed["binary_schema_version"], 14);
+        assert_eq!(
+            parsed["xcode_broker_health"]["reason_code"],
+            "xcode_mcp_capacity_backpressure"
+        );
+        assert_eq!(
+            parsed["xcode_broker_health"]["can_acquire_new_xcode_leases"],
+            false
+        );
     }
 
     #[tokio::test]

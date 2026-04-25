@@ -4,9 +4,11 @@ Date: 2026-04-25
 
 Purpose: record the upstream readiness posture required by P051 before treating the shared Xcode MCP bridge pool as schedulable/closeable. This audit is based on current reference docs and registered gates; it does not rerun the dependency gates.
 
+Repo-local convention prefers current `docs/reference/` truth over old proposal lineage. Historical `docs/proposals/025-*` and `docs/proposals/026-*` files are not checked in, but the implemented references and gate registrations below are present and are the dependency evidence used for P051 fixture/readback closeout.
+
 ## Summary
 
-P051 scaffold can proceed on the current documentation/gate posture. P026 and P029 have registered gates and stable reference coverage sufficient for P051 fixture work. No dependency row below is a current scheduling blocker for fixture-level P051 closeout.
+P051 scaffold can proceed on the current documentation/gate posture. P025, P026, and P029 have registered gates and stable reference coverage sufficient for P051 fixture work. No dependency row below is a current scheduling blocker for fixture-level P051 closeout.
 
 Pre-ship P051 remains blocked by live dogfood/sign-off, tracked separately in [dogfood-signoff.md](dogfood-signoff.md).
 
@@ -22,6 +24,7 @@ Pre-ship P051 remains blocked by live dogfood/sign-off, tracked separately in [d
 
 ## Gate Posture Notes
 
-- P026 and P029 are the only P051 hard scheduling prerequisites named by the proposal. Current docs/gates show both are implemented enough for scaffold closeout.
+- P025/P026 historical proposal-lineage files are absent, but their implemented references and gate registrations are present.
+- P026 and P029 remain the most direct P051 runtime prerequisites; current docs/gates show both are implemented enough for scaffold closeout.
 - P025, P037, and P049 remain compatibility dependencies, not current sequential blockers.
 - This artifact is not dogfood proof and does not claim operator sign-off.

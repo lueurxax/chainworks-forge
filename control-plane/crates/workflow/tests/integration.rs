@@ -367,6 +367,37 @@ agents:
 }
 
 #[test]
+fn p051_catalog_lint_allows_proposal_non_consuming_xcrun_flags() {
+    compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    required_tools:
+      - xcrun --verbose --log simctl list devices
+      - xcrun --no-cache --kill-cache xcodebuild -version
+      - xcrun --show-sdk-platform-path --sdk iphoneos
+      - xcrun -l swift --version
+      - xcrun --help
+      - xcrun -h
+      - xcrun --version
+"#,
+    );
+}
+
+#[test]
 fn p051_workflow_run_task_sets_xcode_signals_for_invoked_agent() {
     let plan = compile_from_strings(
         r#"

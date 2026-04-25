@@ -30,6 +30,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -218,6 +219,11 @@ const HANDSHAKE_TIMEOUT: Duration = DEFAULT_HANDSHAKE_TIMEOUT;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
+
+enum AcpPromptReadOutcome {
+    Read(std::result::Result<Result<usize>, tokio::time::error::Elapsed>),
+    CloseRequested,
+}
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
 const OUTPUT_END_MARKER: &str = "<<<END_CHAINWORKS_OUTPUT>>>";
@@ -1464,6 +1470,55 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
+        self.prompt_with_optional_close_signal(req, None).await
+    }
+
+    pub async fn prompt_with_close_signal(
+        &mut self,
+        req: &ExecutionRequest,
+        close_rx: &mut watch::Receiver<bool>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
+        self.prompt_with_optional_close_signal(req, Some(close_rx))
+            .await
+    }
+
+    async fn prompt_with_optional_close_signal(
+        &mut self,
+        req: &ExecutionRequest,
+        mut close_rx: Option<&mut watch::Receiver<bool>>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
         let typed_expected_outputs = !req.expected_outputs.is_empty();
         let expected_baseline_paths: Vec<&str> = if typed_expected_outputs {
             Vec::new()
@@ -1579,18 +1634,41 @@ impl AcpTransportSession {
             let remaining = IDLE_TIMEOUT - idle;
 
             line.clear();
-            let n = timeout(
-                remaining,
-                read_capped_ndjson_line(
-                    &mut self.reader,
-                    &mut line,
-                    ndjson_line_cap_bytes(&req.expected_outputs),
-                    "ACP prompt stream read_line",
-                ),
-            )
-            .await
-            .context("ACP session idle timeout — no message received")?
-            .context("ACP prompt stream read_line error")?;
+            let read_outcome = {
+                let read_line = timeout(
+                    remaining,
+                    read_capped_ndjson_line(
+                        &mut self.reader,
+                        &mut line,
+                        ndjson_line_cap_bytes(&req.expected_outputs),
+                        "ACP prompt stream read_line",
+                    ),
+                );
+                match close_rx.as_deref_mut() {
+                    Some(close_rx) => {
+                        if *close_rx.borrow() {
+                            AcpPromptReadOutcome::CloseRequested
+                        } else {
+                            tokio::select! {
+                                _ = close_rx.changed() => AcpPromptReadOutcome::CloseRequested,
+                                result = read_line => AcpPromptReadOutcome::Read(result),
+                            }
+                        }
+                    }
+                    None => AcpPromptReadOutcome::Read(read_line.await),
+                }
+            };
+
+            let n = match read_outcome {
+                AcpPromptReadOutcome::CloseRequested => {
+                    let session_id = self.session_id.clone();
+                    let _ = self.close().await;
+                    bail!("ACP session closed during active prompt (session={session_id})");
+                }
+                AcpPromptReadOutcome::Read(result) => result
+                    .context("ACP session idle timeout — no message received")?
+                    .context("ACP prompt stream read_line error")?,
+            };
 
             if n == 0 {
                 bail!(

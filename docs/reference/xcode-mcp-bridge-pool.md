@@ -50,7 +50,7 @@ The daemon creates one `XcodeMcpBridgePool` after SQLite preflight and listener 
 
 The pool base URL uses the same bound daemon port as GraphQL/MCP. `CHAINWORKS_XCODE_BROKER_DISABLED=1` disables lease acquisition and records a fail-closed observation instead of falling back to direct stdio `mcpbridge`.
 
-Broker health is subsystem health, not global daemon readiness. The snapshot includes active and queued lease counts, capacity, rollback disabled state, backend availability, and observation persistence failure count. Missing broker backend is `Failed`; queue pressure, capacity saturation, or any observation append failure is `Degraded`.
+Broker health is subsystem health, not global daemon readiness. The snapshot includes reason code, lease-acquisition availability, active and queued lease counts, capacity, last transition time, operator message, rollback disabled state, backend availability, and observation persistence failure count. Missing broker backend is `Failed`; queue pressure, capacity saturation, or any observation append failure is `Degraded`.
 
 ## Lease And Backend Semantics
 
@@ -63,6 +63,7 @@ Implemented behavior:
 - requests over capacity fail or wait within the configured queue timeout,
 - backend initialization is serialized for a target Xcode process,
 - sibling leases remain isolated by lease token and broker MCP policy,
+- shutdown drains broker lease cleanup before waiting on provider session close,
 - backend failures, first-connect timeouts, target ambiguity, capacity exhaustion, disabled broker state, and policy denials emit typed observations.
 
 Provider sessions do not receive host-home access for their ordinary runtime state. Host Xcode work is routed through the broker/shim boundary.
@@ -87,7 +88,9 @@ Observation data includes:
 - shim invocation and warning events,
 - storage truncation/drop counters.
 
-The domain model owns typed observation shape and redaction. The DB repository owns transactional append/update. The engine injects the observation sink into ACP so ACP does not depend on DB.
+The domain model owns typed observation shape and redaction. The DB repository owns transactional append/update. The engine injects the observation sink into ACP so ACP does not depend on DB. After a successful late append, the sink publishes the existing stage-status invalidation event with the current stage status so GraphQL subscribers re-read the stage and agent execution rows from DB; MCP report readback sees the same persisted observation on the next pull.
+
+If observation persistence fails, the broker increments its subsystem failure count, emits an error-level trace with metric marker `xcode_observation_persist_failed_total` and warning marker `observation_persistence_degraded`, and degrades broker health. It does not recursively try to append a warning through the same failed observation sink.
 
 ## Readback Surfaces
 

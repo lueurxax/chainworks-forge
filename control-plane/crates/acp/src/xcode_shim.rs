@@ -977,6 +977,10 @@ fn host_executor_invocation(
             idx += 1;
             continue;
         }
+        if is_xcrun_non_consuming_flag(token) {
+            idx += 1;
+            continue;
+        }
         if matches!(token, "--run" | "-r") {
             return host_executor_xcrun_tool(args, idx + 1, idx + 2);
         }
@@ -1200,11 +1204,15 @@ fn evaluate_xcrun(args: &[String]) -> (XcodeShimRouteDecision, Option<String>) {
             idx += 1;
             continue;
         }
-        if matches!(
-            token,
-            "--show-sdk-path" | "--show-sdk-version" | "--show-sdk-build-version"
-        ) {
+        if token.starts_with("--show-sdk-") {
             return (XcodeShimRouteDecision::XcrunPassthrough, None);
+        }
+        if is_xcrun_non_consuming_flag(token) {
+            idx += 1;
+            if idx == args.len() {
+                return (XcodeShimRouteDecision::XcrunPassthrough, None);
+            }
+            continue;
         }
         if matches!(token, "--find" | "-f") {
             let Some(tool) = args.get(idx + 1).map(|tool| basename(tool)) else {
@@ -1267,6 +1275,19 @@ fn evaluate_xcrun(args: &[String]) -> (XcodeShimRouteDecision, Option<String>) {
 
 fn is_guarded_tool(tool: &str) -> bool {
     matches!(tool, "xcodebuild" | "simctl" | "mcpbridge" | "xcrun")
+}
+
+fn is_xcrun_non_consuming_flag(token: &str) -> bool {
+    matches!(
+        token,
+        "-l" | "--log"
+            | "--verbose"
+            | "--no-cache"
+            | "--kill-cache"
+            | "--help"
+            | "-h"
+            | "--version"
+    )
 }
 
 fn is_host_executor_tool(tool: &str) -> bool {
@@ -1565,11 +1586,33 @@ mod tests {
                 XcodeShimRouteDecision::XcrunPassthrough,
             ),
             (
+                args(&["--show-sdk-platform-path", "--sdk", "iphoneos"]),
+                XcodeShimRouteDecision::XcrunPassthrough,
+            ),
+            (
                 args(&["--find", "swift"]),
                 XcodeShimRouteDecision::XcrunPassthrough,
             ),
             (
                 args(&["--", "swift", "--version"]),
+                XcodeShimRouteDecision::XcrunPassthrough,
+            ),
+            (
+                args(&["--verbose", "--log", "simctl", "list", "devices"]),
+                XcodeShimRouteDecision::HostExecutor,
+            ),
+            (
+                args(&["--no-cache", "--kill-cache", "xcodebuild", "-version"]),
+                XcodeShimRouteDecision::HostExecutor,
+            ),
+            (
+                args(&["-l", "swift", "--version"]),
+                XcodeShimRouteDecision::XcrunPassthrough,
+            ),
+            (args(&["--help"]), XcodeShimRouteDecision::XcrunPassthrough),
+            (args(&["-h"]), XcodeShimRouteDecision::XcrunPassthrough),
+            (
+                args(&["--version"]),
                 XcodeShimRouteDecision::XcrunPassthrough,
             ),
         ] {

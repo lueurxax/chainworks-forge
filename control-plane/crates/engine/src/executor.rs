@@ -67,6 +67,7 @@ use crate::work_queue::WorkQueue;
 
 struct DbXcodeRuntimeObservationSink {
     pool: SqlitePool,
+    events: EventSender,
 }
 
 #[async_trait::async_trait]
@@ -77,7 +78,63 @@ impl acp::XcodeRuntimeObservationSink for DbXcodeRuntimeObservationSink {
         update: domain::xcode_runtime::XcodeRuntimeObservationUpdate,
     ) -> Result<()> {
         agent_executions::append_xcode_runtime_observation(&self.pool, agent_execution_id, update)
-            .await
+            .await?;
+        self.publish_xcode_runtime_observation_append(agent_execution_id)
+            .await;
+        Ok(())
+    }
+}
+
+impl DbXcodeRuntimeObservationSink {
+    async fn publish_xcode_runtime_observation_append(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+    ) {
+        let execution = match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
+            Ok(Some(execution)) => execution,
+            Ok(None) => {
+                warn!(
+                    agent_execution_id = %agent_execution_id,
+                    "Xcode runtime observation append notification skipped: agent execution missing"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    agent_execution_id = %agent_execution_id,
+                    error = %error,
+                    "Xcode runtime observation append notification skipped: agent execution lookup failed"
+                );
+                return;
+            }
+        };
+        let stage = match stages::find_by_id(&self.pool, execution.stage_execution_id).await {
+            Ok(Some(stage)) => stage,
+            Ok(None) => {
+                warn!(
+                    agent_execution_id = %agent_execution_id,
+                    stage_execution_id = %execution.stage_execution_id,
+                    "Xcode runtime observation append notification skipped: stage missing"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    agent_execution_id = %agent_execution_id,
+                    stage_execution_id = %execution.stage_execution_id,
+                    error = %error,
+                    "Xcode runtime observation append notification skipped: stage lookup failed"
+                );
+                return;
+            }
+        };
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::StageStatusChanged {
+                run_id: stage.run_id,
+                stage_execution_id: execution.stage_execution_id,
+                status: stage.status,
+            });
     }
 }
 
@@ -233,10 +290,9 @@ async fn claim_invoke_agent_work_item_with_start(
     item: WorkItem,
 ) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
     let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
-    if payload
-        .get("session_reuse_scope")
-        .and_then(|value| value.as_str())
-        .is_none()
+    if !payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("session_reuse_scope"))
     {
         work_items::fail(
             pool,
@@ -1895,6 +1951,7 @@ impl BackgroundExecutor {
     ) -> Self {
         acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
             pool: pool.clone(),
+            events: events.clone(),
         }));
         Self {
             pool,
@@ -1916,6 +1973,7 @@ impl BackgroundExecutor {
     ) -> Self {
         acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
             pool: pool.clone(),
+            events: events.clone(),
         }));
         Self {
             pool,
@@ -1991,7 +2049,7 @@ impl BackgroundExecutor {
     /// item was processed, `Ok(false)` if the queue was empty.
     /// Intended for test use — the production path uses `start()`.
     pub async fn process_next_item(&self) -> Result<bool> {
-        match self.work_queue.claim_next().await? {
+        match self.claim_next_processing_item().await? {
             Some(item) => {
                 let item_id = item.id.clone();
                 let kind = item.kind.clone();
@@ -2007,36 +2065,27 @@ impl BackgroundExecutor {
                     }
                 }
             }
-            None => {
-                match claim_next_invoke_agent_with_start_internal(
-                    &self.pool,
-                    &InvokeAgentCapacityConfig::unbounded(),
-                )
-                .await?
-                {
-                    Some((claimed, item)) => {
-                        let item_id = claimed.work_item_id.clone();
-                        match self.process_item(item).await {
-                            Ok(()) => {
-                                self.work_queue.complete(&item_id).await?;
-                                Ok(true)
-                            }
-                            Err(error) => {
-                                self.work_queue.fail(&item_id, &error.to_string()).await?;
-                                Err(error)
-                            }
-                        }
-                    }
-                    None => Ok(false),
-                }
-            }
+            None => Ok(false),
         }
+    }
+
+    async fn claim_next_processing_item(&self) -> Result<Option<WorkItem>> {
+        if let Some(item) = self.work_queue.claim_next().await? {
+            return Ok(Some(item));
+        }
+
+        Ok(claim_next_invoke_agent_with_start_internal(
+            &self.pool,
+            &InvokeAgentCapacityConfig::unbounded(),
+        )
+        .await?
+        .map(|(_, item)| item))
     }
 
     async fn run_loop(self: &Arc<Self>) {
         info!("BackgroundExecutor: starting work loop");
         loop {
-            match self.work_queue.claim_next().await {
+            match self.claim_next_processing_item().await {
                 Ok(Some(item)) => {
                     let item_id = item.id.clone();
                     let kind = item.kind.clone();

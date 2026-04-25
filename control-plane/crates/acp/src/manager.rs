@@ -243,12 +243,34 @@ impl AcpRuntimeManager {
         let session = opened.session;
         let session_req = opened.session_req;
         let lease_cleanup = opened.lease_cleanup;
+        let registered_generation_id = req.session_generation_id.clone();
+        if let Some(generation_id) = registered_generation_id.as_ref() {
+            self.live_sessions
+                .lock()
+                .await
+                .insert(generation_id.clone(), session.clone());
+            if let Some(cleanup) = lease_cleanup.clone() {
+                self.live_xcode_leases
+                    .lock()
+                    .await
+                    .insert(generation_id.clone(), cleanup);
+            }
+        }
 
         let mut result = match session.prompt(&session_req).await {
             Ok(result) => result,
             Err(err) => {
+                let cleanup = match registered_generation_id.as_ref() {
+                    Some(generation_id) => {
+                        self.live_xcode_leases.lock().await.remove(generation_id)
+                    }
+                    None => lease_cleanup,
+                };
+                if let Some(generation_id) = registered_generation_id.as_ref() {
+                    self.live_sessions.lock().await.remove(generation_id);
+                }
                 let _ = session.close().await;
-                self.release_xcode_leases(lease_cleanup).await;
+                self.release_xcode_leases(cleanup).await;
                 return Err(err);
             }
         };
@@ -256,16 +278,6 @@ impl AcpRuntimeManager {
             let generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!("keep_session_alive requested without session_generation_id")
             })?;
-            self.live_sessions
-                .lock()
-                .await
-                .insert(generation_id.clone(), session);
-            if let Some(cleanup) = lease_cleanup {
-                self.live_xcode_leases
-                    .lock()
-                    .await
-                    .insert(generation_id.clone(), cleanup);
-            }
             result.session_generation_id = Some(generation_id);
             result.reused_existing_session = false;
             self.record_xcode_prompt_observations(&session_req, &result)
@@ -273,8 +285,15 @@ impl AcpRuntimeManager {
             return Ok(result);
         }
 
+        let cleanup = match registered_generation_id.as_ref() {
+            Some(generation_id) => self.live_xcode_leases.lock().await.remove(generation_id),
+            None => lease_cleanup,
+        };
+        if let Some(generation_id) = registered_generation_id.as_ref() {
+            self.live_sessions.lock().await.remove(generation_id);
+        }
         let close_result = session.close().await;
-        self.release_xcode_leases(lease_cleanup).await;
+        self.release_xcode_leases(cleanup).await;
         close_result?;
         result.session_generation_id = None;
         result.reused_existing_session = false;
@@ -462,6 +481,13 @@ impl AcpRuntimeManager {
             let mut live_sessions = self.live_sessions.lock().await;
             std::mem::take(&mut *live_sessions)
         };
+        let lease_cleanups = {
+            let mut live_xcode_leases = self.live_xcode_leases.lock().await;
+            std::mem::take(&mut *live_xcode_leases)
+        };
+        for cleanup in lease_cleanups.into_values() {
+            self.release_xcode_leases(Some(cleanup)).await;
+        }
         let mut closed = 0;
         for (generation_id, session) in sessions {
             match session.close().await {

@@ -3738,6 +3738,7 @@ async fn mcp_resolution_persistence_tests() {
 #[tokio::test]
 async fn xcode_broker_fail_closed_observation_is_persisted_from_acp_sink() {
     use acp::AcpRuntimeManager;
+    use domain::events::DomainEvent;
     use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservation};
     use engine::executor::BackgroundExecutor;
     use engine::orchestrator::Orchestrator;
@@ -3771,6 +3772,7 @@ mcp:
     stages::insert(&pool, &stage).await.unwrap();
 
     let events = event_bus::new_bus(64);
+    let mut event_rx = events.subscribe();
     let work_queue = WorkQueue::new(pool.clone());
     let orchestrator = Arc::new(Orchestrator::new(
         pool.clone(),
@@ -3782,7 +3784,7 @@ mcp:
         work_queue.clone(),
         orchestrator,
         Arc::new(AcpRuntimeManager::new()),
-        events,
+        events.clone(),
     );
     work_queue
         .enqueue(
@@ -3816,6 +3818,23 @@ mcp:
         error.to_string().contains("provider_http_mcp_unsupported"),
         "unexpected error: {error:#}"
     );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match event_rx.recv().await.unwrap() {
+                DomainEvent::StageStatusChanged {
+                    run_id: observed_run_id,
+                    stage_execution_id: observed_stage_execution_id,
+                    status,
+                } if observed_run_id == run_id && observed_stage_execution_id == stage_exec_id => {
+                    assert_eq!(status, StageStatus::Running);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("late Xcode observation append should notify stage subscribers");
 
     let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
         .await

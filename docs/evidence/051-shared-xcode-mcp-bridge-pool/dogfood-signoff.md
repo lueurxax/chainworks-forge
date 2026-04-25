@@ -15,6 +15,7 @@ This artifact separates fixture/research evidence that exists from live dogfood 
 | P051 full fixture gate registration | Complete | `scripts/test-gate.sh`, `docs/reference/test-gates.md` |
 | Stable behavior reference | Complete | `docs/reference/xcode-mcp-bridge-pool.md` |
 | Dependency audit | Complete | `docs/evidence/051-shared-xcode-mcp-bridge-pool/dependency-audit.md` |
+| Targeted fixture security review | Complete | `docs/evidence/051-shared-xcode-mcp-bridge-pool/security-review.md` |
 
 ## Fixture/Static Gate Evidence
 
@@ -26,7 +27,8 @@ Required before claiming fixture readiness:
 Fresh local fixture/readback validation was recorded on 2026-04-25:
 
 - `./scripts/test-gate.sh proposal-051` passed.
-- Swift result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-051-swift-20260425-102233.xcresult`.
+- Latest Swift result bundle: `/var/folders/fj/v77kf6rs4dz1ybsm1_1_qhb00000gn/T/chainworks-test-gates/proposal-051-swift-20260425-122713.xcresult`.
+- The fixture gate is not live dogfood; it proves local broker/readback behavior and Swift readback contract only.
 
 ## Live Dogfood Required For Full P051 Completion
 

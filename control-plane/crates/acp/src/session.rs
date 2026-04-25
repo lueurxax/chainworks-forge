@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::warn;
 
 use crate::adapters::XcodeShimGrantCleanup;
@@ -84,10 +84,30 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
+        self.prompt_with_optional_close_signal(req, None).await
+    }
+
+    pub async fn prompt_with_close_signal(
+        &mut self,
+        req: &ExecutionRequest,
+        close_rx: &mut watch::Receiver<bool>,
+    ) -> Result<ExecutionResult> {
+        self.prompt_with_optional_close_signal(req, Some(close_rx))
+            .await
+    }
+
+    async fn prompt_with_optional_close_signal(
+        &mut self,
+        req: &ExecutionRequest,
+        close_rx: Option<&mut watch::Receiver<bool>>,
+    ) -> Result<ExecutionResult> {
         self.xcode_shim_grants
             .iter()
             .for_each(|grant| grant.set_active_prompt(true));
-        let prompt_result = self.transport.prompt(req).await;
+        let prompt_result = match close_rx {
+            Some(close_rx) => self.transport.prompt_with_close_signal(req, close_rx).await,
+            None => self.transport.prompt(req).await,
+        };
         self.xcode_shim_grants
             .iter()
             .for_each(|grant| grant.set_active_prompt(false));
@@ -180,23 +200,28 @@ fn cleanup_path(path: &PathBuf) {
 #[derive(Clone)]
 pub struct AcpSessionHandle {
     inner: Arc<Mutex<AcpSession>>,
+    close_tx: watch::Sender<bool>,
 }
 
 impl AcpSessionHandle {
     pub fn new(session: AcpSession) -> Self {
+        let (close_tx, _close_rx) = watch::channel(false);
         Self {
             inner: Arc::new(Mutex::new(session)),
+            close_tx,
         }
     }
 
     /// Send a prompt through the live session.
     pub async fn prompt(&self, req: &ExecutionRequest) -> Result<ExecutionResult> {
+        let mut close_rx = self.close_tx.subscribe();
         let mut session = self.inner.lock().await;
-        session.prompt(req).await
+        session.prompt_with_close_signal(req, &mut close_rx).await
     }
 
     /// Close the live session.
     pub async fn close(&self) -> Result<()> {
+        let _ = self.close_tx.send(true);
         let mut session = self.inner.lock().await;
         session.close().await?;
         Ok(())

@@ -56,7 +56,13 @@ final class DaemonLifecycleClientTests: XCTestCase {
             "max_queued_leases": 16,
             "broker_disabled": false,
             "backend_available": true,
-            "observation_persistence_failures": 3
+            "observation_persistence_failures": 3,
+            "reason_code": "xcode_observation_persist_failed",
+            "can_acquire_new_xcode_leases": false,
+            "active_lease_count": 8,
+            "initialize_queue_depth": 2,
+            "last_transition_at": "2026-04-18T10:01:00Z",
+            "operator_message": "Xcode broker degraded: observation persistence failures"
           }
         }
         """
@@ -73,6 +79,15 @@ final class DaemonLifecycleClientTests: XCTestCase {
         XCTAssertEqual(status.xcodeBrokerHealth?.brokerDisabled, false)
         XCTAssertEqual(status.xcodeBrokerHealth?.backendAvailable, true)
         XCTAssertEqual(status.xcodeBrokerHealth?.observationPersistenceFailures, 3)
+        XCTAssertEqual(status.xcodeBrokerHealth?.reasonCode, "xcode_observation_persist_failed")
+        XCTAssertEqual(status.xcodeBrokerHealth?.canAcquireNewXcodeLeases, false)
+        XCTAssertEqual(status.xcodeBrokerHealth?.activeLeaseCount, 8)
+        XCTAssertEqual(status.xcodeBrokerHealth?.initializeQueueDepth, 2)
+        XCTAssertEqual(status.xcodeBrokerHealth?.lastTransitionAt, "2026-04-18T10:01:00Z")
+        XCTAssertEqual(
+            status.xcodeBrokerHealth?.operatorMessage,
+            "Xcode broker degraded: observation persistence failures"
+        )
     }
 
     func test_DaemonStatus_decodes_degraded_reasons_array() throws {

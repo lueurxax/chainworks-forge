@@ -240,6 +240,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["state"], "disabled");
+        assert_eq!(body["reason_code"], "xcode_mcp_broker_disabled");
+        assert_eq!(body["can_acquire_new_xcode_leases"], false);
+        assert_eq!(body["active_lease_count"], 0);
+        assert_eq!(body["initialize_queue_depth"], 0);
+        assert_eq!(
+            body["last_transition_at"].as_str().unwrap().is_empty(),
+            false
+        );
+        assert_eq!(body["operator_message"], "Xcode broker disabled");
         assert_eq!(
             serde_json::from_value::<XcodeBrokerHealthState>(body["state"].clone()).unwrap(),
             XcodeBrokerHealthState::Disabled

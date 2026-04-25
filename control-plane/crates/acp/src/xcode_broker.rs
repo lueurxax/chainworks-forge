@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use chrono::Utc;
 use domain::ids::AgentExecutionId;
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate,
@@ -15,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::manager::{BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
@@ -86,6 +88,8 @@ struct LeaseRecord {
 struct XcodeMcpBridgePoolState {
     leases: HashMap<String, LeaseRecord>,
     target_probe_context: Option<HostProbeContext>,
+    health_last_state: Option<XcodeBrokerHealthState>,
+    health_last_transition_at: String,
 }
 
 pub struct XcodeMcpBridgePool {
@@ -141,6 +145,12 @@ pub enum XcodeBrokerHealthState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XcodeBrokerHealthSnapshot {
     pub state: XcodeBrokerHealthState,
+    pub reason_code: String,
+    pub can_acquire_new_xcode_leases: bool,
+    pub active_lease_count: usize,
+    pub initialize_queue_depth: usize,
+    pub last_transition_at: String,
+    pub operator_message: String,
     pub pool_id: String,
     pub active_leases: usize,
     pub queued_leases: usize,
@@ -268,14 +278,21 @@ impl XcodeMcpProcessBackendSession {
 
         let mut command = Command::new(&config.command);
         command
+            .env_clear()
             .args(&config.args)
             .env("HOME", &target_snapshot.operator_home)
             .env("TMPDIR", &target_snapshot.darwin_tmpdir)
             .env("DEVELOPER_DIR", &target_snapshot.developer_dir)
             .env(
-                "CHAINWORKS_XCODE_PID",
-                target_snapshot.xcode_pid.to_string(),
+                "USER",
+                operator_account_name(&target_snapshot.operator_home),
             )
+            .env(
+                "LOGNAME",
+                operator_account_name(&target_snapshot.operator_home),
+            )
+            .env("PATH", xcode_backend_path(&target_snapshot.developer_dir))
+            .env("MCP_XCODE_PID", target_snapshot.xcode_pid.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -535,7 +552,8 @@ impl XcodeMcpBridgePool {
     }
 
     pub async fn health_snapshot(&self) -> XcodeBrokerHealthSnapshot {
-        let active_leases = self.active_lease_count().await;
+        let mut state_guard = self.state.lock().await;
+        let active_leases = state_guard.leases.len();
         let queued_leases = self.queued_lease_count();
         let broker_disabled = self.broker_disabled();
         let backend_available = self.has_backend();
@@ -553,9 +571,32 @@ impl XcodeMcpBridgePool {
         } else {
             XcodeBrokerHealthState::Healthy
         };
+        if state_guard.health_last_state != Some(state)
+            || state_guard.health_last_transition_at.is_empty()
+        {
+            state_guard.health_last_state = Some(state);
+            state_guard.health_last_transition_at = Utc::now().to_rfc3339();
+        }
+        let last_transition_at = state_guard.health_last_transition_at.clone();
+        let (reason_code, operator_message) = xcode_broker_health_reason(
+            state,
+            broker_disabled,
+            backend_available,
+            active_leases,
+            queued_leases,
+            self.config.max_active_leases,
+            observation_persistence_failures,
+        );
+        let can_acquire_new_xcode_leases = state == XcodeBrokerHealthState::Healthy;
 
         XcodeBrokerHealthSnapshot {
             state,
+            reason_code,
+            can_acquire_new_xcode_leases,
+            active_lease_count: active_leases,
+            initialize_queue_depth: queued_leases,
+            last_transition_at,
+            operator_message,
             pool_id: self.config.pool_id.clone(),
             active_leases,
             queued_leases,
@@ -1075,9 +1116,11 @@ impl XcodeMcpBridgePool {
         {
             self.observation_persistence_failures
                 .fetch_add(1, Ordering::AcqRel);
-            warn!(
+            error!(
                 agent_execution_id = %agent_execution_id,
                 error = %err,
+                metric = "xcode_observation_persist_failed_total",
+                warning = "observation_persistence_degraded",
                 "Failed to persist Xcode broker pool observation"
             );
         }
@@ -1776,6 +1819,56 @@ fn target_snapshot_matches_host(snapshot: &XcodeTargetSnapshot, host: &HostProbe
     })
 }
 
+fn operator_account_name(operator_home: &str) -> String {
+    Path::new(operator_home)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("operator")
+        .to_string()
+}
+
+fn xcode_backend_path(developer_dir: &str) -> String {
+    let developer_dir = developer_dir.trim_end_matches('/');
+    format!("/usr/bin:/bin:/usr/sbin:/sbin:{developer_dir}/usr/bin")
+}
+
+fn xcode_broker_health_reason(
+    state: XcodeBrokerHealthState,
+    broker_disabled: bool,
+    backend_available: bool,
+    active_leases: usize,
+    queued_leases: usize,
+    max_active_leases: usize,
+    observation_persistence_failures: u64,
+) -> (String, String) {
+    if broker_disabled || state == XcodeBrokerHealthState::Disabled {
+        return (
+            "xcode_mcp_broker_disabled".to_string(),
+            "Xcode broker disabled".to_string(),
+        );
+    }
+    if !backend_available || state == XcodeBrokerHealthState::Failed {
+        return (
+            "xcode_mcp_backend_unavailable".to_string(),
+            "Xcode broker failed: backend unavailable".to_string(),
+        );
+    }
+    if observation_persistence_failures > 0 {
+        return (
+            "xcode_observation_persist_failed".to_string(),
+            "Xcode broker degraded: observation persistence failures".to_string(),
+        );
+    }
+    if queued_leases > 0 || active_leases >= max_active_leases {
+        return (
+            "xcode_mcp_capacity_backpressure".to_string(),
+            "Xcode broker degraded: capacity backpressure".to_string(),
+        );
+    }
+    ("healthy".to_string(), "Xcode broker healthy".to_string())
+}
+
 fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     format!("{digest:x}")
@@ -1836,6 +1929,12 @@ mod tests {
 
         let health = pool.health_snapshot().await;
         assert_eq!(health.state, XcodeBrokerHealthState::Degraded);
+        assert_eq!(health.reason_code, "xcode_observation_persist_failed");
+        assert!(!health.can_acquire_new_xcode_leases);
+        assert_eq!(health.active_lease_count, 0);
+        assert_eq!(health.initialize_queue_depth, 0);
+        assert!(!health.last_transition_at.is_empty());
+        assert!(health.operator_message.contains("observation persistence"));
         assert_eq!(health.observation_persistence_failures, 1);
         assert!(health.backend_available);
     }

@@ -2,11 +2,11 @@
   "proposal_revision_id": "p051-r30",
   "source_review_pass_id": "p051-review-pass-r29",
   "title": "Proposal 051 Implementation Plan: Shared Xcode MCP Bridge Pool",
-  "status": "Ready for implementation planning after R30 precondition enforcement pass",
+  "status": "Fixture/readback implementation is schedulable against current reference/gate truth; broad shim_enforced rollout remains blocked until live dogfood/sign-off evidence is attached.",
   "review_readiness": {
     "target_score": "aggregate score above 9",
     "why_ready": [
-      "The checked-in proposal is now explicitly the controlling implementation contract, and the scaffold gate must fail stale contrary guidance.",
+      "The checked-in proposal is now the canonical implementation contract, and the scaffold gate must fail stale contrary guidance.",
       "The three architect blockers now have explicit owner-crate, caller, failure-mode, and acceptance-test contracts.",
       "Product rollout ambiguity is resolved with staged gates, broker enablement states, and a rollback switch that preserves non-Xcode workflows.",
       "UX/UI visibility concerns are resolved by making a narrow read-only UI/readback slice part of acceptance instead of leaving runtime truth in raw JSON only.",
@@ -39,7 +39,7 @@
   "implementation_source_of_truth": {
     "controlling_artifact": "/Users/user/Documents/Chainworks Forge/docs/proposals/051-shared-xcode-mcp-bridge-pool.md",
     "source_proposal_status": "Canonical source-of-truth is checked in at `docs/proposals/051-shared-xcode-mcp-bridge-pool.md`; the .chainworks run proposal is provenance only.",
-    "reconciliation_required_before_implementation": "Before any P051 implementation PR begins, reconcile `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` with this contract and remove stale implementation-source guidance from the checked-in source.",
+    "reconciliation_required_before_implementation": "Before any P051 implementation PR begins, confirm this checked-in proposal is canonical and remove stale implementation-source guidance from the checked-in source.",
     "static_gate_requirement": "`p051-scaffold` fails if the checked-in source proposal still contains stale contrary guidance: no SwiftUI changes, debug_assert-only capability enforcement, path+mtime+size-only binary fingerprinting, drop-on-corrupt-observation behavior, direct pgrep newest-Xcode selection, or unbound same-uid-only shim authorization."
   },
   "research_artifact": "docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md",
@@ -87,8 +87,8 @@
       "Each session receives an HTTP Xcode MCP server entry backed by Chainworks.",
       "The first Xcode process may require one consent interaction; sibling leases against the same Xcode PID should not trigger additional modals.",
       "Broker, host-environment, capability, shim, simulator-selection, and provider-transport failures are classified separately instead of being presented as generic agent failures.",
-      "Run timeline/status and the high-level `RunProgressView` status string distinguish `Waiting for Xcode Bridge lock` from `Starting Xcode Bridge` so initialize serialization does not look like a hang.",
-      "If bridge startup is blocked for more than five seconds while Xcode consent is plausible, the timeline and high-level progress string show an `Action Required: Check Xcode` state before the initialize timeout fires.",
+      "Run timeline/status surfaces distinguish `Waiting for Xcode Bridge lock` from `Starting Xcode Bridge` so initialize serialization does not look like a hang.",
+      "If bridge startup is blocked for more than five seconds while Xcode consent is plausible, the timeline/readback surface shows an `Action Required: Check Xcode` state before the initialize timeout fires.",
       "`Action Required: Check Xcode` includes workspace identity and Xcode PID when available from `XcodeTargetSnapshot`, so operators with multiple Xcode windows know which instance needs attention.",
       "Parallel DerivedData or build-system contention is identified as Xcode build concurrency, not broker infrastructure failure."
     ],
@@ -306,7 +306,7 @@
       "issues": [
         "ARCH-R27-001"
       ],
-      "resolution": "Declared this run proposal as the controlling implementation source until the checked-in source proposal is reconciled, and expanded the `p051-scaffold` static gate to fail stale contradictory guidance."
+      "resolution": "Checked-in `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` is the controlling contract; stale contradictory guidance fails the `p051-scaffold` static gate."
     },
     {
       "issues": [
@@ -343,7 +343,7 @@
       "issues": [
         "PO-R27-001"
       ],
-      "resolution": "Promoted upstream dependency audit for P025, P026, P029, P037, and P049 to a named pre-scheduling and `p051-scaffold` precondition with P026/P029 incompleteness as a scheduling blocker."
+      "resolution": "Promoted upstream dependency audit for P025, P026, P029, P037, and P049 to a named pre-scheduling and `p051-scaffold` precondition; current implemented-system reference/gate truth supersedes missing historical proposal-lineage files."
     },
     {
       "issues": [
@@ -378,7 +378,7 @@
       "issues": [
         "ARCH-R27-001"
       ],
-      "resolution": "Declared this run proposal as the controlling implementation contract until the checked-in source proposal is reconciled, and made stale contradictory source text a `p051-scaffold` failure."
+      "resolution": "Checked-in proposal text is the controlling contract; stale contradictory source text is a `p051-scaffold` failure."
     },
     {
       "issues": [
@@ -415,7 +415,7 @@
       "issues": [
         "PO-R27-001"
       ],
-      "resolution": "Added dependency-audit precondition before scheduling, with P026/P029 incompleteness blocking scaffold scheduling."
+      "resolution": "Added dependency-audit precondition before scheduling; current reference/gate evidence now distinguishes fixture/readback schedulability from broad rollout dogfood/sign-off."
     },
     {
       "issues": [
@@ -481,7 +481,7 @@
       "issues": [
         "UX-ISS-002"
       ],
-      "resolution": "Bridge initialization states are required in both the timeline/inspector and the high-level `RunProgressView` status string."
+      "resolution": "Bridge initialization states are required in the run timeline/inspector readback surface; broad high-level summary propagation is deferred until the GraphQL run-list projection carries Xcode observation summaries."
     },
     {
       "issues": [
@@ -506,7 +506,7 @@
       "issues": [
         "ARCH-R29-002"
       ],
-      "resolution": "Expanded dependency audit into a required pre-scheduling artifact with proposal id, owner, gate status, remaining gaps, and parallel-versus-sequential classification; P026/P029 remain hard blockers unless the audit narrows scaffold to independent work."
+      "resolution": "Expanded dependency audit into a required pre-scheduling artifact with proposal id, owner, gate status, remaining gaps, and parallel-versus-sequential classification; implemented-system reference/gate truth now determines fixture schedulability."
     },
     {
       "issues": [
@@ -721,8 +721,8 @@
     {
       "reviewer": "architect",
       "issue_id": "ARCH-R27-001",
-      "concern": "The run proposal and checked-in source proposal disagreed on implementation contracts.",
-      "proposal_resolution": "This run proposal is the controlling implementation source until source reconciliation lands; `p051-scaffold` must fail stale contradictory guidance.",
+      "concern": "Review-path and checked-in proposal guidance disagreed on implementation contracts.",
+      "proposal_resolution": "Checked-in `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` is the implementation source for P051; `p051-scaffold` must fail stale contradictory guidance.",
       "where_resolved": [
         "implementation_source_of_truth",
         "rollout_plan.preconditions",
@@ -786,7 +786,7 @@
       "reviewer": "product_owner",
       "issue_id": "PO-R27-001",
       "concern": "Upstream dependency status was not a named scheduling gate.",
-      "proposal_resolution": "Dependency audit is a pre-scheduling and `p051-scaffold` precondition; P026 or P029 incompleteness blocks scheduling.",
+      "proposal_resolution": "Dependency audit is a pre-scheduling and `p051-scaffold` precondition; P025 or P026 incompleteness blocks scheduling unless PR1 is explicitly narrowed.",
       "where_resolved": [
         "rollout_plan.preconditions",
         "open_questions",
@@ -856,8 +856,8 @@
     {
       "reviewer": "architect",
       "issue_id": "ARCH-R27-001",
-      "concern": "Run proposal and checked-in source proposal disagreed on implementable contracts.",
-      "proposal_resolution": "This run proposal is authoritative until the source proposal is reconciled; stale contrary source guidance fails `p051-scaffold`.",
+      "concern": "Review-path and checked-in source guidance disagreed on implementable contracts.",
+      "proposal_resolution": "Checked-in `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` is authoritative for implementation; stale contrary source guidance fails `p051-scaffold`.",
       "where_resolved": [
         "implementation_source_of_truth",
         "rollout_plan.preconditions",
@@ -921,7 +921,7 @@
       "reviewer": "product_owner",
       "issue_id": "PO-R27-001",
       "concern": "Dependency audit lacked owner/deadline/blocking threshold.",
-      "proposal_resolution": "Dependency audit is a pre-scheduling precondition; P026/P029 incompleteness blocks the scaffold sprint.",
+      "proposal_resolution": "Dependency audit is a pre-scheduling precondition; current reference/gate evidence determines fixture schedulability, while live dogfood/sign-off gates broad rollout.",
       "where_resolved": [
         "rollout_plan.preconditions",
         "metrics"
@@ -1035,7 +1035,7 @@
       "reviewer": "ux_designer",
       "issue_id": "UX-ISS-002",
       "concern": "Bridge progress states must be visible outside the inspector.",
-      "proposal_resolution": "`Waiting for Xcode Bridge lock`, `Starting Xcode Bridge`, and `Action Required: Check Xcode` propagate to the high-level `RunProgressView` status string.",
+      "proposal_resolution": "`Waiting for Xcode Bridge lock`, `Starting Xcode Bridge`, and `Action Required: Check Xcode` propagate to the run timeline/inspector readback surface; the current app has no distinct production high-level progress view.",
       "where_resolved": [
         "ux_ui_notes.operator_visible_behavior",
         "implementation_inventory.swift_ui"
@@ -1075,7 +1075,7 @@
       "reviewer": "architect",
       "issue_id": "ARCH-R29-002",
       "concern": "Upstream dependency readiness is declared as a gate but not proven in reviewed artifacts.",
-      "proposal_resolution": "Dependency audit is a required pre-scheduling artifact with owner, gate status, remaining gap, and parallel-versus-sequential classification; P026/P029 are hard prerequisites unless the audit narrows scaffold to independent work.",
+      "proposal_resolution": "Dependency audit is a required pre-scheduling artifact with owner, gate status, remaining gap, and parallel-versus-sequential classification; current implemented-system references and gate registrations determine fixture/readback schedulability.",
       "where_resolved": [
         "rollout_plan.preconditions",
         "metrics",
@@ -1424,8 +1424,8 @@
         "Late async shim events use the active prompt attribution pointer. Idle-window events are rejected and written to an orphan observation bucket when attributable to run/session but not an active execution."
       ],
       "persistence_failure_policy": [
-        "Observation append failure never silently drops the event: emit tracing error, increment `xcode_observation_persist_failed_total`, and mark broker health Degraded.",
-        "If the event is tied to an active execution, the engine also appends a best-effort `observation_persistence_degraded` warning through the normal execution failure evidence path.",
+        "Observation append failure never silently drops the event: emit tracing error with metric marker `xcode_observation_persist_failed_total`, include warning marker `observation_persistence_degraded`, increment broker health failure count, and mark broker health Degraded.",
+        "If the same DB append path is unavailable, do not attempt a recursive warning append through that failed sink; the degraded health snapshot and error-level metric marker become the operator evidence path until persistence recovers.",
         "Persistence failure does not by itself fail an otherwise successful Xcode command, but the full P051 gate requires persistence success in fixtures."
       ],
       "api_readback": [
@@ -1652,8 +1652,8 @@
     ],
     "rollback": "Set `CHAINWORKS_XCODE_BROKER_DISABLED=1` and restart the daemon to preserve non-Xcode workflows while refusing Xcode broker requests. During rollback, all in-flight and new Xcode-brokered executions fail closed immediately with `xcode_broker_disabled`; this is a rollback switch, not a production fallback for brokered Xcode MCP.",
     "preconditions": [
-      "Before scheduling implementation, create `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` with one row per dependency (P025, P026, P029, P037, P049) covering proposal id, canonical evidence link, owner, gate status, remaining gaps, parallel-vs-sequential decision, and blocker threshold. P026 or P029 incompleteness blocks the scaffold sprint unless the audit explicitly narrows PR1 to independent work.",
-      "Before the first implementation PR starts, confirm the checked-in proposal is the controlling source by removing stale source-of-truth guidance. This is the first scaffold task, and implementation review fails if PRs begin from stale checked-in proposal text.",
+      "Before scheduling implementation, create `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` with one row per dependency (P025, P026, P029, P037, P049) covering proposal id, canonical evidence link, owner, gate status, remaining gaps, parallel-vs-sequential decision, and blocker threshold. P025 or P026 incompleteness blocks the scaffold sprint unless the audit explicitly narrows PR1 to independent work.",
+      "Before the first implementation PR starts, confirm the checked-in proposal is the canonical source by removing stale source-of-truth guidance. This is the first scaffold task, and implementation review fails if PRs begin from stale checked-in proposal text.",
       "Before the third PR merges, assign a security reviewer for bearer lifecycle, shim token replay, provider process binding, Unix socket peer checks, loopback HTTP surface, cwd policy, env allowlist, token redaction, and diagnostic-mode bypasses."
     ]
   },
@@ -1712,7 +1712,7 @@
     },
     {
       "metric": "Dependency audit readiness",
-      "threshold": "Written table exists at `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold; P026 and P029 are marked implemented enough for scaffold or the sprint is not scheduled unless PR1 is explicitly narrowed to independent work."
+      "threshold": "Written table exists at `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold; current reference/gate truth distinguishes fixture blockers from broad rollout blockers."
     },
     {
       "metric": "Broker policy enforcement",
@@ -1732,7 +1732,7 @@
     },
     {
       "metric": "Residual path warning ratio",
-      "threshold": "Dogfood reports residual prompt-time absolute-path warnings by provider and agent. If residual warnings dominate Xcode failures, file a sandbox/libc-audit follow-up before enabling shim_enforced broadly."
+      "threshold": "Dogfood reports residual prompt-time absolute-path warnings by provider and agent. If residual warnings dominate Xcode failures, create and complete rollout follow-up `P051-FU-01` before enabling `shim_enforced` broadly."
     },
     {
       "metric": "Direct command scanner coverage",
@@ -1748,13 +1748,13 @@
     },
     {
       "metric": "Observation hot-row escape trigger",
-      "threshold": "Dogfood report records observation append retry exhaustion, truncation counts, and append backoff/latency spikes. Any retry exhaustion, truncation above 1 percent of brokered Xcode executions, or repeated append pressure across two dogfood runs creates a normalized event-table follow-up before broad `shim_enforced` rollout."
+      "threshold": "Dogfood report records observation append retry exhaustion, truncation counts, and append backoff/latency spikes. Any retry exhaustion, truncation above 1 percent of brokered Xcode executions, or repeated append pressure across two dogfood runs creates rollout follow-up `P051-FU-02` (normalized event-table work) before broad `shim_enforced` rollout."
     }
   ],
   "risks_and_mitigations": [
     {
-      "risk": "Run proposal and checked-in source proposal drift creates two implementation contracts.",
-      "mitigation": "This run proposal is controlling; source reconciliation is a pre-implementation condition and stale contradictory guidance fails `p051-scaffold`."
+      "risk": "Proposal source drift creates multiple potential implementation contracts.",
+      "mitigation": "The checked-in proposal is the canonical source; source reconciliation is a pre-implementation condition and stale contradictory guidance fails `p051-scaffold`."
     },
     {
       "risk": "Providers change HTTP MCP wire shape or capability reporting.",
@@ -1848,7 +1848,7 @@
     "Example catalogs are migrated to explicit `requires_xcode_host_execution` where needed.",
     "`p051-scaffold`, `proposal-051`, and `p051` are registered in `scripts/test-gate.sh` and `docs/reference/test-gates.md`.",
     "Dogfood pass on a parallel Xcode-capable stage shows at most one Xcode consent modal per Xcode process, zero enforced-boundary fake-home failures, and 100 percent observation completeness.",
-    "This run proposal is treated as the controlling P051 implementation source until the checked-in source proposal is reconciled; `p051-scaffold` fails on stale contrary source-proposal guidance.",
+    "Checked-in `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` is the canonical P051 implementation source; `p051-scaffold` fails on stale contrary source-proposal guidance.",
     "`XcodeTargetResolver` replaces newest-process pgrep selection for brokered paths and fails closed on no match, ambiguity, GUI-user mismatch, or workspace drift.",
     "`BrokerMcpPolicy` filters `tools/list`, denies unauthorized `tools/call` before backend forwarding, persists denied observations, and isolates sibling leases.",
     "`LaunchResourceGuard` owns provider fake-home/temp/config resources across initialize-only probes, real-session transfer, rollback, cancellation, and crash cleanup.",
@@ -1862,12 +1862,12 @@
     "`XcodeBrokerHealthSnapshot` is subsystem health separate from global daemon readiness and gates only brokered Xcode lease acquisition.",
     "`XcodeTargetResolver` uses engine-provided selection inputs plus acp host probing to return immutable `XcodeTargetSnapshot`; acp does not reconstruct runtime/workspace policy from global state.",
     "Observation writes go only through the append repository API, with dogfood retry/truncation pressure recorded as the trigger for normalized event-table follow-up.",
-    "High-level `RunProgressView` shows bridge lock/start/action-required states, not only the timeline inspector.",
+    "RunTimelineInspectorView and related run readback surfaces show bridge lock/start/action-required states; there is no distinct production high-level progress view in the current app.",
     "`Action Required: Check Xcode` recovery text includes workspace identity and Xcode PID when available.",
     "Residual path warnings collapse behind `View all residual paths` after more than five unique warnings per execution.",
     "Agent Catalog shows a first-run Xcode consent note for broker-required agents and uses existing ForgePanel/GroupBox styling for the runtime section."
     ,"Source proposal reconciliation or explicit redirect is the first scaffold task; PR review fails if implementation begins from stale checked-in P051 proposal text."
-    ,"Dependency audit artifact exists before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold for P025/P026/P029/P037/P049."
+    ,"Dependency audit artifact exists before scheduling with proposal id, owner, gate status, remaining gaps, parallel-vs-sequential classification, and blocking threshold for P025/P026/P029/P037/P049, using implemented-system reference/gate truth."
     ,"Observation dogfood evidence includes retry exhaustion, truncation percentage, and append backoff/latency spikes; sustained pressure triggers normalized event-table follow-up before broad `shim_enforced` rollout."
   ],
   "open_questions": [
@@ -1889,7 +1889,7 @@
     },
     {
       "question": "Are P025, P026, P029, P037, and P049 all implemented enough for P051 to start?",
-      "default_for_implementation": "Create a dependency status audit at `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` before scheduling P051 implementation; P026 or P029 incompleteness blocks scheduling, while partial status in P025/P037/P049 requires an explicit parallel-vs-sequential plan."
+      "default_for_implementation": "Create a dependency status audit at `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/dependency-audit.md` before scheduling P051 implementation; P025 or P026 incompleteness blocks scheduling, while partial status in P037/P049 requires an explicit parallel-vs-sequential plan."
     }
   ],
   "implementation_handoff": {
@@ -1952,9 +1952,25 @@
       ],
       "gate": "proposal-051|p051 plus dogfood acceptance"
     },
+    "rollout_followups": [
+      {
+        "followup_id": "P051-FU-01",
+        "trigger": "Residual absolute-path warnings dominate Xcode failures or residual warnings remain unresolved after two dogfood runs.",
+        "owner": "chainworks security hardening",
+        "scope": "Implement and land sandbox/libc-audit command-boundary hardening with command-origin attribution, warning suppression evidence, and follow-up regression coverage.",
+        "acceptance": "No unmitigated residual warning channel remains before broad `shim_enforced` rollout; follow-up evidence is attached to rollout package with sign-off."
+      },
+      {
+        "followup_id": "P051-FU-02",
+        "trigger": "Observation append retry exhaustion or append pressure threshold is exceeded in dogfood evidence.",
+        "owner": "control-plane persistence team",
+        "scope": "Implement normalized observation event-table path, migration guardrails, and backfill/runbook updates for high-volume append resilience.",
+        "acceptance": "Retry exhaustion and truncation pressure fall to accepted thresholds on the same workload profile before enabling broad `shim_enforced`; post-follow-up evidence is attached to rollout package."
+      }
+    ],
     "preconditions": [
-      "Before scheduling implementation, complete a dependency audit for P025, P026, P029, P037, and P049 with owner, implementation gate status, remaining gaps, and parallel-versus-sequential constraint. P026 or P029 incompleteness blocks the scaffold sprint.",
-      "Before the first implementation PR starts, reconcile `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` with this proposal or replace stale sections with an explicit pointer to this controlling contract.",
+      "Before scheduling implementation, complete a dependency audit for P025, P026, P029, P037, and P049 with owner, implementation gate status, remaining gaps, and parallel-versus-sequential constraint. P025 or P026 incompleteness blocks the scaffold sprint.",
+      "Before the first implementation PR starts, confirm `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` is the checked-in canonical source and remove stale source-of-truth guidance before implementation begins.",
       "Before the third PR merges, assign a security reviewer for bearer lifecycle, shim token replay, provider process binding, Unix socket peer checks, loopback HTTP surface, cwd policy, env allowlist, token redaction, and diagnostic-mode bypasses."
     ]
   },
@@ -2010,7 +2026,7 @@
       "AgentCatalogView infrastructure flags",
       "Broker health indicator",
       "Action Required Xcode modal state",
-      "RunProgressView bridge state propagation",
+      "RunTimelineInspectorView bridge state propagation",
       "Policy Warning icon/color/coalescing",
       "View all residual paths disclosure after warning threshold",
       "AgentCatalogView first-run Xcode consent note",
