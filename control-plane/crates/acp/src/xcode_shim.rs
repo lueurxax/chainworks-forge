@@ -78,16 +78,7 @@ impl XcodeShimProcessInspector for DefaultXcodeShimProcessInspector {
         &self,
         credentials: XcodeShimPeerCredentials,
     ) -> anyhow::Result<XcodeShimProcessBinding> {
-        let parent_pid = lookup_parent_pid(credentials.pid)?;
-        let ancestor_pids = process_ancestor_pids(credentials.pid)?;
-        Ok(XcodeShimProcessBinding {
-            pid: credentials.pid,
-            uid: credentials.uid,
-            parent_pid,
-            ancestor_pids,
-            start_time_fingerprint: None,
-            executable_fingerprint: None,
-        })
+        inspect_xcode_shim_process_binding(credentials.pid, credentials.uid)
     }
 }
 
@@ -365,6 +356,25 @@ pub fn current_process_uid() -> u32 {
 }
 
 #[cfg(unix)]
+pub fn inspect_xcode_shim_process_binding(
+    pid: u32,
+    uid: u32,
+) -> anyhow::Result<XcodeShimProcessBinding> {
+    let parent_pid = lookup_parent_pid(pid)?;
+    let ancestor_pids = process_ancestor_pids(pid)?;
+    let start_time_fingerprint = process_start_time_fingerprint(pid)?;
+    let executable_fingerprint = process_executable_fingerprint(pid)?;
+    Ok(XcodeShimProcessBinding {
+        pid,
+        uid,
+        parent_pid,
+        ancestor_pids,
+        start_time_fingerprint,
+        executable_fingerprint,
+    })
+}
+
+#[cfg(unix)]
 fn process_ancestor_pids(pid: u32) -> anyhow::Result<Vec<u32>> {
     let mut ancestors = Vec::new();
     let mut current = pid;
@@ -402,6 +412,57 @@ fn lookup_parent_pid(pid: u32) -> anyhow::Result<Option<u32>> {
         .parse::<u32>()
         .context("xcode_shim_parent_pid_parse_failed")?;
     Ok(Some(parent_pid))
+}
+
+#[cfg(unix)]
+fn process_start_time_fingerprint(pid: u32) -> anyhow::Result<Option<String>> {
+    Ok(ps_field(pid, "lstart")?.map(|value| sha256_hex(&value)))
+}
+
+#[cfg(unix)]
+fn process_executable_fingerprint(pid: u32) -> anyhow::Result<Option<String>> {
+    let Some(command_identity) = ps_field(pid, "comm")? else {
+        return Ok(None);
+    };
+    if let Some(path) = resolve_process_command_path(&command_identity) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Ok(Some(format!("{:x}", Sha256::digest(bytes))));
+        }
+        return Ok(Some(sha256_hex(&path.to_string_lossy())));
+    }
+    Ok(Some(sha256_hex(&command_identity)))
+}
+
+#[cfg(unix)]
+fn ps_field(pid: u32, field: &str) -> anyhow::Result<Option<String>> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", &format!("{field}="), "-p", &pid.to_string()])
+        .output()
+        .with_context(|| format!("xcode_shim_ps_lookup_failed:{field}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+#[cfg(unix)]
+fn resolve_process_command_path(command_identity: &str) -> Option<PathBuf> {
+    let path = Path::new(command_identity);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(command_identity);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 impl XcodeShimCommandPolicy {
@@ -2284,6 +2345,25 @@ mod tests {
         assert!(authorization.reason_code.is_none());
         assert_eq!(grant().token_sha256.len(), 64);
         assert_ne!(grant().token_sha256, "secret-a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_process_inspection_populates_runtime_fingerprints() {
+        let binding =
+            inspect_xcode_shim_process_binding(std::process::id(), current_process_uid()).unwrap();
+
+        assert_eq!(binding.pid, std::process::id());
+        assert_eq!(binding.uid, current_process_uid());
+        assert!(binding.parent_pid.is_some());
+        assert_eq!(
+            binding.start_time_fingerprint.as_ref().map(String::len),
+            Some(64)
+        );
+        assert_eq!(
+            binding.executable_fingerprint.as_ref().map(String::len),
+            Some(64)
+        );
     }
 
     #[test]

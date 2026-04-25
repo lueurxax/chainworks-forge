@@ -44,8 +44,8 @@ use daemon::packaging::{self, DaemonMode, ModePaths};
 use daemon::supervisor::{self, CrashBudgetDecision, PidLockOutcome};
 #[cfg(unix)]
 use daemon::xcode_shim_socket::{
-    bind_xcode_shim_listener, ensure_xcode_shim_dir, spawn_xcode_shim_socket_service,
-    XcodeShimGrantRegistry,
+    bind_xcode_shim_listener, cleanup_xcode_shim_socket, ensure_xcode_shim_dir,
+    spawn_xcode_shim_socket_service, XcodeShimGrantRegistry,
 };
 use db::migrate::{self, MigrationError, MigrationOutcome};
 use domain::lifecycle::{
@@ -338,7 +338,7 @@ async fn main() -> Result<()> {
             spawn_xcode_broker_health_publisher(reporter.clone(), xcode_broker_pool.clone());
 
             #[cfg(unix)]
-            let _xcode_shim_socket_handle = {
+            let xcode_shim_socket_service = {
                 let shim_registry = Arc::new(XcodeShimGrantRegistry::default());
                 let shim_socket_path = XcodeShimGrantRegistry::socket_path(&paths.app_support_dir);
                 let shim_dir = ensure_xcode_shim_dir(&paths.app_support_dir)?;
@@ -353,12 +353,15 @@ async fn main() -> Result<()> {
                     shim_dir = %shim_dir.display(),
                     "Xcode shim dispatch socket bound"
                 );
-                spawn_xcode_shim_socket_service(
-                    listener,
-                    shim_registry,
-                    Arc::new(XcodeHostExecutorProcessConfig::default()),
-                    acp.xcode_runtime_observation_sink(),
-                    Arc::new(DefaultXcodeShimProcessInspector),
+                (
+                    shim_socket_path,
+                    spawn_xcode_shim_socket_service(
+                        listener,
+                        shim_registry,
+                        Arc::new(XcodeHostExecutorProcessConfig::default()),
+                        acp.xcode_runtime_observation_sink(),
+                        Arc::new(DefaultXcodeShimProcessInspector),
+                    ),
                 )
             };
 
@@ -457,7 +460,12 @@ async fn main() -> Result<()> {
                 .map_err(anyhow::Error::from)
             };
 
-            match run_drain_protocol(serve_fut, drain_rx, SHUTDOWN_DRAIN_DEADLINE).await? {
+            let drain_outcome =
+                run_drain_protocol(serve_fut, drain_rx, SHUTDOWN_DRAIN_DEADLINE).await?;
+            #[cfg(unix)]
+            shutdown_xcode_shim_socket_service(xcode_shim_socket_service).await;
+
+            match drain_outcome {
                 DrainOutcome::ServeReturnedFirst => {
                     info!("HTTP serve returned before shutdown signal; exit 0");
                 }
@@ -507,6 +515,25 @@ fn xcode_broker_health_for_lifecycle(
         max_active_leases: health.max_active_leases,
         max_queued_leases: health.max_queued_leases,
         broker_disabled: health.broker_disabled,
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_xcode_shim_socket_service(
+    (socket_path, handle): (std::path::PathBuf, tokio::task::JoinHandle<()>),
+) {
+    handle.abort();
+    let _ = handle.await;
+    match cleanup_xcode_shim_socket(&socket_path) {
+        Ok(()) => info!(
+            socket_path = %socket_path.display(),
+            "Xcode shim dispatch socket cleaned up"
+        ),
+        Err(error) => warn!(
+            error = %error,
+            socket_path = %socket_path.display(),
+            "Failed to clean up Xcode shim dispatch socket"
+        ),
     }
 }
 
@@ -887,6 +914,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, DrainOutcome::ServeReturnedFirst);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_xcode_shim_socket_service_removes_socket_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("xcode-shim.sock");
+        std::fs::write(&socket_path, "").expect("write socket placeholder");
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        shutdown_xcode_shim_socket_service((socket_path.clone(), handle)).await;
+
+        assert!(!socket_path.exists());
     }
 
     // ── P042 §9.1 packaged log routing (routing-only; global subscriber

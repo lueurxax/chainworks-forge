@@ -184,6 +184,16 @@ pub fn bind_xcode_shim_listener(socket_path: &Path) -> anyhow::Result<UnixListen
 }
 
 #[cfg(unix)]
+pub fn cleanup_xcode_shim_socket(socket_path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove xcode shim socket {}", socket_path.display())),
+    }
+}
+
+#[cfg(unix)]
 pub async fn handle_xcode_shim_connection(
     stream: UnixStream,
     grant_resolver: &dyn XcodeShimGrantResolver,
@@ -317,6 +327,13 @@ mod tests {
         }
     }
 
+    fn short_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("cw-xc-")
+            .tempdir_in("/tmp")
+            .expect("short tempdir")
+    }
+
     #[tokio::test]
     async fn daemon_handler_uses_registry_active_prompt_truth() {
         let registry = Arc::new(XcodeShimGrantRegistry::default());
@@ -400,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_listener_replaces_stale_socket_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let socket_path = XcodeShimGrantRegistry::socket_path(tempdir.path());
         std::fs::write(&socket_path, "stale").expect("write stale placeholder");
 
@@ -411,8 +428,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_removes_socket_path() {
+        let tempdir = short_tempdir();
+        let socket_path = XcodeShimGrantRegistry::socket_path(tempdir.path());
+        let listener = bind_xcode_shim_listener(&socket_path).expect("bind listener");
+
+        assert!(socket_path.exists());
+
+        drop(listener);
+        cleanup_xcode_shim_socket(&socket_path).expect("cleanup socket");
+
+        assert!(!socket_path.exists());
+    }
+
+    #[tokio::test]
     async fn generated_shim_dispatches_through_socket_with_descendant_grant() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tempdir = short_tempdir();
         let shim_dir = ensure_xcode_shim_dir(tempdir.path()).expect("shim dir");
         let socket_path = XcodeShimGrantRegistry::socket_path(tempdir.path());
         let listener = bind_xcode_shim_listener(&socket_path).expect("bind listener");

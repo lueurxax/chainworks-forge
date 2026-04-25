@@ -18,6 +18,8 @@ use tokio::process::Command;
 
 use crate::session::AcpSessionHandle;
 use crate::transport::AcpSessionConfig;
+#[cfg(unix)]
+use crate::{current_process_uid, inspect_xcode_shim_process_binding};
 use crate::{ExecutionRequest, ExecutionResult, XcodeShimGrantRecord, XcodeShimGrantStore};
 
 /// Process launch details prepared independently from `session/new` params.
@@ -202,21 +204,23 @@ impl AcpLaunchSpec {
             .id()
             .ok_or_else(|| anyhow::anyhow!("p051_xcode_shim_provider_pid_unavailable"))?;
         let now_epoch_ms = chrono::Utc::now().timestamp_millis();
+        #[cfg(unix)]
+        let provider_process = inspect_xcode_shim_process_binding(pid, current_process_uid())
+            .context("p051_xcode_shim_provider_process_inspection_failed")?;
+        #[cfg(not(unix))]
+        let provider_process = crate::XcodeShimProcessBinding {
+            pid,
+            uid: 0,
+            parent_pid: None,
+            ancestor_pids: Vec::new(),
+            start_time_fingerprint: None,
+            executable_fingerprint: None,
+        };
         let grant = crate::XcodeShimDispatchGrant::new(
             runtime.token_id.clone(),
             &runtime.token_secret,
             runtime.lease_id.clone(),
-            crate::XcodeShimProcessBinding {
-                pid,
-                #[cfg(unix)]
-                uid: crate::current_process_uid(),
-                #[cfg(not(unix))]
-                uid: 0,
-                parent_pid: None,
-                ancestor_pids: Vec::new(),
-                start_time_fingerprint: None,
-                executable_fingerprint: None,
-            },
+            provider_process,
             now_epoch_ms,
             now_epoch_ms + 6 * 60 * 60 * 1000,
         );
@@ -815,7 +819,38 @@ fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcpLaunchSpec, ProbeKey, ProviderCapabilities, ProviderCapabilityCache};
+    use super::{
+        AcpLaunchSpec, ProbeKey, ProviderCapabilities, ProviderCapabilityCache,
+        XcodeShimLaunchRuntime,
+    };
+    use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CapturingGrantStore {
+        inserted: Mutex<Vec<XcodeShimGrantRecord>>,
+    }
+
+    impl XcodeShimGrantStore for CapturingGrantStore {
+        fn insert_xcode_shim_grant(&self, record: XcodeShimGrantRecord) {
+            self.inserted
+                .lock()
+                .expect("inserted poisoned")
+                .push(record);
+        }
+
+        fn set_xcode_shim_grant_active_prompt(
+            &self,
+            _token_id: &str,
+            _active_prompt: bool,
+        ) -> bool {
+            false
+        }
+
+        fn remove_xcode_shim_grant(&self, _token_id: &str) -> Option<XcodeShimGrantRecord> {
+            None
+        }
+    }
 
     #[test]
     fn probe_key_changes_when_binary_content_changes() {
@@ -881,5 +916,73 @@ mod tests {
                 .contains("provider_launch_spec_capability_drift"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn register_xcode_shim_grant_for_child_captures_live_process_binding() {
+        let store = Arc::new(CapturingGrantStore::default());
+        let mut spec = AcpLaunchSpec::new("/bin/sh");
+        spec.attach_xcode_shim_runtime(XcodeShimLaunchRuntime {
+            token_id: "token-live".to_string(),
+            token_secret: "secret-live".to_string(),
+            lease_id: "lease-live".to_string(),
+            socket_path: "/tmp/xcode-shim.sock".to_string(),
+            shim_dir: "/tmp/xcode-shims".to_string(),
+            workspace_root: "/tmp".to_string(),
+            agent_execution_id: None,
+            store: store.clone(),
+        });
+
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        let child_pid = child.id().unwrap();
+
+        let cleanup = spec
+            .register_xcode_shim_grant_for_child(&child)
+            .unwrap()
+            .unwrap();
+
+        let record = store
+            .inserted
+            .lock()
+            .expect("inserted poisoned")
+            .last()
+            .cloned()
+            .expect("grant record");
+        let expected =
+            crate::inspect_xcode_shim_process_binding(child_pid, crate::current_process_uid())
+                .unwrap();
+
+        assert_eq!(record.grant.provider_process, expected);
+        assert_eq!(record.grant.provider_process.pid, child_pid);
+        assert_eq!(
+            record.grant.provider_process.uid,
+            crate::current_process_uid()
+        );
+        assert_eq!(
+            record
+                .grant
+                .provider_process
+                .start_time_fingerprint
+                .as_ref()
+                .map(String::len),
+            Some(64)
+        );
+        assert_eq!(
+            record
+                .grant
+                .provider_process
+                .executable_fingerprint
+                .as_ref()
+                .map(String::len),
+            Some(64)
+        );
+
+        cleanup.remove();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }

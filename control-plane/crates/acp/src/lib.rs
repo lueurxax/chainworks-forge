@@ -18,9 +18,9 @@ pub use xcode_broker::{
 pub use xcode_shim::{
     current_process_uid, handle_xcode_shim_unix_stream,
     handle_xcode_shim_unix_stream_with_grant_resolver,
-    handle_xcode_shim_unix_stream_with_peer_credentials, xcode_shim_peer_credentials,
-    DefaultXcodeShimProcessInspector, XcodeShimGrantResolver, XcodeShimPeerCredentials,
-    XcodeShimProcessInspector, XcodeShimResolvedDispatch,
+    handle_xcode_shim_unix_stream_with_peer_credentials, inspect_xcode_shim_process_binding,
+    xcode_shim_peer_credentials, DefaultXcodeShimProcessInspector, XcodeShimGrantResolver,
+    XcodeShimPeerCredentials, XcodeShimProcessInspector, XcodeShimResolvedDispatch,
 };
 pub use xcode_shim::{
     dispatch_xcode_shim_request, dispatch_xcode_shim_socket_request, XcodeHostExecutorPlan,
