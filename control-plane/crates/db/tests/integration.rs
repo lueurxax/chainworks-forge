@@ -1059,6 +1059,70 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
 }
 
 #[tokio::test]
+async fn proposal_051_xcode_runtime_observation_append_serializes_parallel_writers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_file = tmp.path().join("p051-observation-contention.db");
+    let db_url = format!("sqlite://{}", db_file.display());
+    let pool = create_pool(&db_url).await.unwrap();
+    let execution_id = insert_p051_test_agent_execution(&pool).await;
+    let writer_count = 12usize;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writer_count));
+
+    let mut handles = Vec::new();
+    for idx in 0..writer_count {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            agent_executions::append_xcode_runtime_observation(
+                &pool,
+                execution_id,
+                XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+                    source: "xcode_mcp_broker".into(),
+                    backend_start_disposition: "lease_active".into(),
+                    pool_id: Some("pool-1".into()),
+                    lease_id: Some(format!("lease-{idx}")),
+                    xcode_pid: Some("36971".into()),
+                    backend_process_id: Some(25000 + idx as i64),
+                    http_endpoint: Some(format!("http://127.0.0.1:4000/xcode-mcp/lease-{idx}")),
+                    xcode_home_disposition: Some("host_operator_home_available".into()),
+                    xcode_tmpdir_disposition: Some("darwin_tmpdir_available".into()),
+                    simulator_selection: None,
+                    sibling_leases_at_spawn: Some(idx as i64),
+                    backend_initialize_wait_ms: Some(0),
+                    backend_startup_latency_ms: None,
+                    http_session_startup_latency_ms: None,
+                    backend_failure_class: None,
+                    originating_execution_id: Some(execution_id.to_string()),
+                    prompt_cycle_index: None,
+                    status_update: Some(format!("parallel observation {idx}")),
+                }),
+            )
+            .await
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+
+    let execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .expect("execution should exist");
+    let observation: XcodeRuntimeObservation = serde_json::from_str(
+        execution
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .expect("observation should be persisted"),
+    )
+    .unwrap();
+    assert_eq!(observation.mcp_broker_observations.len(), writer_count);
+    assert!(!observation.storage.truncated);
+    assert_eq!(observation.storage.total_events_dropped, 0);
+}
+
+#[tokio::test]
 async fn proposal_051_xcode_runtime_observation_append_enforces_event_and_byte_bounds() {
     let pool = test_pool().await;
     let execution_id = insert_p051_test_agent_execution(&pool).await;

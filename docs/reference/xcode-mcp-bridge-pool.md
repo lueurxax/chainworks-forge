@@ -66,6 +66,14 @@ Implemented behavior:
 - shutdown drains broker lease cleanup before waiting on provider session close,
 - backend failures, first-connect timeouts, target ambiguity, capacity exhaustion, disabled broker state, and policy denials emit typed observations.
 
+### Shared Backend Model
+
+The implemented backend identity is `run_id + Xcode pid + developer_dir`. For that key the pool owns one initialized `xcrun mcpbridge` subprocess and maps sibling HTTP leases to it with reference-counted ownership. The last released lease closes the backend. Backend failure removes the mapped leases so a retry gets a fresh backend.
+
+Lease isolation remains at the broker facade: each lease keeps its own bearer token and `BrokerMcpPolicy`, and authorization or tool denial happens before any request reaches the shared backend. The first lease forwards the real MCP `initialize` to `mcpbridge`; later sibling leases receive the cached initialize result with the caller's JSON-RPC id. Only the first `notifications/initialized` is forwarded, while duplicates are no-op acknowledgements.
+
+Requests to one shared backend use an ordered stdio request pump rather than concurrent writes to the same process. Leases for different run/Xcode-target keys use independent backend processes.
+
 Provider sessions do not receive host-home access for their ordinary runtime state. Host Xcode work is routed through the broker/shim boundary.
 
 ## Shim Dispatch

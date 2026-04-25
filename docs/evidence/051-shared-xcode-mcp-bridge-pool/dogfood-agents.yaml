@@ -1,0 +1,171 @@
+schema_version: 1
+app:
+  name: Chainworks P051 Dogfood
+  runtime: acp
+  transport: acp_stdio
+  description: Minimal catalog for live P051 Gemini Xcode broker dogfood.
+  required_providers:
+    - claude_acp
+    - gemini_acp
+artifacts:
+  idea_brief: ${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md
+  proposal_review_ux: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ux.json
+  proposal_review_ui: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json
+contracts:
+  proposal_review_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: proposal_review_raw
+    normalized_artifact_name: proposal_review_normalized
+    required_fields:
+      - agent_id
+      - role
+      - score
+      - decision
+      - verdict
+      - summary
+      - issues
+      - blocking_issues
+      - non_blocking_issues
+      - suggestions
+      - assumptions
+runtime_profiles:
+  claude_agent_acp:
+    capability_class: operator_grade
+    adapter_family: claude_agent_acp
+    requires:
+      - streaming
+      - tools
+      - permission_callbacks
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
+  gemini_cli_acp:
+    capability_class: control_capable
+    adapter_family: gemini_cli_acp
+    requires:
+      - streaming
+      - tools
+    transport_kind: acp_stdio
+    mcp_realization_path: acp_native
+backend_profiles:
+  claude_orchestrator_p051:
+    provider: claude_acp
+    model: opus
+    effort: medium
+    temperature: 0.1
+    max_turns: 8
+    structured_output: preferred
+    mcp: []
+    runtime_profile: claude_agent_acp
+  gemini_review_pro_xcode:
+    provider: gemini_acp
+    runtime_profile: gemini_cli_acp
+    model: gemini-2.5-pro
+    effort: medium
+    temperature: 0.1
+    max_turns: 4
+    structured_output: required
+    mcp:
+      - xcode
+permission_profiles:
+  ORCH:
+    filesystem:
+      read:
+        - ${CHAINWORKS_REPO_ROOT:-.}/**
+        - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+        - ${CHAINWORKS_META_ROOT:-.chainworks}/context/**
+    git:
+      status: true
+      diff: false
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow: []
+      deny:
+        - "*"
+    network:
+      allow: []
+    mcp:
+      legacy_allow: []
+      runtime_authority: false
+  RO_REVIEW_XCODE:
+    filesystem:
+      read:
+        - ${CHAINWORKS_REPO_ROOT:-.}/**
+        - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+        - ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow: []
+      deny:
+        - "*"
+    network:
+      allow:
+        - connect
+    mcp:
+      legacy_allow:
+        - xcode
+      runtime_authority: true
+agents:
+  - id: p051_dogfood_orchestrator
+    title: P051 Dogfood Orchestrator
+    mode: orchestration
+    backend_profile: claude_orchestrator_p051
+    permission_profile: ORCH
+    inputs:
+      - input.idea
+    outputs:
+      - idea_brief
+    requires_human_approval: false
+    prompt: >
+      Normalize the operator request into a concise review brief for P051
+      Gemini Xcode broker dogfood. Produce only the idea brief.
+  - id: p051_gemini_ux_xcode
+    title: P051 Gemini UX Xcode Reviewer
+    mode: proposal_review.ux
+    backend_profile: gemini_review_pro_xcode
+    permission_profile: RO_REVIEW_XCODE
+    inputs:
+      - idea_brief
+    outputs:
+      - proposal_review_ux
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    prompt: >
+      Review the P051 dogfood brief from a UX perspective. Use the brokered
+      Xcode MCP server exactly once to confirm live app context, then stop
+      tool use and immediately return only:
+      <<<CHAINWORKS_OUTPUT:proposal_review_ux>>>{...}<<<END_CHAINWORKS_OUTPUT>>>
+      The JSON object inside the marker must satisfy proposal_review_v1 with
+      agent_id, role, score, decision, verdict, summary, issues,
+      blocking_issues, non_blocking_issues, suggestions, and assumptions.
+      Do not use Markdown fences or prose outside the marker.
+  - id: p051_gemini_ui_xcode
+    title: P051 Gemini UI Xcode Reviewer
+    mode: proposal_review.ui
+    backend_profile: gemini_review_pro_xcode
+    permission_profile: RO_REVIEW_XCODE
+    inputs:
+      - idea_brief
+    outputs:
+      - proposal_review_ui
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    prompt: >
+      Review the P051 dogfood brief from a UI perspective. Use the brokered
+      Xcode MCP server exactly once to confirm live app context, then stop
+      tool use and immediately return only:
+      <<<CHAINWORKS_OUTPUT:proposal_review_ui>>>{...}<<<END_CHAINWORKS_OUTPUT>>>
+      The JSON object inside the marker must satisfy proposal_review_v1 with
+      agent_id, role, score, decision, verdict, summary, issues,
+      blocking_issues, non_blocking_issues, suggestions, and assumptions.
+      Do not use Markdown fences or prose outside the marker.

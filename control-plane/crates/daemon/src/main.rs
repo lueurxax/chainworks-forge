@@ -51,9 +51,11 @@ use db::migrate::{self, MigrationError, MigrationOutcome};
 use domain::lifecycle::{
     DaemonLifecycleState, FailureKind, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
 };
+use domain::provider::InvokeAgentCapacityConfig;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::new_bus;
 use engine::executor::BackgroundExecutor;
+use engine::host_interruption::{spawn_runtime_heartbeat_monitor, HostInterruptionService};
 use engine::lifecycle_reporter::LifecycleReporter;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
@@ -284,6 +286,19 @@ async fn main() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
+    let host_interruption_service = HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+        pool.clone(),
+        work_queue.clone(),
+        InvokeAgentCapacityConfig::default(),
+        acp.clone(),
+    );
+    let _runtime_heartbeat_monitor =
+        spawn_runtime_heartbeat_monitor(host_interruption_service.clone());
+    let _native_host_interruption_monitor =
+        daemon::host_interruption_sources::spawn_native_host_interruption_monitor(
+            host_interruption_service,
+        );
+    info!("Host interruption monitors started");
 
     // (Principal table is loaded up-front so failed-serve branches have
     // it available; see the R13 API-001 comment at the top of `main`.)

@@ -7,6 +7,8 @@ use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{XcodeRuntimeObservation, XcodeRuntimeObservationUpdate};
 
+use crate::pool::begin_immediate_with_retry;
+
 const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
                 owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
                 invocation_owner_key, session_reuse_scope, session_family_id,
@@ -183,7 +185,9 @@ pub async fn append_xcode_runtime_observation(
     update: XcodeRuntimeObservationUpdate,
 ) -> Result<()> {
     for attempt in 0..3 {
-        let mut tx = pool.begin().await?;
+        let mut tx =
+            begin_immediate_with_retry(pool, "agent_executions.append_xcode_runtime_observation")
+                .await?;
         let row = sqlx::query(
             "SELECT actual_xcode_runtime_observation_json FROM agent_executions WHERE id = ?",
         )

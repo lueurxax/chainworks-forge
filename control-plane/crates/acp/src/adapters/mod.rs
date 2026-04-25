@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -681,6 +681,10 @@ pub trait AcpAdapter: Send + Sync {
         true
     }
 
+    fn capability_probe_timeout(&self) -> Duration {
+        crate::transport::handshake_timeout_for_provider(self.provider_name())
+    }
+
     async fn probe_capabilities_from_launch_spec(
         &self,
         launch_spec: &AcpLaunchSpec,
@@ -702,7 +706,9 @@ pub trait AcpAdapter: Send + Sync {
                 launch_spec.binary_path
             )
         })?;
-        let initialize_result = crate::transport::probe_initialize(child).await?;
+        let initialize_result =
+            crate::transport::probe_initialize_with_timeout(child, self.capability_probe_timeout())
+                .await?;
         Ok(parse_provider_capabilities(&initialize_result))
     }
 
@@ -880,11 +886,21 @@ fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_provider_path_dirs, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
+        default_provider_path_dirs, AcpAdapter, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
         ProviderCapabilityCache, XcodeShimLaunchRuntime,
     };
     use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct ProbeTimeoutAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for ProbeTimeoutAdapter {
+        fn provider_name(&self) -> &str {
+            self.0
+        }
+    }
 
     #[derive(Default)]
     struct CapturingGrantStore {
@@ -910,6 +926,18 @@ mod tests {
         fn remove_xcode_shim_grant(&self, _token_id: &str) -> Option<XcodeShimGrantRecord> {
             None
         }
+    }
+
+    #[test]
+    fn capability_probe_timeout_uses_provider_specific_handshake_budget() {
+        assert_eq!(
+            ProbeTimeoutAdapter("gemini").capability_probe_timeout(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            ProbeTimeoutAdapter("claude").capability_probe_timeout(),
+            Duration::from_secs(90)
+        );
     }
 
     #[test]

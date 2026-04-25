@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use domain::ids::AgentExecutionId;
+use domain::ids::{AgentExecutionId, RunId};
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate,
 };
@@ -75,6 +75,7 @@ pub enum XcodeMcpLeaseState {
 
 #[derive(Clone, Debug)]
 struct LeaseRecord {
+    run_id: RunId,
     agent_execution_id: Option<AgentExecutionId>,
     endpoint: String,
     authorization_hash: String,
@@ -123,7 +124,14 @@ impl Default for XcodeMcpProcessBackendConfig {
 #[derive(Default)]
 pub struct XcodeMcpProcessBackend {
     config: XcodeMcpProcessBackendConfig,
-    sessions: Mutex<HashMap<String, Arc<Mutex<XcodeMcpProcessBackendSession>>>>,
+    registry: Mutex<XcodeMcpProcessBackendRegistry>,
+}
+
+#[derive(Default)]
+struct XcodeMcpProcessBackendRegistry {
+    sessions: HashMap<String, Arc<Mutex<XcodeMcpProcessBackendSession>>>,
+    lease_to_session: HashMap<String, String>,
+    session_ref_counts: HashMap<String, usize>,
 }
 
 struct XcodeMcpProcessBackendSession {
@@ -131,6 +139,8 @@ struct XcodeMcpProcessBackendSession {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_backend_id: u64,
+    cached_initialize_result: Option<serde_json::Value>,
+    initialized_notification_forwarded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +179,7 @@ pub enum XcodeBrokerHttpRouteState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XcodeMcpBackendRequestContext {
+    pub run_id: RunId,
     pub lease_id: String,
     pub endpoint: String,
     pub agent_execution_id: Option<AgentExecutionId>,
@@ -196,7 +207,7 @@ impl XcodeMcpProcessBackend {
     pub fn new(config: XcodeMcpProcessBackendConfig) -> Self {
         Self {
             config,
-            sessions: Mutex::new(HashMap::new()),
+            registry: Mutex::new(XcodeMcpProcessBackendRegistry::default()),
         }
     }
 
@@ -204,19 +215,42 @@ impl XcodeMcpProcessBackend {
         &self,
         context: &XcodeMcpBackendRequestContext,
     ) -> Result<Arc<Mutex<XcodeMcpProcessBackendSession>>> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(&context.lease_id) {
+        let session_key = backend_session_key(context);
+        let mut registry = self.registry.lock().await;
+        if let Some(session) = registry.sessions.get(&session_key).cloned() {
+            if !registry.lease_to_session.contains_key(&context.lease_id) {
+                registry
+                    .lease_to_session
+                    .insert(context.lease_id.clone(), session_key.clone());
+                *registry.session_ref_counts.entry(session_key).or_default() += 1;
+            }
             return Ok(session.clone());
         }
         let session = Arc::new(Mutex::new(
             XcodeMcpProcessBackendSession::spawn(&self.config, context).await?,
         ));
-        sessions.insert(context.lease_id.clone(), session.clone());
+        registry
+            .sessions
+            .insert(session_key.clone(), session.clone());
+        registry
+            .lease_to_session
+            .insert(context.lease_id.clone(), session_key.clone());
+        registry.session_ref_counts.insert(session_key, 1);
         Ok(session)
     }
 
     async fn remove_session_after_failure(&self, lease_id: &str) {
-        let session = self.sessions.lock().await.remove(lease_id);
+        let session = {
+            let mut registry = self.registry.lock().await;
+            let Some(session_key) = registry.lease_to_session.remove(lease_id) else {
+                return;
+            };
+            registry
+                .lease_to_session
+                .retain(|_, mapped_key| mapped_key != &session_key);
+            registry.session_ref_counts.remove(&session_key);
+            registry.sessions.remove(&session_key)
+        };
         if let Some(session) = session {
             let _ = session.lock().await.close().await;
         }
@@ -250,13 +284,35 @@ impl XcodeMcpBackend for XcodeMcpProcessBackend {
     }
 
     async fn backend_process_id(&self, lease_id: &str) -> Option<i64> {
-        let session = self.sessions.lock().await.get(lease_id).cloned()?;
+        let session = {
+            let registry = self.registry.lock().await;
+            let session_key = registry.lease_to_session.get(lease_id)?;
+            registry.sessions.get(session_key).cloned()?
+        };
         let session = session.lock().await;
         session.child.id().map(|pid| pid as i64)
     }
 
     async fn release_lease(&self, lease_id: &str) -> Result<()> {
-        let session = self.sessions.lock().await.remove(lease_id);
+        let session = {
+            let mut registry = self.registry.lock().await;
+            let Some(session_key) = registry.lease_to_session.remove(lease_id) else {
+                return Ok(());
+            };
+            let remaining = registry
+                .session_ref_counts
+                .get(&session_key)
+                .copied()
+                .unwrap_or(1)
+                .saturating_sub(1);
+            if remaining > 0 {
+                registry.session_ref_counts.insert(session_key, remaining);
+                None
+            } else {
+                registry.session_ref_counts.remove(&session_key);
+                registry.sessions.remove(&session_key)
+            }
+        };
         if let Some(session) = session {
             session.lock().await.close().await?;
         }
@@ -318,14 +374,50 @@ impl XcodeMcpProcessBackendSession {
             stdin,
             reader: BufReader::new(stdout),
             next_backend_id: 0,
+            cached_initialize_result: None,
+            initialized_notification_forwarded: false,
         })
     }
 
     async fn forward(&mut self, mut request: serde_json::Value) -> Result<serde_json::Value> {
-        let original_id = request
-            .get("id")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let method = request
+            .get("method")
+            .and_then(|method| method.as_str())
+            .map(str::to_string);
+        let original_id = request.get("id").cloned();
+        if original_id.is_none() {
+            if method.as_deref() == Some("notifications/initialized")
+                && self.initialized_notification_forwarded
+            {
+                return Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "result": serde_json::Value::Null
+                }));
+            }
+            write_json_line(&mut self.stdin, &request)
+                .await
+                .context("xcode_mcp_backend_write_failed: send notification to backend process")?;
+            if method.as_deref() == Some("notifications/initialized") {
+                self.initialized_notification_forwarded = true;
+            }
+            return Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": serde_json::Value::Null,
+                "result": serde_json::Value::Null
+            }));
+        }
+
+        let original_id = original_id.unwrap_or(serde_json::Value::Null);
+        if method.as_deref() == Some("initialize") {
+            if let Some(cached_result) = self.cached_initialize_result.clone() {
+                return Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": original_id,
+                    "result": cached_result
+                }));
+            }
+        }
         self.next_backend_id += 1;
         let backend_id = self.next_backend_id;
         request["id"] = serde_json::Value::from(backend_id);
@@ -352,6 +444,11 @@ impl XcodeMcpProcessBackendSession {
                 .context("xcode_mcp_backend_read_failed: parse backend JSON-RPC response")?;
             if response.get("id").and_then(|id| id.as_u64()) != Some(backend_id) {
                 continue;
+            }
+            if method.as_deref() == Some("initialize") {
+                if let Some(result) = response.get("result").cloned() {
+                    self.cached_initialize_result = Some(result);
+                }
             }
             response["id"] = original_id;
             return Ok(response);
@@ -735,6 +832,7 @@ impl XcodeMcpBridgePool {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
             };
             XcodeMcpBackendRequestContext {
+                run_id: lease.run_id,
                 lease_id: lease_id.to_string(),
                 endpoint: lease.endpoint.clone(),
                 agent_execution_id: lease.agent_execution_id,
@@ -1546,6 +1644,7 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
                 state.leases.insert(
                     lease_id.clone(),
                     LeaseRecord {
+                        run_id: req.run_id,
                         agent_execution_id: req.agent_execution_id,
                         endpoint: endpoint.clone(),
                         authorization_hash: hash_secret(&bearer_token),
@@ -1797,6 +1896,19 @@ fn initialize_lock_key(context: &XcodeMcpBackendRequestContext) -> String {
         .as_ref()
         .map(|snapshot| format!("xcode-pid:{}", snapshot.xcode_pid))
         .unwrap_or_else(|| "xcode-pid:unresolved".to_string())
+}
+
+fn backend_session_key(context: &XcodeMcpBackendRequestContext) -> String {
+    context
+        .target_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            format!(
+                "run:{}:xcode-pid:{}:developer-dir:{}",
+                context.run_id, snapshot.xcode_pid, snapshot.developer_dir
+            )
+        })
+        .unwrap_or_else(|| format!("lease:{}", context.lease_id))
 }
 
 fn target_snapshot_matches_host(snapshot: &XcodeTargetSnapshot, host: &HostProbeContext) -> bool {

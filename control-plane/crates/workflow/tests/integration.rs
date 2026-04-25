@@ -11,6 +11,10 @@ fn fixtures_dir() -> String {
     format!("{manifest}/../../../examples")
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
 fn write_temp_fixture(filename: &str, content: &str) -> String {
     let unique = TEMP_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -140,6 +144,46 @@ fn p051_example_catalogs_explicitly_mark_xcode_required_tools_for_host_execution
         assert!(
             missing.is_empty(),
             "{relative_path} agents with Xcode required_tools must explicitly set requires_xcode_host_execution: true: {missing:?}"
+        );
+    }
+}
+
+#[test]
+fn p051_dogfood_workflow_runs_parallel_gemini_xcode_lanes() {
+    let root = repo_root();
+    let wf_path = root
+        .join("docs/evidence/051-shared-xcode-mcp-bridge-pool/dogfood-workflow.yaml")
+        .to_string_lossy()
+        .into_owned();
+    let cat_path = root
+        .join("docs/evidence/051-shared-xcode-mcp-bridge-pool/dogfood-agents.yaml")
+        .to_string_lossy()
+        .into_owned();
+
+    let plan = compiler::compile(&wf_path, &cat_path).expect("should compile P051 dogfood plan");
+    let review_state = &plan.states["state_2_parallel_gemini_xcode_review"];
+
+    assert_eq!(
+        review_state.tasks.len(),
+        2,
+        "dogfood review fan-out is parallel"
+    );
+    for agent_id in ["p051_gemini_ux_xcode", "p051_gemini_ui_xcode"] {
+        let task = review_state
+            .tasks
+            .iter()
+            .find(|task| task.agent.agent_id == agent_id)
+            .unwrap_or_else(|| panic!("missing {agent_id} reviewer task"));
+
+        assert_eq!(task.agent.provider, "gemini", "{agent_id} uses Gemini");
+        assert_eq!(
+            task.agent.requested_mcp_server_ids,
+            vec!["xcode".to_string()],
+            "{agent_id} requests only brokered Xcode MCP"
+        );
+        assert!(
+            task.agent.xcode_broker_required,
+            "{agent_id} is marked as requiring the Xcode broker"
         );
     }
 }

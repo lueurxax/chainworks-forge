@@ -22,6 +22,16 @@ struct Chainworks_ForgeAppTests {
         ]))
     }
 
+    @Test("Unit test host detection treats an empty XCTest configuration path as active")
+    func testHostDetectionUsesEnvironmentKeyPresence() {
+        #expect(Chainworks_ForgeApp.isTestHost(for: [
+            "XCTestConfigurationFilePath": ""
+        ]))
+        #expect(!Chainworks_ForgeApp.isTestHost(for: [
+            "CHAINWORKS_UI_TEST_MODE": "1"
+        ]))
+    }
+
     @Test("Packaged daemon LaunchAgent lookup uses bundle root, not Resources")
     func packagedDaemonAgentLookupUsesBundleRoot() throws {
         let root = FileManager.default.temporaryDirectory
@@ -39,5 +49,29 @@ struct Chainworks_ForgeAppTests {
         try Data("<plist/>".utf8).write(to: plistURL)
 
         #expect(Chainworks_ForgeApp.packagedDaemonAgentPlistURL(in: bundleURL) == plistURL)
+    }
+
+    @Test("LaunchAgent kickstart targets the submitted GUI service without forcing restart")
+    func launchAgentKickstartArgumentsDoNotForceRestart() {
+        #if os(macOS)
+        #expect(
+            Chainworks_ForgeApp.launchctlKickstartArguments(
+                label: "com.chainworks.forge.daemon",
+                uid: 501
+            ) == [
+                "kickstart",
+                "gui/501/com.chainworks.forge.daemon",
+            ])
+        #expect(
+            Chainworks_ForgeApp.launchctlKickstartArguments(
+                label: "com.chainworks.forge.daemon",
+                uid: 501,
+                force: true
+            ) == [
+                "kickstart",
+                "-k",
+                "gui/501/com.chainworks.forge.daemon",
+            ])
+        #endif
     }
 }

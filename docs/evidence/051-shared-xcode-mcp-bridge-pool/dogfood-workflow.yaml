@@ -1,0 +1,61 @@
+schema_version: 1
+workflow:
+  id: p051_gemini_xcode_dogfood
+  name: P051 Gemini Xcode Broker Dogfood
+  uses_agent_catalog: dogfood-agents.yaml
+  description: >
+    Direct live dogfood workflow for P051. It bypasses proposal authoring and
+    runs two parallel Gemini reviewers that both request brokered Xcode MCP.
+  idea_input:
+    mode: text_with_optional_file
+  execution:
+    single_active_run_per_idea: true
+    resume_policy: automatic_on_launch
+    requires_project_access: true
+  required_providers:
+    - claude_acp
+    - gemini_acp
+failure_policy:
+  on_error: pause_and_require_human
+  preserve_artifacts: true
+initial_state: state_1_idea_received
+states:
+  state_1_idea_received:
+    label: Idea received
+    type: start
+    owner: p051_dogfood_orchestrator
+    run:
+      sequence:
+        - agent: p051_dogfood_orchestrator
+          task: normalize_p051_dogfood_brief
+          inputs:
+            - input.idea
+          outputs:
+            - idea_brief
+    transitions:
+      - to: state_2_parallel_gemini_xcode_review
+        when: exists('idea_brief')
+  state_2_parallel_gemini_xcode_review:
+    label: Parallel Gemini Xcode review
+    owner: p051_dogfood_orchestrator
+    run:
+      parallel:
+        - agent: p051_gemini_ux_xcode
+          task: dogfood_ux_review_with_xcode_broker
+          inputs:
+            - idea_brief
+          outputs:
+            - proposal_review_ux
+        - agent: p051_gemini_ui_xcode
+          task: dogfood_ui_review_with_xcode_broker
+          inputs:
+            - idea_brief
+          outputs:
+            - proposal_review_ui
+    transitions:
+      - to: state_3_workflow_complete
+        when: "exists('proposal_review_ux') and exists('proposal_review_ui')"
+  state_3_workflow_complete:
+    label: Workflow complete
+    type: end
+    owner: p051_dogfood_orchestrator

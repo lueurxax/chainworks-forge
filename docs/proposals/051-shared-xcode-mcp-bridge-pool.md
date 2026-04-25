@@ -60,8 +60,8 @@
   },
   "goals": [
     "Serve Xcode MCP to ACP providers through Chainworks-owned HTTP streaming endpoints instead of provider-owned `xcrun mcpbridge` stdio entries.",
-    "Spawn one backend `xcrun mcpbridge` subprocess per provider HTTP lease, under host-user Xcode environment.",
-    "Serialize backend spawn plus MCP `initialize` per Xcode PID, then allow `tools/*` parallelism across independent leases and backends.",
+    "Share one initialized backend `xcrun mcpbridge` subprocess per `run_id + Xcode pid + developer_dir`, under the host-user Xcode environment, while keeping provider HTTP leases and policies isolated at the broker facade.",
+    "Serialize first backend spawn plus MCP `initialize` per Xcode target, return cached initialize results to sibling leases, and route same run/target `tools/*` calls through one ordered backend pump while different run/target keys use independent backend processes.",
     "Preserve provider fake-home isolation for ACP/model/client state.",
     "Fail closed before lease, token, backend process, shim token, or `session/new` payload allocation when the provider does not advertise HTTP MCP capability.",
     "Guard direct Xcode shell commands through PATH shims and catalog lint for the enforced boundary: PATH-based commands and catalog-declared structured commands.",
@@ -267,7 +267,7 @@
         "ARCH-005",
         "SLB-011"
       ],
-      "resolution": "Clarified that `tools/*` parallelism is cross-lease. Each lease has one stdio backend and therefore uses a per-backend ordered request pump."
+      "resolution": "Clarified that same run/target leases share one initialized stdio backend with an ordered request pump; cross-lease progress is enforced at the broker facade, and different run/target keys use independent backend processes."
     },
     {
       "issues": [
@@ -671,8 +671,8 @@
     {
       "reviewer": "architect",
       "issue_id": "ARCH-004",
-      "concern": "Per-lease bridge process model lacked capacity and backpressure.",
-      "proposal_resolution": "Defaults and failure classes are specified for active leases, initialize queue, queue timeout, spawn/initialize timeout, and first-connect deadline.",
+      "concern": "Shared initialized bridge backend model needed capacity, backpressure, and deterministic ref-counted cleanup.",
+      "proposal_resolution": "Defaults and failure classes are specified for active leases, initialize queue, queue timeout, spawn/initialize timeout, first-connect deadline, and shared-backend ref-count cleanup.",
       "where_resolved": [
         "architecture.capacity_and_backpressure",
         "metrics"
@@ -681,8 +681,8 @@
     {
       "reviewer": "architect",
       "issue_id": "ARCH-005",
-      "concern": "`tools/*` parallelism could be misread as concurrent writes to one stdio backend.",
-      "proposal_resolution": "Parallelism is explicitly cross-lease; each backend has an ordered request pump for its stdio process.",
+      "concern": "`tools/*` parallelism could be misread as concurrent writes to one shared stdio backend.",
+      "proposal_resolution": "Cross-lease progress is required, but same run/target leases share one ordered request pump; different run/target keys use independent backend processes.",
       "where_resolved": [
         "architecture.broker_backend_model",
         "acceptance_criteria"
@@ -1197,9 +1197,10 @@
       "stdio_requirement": "Stdio entries also include `type: stdio` so all providers receive canonical ACP discriminated-union shape."
     },
     "broker_backend_model": {
-      "process_model": "One backend `xcrun mcpbridge` subprocess per active provider HTTP lease. Pool keys group policy and lifecycle but do not multiplex one backend process across leases.",
-      "initialize_serialization": "A per-Xcode-PID mutex covers backend spawn plus MCP `initialize`; it releases after initialize responds.",
-      "tools_parallelism": "Default `tools/*` parallelism is cross-lease across independent backend processes. Within one lease, a per-backend ordered request pump serializes writes to the stdio backend, rewrites JSON-RPC ids, correlates responses, handles cancellation, and attributes backend errors.",
+      "process_model": "One initialized backend `xcrun mcpbridge` subprocess is shared per `run_id + Xcode pid + developer_dir`. Leases remain independent HTTP bearer/policy records; the backend registry maps leases to shared session keys, ref-counts ownership, and closes the backend only after the last mapped lease releases.",
+      "initialize_serialization": "A per-Xcode-target mutex covers first backend spawn plus real MCP `initialize`. Later leases on the same run/target return the cached initialize result with the caller's JSON-RPC id and do not forward a duplicate `initialize` to `mcpbridge`.",
+      "initialized_notification_handling": "Only the first `notifications/initialized` reaches the backend. Duplicate initialized notifications from sibling leases are synthetic no-ops at the broker facade.",
+      "tools_parallelism": "Cross-lease tools progress is required, but same run/target leases share one ordered stdio request pump rather than independent backend processes. Requests to one shared backend are serialized by the backend mutex; leases for different run/target keys use independent backend processes. Per-lease HTTP authorization and `BrokerMcpPolicy` filtering/denial happen before any shared backend forwarding.",
       "host_env": [
         "`HOME=<operator home from getpwuid(getuid()) or daemon config override>`",
         "`TMPDIR=<operator Darwin user temp dir>`",
@@ -1534,7 +1535,7 @@
     },
     {
       "failure": "Backend bridge crashes",
-      "behavior": "Fail only that lease with per-lease backend failure; siblings continue."
+      "behavior": "Fail the request with backend failure, remove the crashed shared backend session and all mapped lease-to-session bindings, then let surviving leases retry through a fresh backend. Leases on different run/target backends continue."
     },
     {
       "failure": "Xcode PID drift",
@@ -1676,7 +1677,7 @@
     },
     {
       "metric": "Parallel Xcode MCP startup",
-      "threshold": "At least two parallel sessions against the same Xcode PID get isolated leases/backends, one-at-a-time initialize, and cross-lease parallel tools after initialize."
+      "threshold": "At least two parallel sessions against the same Xcode PID get isolated HTTP leases and policies, share one initialized backend for the same run/target, forward only one real initialize, and both complete `tools/list`/`tools/call` through the broker."
     },
     {
       "metric": "Modal dedup dogfood",
@@ -1765,12 +1766,12 @@
       "mitigation": "Adapter API split plus release-mode capability fingerprint check before provider launch."
     },
     {
-      "risk": "Per-lease backend model increases process count.",
-      "mitigation": "Default max eight active leases per Xcode PID, bounded initialize queue, explicit capacity failure, and dogfood fan-out proof."
+      "risk": "Shared backend serializes same-target tools traffic and may couple sibling leases through one stdio process.",
+      "mitigation": "Per-lease policy and authorization are enforced before forwarding, backend failure closes all mapped leases so retry gets a fresh backend, observations record backend PID/disposition, and dogfood proves two sibling leases complete `tools/list`/`tools/call` while showing at most one modal per Xcode process."
     },
     {
       "risk": "Initialize serialization becomes a bottleneck.",
-      "mitigation": "Lock only spawn plus initialize, report waiting status, record wait time, and keep cross-lease tools parallel."
+      "mitigation": "Lock only first spawn plus initialize, return cached initialize results to sibling leases, report waiting status, record wait time, and keep different run/target keys on independent backend processes."
     },
     {
       "risk": "Host-user env builder picks wrong GUI user.",
@@ -1830,8 +1831,8 @@
     "Executor follows the seven-phase flow and rolls back reserved state on failure.",
     "HTTP MCP transport is serialized in canonical ACP discriminated-union shape.",
     "Provider HTTP unsupported fails before lease/token/backend/session-new/shim allocation.",
-    "Parallel Xcode MCP sessions get isolated leases and backend `mcpbridge` subprocesses; initialize serializes per Xcode PID; `tools/*` runs in parallel across leases.",
-    "Each lease uses a per-backend ordered request pump for the stdio backend.",
+    "Parallel Xcode MCP sessions get isolated HTTP leases and policies mapped to one shared initialized backend per run/Xcode target; only one real `initialize` reaches `mcpbridge`; sibling lease `tools/*` calls complete through the ordered backend pump.",
+    "Each shared backend uses a per-backend ordered request pump for the stdio process and leases for different run/target keys use independent backend processes.",
     "Broker capacity and backpressure defaults are enforced and observable.",
     "Broker enablement states and `CHAINWORKS_XCODE_BROKER_DISABLED=1` rollback behavior are implemented without adding a stdio fallback.",
     "Broker-owned Xcode subprocesses run with host-user `HOME` and `TMPDIR`; ACP providers keep fake-home isolation.",
@@ -1885,7 +1886,7 @@
     },
     {
       "question": "Should policy-separated leases key on permission profile id, resolved tool allowlist hash, or both?",
-      "default_for_implementation": "Both."
+      "default_for_implementation": "Neither for backend identity in P051. Per-lease `BrokerMcpPolicy` remains authoritative at the HTTP facade; the shared backend key intentionally excludes permission profile and allowlist hash until a follow-up proves `mcpbridge` has policy-sensitive mutable state. Denied calls never forward to the backend."
     },
     {
       "question": "Are P025, P026, P029, P037, and P049 all implemented enough for P051 to start?",

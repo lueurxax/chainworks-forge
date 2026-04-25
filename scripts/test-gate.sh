@@ -2462,6 +2462,12 @@ stale_checks = [
     ("direct pgrep newest-Xcode selection", ["pgrep", "newest xcode"]),
     ("unbound same-uid-only shim authorization", ["same-uid-only", "same uid only"]),
 ]
+strict_stale_checks = [
+    ("backend per provider HTTP lease", ["per provider http lease", "per-provider http lease", "per active provider http lease"]),
+    ("independent same-target leases/backends", ["independent leases and backends", "across independent leases and backends", "isolated leases/backends"]),
+    ("lease-owned stdio backend", ["each lease has one stdio backend"]),
+    ("per-lease backend failure semantics", ["fail only that lease", "fail only that lease with per-lease backend failure"]),
+]
 allowed_context_markers = [
     "absent",
     "concern",
@@ -2493,6 +2499,15 @@ for label, needles in stale_checks:
         offending_lines.append(line_number)
     if offending_lines:
         stale.append(label)
+
+for label, needles in strict_stale_checks:
+    offending_lines = []
+    for line_number, line in enumerate(lines, start=1):
+        normalized = line.lower()
+        if any(needle in normalized for needle in needles):
+            offending_lines.append(line_number)
+    if offending_lines:
+        stale.append(f"{label} at lines {offending_lines}")
 
 if stale:
     raise SystemExit(

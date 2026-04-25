@@ -240,7 +240,7 @@ const MAX_STREAMED_TRANSCRIPT_BYTES: usize = 10 * 1024 * 1024;
 const STREAMED_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[chainworks transcript truncated at 10485760 bytes]\n";
 
-fn handshake_timeout_for_provider(provider: &str) -> Duration {
+pub(crate) fn handshake_timeout_for_provider(provider: &str) -> Duration {
     if provider.eq_ignore_ascii_case("gemini") {
         GEMINI_HANDSHAKE_TIMEOUT
     } else {
@@ -1040,7 +1040,14 @@ async fn diagnose_late_handshake_response(
     }
 }
 
-pub async fn probe_initialize(mut child: Child) -> Result<Value> {
+pub async fn probe_initialize(child: Child) -> Result<Value> {
+    probe_initialize_with_timeout(child, HANDSHAKE_TIMEOUT).await
+}
+
+pub(crate) async fn probe_initialize_with_timeout(
+    mut child: Child,
+    handshake_timeout: Duration,
+) -> Result<Value> {
     let mut stdin = child
         .stdin
         .take()
@@ -1070,7 +1077,7 @@ pub async fn probe_initialize(mut child: Child) -> Result<Value> {
     .await
     .context("ACP: send capability probe initialize")?;
 
-    let result = await_response(&mut reader, 1, HANDSHAKE_TIMEOUT)
+    let result = await_response(&mut reader, 1, handshake_timeout)
         .await
         .context("ACP: capability probe initialize handshake")?;
 
