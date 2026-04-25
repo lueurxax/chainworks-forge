@@ -1,11 +1,22 @@
 # P051 Dogfood And Sign-Off
 
-Date: 2026-04-25
+Date: 2026-04-26
 
-Status: `HOLD` pending explicit release-owner `GO`.
+Status: `GO` for P051 closeout.
 
 This artifact records live dogfood evidence separately from fixture evidence. It
-does not claim release-owner sign-off.
+records release-owner sign-off for the P051 broker/readback and live dev-daemon
+dogfood scope.
+
+## Release-Owner Sign-Off
+
+| Field | Value |
+|---|---|
+| Decision | `GO` for P051 closeout |
+| Signer | Operator / release owner, confirmed in Codex thread |
+| Timestamp | 2026-04-26 00:42 +0300 |
+| Scope | P051 broker/readback implementation plus live dogfood through `com.chainworks.forge.daemon.manual.p051` |
+| Production rollout boundary | Production `com.chainworks.forge.daemon` SMAppService validation remains owned by P042 `proposal-042-packaging` before release or broad `shim_enforced` rollout |
 
 ## Completed Evidence
 
@@ -269,12 +280,12 @@ the active proof remains the manual dogfood daemon.
 | Observation pressure | Retry exhaustion, truncation, append pressure | No broker persistence failures; health reports `observation_persistence_failures=0` after R9 |
 | Parallel tools success | Cross-lease tools after initialize | Satisfied in R9: both parallel leases completed `tools/list` and follow-up `tools/call` through the broker |
 | Production packaged daemon | Release-host SMAppService packaging validation | Scoped out of P051 closeout; remains owned by P042 `proposal-042-packaging` before release/broad rollout |
-| Operator/release-owner decision | Explicit `GO`/`HOLD` with signer and timestamp | `HOLD`; no signed `GO` |
+| Operator/release-owner decision | Explicit `GO`/`HOLD` with signer and timestamp | `GO`; operator/release owner confirmed P051 closeout scope at 2026-04-26 00:42 +0300 |
 
 ## Stop Sign
 
-Do not mark P051 release-ready or operator-signed-off until an explicit human
-`GO` is attached.
+P051 broker/readback closeout is operator-signed-off for the scoped evidence
+above.
 
 Do not mark release/broad `shim_enforced` rollout ready until the production
 `com.chainworks.forge.daemon` SMAppService path is validated by P042
