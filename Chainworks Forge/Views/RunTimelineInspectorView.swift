@@ -13,7 +13,8 @@ struct FocusedTimelineSpineEntry: Identifiable, Sendable {
 
 func buildFocusedTimelineSpineEntries(
     liveTimeline: [LiveExecutionTimelineEntry],
-    persistedTimeline: [WorkflowMapPersistedTimelineEntry]
+    persistedTimeline: [WorkflowMapPersistedTimelineEntry],
+    xcodeRuntimeObservations: [WorkflowMapXcodeRuntimeObservation] = []
 ) -> [FocusedTimelineSpineEntry] {
     let liveEntries = liveTimeline.map { entry in
         FocusedTimelineSpineEntry(
@@ -28,20 +29,35 @@ func buildFocusedTimelineSpineEntries(
         )
     }
 
-        let persistedEntries = persistedTimeline.map { entry in
+    let persistedEntries = persistedTimeline.map { entry in
+        FocusedTimelineSpineEntry(
+            id: entry.id,
+            title: entry.title,
+            detail: entry.detail,
+            timestamp: entry.timestamp,
+            stageID: "persisted",
+            surfaceLabel: "persisted",
+            sessionID: entry.sessionID,
+            liveEvent: nil
+        )
+    }
+
+    let xcodePolicyWarnings = xcodeRuntimeObservations.flatMap { observation in
+        observation.coalescedShimWarnings.enumerated().map { index, warning in
             FocusedTimelineSpineEntry(
-                id: entry.id,
-                title: entry.title,
-                detail: entry.detail,
-                timestamp: entry.timestamp,
-                stageID: "persisted",
-                surfaceLabel: "persisted",
-                sessionID: entry.sessionID,
+                id: "\(observation.id)::policy-warning::\(index)",
+                title: "Policy Warning",
+                detail: "\(warning.policyReason): \(warning.matchedSubstring)",
+                timestamp: warning.timestamp ?? Date(timeIntervalSince1970: 0),
+                stageID: observation.stageID,
+                surfaceLabel: "policy_warning",
+                sessionID: nil,
                 liveEvent: nil
             )
         }
+    }
 
-    return (liveEntries + persistedEntries).sorted { lhs, rhs in
+    return (liveEntries + persistedEntries + xcodePolicyWarnings).sorted { lhs, rhs in
         if lhs.timestamp == rhs.timestamp {
             return lhs.id > rhs.id
         }
@@ -56,7 +72,11 @@ struct RunTimelineInspectorView: View {
     var body: some View {
         let timelineEntries = buildFocusedTimelineSpineEntries(
             liveTimeline: projection.liveTimeline,
-            persistedTimeline: projection.persistedTimeline
+            persistedTimeline: projection.persistedTimeline,
+            xcodeRuntimeObservations: projection.xcodeRuntimeObservations
+        )
+        let bridgeProgressStatus = latestXcodeBridgeProgressStatus(
+            in: projection.xcodeRuntimeObservations
         )
         ScrollViewReader { proxy in
             ScrollView {
@@ -69,6 +89,17 @@ struct RunTimelineInspectorView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                    }
+
+                    if let bridgeProgressStatus {
+                        Label {
+                            Text(bridgeProgressStatus.label)
+                                .font(.callout.weight(.semibold))
+                        } icon: {
+                            Image(systemName: bridgeProgressStatus.kind == .actionRequired ? "exclamationmark.shield" : "point.3.connected.trianglepath.dotted")
+                        }
+                        .foregroundStyle(bridgeProgressStatus.kind == .actionRequired ? .orange : .secondary)
+                        .accessibilityIdentifier("xcode-bridge-progress-status")
                     }
 
                     if !projection.xcodeRuntimeObservations.isEmpty {
@@ -99,6 +130,16 @@ struct RunTimelineInspectorView: View {
 
                                         if let liveEvent = entry.liveEvent {
                                             TimelineEventDetailView(event: liveEvent)
+                                        } else if entry.surfaceLabel == "policy_warning" {
+                                            Label {
+                                                Text(entry.detail)
+                                                    .font(.caption)
+                                                    .textSelection(.enabled)
+                                            } icon: {
+                                                Image(systemName: "exclamationmark.shield")
+                                            }
+                                            .foregroundStyle(.orange)
+                                            .accessibilityIdentifier("xcode-policy-warning")
                                         } else {
                                             Text(entry.detail)
                                                 .font(.caption)
@@ -197,6 +238,9 @@ private struct XcodeRuntimeObservationCard: View {
                         .accessibilityIdentifier("xcode-lease-id")
                     runtimeRow("Backend PID", broker.backendProcessID.map(String.init) ?? "none")
                         .accessibilityIdentifier("xcode-backend-pid")
+                    if let brokerHealth = observation.brokerHealthLabel {
+                        runtimeRow("Broker Health", brokerHealth)
+                    }
                     runtimeRow("Start", broker.statusUpdate ?? broker.backendStartDisposition)
                     if let xcodePID = broker.xcodePID {
                         runtimeRow("Xcode PID", xcodePID)

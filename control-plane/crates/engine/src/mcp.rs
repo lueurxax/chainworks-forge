@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use acp::{AcpMcpServerPayload, BrokeredXcodeMcpIntent, ResolvedMcpServerTransport};
@@ -87,6 +87,11 @@ pub fn xcode_broker_contract_hash(payloads: &[AcpMcpServerPayload]) -> Option<St
     Some(format!("{:x}", Sha256::digest(raw)))
 }
 
+pub fn load_xcode_broker_tool_allowlists() -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let registry = load_machine_registry()?;
+    Ok(xcode_broker_tool_allowlists_from_registry(&registry))
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct MachineMcpRegistry {
     #[serde(default, alias = "mcpServers", alias = "mcp_servers")]
@@ -119,6 +124,14 @@ struct RegistryMcpServer {
     transport: Option<String>,
     #[serde(default, alias = "xcodePidSelector", alias = "xcode_pid_selector")]
     xcode_pid_selector: Option<String>,
+    #[serde(
+        default,
+        alias = "toolAllowlist",
+        alias = "tool_allowlist",
+        alias = "allowedTools",
+        alias = "allowed_tools"
+    )]
+    tool_allowlist: Vec<String>,
 }
 
 impl MachineMcpRegistry {
@@ -206,7 +219,7 @@ fn resolve_mcp_servers_from_registry(
                                 xcode_pid_selector: intent.xcode_pid_selector,
                                 runtime_profile_id: backend_profile_id.map(ToOwned::to_owned),
                                 permission_profile_id: None,
-                                resolved_tool_allowlist_hash: None,
+                                resolved_tool_allowlist_hash: intent.resolved_tool_allowlist_hash,
                                 provider_http_required: true,
                             },
                         },
@@ -314,6 +327,7 @@ fn resolve_mcp_servers_from_registry(
 
 struct XcodeIntentRegistryFields {
     xcode_pid_selector: Option<String>,
+    resolved_tool_allowlist_hash: Option<String>,
 }
 
 fn resolve_xcode_broker_intent(
@@ -339,11 +353,13 @@ fn resolve_xcode_broker_intent(
 
     if let Some((server_id, entry)) = canonical_entries.into_iter().next() {
         let runtime_id = runtime_id_for(&server_id, &entry, extension_id);
+        let resolved_tool_allowlist_hash = resolved_tool_allowlist_hash(&entry);
         return Ok((
             runtime_id,
             server_id,
             XcodeIntentRegistryFields {
                 xcode_pid_selector: entry.xcode_pid_selector,
+                resolved_tool_allowlist_hash,
             },
             None,
         ));
@@ -355,11 +371,13 @@ fn resolve_xcode_broker_intent(
         .cloned()
     {
         if is_xcrun_mcpbridge_entry(&entry) {
+            let resolved_tool_allowlist_hash = resolved_tool_allowlist_hash(&entry);
             return Ok((
                 runtime_id_for(&server_id, &entry, extension_id),
                 server_id,
                 XcodeIntentRegistryFields {
                     xcode_pid_selector: entry.xcode_pid_selector,
+                    resolved_tool_allowlist_hash,
                 },
                 Some("xcode_mcp_registry_stdio_migrated".to_string()),
             ));
@@ -383,6 +401,44 @@ fn resolve_xcode_broker_intent(
     let profile = backend_profile_id.unwrap_or("unknown");
     Err(format!(
         "xcode_mcp_registry_missing_canonical_id: MCP extension '{extension_id}' is requested by backend profile '{profile}' but no canonical 'xcode' broker entry exists."
+    ))
+}
+
+fn resolved_tool_allowlist_hash(entry: &RegistryMcpServer) -> Option<String> {
+    resolved_tool_allowlist(entry).map(|(hash, _tools)| hash)
+}
+
+fn xcode_broker_tool_allowlists_from_registry(
+    registry: &MachineMcpRegistry,
+) -> BTreeMap<String, BTreeSet<String>> {
+    registry
+        .server_entries()
+        .into_iter()
+        .filter(|(server_id, entry)| is_canonical_xcode_broker_entry(server_id, entry))
+        .filter_map(|(_, entry)| resolved_tool_allowlist(&entry))
+        .collect()
+}
+
+fn resolved_tool_allowlist(entry: &RegistryMcpServer) -> Option<(String, BTreeSet<String>)> {
+    let mut tools = entry
+        .tool_allowlist
+        .iter()
+        .filter(|tool| !tool.trim().is_empty())
+        .map(|tool| tool.trim().to_string())
+        .collect::<Vec<_>>();
+    if tools.is_empty() {
+        return None;
+    }
+    tools.sort();
+    tools.dedup();
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "tools": tools,
+    }))
+    .expect("Xcode tool allowlist payload should serialize");
+    Some((
+        format!("{:x}", Sha256::digest(raw)),
+        tools.into_iter().collect(),
     ))
 }
 
@@ -608,6 +664,97 @@ mcp:
             other => panic!("expected Xcode broker intent, got {other:?}"),
         }
         assert_ne!(first_hash, changed_hash);
+    }
+
+    #[test]
+    fn xcode_broker_contract_hash_changes_when_tool_allowlist_content_changes() {
+        let build_registry: MachineMcpRegistry = serde_yaml::from_str(
+            r#"
+mcp:
+  xcode:
+    type: xcode_broker
+    runtime_id: xcode
+    tool_allowlist: ["xcode.build"]
+"#,
+        )
+        .unwrap();
+        let test_registry: MachineMcpRegistry = serde_yaml::from_str(
+            r#"
+mcp:
+  xcode:
+    type: xcode_broker
+    runtime_id: xcode
+    tool_allowlist: ["xcode.test"]
+"#,
+        )
+        .unwrap();
+
+        let mut build_resolution = resolve_mcp_servers_from_registry(
+            &["xcode".into()],
+            Some("profile-a"),
+            "codex",
+            &build_registry,
+        );
+        let mut test_resolution = resolve_mcp_servers_from_registry(
+            &["xcode".into()],
+            Some("profile-a"),
+            "codex",
+            &test_registry,
+        );
+        attach_xcode_broker_execution_context(
+            &mut build_resolution.payloads,
+            "/workspace/project",
+            Some("workspace_write"),
+        );
+        attach_xcode_broker_execution_context(
+            &mut test_resolution.payloads,
+            "/workspace/project",
+            Some("workspace_write"),
+        );
+
+        let build_hash = xcode_broker_contract_hash(&build_resolution.payloads).unwrap();
+        let test_hash = xcode_broker_contract_hash(&test_resolution.payloads).unwrap();
+
+        let build_allowlist_hash = match &build_resolution.payloads[0].transport {
+            ResolvedMcpServerTransport::XcodeBrokerIntent { intent } => {
+                intent.resolved_tool_allowlist_hash.as_deref()
+            }
+            other => panic!("expected Xcode broker intent, got {other:?}"),
+        };
+        let test_allowlist_hash = match &test_resolution.payloads[0].transport {
+            ResolvedMcpServerTransport::XcodeBrokerIntent { intent } => {
+                intent.resolved_tool_allowlist_hash.as_deref()
+            }
+            other => panic!("expected Xcode broker intent, got {other:?}"),
+        };
+
+        assert_ne!(build_allowlist_hash, test_allowlist_hash);
+        assert_ne!(build_hash, test_hash);
+    }
+
+    #[test]
+    fn xcode_broker_tool_allowlists_from_registry_resolves_hash_table() {
+        let registry: MachineMcpRegistry = serde_yaml::from_str(
+            r#"
+mcp:
+  xcode:
+    type: xcode_broker
+    runtime_id: xcode
+    tool_allowlist: ["xcode.test", "xcode.build", "xcode.build"]
+"#,
+        )
+        .unwrap();
+
+        let allowlists = xcode_broker_tool_allowlists_from_registry(&registry);
+        let tools = allowlists
+            .values()
+            .next()
+            .expect("fixture registry should produce one allowlist");
+
+        assert_eq!(allowlists.len(), 1);
+        assert!(tools.contains("xcode.build"));
+        assert!(tools.contains("xcode.test"));
+        assert_eq!(tools.len(), 2);
     }
 
     #[test]

@@ -197,7 +197,11 @@ struct DaemonLifecycleBanner: View {
     ) -> (symbol: String, tint: Color, text: String) {
         let leases = "\(health.activeLeases)/\(health.maxActiveLeases) active"
         let queue = "\(health.queuedLeases)/\(health.maxQueuedLeases) queued"
-        let suffix = "\(leases), \(queue)"
+        let backend = health.backendAvailable ? "backend ready" : "backend missing"
+        let persistence = health.observationPersistenceFailures > 0
+            ? ", \(health.observationPersistenceFailures) observation write failures"
+            : ""
+        let suffix = "\(leases), \(queue), \(backend)\(persistence)"
         switch health.state {
         case .disabled:
             return ("pause.circle.fill", .gray, "Xcode Broker disabled — \(suffix)")

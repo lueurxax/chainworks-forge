@@ -290,6 +290,7 @@ impl AcpRuntimeManager {
     ) -> Result<OpenedAcpSession> {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = adapter.prepare_launch_spec(req, &mut resources)?;
+        launch_spec.apply_chainworks_meta_root_env(req);
         let runtime_profile_id = req
             .brokered_xcode_intents()
             .into_iter()
@@ -352,6 +353,9 @@ impl AcpRuntimeManager {
         req: &ExecutionRequest,
         launch_spec: &mut crate::adapters::AcpLaunchSpec,
     ) -> Result<()> {
+        if env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED") {
+            return Ok(());
+        }
         if !req.xcode_shim_injection_signal && !req.requires_xcode_host_execution {
             return Ok(());
         }
@@ -606,6 +610,18 @@ impl AcpRuntimeManager {
     }
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 struct OpenedAcpSession {
     session: AcpSessionHandle,
     session_req: ExecutionRequest,
@@ -676,5 +692,58 @@ mod tests {
             &sink,
             &manager.xcode_runtime_observation_sink()
         ));
+    }
+
+    #[test]
+    fn broker_disabled_env_suppresses_xcode_shim_injection() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let previous = std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED").ok();
+        std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", "1");
+
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        let mut launch_spec = crate::adapters::AcpLaunchSpec::new("/bin/sh");
+        let req = ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_xcode".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_xcode".to_string(),
+            provider: "claude".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: "/tmp/workspace".to_string(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: true,
+            requires_xcode_host_execution: true,
+        };
+
+        manager
+            .attach_xcode_shim_runtime_if_needed(&req, &mut launch_spec)
+            .unwrap();
+
+        assert!(launch_spec.xcode_shim_runtime.is_none());
+        assert!(launch_spec
+            .env
+            .iter()
+            .all(|(name, _)| !name.starts_with("CHAINWORKS_XCODE_SHIM_")));
+
+        match previous {
+            Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
+            None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
+        }
     }
 }

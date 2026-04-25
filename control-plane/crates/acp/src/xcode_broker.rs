@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,7 @@ pub struct XcodeMcpBridgePool {
     queue_notify: Notify,
     observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
     backend: Option<Arc<dyn XcodeMcpBackend>>,
+    observation_persistence_failures: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +147,8 @@ pub struct XcodeBrokerHealthSnapshot {
     pub max_active_leases: usize,
     pub max_queued_leases: usize,
     pub broker_disabled: bool,
+    pub backend_available: bool,
+    pub observation_persistence_failures: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -459,6 +462,19 @@ impl XcodeMcpBridgePool {
         Self::new_with_optional_backend(config, observation_sink, Some(backend))
     }
 
+    pub fn new_with_sink_and_process_backend(
+        config: XcodeMcpBridgePoolConfig,
+        observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
+    ) -> Self {
+        Self::new_with_sink_and_backend(
+            config,
+            observation_sink,
+            Arc::new(XcodeMcpProcessBackend::new(
+                XcodeMcpProcessBackendConfig::default(),
+            )),
+        )
+    }
+
     fn new_with_optional_backend(
         config: XcodeMcpBridgePoolConfig,
         observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
@@ -476,7 +492,16 @@ impl XcodeMcpBridgePool {
             queue_notify: Notify::new(),
             observation_sink,
             backend,
+            observation_persistence_failures: AtomicU64::new(0),
         }
+    }
+
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    pub fn has_tool_allowlist_hash(&self, hash: &str) -> bool {
+        self.config.tool_allowlists_by_hash.contains_key(hash)
     }
 
     pub async fn active_lease_count(&self) -> usize {
@@ -513,9 +538,17 @@ impl XcodeMcpBridgePool {
         let active_leases = self.active_lease_count().await;
         let queued_leases = self.queued_lease_count();
         let broker_disabled = self.broker_disabled();
+        let backend_available = self.has_backend();
+        let observation_persistence_failures = self
+            .observation_persistence_failures
+            .load(Ordering::Acquire);
         let state = if broker_disabled {
             XcodeBrokerHealthState::Disabled
+        } else if !backend_available {
+            XcodeBrokerHealthState::Failed
         } else if queued_leases > 0 || active_leases >= self.config.max_active_leases {
+            XcodeBrokerHealthState::Degraded
+        } else if observation_persistence_failures > 0 {
             XcodeBrokerHealthState::Degraded
         } else {
             XcodeBrokerHealthState::Healthy
@@ -529,6 +562,8 @@ impl XcodeMcpBridgePool {
             max_active_leases: self.config.max_active_leases,
             max_queued_leases: self.config.max_queued_leases,
             broker_disabled,
+            backend_available,
+            observation_persistence_failures,
         }
     }
 
@@ -1038,6 +1073,8 @@ impl XcodeMcpBridgePool {
             )
             .await
         {
+            self.observation_persistence_failures
+                .fetch_add(1, Ordering::AcqRel);
             warn!(
                 agent_execution_id = %agent_execution_id,
                 error = %err,
@@ -1748,6 +1785,60 @@ fn hash_secret(secret: &str) -> String {
 mod tests {
     use super::*;
     use crate::xcode_target::XcodeProcessCandidate;
+
+    struct FailingObservationSink;
+
+    #[async_trait]
+    impl XcodeRuntimeObservationSink for FailingObservationSink {
+        async fn append_xcode_runtime_observation(
+            &self,
+            _agent_execution_id: AgentExecutionId,
+            _update: XcodeRuntimeObservationUpdate,
+        ) -> Result<()> {
+            bail!("fixture persistence failure")
+        }
+    }
+
+    struct NoopBackend;
+
+    #[async_trait]
+    impl XcodeMcpBackend for NoopBackend {
+        async fn forward_json_rpc(
+            &self,
+            _context: XcodeMcpBackendRequestContext,
+            _request: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({"jsonrpc":"2.0","result":{}}))
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_persistence_failure_degrades_broker_health() {
+        let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+            XcodeMcpBridgePoolConfig::default(),
+            Arc::new(FailingObservationSink),
+            Arc::new(NoopBackend),
+        );
+
+        pool.record_observation(
+            Some(AgentExecutionId::new()),
+            pool.lease_observation(
+                "lease-fixture".to_string(),
+                "http://127.0.0.1:0/xcode-mcp/lease-fixture".to_string(),
+                None,
+                "reserved",
+                None,
+                "reserved",
+                Some(0),
+            ),
+        )
+        .await;
+
+        let health = pool.health_snapshot().await;
+        assert_eq!(health.state, XcodeBrokerHealthState::Degraded);
+        assert_eq!(health.observation_persistence_failures, 1);
+        assert!(health.backend_available);
+    }
 
     #[test]
     fn explicit_pid_snapshot_stays_valid_when_workspace_identity_is_unavailable() {

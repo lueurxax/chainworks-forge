@@ -111,6 +111,8 @@ struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
     let maxActiveLeases: Int
     let maxQueuedLeases: Int
     let brokerDisabled: Bool
+    let backendAvailable: Bool
+    let observationPersistenceFailures: Int
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -120,6 +122,24 @@ struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
         case maxActiveLeases = "max_active_leases"
         case maxQueuedLeases = "max_queued_leases"
         case brokerDisabled = "broker_disabled"
+        case backendAvailable = "backend_available"
+        case observationPersistenceFailures = "observation_persistence_failures"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = try c.decode(XcodeBrokerHealthState.self, forKey: .state)
+        poolID = try c.decode(String.self, forKey: .poolID)
+        activeLeases = try c.decode(Int.self, forKey: .activeLeases)
+        queuedLeases = try c.decode(Int.self, forKey: .queuedLeases)
+        maxActiveLeases = try c.decode(Int.self, forKey: .maxActiveLeases)
+        maxQueuedLeases = try c.decode(Int.self, forKey: .maxQueuedLeases)
+        brokerDisabled = try c.decode(Bool.self, forKey: .brokerDisabled)
+        backendAvailable = try c.decodeIfPresent(Bool.self, forKey: .backendAvailable) ?? true
+        observationPersistenceFailures = try c.decodeIfPresent(
+            Int.self,
+            forKey: .observationPersistenceFailures
+        ) ?? 0
     }
 }
 

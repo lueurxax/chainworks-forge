@@ -123,6 +123,34 @@ struct WorkflowMapXcodeRuntimeObservation: Identifiable, Sendable, Equatable {
         }
     }
 
+    var brokerHealthLabel: String? {
+        guard let broker = latestBrokerObservation else { return nil }
+        let detail = [
+            broker.backendFailureClass,
+            broker.statusUpdate,
+            broker.backendStartDisposition
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
+        .lowercased()
+
+        if detail.contains("disabled") {
+            return "Disabled"
+        }
+        if detail.contains("degraded") || detail.contains("observation_persistence") {
+            return "Degraded"
+        }
+        if broker.backendFailureClass != nil
+            || detail.contains("failed")
+            || detail.contains("timeout")
+            || detail.contains("crash")
+        {
+            return "Failed"
+        }
+        return "Healthy"
+    }
+
     var bridgeProgressStatus: WorkflowMapXcodeBridgeProgressStatus? {
         brokerObservations.reversed().compactMap {
             WorkflowMapXcodeBridgeProgressStatus(observation: $0)
@@ -164,6 +192,7 @@ struct WorkflowMapXcodeShimInvocation: Sendable, Equatable {
 }
 
 struct WorkflowMapXcodeShimWarning: Sendable, Equatable {
+    let timestamp: Date?
     let policyReason: String
     let sourceField: String
     let matchedSubstring: String
@@ -173,8 +202,7 @@ struct WorkflowMapXcodeShimWarning: Sendable, Equatable {
         [
             policyReason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             sourceField.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            matchedSubstring.trimmingCharacters(in: .whitespacesAndNewlines),
-            excerpt.trimmingCharacters(in: .whitespacesAndNewlines)
+            matchedSubstring.trimmingCharacters(in: .whitespacesAndNewlines)
         ].joined(separator: "\u{1F}")
     }
 }
@@ -259,6 +287,13 @@ func latestXcodeBridgeProgressStatus(
     observations.reversed().compactMap(\.bridgeProgressStatus).first
 }
 
+func xcodeBridgeProgressLabel(
+    baseProgressLabel: String?,
+    observations: [WorkflowMapXcodeRuntimeObservation]
+) -> String? {
+    latestXcodeBridgeProgressStatus(in: observations)?.label ?? baseProgressLabel
+}
+
 func buildXcodeRuntimeObservations(
     from persistedStages: [RunStageSnapshot]
 ) -> [WorkflowMapXcodeRuntimeObservation] {
@@ -277,6 +312,18 @@ func buildXcodeRuntimeObservations(
             return observation
         }
     }
+}
+
+private func parseWorkflowMapISO8601Date(_ value: String) -> Date? {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) {
+        return date
+    }
+
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    return plain.date(from: value)
 }
 
 private struct WorkflowMapXcodeRuntimePayload: Decodable {
@@ -314,6 +361,7 @@ private struct WorkflowMapXcodeRuntimePayload: Decodable {
         let shimWarnings = payload.xcodeShimEvents.compactMap { event -> WorkflowMapXcodeShimWarning? in
             guard case .warning(let warning) = event else { return nil }
             return WorkflowMapXcodeShimWarning(
+                timestamp: warning.timestamp,
                 policyReason: warning.policyReason,
                 sourceField: warning.sourceField,
                 matchedSubstring: warning.matchedSubstring,
@@ -421,6 +469,7 @@ private struct WorkflowMapXcodeRuntimePayload: Decodable {
                 self = .warning(try ShimWarning(from: decoder))
             default:
                 self = .warning(ShimWarning(
+                    timestamp: nil,
                     policyReason: "Unknown shim event kind: \(kind)",
                     sourceField: "kind",
                     matchedSubstring: kind,
@@ -445,16 +494,42 @@ private struct WorkflowMapXcodeRuntimePayload: Decodable {
     }
 
     struct ShimWarning: Decodable {
+        let timestamp: Date?
         let policyReason: String
         let sourceField: String
         let matchedSubstring: String
         let excerpt: String
 
         enum CodingKeys: String, CodingKey {
+            case timestamp = "ts"
             case policyReason = "policy_reason"
             case sourceField = "source_field"
             case matchedSubstring = "matched_substring"
             case excerpt
+        }
+
+        init(
+            timestamp: Date?,
+            policyReason: String,
+            sourceField: String,
+            matchedSubstring: String,
+            excerpt: String
+        ) {
+            self.timestamp = timestamp
+            self.policyReason = policyReason
+            self.sourceField = sourceField
+            self.matchedSubstring = matchedSubstring
+            self.excerpt = excerpt
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let timestampString = try container.decodeIfPresent(String.self, forKey: .timestamp)
+            timestamp = timestampString.flatMap(parseWorkflowMapISO8601Date)
+            policyReason = try container.decode(String.self, forKey: .policyReason)
+            sourceField = try container.decode(String.self, forKey: .sourceField)
+            matchedSubstring = try container.decode(String.self, forKey: .matchedSubstring)
+            excerpt = try container.decode(String.self, forKey: .excerpt)
         }
     }
 

@@ -517,6 +517,8 @@ pub struct GqlXcodeBrokerHealthSnapshot {
     pub max_active_leases: i32,
     pub max_queued_leases: i32,
     pub broker_disabled: bool,
+    pub backend_available: bool,
+    pub observation_persistence_failures: i32,
 }
 
 impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealthSnapshot {
@@ -529,6 +531,8 @@ impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealth
             max_active_leases: s.max_active_leases as i32,
             max_queued_leases: s.max_queued_leases as i32,
             broker_disabled: s.broker_disabled,
+            backend_available: s.backend_available,
+            observation_persistence_failures: s.observation_persistence_failures as i32,
         }
     }
 }

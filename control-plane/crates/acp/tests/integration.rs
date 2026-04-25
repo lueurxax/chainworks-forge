@@ -2349,7 +2349,7 @@ for line in sys.stdin:
     let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
         command: backend_script.to_string_lossy().into_owned(),
         args: Vec::new(),
-        request_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(15),
     }));
     let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
         XcodeMcpBridgePoolConfig {
@@ -2473,7 +2473,7 @@ for line in sys.stdin:
     let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
         command: backend_script.to_string_lossy().into_owned(),
         args: vec![spawn_count_path.to_string_lossy().into_owned()],
-        request_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(15),
     }));
     let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
         XcodeMcpBridgePoolConfig {

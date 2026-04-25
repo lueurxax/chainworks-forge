@@ -37,6 +37,28 @@ struct RunTimelineInspectorViewTests {
         #expect(spine.last?.sessionID == "persisted-session-1")
     }
 
+    @Test("Focused timeline includes coalesced Xcode policy warnings")
+    func focusedTimelineIncludesCoalescedXcodePolicyWarnings() {
+        let observation = xcodeObservation(
+            broker: xcodeBrokerObservation(disposition: "started", statusUpdate: "active"),
+            shimWarnings: [
+                xcodeShimWarning(path: "/usr/bin/xcodebuild", excerpt: "first direct xcodebuild"),
+                xcodeShimWarning(path: "/usr/bin/xcodebuild", excerpt: "second direct xcodebuild"),
+                xcodeShimWarning(path: "/Applications/Xcode.app/Contents/Developer/usr/bin/xcrun", excerpt: "direct xcrun"),
+            ]
+        )
+
+        let spine = buildFocusedTimelineSpineEntries(
+            liveTimeline: [],
+            persistedTimeline: [],
+            xcodeRuntimeObservations: [observation]
+        )
+
+        #expect(spine.map(\.surfaceLabel) == ["policy_warning", "policy_warning"])
+        #expect(spine.map(\.title) == ["Policy Warning", "Policy Warning"])
+        #expect(spine.contains { $0.detail.contains("/usr/bin/xcodebuild") })
+    }
+
     @Test("Xcode runtime observations decode into structured inspector rows")
     func xcodeRuntimeObservationsDecodeIntoStructuredRows() throws {
         let agentExecutionID = try #require(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
@@ -60,7 +82,7 @@ struct RunTimelineInspectorViewTests {
           }],
           "xcode_shim_events": [{
             "kind": "warning",
-            "ts": "2026-04-21T12:00:00Z",
+            "ts": "2026-04-21T12:00:00.123456Z",
             "policy_reason": "residual_absolute_path",
             "source_field": "session_update",
             "matched_substring": "/usr/bin/xcodebuild",
@@ -149,7 +171,9 @@ struct RunTimelineInspectorViewTests {
         #expect(observation.shimWarnings.count == 2)
         #expect(observation.coalescedShimWarnings.count == 1)
         #expect(observation.shimWarnings.first?.matchedSubstring == "/usr/bin/xcodebuild")
+        #expect(observation.shimWarnings.first?.timestamp != nil)
         #expect(observation.hostExecutorEvents.first?.hostEnvDisposition == "allowlist_applied")
+        #expect(observation.brokerHealthLabel == "Healthy")
     }
 
     @Test("Xcode bridge progress status maps broker runtime states")
@@ -180,6 +204,29 @@ struct RunTimelineInspectorViewTests {
         #expect(
             latestXcodeBridgeProgressStatus(in: [waiting, actionRequired])?.kind == .actionRequired
         )
+        #expect(
+            xcodeBridgeProgressLabel(
+                baseProgressLabel: "2/4 stages",
+                observations: [waiting, actionRequired]
+            ) == "Action Required: Check Xcode"
+        )
+    }
+
+    @Test("Xcode residual warnings coalesce by matched path")
+    func xcodeResidualWarningsCoalesceByMatchedPath() {
+        let observation = xcodeObservation(
+            broker: xcodeBrokerObservation(disposition: "started", statusUpdate: "active"),
+            shimWarnings: [
+                xcodeShimWarning(path: "/usr/bin/xcodebuild", excerpt: "first direct xcodebuild"),
+                xcodeShimWarning(path: "/usr/bin/xcodebuild", excerpt: "different excerpt"),
+                xcodeShimWarning(path: "/usr/bin/simctl", excerpt: "direct simctl"),
+            ]
+        )
+
+        #expect(observation.coalescedShimWarnings.map(\.matchedSubstring) == [
+            "/usr/bin/xcodebuild",
+            "/usr/bin/simctl",
+        ])
     }
 
     @Test("Xcode failure classes use friendly recovery text")
@@ -221,7 +268,8 @@ struct RunTimelineInspectorViewTests {
     }
 
     private func xcodeObservation(
-        broker: WorkflowMapXcodeBrokerObservation
+        broker: WorkflowMapXcodeBrokerObservation,
+        shimWarnings: [WorkflowMapXcodeShimWarning] = []
     ) -> WorkflowMapXcodeRuntimeObservation {
         WorkflowMapXcodeRuntimeObservation(
             id: UUID().uuidString,
@@ -231,7 +279,7 @@ struct RunTimelineInspectorViewTests {
             agentTitle: "Code Writer",
             brokerObservations: [broker],
             shimInvocations: [],
-            shimWarnings: [],
+            shimWarnings: shimWarnings,
             hostExecutorEvents: [],
             storage: WorkflowMapXcodeRuntimeStorageStatus(
                 truncated: false,
@@ -262,6 +310,16 @@ struct RunTimelineInspectorViewTests {
             statusUpdate: statusUpdate,
             simulatorSelectionMode: nil,
             simulatorID: nil
+        )
+    }
+
+    private func xcodeShimWarning(path: String, excerpt: String) -> WorkflowMapXcodeShimWarning {
+        WorkflowMapXcodeShimWarning(
+            timestamp: nil,
+            policyReason: "residual_absolute_path",
+            sourceField: "session_update",
+            matchedSubstring: path,
+            excerpt: excerpt
         )
     }
 }
