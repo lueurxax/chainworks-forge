@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "mapping_version": "1.0",
+  "entries": [],
+  "mapping_owner": "P017 implementation lead",
+  "entry_attestation_rule": "architect-reviewed",
+  "staleness_review_trigger": "Phase C slip",
+  "fail_closed_behavior": "REJECT_CLONE_MANUAL",
+  "upgrade_and_removal_criteria": "Phase C static validation authoritative"
+}

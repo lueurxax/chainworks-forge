@@ -1,0 +1,101 @@
+{
+  "artifact_id": "phase_0_approval_mediation_contract",
+  "path": "docs/proposals/017-evidence/phase-0-approval-mediation-contract.json",
+  "mediation_confirmation_store": {
+    "table": "lead_mediation_confirmations",
+    "projection": "lead_mediation_confirmation_inbox",
+    "status_enum": [
+      "pending",
+      "resolved",
+      "superseded",
+      "expired",
+      "canceled"
+    ],
+    "required_columns": [
+      "id",
+      "mediation_record_id",
+      "run_id",
+      "conflict_id",
+      "conflict_fingerprint",
+      "status",
+      "suggested_action",
+      "requested_at",
+      "deadline_at",
+      "readback_ref",
+      "idempotency_scope_key",
+      "resolved_at",
+      "resolved_by_principal_id"
+    ],
+    "uniqueness_rules": [
+      "At most one pending confirmation row may exist per mediation_record_id.",
+      "Confirmation rows become terminal or superseded inside the same engine-owned settlement transaction that resolves the mediation outcome."
+    ],
+    "expiry_behavior": [
+      "Only rows in status=pending appear in the canonical mixed inbox.",
+      "When deadline_at passes without operator action, an engine-owned watchdog or recovery pass marks the confirmation row expired and settles the linked mediation as terminal_unverifiable with a confirmation_deadline_expired reason and clone_or_manual_fallback recovery action.",
+      "Expired, superseded, canceled, and resolved rows remain available for readback and audit but may not remain in approvals.list."
+    ]
+  },
+  "mcp_contract": {
+    "approvals_list": {
+      "behavior": "Return a mixed inbox keyed by subject_kind.",
+      "authoritative_read_rule": "approvals.list unions canonical pending rows from approvals and canonical pending rows from lead_mediation_confirmations. GraphQL, projections, chainworks://approval resources, and report surfaces remain derived mirrors only and may not define freshness or pending-state truth.",
+      "subject_kinds": [
+        "stage_approval",
+        "lead_mediation_confirmation"
+      ],
+      "required_union_fields": [
+        "subject_kind",
+        "subject_id",
+        "run_id",
+        "status",
+        "requested_at",
+        "deadline_at",
+        "readback_ref"
+      ],
+      "lead_mediation_confirmation_fields": [
+        "conflict_id",
+        "conflict_fingerprint",
+        "suggested_action",
+        "resolution_mode"
+      ]
+    },
+    "approvals_resolve": {
+      "compatibility_strategy": "Additive wire-shape evolution under the existing tool name.",
+      "legacy_stage_payload": {
+        "required_fields": [
+          "run_id",
+          "stage_id",
+          "decision"
+        ],
+        "decision_enum": [
+          "granted",
+          "rejected"
+        ]
+      },
+      "lead_mediation_payload": {
+        "required_fields": [
+          "subject_kind",
+          "subject_id",
+          "decision",
+          "conflict_fingerprint",
+          "idempotency_key"
+        ],
+        "required_fixed_value": {
+          "subject_kind": "lead_mediation_confirmation"
+        },
+        "decision_enum": [
+          "confirm",
+          "manual_fallback"
+        ],
+        "optional_fields": [
+          "comment"
+        ]
+      },
+      "staleness_rules": [
+        "The mediation branch must validate subject_id, mediation_record_id linkage, conflict_fingerprint, subject status, and idempotency_key at commit time.",
+        "Stale, terminal, canceled, or superseded items fail closed with a typed stale_or_terminal result."
+      ]
+    }
+  }
+}

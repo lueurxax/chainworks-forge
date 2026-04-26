@@ -17,7 +17,8 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
                 denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
                 actual_xcode_runtime_observation_json,
-                mcp_session_startup_latency_ms"#;
+                mcp_session_startup_latency_ms,
+                owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id"#;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningAgentExecution {
@@ -47,8 +48,9 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
           predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
           denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
           actual_xcode_runtime_observation_json,
-          mcp_session_startup_latency_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          mcp_session_startup_latency_ms,
+          owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
     .bind(exec.stage_execution_id.to_string())
@@ -79,6 +81,10 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
     .bind(&exec.actual_mcp_observation_json)
     .bind(&exec.actual_xcode_runtime_observation_json)
     .bind(exec.mcp_session_startup_latency_ms)
+    .bind(exec.owner_kind.as_deref().unwrap_or("stage_execution"))
+    .bind(&exec.owner_id)
+    .bind(&exec.lead_mediation_record_id)
+    .bind(&exec.origin_stage_execution_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -325,6 +331,7 @@ pub async fn find_by_stage_tx(
 }
 
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentExecution>> {
+    // P017: Include both stage-owned and mediation-owned executions for a run.
     let prefixed_select_cols = SELECT_COLS
         .split(',')
         .map(|col| format!("ae.{}", col.trim()))
@@ -333,11 +340,15 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentEx
     let query = format!(
         "SELECT {prefixed_select_cols}
          FROM agent_executions ae
-         INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-         WHERE se.run_id = ?
+         LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+         LEFT JOIN lead_conflict_mediations lcm
+             ON ae.owner_kind = 'lead_conflict_mediation'
+             AND ae.lead_mediation_record_id = lcm.id
+         WHERE se.run_id = ? OR lcm.run_id = ?
          ORDER BY ae.started_at ASC"
     );
     let rows = sqlx::query(&query)
+        .bind(run_id.to_string())
         .bind(run_id.to_string())
         .fetch_all(pool)
         .await?;
@@ -349,6 +360,7 @@ pub async fn list_by_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
 ) -> Result<Vec<AgentExecution>> {
+    // P017: Include both stage-owned and mediation-owned executions for a run.
     let prefixed_select_cols = SELECT_COLS
         .split(',')
         .map(|col| format!("ae.{}", col.trim()))
@@ -357,11 +369,15 @@ pub async fn list_by_run_tx(
     let query = format!(
         "SELECT {prefixed_select_cols}
          FROM agent_executions ae
-         INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-         WHERE se.run_id = ?
+         LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+         LEFT JOIN lead_conflict_mediations lcm
+             ON ae.owner_kind = 'lead_conflict_mediation'
+             AND ae.lead_mediation_record_id = lcm.id
+         WHERE se.run_id = ? OR lcm.run_id = ?
          ORDER BY ae.started_at ASC"
     );
     let rows = sqlx::query(&query)
+        .bind(run_id.to_string())
         .bind(run_id.to_string())
         .fetch_all(&mut **tx)
         .await?;
@@ -374,16 +390,26 @@ pub async fn cancel_running_by_run(
     run_id: RunId,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
+    // BLK-003: Cancel both stage-owned and mediation-owned executions for the run.
     sqlx::query(
         "UPDATE agent_executions
          SET status = ?, completed_at = ?
-         WHERE status = ? AND stage_execution_id IN (
-             SELECT id FROM stage_executions WHERE run_id = ?
+         WHERE status = ? AND (
+             stage_execution_id IN (
+                 SELECT id FROM stage_executions WHERE run_id = ?
+             )
+             OR (
+                 owner_kind = 'lead_conflict_mediation'
+                 AND lead_mediation_record_id IN (
+                     SELECT id FROM lead_conflict_mediations WHERE run_id = ?
+                 )
+             )
          )",
     )
     .bind(AgentStatus::Cancelled.to_string())
     .bind(completed_at.to_rfc3339())
     .bind(AgentStatus::Running.to_string())
+    .bind(run_id.to_string())
     .bind(run_id.to_string())
     .execute(pool)
     .await?;
@@ -395,16 +421,26 @@ pub async fn cancel_running_by_run_tx(
     run_id: RunId,
     completed_at: DateTime<Utc>,
 ) -> Result<u64> {
+    // BLK-003: Cancel both stage-owned and mediation-owned executions for the run.
     let result = sqlx::query(
         "UPDATE agent_executions
          SET status = ?, completed_at = ?
-         WHERE status = ? AND stage_execution_id IN (
-             SELECT id FROM stage_executions WHERE run_id = ?
+         WHERE status = ? AND (
+             stage_execution_id IN (
+                 SELECT id FROM stage_executions WHERE run_id = ?
+             )
+             OR (
+                 owner_kind = 'lead_conflict_mediation'
+                 AND lead_mediation_record_id IN (
+                     SELECT id FROM lead_conflict_mediations WHERE run_id = ?
+                 )
+             )
          )",
     )
     .bind(AgentStatus::Cancelled.to_string())
     .bind(completed_at.to_rfc3339())
     .bind(AgentStatus::Running.to_string())
+    .bind(run_id.to_string())
     .bind(run_id.to_string())
     .execute(&mut **tx)
     .await?;
@@ -530,5 +566,9 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         actual_mcp_observation_json: row.get("actual_mcp_observation_json"),
         actual_xcode_runtime_observation_json: row.get("actual_xcode_runtime_observation_json"),
         mcp_session_startup_latency_ms: row.get("mcp_session_startup_latency_ms"),
+        owner_kind: row.get("owner_kind"),
+        owner_id: row.get("owner_id"),
+        lead_mediation_record_id: row.get("lead_mediation_record_id"),
+        origin_stage_execution_id: row.get("origin_stage_execution_id"),
     })
 }

@@ -24,6 +24,7 @@ At the current baseline, the product includes:
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
 - thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections,
+- lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
@@ -160,13 +161,14 @@ The following flows should be treated as implemented system behavior:
 1. idea creation and archive/restore,
 2. provider setup and pilot-readiness validation,
 3. live proposal-loop execution with approval pause/resume,
-4. run progress, artifact inspection, and recovery from the operator shell,
-5. workflow-map rendering and fallback handling,
-6. repo-backed full delivery using dedicated worktrees and manual release,
-7. implementation self-assessment and handoff routing,
-8. rejected implementation approval loopback to proposal refinement,
-9. evidence-pack export for repo-backed runs,
-10. benchmark/sign-off evaluation and export.
+4. lead conflict mediation for same-run resolution of workflow conflicts,
+5. run progress, artifact inspection, and recovery from the operator shell,
+6. workflow-map rendering and fallback handling,
+7. repo-backed full delivery using dedicated worktrees and manual release,
+8. implementation self-assessment and handoff routing,
+9. rejected implementation approval loopback to proposal refinement,
+10. evidence-pack export for repo-backed runs,
+11. benchmark/sign-off evaluation and export.
 
 ## Current review posture
 

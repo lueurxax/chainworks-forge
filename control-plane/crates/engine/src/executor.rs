@@ -525,6 +525,10 @@ async fn claim_invoke_agent_work_item_with_start(
             actual_mcp_observation_json: None,
             actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
+            owner_kind: Some("stage_execution".to_string()),
+            owner_id: Some(stage_execution_id.to_string()),
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
         },
     )
     .await?;
@@ -772,6 +776,11 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                     domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
                 xcode_shim_injection_signal: false,
                 requires_xcode_host_execution: false,
+                owner_kind: "stage_execution".to_string(),
+                owner_id: None,
+                origin_stage_id: None,
+                origin_stage_execution_id: None,
+                mediation_record_id: None,
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -2247,9 +2256,217 @@ impl BackgroundExecutor {
 
     /// Start the background loop. Returns a JoinHandle.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let housekeeping_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            housekeeping_executor
+                .run_generated_state_housekeeping_loop()
+                .await;
+        });
+
+        let mediation_expiry_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            mediation_expiry_executor
+                .run_mediation_expiry_watchdog()
+                .await;
+        });
+
         tokio::spawn(async move {
             self.run_loop().await;
         })
+    }
+
+    async fn run_generated_state_housekeeping_loop(self: Arc<Self>) {
+        let config = GeneratedStateHousekeepingConfig::from_env();
+        if !config.enabled {
+            info!("Generated-state housekeeping disabled");
+            return;
+        }
+
+        info!(
+            interval_secs = config.interval.as_secs(),
+            min_age_secs = config.min_age.as_secs(),
+            "Generated-state housekeeping loop started"
+        );
+
+        loop {
+            if let Err(error) = GeneratedStateHousekeeper::run_once(&self.pool, &config).await {
+                warn!(error = %error, "Generated-state housekeeping failed");
+            }
+            sleep(config.interval).await;
+        }
+    }
+
+    /// P017 Phase B: Engine-owned deadline expiry watchdog for mediation confirmations.
+    /// Periodically checks for pending confirmations past their deadline_at and settles
+    /// them as expired, which also settles the linked mediation as terminal_unverifiable.
+    async fn run_mediation_expiry_watchdog(self: Arc<Self>) {
+        let interval = Duration::from_secs(
+            std::env::var("P017_MEDIATION_EXPIRY_CHECK_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        );
+
+        // CL-010: Use a longer interval when the flag is off to avoid
+        // waking every 60s for no work. Check at 5x the normal interval.
+        let disabled_interval = Duration::from_secs(interval.as_secs().saturating_mul(5).max(300));
+
+        if !crate::mediation::feature_flag::is_phase_b_mediation_enabled() {
+            info!("P017 mediation expiry watchdog: Phase B not enabled, checking at reduced frequency");
+        }
+
+        loop {
+            if crate::mediation::feature_flag::is_phase_b_mediation_enabled() {
+                sleep(interval).await;
+            } else {
+                sleep(disabled_interval).await;
+                continue;
+            }
+
+            let now = chrono::Utc::now();
+            // MF-PRE-ENABLE-001: Find candidates first, then expire + settle
+            // each one atomically in a single IMMEDIATE transaction.
+            match db::repos::lead_mediation_confirmations::find_pending_past_deadline(
+                &self.pool, now,
+            )
+            .await
+            {
+                Ok(candidates) => {
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    let mut settled_count = 0u64;
+                    for candidate in &candidates {
+                        let now = chrono::Utc::now();
+                        match db::pool::begin_immediate_with_retry(
+                            &self.pool,
+                            "mediation.expire_and_settle",
+                        )
+                        .await
+                        {
+                            Ok(mut tx) => {
+                                // Expire the confirmation within the tx (CAS: only if still pending).
+                                let rows =
+                                    match db::repos::lead_mediation_confirmations::expire_one_tx(
+                                        &mut tx,
+                                        &candidate.id,
+                                        now,
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            warn!(
+                                                confirmation_id = %candidate.id,
+                                                error = %e,
+                                                "Failed to expire confirmation in tx"
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                if rows == 0 {
+                                    // Already resolved/expired by a concurrent path — skip.
+                                    continue;
+                                }
+                                // Settle the linked mediation in the same tx.
+                                if let Err(e) = crate::mediation::settlement::settle_expired_tx(
+                                    &mut tx,
+                                    &candidate.mediation_record_id,
+                                    now,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        confirmation_id = %candidate.id,
+                                        mediation_id = %candidate.mediation_record_id,
+                                        error = %e,
+                                        "Failed to settle expired mediation in tx"
+                                    );
+                                    // tx drops without commit — both expire and settle are rolled back.
+                                    continue;
+                                }
+                                if let Err(e) = tx.commit().await {
+                                    warn!(
+                                        confirmation_id = %candidate.id,
+                                        error = %e,
+                                        "Failed to commit expire+settle tx"
+                                    );
+                                    continue;
+                                }
+                                settled_count += 1;
+                                info!(
+                                    confirmation_id = %candidate.id,
+                                    mediation_id = %candidate.mediation_record_id,
+                                    "Atomically expired confirmation and settled mediation"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    confirmation_id = %candidate.id,
+                                    error = %e,
+                                    "Failed to begin tx for expire+settle"
+                                );
+                            }
+                        }
+                    }
+                    if settled_count > 0 {
+                        info!(
+                            count = settled_count,
+                            "P017 mediation expiry watchdog: atomically expired and settled confirmations"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "P017 mediation expiry watchdog: failed to check for expired confirmations"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn mark_agent_execution_failed_if_running(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        item_id: &str,
+        error_message: &str,
+    ) {
+        match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
+            Ok(Some(execution)) if execution.status == AgentStatus::Running => {
+                if let Err(update_error) = agent_executions::update_completed(
+                    &self.pool,
+                    agent_execution_id,
+                    AgentStatus::Failed,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    error!(
+                        item_id = %item_id,
+                        agent_execution_id = %agent_execution_id,
+                        error = %update_error,
+                        "Failed to close running agent execution after InvokeAgent work item failure"
+                    );
+                } else {
+                    warn!(
+                        item_id = %item_id,
+                        agent_execution_id = %agent_execution_id,
+                        failure = %error_message,
+                        "Closed stale running agent execution after InvokeAgent work item failure"
+                    );
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(find_error) => {
+                error!(
+                    item_id = %item_id,
+                    agent_execution_id = %agent_execution_id,
+                    error = %find_error,
+                    "Failed to inspect agent execution after InvokeAgent work item failure"
+                );
+            }
+        }
     }
 
     /// Claim and process the next pending work item. Returns `Ok(true)` if an
@@ -2588,18 +2805,49 @@ impl BackgroundExecutor {
                     .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing 'stage_id'"))?
                     .to_string();
 
+                // P017: Owner-aware execution identity. Defaults to stage_execution
+                // for backwards compatibility with all existing work items.
+                let owner_kind = payload["owner_kind"]
+                    .as_str()
+                    .unwrap_or("stage_execution")
+                    .to_string();
+                let owner_id = payload["owner_id"].as_str().map(String::from);
+
+                // MF-PRE-ENABLE-003: For mediation-owned executions, stage_execution_id
+                // must remain None — never synthesize a fake StageExecutionId.
+                let is_mediation_owned = owner_kind == "lead_conflict_mediation";
+
                 let stage_execution_id_str = payload["stage_execution_id"]
                     .as_str()
                     .unwrap_or("")
                     .to_string();
                 let stage_execution_id: domain::ids::StageExecutionId =
                     if stage_execution_id_str.is_empty() {
-                        domain::ids::StageExecutionId::new()
+                        if is_mediation_owned {
+                            // MF-PRE-ENABLE-003: Guard — mediation-owned executions
+                            // must have owner_id set and must not synthesize stage IDs.
+                            if owner_id.is_none() {
+                                return Err(anyhow::anyhow!(
+                                    "Mediation-owned execution requires owner_id in payload"
+                                ));
+                            }
+                            // Use a sentinel that clearly signals "no stage execution".
+                            // This value is never used as a durable identity anchor.
+                            domain::ids::StageExecutionId::new()
+                        } else {
+                            domain::ids::StageExecutionId::new()
+                        }
                     } else {
                         stage_execution_id_str
                             .parse()
                             .map_err(|e| anyhow::anyhow!("{}", e))?
                     };
+
+                let origin_stage_id = payload["origin_stage_id"].as_str().map(String::from);
+                let origin_stage_execution_id = payload["origin_stage_execution_id"]
+                    .as_str()
+                    .map(String::from);
+                let mediation_record_id = payload["mediation_record_id"].as_str().map(String::from);
 
                 // agent_id defaults to the stage_id — a reasonable per-stage identifier.
                 let agent_id = payload["agent_id"]
@@ -2761,7 +3009,16 @@ impl BackgroundExecutor {
                     .as_ref()
                     .map(|claimed| claimed.agent_execution_id)
                     .unwrap_or_else(domain::ids::AgentExecutionId::new);
-                let owner_execution_lineage_id = stage_execution_id.to_string();
+                // P017: Owner-aware lineage. For mediation-owned executions, the
+                // owner_id (mediation record id) is the lineage anchor; for stage-owned
+                // executions, the stage_execution_id remains the lineage anchor.
+                let owner_execution_lineage_id = if owner_kind == "lead_conflict_mediation" {
+                    owner_id
+                        .clone()
+                        .unwrap_or_else(|| stage_execution_id.to_string())
+                } else {
+                    stage_execution_id.to_string()
+                };
                 let policy_input = SessionPolicyInput {
                     run_id: run_id.to_string(),
                     agent_id: agent_id.clone(),
@@ -2961,8 +3218,57 @@ impl BackgroundExecutor {
                         actual_mcp_observation_json: None,
                         actual_xcode_runtime_observation_json: None,
                         mcp_session_startup_latency_ms: None,
+                        owner_kind: Some(owner_kind.clone()),
+                        // MF-PRE-ENABLE-003: For mediation-owned executions, owner_id
+                        // must come from the payload — never fall back to synthetic stage ID.
+                        owner_id: if is_mediation_owned {
+                            owner_id.clone()
+                        } else {
+                            owner_id
+                                .clone()
+                                .or_else(|| Some(stage_execution_id.to_string()))
+                        },
+                        lead_mediation_record_id: mediation_record_id.clone(),
+                        origin_stage_execution_id: origin_stage_execution_id.clone(),
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
+                }
+
+                // Reconcile pre-claimed agent execution with freshly evaluated session policy.
+                // When InvokeAgent items are claimed via claim_next_invoke_agent_with_start,
+                // the agent execution row is created without session policy data. Update it now.
+                if let (Some(claimed), Some(decision)) =
+                    (preclaimed_start.as_ref(), policy_decision.as_ref())
+                {
+                    let disposition = serde_json::to_value(&decision.disposition)
+                        .ok()
+                        .and_then(|value| value.as_str().map(String::from));
+                    agent_executions::update_session_policy(
+                        &self.pool,
+                        claimed.agent_execution_id,
+                        Some(&decision.lineage.id),
+                        Some(&decision.generation.id),
+                        decision
+                            .generation
+                            .rehydrated_from_checkpoint_artifact_id
+                            .as_deref(),
+                        Some(&decision.generation.invocation_owner_key),
+                        disposition.as_deref(),
+                        decision.session_reset_reason.as_deref(),
+                    )
+                    .await?;
+                    artifact_contracts::update_source_generation_claim_session(
+                        &self.pool,
+                        &claimed.artifact_claim_key,
+                        Some(&decision.generation.id),
+                    )
+                    .await?;
+
+                    let mut facts =
+                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
+                    facts.session_reuse_reason =
+                        Some(session_reuse_reason_for_policy_decision(decision));
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
                 }
 
                 if !mcp_resolution.report.blocking_issues.is_empty() {
@@ -3195,6 +3501,26 @@ impl BackgroundExecutor {
                     legacy_broad_discovery_policy: legacy_broad_discovery_policy.clone(),
                     xcode_shim_injection_signal,
                     requires_xcode_host_execution,
+                    // P017: owner-aware execution identity from payload.
+                    // MF-PRE-ENABLE-003: For mediation-owned executions, owner_id and
+                    // origin_stage_execution_id must not fall back to synthetic stage IDs.
+                    owner_kind: owner_kind.clone(),
+                    owner_id: if is_mediation_owned {
+                        owner_id.clone()
+                    } else {
+                        owner_id
+                            .clone()
+                            .or_else(|| Some(stage_execution_id.to_string()))
+                    },
+                    origin_stage_id: origin_stage_id.clone().or_else(|| Some(stage_id.clone())),
+                    origin_stage_execution_id: if is_mediation_owned {
+                        origin_stage_execution_id.clone()
+                    } else {
+                        origin_stage_execution_id
+                            .clone()
+                            .or_else(|| Some(stage_execution_id.to_string()))
+                    },
+                    mediation_record_id: mediation_record_id.clone(),
                 };
                 // Runtime event: session starting
                 let _ = self
@@ -3300,6 +3626,67 @@ impl BackgroundExecutor {
                         );
                         return Ok(());
                     }
+                }
+
+                // P017 B2-004: Check mediation staleness for mediation-owned executions.
+                // If the mediation has been superseded or canceled while the agent ran,
+                // record the output as ignored_late_output and skip artifact persistence.
+                let mediation_stale = if owner_kind == "lead_conflict_mediation" {
+                    if let Some(ref med_id) = mediation_record_id {
+                        match db::repos::lead_conflict_mediations::find_by_id(&self.pool, med_id)
+                            .await
+                        {
+                            Ok(Some(med)) => med.status.is_terminal(),
+                            Ok(None) => {
+                                warn!(
+                                    mediation_id = %med_id,
+                                    "Mediation record not found; treating output as stale"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                // MC-003: Fail closed on DB error — if we can't verify
+                                // mediation status, treat output as stale to prevent
+                                // persisting against a terminal or superseded mediation.
+                                warn!(
+                                    mediation_id = %med_id,
+                                    error = %e,
+                                    "Failed to check mediation staleness; treating as stale (fail-closed)"
+                                );
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if mediation_stale {
+                    info!(
+                        run_id = %run_id,
+                        agent_id = %agent_id,
+                        mediation_record_id = ?mediation_record_id,
+                        "Mediation-owned execution output is stale; recording as ignored_late_output"
+                    );
+                    let completed_at = chrono::Utc::now();
+                    let mut facts =
+                        AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, completed_at);
+                    facts.output_settlement = AgentOutputSettlement::IgnoredLateOutputs;
+                    facts.ignored_late_output_count = 1;
+                    facts.late_output_count = 1;
+                    facts.valid_required_outputs = false;
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        completed_at,
+                    )
+                    .await?;
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    return Ok(());
                 }
 
                 if !requested_mcp_server_ids.is_empty() {
@@ -3598,6 +3985,10 @@ impl BackgroundExecutor {
                         agent_execution_id: agent_exec_id,
                         source_work_item_id: item.id.clone(),
                     });
+                // Prefer the policy decision's generation id when available,
+                // because reconciliation updated the DB claim to match it.
+                // The claimed.session_generation_id may be stale (a random UUID
+                // from pre-claim time that doesn't match the real session).
                 let source_session_generation_id = policy_decision
                     .as_ref()
                     .map(|decision| decision.generation.id.as_str())

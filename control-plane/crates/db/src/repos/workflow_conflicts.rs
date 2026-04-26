@@ -503,6 +503,61 @@ fn conflict_update_sql() -> &'static str {
        WHERE conflict_id = ?21"#
 }
 
+/// Update the lead_agent_id, mediation_record_id, and status on a conflict record
+/// to link it to a newly created mediation. Used by the orchestrator when Phase B
+/// mediation is initiated for an eligible conflict.
+pub async fn update_mediation_pointer(
+    pool: &SqlitePool,
+    conflict_id: &str,
+    lead_agent_id: &str,
+    mediation_record_id: &str,
+    status: WorkflowConflictStatus,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let row = sqlx::query(r#"SELECT record_json FROM workflow_conflicts WHERE conflict_id = ?1"#)
+        .bind(conflict_id)
+        .fetch_one(pool)
+        .await
+        .context("find workflow conflict for mediation pointer update")?;
+
+    let mut record = decode_conflict_row(&row)?;
+    record.lead_agent_id = Some(lead_agent_id.to_string());
+    record.mediation_record_id = Some(mediation_record_id.to_string());
+    record.status = status;
+    record.updated_at = now;
+
+    let mut tx = pool.begin().await?;
+    write_conflict_update_tx(&mut tx, &record).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Transaction variant of update_mediation_pointer for use inside an
+/// existing IMMEDIATE transaction (MF-PRE-ENABLE-002).
+pub async fn update_mediation_pointer_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conflict_id: &str,
+    lead_agent_id: &str,
+    mediation_record_id: &str,
+    status: WorkflowConflictStatus,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let row = sqlx::query(r#"SELECT record_json FROM workflow_conflicts WHERE conflict_id = ?1"#)
+        .bind(conflict_id)
+        .fetch_one(&mut **tx)
+        .await
+        .context("find workflow conflict for mediation pointer update (tx)")?;
+
+    let mut record = decode_conflict_row(&row)?;
+    record.lead_agent_id = Some(lead_agent_id.to_string());
+    record.mediation_record_id = Some(mediation_record_id.to_string());
+    record.status = status;
+    record.updated_at = now;
+
+    write_conflict_update_tx(tx, &record).await?;
+    Ok(())
+}
+
 fn decode_conflict_row(row: &sqlx::sqlite::SqliteRow) -> Result<WorkflowConflictRecord> {
     let raw: String = row.get("record_json");
     serde_json::from_str(&raw).context("decode WorkflowConflictRecord")

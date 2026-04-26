@@ -78,6 +78,21 @@ pub enum CommandResult {
     ArtifactContractOverrideCreated {
         override_id: String,
     },
+    /// P017 Phase B: Mediation confirmation resolved.
+    LeadMediationConfirmationResolved {
+        run_id: RunId,
+        mediation_record_id: String,
+        confirmation_subject_id: String,
+        journal_id: String,
+    },
+    /// P017 Phase B: Mediation confirmation is no longer actionable.
+    /// DEF-002: Typed result for stale, terminal, canceled, or superseded items
+    /// instead of a generic error. Callers can distinguish this from real errors.
+    LeadMediationConfirmationStaleOrTerminal {
+        confirmation_subject_id: String,
+        reason: String,
+        journal_id: String,
+    },
 }
 
 pub struct StartRunBlockedByDeliveryPreflight {
@@ -117,6 +132,7 @@ impl CommandJournalEntry {
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
             Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
+            Command::ResolveLeadMediationConfirmation(_) => "ResolveLeadMediationConfirmation",
         };
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
@@ -131,6 +147,7 @@ impl CommandJournalEntry {
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
             Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
+            Command::ResolveLeadMediationConfirmation(c) => Some(c.run_id.to_string()),
         };
         let principal_class = caller.principal_class.to_string();
 
@@ -159,6 +176,7 @@ impl CommandJournalEntry {
                 | "OverrideLegacyDiscoveryPolicy"
                 | "CancelRun"
                 | "ResetSession"
+                | "ResolveLeadMediationConfirmation"
         )
     }
 }
@@ -251,6 +269,12 @@ fn validate_operator_selected_candidate(candidate: &CandidateTransitionEvaluatio
 }
 
 impl CommandHandler {
+    /// Read-only access to the pool for pre-flight lookups (e.g. MCP server
+    /// deriving mediation_record_id before building a command).
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
         Self::new_with_capacity(
             pool,
@@ -1552,6 +1576,265 @@ impl CommandHandler {
                     )
                     .await?;
                 Ok(CommandResult::StewardAnalysisQueued)
+            }
+
+            Command::ResolveLeadMediationConfirmation(c) => {
+                // BLK-006: Guard against resolution when mediation is disabled
+                if !crate::mediation::feature_flag::is_phase_b_mediation_enabled() {
+                    return Err(anyhow!("Phase B mediation is disabled"));
+                }
+
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = db::pool::begin_immediate_with_retry(
+                    &self.pool,
+                    "command.ResolveLeadMediationConfirmation",
+                )
+                .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+
+                // Validate the confirmation exists and is pending
+                let confirmation = db::repos::lead_mediation_confirmations::find_by_id_tx(
+                    &mut tx,
+                    &c.confirmation_subject_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Mediation confirmation {} not found",
+                        c.confirmation_subject_id
+                    )
+                })?;
+
+                // BLK-005: Validate run_id matches the confirmation's run
+                if confirmation.run_id != c.run_id.to_string() {
+                    let error = anyhow!(
+                        "Confirmation run_id mismatch: confirmation belongs to a different run"
+                    );
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction(
+                        "command.ResolveLeadMediationConfirmation",
+                        tx_started,
+                    );
+                    return Err(error);
+                }
+
+                // MF-PRE-ENABLE-005: Validate idempotency_key against stored scope key.
+                if let Some(ref stored_key) = confirmation.idempotency_scope_key {
+                    if *stored_key != c.idempotency_key {
+                        let error = anyhow!(
+                            "Idempotency key mismatch for confirmation {}",
+                            c.confirmation_subject_id,
+                        );
+                        command_journal::fail_entry_tx(
+                            &mut tx,
+                            &journal.id,
+                            Utc::now(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction(
+                            "command.ResolveLeadMediationConfirmation",
+                            tx_started,
+                        );
+                        return Err(error);
+                    }
+                }
+
+                if confirmation.status != domain::mediation::MediationConfirmationStatus::Pending {
+                    // MF-PRE-ENABLE-005: If already resolved with the same idempotency key,
+                    // return cached success instead of an error (idempotent retry).
+                    if confirmation.status
+                        == domain::mediation::MediationConfirmationStatus::Resolved
+                    {
+                        let mediation_record_id = &confirmation.mediation_record_id;
+                        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now())
+                            .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction(
+                            "command.ResolveLeadMediationConfirmation",
+                            tx_started,
+                        );
+                        return Ok(CommandResult::LeadMediationConfirmationResolved {
+                            run_id: c.run_id,
+                            mediation_record_id: mediation_record_id.clone(),
+                            confirmation_subject_id: c.confirmation_subject_id,
+                            journal_id: journal_id.to_string(),
+                        });
+                    }
+                    // DEF-002: Return typed stale_or_terminal result instead of
+                    // generic error so MCP callers can distinguish this outcome.
+                    let reason = format!(
+                        "confirmation status is '{}' (not pending)",
+                        confirmation.status,
+                    );
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &format!("stale_or_terminal: {}", reason),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction(
+                        "command.ResolveLeadMediationConfirmation",
+                        tx_started,
+                    );
+                    return Ok(CommandResult::LeadMediationConfirmationStaleOrTerminal {
+                        confirmation_subject_id: c.confirmation_subject_id,
+                        reason,
+                        journal_id: journal_id.to_string(),
+                    });
+                }
+
+                // Validate conflict fingerprint matches
+                // CL-001: Do not leak stored fingerprint in error messages.
+                if confirmation.conflict_fingerprint != c.conflict_fingerprint {
+                    tracing::debug!(
+                        confirmation_id = %c.confirmation_subject_id,
+                        stored_fingerprint = %confirmation.conflict_fingerprint,
+                        supplied_fingerprint = %c.conflict_fingerprint,
+                        "Conflict fingerprint mismatch detail"
+                    );
+                    let error = anyhow!("Conflict fingerprint mismatch (stale_or_superseded)");
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction(
+                        "command.ResolveLeadMediationConfirmation",
+                        tx_started,
+                    );
+                    return Err(error);
+                }
+
+                // Validate mediation record linkage — derive mediation_record_id
+                // from the confirmation record instead of trusting the caller
+                let mediation_record_id = &confirmation.mediation_record_id;
+
+                // Resolve the confirmation — MC-001: check rows_affected
+                // to detect concurrent resolution (CAS guard on status='pending').
+                let resolve_rows = db::repos::lead_mediation_confirmations::resolve_tx(
+                    &mut tx,
+                    &c.confirmation_subject_id,
+                    &c.decision.to_string(),
+                    c.comment.as_deref(),
+                    caller.principal_id.as_str(),
+                    now,
+                )
+                .await?;
+
+                if resolve_rows == 0 {
+                    // Confirmation was concurrently resolved, expired, or superseded.
+                    // DEF-002: Return typed stale_or_terminal result.
+                    let reason = "concurrent resolution (CAS guard blocked update)".to_string();
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &format!("stale_or_terminal: {}", reason),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction(
+                        "command.ResolveLeadMediationConfirmation",
+                        tx_started,
+                    );
+                    return Ok(CommandResult::LeadMediationConfirmationStaleOrTerminal {
+                        confirmation_subject_id: c.confirmation_subject_id,
+                        reason,
+                        journal_id: journal_id.to_string(),
+                    });
+                }
+
+                // BLK-004: Route settlement through MediationSettlementService
+                match c.decision {
+                    domain::mediation::MediationConfirmationDecision::Confirm => {
+                        crate::mediation::settlement::settle_confirmed_tx(
+                            &mut tx,
+                            mediation_record_id,
+                            now,
+                        )
+                        .await?;
+                    }
+                    domain::mediation::MediationConfirmationDecision::ManualFallback => {
+                        crate::mediation::settlement::settle_rejected_clone_manual_tx(
+                            &mut tx,
+                            mediation_record_id,
+                            now,
+                        )
+                        .await?;
+                    }
+                };
+
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction(
+                    "command.ResolveLeadMediationConfirmation",
+                    tx_started,
+                );
+
+                let mediation_record_id_owned = mediation_record_id.clone();
+
+                let _ =
+                    self.events
+                        .send(domain::events::DomainEvent::MediationConfirmationResolved {
+                            run_id: c.run_id,
+                            mediation_record_id: mediation_record_id_owned.clone(),
+                            confirmation_subject_id: c.confirmation_subject_id.clone(),
+                            decision: c.decision.clone(),
+                        });
+
+                // P017 B2-006: Enqueue AdvanceRun to re-advance the run after mediation
+                // settlement, just as ApproveStage does for stage approvals. This triggers
+                // the orchestrator to re-evaluate transitions with the mediation outcome.
+                self.work_queue
+                    .enqueue(
+                        WorkItemKind::AdvanceRun,
+                        Some(c.run_id),
+                        None,
+                        serde_json::json!({
+                            "run_id": c.run_id.to_string(),
+                            "trigger": "mediation_confirmation_resolved",
+                            "mediation_record_id": mediation_record_id_owned,
+                        }),
+                    )
+                    .await?;
+
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
+                Ok(CommandResult::LeadMediationConfirmationResolved {
+                    run_id: c.run_id,
+                    mediation_record_id: mediation_record_id_owned,
+                    confirmation_subject_id: c.confirmation_subject_id,
+                    journal_id: journal_id.to_string(),
+                })
             }
 
             Command::ResetSession(c) => {

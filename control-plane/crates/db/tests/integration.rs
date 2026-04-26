@@ -108,6 +108,7 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         agent_id: "xcode_agent".into(),
         provider: "codex".into(),
         model: None,
+
         started_at: Utc::now(),
         completed_at: None,
         status: AgentStatus::Running,
@@ -131,6 +132,10 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
@@ -627,6 +632,10 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -773,6 +782,10 @@ async fn proposal_048_persistence_fields_round_trip() {
         ),
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: Some(42),
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -925,6 +938,10 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1336,6 +1353,10 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -1366,6 +1387,10 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await

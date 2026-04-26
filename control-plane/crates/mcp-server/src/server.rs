@@ -1315,6 +1315,10 @@ mod tests {
                 ),
                 actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
             },
         )
         .await

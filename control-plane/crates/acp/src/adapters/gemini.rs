@@ -140,6 +140,11 @@ mod tests {
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
             xcode_shim_injection_signal: false,
             requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
         }
     }
 

@@ -118,6 +118,37 @@ async fn enrich_run_with_artifact_contracts(
     gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
+    // P017: Enrich workflow conflict with lead mediation readback if present.
+    if let Some(ref mut conflict) = gql.workflow_conflict {
+        if let Some(ref mediation_id) = conflict.mediation_record_id {
+            if let Ok(Some(med)) =
+                db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
+            {
+                // MC-004: Use shared domain derivation for consistent resolution_mode.
+                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation {
+                    status: med.status.to_string(),
+                    resolution_mode: domain::mediation::derive_resolution_mode(&med),
+                    chosen_action: med.chosen_action.clone(),
+                    chosen_next_state_id: med.chosen_next_state_id.clone(),
+                    chosen_next_state_label: med.chosen_next_state_label.clone(),
+                    operator_rationale: med.operator_rationale.clone(),
+                    sanitized_progress: med.sanitized_progress.clone(),
+                    validation_errors: med
+                        .validation_errors_json
+                        .as_ref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .map(async_graphql::Json),
+                    confirmation_subject_id: med.confirmation_subject_id.clone(),
+                    superseded_by_event_ref: med.superseded_by_event_ref.clone(),
+                    cost_summary: med
+                        .cost_summary_json
+                        .as_ref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .map(async_graphql::Json),
+                });
+            }
+        }
+    }
     gql.implementation_handoff_status_json = if let Some(status) =
         workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
     {
@@ -603,6 +634,37 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
+    // P017: Enrich workflow conflict with lead mediation readback if present.
+    if let Some(ref mut conflict) = run.workflow_conflict {
+        if let Some(ref mediation_id) = conflict.mediation_record_id {
+            if let Ok(Some(med)) =
+                db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
+            {
+                // MC-004: Use shared domain derivation for consistent resolution_mode.
+                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation {
+                    status: med.status.to_string(),
+                    resolution_mode: domain::mediation::derive_resolution_mode(&med),
+                    chosen_action: med.chosen_action.clone(),
+                    chosen_next_state_id: med.chosen_next_state_id.clone(),
+                    chosen_next_state_label: med.chosen_next_state_label.clone(),
+                    operator_rationale: med.operator_rationale.clone(),
+                    sanitized_progress: med.sanitized_progress.clone(),
+                    validation_errors: med
+                        .validation_errors_json
+                        .as_ref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .map(async_graphql::Json),
+                    confirmation_subject_id: med.confirmation_subject_id.clone(),
+                    superseded_by_event_ref: med.superseded_by_event_ref.clone(),
+                    cost_summary: med
+                        .cost_summary_json
+                        .as_ref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .map(async_graphql::Json),
+                });
+            }
+        }
+    }
     run.implementation_handoff_status_json = if let Some(status) =
         workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
     {
@@ -1785,6 +1847,10 @@ mod tests {
                 ),
                 actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
             },
         )
         .await
@@ -2067,8 +2133,9 @@ mod tests {
             .to_string();
 
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -2076,7 +2143,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -2109,8 +2178,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -2121,10 +2191,12 @@ mod tests {
                       blockingRemainingCodeTaskCount
                       testsRun
                     }}
-                  }}
-                }}
-                "#
-            )))
+	                  }}
+	                }}
+	                "#
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -2164,8 +2236,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -2182,7 +2255,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -2227,8 +2302,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(
-                r#"
+            .execute(
+                Request::new(
+                    r#"
                 query Runs {
                   runs {
                     id
@@ -2240,7 +2316,9 @@ mod tests {
                   }
                 }
                 "#,
-            ))
+                )
+                .data(test_principal()),
+            )
             .await;
 
         assert!(

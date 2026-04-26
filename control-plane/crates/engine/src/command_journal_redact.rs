@@ -104,6 +104,12 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::OverrideArtifactContract(_) => {
             // P057: preserve typed override fields for operator audit.
         }
+        Command::ResolveLeadMediationConfirmation(_) => {
+            // P017 Phase B: redact comment (may contain operator-submitted text).
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "comment");
+            }
+        }
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| payload_json.to_string())
@@ -142,11 +148,12 @@ mod tests {
     use super::*;
     use domain::commands::{
         ApproveStageCmd, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
-        ResetSessionCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
-        RunStewardAnalysisCmd, StartRunCmd,
+        ResetSessionCmd, ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd,
+        RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
+    use domain::mediation::MediationConfirmationDecision;
     use serde_json::Value;
 
     fn round_trip(cmd: &Command) -> Value {
@@ -422,6 +429,15 @@ mod tests {
                 reason: "manual".into(),
                 artifact_base: None,
             }),
+            Command::ResolveLeadMediationConfirmation(ResolveLeadMediationConfirmationCmd {
+                run_id: RunId::new(),
+                mediation_record_id: "med-1".into(),
+                confirmation_subject_id: "conf-1".into(),
+                decision: MediationConfirmationDecision::Confirm,
+                comment: Some("Looks good".into()),
+                conflict_fingerprint: "sha256:abc".into(),
+                idempotency_key: "idem-1".into(),
+            }),
         ];
 
         for cmd in &samples {
@@ -448,6 +464,7 @@ mod tests {
                 Command::ResetSession(_) => {}
                 Command::RunStewardAnalysis(_) => {}
                 Command::OverrideArtifactContract(_) => {}
+                Command::ResolveLeadMediationConfirmation(_) => {}
             }
         }
     }

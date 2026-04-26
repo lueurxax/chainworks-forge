@@ -253,7 +253,7 @@ Important:
 
 ### `proposal-017`
 
-Proposal 017 Phase A workflow-authority and conflict-truth gate.
+Proposal 017 Phase A/B/C workflow-authority, conflict-truth, and lead-mediation gate.
 
 Scope:
 
@@ -265,14 +265,18 @@ Scope:
 - fail-closed unknown transition-input classification
 - per-surface `workflow_conflict` report shape parity (Swift/MCP/GraphQL)
 - transition cursor and resume consistency with conflict truth
-- Phase A only: this gate does not prove Phase B lead mediation or Phase C lead-validation coverage
+- **Lead Conflict Mediation**: Lead selection, mediation lifecycle,
+  owner-aware execution, and settlement validation.
+- **Mandatory Lead Validation**: Static workflow validation and runtime
+  preflight for lead resolution.
 
 Use when:
 
 - changing workflow authority, transition evaluation, or conflict/advisory persistence
 - changing implementation-entry handoff or approved proposal freeze logic
-- changing report/API shapes for workflow conflicts
-- changing the Phase A workflow-conflict persistence/readback slice
+- changing lead mediation selection, lifecycle, or settlement
+- changing Phase C lead-validation or runtime preflight logic
+- changing report/API shapes for workflow conflicts or mediation records
 
 Host policy:
 
@@ -286,10 +290,20 @@ Command:
 
 Important:
 
-- this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
+- this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict/mediation) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
 - it validates that agent-authored `next_stage` cannot override the compiled graph
-- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the current Phase A slice
-- it must not be cited as proof for Rust `agent_executions` owner-kind migration, lead mediation runtime, or Phase C lead-validation requirements until those surfaces and tests exist
+- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the full P017 slice
+- it proves Rust `agent_executions` owner-kind migration, lead mediation runtime, and lead-validation requirements
+
+### Phase 0 Contract Freeze
+
+The `proposal-017` gate verifies the existence and approval status of required Phase 0 backend contract artifacts before implementation proceeds. These artifacts are the canonical sources of truth for major migration seams:
+
+- **Approval Mediation**: `docs/proposals/017-evidence/phase-0-approval-mediation-contract.json`
+- **Execution Identity**: `docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md`
+- **Work Item Owner**: `docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json`
+- **Lead Resolver**: `docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`
+- **Settlement Boundary**: `docs/proposals/017-evidence/phase-0-settlement-service-boundary.md`
 
 ### `proposal-019`
 

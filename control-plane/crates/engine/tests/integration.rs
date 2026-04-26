@@ -248,6 +248,10 @@ fn make_agent_execution(
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     }
 }
 
@@ -6893,6 +6897,10 @@ sys.exit(0)
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -9360,6 +9368,11 @@ fn test_execution_request_carries_chainworks_meta_root() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),
@@ -9502,4 +9515,373 @@ fn test_prompt_input_paths_point_to_per_run_meta_root() {
             resolved
         );
     }
+}
+
+// ── P017 Phase B: Lead mediation integration tests ──────────────────────
+
+/// P017 B1-005: Verify lead_conflict_mediations repo insert, find, and status
+/// update work end-to-end with both owner kinds.
+#[tokio::test]
+async fn p017_mediation_record_lifecycle() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: "med-001".to_string(),
+        run_id: "run-001".to_string(),
+        conflict_id: "conflict-001".to_string(),
+        conflict_fingerprint: "fp-001".to_string(),
+        lead_agent_id: "lead_agent".to_string(),
+        status: domain::mediation::LeadMediationStatus::Pending,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Queued for lead mediation".to_string()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    // Verify find_by_id
+    let found = db::repos::lead_conflict_mediations::find_by_id(&pool, "med-001")
+        .await
+        .expect("find_by_id")
+        .expect("should exist");
+    assert_eq!(
+        found.status,
+        domain::mediation::LeadMediationStatus::Pending
+    );
+    assert_eq!(found.lead_agent_id, "lead_agent");
+
+    // Verify find_active_for_conflict
+    let active =
+        db::repos::lead_conflict_mediations::find_active_for_conflict(&pool, "run-001", "fp-001")
+            .await
+            .expect("find_active_for_conflict");
+    assert!(active.is_some(), "should find active mediation");
+
+    // Verify list_by_run
+    let list = db::repos::lead_conflict_mediations::list_by_run(&pool, "run-001")
+        .await
+        .expect("list_by_run");
+    assert_eq!(list.len(), 1);
+
+    // Settle the mediation
+    let settlement_svc =
+        engine::mediation::settlement::MediationSettlementService::new(pool.clone());
+    settlement_svc
+        .settle_confirmed("med-001", now)
+        .await
+        .expect("settle_confirmed");
+
+    // Verify terminal status
+    let settled = db::repos::lead_conflict_mediations::find_by_id(&pool, "med-001")
+        .await
+        .expect("find settled")
+        .expect("should exist");
+    assert_eq!(
+        settled.status,
+        domain::mediation::LeadMediationStatus::Settled
+    );
+    assert_eq!(
+        settled.settlement_result.as_deref(),
+        Some("confirmed_by_operator")
+    );
+    assert!(settled.settled_at.is_some());
+
+    // Verify no longer active
+    let no_active =
+        db::repos::lead_conflict_mediations::find_active_for_conflict(&pool, "run-001", "fp-001")
+            .await
+            .expect("find_active after settlement");
+    assert!(
+        no_active.is_none(),
+        "settled mediation should not be active"
+    );
+}
+
+/// P017 B1-005: Verify lead_mediation_confirmations repo lifecycle including
+/// pending list, resolution, and deadline expiry.
+#[tokio::test]
+async fn p017_confirmation_lifecycle_and_expiry() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    // Insert a mediation record first (confirmations reference it)
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: "med-002".to_string(),
+        run_id: "run-002".to_string(),
+        conflict_id: "conflict-002".to_string(),
+        conflict_fingerprint: "fp-002".to_string(),
+        lead_agent_id: "lead_agent".to_string(),
+        status: domain::mediation::LeadMediationStatus::OperatorConfirmationRequired,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Awaiting operator confirmation".to_string()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: Some("conf-002".to_string()),
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    // Insert a pending confirmation
+    let confirmation = domain::mediation::LeadMediationConfirmation {
+        id: "conf-002".to_string(),
+        mediation_record_id: "med-002".to_string(),
+        run_id: "run-002".to_string(),
+        conflict_id: "conflict-002".to_string(),
+        conflict_fingerprint: "fp-002".to_string(),
+        status: domain::mediation::MediationConfirmationStatus::Pending,
+        suggested_action: Some("confirm_lead_resolution".to_string()),
+        requested_at: now,
+        deadline_at: Some(now + chrono::Duration::hours(1)),
+        readback_ref: Some("report://run-002/mediation/med-002".to_string()),
+        idempotency_scope_key: Some("scope-002".to_string()),
+        resolved_at: None,
+        resolved_by_principal_id: None,
+        resolution_decision: None,
+        resolution_comment: None,
+    };
+    db::repos::lead_mediation_confirmations::insert(&pool, &confirmation)
+        .await
+        .expect("insert confirmation");
+
+    // Verify list_pending returns the confirmation
+    let pending = db::repos::lead_mediation_confirmations::list_pending(&pool)
+        .await
+        .expect("list_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "conf-002");
+
+    // Resolve the confirmation
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        db::repos::lead_mediation_confirmations::resolve_tx(
+            &mut tx,
+            "conf-002",
+            "confirm",
+            Some("Approved by operator"),
+            "principal-001",
+            now,
+        )
+        .await
+        .expect("resolve confirmation");
+        tx.commit().await.expect("commit");
+    }
+
+    // Verify resolved confirmation is no longer in pending list
+    let pending_after = db::repos::lead_mediation_confirmations::list_pending(&pool)
+        .await
+        .expect("list_pending after resolve");
+    assert!(
+        pending_after.is_empty(),
+        "resolved should not be in pending"
+    );
+
+    // Test expiry: insert a confirmation with a past deadline
+    let past = now - chrono::Duration::hours(2);
+    let expired_conf = domain::mediation::LeadMediationConfirmation {
+        id: "conf-expired".to_string(),
+        mediation_record_id: "med-002".to_string(),
+        run_id: "run-002".to_string(),
+        conflict_id: "conflict-002".to_string(),
+        conflict_fingerprint: "fp-002".to_string(),
+        status: domain::mediation::MediationConfirmationStatus::Pending,
+        suggested_action: Some("confirm_lead_resolution".to_string()),
+        requested_at: past,
+        deadline_at: Some(past + chrono::Duration::minutes(30)),
+        readback_ref: None,
+        idempotency_scope_key: Some("scope-expired".to_string()),
+        resolved_at: None,
+        resolved_by_principal_id: None,
+        resolution_decision: None,
+        resolution_comment: None,
+    };
+    db::repos::lead_mediation_confirmations::insert(&pool, &expired_conf)
+        .await
+        .expect("insert expired confirmation");
+
+    // Run expiry using the atomic find + expire_one_tx pattern (MF-PRE-ENABLE-001).
+    let candidates =
+        db::repos::lead_mediation_confirmations::find_pending_past_deadline(&pool, now)
+            .await
+            .expect("find_pending_past_deadline");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].id, "conf-expired");
+
+    // Expire atomically inside a transaction.
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        let rows =
+            db::repos::lead_mediation_confirmations::expire_one_tx(&mut tx, &candidates[0].id, now)
+                .await
+                .expect("expire_one_tx");
+        assert_eq!(rows, 1, "should expire exactly one row");
+        tx.commit().await.expect("commit");
+    }
+
+    // Verify expired confirmation is no longer pending
+    let pending_final = db::repos::lead_mediation_confirmations::list_pending(&pool)
+        .await
+        .expect("list_pending after expiry");
+    assert!(
+        pending_final.is_empty(),
+        "expired should not be in pending list"
+    );
+}
+
+/// P017 B1-005: Verify PhaseBLeadResolver fail-closed behavior with multiple
+/// entries and ambiguous matches.
+#[test]
+fn p017_lead_resolver_ambiguous_match_fails_closed() {
+    use engine::mediation::lead_resolver::*;
+
+    let map = PhaseBLeadResolverMap {
+        schema_version: "phase_b_lead_resolver_v1".to_string(),
+        mapping_version: "1".to_string(),
+        entries: vec![
+            LeadResolverEntry {
+                workflow_source_path: "workflows/a.yaml".to_string(),
+                catalog_source_path: "agents/a.yaml".to_string(),
+                lead_agent_id: "lead_1".to_string(),
+                lead_resolution_contract_ref: "contract_1".to_string(),
+                mapping_owner: "test".to_string(),
+                entry_attested_by: "test".to_string(),
+                reviewed_at: "2026-04-24".to_string(),
+                phase_c_removal_condition: "Phase C authoritative".to_string(),
+            },
+            LeadResolverEntry {
+                workflow_source_path: "workflows/a.yaml".to_string(),
+                catalog_source_path: "agents/a.yaml".to_string(),
+                lead_agent_id: "lead_2".to_string(),
+                lead_resolution_contract_ref: "contract_2".to_string(),
+                mapping_owner: "test".to_string(),
+                entry_attested_by: "test".to_string(),
+                reviewed_at: "2026-04-24".to_string(),
+                phase_c_removal_condition: "Phase C authoritative".to_string(),
+            },
+        ],
+        mapping_owner: "test".to_string(),
+        entry_attestation_rule: "Test".to_string(),
+        staleness_review_trigger: "30 days".to_string(),
+        fail_closed_behavior: "Block".to_string(),
+        upgrade_and_removal_criteria: "Phase C".to_string(),
+    };
+
+    let resolver = PhaseBLeadResolver::from_map(map);
+    match resolver.resolve("workflows/a.yaml", "agents/a.yaml") {
+        LeadResolution::FailedClosed { reason } => {
+            assert!(
+                reason.contains("Ambiguous"),
+                "Expected ambiguous match failure, got: {reason}"
+            );
+        }
+        LeadResolution::Resolved { .. } => {
+            panic!("Should fail closed on ambiguous match");
+        }
+    }
+}
+
+/// P017 B1-005: Verify WorkflowConflictStatus::is_terminal_or_operator
+/// correctly classifies all status variants.
+#[test]
+fn p017_conflict_status_terminal_or_operator_classification() {
+    use domain::workflow_conflict::WorkflowConflictStatus;
+
+    // Unresolved is the only status eligible for mediation initiation
+    assert!(
+        !WorkflowConflictStatus::Unresolved.is_terminal_or_operator(),
+        "Unresolved should be eligible for mediation"
+    );
+
+    // All others should be ineligible
+    assert!(WorkflowConflictStatus::LeadMediationPending.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::OperatorConfirmationRequired.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::Resolved.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::Superseded.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::TerminalUnverifiable.is_terminal_or_operator());
+}
+
+/// P017 B2-003: Verify MediationSettlementService settle_expired correctly
+/// transitions mediation to terminal_unverifiable with proper settlement_result.
+#[tokio::test]
+async fn p017_settlement_service_expire_path() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: "med-expire".to_string(),
+        run_id: "run-expire".to_string(),
+        conflict_id: "conflict-expire".to_string(),
+        conflict_fingerprint: "fp-expire".to_string(),
+        lead_agent_id: "lead_agent".to_string(),
+        status: domain::mediation::LeadMediationStatus::OperatorConfirmationRequired,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Awaiting confirmation".to_string()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    let settlement_svc =
+        engine::mediation::settlement::MediationSettlementService::new(pool.clone());
+    let outcome = settlement_svc
+        .settle_expired("med-expire", now)
+        .await
+        .expect("settle_expired");
+
+    assert_eq!(outcome.settlement_result, "confirmation_deadline_expired");
+    assert_eq!(
+        outcome.recovery_action.as_deref(),
+        Some("clone_or_manual_fallback")
+    );
+
+    let settled = db::repos::lead_conflict_mediations::find_by_id(&pool, "med-expire")
+        .await
+        .expect("find")
+        .expect("should exist");
+    assert_eq!(
+        settled.status,
+        domain::mediation::LeadMediationStatus::TerminalUnverifiable
+    );
+    assert!(settled.settled_at.is_some());
 }

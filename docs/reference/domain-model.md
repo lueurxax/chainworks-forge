@@ -15,10 +15,14 @@ This document describes the SwiftData persistence layer of Chainworks Forge. All
                      │ Approval │          │   Agent     │
                      │          │          │  Execution  │
                      └──────────┘          └─────┬───────┘
-                                                 │ *
-                                           ┌─────▼───────┐
-                                           │  Artifact   │
-                                           └─────────────┘
+                          │                      │ *
+              ┌───────────▼───────────┐    ┌─────▼───────┐
+              │ Lead Mediation (Rust) │    │  Artifact   │
+              └───────────┬───────────┘    └─────────────┘
+                          │ 1
+              ┌───────────▼───────────┐
+              │  Confirmation (Rust)  │
+              └───────────────────────┘
 ```
 
 ## Models
@@ -122,13 +126,13 @@ Tracks the execution of a single stage (state) in the workflow.
 
 **File:** `Models/AgentExecution.swift`
 
-Tracks a single agent's work. In Phase B, this model migrates to a general 
+Tracks a single agent's work. This model uses a general
 owner model (ARCH-037) to support lead-mediated conflicts.
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | `UUID` | Unique identifier |
-| `ownerKind` | `String` | `stage_execution` or `lead_conflict_mediation` |
+| `ownerKind` | `String` | `stage_execution` · `lead_conflict_mediation` |
 | `ownerID` | `UUID` | References the owner record |
 | `agentID` | `String` | Agent identifier from the catalog |
 | `agentTitle` | `String` | Human-readable agent name |
@@ -141,12 +145,16 @@ owner model (ARCH-037) to support lead-mediated conflicts.
 | `costCents` | `Int64?` | Cost in minor units |
 | `logSnippet` | `String?` | Last N lines of log |
 | `runtimeSessionID` | `String?` | Runtime session tracking |
+| `leadMediationRecordID` | `UUID?` | Linked mediation record (P017) |
+| `originStageID` | `String?` | Origin stage lineage |
+| `originStageExecutionID`| `UUID?` | Origin stage execution lineage |
+| `stageExecutionID` | `UUID?` | Compatibility stage-execution ID (null for mediation) |
 
 #### Relationships
 
 | Relationship | Target | Delete Rule |
 |---|---|---|
-| `stageExecution` | `StageExecution?` | Optional in Phase B; non-null for stage-owned work |
+| `stageExecution` | `StageExecution?` | Optional; non-null for stage-owned work |
 | `artifacts` | `[Artifact]` | Cascade |
 
 ### `Approval`
@@ -200,6 +208,51 @@ Metadata for a durable output produced by an agent. Content lives on disk; Swift
 | Relationship | Target | Delete Rule |
 |---|---|---|
 | `agentExecution` | `AgentExecution` | Inverse of `AgentExecution.artifacts` |
+
+## Control-Plane Only Models (Rust)
+
+The following models live exclusively in the Rust control-plane (`control-plane/crates/domain/src/mediation.rs`) and are not yet mirrored in SwiftData.
+
+### `LeadConflictMediationRecord`
+
+Tracks the lifecycle of a system-lead mediation for a workflow conflict.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `runID` | `String` | Run being mediated |
+| `conflictID` | `String` | Original blocking conflict identifier |
+| `conflictFingerprint`| `String` | Deterministic fingerprint for the conflict |
+| `status` | `LeadMediationStatus` | `pending` · `queued` · `running` · `awaiting_output_validation` · `operator_confirmation_required` · `settled` · `terminal_unverifiable` · `canceled` · `superseded` |
+| `leadAgentID` | `String` | System lead agent chosen for mediation |
+| `chosenAction` | `String?` | Action chosen by the lead |
+| `chosenNextStateID`| `String?` | Target next state ID |
+| `operatorRationale` | `String?` | Sanitized plain-text rationale for the operator |
+| `sanitizedProgress` | `String?` | Non-empty progress string for pending/queued states |
+| `validationErrors` | `String?` | JSON-serialized validation errors |
+| `settlementResult`| `String?` | Result classification (e.g., `rejected_clone_manual`) |
+| `confirmationSubjectID`| `String?` | Link to the operator confirmation item |
+| `costSummaryJSON` | `String?` | Structured cents-based cost data |
+
+### `LeadMediationConfirmation`
+
+A separate store for operator sign-off on mediation outcomes. These are unioned with stage approvals in the `approvals.list` MCP tool.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `mediationRecordID`| `String` | Linked mediation record |
+| `runID` | `String` | Run ID |
+| `conflictID` | `String` | Conflict ID |
+| `conflictFingerprint`| `String` | Fingerprint to validate against stale outcomes |
+| `status` | `ConfirmationStatus` | `pending` · `resolved` · `superseded` · `expired` · `canceled` |
+| `suggestedAction` | `String` | The lead's recommendation for the operator |
+| `requestedAt` | `Date` | When the confirmation was requested |
+| `deadlineAt` | `Date?` | Expiration window; engine-owned watchdog settles fail-closed on expiry |
+| `readbackRef` | `String?` | Reference for report or GraphQL awareness navigation |
+| `idempotencyScopeKey`| `String?` | Prevents duplicate resolutions |
+| `resolvedAt` | `Date?` | Resolution timestamp |
+| `resolvedByPrincipalID`| `String?` | Identity of the resolving operator |
 
 ## Status enums
 

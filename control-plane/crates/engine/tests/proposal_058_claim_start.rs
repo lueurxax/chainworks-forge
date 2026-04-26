@@ -482,6 +482,10 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             actual_mcp_observation_json: None,
             mcp_session_startup_latency_ms: None,
             actual_xcode_runtime_observation_json: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
         },
     )
     .await
@@ -1394,6 +1398,10 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
             actual_mcp_observation_json: None,
             actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
         },
     )
     .await
@@ -1580,6 +1588,10 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
             actual_mcp_observation_json: None,
             actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
         },
     )
     .await

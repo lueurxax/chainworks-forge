@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::LegacyBroadDiscoveryPolicy;
 use crate::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
+use crate::mediation::MediationConfirmationDecision;
 
 // ── P029: Canonical PrincipalClass definition (owned by domain) ────────
 
@@ -35,6 +36,9 @@ pub enum Command {
     ResetSession(ResetSessionCmd),
     RunStewardAnalysis(RunStewardAnalysisCmd),
     OverrideArtifactContract(OverrideArtifactContractCmd),
+    /// P017 Phase B: Resolve a lead mediation confirmation via the
+    /// engine-owned settlement boundary.
+    ResolveLeadMediationConfirmation(ResolveLeadMediationConfirmationCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,6 +127,19 @@ pub struct OverrideArtifactContractCmd {
 pub struct ResetSessionCmd {
     pub run_id: RunId,
     pub stage_id: String,
+}
+
+/// P017 Phase B: Command to resolve a lead mediation confirmation.
+/// Distinct from ApproveStage/RejectStage per the frozen contract.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolveLeadMediationConfirmationCmd {
+    pub run_id: RunId,
+    pub mediation_record_id: String,
+    pub confirmation_subject_id: String,
+    pub decision: MediationConfirmationDecision,
+    pub comment: Option<String>,
+    pub conflict_fingerprint: String,
+    pub idempotency_key: String,
 }
 
 // ── P029: Caller identity for audit journaling ──────────────────────────

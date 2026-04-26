@@ -67,6 +67,14 @@ pub struct AgentExecution {
     pub actual_mcp_observation_json: Option<String>,
     pub actual_xcode_runtime_observation_json: Option<String>,
     pub mcp_session_startup_latency_ms: Option<i64>,
+    /// P017: Owner-aware execution identity. Defaults to "stage_execution".
+    pub owner_kind: Option<String>,
+    /// P017: Owner ID — stage_execution_id for stage-owned, mediation record ID for mediation-owned.
+    pub owner_id: Option<String>,
+    /// P017: Mediation record ID when owner_kind = lead_conflict_mediation.
+    pub lead_mediation_record_id: Option<String>,
+    /// P017: Origin stage execution ID for mediation-owned executions (compatibility context).
+    pub origin_stage_execution_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

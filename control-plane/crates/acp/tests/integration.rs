@@ -1104,6 +1104,11 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     }
 }
 
@@ -1149,6 +1154,11 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1217,6 +1227,11 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1270,6 +1285,11 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1328,6 +1348,11 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1393,6 +1418,11 @@ async fn mcp_servers_session_new_serialization_tests() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1451,6 +1481,11 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1507,6 +1542,11 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
     let config = AcpSessionConfig {
         set_mode_after_session_new: true,
@@ -1561,6 +1601,11 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -1643,6 +1688,11 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -4060,6 +4110,11 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4114,6 +4169,11 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let error = adapter
@@ -4190,6 +4250,11 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4240,6 +4305,11 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4295,6 +4365,11 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4373,6 +4448,11 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4450,6 +4530,11 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4510,6 +4595,11 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4566,6 +4656,11 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4637,6 +4732,11 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -4679,6 +4779,11 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -4744,6 +4849,11 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         legacy_broad_discovery_policy: Default::default(),
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let execution = {
@@ -4822,6 +4932,11 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -4865,6 +4980,11 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -4915,6 +5035,11 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5011,6 +5136,11 @@ sys.exit(0)
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let _ = adapter.execute(req).await;

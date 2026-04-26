@@ -131,6 +131,20 @@ impl WorkflowConflictStatus {
         )
     }
 
+    /// Returns true when the conflict is already terminal, resolved, superseded,
+    /// in mediation, or already requiring operator confirmation — i.e., not eligible
+    /// for new Phase B mediation initiation.
+    pub fn is_terminal_or_operator(&self) -> bool {
+        matches!(
+            self,
+            WorkflowConflictStatus::TerminalUnverifiable
+                | WorkflowConflictStatus::Resolved
+                | WorkflowConflictStatus::Superseded
+                | WorkflowConflictStatus::LeadMediationPending
+                | WorkflowConflictStatus::OperatorConfirmationRequired
+        )
+    }
+
     pub fn graphql_name(&self) -> &'static str {
         match self {
             WorkflowConflictStatus::Unresolved => "UNRESOLVED",

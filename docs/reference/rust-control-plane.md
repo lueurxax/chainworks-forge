@@ -83,9 +83,9 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
 |---|---|---|
 | `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events. No I/O. |
 | `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules, work item types. |
-| `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation. |
+| `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
-| `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus. |
+| `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus, and mediation settlement. |
 | `graphql-server` | `crates/graphql-server/src/lib.rs` | async-graphql schema (queries, mutations, subscriptions) served over axum. |
 | `mcp-server` | `crates/mcp-server/src/lib.rs` | MCP JSON-RPC server with tool dispatch, resource reads, stdio and HTTP transports. |
 | `daemon` | `crates/daemon/src/main.rs` | Binary entry point. Wires all crates, runs startup recovery, enters mode dispatch. |
@@ -104,7 +104,11 @@ domain  <--  db  <--  workflow
 
 ## Boundary shape
 
-The daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`):
+The daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`).
+Both surfaces are authenticated with bearer tokens (P029) and filter their
+visible area by the caller's principal class. See
+[mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
+for the full authentication and capability filtering reference.
 
 ### GraphQL
 
@@ -201,11 +205,11 @@ transition wins. Agent-authored hints are treated as advisory only.
 **Authority Rules:**
 - The compiled workflow graph is the only authority.
 - Agent-authored hints (`next_stage`, `next_action`) are advisory evidence.
-- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate 
+- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate
   to true; they fail closed as `invalid_expression` or `missing_input`.
 
 **Aggregate Artifact Field Authority:**
-To ensure deterministic evaluation, aggregate artifact fields are classified by 
+To ensure deterministic evaluation, aggregate artifact fields are classified by
 authority. For `proposal_review_summary_v1`:
 - `pass` and `blocker_count` are **transition authoritative**.
 - `next_action` and `next_stage` are **advisory only**.
@@ -221,8 +225,8 @@ Supported expression syntax (`crates/engine/src/orchestrator.rs`, line 487):
 | `expr and expr`, `expr or expr` | Logical connectives (parenthesis-aware split) |
 
 **Workflow Conflict Persistence:**
-If no transition matches or multiple match without a tie-break, the orchestrator 
-persists a `WorkflowConflictRecord` to the `workflow_conflicts` table. Non-blocking 
+If no transition matches or multiple match without a tie-break, the orchestrator
+persists a `WorkflowConflictRecord` to the `workflow_conflicts` table. Non-blocking
 rejected hints are recorded in `workflow_advisory_rejections`.
 
 **Implementation self-assessment mapping:**
@@ -363,29 +367,30 @@ language-specific scheduler capacity dimensions.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `021_p017_workflow_conflicts.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `028_p017_phase_b_mediation.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
-| `agent_executions` | Per-agent invocation records (provider, model, status, **owner_kind**, **owner_id**) |
-| `workflow_conflicts` | Blocking graph-authority conflicts by fingerprint and status |
+| `agent_executions` | Per-agent invocation records (provider, model, status, **owner_kind**, **owner_id**, **lead_mediation_record_id**, **origin_stage_id**, **origin_stage_execution_id**, **stage_execution_id**) |
+| `workflow_conflicts` | Blocking graph-authority conflicts (run_id, fingerprint, status, reason, current_mediation_id) |
 | `workflow_advisory_rejections` | Non-blocking historical records of rejected agent hints |
-| `lead_mediation` | State for lead-owned conflict resolution attempts |
+| `lead_conflict_mediations` | Durable mediation lifecycle (id, run_id, conflict_id, status, lead_agent_id, settlement_result) |
+| `lead_mediation_confirmations` | Separate store for mediation confirmations (id, mediation_id, status, deadline_at, suggested_action) |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
 
-**AgentExecution Owner Migration (Phase B):**
-To support lead-mediated conflicts without synthetic stage states, `agent_executions` 
+**AgentExecution Owner Migration:**
+To support lead-mediated conflicts without synthetic stage states, `agent_executions`
 migrated to a general owner model:
 - `owner_kind`: `stage_execution` or `lead_conflict_mediation`.
 - `owner_id`: References either `stage_execution_id` or `mediation_record_id`.
 - `stage_execution_id` remains as a nullable compatibility field.
-- This allows mediation-owned executions to reuse the same retry, quota, 
+- This allows mediation-owned executions to reuse the same retry, quota,
   artifact, and cost infrastructure as stage-owned executions.
 
 **Projections and read-model tables** (e.g., `002_projections.sql`, `021_scheduler_backpressure_foundation.sql`):
@@ -419,6 +424,19 @@ Projections are rebuilt after every mutation that changes run state. The rebuild
 
 This keeps projections eventually consistent with canonical tables within a single work item cycle.
 
+## Metrics and Observability
+
+The control plane emits rollout metrics to track conflict resolution and mediation effectiveness.
+
+### Rollout Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `workflow_conflict_time_to_resolution_seconds` | Histogram | `conflict_reason` | Time from conflict detection to resolution or terminal settlement. |
+| `conflict_reason_to_action_outcome_total` | Counter | `conflict_reason`, `outcome` | Counts outcomes (resolved, terminal, superseded) per conflict reason. |
+| `recovery_action_chosen_total` | Counter | `action_kind` | Counts chosen recovery actions (retry, clone, manual_fallback). |
+| `phase_c_validation_outcome_total` | Counter | `outcome` | Phase C validation results: `static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`. |
+
 ## Work queue
 
 The work queue (`crates/engine/src/work_queue.rs`) wraps the `work_items` SQLite table with claim-next / complete / fail semantics.
@@ -440,31 +458,31 @@ The background executor (`crates/engine/src/executor.rs`) polls the queue in a l
 
 The executor uses a capacity-aware claim/start gate for `InvokeAgent`: it checks global,
 provider, and per-run active execution caps before mutating ownership, and leaves
-capacity-blocked work pending. 
+capacity-blocked work pending.
 
 - **Default Caps**: Global 20, per-run 4, Claude 8, Gemini 4, Codex 10, Auggie 1, Junie 1.
-- **Backpressure Visibility**: Blocked work remains `pending` and is exposed via 
+- **Backpressure Visibility**: Blocked work remains `pending` and is exposed via
   `scheduler_queue_summaries` and `scheduler_health_snapshots` projections.
-- **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion 
-  `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the 
+- **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion
+  `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the
   completed work item before settling the stage.
 
 ### Scheduler Fairness
 
 The scheduler ensures that no single run or provider family starves others:
 
-- **Bounded Candidate Window**: Reads a window of pending work (default 20) ordered 
+- **Bounded Candidate Window**: Reads a window of pending work (default 20) ordered
   by `scheduled_at` and `rowid`.
 - **Least-Recently-Served**: Selects the oldest eligible item from the run that was
   least recently served, using the `scheduler_service_state` table to persist
   fairness state across restarts.
 - **Deterministic Tie-breaking**: Uses `scheduled_at` then `rowid`.
-- **Hot Indexes**: Scans are backed by hot indexes on `work_items` and 
+- **Hot Indexes**: Scans are backed by hot indexes on `work_items` and
   `agent_executions` to ensure O(1) or O(log N) lookup at scale.
 
 ## Command handler
 
-The command handler at `crates/engine/src/command_handler.rs` processes six command types. Every command is recorded in the `command_journal` table before execution and marked completed or failed afterward.
+The command handler at `crates/engine/src/command_handler.rs` processes eleven command types. Every command is recorded in the `command_journal` table before execution and marked completed or failed afterward.
 
 | Command | Effect |
 |---|---|
@@ -472,8 +490,13 @@ The command handler at `crates/engine/src/command_handler.rs` processes six comm
 | `ApproveStage` | Resolves approval as Granted, settles manual gates or activates compute stages, enqueues `AdvanceRun`. |
 | `RejectStage` | Resolves approval as Rejected, marks stage Blocked. |
 | `RetryStage` | Marks old stage Skipped, creates new `StageExecution` with incremented attempt, enqueues `AdvanceRun`. |
+| `ResolveWorkflowConflictTransition` | Resolves a blocking workflow conflict by selecting a legal graph transition manually. |
+| `OverrideLegacyDiscoveryPolicy` | Overrides the artifact discovery policy for a specific stage execution. |
 | `CancelRun` | Sets run to Cancelling, rebuilds projections. |
 | `ResetSession` | Resets stage to Pending, enqueues StartupRepair. |
+| `RunStewardAnalysis` | Triggers a Steward system-health analysis. |
+| `OverrideArtifactContract` | Applies a manual operator override to an artifact contract's status. |
+| `ResolveLeadMediationConfirmation` | Resolves a lead mediation confirmation (P017 Phase B) via the engine-owned settlement boundary. |
 
 ## Recovery service
 

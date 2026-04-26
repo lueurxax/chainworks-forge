@@ -190,6 +190,24 @@ pub struct GqlWorkflowConflict {
     pub resolution_record_json: Option<Json<serde_json::Value>>,
     pub terminal_failure_reason: Option<String>,
     pub diagnostic_redaction_tier: String,
+    /// P017 Phase B: Lead mediation readback (read-only, no mutations).
+    pub lead_mediation: Option<GqlLeadMediation>,
+}
+
+/// P017 Phase B: Read-only mediation readback projected from the lead_conflict_mediations table.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlLeadMediation {
+    pub status: String,
+    pub resolution_mode: Option<String>,
+    pub chosen_action: Option<String>,
+    pub chosen_next_state_id: Option<String>,
+    pub chosen_next_state_label: Option<String>,
+    pub operator_rationale: Option<String>,
+    pub sanitized_progress: Option<String>,
+    pub validation_errors: Option<Json<serde_json::Value>>,
+    pub confirmation_subject_id: Option<String>,
+    pub superseded_by_event_ref: Option<String>,
+    pub cost_summary: Option<Json<serde_json::Value>>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -265,6 +283,7 @@ impl From<WorkflowConflictRecord> for GqlWorkflowConflict {
             resolution_record_json: record.resolution_record_json.map(Json),
             terminal_failure_reason: record.terminal_failure_reason,
             diagnostic_redaction_tier: record.diagnostic_redaction_tier,
+            lead_mediation: None, // Populated by enrichment when mediation_record_id is present
         }
     }
 }

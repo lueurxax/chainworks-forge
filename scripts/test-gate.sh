@@ -1617,7 +1617,7 @@ Available gates:
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-015    Proposal 015 skill resolution and runtime injection gate
-  proposal-017    Proposal 017 Phase A workflow conflict truth gate
+  proposal-017    Proposal 017 Phase A/B/C workflow authority, conflict truth, and lead mediation gate
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
@@ -1805,19 +1805,40 @@ case "$GATE" in
     run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
     ;;
   proposal-017|p017)
-    log "Proposal 017 gate: Phase A Swift bridge/report readback plus control-plane conflict truth"
+    log "Proposal 017 gate: Phase A/B/C workflow authority, conflict truth, and lead mediation"
     check_idle_environment allow_app
+
+    # Phase 0 Contract Freeze: verify existence of required backend artifacts
+    log "Verifying Phase 0 backend contract artifacts..."
+    required_artifacts=(
+      "docs/proposals/017-evidence/phase-0-approval-mediation-contract.json"
+      "docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md"
+      "docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json"
+      "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json"
+      "docs/proposals/017-evidence/phase-0-settlement-service-boundary.md"
+      "docs/proposals/017-evidence/phase-0-artifact-manifest.json"
+    )
+    for art in "${required_artifacts[@]}"; do
+      if [[ ! -f "$ROOT_DIR/$art" ]]; then
+        die "Missing required Phase 0 artifact: $art"
+      fi
+    done
+
     run_targeted_tests "proposal-017-swift" "${PROPOSAL_017_SWIFT_TESTS[@]}"
     (
       cd "$ROOT_DIR/control-plane"
       export CARGO_TARGET_DIR=target/proposal-017-gate
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      # Phase A: Workflow authority and conflict truth
       cargo test -p workflow proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p domain --test proposal_017_workflow_conflict -- --test-threads=1 --nocapture
       cargo test -p db --test proposal_017_workflow_conflict_persistence -- --test-threads=1 --nocapture
-      cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p mcp-server proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p graphql-server proposal_017_ -- --test-threads=1 --nocapture
+
+      # Phase B/C: Lead mediation and owner-aware execution
+      cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p engine p017_mediation_ -- --test-threads=1 --nocapture
     )
     log "Proposal 017 gate passed"
     ;;

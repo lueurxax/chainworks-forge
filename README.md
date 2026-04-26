@@ -91,9 +91,10 @@ The current MVP provider set is:
 
 The repository is past the scaffold stage. The implemented system now includes:
 
-- implemented thin GraphQL-only read boundary ensuring production UI truth is read from server projections
+- lead-mediated workflow conflict resolution and mandatory lead validation (Proposal 017 Phase B/C)
+- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
-- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017)
+- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017 Phase A)
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
