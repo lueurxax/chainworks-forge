@@ -1,3 +1,4 @@
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -117,6 +118,16 @@ async fn enrich_run_with_artifact_contracts(
     gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
+    // P017: Enrich workflow conflict with lead mediation readback if present.
+    if let Some(ref mut conflict) = gql.workflow_conflict {
+        if let Some(ref mediation_id) = conflict.mediation_record_id {
+            if let Ok(Some(med)) =
+                db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
+            {
+                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation::from(&med));
+            }
+        }
+    }
     gql.implementation_handoff_status_json = if let Some(status) =
         workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
     {
@@ -222,11 +233,17 @@ impl QueryRoot {
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let run = runs::find_by_id(pool, parsed_run_id).await?;
         let items = projections::list_artifacts_projection(pool, run_id.as_str()).await?;
+        let mut bulk_preview_budget_remaining = P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES;
         Ok(items
             .into_iter()
             .map(|row| {
                 let mut artifact = GqlArtifact::from(row.clone());
-                attach_p031_artifact_payload(&row, run.as_ref(), &mut artifact);
+                attach_p031_artifact_payload(
+                    &row,
+                    run.as_ref(),
+                    &mut artifact,
+                    &mut bulk_preview_budget_remaining,
+                );
                 artifact
             })
             .collect())
@@ -511,6 +528,12 @@ impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
 #[derive(SimpleObject, Clone)]
 pub struct GqlXcodeBrokerHealthSnapshot {
     pub state: GqlXcodeBrokerHealthState,
+    pub reason_code: String,
+    pub can_acquire_new_xcode_leases: bool,
+    pub active_lease_count: i32,
+    pub initialize_queue_depth: i32,
+    pub last_transition_at: String,
+    pub operator_message: String,
     pub pool_id: String,
     pub active_leases: i32,
     pub queued_leases: i32,
@@ -525,6 +548,12 @@ impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealth
     fn from(s: domain::lifecycle::XcodeBrokerHealthSnapshot) -> Self {
         Self {
             state: s.state.into(),
+            reason_code: s.reason_code,
+            can_acquire_new_xcode_leases: s.can_acquire_new_xcode_leases,
+            active_lease_count: s.active_lease_count as i32,
+            initialize_queue_depth: s.initialize_queue_depth as i32,
+            last_transition_at: s.last_transition_at,
+            operator_message: s.operator_message,
             pool_id: s.pool_id,
             active_leases: s.active_leases as i32,
             queued_leases: s.queued_leases as i32,
@@ -584,6 +613,16 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
+    // P017: Enrich workflow conflict with lead mediation readback if present.
+    if let Some(ref mut conflict) = run.workflow_conflict {
+        if let Some(ref mediation_id) = conflict.mediation_record_id {
+            if let Ok(Some(med)) =
+                db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
+            {
+                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation::from(&med));
+            }
+        }
+    }
     run.implementation_handoff_status_json = if let Some(status) =
         workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
     {
@@ -594,27 +633,44 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     Ok(run)
 }
 
-const P031_ARTIFACT_PAYLOAD_MAX_BYTES: i64 = 1024 * 1024;
+const P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES: usize = 120_000;
+const P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES: usize = 1_000_000;
+
+struct P031ArtifactPayloadPreview {
+    text: String,
+    truncated: bool,
+    bytes_read: usize,
+}
 
 fn attach_p031_artifact_payload(
     row: &db::repos::projections::ArtifactIndexRow,
     run: Option<&domain::run::Run>,
     artifact: &mut GqlArtifact,
+    bulk_preview_budget_remaining: &mut usize,
 ) {
     if artifact.report_kind.is_some() || row.format == "report" {
         return;
     }
 
-    if row.size_bytes.unwrap_or(0) > P031_ARTIFACT_PAYLOAD_MAX_BYTES {
-        mark_payload_unavailable(
+    let estimated_preview_bytes = row
+        .size_bytes
+        .and_then(|size| usize::try_from(size).ok())
+        .filter(|size| *size > 0)
+        .map(|size| size.min(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES))
+        .unwrap_or(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
+    if estimated_preview_bytes > *bulk_preview_budget_remaining {
+        mark_payload_deferred(
             artifact,
-            "Artifact payload is larger than the P031 GraphQL preview limit",
+            "Artifact payload preview deferred because the bulk artifact list reached its payload preview budget",
         );
         return;
     }
 
     let Some(run) = run else {
-        mark_payload_unavailable(artifact, "Run metadata was unavailable for artifact readback");
+        mark_payload_unavailable(
+            artifact,
+            "Run metadata was unavailable for artifact readback",
+        );
         return;
     };
 
@@ -626,12 +682,31 @@ fn attach_p031_artifact_payload(
         return;
     };
 
-    match std::fs::read_to_string(path) {
-        Ok(payload) => {
-            artifact.payload_text = Some(payload);
+    match read_p031_artifact_payload_preview(&path) {
+        Ok(preview) => {
+            let consumed_preview_bytes = estimated_preview_bytes.max(
+                preview
+                    .bytes_read
+                    .min(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES),
+            );
+            if consumed_preview_bytes > *bulk_preview_budget_remaining {
+                mark_payload_deferred(
+                    artifact,
+                    "Artifact payload preview deferred because the bulk artifact list reached its payload preview budget",
+                );
+                return;
+            }
+            *bulk_preview_budget_remaining =
+                bulk_preview_budget_remaining.saturating_sub(consumed_preview_bytes);
+            artifact.payload_text = Some(preview.text);
             artifact.payload_availability_state = GqlPayloadAvailabilityState::Available;
             artifact.payload_unavailable_reason_code = None;
-            artifact.server_debug_detail = None;
+            artifact.server_debug_detail = preview.truncated.then(|| {
+                format!(
+                    "Artifact payload preview capped at {} bytes; full payload remains server-owned",
+                    P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES
+                )
+            });
         }
         Err(err) => {
             mark_payload_unavailable(
@@ -642,10 +717,52 @@ fn attach_p031_artifact_payload(
     }
 }
 
+fn read_p031_artifact_payload_preview(path: &Path) -> io::Result<P031ArtifactPayloadPreview> {
+    let file = std::fs::File::open(path)?;
+    let mut limited = file.take((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES + 1) as u64);
+    let mut bytes = Vec::with_capacity(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES + 1);
+    limited.read_to_end(&mut bytes)?;
+
+    let truncated = bytes.len() > P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES;
+    if truncated {
+        bytes.truncate(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
+    }
+    let bytes_read = bytes.len();
+
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(P031ArtifactPayloadPreview {
+            text,
+            truncated,
+            bytes_read,
+        }),
+        Err(err) => {
+            let valid_up_to = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid_up_to);
+            let text = String::from_utf8(bytes).map_err(|utf8_err| {
+                io::Error::new(io::ErrorKind::InvalidData, utf8_err.to_string())
+            })?;
+            Ok(P031ArtifactPayloadPreview {
+                text,
+                truncated: true,
+                bytes_read,
+            })
+        }
+    }
+}
+
 fn mark_payload_unavailable(artifact: &mut GqlArtifact, detail: &str) {
     artifact.payload_text = None;
     artifact.payload_availability_state = GqlPayloadAvailabilityState::Unavailable;
     artifact.payload_unavailable_reason_code = Some(GqlPayloadUnavailableReasonCode::NotAvailable);
+    artifact.server_debug_detail = Some(detail.to_string());
+}
+
+fn mark_payload_deferred(artifact: &mut GqlArtifact, detail: &str) {
+    artifact.payload_text = None;
+    artifact.payload_availability_state = GqlPayloadAvailabilityState::PayloadDeferred;
+    artifact.payload_unavailable_reason_code =
+        Some(GqlPayloadUnavailableReasonCode::PayloadDeferredByP031);
     artifact.server_debug_detail = Some(detail.to_string());
 }
 
@@ -1351,6 +1468,7 @@ mod tests {
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
+    use domain::mediation::{LeadConflictMediationRecord, LeadMediationStatus};
     use domain::steward::{
         CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
         StewardRecommendation,
@@ -1519,6 +1637,47 @@ mod tests {
         }
     }
 
+    fn make_lead_mediation_record(
+        run_id: RunId,
+        conflict: &WorkflowConflictRecord,
+        mediation_id: &str,
+    ) -> LeadConflictMediationRecord {
+        LeadConflictMediationRecord {
+            id: mediation_id.to_string(),
+            run_id: run_id.to_string(),
+            conflict_id: conflict.conflict_id.clone(),
+            conflict_fingerprint: conflict.conflict_fingerprint.clone(),
+            lead_agent_id: "lead-agent-1".into(),
+            status: LeadMediationStatus::OperatorConfirmationRequired,
+            settlement_result: Some("operator_confirmed".into()),
+            recovery_action: None,
+            chosen_action: Some("advance".into()),
+            chosen_next_state_id: Some("release".into()),
+            chosen_next_state_label: Some("Release".into()),
+            operator_rationale: Some("PRIVATE rationale must not leave storage".into()),
+            sanitized_progress: Some("Lead mediation selected a release transition.".into()),
+            validation_errors_json: Some(
+                serde_json::json!([{"field": "summary", "message": "safe validation note"}])
+                    .to_string(),
+            ),
+            cost_summary_json: Some(
+                serde_json::json!({
+                    "total_cost_cents": 42,
+                    "input_tokens": 100,
+                    "output_tokens": 25
+                })
+                .to_string(),
+            ),
+            metric_event_id: Some("metric-1".into()),
+            superseded_by_event_ref: Some("event-2".into()),
+            agent_execution_id: Some("agent-exec-1".into()),
+            confirmation_subject_id: Some("confirmation-1".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            settled_at: None,
+        }
+    }
+
     fn test_workflow_yaml_path() -> String {
         format!(
             "{}/../../../examples/workflows/workflow.yaml",
@@ -1659,7 +1818,7 @@ mod tests {
             pool,
             &domain::agent::AgentExecution {
                 id: agent_execution_id,
-                stage_execution_id: stage_id,
+                stage_execution_id: Some(stage_id),
                 agent_id: "validation_agent".to_string(),
                 provider: "system".to_string(),
                 model: None,
@@ -1688,6 +1847,10 @@ mod tests {
                 ),
                 actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
             },
         )
         .await
@@ -1970,8 +2133,9 @@ mod tests {
             .to_string();
 
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -1979,7 +2143,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -2012,8 +2178,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -2024,10 +2191,12 @@ mod tests {
                       blockingRemainingCodeTaskCount
                       testsRun
                     }}
-                  }}
-                }}
-                "#
-            )))
+	                  }}
+	                }}
+	                "#
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -2067,8 +2236,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -2085,7 +2255,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -2104,6 +2276,143 @@ mod tests {
             conflict_json["candidateTransitions"][0]["result"],
             serde_json::json!("MISSING_INPUT")
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_run_query_exposes_sanitized_lead_mediation_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let mediation_id = "mediation-p017-readback";
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.status = WorkflowConflictStatus::OperatorConfirmationRequired;
+        conflict.mediation_record_id = Some(mediation_id.into());
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+        db::repos::lead_conflict_mediations::insert(
+            &pool,
+            &make_lead_mediation_record(run_id, &conflict, mediation_id),
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        assert!(!schema.sdl().contains("operatorRationale"));
+
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query P017LeadMediationReadback {{
+                  run(id: "{run_id}") {{
+                    workflowConflict {{
+                      mediationRecordId
+                      leadMediation {{
+                        id
+                        conflictId
+                        leadAgentId
+                        status
+                        resolutionMode
+                        chosenAction
+                        chosenNextStateId
+                        chosenNextStateLabel
+                        sanitizedProgress
+                        statusUpdates {{
+                          status
+                          sanitizedProgress
+                          updatedAt
+                          attemptNumber
+                        }}
+                        validationErrors
+                        confirmationSubjectId
+                        supersededByEventRef
+                        costSummary
+                      }}
+                    }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let mediation = &json["run"]["workflowConflict"]["leadMediation"];
+        assert_eq!(mediation["id"], serde_json::json!(mediation_id));
+        assert_eq!(
+            mediation["conflictId"],
+            serde_json::json!(conflict.conflict_id)
+        );
+        assert_eq!(mediation["leadAgentId"], serde_json::json!("lead-agent-1"));
+        assert_eq!(
+            mediation["status"],
+            serde_json::json!("operator_confirmation_required")
+        );
+        assert_eq!(
+            mediation["resolutionMode"],
+            serde_json::json!("operator_confirmation")
+        );
+        assert_eq!(mediation["chosenAction"], serde_json::json!("advance"));
+        assert_eq!(mediation["chosenNextStateId"], serde_json::json!("release"));
+        assert_eq!(
+            mediation["chosenNextStateLabel"],
+            serde_json::json!("Release")
+        );
+        assert_eq!(
+            mediation["sanitizedProgress"],
+            serde_json::json!("Lead mediation selected a release transition.")
+        );
+        assert_eq!(
+            mediation["statusUpdates"][0]["status"],
+            serde_json::json!("operator_confirmation_required")
+        );
+        assert_eq!(
+            mediation["statusUpdates"][0]["sanitizedProgress"],
+            serde_json::json!("Lead mediation selected a release transition.")
+        );
+        assert_eq!(
+            mediation["statusUpdates"][0]["attemptNumber"],
+            serde_json::json!(1)
+        );
+        assert!(mediation["statusUpdates"][0]["updatedAt"].is_string());
+        assert_eq!(
+            mediation["confirmationSubjectId"],
+            serde_json::json!("confirmation-1")
+        );
+        assert_eq!(
+            mediation["supersededByEventRef"],
+            serde_json::json!("event-2")
+        );
+        assert_eq!(
+            mediation["validationErrors"][0]["field"],
+            serde_json::json!("summary")
+        );
+        assert_eq!(
+            mediation["costSummary"]["total_cost_cents"],
+            serde_json::json!(42)
+        );
+
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("operatorRationale"));
+        assert!(!serialized.contains("operator_rationale"));
+        assert!(!serialized.contains("PRIVATE rationale"));
     }
 
     #[tokio::test]
@@ -2130,8 +2439,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(
-                r#"
+            .execute(
+                Request::new(
+                    r#"
                 query Runs {
                   runs {
                     id
@@ -2143,7 +2453,9 @@ mod tests {
                   }
                 }
                 "#,
-            ))
+                )
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -3372,6 +3684,316 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_031_artifact_payload_text_is_server_owned_readback() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let artifact_root =
+            std::env::temp_dir().join(format!("p031-artifact-payload-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let artifact_path = artifact_root.join("proposal.md");
+        fs::write(&artifact_path, "# Proposal\n\nGraphQL payload").unwrap();
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "proposal".into(),
+                agent_id: "proposal_writer".into(),
+                name: "proposal.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: artifact_path.to_string_lossy().into_owned(),
+                checksum_sha256: None,
+                size_bytes: Some(24),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactPayloadReadback {{
+                      artifacts(runId: "{run_id}") {{
+                        id
+                        format
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        payloadText
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 artifact payload readback query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifacts"][0];
+        assert_eq!(artifact["id"], serde_json::json!(artifact_id.to_string()));
+        assert_eq!(artifact["format"], serde_json::json!("markdown"));
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("available")
+        );
+        assert!(artifact["payloadUnavailableReasonCode"].is_null());
+        assert_eq!(
+            artifact["payloadText"],
+            serde_json::json!("# Proposal\n\nGraphQL payload")
+        );
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
+    async fn proposal_031_artifact_payload_text_is_capped_for_bulk_readback() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let artifact_root =
+            std::env::temp_dir().join(format!("p031-artifact-preview-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let artifact_path = artifact_root.join("large.md");
+        let payload = format!(
+            "{}tail-marker",
+            "large artifact preview line\n"
+                .repeat((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES / 28) + 256)
+        );
+        fs::write(&artifact_path, &payload).unwrap();
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "proposal".into(),
+                agent_id: "proposal_writer".into(),
+                name: "large.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: artifact_path.to_string_lossy().into_owned(),
+                checksum_sha256: None,
+                size_bytes: Some(payload.len() as i64),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactPayloadPreview {{
+                      artifacts(runId: "{run_id}") {{
+                        payloadAvailabilityState
+                        payloadText
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 capped artifact payload query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifacts"][0];
+        let preview = artifact["payloadText"].as_str().unwrap();
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("available")
+        );
+        assert!(preview.len() <= P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
+        assert!(preview.starts_with("large artifact preview line"));
+        assert!(!preview.contains("tail-marker"));
+        assert!(
+            artifact["serverDebugDetail"]
+                .as_str()
+                .unwrap()
+                .contains("preview capped"),
+            "truncated payloads should expose operator-visible preview metadata"
+        );
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
+    async fn proposal_031_artifact_payload_text_has_bulk_response_budget() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "p031-artifact-bulk-preview-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let payload = format!(
+            "{}tail-marker",
+            "bulk artifact preview line\n"
+                .repeat((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES / 27) + 8)
+        );
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+
+        for index in 0..10 {
+            let artifact_id = ArtifactId::new();
+            let artifact_path = artifact_root.join(format!("large-{index}.md"));
+            fs::write(&artifact_path, &payload).unwrap();
+            artifacts::insert(
+                &pool,
+                &Artifact {
+                    id: artifact_id,
+                    run_id,
+                    stage_id: "proposal".into(),
+                    agent_id: "proposal_writer".into(),
+                    name: format!("large-{index}.md"),
+                    contract_id: "proposal_markdown_v1".into(),
+                    format: ArtifactFormat::Markdown,
+                    file_path: artifact_path.to_string_lossy().into_owned(),
+                    checksum_sha256: None,
+                    // Stale discovery metadata can under-report size. The
+                    // response budget must be enforced from actual preview
+                    // bytes, not only the indexed size.
+                    size_bytes: Some(0),
+                    provider: "test".into(),
+                    model: None,
+                    created_at: Utc::now(),
+                    is_pinned: false,
+                    report_kind: None,
+                    report_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactPayloadBulkBudget {{
+                      artifacts(runId: "{run_id}") {{
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        payloadText
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 bulk artifact payload query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifacts = json["artifacts"].as_array().unwrap();
+        let available_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["payloadAvailabilityState"] == serde_json::json!("available")
+            })
+            .count();
+        let deferred_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["payloadAvailabilityState"] == serde_json::json!("payload_deferred")
+            })
+            .count();
+        let total_payload_bytes: usize = artifacts
+            .iter()
+            .filter_map(|artifact| artifact["payloadText"].as_str())
+            .map(str::len)
+            .sum();
+
+        assert_eq!(available_count, 8);
+        assert_eq!(deferred_count, 2);
+        assert!(total_payload_bytes <= P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact["payloadUnavailableReasonCode"]
+                == serde_json::json!("PAYLOAD_DEFERRED_BY_P031")
+                && artifact["serverDebugDetail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("bulk artifact list reached its payload preview budget")
+        }));
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
     async fn proposal_031_diagnostic_metadata_is_operator_only() {
         let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
@@ -4591,6 +5213,24 @@ mod tests {
         let reporter = LifecycleReporter::new(14, "cafe-babe", bus.clone());
         reporter.set_state(domain::lifecycle::DaemonLifecycleState::Starting);
         reporter.set_state(domain::lifecycle::DaemonLifecycleState::Ready);
+        reporter.set_xcode_broker_health(domain::lifecycle::XcodeBrokerHealthSnapshot {
+            state: domain::lifecycle::XcodeBrokerHealthState::Degraded,
+            reason_code: "xcode_mcp_capacity_backpressure".to_string(),
+            can_acquire_new_xcode_leases: false,
+            active_lease_count: 2,
+            initialize_queue_depth: 8,
+            last_transition_at: "2026-04-25T09:00:00Z".to_string(),
+            operator_message: "Xcode MCP bridge pool is applying capacity backpressure."
+                .to_string(),
+            pool_id: "pool-test".to_string(),
+            active_leases: 2,
+            queued_leases: 8,
+            max_active_leases: 2,
+            max_queued_leases: 8,
+            broker_disabled: false,
+            backend_available: true,
+            observation_persistence_failures: 0,
+        });
 
         let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
             .data(pool.clone())
@@ -4606,6 +5246,13 @@ mod tests {
                       daemonStatus {
                         state schemaVersion binarySchemaVersion buildSha
                         pid lastStateChangeAt json
+                        xcodeBrokerHealth {
+                          state reasonCode canAcquireNewXcodeLeases
+                          activeLeaseCount initializeQueueDepth lastTransitionAt
+                          operatorMessage poolId activeLeases queuedLeases
+                          maxActiveLeases maxQueuedLeases brokerDisabled
+                          backendAvailable observationPersistenceFailures
+                        }
                       }
                     }"#,
                 )
@@ -4622,11 +5269,38 @@ mod tests {
         assert_eq!(data["daemonStatus"]["state"], "READY");
         assert_eq!(data["daemonStatus"]["binarySchemaVersion"], 14);
         assert_eq!(data["daemonStatus"]["buildSha"], "cafe-babe");
+        let health = &data["daemonStatus"]["xcodeBrokerHealth"];
+        assert_eq!(health["state"], "DEGRADED");
+        assert_eq!(health["reasonCode"], "xcode_mcp_capacity_backpressure");
+        assert_eq!(health["canAcquireNewXcodeLeases"], false);
+        assert_eq!(health["activeLeaseCount"], 2);
+        assert_eq!(health["initializeQueueDepth"], 8);
+        assert_eq!(health["lastTransitionAt"], "2026-04-25T09:00:00Z");
+        assert_eq!(
+            health["operatorMessage"],
+            "Xcode MCP bridge pool is applying capacity backpressure."
+        );
+        assert_eq!(health["poolId"], "pool-test");
+        assert_eq!(health["activeLeases"], 2);
+        assert_eq!(health["queuedLeases"], 8);
+        assert_eq!(health["maxActiveLeases"], 2);
+        assert_eq!(health["maxQueuedLeases"], 8);
+        assert_eq!(health["brokerDisabled"], false);
+        assert_eq!(health["backendAvailable"], true);
+        assert_eq!(health["observationPersistenceFailures"], 0);
         // The json field carries the full P042 §5.2 wire shape (snake_case).
         let json_str = data["daemonStatus"]["json"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(parsed["state"], "ready");
         assert_eq!(parsed["binary_schema_version"], 14);
+        assert_eq!(
+            parsed["xcode_broker_health"]["reason_code"],
+            "xcode_mcp_capacity_backpressure"
+        );
+        assert_eq!(
+            parsed["xcode_broker_health"]["can_acquire_new_xcode_leases"],
+            false
+        );
     }
 
     #[tokio::test]

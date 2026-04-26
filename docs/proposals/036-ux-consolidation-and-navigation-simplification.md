@@ -5,7 +5,7 @@
 | Date | 2026-04-09 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [../reference/domain-model.md](../reference/domain-model.md), [021-run-transition-notifications-and-attention-routing.md](021-run-transition-notifications-and-attention-routing.md) |
+| Depends on | [../reference/domain-model.md](../reference/domain-model.md), [../reference/query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [021-run-transition-notifications-and-attention-routing.md](021-run-transition-notifications-and-attention-routing.md) |
 | Scope | Reduce the seven-tab navigation to four tabs by eliminating view duplication, inlining approvals into their natural contexts, merging reference views, and absorbing readiness checks into Settings. |
 | Goal | Every tab owns a single clear purpose. The operator never sees the same information in two places and never needs more than two clicks to reach any surface. |
 
@@ -85,6 +85,35 @@ This proposal does **not** include:
 - Changes to agent.yaml or workflow.yaml schema.
 - New features beyond reorganization (no new data surfaces, no new actions).
 - Mobile or compact layout adaptation (macOS primary).
+
+### 3.1 P031 visual-parity handoff
+
+The GraphQL-only thin UI boundary is established in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). P036 now owns the visual and navigation restoration work over that read model.
+
+Visual baseline commit: `1cca56b9abd622ad7dc4e38304985cbf49e66780` (`2026-04-19T19:05:19+03:00`, `Add P060: lead-driven reviewer routing and expanded reviewer catalog`).
+
+This is the last pre-control-plane visual/ergonomic baseline selected for P036 restoration work. It is the parent of the first large control-plane land commit `a17b1cd04ac38f46f61111c647911f03844b4a33` from 2026-04-21. Use it only for visual/ergonomic behavior. Old Swift-local mutation operations from that baseline are not part of P036 unless a separate write-transport proposal approves them.
+
+P036 must restore or consciously replace these P031 stop-tail surfaces:
+
+| Area | Required visual/product outcome |
+| --- | --- |
+| Runs Home | Restore stronger scanability: status/attention lanes, clear selected row treatment, dense but readable row cards, run title clarity, progress/status chips, and idea origin context. |
+| Run detail | Rebuild a proper inspection layout instead of a single proof-of-read stack: summary, stages, transitions, artifacts, reports, approvals diagnostics, recovery/evidence, and daemon state should be visually distinct but not nested-card heavy. |
+| Stage cards and transitions | Replace the current thin vertical transition list with a richer GraphQL-backed stage map/card treatment inspired by the old `WorkflowMapView`: stage cards, current-stage emphasis, transition arrows/labels, loop progress, attempt/iteration metadata, and compact occurrence summaries. |
+| Handoffs and agent execution context | Bring back readable handoff/agent panels when GraphQL exposes enough projection data; otherwise show explicit deferred states. |
+| Artifact hierarchy | Productize the GraphQL artifact browser: independent list/document scrolling, grouping by stage/agent/type, filters, search, promoted/latest artifacts, status badges, and predictable detail selection. |
+| Artifact rendering | Preserve content-based format detection: a `.json` artifact may contain markdown/plain text and must render by payload shape, not filename alone. Markdown and JSON rendering should remain readable in a split inspector. |
+| Ideas/catalog surfaces | Restore GraphQL-only idea browsing and catalog/definitions inspection so the operator can identify the idea/run context and inspect workflow/agent definitions without leaving the app. |
+| Definitions | Fold Agent Catalog and Workflow Inspector into the P036 Definitions design, including agent grouping and workflow execution-order sorting. |
+| Approvals | Keep P031's read-only/diagnostic rule until a write-path proposal exists, but make approval context visually useful in the Runs flow. |
+
+Acceptance for this handoff:
+
+- The app remains GraphQL-read-only for governed workflow truth.
+- No UI MCP calls, GraphQL mutations, local workflow mutations, raw artifact directory truth, or old Swift orchestrator fallback are reintroduced.
+- Visual parity is judged against operator inspection ergonomics, not against removed write controls.
+- Dogfood should not be claimed until the restored P036 surfaces let an operator identify the idea, inspect run/stage state, inspect artifacts/reports, understand catalog/workflow context, and diagnose daemon/read freshness from the app.
 
 ---
 

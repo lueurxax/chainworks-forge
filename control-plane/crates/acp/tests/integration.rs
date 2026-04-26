@@ -88,6 +88,64 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    pub fn create_set_mode_script(
+        tmpdir: &std::path::Path,
+        observed_mode_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_set_mode.py");
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, pathlib
+
+observed_mode_path = pathlib.Path({observed_mode_path:?})
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/new":
+    sys.exit(1)
+session_id = "fixture-session-set-mode"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/set_mode":
+    sys.exit(1)
+observed_mode_path.write_text(msg.get("params", {{}}).get("modeId", ""))
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/prompt":
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+
+recv()
+sys.exit(0)
+"#,
+            observed_mode_path = observed_mode_path.to_string_lossy().to_string(),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server that emits duplicate session/update chunks
     /// containing a residual absolute Xcode command path.
     pub fn create_residual_xcode_warning_script(tmpdir: &std::path::Path) -> String {
@@ -181,7 +239,10 @@ def recv():
 msg = recv()
 if msg is None:
     sys.exit(1)
-send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+    "protocolVersion": 1,
+    "mcpCapabilities": {"http": True}
+}})
 
 # Phase 2: session/new
 msg = recv()
@@ -925,6 +986,78 @@ sys.exit(0)
         std::fs::set_permissions(&script, p).unwrap();
         script.to_string_lossy().into_owned()
     }
+
+    /// Like `create_broker_attach_session_script`, but keeps the session
+    /// process alive during `session/close` until the test creates
+    /// `allow_close_path`.
+    pub fn create_broker_attach_blocking_close_script(
+        tmpdir: &std::path::Path,
+        close_seen_path: &std::path::Path,
+        allow_close_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_broker_attach_blocking_close.py");
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, pathlib, time
+
+close_seen_path = pathlib.Path({close_seen_path:?})
+allow_close_path = pathlib.Path({allow_close_path:?})
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{
+    "jsonrpc": "2.0",
+    "id": msg["id"],
+    "result": {{
+        "protocolVersion": 1,
+        "serverInfo": {{"name": "broker-attach-blocking-close", "version": "0.0.1"}},
+        "mcpCapabilities": {{"http": True}}
+    }}
+}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-" + str(msg["id"])
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+
+msg = recv()
+if msg is not None and msg.get("method") == "session/close":
+    with close_seen_path.open("a") as f:
+        f.write(session_id + "\n")
+    while not allow_close_path.exists():
+        time.sleep(0.02)
+
+sys.exit(0)
+"#,
+            close_seen_path = close_seen_path.to_string_lossy(),
+            allow_close_path = allow_close_path.to_string_lossy(),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(unix)]
@@ -971,6 +1104,11 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     }
 }
 
@@ -1016,6 +1154,11 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1084,6 +1227,11 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1137,6 +1285,11 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1195,6 +1348,11 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1260,6 +1418,11 @@ async fn mcp_servers_session_new_serialization_tests() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1318,6 +1481,11 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1328,6 +1496,73 @@ async fn http_mcp_servers_session_new_serialization_tests() {
     assert_eq!(server["headers"][0]["name"], "Authorization");
     assert_eq!(server["headers"][0]["value"], "Bearer redacted");
     assert!(server.get("command").is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transport_sends_set_mode_after_session_new_when_configured() {
+    use acp::transport::{AcpSessionConfig, AcpTransportSession};
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let observed_mode_path = tmp.path().join("observed-mode.txt");
+    let script = fixture::create_set_mode_script(tmp.path(), &observed_mode_path);
+    let child = Command::new(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+    };
+    let config = AcpSessionConfig {
+        set_mode_after_session_new: true,
+        ..AcpSessionConfig::default()
+    };
+
+    let mut session = AcpTransportSession::start(child, &req, &config)
+        .await
+        .unwrap();
+    let result = session.prompt(&req).await.unwrap();
+    assert_eq!(result.0, domain::agent::AgentStatus::Completed);
+    session.close().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(observed_mode_path).unwrap(),
+        "bypassPermissions"
+    );
 }
 
 #[cfg(unix)]
@@ -1366,6 +1601,11 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -1448,6 +1688,11 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -2310,15 +2555,19 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps({
         "jsonrpc": "2.0",
         "id": request.get("id"),
-        "result": {
-            "received_id": request.get("id"),
-            "method": request.get("method"),
-            "home": os.environ.get("HOME"),
-            "tmpdir": os.environ.get("TMPDIR"),
-            "developer_dir": os.environ.get("DEVELOPER_DIR"),
-            "xcode_pid": os.environ.get("CHAINWORKS_XCODE_PID")
-        }
-    }) + "\n")
+            "result": {
+                "received_id": request.get("id"),
+                "method": request.get("method"),
+                "home": os.environ.get("HOME"),
+                "tmpdir": os.environ.get("TMPDIR"),
+                "developer_dir": os.environ.get("DEVELOPER_DIR"),
+                "user": os.environ.get("USER"),
+                "logname": os.environ.get("LOGNAME"),
+                "path": os.environ.get("PATH"),
+                "mcp_xcode_pid": os.environ.get("MCP_XCODE_PID"),
+                "chainworks_env": sorted([key for key in os.environ if key.startswith("CHAINWORKS_")])
+            }
+        }) + "\n")
     sys.stdout.flush()
 "#;
     std::fs::write(&backend_script, code).unwrap();
@@ -2387,7 +2636,20 @@ for line in sys.stdin:
         initialize["result"]["developer_dir"],
         "/Applications/Xcode.app/Contents/Developer"
     );
-    assert_eq!(initialize["result"]["xcode_pid"], "4242");
+    assert_eq!(initialize["result"]["mcp_xcode_pid"], "4242");
+    assert_eq!(initialize["result"]["user"], "gui");
+    assert_eq!(initialize["result"]["logname"], "gui");
+    assert_eq!(
+        initialize["result"]["path"],
+        "/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Xcode.app/Contents/Developer/usr/bin"
+    );
+    assert_eq!(
+        initialize["result"]["chainworks_env"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 
     let tools = pool
         .forward_json_rpc_request(
@@ -2398,6 +2660,337 @@ for line in sys.stdin:
         .unwrap();
     assert_eq!(tools["id"], 99);
     assert_eq!(tools["result"]["received_id"], 2);
+
+    pool.release_brokered_xcode_leases(&attachment.lease_ids)
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn xcode_mcp_bridge_pool_process_backend_shares_initialized_backend_per_run_and_xcode_pid() {
+    // P051 intentionally shares one initialized backend per run/Xcode target to
+    // bound Xcode consent prompts; lease policy remains enforced before forward.
+    use acp::{
+        HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBridgePool,
+        XcodeMcpBridgePoolConfig, XcodeMcpProcessBackend, XcodeMcpProcessBackendConfig,
+        XcodeProcessCandidate,
+    };
+    use domain::ids::RunId;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let backend_script = tmp.path().join("mcp_backend_shared.py");
+    let spawn_count_path = tmp.path().join("spawn_count.txt");
+    let request_log = tmp.path().join("requests.jsonl");
+    let code = r#"#!/usr/bin/env python3
+import json
+import sys
+
+counter_path = sys.argv[1]
+request_log = sys.argv[2]
+try:
+    with open(counter_path, "r", encoding="utf-8") as fh:
+        spawn_count = int(fh.read().strip() or "0") + 1
+except FileNotFoundError:
+    spawn_count = 1
+with open(counter_path, "w", encoding="utf-8") as fh:
+    fh.write(str(spawn_count))
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    with open(request_log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"spawn_count": spawn_count, "method": request.get("method"), "id": request.get("id")}) + "\n")
+    sys.stdout.write(json.dumps({
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "result": {
+            "spawn_count": spawn_count,
+            "received_id": request.get("id"),
+            "method": request.get("method")
+        }
+    }) + "\n")
+    sys.stdout.flush()
+"#;
+    std::fs::write(&backend_script, code).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&backend_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&backend_script, permissions).unwrap();
+    }
+
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let host = HostProbeContext {
+        expected_gui_uid: Some(501),
+        operator_home: Some("/Users/gui".to_string()),
+        darwin_tmpdir: Some("/var/folders/t/tmp".to_string()),
+        developer_dir: Some("/Applications/Xcode.app/Contents/Developer".to_string()),
+        candidate_xcodes: vec![XcodeProcessCandidate {
+            pid: 4242,
+            uid: 501,
+            workspace_identity: Some(workspace),
+            app_path: Some("/Applications/Xcode.app".to_string()),
+            developer_dir: None,
+            operator_home: None,
+            darwin_tmpdir: None,
+            alive: true,
+        }],
+    };
+    let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
+        command: backend_script.to_string_lossy().into_owned(),
+        args: vec![
+            spawn_count_path.to_string_lossy().into_owned(),
+            request_log.to_string_lossy().into_owned(),
+        ],
+        request_timeout: Duration::from_secs(15),
+    }));
+    let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+        XcodeMcpBridgePoolConfig {
+            pool_id: "fixture-pool".to_string(),
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            max_active_leases: 3,
+            max_queued_leases: 0,
+            queue_timeout: Duration::from_millis(0),
+            spawn_init_timeout: Duration::from_secs(1),
+            first_connect_timeout: Duration::from_secs(60),
+            broker_disabled: false,
+            tool_allowlists_by_hash: Default::default(),
+            target_probe_context: Some(host),
+            use_local_host_probe: false,
+        },
+        Arc::new(acp::NoopXcodeRuntimeObservationSink),
+        backend.clone(),
+    );
+    let run_id = RunId::new();
+    let mut first_req = brokered_xcode_request(&tmp, "gemini");
+    first_req.run_id = run_id;
+    first_req.agent_id = "p051_gemini_ux_xcode".into();
+    let mut second_req = brokered_xcode_request(&tmp, "gemini");
+    second_req.run_id = run_id;
+    second_req.agent_id = "p051_gemini_ui_xcode".into();
+    let mut different_run_req = brokered_xcode_request(&tmp, "gemini");
+    different_run_req.agent_id = "p051_gemini_other_run_xcode".into();
+
+    let first_attachment = pool.attach_brokered_xcode_leases(&first_req).await.unwrap();
+    let second_attachment = pool
+        .attach_brokered_xcode_leases(&second_req)
+        .await
+        .unwrap();
+    let different_run_attachment = pool
+        .attach_brokered_xcode_leases(&different_run_req)
+        .await
+        .unwrap();
+    let first_lease = &first_attachment.lease_ids[0];
+    let second_lease = &second_attachment.lease_ids[0];
+    let different_run_lease = &different_run_attachment.lease_ids[0];
+
+    let first_initialize = pool
+        .forward_json_rpc_request(
+            first_lease,
+            serde_json::json!({"jsonrpc":"2.0","id":"first-init","method":"initialize"}),
+        )
+        .await
+        .unwrap();
+    let first_backend_pid = backend.backend_process_id(first_lease).await;
+    assert!(first_backend_pid.is_some());
+
+    let second_initialize = pool
+        .forward_json_rpc_request(
+            second_lease,
+            serde_json::json!({"jsonrpc":"2.0","id":"second-init","method":"initialize"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_initialize["result"]["spawn_count"], 1);
+    assert_eq!(second_initialize["id"], "second-init");
+    assert_eq!(second_initialize["result"]["spawn_count"], 1);
+    assert_eq!(second_initialize["result"]["received_id"], 1);
+    assert_eq!(
+        backend.backend_process_id(second_lease).await,
+        first_backend_pid
+    );
+
+    let different_run_initialize = pool
+        .forward_json_rpc_request(
+            different_run_lease,
+            serde_json::json!({"jsonrpc":"2.0","id":"different-run-init","method":"initialize"}),
+        )
+        .await
+        .unwrap();
+    let different_run_backend_pid = backend.backend_process_id(different_run_lease).await;
+    assert_ne!(different_run_backend_pid, first_backend_pid);
+    assert_eq!(different_run_initialize["id"], "different-run-init");
+    assert_eq!(different_run_initialize["result"]["spawn_count"], 2);
+
+    let tools = pool
+        .forward_json_rpc_request(
+            second_lease,
+            serde_json::json!({"jsonrpc":"2.0","id":"second-tools","method":"tools/list"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tools["id"], "second-tools");
+    assert_eq!(tools["result"]["received_id"], 2);
+
+    let log = std::fs::read_to_string(&request_log).unwrap();
+    assert_eq!(log.matches("\"method\": \"initialize\"").count(), 2);
+    assert_eq!(std::fs::read_to_string(&spawn_count_path).unwrap(), "2");
+
+    pool.release_brokered_xcode_leases(&first_attachment.lease_ids)
+        .await
+        .unwrap();
+    assert_eq!(backend.backend_process_id(first_lease).await, None);
+    assert_eq!(
+        backend.backend_process_id(second_lease).await,
+        first_backend_pid
+    );
+    assert_eq!(
+        backend.backend_process_id(different_run_lease).await,
+        different_run_backend_pid
+    );
+
+    pool.release_brokered_xcode_leases(&second_attachment.lease_ids)
+        .await
+        .unwrap();
+    assert_eq!(backend.backend_process_id(second_lease).await, None);
+    assert_eq!(
+        backend.backend_process_id(different_run_lease).await,
+        different_run_backend_pid
+    );
+
+    pool.release_brokered_xcode_leases(&different_run_attachment.lease_ids)
+        .await
+        .unwrap();
+    assert_eq!(backend.backend_process_id(different_run_lease).await, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn xcode_mcp_bridge_pool_process_backend_forwards_notifications_without_backend_ids() {
+    use acp::{
+        HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBridgePool, XcodeMcpBridgePoolConfig,
+        XcodeMcpProcessBackend, XcodeMcpProcessBackendConfig, XcodeProcessCandidate,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let backend_script = tmp.path().join("mcp_backend_notifications.py");
+    let notification_log = tmp.path().join("notifications.jsonl");
+    let code = r#"#!/usr/bin/env python3
+import json
+import sys
+
+notification_log = sys.argv[1]
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    request = json.loads(line)
+    if "id" not in request:
+        with open(notification_log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(request) + "\n")
+        continue
+    sys.stdout.write(json.dumps({
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "result": {
+            "received_id": request.get("id"),
+            "method": request.get("method")
+        }
+    }) + "\n")
+    sys.stdout.flush()
+"#;
+    std::fs::write(&backend_script, code).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&backend_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&backend_script, permissions).unwrap();
+    }
+
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let host = HostProbeContext {
+        expected_gui_uid: Some(501),
+        operator_home: Some("/Users/gui".to_string()),
+        darwin_tmpdir: Some("/var/folders/t/tmp".to_string()),
+        developer_dir: Some("/Applications/Xcode.app/Contents/Developer".to_string()),
+        candidate_xcodes: vec![XcodeProcessCandidate {
+            pid: 4242,
+            uid: 501,
+            workspace_identity: Some(workspace),
+            app_path: Some("/Applications/Xcode.app".to_string()),
+            developer_dir: None,
+            operator_home: None,
+            darwin_tmpdir: None,
+            alive: true,
+        }],
+    };
+    let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
+        command: backend_script.to_string_lossy().into_owned(),
+        args: vec![notification_log.to_string_lossy().into_owned()],
+        request_timeout: Duration::from_secs(15),
+    }));
+    let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+        XcodeMcpBridgePoolConfig {
+            pool_id: "fixture-pool".to_string(),
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            max_active_leases: 1,
+            max_queued_leases: 0,
+            queue_timeout: Duration::from_millis(0),
+            spawn_init_timeout: Duration::from_secs(1),
+            first_connect_timeout: Duration::from_secs(60),
+            broker_disabled: false,
+            tool_allowlists_by_hash: Default::default(),
+            target_probe_context: Some(host),
+            use_local_host_probe: false,
+        },
+        Arc::new(acp::NoopXcodeRuntimeObservationSink),
+        backend,
+    );
+    let req = brokered_xcode_request(&tmp, "claude");
+    let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+    let lease_id = &attachment.lease_ids[0];
+
+    let initialize = pool
+        .forward_json_rpc_request(
+            lease_id,
+            serde_json::json!({"jsonrpc":"2.0","id":"client-init","method":"initialize"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initialize["id"], "client-init");
+    assert_eq!(initialize["result"]["received_id"], 1);
+
+    let notification = pool
+        .forward_json_rpc_request(
+            lease_id,
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notification["id"], serde_json::Value::Null);
+    assert_eq!(notification["result"], serde_json::Value::Null);
+
+    let tools = pool
+        .forward_json_rpc_request(
+            lease_id,
+            serde_json::json!({"jsonrpc":"2.0","id":99,"method":"tools/list"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tools["id"], 99);
+    assert_eq!(tools["result"]["received_id"], 2);
+
+    let log = std::fs::read_to_string(&notification_log).unwrap();
+    assert!(log.contains("notifications/initialized"));
+    assert!(
+        !log.contains("\"id\""),
+        "notification must not receive a backend id: {log}"
+    );
 
     pool.release_brokered_xcode_leases(&attachment.lease_ids)
         .await
@@ -3240,6 +3833,206 @@ async fn runtime_manager_attaches_brokered_xcode_http_lease_before_session_new()
 
 #[cfg(unix)]
 #[tokio::test]
+async fn runtime_manager_close_all_sessions_releases_brokered_xcode_leases_before_blocked_close() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::{
+        AcpMcpServerPayload, AcpRuntimeManager, BrokeredXcodeLeaseAttachment, ExecutionRequest,
+        ResolvedMcpServerTransport, XcodeBrokerLeaseAttacher,
+    };
+    use domain::agent::AgentStatus;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct RecordingLeaseAttacher {
+        released: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeBrokerLeaseAttacher for RecordingLeaseAttacher {
+        async fn attach_brokered_xcode_leases(
+            &self,
+            req: &ExecutionRequest,
+        ) -> anyhow::Result<BrokeredXcodeLeaseAttachment> {
+            let generation_id = req
+                .session_generation_id
+                .as_deref()
+                .unwrap_or("missing-generation");
+            let lease_id = format!("lease-{generation_id}");
+            let mut attached = req.clone();
+            for server in &mut attached.mcp_servers {
+                if let ResolvedMcpServerTransport::XcodeBrokerIntent { intent } = &server.transport
+                {
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "Authorization".to_string(),
+                        format!("Bearer token-{generation_id}"),
+                    );
+                    *server = AcpMcpServerPayload {
+                        id: intent.runtime_id.clone(),
+                        extension_id: intent.extension_id.clone(),
+                        transport: ResolvedMcpServerTransport::Http {
+                            url: format!("http://127.0.0.1:8123/xcode-mcp/{lease_id}"),
+                            headers,
+                        },
+                    };
+                }
+            }
+            Ok(BrokeredXcodeLeaseAttachment {
+                request: attached,
+                lease_ids: vec![lease_id],
+            })
+        }
+
+        async fn release_brokered_xcode_leases(&self, lease_ids: &[String]) -> anyhow::Result<()> {
+            self.released.lock().await.extend_from_slice(lease_ids);
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let close_seen = tmp.path().join("close-seen.txt");
+    let allow_close = tmp.path().join("allow-close.txt");
+    let script =
+        fixture::create_broker_attach_blocking_close_script(tmp.path(), &close_seen, &allow_close);
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script));
+    let manager = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let released = Arc::new(Mutex::new(Vec::new()));
+    manager.set_xcode_broker_lease_attacher(Arc::new(RecordingLeaseAttacher {
+        released: Arc::clone(&released),
+    }));
+
+    for generation_id in ["generation-a", "generation-b"] {
+        let mut req = brokered_xcode_request(&tmp, "claude");
+        req.keep_session_alive = true;
+        req.session_generation_id = Some(generation_id.to_string());
+        let result = manager.start_session(req).await.unwrap();
+        assert_eq!(result.status, AgentStatus::Completed);
+        assert_eq!(result.session_generation_id.as_deref(), Some(generation_id));
+    }
+
+    let close_task = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.close_all_sessions().await })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut released_ids = released.lock().await.clone();
+            released_ids.sort();
+            if released_ids == ["lease-generation-a", "lease-generation-b"] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("close_all_sessions should release leases before blocked session close completes");
+    assert!(
+        !close_task.is_finished(),
+        "session close should still be blocked while leases are already released"
+    );
+
+    std::fs::write(&allow_close, "ok").unwrap();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), close_task)
+        .await
+        .expect("close_all_sessions should finish after close unblocks")
+        .expect("close task should not panic");
+    assert_eq!(closed, 2);
+    let close_lines = std::fs::read_to_string(close_seen).unwrap();
+    assert_eq!(close_lines.lines().count(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_manager_releases_brokered_xcode_lease_when_kept_session_fails() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::{
+        AcpMcpServerPayload, AcpRuntimeManager, BrokeredXcodeLeaseAttachment, ExecutionRequest,
+        ResolvedMcpServerTransport, XcodeBrokerLeaseAttacher,
+    };
+    use domain::agent::AgentStatus;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct RecordingLeaseAttacher {
+        released: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeBrokerLeaseAttacher for RecordingLeaseAttacher {
+        async fn attach_brokered_xcode_leases(
+            &self,
+            req: &ExecutionRequest,
+        ) -> anyhow::Result<BrokeredXcodeLeaseAttachment> {
+            let mut attached = req.clone();
+            for server in &mut attached.mcp_servers {
+                if let ResolvedMcpServerTransport::XcodeBrokerIntent { intent } = &server.transport
+                {
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "Authorization".to_string(),
+                        "Bearer token-failed".to_string(),
+                    );
+                    *server = AcpMcpServerPayload {
+                        id: intent.runtime_id.clone(),
+                        extension_id: intent.extension_id.clone(),
+                        transport: ResolvedMcpServerTransport::Http {
+                            url: "http://127.0.0.1:8123/xcode-mcp/lease-failed".to_string(),
+                            headers,
+                        },
+                    };
+                }
+            }
+            Ok(BrokeredXcodeLeaseAttachment {
+                request: attached,
+                lease_ids: vec!["lease-failed".to_string()],
+            })
+        }
+
+        async fn release_brokered_xcode_leases(&self, lease_ids: &[String]) -> anyhow::Result<()> {
+            self.released.lock().await.extend_from_slice(lease_ids);
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_fail_script(tmp.path());
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script));
+    let manager = AcpRuntimeManager::new_with_adapters(vec![adapter]);
+    let released = Arc::new(Mutex::new(Vec::new()));
+    manager.set_xcode_broker_lease_attacher(Arc::new(RecordingLeaseAttacher {
+        released: Arc::clone(&released),
+    }));
+
+    let mut req = brokered_xcode_request(&tmp, "claude");
+    req.keep_session_alive = true;
+    req.session_generation_id = Some("generation-failed".to_string());
+    let result = manager.start_session(req).await;
+
+    assert!(
+        result
+            .as_ref()
+            .is_ok_and(|result| result.status == AgentStatus::Failed)
+            || result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("session/close")),
+        "failed prompt should not be kept alive even if close reports process exit: {result:?}"
+    );
+    assert_eq!(
+        released.lock().await.as_slice(),
+        ["lease-failed"],
+        "failed kept session must release its brokered Xcode lease"
+    );
+    assert!(
+        !manager.has_live_session("generation-failed", None).await,
+        "failed prompt must not leave a reusable live session"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn unsupported_brokered_xcode_provider_fails_before_probe_spawn() {
     use acp::adapters::auggie::AuggieAdapter;
     use acp::adapters::AcpAdapter;
@@ -3317,6 +4110,11 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3371,6 +4169,11 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let error = adapter
@@ -3447,6 +4250,11 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3497,6 +4305,11 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3552,6 +4365,11 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3630,6 +4448,11 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3652,7 +4475,7 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
     assert_eq!(result.pre_prompt_expected_outputs[0].attempt_number, 2);
     assert_eq!(
         result.pre_prompt_expected_outputs[0].agent_execution_id,
-        "agent-exec-typed"
+        agent_execution_id.to_string()
     );
     assert_eq!(
         result.pre_prompt_expected_outputs[0].stage_execution_id,
@@ -3707,6 +4530,11 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3767,6 +4595,11 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3823,6 +4656,11 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -3894,6 +4732,11 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -3936,6 +4779,11 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -4001,6 +4849,11 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         legacy_broad_discovery_policy: Default::default(),
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let execution = {
@@ -4079,6 +4932,11 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -4122,6 +4980,11 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -4172,6 +5035,11 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4268,6 +5136,11 @@ sys.exit(0)
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
 
     let _ = adapter.execute(req).await;

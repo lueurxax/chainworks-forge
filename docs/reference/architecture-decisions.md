@@ -102,3 +102,19 @@ This document records the key architecture decisions made during the foundation 
 4. UI state is limited to presentation, server-derived caches, read-refresh state, and freshness handling.
 
 **Consequence:** Single authoritative read plane (GraphQL). Commands move outside the macOS UI to validated external workflows. Static guards and a machine-readable UI inventory enforce the read-only boundary.
+
+## ARCH-037: Owner-aware execution identity
+
+**Context:** Agent executions traditionally assumed stage-ownership. Proposal 017 requires lead-mediated conflicts to own agent executions without creating synthetic stages.
+
+**Decision:** Migrate `AgentExecution` to a general owner model with `ownerKind` and `ownerID`. Support `stage_execution` and `lead_conflict_mediation` owners.
+
+**Consequence:** All persistence, quota, retry, artifact, and cost paths must key off durable owner identity. `stageExecutionID` becomes nullable. This enables mediation-owned executions to reuse the same infrastructure as stage-owned executions.
+
+## ARCH-038: Implementation Handoff Status
+
+**Context:** Runs entering implementation (Phase A/B) need to track engine-owned handoff truth separately from simple stage status.
+
+**Decision:** Use `ImplementationHandoffStatus` to track engine-owned handoff truth (`ready`, `blocked_before_code`, `running`).
+
+**Consequence:** Handoff remains engine-owned and deterministic, independent of advisory agent hints.

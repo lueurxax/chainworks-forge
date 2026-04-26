@@ -29,13 +29,13 @@ It does not define:
 - lower-layer ACP transport details in [acp-runtime-transport.md](acp-runtime-transport.md),
 - higher-layer orchestrator topology in [workflow-execution-engine.md](workflow-execution-engine.md),
 - operator-facing recovery presentation in [operator-experience.md](operator-experience.md),
-- or macOS operator UI rendering for these diagnostics. The UI owner is [Proposal 069](../proposals/069-bounded-discovery-diagnostics-operator-ui.md), which is blocked by [Proposal 031](../proposals/031-thin-graphql-ui-rewrite.md).
+- or macOS operator UI rendering for these diagnostics. The UI owner is [Proposal 069](../proposals/069-bounded-discovery-diagnostics-operator-ui.md), which builds on the canonical thin UI read contract in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
 
 ## Operator UI Deferral
 
 The implemented reference truth is the control-plane discovery and settlement model plus durable readback. The macOS operator UI for discovery diagnostics is intentionally owned separately.
 
-Proposal 069 owns the UI surfaces for missing/stale/rejected outputs, discovery mode, startup timing, cap warnings, source changes, Copy Path, Open Location, accessibility labels, and Dynamic Type behavior. That UI must build on the P031 thin UI boundary and consume GraphQL read projections only. The macOS UI must not use MCP, direct SQLite reads, local artifact scanning, or Swift-local workflow truth for discovery diagnostics.
+Proposal 069 owns the UI surfaces for missing/stale/rejected outputs, discovery mode, startup timing, cap warnings, source changes, Copy Path, Open Location, accessibility labels, and Dynamic Type behavior. That UI must build on the canonical thin UI boundary and consume GraphQL read projections only. The macOS UI must not use MCP, direct SQLite reads, local artifact scanning, or Swift-local workflow truth for discovery diagnostics.
 
 ## Bounded Discovery Model
 

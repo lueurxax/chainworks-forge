@@ -857,7 +857,7 @@ struct Proposal026Tests {
             #expect(!securityExecutions.isEmpty)
             #expect(!prepushExecutions.isEmpty)
             #expect(securityExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("context7") })
-            #expect(prepushExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("xcode") })
+            #expect(prepushExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).isEmpty })
         }
     }
 

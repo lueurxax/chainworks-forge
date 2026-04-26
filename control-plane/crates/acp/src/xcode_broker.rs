@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -6,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use domain::ids::AgentExecutionId;
+use chrono::Utc;
+use domain::ids::{AgentExecutionId, RunId};
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate,
 };
@@ -15,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::manager::{BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
@@ -73,6 +75,7 @@ pub enum XcodeMcpLeaseState {
 
 #[derive(Clone, Debug)]
 struct LeaseRecord {
+    run_id: RunId,
     agent_execution_id: Option<AgentExecutionId>,
     endpoint: String,
     authorization_hash: String,
@@ -86,6 +89,8 @@ struct LeaseRecord {
 struct XcodeMcpBridgePoolState {
     leases: HashMap<String, LeaseRecord>,
     target_probe_context: Option<HostProbeContext>,
+    health_last_state: Option<XcodeBrokerHealthState>,
+    health_last_transition_at: String,
 }
 
 pub struct XcodeMcpBridgePool {
@@ -119,7 +124,14 @@ impl Default for XcodeMcpProcessBackendConfig {
 #[derive(Default)]
 pub struct XcodeMcpProcessBackend {
     config: XcodeMcpProcessBackendConfig,
-    sessions: Mutex<HashMap<String, Arc<Mutex<XcodeMcpProcessBackendSession>>>>,
+    registry: Mutex<XcodeMcpProcessBackendRegistry>,
+}
+
+#[derive(Default)]
+struct XcodeMcpProcessBackendRegistry {
+    sessions: HashMap<String, Arc<Mutex<XcodeMcpProcessBackendSession>>>,
+    lease_to_session: HashMap<String, String>,
+    session_ref_counts: HashMap<String, usize>,
 }
 
 struct XcodeMcpProcessBackendSession {
@@ -127,6 +139,8 @@ struct XcodeMcpProcessBackendSession {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_backend_id: u64,
+    cached_initialize_result: Option<serde_json::Value>,
+    initialized_notification_forwarded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +155,12 @@ pub enum XcodeBrokerHealthState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XcodeBrokerHealthSnapshot {
     pub state: XcodeBrokerHealthState,
+    pub reason_code: String,
+    pub can_acquire_new_xcode_leases: bool,
+    pub active_lease_count: usize,
+    pub initialize_queue_depth: usize,
+    pub last_transition_at: String,
+    pub operator_message: String,
     pub pool_id: String,
     pub active_leases: usize,
     pub queued_leases: usize,
@@ -159,6 +179,7 @@ pub enum XcodeBrokerHttpRouteState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XcodeMcpBackendRequestContext {
+    pub run_id: RunId,
     pub lease_id: String,
     pub endpoint: String,
     pub agent_execution_id: Option<AgentExecutionId>,
@@ -186,7 +207,7 @@ impl XcodeMcpProcessBackend {
     pub fn new(config: XcodeMcpProcessBackendConfig) -> Self {
         Self {
             config,
-            sessions: Mutex::new(HashMap::new()),
+            registry: Mutex::new(XcodeMcpProcessBackendRegistry::default()),
         }
     }
 
@@ -194,19 +215,42 @@ impl XcodeMcpProcessBackend {
         &self,
         context: &XcodeMcpBackendRequestContext,
     ) -> Result<Arc<Mutex<XcodeMcpProcessBackendSession>>> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(&context.lease_id) {
+        let session_key = backend_session_key(context);
+        let mut registry = self.registry.lock().await;
+        if let Some(session) = registry.sessions.get(&session_key).cloned() {
+            if !registry.lease_to_session.contains_key(&context.lease_id) {
+                registry
+                    .lease_to_session
+                    .insert(context.lease_id.clone(), session_key.clone());
+                *registry.session_ref_counts.entry(session_key).or_default() += 1;
+            }
             return Ok(session.clone());
         }
         let session = Arc::new(Mutex::new(
             XcodeMcpProcessBackendSession::spawn(&self.config, context).await?,
         ));
-        sessions.insert(context.lease_id.clone(), session.clone());
+        registry
+            .sessions
+            .insert(session_key.clone(), session.clone());
+        registry
+            .lease_to_session
+            .insert(context.lease_id.clone(), session_key.clone());
+        registry.session_ref_counts.insert(session_key, 1);
         Ok(session)
     }
 
     async fn remove_session_after_failure(&self, lease_id: &str) {
-        let session = self.sessions.lock().await.remove(lease_id);
+        let session = {
+            let mut registry = self.registry.lock().await;
+            let Some(session_key) = registry.lease_to_session.remove(lease_id) else {
+                return;
+            };
+            registry
+                .lease_to_session
+                .retain(|_, mapped_key| mapped_key != &session_key);
+            registry.session_ref_counts.remove(&session_key);
+            registry.sessions.remove(&session_key)
+        };
         if let Some(session) = session {
             let _ = session.lock().await.close().await;
         }
@@ -240,13 +284,35 @@ impl XcodeMcpBackend for XcodeMcpProcessBackend {
     }
 
     async fn backend_process_id(&self, lease_id: &str) -> Option<i64> {
-        let session = self.sessions.lock().await.get(lease_id).cloned()?;
+        let session = {
+            let registry = self.registry.lock().await;
+            let session_key = registry.lease_to_session.get(lease_id)?;
+            registry.sessions.get(session_key).cloned()?
+        };
         let session = session.lock().await;
         session.child.id().map(|pid| pid as i64)
     }
 
     async fn release_lease(&self, lease_id: &str) -> Result<()> {
-        let session = self.sessions.lock().await.remove(lease_id);
+        let session = {
+            let mut registry = self.registry.lock().await;
+            let Some(session_key) = registry.lease_to_session.remove(lease_id) else {
+                return Ok(());
+            };
+            let remaining = registry
+                .session_ref_counts
+                .get(&session_key)
+                .copied()
+                .unwrap_or(1)
+                .saturating_sub(1);
+            if remaining > 0 {
+                registry.session_ref_counts.insert(session_key, remaining);
+                None
+            } else {
+                registry.session_ref_counts.remove(&session_key);
+                registry.sessions.remove(&session_key)
+            }
+        };
         if let Some(session) = session {
             session.lock().await.close().await?;
         }
@@ -268,14 +334,21 @@ impl XcodeMcpProcessBackendSession {
 
         let mut command = Command::new(&config.command);
         command
+            .env_clear()
             .args(&config.args)
             .env("HOME", &target_snapshot.operator_home)
             .env("TMPDIR", &target_snapshot.darwin_tmpdir)
             .env("DEVELOPER_DIR", &target_snapshot.developer_dir)
             .env(
-                "CHAINWORKS_XCODE_PID",
-                target_snapshot.xcode_pid.to_string(),
+                "USER",
+                operator_account_name(&target_snapshot.operator_home),
             )
+            .env(
+                "LOGNAME",
+                operator_account_name(&target_snapshot.operator_home),
+            )
+            .env("PATH", xcode_backend_path(&target_snapshot.developer_dir))
+            .env("MCP_XCODE_PID", target_snapshot.xcode_pid.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -301,14 +374,50 @@ impl XcodeMcpProcessBackendSession {
             stdin,
             reader: BufReader::new(stdout),
             next_backend_id: 0,
+            cached_initialize_result: None,
+            initialized_notification_forwarded: false,
         })
     }
 
     async fn forward(&mut self, mut request: serde_json::Value) -> Result<serde_json::Value> {
-        let original_id = request
-            .get("id")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let method = request
+            .get("method")
+            .and_then(|method| method.as_str())
+            .map(str::to_string);
+        let original_id = request.get("id").cloned();
+        if original_id.is_none() {
+            if method.as_deref() == Some("notifications/initialized")
+                && self.initialized_notification_forwarded
+            {
+                return Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "result": serde_json::Value::Null
+                }));
+            }
+            write_json_line(&mut self.stdin, &request)
+                .await
+                .context("xcode_mcp_backend_write_failed: send notification to backend process")?;
+            if method.as_deref() == Some("notifications/initialized") {
+                self.initialized_notification_forwarded = true;
+            }
+            return Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": serde_json::Value::Null,
+                "result": serde_json::Value::Null
+            }));
+        }
+
+        let original_id = original_id.unwrap_or(serde_json::Value::Null);
+        if method.as_deref() == Some("initialize") {
+            if let Some(cached_result) = self.cached_initialize_result.clone() {
+                return Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": original_id,
+                    "result": cached_result
+                }));
+            }
+        }
         self.next_backend_id += 1;
         let backend_id = self.next_backend_id;
         request["id"] = serde_json::Value::from(backend_id);
@@ -335,6 +444,11 @@ impl XcodeMcpProcessBackendSession {
                 .context("xcode_mcp_backend_read_failed: parse backend JSON-RPC response")?;
             if response.get("id").and_then(|id| id.as_u64()) != Some(backend_id) {
                 continue;
+            }
+            if method.as_deref() == Some("initialize") {
+                if let Some(result) = response.get("result").cloned() {
+                    self.cached_initialize_result = Some(result);
+                }
             }
             response["id"] = original_id;
             return Ok(response);
@@ -535,7 +649,8 @@ impl XcodeMcpBridgePool {
     }
 
     pub async fn health_snapshot(&self) -> XcodeBrokerHealthSnapshot {
-        let active_leases = self.active_lease_count().await;
+        let mut state_guard = self.state.lock().await;
+        let active_leases = state_guard.leases.len();
         let queued_leases = self.queued_lease_count();
         let broker_disabled = self.broker_disabled();
         let backend_available = self.has_backend();
@@ -553,9 +668,32 @@ impl XcodeMcpBridgePool {
         } else {
             XcodeBrokerHealthState::Healthy
         };
+        if state_guard.health_last_state != Some(state)
+            || state_guard.health_last_transition_at.is_empty()
+        {
+            state_guard.health_last_state = Some(state);
+            state_guard.health_last_transition_at = Utc::now().to_rfc3339();
+        }
+        let last_transition_at = state_guard.health_last_transition_at.clone();
+        let (reason_code, operator_message) = xcode_broker_health_reason(
+            state,
+            broker_disabled,
+            backend_available,
+            active_leases,
+            queued_leases,
+            self.config.max_active_leases,
+            observation_persistence_failures,
+        );
+        let can_acquire_new_xcode_leases = state == XcodeBrokerHealthState::Healthy;
 
         XcodeBrokerHealthSnapshot {
             state,
+            reason_code,
+            can_acquire_new_xcode_leases,
+            active_lease_count: active_leases,
+            initialize_queue_depth: queued_leases,
+            last_transition_at,
+            operator_message,
             pool_id: self.config.pool_id.clone(),
             active_leases,
             queued_leases,
@@ -694,6 +832,7 @@ impl XcodeMcpBridgePool {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
             };
             XcodeMcpBackendRequestContext {
+                run_id: lease.run_id,
                 lease_id: lease_id.to_string(),
                 endpoint: lease.endpoint.clone(),
                 agent_execution_id: lease.agent_execution_id,
@@ -1075,9 +1214,11 @@ impl XcodeMcpBridgePool {
         {
             self.observation_persistence_failures
                 .fetch_add(1, Ordering::AcqRel);
-            warn!(
+            error!(
                 agent_execution_id = %agent_execution_id,
                 error = %err,
+                metric = "xcode_observation_persist_failed_total",
+                warning = "observation_persistence_degraded",
                 "Failed to persist Xcode broker pool observation"
             );
         }
@@ -1503,6 +1644,7 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
                 state.leases.insert(
                     lease_id.clone(),
                     LeaseRecord {
+                        run_id: req.run_id,
                         agent_execution_id: req.agent_execution_id,
                         endpoint: endpoint.clone(),
                         authorization_hash: hash_secret(&bearer_token),
@@ -1756,6 +1898,19 @@ fn initialize_lock_key(context: &XcodeMcpBackendRequestContext) -> String {
         .unwrap_or_else(|| "xcode-pid:unresolved".to_string())
 }
 
+fn backend_session_key(context: &XcodeMcpBackendRequestContext) -> String {
+    context
+        .target_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            format!(
+                "run:{}:xcode-pid:{}:developer-dir:{}",
+                context.run_id, snapshot.xcode_pid, snapshot.developer_dir
+            )
+        })
+        .unwrap_or_else(|| format!("lease:{}", context.lease_id))
+}
+
 fn target_snapshot_matches_host(snapshot: &XcodeTargetSnapshot, host: &HostProbeContext) -> bool {
     host.candidate_xcodes.iter().any(|candidate| {
         candidate.alive
@@ -1774,6 +1929,56 @@ fn target_snapshot_matches_host(snapshot: &XcodeTargetSnapshot, host: &HostProbe
                     .is_some_and(|workspace| workspace == snapshot.workspace_identity),
             }
     })
+}
+
+fn operator_account_name(operator_home: &str) -> String {
+    Path::new(operator_home)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("operator")
+        .to_string()
+}
+
+fn xcode_backend_path(developer_dir: &str) -> String {
+    let developer_dir = developer_dir.trim_end_matches('/');
+    format!("/usr/bin:/bin:/usr/sbin:/sbin:{developer_dir}/usr/bin")
+}
+
+fn xcode_broker_health_reason(
+    state: XcodeBrokerHealthState,
+    broker_disabled: bool,
+    backend_available: bool,
+    active_leases: usize,
+    queued_leases: usize,
+    max_active_leases: usize,
+    observation_persistence_failures: u64,
+) -> (String, String) {
+    if broker_disabled || state == XcodeBrokerHealthState::Disabled {
+        return (
+            "xcode_mcp_broker_disabled".to_string(),
+            "Xcode broker disabled".to_string(),
+        );
+    }
+    if !backend_available || state == XcodeBrokerHealthState::Failed {
+        return (
+            "xcode_mcp_backend_unavailable".to_string(),
+            "Xcode broker failed: backend unavailable".to_string(),
+        );
+    }
+    if observation_persistence_failures > 0 {
+        return (
+            "xcode_observation_persist_failed".to_string(),
+            "Xcode broker degraded: observation persistence failures".to_string(),
+        );
+    }
+    if queued_leases > 0 || active_leases >= max_active_leases {
+        return (
+            "xcode_mcp_capacity_backpressure".to_string(),
+            "Xcode broker degraded: capacity backpressure".to_string(),
+        );
+    }
+    ("healthy".to_string(), "Xcode broker healthy".to_string())
 }
 
 fn hash_secret(secret: &str) -> String {
@@ -1836,6 +2041,12 @@ mod tests {
 
         let health = pool.health_snapshot().await;
         assert_eq!(health.state, XcodeBrokerHealthState::Degraded);
+        assert_eq!(health.reason_code, "xcode_observation_persist_failed");
+        assert!(!health.can_acquire_new_xcode_leases);
+        assert_eq!(health.active_lease_count, 0);
+        assert_eq!(health.initialize_queue_depth, 0);
+        assert!(!health.last_transition_at.is_empty());
+        assert!(health.operator_message.contains("observation persistence"));
         assert_eq!(health.observation_persistence_failures, 1);
         assert!(health.backend_available);
     }

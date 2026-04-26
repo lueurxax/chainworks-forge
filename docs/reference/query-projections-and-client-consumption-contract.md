@@ -1,6 +1,6 @@
 # Query projections and client consumption contract
 
-This document is the implemented GraphQL read contract for the thin macOS client. It replaces Proposal 043 and the former P031 handoff artifact. It has been updated to reflect the P031-r18 narrowing to a GraphQL-only read UI.
+This document is the canonical implemented GraphQL read contract for the thin macOS client. It replaces Proposal 043 and the former thin UI handoff artifact as the operational source of truth. Future macOS UI proposals must consume this contract instead of depending on historical proposal text.
 
 | Field | Value |
 |---|---|
@@ -10,27 +10,32 @@ This document is the implemented GraphQL read contract for the thin macOS client
 | Gate | `./scripts/test-gate.sh proposal-043` |
 | Alias | `./scripts/test-gate.sh p043` |
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
-| Governing proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
-| Scope | Rust control-plane GraphQL **read** contract for P031 client consumption. Command/control (MCP mutations) is explicitly NOT part of this contract. |
-| Downstream owner | P031 thin macOS UI rewrite (**read-only** consumer, per r18 scope narrowing). |
+| Historical proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
+| Scope | Rust control-plane GraphQL **read** contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract. |
+| Current UI boundary | Thin macOS UI (**read-only** consumer over server-owned projections). |
+| Stabilization owners | P032 for release/dogfood/stabilization evidence; P036 for visual/navigation restoration over this read model. |
 
-### Scope boundary (r8 correction)
+## Thin UI Boundary
 
-P031's thin macOS UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations. 
+The original P043/P031 gate labels are retained for compatibility. The active content below is the current thin UI boundary:
 
-**PROHIBITED ACTIONS for P031 UI:**
+The macOS thin UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations.
+
+**PROHIBITED ACTIONS for governed macOS UI:**
 - It does **NOT** issue MCP mutations.
 - It does **NOT** use GraphQL mutations.
 - It does **NOT** use local workflow mutation fallback.
 - It does **NOT** probe raw truth from SwiftData or filesystem (except for authorized artifact display).
 
-MCP command/control — `runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `ideas.create`, `steward.run_analysis` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in CLI / automation / scripted clients) or by separate follow-up transport proposals. A client that issues MCP mutations ("command UI") is out of scope for P031 and for this reference document.
+MCP command/control — `runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `ideas.create`, `steward.run_analysis` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in CLI / automation / scripted clients) or by separate follow-up transport proposals. A client that issues MCP mutations ("command UI") is out of scope for the governed thin UI and for this reference document.
 
-Wherever this document mentions "controls", "actions", "mutations", or "command completion" it refers to the generic client / operator system — not to P031's read-only thin UI. For P031 those rules apply vacuously: no mutation surfaces to enable/disable, no command-completion refresh to perform. Rules that explicitly pin behavior to P031 (freshness rendering, read-only evidence, subscription consumption) remain in force for the thin UI.
+Wherever this document mentions "controls", "actions", "mutations", or "command completion" it refers to the generic client / operator system, not to the governed read-only thin UI. For the current thin UI those rules apply vacuously: no mutation surfaces to enable/disable, no command-completion refresh to perform. Rules for freshness rendering, read-only evidence, subscription consumption, and projection ownership remain in force for all future UI work.
 
-## P031-r18 Schema Contract
+Downstream proposal rule: new macOS UI features must start from this thin UI boundary. They may add server-owned GraphQL read fields, projections, subscriptions, and read-side presentation state. They must not restore Swift-local workflow truth, UI MCP calls, GraphQL mutations, raw artifact scans as truth, or old local-orchestrator fallback paths unless a later approved write-transport proposal explicitly changes this boundary.
 
-Every visible P031 workflow field must have one named GraphQL source or one explicit disabled/deferred state.
+## Thin UI Schema Contract
+
+Every visible governed workflow field must have one named GraphQL source or one explicit disabled/deferred state.
 
 ### Metadata and Freshness Fields
 
@@ -81,7 +86,7 @@ The client must not infer:
 | Run detail | `run(id:)` with projection enrichment | Canonical run row enriched by `db::repos::projections::find_run_projection` | Implemented | Use projection-backed counters and summaries; show projection lag when projection truth is missing or stale. |
 | Stage list / progress | `stages(runID:)` | `db::repos::projections::list_stages_projection` | Implemented | Use projection-owned decision flags; disable dependent actions when `projectionLag` is true. |
 | Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionID:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. |
-| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution (`approvals.resolve`) is an operator-side MCP action on a separate surface; P031's thin UI renders the inbox read-only. |
+| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution (`approvals.resolve`) is an operator-side MCP action on a separate surface; the thin UI renders the inbox read-only. |
 | Artifact viewer | `artifacts(runID:)` | artifact index projection / `db::repos::projections::list_artifacts_projection` | Implemented | Browse the server artifact hierarchy only; direct file open/export may happen only after server selection. |
 | Scheduler health | `schedulerHealthSummary` | `scheduler_health_snapshots` projection | Implemented | Render system-wide capacity, pressure, and latency health. |
 | Startup recovery | `startupRecoverySummary` | `startup_recovery_readbacks` projection | Implemented | Render startup recovery progress, counts, and backpressure state. |
@@ -102,7 +107,7 @@ Run and stage read payloads expose projection freshness explicitly. This prevent
 
 | GraphQL type | Fields | Semantics | Focused proof |
 |---|---|---|---|
-| `GqlRun` | `projectionPresent`, `projectionUpdatedAt`, `projectionLag`, `workflowConflict` | `projectionPresent=false` and `projectionLag=true` when no `run_summaries` row exists. `projectionLag=true` when the projection row exists but status diverges from the canonical run row. `workflowConflict` exposes current and historical conflict truth. | `proposal_043_missing_projection_rows_are_explicit_lag_state`, `proposal_043_run_query_uses_projection_summary_fields`, `proposal_043_run_subscription_uses_projection_summary_fields`, `proposal_017_workflow_conflict_readback` |
+| `GqlRun` | `projectionPresent`, `projectionUpdatedAt`, `projectionLag`, `workflowConflict` | `projectionPresent=false` and `projectionLag=true` when no `run_summaries` row exists. `projectionLag=true` when the projection row exists but status diverges from the canonical run row. `workflowConflict` exposes current and historical conflict truth, including **lead mediation status, resolution mode, and confirmation subject linkage**. | `proposal_043_missing_projection_rows_are_explicit_lag_state`, `proposal_043_run_query_uses_projection_summary_fields`, `proposal_043_run_subscription_uses_projection_summary_fields`, `proposal_017_workflow_conflict_readback` |
 | `GqlStageExecution` | `projectionPresent`, `projectionUpdatedAt`, `projectionLag` | `projectionPresent=false` and `projectionLag=true` when no `stage_summaries` row exists. `projectionLag=true` when the projection row exists but status or attempt diverges from the canonical stage row. | `proposal_043_missing_projection_rows_are_explicit_lag_state`, `proposal_043_stage_queries_expose_projection_decision_flags`, `proposal_043_stage_subscription_uses_projection_decision_flags` |
 
 Client behavior:
@@ -126,7 +131,7 @@ Client behavior:
 
 ## Freshness budget
 
-These values bind any client consuming this contract. P031's read-only thin UI must use them for stale-state rendering, retry cadence, and rollback checks. The `Stale/action-safety disable threshold` and `Cutover rollback threshold` rows that reference commands/mutations are NO-OPS for P031 (no commands to disable, no mutations to roll back) but remain normative for any command-UI consumer. Changes to these values are contract changes and must update the gate.
+These values bind any client consuming this contract. The read-only thin UI must use them for stale-state rendering, retry cadence, and release hold/degraded-state checks. The `Stale/action-safety disable threshold` and `Cutover rollback threshold` rows that reference commands/mutations are NO-OPS for the governed thin UI (no commands to disable, no mutations to roll back) but remain normative for any command-UI consumer. These rows do not restore the old Swift orchestrator or any local workflow-truth write path. Changes to these values are contract changes and must update the gate.
 
 | Budget | Value | Required behavior |
 |---|---:|---|
@@ -138,7 +143,7 @@ These values bind any client consuming this contract. P031's read-only thin UI m
 | Bounded polling interval without subscription | 5 seconds | Poll only visible surfaces; do not infer missing truth locally. |
 | Bounded polling backoff | 5s, 10s, 20s, then 30s max | Keep stale/unavailable labels visible and fail closed on repeated refresh failure. |
 | Stale/action-safety disable threshold | immediate | Disable destructive/state-changing controls for `refreshing_disconnected`, `stale`, `projection_lag`, `unavailable`, and `unauthorized` unless an action is explicitly stale-safe. |
-| Cutover rollback threshold | 3 consecutive command-completion refresh timeouts or 2 minutes continuous `unavailable` | Hold or roll back P031 for the affected surface. |
+| Cutover rollback threshold | 3 consecutive command-completion refresh timeouts or 2 minutes continuous `unavailable` | Hold or roll back the affected command-client surface. For the governed thin UI, this is only a read-only unavailable/degraded-state release hold; it is not a rollback to local Swift orchestration. |
 
 ## Refresh and subscription posture
 
@@ -146,7 +151,7 @@ These values bind any client consuming this contract. P031's read-only thin UI m
 |---|---|
 | View load/navigation | Execute the matrix entrypoint for the selected surface. |
 | App foreground/reconnect | Refresh visible run, stage, approval, artifact, report, and health surfaces. |
-| MCP command accepted (command-UI only; N/A for P031) | Keep previous authoritative read model plus pending receipt; refresh GraphQL before displaying new workflow truth. |
+| MCP command accepted (command-UI only; N/A for governed thin UI) | Keep previous authoritative read model plus pending receipt; refresh GraphQL before displaying new workflow truth. |
 | Subscription event | Patch only fields covered by that event contract, or perform a bounded refresh. Do not infer unrelated state. |
 | Subscription disconnect | Mark affected surfaces `refreshing_disconnected`; schedule bounded reconnect; transition to `live` if reconnect succeeds inside 10 seconds or `stale` if the grace window expires. |
 | Query failure | Keep last known state as `stale` when available; otherwise show `unavailable` or `unauthorized` based on error class. |
@@ -154,54 +159,54 @@ These values bind any client consuming this contract. P031's read-only thin UI m
 
 Recognized subscription names for this contract:
 
-| Subscription | Payload contract | P031 consumption rule |
+| Subscription | Payload contract | Thin UI consumption rule |
 |---|---|---|
 | `runStatusChanged(runID:)` | Projection-enriched `GqlRun` via `find_run_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch displayed run summary fields; refresh after command completion still required. |
 | `stageStatusChanged(runID:)` | Projection-enriched `GqlStageExecution` via `list_stages_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch stage decision flags; controls remain disabled during `projection_lag`. |
 | `approvalRequested` | Emits current approval row for the requested approval. | May update approval inbox; command completion refresh still required after decisions. |
 | `approvalResolved` | Emits current approval row for the resolved approval. | May remove/update approval row; bounded refresh fallback remains valid if subscription is unavailable. |
 | `schedulerBackpressureChanged` | Emits sustained-backpressure events when thresholds are crossed. | May trigger UI health alerts or banner changes. |
-| `runtimeStatusChanged` | Broader runtime/adapter health event stream remains future work beyond the implemented daemon lifecycle stream. | Deferred for P031 adapter-health UI until a server-owned runtime-health contract is accepted. |
+| `runtimeStatusChanged` | Broader runtime/adapter health event stream remains future work beyond the implemented daemon lifecycle stream. | Deferred for adapter-health UI until a server-owned runtime-health contract is accepted. |
 
 Missing subscription support is not a reason for the client to infer truth locally. It only changes the refresh strategy to bounded visible-surface polling.
 
 ## Freshness behavior evidence and limitations
 
-P043 owns the read contract and server-published facts. P031 owns macOS UI timers, reconnect loops, and read-side freshness rendering. Command-completion refresh and disabled-control rendering apply to any command-issuing client that consumes this contract; P031's read-only thin UI has no commands to refresh or controls to disable, so those rows apply vacuously to P031 (they remain normative for any future command UI).
+The control-plane read contract owns server-published facts. The thin macOS UI owns timers, reconnect loops, and read-side freshness rendering. Command-completion refresh and disabled-control rendering apply to any command-issuing client that consumes this contract; the read-only thin UI has no commands to refresh or controls to disable, so those rows apply vacuously to it (they remain normative for any future command UI).
 
 | Freshness behavior | P043 evidence | Consumer cutover rule |
 |---|---|---|
-| Initial query failure to `unavailable` or `stale` | Contract row: Initial read timeout = 5 seconds. | P031 must test visible read-surface initial-failure rendering. A command UI must additionally disable surfaces that depend on the same initial read. |
-| Command-completion refresh timeout to `stale` | Contract row: Command-completion refresh timeout = 3 seconds. | Applies to a command-issuing client: must test accepted-command pending receipt plus stale transition before enabling follow-on mutations. P031 has no commands; vacuous. |
-| Foreground/reconnect refresh timeout | Contract row: Foreground/reconnect refresh timeout = 5 seconds. | P031 must test foreground/reconnect refresh state settlement for its read surfaces. |
-| Projection lag action safety | Contract row: Projection-lag grace window = 2 seconds. | A command-issuing client must disable actions that depend on projection flags until projection-backed queries catch up. P031 has no actions; vacuous. |
-| Subscription disconnect action safety | Contract row: Subscription disconnect grace window = 10 seconds and state `refreshing_disconnected`. | A command-issuing client must disable destructive/state-changing actions during reconnect grace and mark `stale` after expiry. P031 renders the freshness state read-only; no actions to disable. |
-| Bounded polling fallback | Contract rows: interval = 5 seconds; backoff = 5s, 10s, 20s, then 30s max. | P031 may poll only visible implemented surfaces and must not poll deferred surfaces. |
-| Unauthorized read behavior | Executable proof: `proposal_043_graphql_reads_are_operator_only_v1`. | P031 must show read authorization error and never fall back to local storage. |
-| Stale/action-safety disable threshold | Contract row: immediate disable for unsafe freshness states. | A command-issuing client must prove disabled controls for `refreshing_disconnected`, `stale`, `projection_lag`, `unavailable`, and `unauthorized`. P031 renders these as read-side badges/annotations on the affected surfaces — no controls to disable. |
+| Initial query failure to `unavailable` or `stale` | Contract row: Initial read timeout = 5 seconds. | Thin UI must test visible read-surface initial-failure rendering. A command UI must additionally disable surfaces that depend on the same initial read. |
+| Command-completion refresh timeout to `stale` | Contract row: Command-completion refresh timeout = 3 seconds. | Applies to a command-issuing client: must test accepted-command pending receipt plus stale transition before enabling follow-on mutations. Governed thin UI has no commands; vacuous. |
+| Foreground/reconnect refresh timeout | Contract row: Foreground/reconnect refresh timeout = 5 seconds. | Thin UI must test foreground/reconnect refresh state settlement for its read surfaces. |
+| Projection lag action safety | Contract row: Projection-lag grace window = 2 seconds. | A command-issuing client must disable actions that depend on projection flags until projection-backed queries catch up. Governed thin UI has no actions; vacuous. |
+| Subscription disconnect action safety | Contract row: Subscription disconnect grace window = 10 seconds and state `refreshing_disconnected`. | A command-issuing client must disable destructive/state-changing actions during reconnect grace and mark `stale` after expiry. Governed thin UI renders the freshness state read-only; no actions to disable. |
+| Bounded polling fallback | Contract rows: interval = 5 seconds; backoff = 5s, 10s, 20s, then 30s max. | Thin UI may poll only visible implemented surfaces and must not poll deferred surfaces. |
+| Unauthorized read behavior | Executable proof: `proposal_043_graphql_reads_are_operator_only_v1`. | Thin UI must show read authorization error and never fall back to local storage. |
+| Stale/action-safety disable threshold | Contract row: immediate disable for unsafe freshness states. | A command-issuing client must prove disabled controls for `refreshing_disconnected`, `stale`, `projection_lag`, `unavailable`, and `unauthorized`. Governed thin UI renders these as read-side badges/annotations on the affected surfaces and has no controls to disable. |
 
 ## GraphQL field proof
 
 | Surface | Proof | Result |
 |---|---|---|
-| Runs home | Projection-backed list query through `list_by_idea_projection` and `list_active_projection`. | Sufficient for P031 ship. |
-| Run detail | `run(id:)` returns projection-enriched counters, summaries, `workflowConflict`, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag` from `find_run_projection`. | Sufficient for P031 ship. |
-| Stage list / progress | `stages(runID:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for P031 ship. |
-| Stage detail | `stage(id:)` returns projection-enriched decision flags and projection freshness while preserving canonical evidence/recovery payloads. | Sufficient for P031 ship. |
-| Missing projection rows | Missing `run_summaries` or `stage_summaries` rows surface as `projectionPresent=false` and `projectionLag=true`, not normal zero/false truth. | Sufficient for P031 projection-lag rendering. |
-| Run status subscription | `runStatusChanged(runID:)` emits projection-enriched run summary and freshness fields. | Sufficient for P031 event patching. |
-| Stage status subscription | `stageStatusChanged(runID:)` emits projection-enriched stage decision and freshness fields. | Sufficient for P031 event patching. |
-| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for P031 event patching. |
-| Approval inbox | `approvalInbox` is projection-backed. | Sufficient for P031 ship. |
-| Artifact viewer | `artifacts(runID:)` | is projection-backed. | Sufficient for P031 ship. |
-| Scheduler health | `schedulerHealthSummary` returns global capacity, active counts, oldest queued age, and sustained backpressure state. | Sufficient for P031 health alerts. |
-| Startup recovery | `startupRecoverySummary` returns recovered items, backpressured recovery counts, and affected runs. | Sufficient for P031 recovery UI. |
-| Command latency | `commandLatencySummary` returns p95 latency for approve, retry, and cancel. | Sufficient for P031 diagnostics. |
-| DB contention | `dbWriterContentionSummary` returns write wait p95 and transaction contention. | Sufficient for P031 diagnostics. |
-| Provider capacity | `activeExecutionCountsByProvider` returns active execution counts per canonical family. | Sufficient for P031 capacity UI. |
-| Queue summaries | `runQueueSummary`, `stageQueueSummary`, and `queuedBackpressuredCountsByProviderAndReason` are projection-backed. | Sufficient for P031 backpressure UI. |
-| Queue position | `queuePositionHint` returns non-ETA position hint from projection truth. | Sufficient for P031 queue UI. |
-| Host interruption | `hostInterruptionEpochs` and `hostInterruptionAffectedExecutions` are canonical readbacks. | Sufficient for P031 recovery UI. |
+| Runs home | Projection-backed list query through `list_by_idea_projection` and `list_active_projection`. | Sufficient for thin UI consumption. |
+| Run detail | `run(id:)` returns projection-enriched counters, summaries, `workflowConflict`, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag` from `find_run_projection`. | Sufficient for thin UI consumption. |
+| Stage list / progress | `stages(runID:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for thin UI consumption. |
+| Stage detail | `stage(id:)` returns projection-enriched decision flags and projection freshness while preserving canonical evidence/recovery payloads. | Sufficient for thin UI consumption. |
+| Missing projection rows | Missing `run_summaries` or `stage_summaries` rows surface as `projectionPresent=false` and `projectionLag=true`, not normal zero/false truth. | Sufficient for projection-lag rendering. |
+| Run status subscription | `runStatusChanged(runID:)` emits projection-enriched run summary and freshness fields. | Sufficient for thin UI event patching. |
+| Stage status subscription | `stageStatusChanged(runID:)` emits projection-enriched stage decision and freshness fields. | Sufficient for thin UI event patching. |
+| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for thin UI event patching. |
+| Approval inbox | `approvalInbox` is projection-backed. | Sufficient for thin UI consumption. |
+| Artifact viewer | `artifacts(runID:)` | is projection-backed. | Sufficient for thin UI consumption. |
+| Scheduler health | `schedulerHealthSummary` returns global capacity, active counts, oldest queued age, and sustained backpressure state. | Sufficient for thin UI health alerts. |
+| Startup recovery | `startupRecoverySummary` returns recovered items, backpressured recovery counts, and affected runs. | Sufficient for thin UI recovery UI. |
+| Command latency | `commandLatencySummary` returns p95 latency for approve, retry, and cancel. | Sufficient for thin UI diagnostics. |
+| DB contention | `dbWriterContentionSummary` returns write wait p95 and transaction contention. | Sufficient for thin UI diagnostics. |
+| Provider capacity | `activeExecutionCountsByProvider` returns active execution counts per canonical family. | Sufficient for thin UI capacity UI. |
+| Queue summaries | `runQueueSummary`, `stageQueueSummary`, and `queuedBackpressuredCountsByProviderAndReason` are projection-backed. | Sufficient for thin UI backpressure UI. |
+| Queue position | `queuePositionHint` returns non-ETA position hint from projection truth. | Sufficient for thin UI queue UI. |
+| Host interruption | `hostInterruptionEpochs` and `hostInterruptionAffectedExecutions` are canonical readbacks. | Sufficient for thin UI recovery UI. |
 | Report viewer | Metadata-backed only; dedicated report payload path is not complete. | Partial proof only. |
 | Runtime health | No P043-owned GraphQL health proof for thin-client use. | Deferred. |
 | Experiment comparison | No current GraphQL query proof. | Deferred. |
@@ -239,9 +244,9 @@ P043 V1 is operator-only for the production macOS client read path. Current Grap
 
 Future non-operator read expansion must be explicit in auth/capability policy and covered by server-side query authorization/redaction tests.
 
-## P031 consumption contract
+## Thin UI Consumption Contract
 
-P031 may ship these surfaces from this contract:
+Governed macOS UI surfaces may ship from this contract:
 
 - Runs home;
 - Run detail;
@@ -250,19 +255,19 @@ P031 may ship these surfaces from this contract:
 - Approval inbox;
 - Artifact viewer.
 
-P031 may ship report viewing only as a partial surface where missing payload readback is visibly annotated as unavailable. Runtime health and experiment comparison remain hidden or placeholder-only.
+Report viewing may ship only as a partial surface where missing payload readback is visibly annotated as unavailable. Runtime health and experiment comparison remain hidden or placeholder-only until server-owned read surfaces exist.
 
-P031 owns the UI-side evidence for the **read-side** client contract:
+The macOS thin UI owns the UI-side evidence for the **read-side** client contract:
 
 - reconnect timers;
-- live / refreshing_disconnected / stale / projection_lag / unavailable / unauthorized rendering on each surface (as badges or inline annotations, not disabled controls — P031 has no controls);
+- live / refreshing_disconnected / stale / projection_lag / unavailable / unauthorized rendering on each surface (as badges or inline annotations, not disabled controls because the governed thin UI has no write controls);
 - no SwiftData / local-service fallback for workflow truth;
 - subscription patching rules from the "Refresh and subscription posture" section.
 
-P031 does NOT own:
+The thin UI boundary does NOT own:
 
-- MCP command-completion refresh behavior (P031 issues no MCP mutations);
-- disabled-action rendering for destructive commands (P031 has no action surfaces);
+- MCP command-completion refresh behavior (the governed thin UI issues no MCP mutations);
+- disabled-action rendering for destructive commands (the governed thin UI has no action surfaces);
 - "command receipt" displays (no commands);
 - any `runs.start` / `runs.cancel` / `approvals.resolve` / `stages.retry` / `ideas.create` UI.
 
@@ -275,9 +280,11 @@ The current proof lane is:
 ```bash
 ./scripts/test-gate.sh proposal-043
 ./scripts/test-gate.sh p043
+./scripts/test-gate.sh proposal-031
+./scripts/test-gate.sh p031
 ```
 
-The gate runs the focused `graphql-server` tests whose names start with `proposal_043_` and `proposal_031_`, then validates this reference document from the repository root.
+The P043 gate runs focused `graphql-server` tests whose names start with `proposal_043_` and `proposal_031_`, then validates this reference document from the repository root. The P031 gate composes the thin UI inventory, Swift read-boundary tests, GraphQL read model checks, and static guards for governed UI code.
 
 The test slice covers:
 
@@ -296,4 +303,4 @@ The gate fails closed when this reference document omits required surfaces, stat
 - Report payload rendering needs a server-owned GraphQL payload path before it can be a full thin-client surface.
 - Adapter/runtime health beyond the daemon lifecycle read model remains deferred unless a future server-owned read surface publishes it.
 - Experiment comparison has no current GraphQL read owner and stays deferred.
-- P031 must still prove macOS UI consumption behavior before user-visible thin-client cutover.
+- Release/dogfood/stabilization evidence is owned by P032, and visual/navigation restoration is owned by P036. Those tails do not change the thin UI boundary for new feature work.

@@ -1,0 +1,255 @@
+/* ============================================================
+   CHAINWORKS FORGE — токены дизайна
+   ============================================================
+
+   КАК ПОЛЬЗОВАТЬСЯ:
+   В компонентах используйте только семантические токены:
+     цвет текста      → var(--label) / var(--label-secondary)
+     фон              → var(--bg-canvas) / var(--bg-elevated)
+     акцент           → var(--tint)
+     статус           → var(--status-running) / --success / ...
+     отступ           → var(--sp-4)
+     скругление       → var(--r-5)
+     тень             → var(--shadow-1)
+     текст            → font: var(--t-body)
+
+   Не используйте сырые цвета (#0A84FF, #F59A2B) напрямую — они
+   не переключатся в тёмную тему.
+
+   ============================================================ */
+
+
+:root {
+
+/* —— ЦВЕТА БРЕНДА —————————————————————————————————————————————
+   Основа логотипа: тёмно-синий фон, серебристая орбита, белая
+   птица, оранжевый клюв. Используются в маркетинге/лендинге.   */
+
+  --brand-navy:     #04080D;   /* самый тёмный                  */
+  --brand-ink:      #0E1623;   /* фон логотипа                   */
+  --brand-panel:    #18222F;   /* навигационная панель           */
+
+  --brand-silver:   #A3AFC0;   /* серебро орбиты                 */
+  --brand-paper:    #F6F8FC;   /* светлый фон                    */
+  --brand-feather:  #FAFBFD;   /* белый                          */
+
+  --brand-orange:   #F59A2B;   /* фирменный — точечно            */
+
+
+/* —— ФОНЫ ————————————————————————————————————————————————————
+   Послойно снизу вверх:
+     canvas    рабочая область (под всем)
+     elevated  карточки, диалоги
+     fill-*    подложки чипов, hover, segmented control            */
+
+  --bg-canvas:           #F2F2F7;
+  --bg-elevated:         #FFFFFF;
+  --bg-tertiary:         #F9F9FB;
+
+  --bg-fill-quaternary:  rgba(116,116,128,0.08);
+  --bg-fill-tertiary:    rgba(118,118,128,0.12);
+  --bg-fill-secondary:   rgba(120,120,128,0.16);
+  --bg-fill-primary:     rgba(120,120,128,0.20);
+
+  --separator:           rgba(60,60,67,0.14);
+
+
+/* —— ТЕКСТ ———————————————————————————————————————————————————
+   По убыванию контраста:
+     label            заголовки и основной текст
+     label-secondary  подписи, метаданные
+     label-tertiary   плейсхолдеры
+     label-quaternary едва заметный текст                        */
+
+  --label:             #000000;
+  --label-secondary:   rgba(60,60,67,0.60);
+  --label-tertiary:    rgba(60,60,67,0.30);
+  --label-quaternary:  rgba(60,60,67,0.18);
+
+
+/* —— АКЦЕНТ ———————————————————————————————————————————————————
+   Цвет первичных действий: кнопки, ссылки, выделение, фокус.   */
+
+  --tint:    #0A84FF;
+  --accent:  var(--brand-orange);   /* брендовый — РЕДКО         */
+
+
+/* —— СТАТУСЫ ——————————————————————————————————————————————————
+   Цвет run'а / стадии. Капсула, прогресс-бар, иконка — всё
+   красится из этих переменных.                                  */
+
+  --status-running:    #0A84FF;   /* синий    идёт выполнение    */
+  --status-success:    #34C759;   /* зелёный  завершено          */
+  --status-warning:    #FF9F0A;   /* оранж.   заблокировано      */
+  --status-error:      #FF3B30;   /* красный  провал             */
+  --status-approval:   #FFD60A;   /* жёлтый   ждёт оператора     */
+  --status-pending:    #8E8E93;   /* серый    не начато          */
+  --status-cancelled:  #C7C7CC;   /* светл.   отменено           */
+
+
+/* —— ОТСТУПЫ (сетка 4-pt) ————————————————————————————————————
+   Все размеры кратны 4. Не выдумывайте промежуточные.           */
+
+  --sp-1:   4px;   /* иконка ↔ подпись                            */
+  --sp-2:   8px;   /* внутри маленьких контролов                  */
+  --sp-3:  12px;   /* между связанными строками                   */
+  --sp-4:  16px;   /* стандартный паддинг карточки                */
+  --sp-5:  20px;   /* паддинг секции                              */
+  --sp-6:  24px;   /* между группами                              */
+  --sp-7:  32px;   /* между секциями                              */
+  --sp-8:  40px;   /* паддинг страницы                            */
+  --sp-9:  56px;
+  --sp-10: 80px;
+
+
+/* —— СКРУГЛЕНИЯ ——————————————————————————————————————————————
+
+     --r-3   8px    мелкие чипы
+     --r-4  10px    маленькие контролы
+     --r-5  12px    стандартная карточка
+     --r-7  16px    панель / sheet
+     --r-9  28px    hero / иконка приложения
+     --r-pill       капсула                                       */
+
+  --r-1:    4px;
+  --r-2:    6px;
+  --r-3:    8px;
+  --r-4:   10px;
+  --r-5:   12px;
+  --r-6:   14px;
+  --r-7:   16px;
+  --r-8:   20px;
+  --r-9:   28px;
+  --r-pill: 999px;
+
+
+/* —— ТЕНИ ————————————————————————————————————————————————————
+
+     shadow-1   карточка в покое
+     shadow-2   приподнятая / hover
+     shadow-3   sheet / drawer
+     shadow-4   модальное окно
+     shadow-popover  меню, тултип, пикер                          */
+
+  --shadow-1:       0 1px 2px  rgba(0,0,0,0.04), 0 0 0 0.5px rgba(0,0,0,0.06);
+  --shadow-2:       0 1px 3px  rgba(0,0,0,0.05), 0 4px 12px rgba(0,0,0,0.04);
+  --shadow-3:       0 4px 16px rgba(0,0,0,0.08), 0 1px 4px  rgba(0,0,0,0.06);
+  --shadow-4:       0 12px 32px rgba(0,0,0,0.10), 0 2px 8px rgba(0,0,0,0.06);
+  --shadow-popover: 0 16px 48px rgba(0,0,0,0.18), 0 1px 2px rgba(0,0,0,0.10);
+
+
+/* —— ШРИФТЫ ——————————————————————————————————————————————————
+
+     display   заголовки и всё ≥17px
+     text      основной текст и интерфейс
+     mono      код, хеши, ID                                     */
+
+  --font-display:  -apple-system, "SF Pro Display", "Inter", system-ui, sans-serif;
+  --font-text:     -apple-system, "SF Pro Text",    "Inter", system-ui, sans-serif;
+  --font-mono:     "SF Mono", ui-monospace, "JetBrains Mono", "Menlo", monospace;
+
+
+/* —— ШКАЛА ТЕКСТА (Apple HIG) ————————————————————————————————
+   weight size/line-height font-family
+
+     largeTitle    34/41   герой страницы
+     title1        28/34   заголовок секции
+     title2        22/28   подсекция / диалог
+     title3        17/22   заголовок карточки
+     headline      15/20   жирный акцент в тексте
+     body          15/20   основной текст
+     callout       14/19   вторичный текст
+     subheadline   13/18   мелкий текст / подсказки
+     footnote      12/16   метаданные
+     caption1      11/13   подписи, run-ID
+     caption2      10/13   uppercase eyebrow                     */
+
+  --t-largeTitle:   700 34px/41px var(--font-display);
+  --t-title1:       600 28px/34px var(--font-display);
+  --t-title2:       600 22px/28px var(--font-display);
+  --t-title3:       600 17px/22px var(--font-display);
+  --t-headline:     600 15px/20px var(--font-text);
+  --t-body:         400 15px/20px var(--font-text);
+  --t-callout:      400 14px/19px var(--font-text);
+  --t-subheadline:  400 13px/18px var(--font-text);
+  --t-footnote:     400 12px/16px var(--font-text);
+  --t-caption1:     500 11px/13px var(--font-text);
+  --t-caption2:     500 10px/13px var(--font-text);
+}
+
+
+/* —— ТЁМНАЯ ТЕМА ——————————————————————————————————————————————
+   Переопределяются ТОЛЬКО фоны и текст. Цвета бренда (§выше) и
+   статусов остаются прежними.                                   */
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-canvas:           #000000;
+    --bg-elevated:         #1C1C1E;
+    --bg-tertiary:         #2C2C2E;
+
+    --bg-fill-quaternary:  rgba(118,118,128,0.18);
+    --bg-fill-tertiary:    rgba(118,118,128,0.24);
+    --bg-fill-secondary:   rgba(120,120,128,0.32);
+    --bg-fill-primary:     rgba(120,120,128,0.36);
+
+    --separator:           rgba(84,84,88,0.6);
+
+    --label:               rgba(255,255,255,0.94);
+    --label-secondary:     rgba(235,235,245,0.60);
+    --label-tertiary:      rgba(235,235,245,0.30);
+    --label-quaternary:    rgba(235,235,245,0.16);
+  }
+}
+
+
+/* ============================================================
+   ГОТОВЫЕ КЛАССЫ
+   Просто навесьте на элемент.
+   ============================================================ */
+
+/* Текст */
+.t-largeTitle  { font: var(--t-largeTitle);  letter-spacing: -0.022em; color: var(--label); }
+.t-title1      { font: var(--t-title1);      letter-spacing: -0.022em; color: var(--label); }
+.t-title2      { font: var(--t-title2);      letter-spacing: -0.022em; color: var(--label); }
+.t-title3      { font: var(--t-title3);      letter-spacing: -0.022em; color: var(--label); }
+.t-headline    { font: var(--t-headline);    color: var(--label); }
+.t-body        { font: var(--t-body);        color: var(--label); }
+.t-callout     { font: var(--t-callout);     color: var(--label); }
+.t-subheadline { font: var(--t-subheadline); color: var(--label-secondary); }
+.t-footnote    { font: var(--t-footnote);    color: var(--label-secondary); }
+.t-caption1    { font: var(--t-caption1);    color: var(--label-secondary); }
+.t-caption2    { font: var(--t-caption2);    color: var(--label-tertiary);
+                 text-transform: uppercase;  letter-spacing: 0.04em; }
+.t-mono        { font-family: var(--font-mono); font-size: 12px; line-height: 16px; }
+
+/* Поверхности */
+.surface-canvas   { background: var(--bg-canvas);   color: var(--label); }
+.surface-elevated { background: var(--bg-elevated); color: var(--label); }
+
+.card-forge {
+  background: var(--bg-elevated);
+  border-radius: var(--r-7);
+  box-shadow: var(--shadow-2);
+}
+
+.panel-forge {
+  background: var(--bg-elevated);
+  border-radius: var(--r-7);
+  border: 0.5px solid var(--separator);
+}
+
+.hairline { border: 0; border-top: 0.5px solid var(--separator); }
+
+/* Капсула статуса
+   Пример:
+     <span class="capsule" style="color: var(--status-running)">Running</span>
+   Фон автоматически тонируется от currentColor.                  */
+.capsule {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 8px;
+  font: var(--t-caption1); font-weight: 600;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+.capsule.sm { padding: 2px 6px; font: var(--t-caption2); }

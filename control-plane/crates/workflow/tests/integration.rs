@@ -11,6 +11,10 @@ fn fixtures_dir() -> String {
     format!("{manifest}/../../../examples")
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
 fn write_temp_fixture(filename: &str, content: &str) -> String {
     let unique = TEMP_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -24,7 +28,38 @@ fn write_temp_fixture(filename: &str, content: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn compile_result_from_strings(
+fn catalog_with_default_system_lead(catalog_yaml: &str) -> String {
+    let mut catalog: serde_yaml::Value =
+        serde_yaml::from_str(catalog_yaml).expect("test catalog fixture should parse as YAML");
+    let has_system_lead = catalog
+        .get("agents")
+        .and_then(|agents| agents.as_sequence())
+        .map(|agents| {
+            agents.iter().any(|agent| {
+                agent.get("system_role").and_then(|role| role.as_str()) == Some("lead")
+            })
+        })
+        .unwrap_or(false);
+    if has_system_lead {
+        return catalog_yaml.to_string();
+    }
+
+    if let Some(agents) = catalog
+        .get_mut("agents")
+        .and_then(|agents| agents.as_sequence_mut())
+    {
+        if let Some(first_agent) = agents.first_mut().and_then(|agent| agent.as_mapping_mut()) {
+            first_agent.insert(
+                serde_yaml::Value::String("system_role".to_string()),
+                serde_yaml::Value::String("lead".to_string()),
+            );
+        }
+    }
+
+    serde_yaml::to_string(&catalog).expect("test catalog fixture should serialize")
+}
+
+fn compile_result_from_raw_strings(
     workflow_yaml: &str,
     catalog_yaml: &str,
 ) -> anyhow::Result<workflow::plan::RunPlan> {
@@ -38,6 +73,16 @@ fn compile_result_from_strings(
     compiler::compile(&wf_path, &cat_path)
 }
 
+fn compile_result_from_strings(
+    workflow_yaml: &str,
+    catalog_yaml: &str,
+) -> anyhow::Result<workflow::plan::RunPlan> {
+    compile_result_from_raw_strings(
+        workflow_yaml,
+        &catalog_with_default_system_lead(catalog_yaml),
+    )
+}
+
 fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::plan::RunPlan {
     compile_result_from_strings(workflow_yaml, catalog_yaml).expect("should compile plan")
 }
@@ -49,7 +94,8 @@ fn compile_error_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> String
         format!("workflow:\n  id: contract-fixture\n  family: contract_fixture\n{workflow_yaml}")
     };
     let wf_path = write_temp_fixture("workflow.yaml", &workflow_yaml);
-    let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
+    let catalog_yaml = catalog_with_default_system_lead(catalog_yaml);
+    let cat_path = write_temp_fixture("catalog.yaml", &catalog_yaml);
     compiler::compile(&wf_path, &cat_path)
         .expect_err("plan should fail direct-command lint")
         .to_string()
@@ -104,6 +150,11 @@ fn test_parse_agent_catalog() {
     assert!(agent_ids.contains(&"proposal_writer"));
     assert!(agent_ids.contains(&"proposal_reviewer_ux"));
 
+    let lead = workflow::catalog::validate_catalog_has_exactly_one_system_lead(&cat)
+        .expect("bundled catalog should declare exactly one system lead");
+    assert_eq!(lead.id, "lead_orchestrator");
+    assert_eq!(lead.system_role, Some(workflow::catalog::SystemRole::Lead));
+
     let proposal_writer = agents
         .iter()
         .find(|agent| agent.id == "proposal_writer")
@@ -115,6 +166,168 @@ fn test_parse_agent_catalog() {
     assert_eq!(
         proposal_writer.session_family_id.as_deref(),
         Some("proposal_authoring_loop")
+    );
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_rejects_missing_system_lead() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: reviewer
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: reviewer
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+agents:
+  - id: reviewer
+    backend_profile: claude_review
+"#;
+
+    let error = compile_result_from_raw_strings(workflow, catalog)
+        .expect_err("catalog without system_role=lead should fail executable validation")
+        .to_string();
+
+    assert!(
+        error.contains("lead_missing"),
+        "expected typed missing-lead validation error, got: {error}"
+    );
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_rejects_duplicate_system_leads() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: lead_one
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: lead_one
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+agents:
+  - id: lead_one
+    system_role: lead
+    backend_profile: claude_review
+  - id: lead_two
+    system_role: lead
+    backend_profile: claude_review
+"#;
+
+    let error = compile_result_from_raw_strings(workflow, catalog)
+        .expect_err("catalog with duplicate system leads should fail executable validation")
+        .to_string();
+
+    assert!(
+        error.contains("lead_ambiguous"),
+        "expected typed duplicate-lead validation error, got: {error}"
+    );
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_allows_exactly_one_system_lead() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: lead
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: lead
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_review
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+  - id: reviewer
+    backend_profile: claude_review
+"#;
+
+    let plan = compile_result_from_raw_strings(workflow, catalog).expect("plan should compile");
+
+    assert_eq!(plan.initial_state, "start");
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_rejects_lead_without_resolution_contract() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: lead
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: lead
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+permission_profiles:
+  ORCH: {}
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_review
+    permission_profile: ORCH
+"#;
+
+    let error = compile_result_from_raw_strings(workflow, catalog)
+        .expect_err("lead without LeadResolutionContract should fail executable validation")
+        .to_string();
+
+    assert!(
+        error.contains("lead_resolution_contract_missing"),
+        "expected typed missing lead resolution contract error, got: {error}"
     );
 }
 
@@ -140,6 +353,46 @@ fn p051_example_catalogs_explicitly_mark_xcode_required_tools_for_host_execution
         assert!(
             missing.is_empty(),
             "{relative_path} agents with Xcode required_tools must explicitly set requires_xcode_host_execution: true: {missing:?}"
+        );
+    }
+}
+
+#[test]
+fn p051_dogfood_workflow_runs_parallel_gemini_xcode_lanes() {
+    let root = repo_root();
+    let wf_path = root
+        .join("docs/evidence/051-shared-xcode-mcp-bridge-pool/dogfood-workflow.yaml")
+        .to_string_lossy()
+        .into_owned();
+    let cat_path = root
+        .join("docs/evidence/051-shared-xcode-mcp-bridge-pool/dogfood-agents.yaml")
+        .to_string_lossy()
+        .into_owned();
+
+    let plan = compiler::compile(&wf_path, &cat_path).expect("should compile P051 dogfood plan");
+    let review_state = &plan.states["state_2_parallel_gemini_xcode_review"];
+
+    assert_eq!(
+        review_state.tasks.len(),
+        2,
+        "dogfood review fan-out is parallel"
+    );
+    for agent_id in ["p051_gemini_ux_xcode", "p051_gemini_ui_xcode"] {
+        let task = review_state
+            .tasks
+            .iter()
+            .find(|task| task.agent.agent_id == agent_id)
+            .unwrap_or_else(|| panic!("missing {agent_id} reviewer task"));
+
+        assert_eq!(task.agent.provider, "gemini", "{agent_id} uses Gemini");
+        assert_eq!(
+            task.agent.requested_mcp_server_ids,
+            vec!["xcode".to_string()],
+            "{agent_id} requests only brokered Xcode MCP"
+        );
+        assert!(
+            task.agent.xcode_broker_required,
+            "{agent_id} is marked as requiring the Xcode broker"
         );
     }
 }
@@ -198,15 +451,15 @@ fn test_compile_full_mvp_live_plan() {
         "architect MCP intent comes from codex_architect_high backend_profile"
     );
 
-    // Verify code_writer → codex
+    // Verify code_writer → claude
     let s7 = &plan.states["state_7_implementation_started"];
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
-    assert_eq!(cw_task.unwrap().agent.provider, "codex");
+    assert_eq!(cw_task.unwrap().agent.provider, "claude");
     assert_eq!(
         cw_task.unwrap().agent.requested_mcp_server_ids,
-        vec!["context7".to_string(), "xcode".to_string()],
-        "code_writer MCP intent comes from codex_builder_high backend_profile"
+        vec!["xcode".to_string()],
+        "code_writer MCP intent comes from claude_builder_high backend_profile"
     );
 
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
@@ -244,6 +497,44 @@ fn test_compile_full_mvp_live_plan() {
 
     // Verify variables were loaded
     assert!(plan.variables.contains_key("proposal_score_target"));
+    assert_eq!(
+        plan.variables
+            .get("audit_target_status")
+            .and_then(|value| value.as_str()),
+        Some("implemented"),
+        "audit transition target must use canonical audit_report_v1 status"
+    );
+    assert_eq!(
+        plan.variables
+            .get("implementation_review_target_status")
+            .and_then(|value| value.as_str()),
+        Some("code_complete"),
+        "implementation review target must use canonical implementation_review_summary_v1 status"
+    );
+}
+
+#[test]
+fn workflow_status_targets_use_canonical_contract_values() {
+    for workflow_name in ["workflow.yaml", "full-mvp-live.yaml"] {
+        let wf_path = format!("{}/workflows/{workflow_name}", fixtures_dir());
+        let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+        let plan = compiler::compile(&wf_path, &cat_path).expect("should compile plan");
+
+        assert_eq!(
+            plan.variables
+                .get("audit_target_status")
+                .and_then(|value| value.as_str()),
+            Some("implemented"),
+            "{workflow_name} must compare audit_report_v1 against canonical status"
+        );
+        assert_eq!(
+            plan.variables
+                .get("implementation_review_target_status")
+                .and_then(|value| value.as_str()),
+            Some("code_complete"),
+            "{workflow_name} must compare implementation_review_summary_v1 against canonical status"
+        );
+    }
 }
 
 #[test]
@@ -363,6 +654,37 @@ agents:
     assert!(
         error.contains("p051_xcrun_unknown_flag"),
         "unknown xcrun flags should be rejected: {error}"
+    );
+}
+
+#[test]
+fn p051_catalog_lint_allows_proposal_non_consuming_xcrun_flags() {
+    compile_from_strings(
+        r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: end
+    owner: builder
+"#,
+        r#"
+backend_profiles:
+  builder_profile:
+    provider: codex_acp
+    model: gpt-5.4
+agents:
+  - id: builder
+    backend_profile: builder_profile
+    required_tools:
+      - xcrun --verbose --log simctl list devices
+      - xcrun --no-cache --kill-cache xcodebuild -version
+      - xcrun --show-sdk-platform-path --sdk iphoneos
+      - xcrun -l swift --version
+      - xcrun --help
+      - xcrun -h
+      - xcrun --version
+"#,
     );
 }
 
@@ -689,6 +1011,7 @@ backend_profiles:
     model: steward-model
 agents:
   - id: steward
+    system_role: lead
     backend_profile: steward_profile
     prompt: "observe"
 "#;
@@ -696,6 +1019,7 @@ agents:
 agents:
   - prompt: "observe"
     backend_profile: steward_profile
+    system_role: lead
     id: steward
 backend_profiles:
   steward_profile:
@@ -799,6 +1123,18 @@ fn test_compile_n_phase_ordering() {
         phase_1[0].agent.agent_id, "proposal_implementation_auditor",
         "phase 1 task must be the auditor"
     );
+    assert!(
+        phase_1[0].agent.requested_mcp_server_ids.is_empty(),
+        "proposal implementation auditor must not acquire interactive Xcode MCP leases"
+    );
+    assert!(
+        !phase_1[0].agent.xcode_broker_required,
+        "proposal implementation auditor must not require the Xcode MCP broker"
+    );
+    assert!(
+        phase_1[0].agent.requires_xcode_host_execution,
+        "proposal implementation auditor may still use host Xcode command shims for non-interactive verification"
+    );
 
     let phase_2: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 2).collect();
     assert_eq!(
@@ -809,6 +1145,18 @@ fn test_compile_n_phase_ordering() {
     assert_eq!(
         phase_2[0].agent.agent_id, "prepush_code_reviewer",
         "phase 2 task must be prepush_code_reviewer"
+    );
+    assert!(
+        phase_2[0].agent.requested_mcp_server_ids.is_empty(),
+        "prepush review must not acquire MCP runtimes; it reviews existing artifacts and diffs"
+    );
+    assert!(
+        !phase_2[0].agent.xcode_broker_required,
+        "prepush review must not acquire an Xcode broker lease"
+    );
+    assert!(
+        !phase_2[0].agent.requires_xcode_host_execution,
+        "prepush review must not depend on host Xcode execution"
     );
 
     let phase_3: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 3).collect();

@@ -1,6 +1,6 @@
 # Xcode MCP Bridge Pool
 
-Stable reference for the implemented Proposal 051 Xcode MCP bridge pool behavior.
+Stable reference for the implemented Xcode MCP bridge pool behavior.
 
 The bridge pool is the Chainworks-owned boundary for Xcode-capable ACP agents. It keeps provider fake-home isolation intact while moving Xcode MCP and selected Xcode shell execution through daemon-owned host-user services.
 
@@ -15,9 +15,9 @@ This reference covers:
 - Xcode runtime observations,
 - shim dispatch for direct Xcode commands,
 - minimum operator readback surfaces,
-- and P051 verification gates.
+- verification gates and the production release boundary.
 
-It does not claim live dogfood sign-off. Fixture and static evidence can prove broker mechanics; live modal behavior and release-owner approval remain separate readiness evidence.
+The scoped broker/readback implementation has live dogfood sign-off recorded under `docs/evidence/051-shared-xcode-mcp-bridge-pool/`. Production packaged-daemon validation remains owned by the release-host packaging lane in [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md).
 
 ## Brokered MCP Path
 
@@ -50,7 +50,7 @@ The daemon creates one `XcodeMcpBridgePool` after SQLite preflight and listener 
 
 The pool base URL uses the same bound daemon port as GraphQL/MCP. `CHAINWORKS_XCODE_BROKER_DISABLED=1` disables lease acquisition and records a fail-closed observation instead of falling back to direct stdio `mcpbridge`.
 
-Broker health is subsystem health, not global daemon readiness. The snapshot includes active and queued lease counts, capacity, rollback disabled state, backend availability, and observation persistence failure count. Missing broker backend is `Failed`; queue pressure, capacity saturation, or any observation append failure is `Degraded`.
+Broker health is subsystem health, not global daemon readiness. The snapshot includes reason code, lease-acquisition availability, active and queued lease counts, capacity, last transition time, operator message, rollback disabled state, backend availability, and observation persistence failure count. Missing broker backend is `Failed`; queue pressure, capacity saturation, or any observation append failure is `Degraded`.
 
 ## Lease And Backend Semantics
 
@@ -63,7 +63,16 @@ Implemented behavior:
 - requests over capacity fail or wait within the configured queue timeout,
 - backend initialization is serialized for a target Xcode process,
 - sibling leases remain isolated by lease token and broker MCP policy,
+- shutdown drains broker lease cleanup before waiting on provider session close,
 - backend failures, first-connect timeouts, target ambiguity, capacity exhaustion, disabled broker state, and policy denials emit typed observations.
+
+### Shared Backend Model
+
+The implemented backend identity is `run_id + Xcode pid + developer_dir`. For that key the pool owns one initialized `xcrun mcpbridge` subprocess and maps sibling HTTP leases to it with reference-counted ownership. The last released lease closes the backend. Backend failure removes the mapped leases so a retry gets a fresh backend.
+
+Lease isolation remains at the broker facade: each lease keeps its own bearer token and `BrokerMcpPolicy`, and authorization or tool denial happens before any request reaches the shared backend. The first lease forwards the real MCP `initialize` to `mcpbridge`; later sibling leases receive the cached initialize result with the caller's JSON-RPC id. Only the first `notifications/initialized` is forwarded, while duplicates are no-op acknowledgements.
+
+Requests to one shared backend use an ordered stdio request pump rather than concurrent writes to the same process. Leases for different run/Xcode-target keys use independent backend processes.
 
 Provider sessions do not receive host-home access for their ordinary runtime state. Host Xcode work is routed through the broker/shim boundary.
 
@@ -87,7 +96,9 @@ Observation data includes:
 - shim invocation and warning events,
 - storage truncation/drop counters.
 
-The domain model owns typed observation shape and redaction. The DB repository owns transactional append/update. The engine injects the observation sink into ACP so ACP does not depend on DB.
+The domain model owns typed observation shape and redaction. The DB repository owns transactional append/update. The engine injects the observation sink into ACP so ACP does not depend on DB. After a successful late append, the sink publishes the existing stage-status invalidation event with the current stage status so GraphQL subscribers re-read the stage and agent execution rows from DB; MCP report readback sees the same persisted observation on the next pull.
+
+If observation persistence fails, the broker increments its subsystem failure count, emits an error-level trace with metric marker `xcode_observation_persist_failed_total` and warning marker `observation_persistence_degraded`, and degrades broker health. It does not recursively try to append a warning through the same failed observation sink.
 
 ## Readback Surfaces
 
@@ -118,6 +129,6 @@ Use the staged gate names in [test-gates.md](test-gates.md):
 ./scripts/test-gate.sh p051
 ```
 
-`p051-scaffold` is the fixture/static substrate gate. `proposal-051|p051` composes the scaffold gate with the broader fixture/readback lane.
+`p051-scaffold` is the fixture/static substrate gate. `proposal-051|p051` composes the scaffold gate with the broader fixture/readback lane. These historical gate aliases remain stable after proposal retirement.
 
-Live dogfood is intentionally outside these fixture gates. P051 pre-ship readiness still requires a parallel Xcode-capable dogfood run, modal-count evidence, observation completeness evidence, token-leakage review, and operator or release-owner sign-off.
+The scoped broker/readback closeout sign-off is recorded in [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md). Broad release or broad `shim_enforced` rollout still requires the P042 `proposal-042-packaging` release-host proof before shipping the production packaged daemon path.

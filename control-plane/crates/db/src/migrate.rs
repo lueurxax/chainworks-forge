@@ -430,6 +430,8 @@ async fn p058_schema_shape_matches(pool: &SqlitePool) -> Result<bool, MigrationE
             &[
                 "id",
                 "run_id",
+                "owner_kind",
+                "owner_id",
                 "stage_execution_id",
                 "agent_execution_id",
                 "failure_kind",
@@ -446,6 +448,8 @@ async fn p058_schema_shape_matches(pool: &SqlitePool) -> Result<bool, MigrationE
             "artifact_source_generation_claims",
             &[
                 "run_id",
+                "owner_kind",
+                "owner_id",
                 "stage_execution_id",
                 "agent_execution_id",
                 "source_work_item_id",

@@ -201,16 +201,18 @@ struct DaemonLifecycleBanner: View {
         let persistence = health.observationPersistenceFailures > 0
             ? ", \(health.observationPersistenceFailures) observation write failures"
             : ""
-        let suffix = "\(leases), \(queue), \(backend)\(persistence)"
+        let acquisition = health.canAcquireNewXcodeLeases ? "leases available" : "leases blocked"
+        let message = health.operatorMessage.isEmpty ? nil : health.operatorMessage
+        let suffix = "\(leases), \(queue), \(backend), \(acquisition)\(persistence)"
         switch health.state {
         case .disabled:
-            return ("pause.circle.fill", .gray, "Xcode Broker disabled — \(suffix)")
+            return ("pause.circle.fill", .gray, "\(message ?? "Xcode Broker disabled") — \(suffix)")
         case .healthy:
-            return ("checkmark.shield.fill", .green, "Xcode Broker healthy — \(suffix)")
+            return ("checkmark.shield.fill", .green, "\(message ?? "Xcode Broker healthy") — \(suffix)")
         case .degraded:
-            return ("exclamationmark.triangle.fill", .yellow, "Xcode Broker degraded — \(suffix)")
+            return ("exclamationmark.triangle.fill", .yellow, "\(message ?? "Xcode Broker degraded") — \(suffix)")
         case .failed:
-            return ("xmark.octagon.fill", .red, "Xcode Broker failed — \(suffix)")
+            return ("xmark.octagon.fill", .red, "\(message ?? "Xcode Broker failed") — \(suffix)")
         }
     }
 
@@ -286,15 +288,17 @@ struct DaemonLifecycleBanner: View {
     }
 
     private func performCrashBudgetReset() {
-        let result = CrashBudgetResetCoordinator.shared.performReset()
-        crashBudgetResetResultSummary = result.summary
-        showCrashBudgetResetResultAlert = true
-        // After a successful reset the daemon should come back up on
-        // its own; refresh the view model so the banner picks up the
-        // next heartbeat rather than staying pinned on the old failed
-        // frame.
-        if result.isFullySuccessful {
-            Task { await viewModel.refresh() }
+        Task { @MainActor in
+            let result = await CrashBudgetResetCoordinator.shared.performReset()
+            crashBudgetResetResultSummary = result.summary
+            showCrashBudgetResetResultAlert = true
+            // After a successful reset the daemon should come back up
+            // on its own; refresh the view model so the banner picks
+            // up the next heartbeat rather than staying pinned on the
+            // old failed frame.
+            if result.isFullySuccessful {
+                await viewModel.refresh()
+            }
         }
     }
 

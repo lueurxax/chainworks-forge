@@ -21,6 +21,7 @@ const BINARY_ENV_VAR: &str = "CHAINWORKS_CLAUDE_ACP_BINARY";
 /// and after the session.
 pub struct ClaudeAgentAdapter {
     binary_path: String,
+    set_mode_after_session_new: bool,
 }
 
 impl ClaudeAgentAdapter {
@@ -29,13 +30,17 @@ impl ClaudeAgentAdapter {
     pub fn new() -> Self {
         let binary_path =
             std::env::var(BINARY_ENV_VAR).unwrap_or_else(|_| "claude-agent-acp".to_string());
-        Self { binary_path }
+        Self {
+            binary_path,
+            set_mode_after_session_new: true,
+        }
     }
 
     /// Construct with an explicit binary path — for testing and runtime injection.
     pub fn new_with_binary(path: impl Into<String>) -> Self {
         Self {
             binary_path: path.into(),
+            set_mode_after_session_new: false,
         }
     }
 }
@@ -85,6 +90,7 @@ impl AcpAdapter for ClaudeAgentAdapter {
             .to_string();
         let config = AcpSessionConfig {
             model: &model_str,
+            set_mode_after_session_new: self.set_mode_after_session_new,
             ..default_config
         };
         Ok(AcpSessionNewSpec::from_config(config))

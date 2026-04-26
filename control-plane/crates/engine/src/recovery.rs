@@ -4,10 +4,10 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, runs, stages, startup_repairs, work_items,
-    workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, artifact_contracts, projections, runs, stages,
+    startup_repairs, work_items, workflow_conflicts,
 };
-use db::work_item::WorkItemKind;
+use db::work_item::{WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::Run;
@@ -57,6 +57,7 @@ pub struct RecoverySummary {
     pub runs_inspected: usize,
     pub runs_repaired: usize,
     pub work_items_requeued: usize,
+    pub agent_executions_settled: u64,
     pub recovered_item_count: i64,
     pub queued_under_startup_recovery_backpressure_count: i64,
     pub oldest_recovered_queued_age_ms: Option<i64>,
@@ -143,6 +144,32 @@ fn recovery_action_from_runtime_facts(
     }
 }
 
+async fn stage_has_pending_or_running_invoke_work(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+) -> Result<bool> {
+    let items = work_items::list_by_run(pool, run_id).await?;
+    let stage_execution_id = stage_execution_id.to_string();
+    Ok(items.iter().any(|item| {
+        item.kind == WorkItemKind::InvokeAgent
+            && matches!(
+                item.status,
+                WorkItemStatus::Pending | WorkItemStatus::Running
+            )
+            && serde_json::from_str::<serde_json::Value>(&item.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("stage_execution_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some(stage_execution_id.as_str())
+    }))
+}
+
 impl RecoveryService {
     pub fn new(pool: SqlitePool, work_queue: WorkQueue, events: EventSender) -> Self {
         Self {
@@ -175,20 +202,89 @@ impl RecoveryService {
         let runs_inspected = active_runs.len();
         let mut runs_repaired = 0usize;
         let mut work_items_requeued = 0usize;
+        let now = Utc::now();
+        let agent_executions_settled =
+            work_items::settle_terminal_preclaimed_invoke_agent_executions(&self.pool, now).await?;
 
         info!(runs_inspected = %runs_inspected, "Starting startup recovery");
+        if agent_executions_settled > 0 {
+            warn!(
+                settled = agent_executions_settled,
+                "Startup recovery settled terminal preclaimed InvokeAgent executions"
+            );
+        }
+        let requeued_steward_analyses = work_items::requeue_running_steward_analysis_on_startup(
+            &self.pool,
+            now,
+            "startup_repair_abandoned_steward_analysis",
+        )
+        .await?;
+        if requeued_steward_analyses > 0 {
+            work_items_requeued += requeued_steward_analyses as usize;
+            warn!(
+                requeued = requeued_steward_analyses,
+                "Startup recovery requeued abandoned StewardAnalysis work items"
+            );
+        }
+        let requeued_invoke_agents = work_items::requeue_running_invoke_agent_on_startup(
+            &self.pool,
+            now,
+            "startup_repair_abandoned_invoke_agent",
+        )
+        .await?;
+        if requeued_invoke_agents > 0 {
+            work_items_requeued += requeued_invoke_agents as usize;
+            warn!(
+                requeued = requeued_invoke_agents,
+                "Startup recovery requeued abandoned InvokeAgent work items"
+            );
+        }
 
         for run in &active_runs {
+            let mut repaired_run = false;
+            match artifact_contracts::repair_contract_status_normalization_and_rebuild(
+                &self.pool, run.id,
+            )
+            .await
+            {
+                Ok(repaired_contracts) => {
+                    if repaired_contracts > 0 {
+                        repaired_run = true;
+                        info!(
+                            run_id = %run.id,
+                            repaired_contracts = repaired_contracts,
+                            "Startup recovery repaired legacy artifact contract status normalization"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to repair artifact contract normalization during startup"
+                    );
+                }
+            }
+            if let Err(e) = rebuild_operator_read_projections(&self.pool, run.id).await {
+                warn!(
+                    run_id = %run.id,
+                    error = %e,
+                    "Failed to rebuild operator read projections during startup"
+                );
+            }
             match self.repair_run(run).await {
                 Ok(requeued) => {
                     if requeued > 0 {
-                        runs_repaired += 1;
+                        repaired_run = true;
                         work_items_requeued += requeued;
                     }
                 }
                 Err(e) => {
                     warn!(run_id = %run.id, error = %e, "Failed to repair run during startup");
                 }
+            }
+            if repaired_run {
+                runs_repaired += 1;
             }
         }
 
@@ -214,10 +310,16 @@ impl RecoveryService {
             None
         };
 
+        let reported_runs_repaired = readback
+            .as_ref()
+            .map(|readback| readback.affected_run_count.max(runs_repaired as i64) as usize)
+            .unwrap_or(runs_repaired);
+
         Ok(RecoverySummary {
             runs_inspected,
-            runs_repaired,
+            runs_repaired: reported_runs_repaired,
             work_items_requeued,
+            agent_executions_settled,
             recovered_item_count: readback
                 .as_ref()
                 .map(|readback| readback.recovered_item_count)
@@ -312,6 +414,15 @@ impl RecoveryService {
                 requeued += requeued_preclaimed;
                 continue;
             }
+            if stage_has_pending_or_running_invoke_work(&self.pool, run.id, stage.id).await? {
+                info!(
+                    run_id = %run.id,
+                    stage_id = %stage.stage_id,
+                    stage_execution_id = %stage.id,
+                    "Startup repair left running stage open because recovered InvokeAgent work is queued"
+                );
+                continue;
+            }
 
             let provenance_suffix = self
                 .latest_execution_provenance_suffix(stage.id)
@@ -380,7 +491,37 @@ impl RecoveryService {
             requeued += 1;
         } else {
             if self.transition_cursor_blocks_startup_catchup(run).await? {
+                let cancelled = work_items::cancel_pending_or_running_advance_by_run(
+                    &self.pool,
+                    run.id,
+                    now,
+                    "startup_repair_transition_cursor_parked",
+                )
+                .await?;
+                if cancelled > 0 {
+                    warn!(
+                        run_id = %run.id,
+                        cancelled = %cancelled,
+                        "Startup recovery cancelled stale AdvanceRun work items for transition cursor parked run"
+                    );
+                }
                 return Ok(requeued);
+            }
+
+            let requeued_running_advance = work_items::requeue_running_advance_by_run(
+                &self.pool,
+                run.id,
+                now,
+                "startup_repair_abandoned_advance_run",
+            )
+            .await?;
+            if requeued_running_advance > 0 {
+                info!(
+                    run_id = %run.id,
+                    requeued = %requeued_running_advance,
+                    "Startup recovery requeued abandoned AdvanceRun work items"
+                );
+                requeued += requeued_running_advance as usize;
             }
 
             // Even if no stages are stuck in Running, the run may need
@@ -474,4 +615,14 @@ impl RecoveryService {
             ))
         }
     }
+}
+
+async fn rebuild_operator_read_projections(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> Result<()> {
+    projections::rebuild_run_summary(pool, run_id).await?;
+    projections::rebuild_stage_summaries(pool, run_id).await?;
+    projections::rebuild_approval_inbox(pool, run_id).await?;
+    Ok(())
 }

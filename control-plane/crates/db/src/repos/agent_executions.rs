@@ -7,6 +7,8 @@ use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{XcodeRuntimeObservation, XcodeRuntimeObservationUpdate};
 
+use crate::pool::begin_immediate_with_retry;
+
 const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
                 owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
                 invocation_owner_key, session_reuse_scope, session_family_id,
@@ -15,7 +17,8 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
                 denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
                 actual_xcode_runtime_observation_json,
-                mcp_session_startup_latency_ms"#;
+                mcp_session_startup_latency_ms,
+                owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id"#;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningAgentExecution {
@@ -35,6 +38,13 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
 }
 
 pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) -> Result<()> {
+    let owner_kind = exec.owner_kind.as_deref().unwrap_or("stage_execution");
+    let stage_execution_id = exec.stage_execution_id.map(|id| id.to_string());
+    let owner_id = exec.owner_id.clone().or_else(|| {
+        (owner_kind == "stage_execution")
+            .then(|| stage_execution_id.clone())
+            .flatten()
+    });
     sqlx::query(
         "INSERT INTO agent_executions
          (id, stage_execution_id, agent_id, provider, provider_family, model, status, started_at, completed_at,
@@ -45,11 +55,12 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
           predicted_mcp_runtime_ids_json, actual_mcp_extensions_json, actual_mcp_runtime_ids_json,
           denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
           actual_xcode_runtime_observation_json,
-          mcp_session_startup_latency_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          mcp_session_startup_latency_ms,
+          owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
-    .bind(exec.stage_execution_id.to_string())
+    .bind(&stage_execution_id)
     .bind(&exec.agent_id)
     .bind(&exec.provider)
     .bind(ProviderFamily::canonicalize_known_alias(&exec.provider))
@@ -77,6 +88,10 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
     .bind(&exec.actual_mcp_observation_json)
     .bind(&exec.actual_xcode_runtime_observation_json)
     .bind(exec.mcp_session_startup_latency_ms)
+    .bind(owner_kind)
+    .bind(&owner_id)
+    .bind(&exec.lead_mediation_record_id)
+    .bind(&exec.origin_stage_execution_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -177,13 +192,48 @@ pub async fn update_mcp_actual(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn update_session_policy(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    session_lineage_id: Option<&str>,
+    session_generation_id: Option<&str>,
+    rehydrated_from_checkpoint_artifact_id: Option<&str>,
+    invocation_owner_key: Option<&str>,
+    session_reuse_disposition: Option<&str>,
+    session_reset_reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_executions
+         SET session_lineage_id = ?1,
+             session_generation_id = ?2,
+             rehydrated_from_checkpoint_artifact_id = ?3,
+             invocation_owner_key = ?4,
+             session_reuse_disposition = ?5,
+             session_reset_reason = ?6
+         WHERE id = ?7",
+    )
+    .bind(session_lineage_id)
+    .bind(session_generation_id)
+    .bind(rehydrated_from_checkpoint_artifact_id)
+    .bind(invocation_owner_key)
+    .bind(session_reuse_disposition)
+    .bind(session_reset_reason)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn append_xcode_runtime_observation(
     pool: &SqlitePool,
     id: AgentExecutionId,
     update: XcodeRuntimeObservationUpdate,
 ) -> Result<()> {
     for attempt in 0..3 {
-        let mut tx = pool.begin().await?;
+        let mut tx =
+            begin_immediate_with_retry(pool, "agent_executions.append_xcode_runtime_observation")
+                .await?;
         let row = sqlx::query(
             "SELECT actual_xcode_runtime_observation_json FROM agent_executions WHERE id = ?",
         )
@@ -288,6 +338,7 @@ pub async fn find_by_stage_tx(
 }
 
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentExecution>> {
+    // P017: Include both stage-owned and mediation-owned executions for a run.
     let prefixed_select_cols = SELECT_COLS
         .split(',')
         .map(|col| format!("ae.{}", col.trim()))
@@ -296,11 +347,15 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentEx
     let query = format!(
         "SELECT {prefixed_select_cols}
          FROM agent_executions ae
-         INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-         WHERE se.run_id = ?
+         LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+         LEFT JOIN lead_conflict_mediations lcm
+             ON ae.owner_kind = 'lead_conflict_mediation'
+             AND ae.lead_mediation_record_id = lcm.id
+         WHERE se.run_id = ? OR lcm.run_id = ?
          ORDER BY ae.started_at ASC"
     );
     let rows = sqlx::query(&query)
+        .bind(run_id.to_string())
         .bind(run_id.to_string())
         .fetch_all(pool)
         .await?;
@@ -312,6 +367,7 @@ pub async fn list_by_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
 ) -> Result<Vec<AgentExecution>> {
+    // P017: Include both stage-owned and mediation-owned executions for a run.
     let prefixed_select_cols = SELECT_COLS
         .split(',')
         .map(|col| format!("ae.{}", col.trim()))
@@ -320,11 +376,15 @@ pub async fn list_by_run_tx(
     let query = format!(
         "SELECT {prefixed_select_cols}
          FROM agent_executions ae
-         INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-         WHERE se.run_id = ?
+         LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+         LEFT JOIN lead_conflict_mediations lcm
+             ON ae.owner_kind = 'lead_conflict_mediation'
+             AND ae.lead_mediation_record_id = lcm.id
+         WHERE se.run_id = ? OR lcm.run_id = ?
          ORDER BY ae.started_at ASC"
     );
     let rows = sqlx::query(&query)
+        .bind(run_id.to_string())
         .bind(run_id.to_string())
         .fetch_all(&mut **tx)
         .await?;
@@ -337,16 +397,26 @@ pub async fn cancel_running_by_run(
     run_id: RunId,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
+    // BLK-003: Cancel both stage-owned and mediation-owned executions for the run.
     sqlx::query(
         "UPDATE agent_executions
          SET status = ?, completed_at = ?
-         WHERE status = ? AND stage_execution_id IN (
-             SELECT id FROM stage_executions WHERE run_id = ?
+         WHERE status = ? AND (
+             stage_execution_id IN (
+                 SELECT id FROM stage_executions WHERE run_id = ?
+             )
+             OR (
+                 owner_kind = 'lead_conflict_mediation'
+                 AND lead_mediation_record_id IN (
+                     SELECT id FROM lead_conflict_mediations WHERE run_id = ?
+                 )
+             )
          )",
     )
     .bind(AgentStatus::Cancelled.to_string())
     .bind(completed_at.to_rfc3339())
     .bind(AgentStatus::Running.to_string())
+    .bind(run_id.to_string())
     .bind(run_id.to_string())
     .execute(pool)
     .await?;
@@ -358,16 +428,26 @@ pub async fn cancel_running_by_run_tx(
     run_id: RunId,
     completed_at: DateTime<Utc>,
 ) -> Result<u64> {
+    // BLK-003: Cancel both stage-owned and mediation-owned executions for the run.
     let result = sqlx::query(
         "UPDATE agent_executions
          SET status = ?, completed_at = ?
-         WHERE status = ? AND stage_execution_id IN (
-             SELECT id FROM stage_executions WHERE run_id = ?
+         WHERE status = ? AND (
+             stage_execution_id IN (
+                 SELECT id FROM stage_executions WHERE run_id = ?
+             )
+             OR (
+                 owner_kind = 'lead_conflict_mediation'
+                 AND lead_mediation_record_id IN (
+                     SELECT id FROM lead_conflict_mediations WHERE run_id = ?
+                 )
+             )
          )",
     )
     .bind(AgentStatus::Cancelled.to_string())
     .bind(completed_at.to_rfc3339())
     .bind(AgentStatus::Running.to_string())
+    .bind(run_id.to_string())
     .bind(run_id.to_string())
     .execute(&mut **tx)
     .await?;
@@ -457,14 +537,16 @@ fn parse_running_agent_execution_row(
 
 fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecution> {
     let id: String = row.get("id");
-    let seid: String = row.get("stage_execution_id");
+    let seid: Option<String> = row.get("stage_execution_id");
     let status_str: String = row.get("status");
     let started_str: String = row.get("started_at");
     let completed_str: Option<String> = row.get("completed_at");
 
     Ok(AgentExecution {
         id: id.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
-        stage_execution_id: seid.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
+        stage_execution_id: seid
+            .map(|id| id.parse().map_err(|e| anyhow::anyhow!("{}", e)))
+            .transpose()?,
         agent_id: row.get("agent_id"),
         provider: row.get("provider"),
         model: row.get("model"),
@@ -493,5 +575,9 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         actual_mcp_observation_json: row.get("actual_mcp_observation_json"),
         actual_xcode_runtime_observation_json: row.get("actual_xcode_runtime_observation_json"),
         mcp_session_startup_latency_ms: row.get("mcp_session_startup_latency_ms"),
+        owner_kind: row.get("owner_kind"),
+        owner_id: row.get("owner_id"),
+        lead_mediation_record_id: row.get("lead_mediation_record_id"),
+        origin_stage_execution_id: row.get("origin_stage_execution_id"),
     })
 }

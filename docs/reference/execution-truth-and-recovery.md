@@ -245,7 +245,7 @@ The run-level transition cursor is the authoritative continuation signal:
 
 ### Implementation Handoff Status
 
-Runs entering implementation (Phase A/B) use `ImplementationHandoffStatus` to
+Runs entering implementation use `ImplementationHandoffStatus` to
 track engine-owned handoff truth (ARCH-038):
 - **Engine-Owned Handoff**: The engine owns the deterministic `approved_proposal`
   snapshot and handoff artifacts.

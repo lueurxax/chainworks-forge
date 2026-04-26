@@ -631,6 +631,52 @@ permission_profiles:
       - scanner.readonly
       - dependency_scan.readonly
       - secrets_scan.readonly
+  RO_PREPUSH_VERIFY:
+    filesystem:
+      read:
+      - ${CHAINWORKS_REPO_ROOT:-.}/**
+      - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/**
+      write:
+      - ${CHAINWORKS_META_ROOT:-.chainworks}/review/**
+      deny:
+      - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
+      - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
+    git:
+      status: true
+      diff: true
+      checkout: false
+      commit: false
+      push: false
+    shell:
+      allow:
+      - rg
+      - fd
+      - find
+      - ls
+      - cat
+      - git status
+      - git diff --stat
+      - git diff --name-only
+      - go test ./...
+      - cargo test
+      - cargo clippy
+      - swift build
+      - swift test
+      - npm test
+      - pnpm test
+      - yarn test
+      - make test
+      - just test
+      deny:
+      - git commit*
+      - git push*
+      - rm -rf *
+    network:
+      allow: []
+    mcp:
+      allow: []
   PROPOSAL_WRITE:
     filesystem:
       read:
@@ -1125,7 +1171,7 @@ agents:
   title: Pre-push Code Reviewer
   mode: prepush_review
   backend_profile: claude_prepush_medium
-  permission_profile: RO_VERIFY
+  permission_profile: RO_PREPUSH_VERIFY
   skill_ref: prepush_review_core
   required_tools:
   - git diff --stat
@@ -1133,8 +1179,6 @@ agents:
   - go test ./...
   - cargo test
   - swift test
-  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
-  - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
   inputs:
   - approved_proposal
   - implementation_progress

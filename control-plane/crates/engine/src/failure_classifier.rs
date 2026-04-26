@@ -187,6 +187,7 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
     }
     if lower.contains("stdout closed")
         || lower.contains("transport closed")
+        || lower.contains("session closed during active prompt")
         || lower.contains("acp: send session/prompt")
         || lower.contains("write acp message to subprocess stdin")
     {
@@ -250,7 +251,50 @@ fn extract_retry_after_from_message_at(message: &str, now: DateTime<Utc>) -> Opt
             }
         }
     }
+    if let Some(retry_after) = extract_relative_reset_retry_after(message, now) {
+        return Some(retry_after);
+    }
     extract_reset_clock_retry_after(message, now)
+}
+
+fn extract_relative_reset_retry_after(message: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = message.to_ascii_lowercase();
+    let (_, tail) = lower
+        .split_once("reset after ")
+        .or_else(|| lower.split_once("resets after "))
+        .or_else(|| lower.split_once("retry after "))?;
+    let token = tail
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';' | '.'));
+    let duration = parse_compact_duration(token)?;
+    Some(now + duration)
+}
+
+fn parse_compact_duration(token: &str) -> Option<Duration> {
+    let mut total = Duration::zero();
+    let mut digits = String::new();
+    let mut saw_unit = false;
+    for ch in token.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        let value: i64 = digits.parse().ok()?;
+        digits.clear();
+        match ch {
+            'd' => total = total + Duration::days(value),
+            'h' => total = total + Duration::hours(value),
+            'm' => total = total + Duration::minutes(value),
+            's' => total = total + Duration::seconds(value),
+            _ => return None,
+        }
+        saw_unit = true;
+    }
+    if !digits.is_empty() || !saw_unit || total <= Duration::zero() {
+        return None;
+    }
+    Some(total)
 }
 
 fn extract_reset_clock_retry_after(message: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -493,6 +537,10 @@ mod tests {
                 supervision_classification: Some("idle_hang_before_first_progress".into())
             }
         );
+        assert_eq!(
+            observation_from_acp_error_message("ACP session closed during active prompt"),
+            RuntimeFailureObservation::TransportClosed
+        );
     }
 
     #[test]
@@ -510,6 +558,28 @@ mod tests {
         assert!(matches!(
             observation_from_acp_error_message(
                 "provider limit reached; resets 10pm (Asia/Nicosia)"
+            ),
+            RuntimeFailureObservation::ProviderQuota {
+                retry_after: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_quota_parses_relative_reset_message() {
+        let now = DateTime::parse_from_rfc3339("2026-04-26T07:24:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry_after = extract_retry_after_from_message_at(
+            "You have exhausted your capacity on this model. Your quota will reset after 12h21m1s.",
+            now,
+        )
+        .expect("relative provider reset should parse");
+
+        assert_eq!(retry_after.to_rfc3339(), "2026-04-26T19:45:06+00:00");
+        assert!(matches!(
+            observation_from_acp_error_message(
+                "You have exhausted your capacity on this model. Your quota will reset after 12h21m1s."
             ),
             RuntimeFailureObservation::ProviderQuota {
                 retry_after: Some(_)

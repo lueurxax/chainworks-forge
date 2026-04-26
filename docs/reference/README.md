@@ -6,16 +6,16 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Foundation Layer
 
-- [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking
+- [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking; plus Rust-only **lead mediation and confirmation** models
 - [yaml-dsl-parser.md](yaml-dsl-parser.md) — YAML parsing, validation (10 check categories), compact workflow normalization, provenance hashing, verification scaffold
-- [architecture-decisions.md](architecture-decisions.md) — Key AD decisions: CodingKeys, single-active-run, drift detection, snapshot storage, integer cost, derived currentStageID
+- [architecture-decisions.md](architecture-decisions.md) — Key AD decisions: CodingKeys, single-active-run, drift detection, snapshot storage, integer cost, derived currentStageID, and **owner-aware execution identity**
 
 ## Execution Engine
 
-- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service
+- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, and **lead conflict mediation** (Proposal 017)
 - [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
-- [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, and startup recovery progress readback
+- [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules, and **mediation-owned execution identity**
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, **mediation settlement**, and startup recovery progress readback
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
@@ -25,21 +25,21 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
-- [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, broker health, and P051 readiness gates
+- [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, broker health, and retained bridge-pool gate aliases
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, write serialization, provider toolchain homes, and generated-state housekeeping
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, write serialization, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
-- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
+- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
-- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and P031 consumption rules
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and downstream UI consumption rules
 
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
-- [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs Home, reports, recovery guidance, comparison, artifact inspection, notifications, backpressure visibility, and host interruption labels
-- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed UI write controls (P031)
+- [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs Home, reports, recovery guidance, comparison, artifact inspection, notifications, **mediation resolution**, backpressure visibility, and host interruption labels
+- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls (P031)
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces

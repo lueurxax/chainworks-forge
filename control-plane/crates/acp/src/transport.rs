@@ -30,6 +30,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -98,6 +99,11 @@ pub struct AcpSessionConfig<'a> {
     /// Errors are logged but do not fail the session (providers that don't
     /// support the method respond with `Method not found`).
     pub config_options: Vec<(String, String)>,
+
+    /// Some ACP providers expose a mode catalog in `session/new` but do not
+    /// apply `session/new.params.mode`. For those providers, send
+    /// `session/set_mode` with `modeId` immediately after session creation.
+    pub set_mode_after_session_new: bool,
 }
 
 impl Default for AcpSessionConfig<'_> {
@@ -117,6 +123,7 @@ impl Default for AcpSessionConfig<'_> {
                 }
             })),
             config_options: Vec::new(),
+            set_mode_after_session_new: false,
         }
     }
 }
@@ -216,8 +223,16 @@ const HANDSHAKE_TIMEOUT: Duration = DEFAULT_HANDSHAKE_TIMEOUT;
 /// Max silence between messages before we consider the session hung.
 /// Reset on every received line (including notifications).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Max time without meaningful agent progress while the transport remains alive.
+/// Keepalive/status-only ACP messages reset transport idleness, but not progress.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
+
+enum AcpPromptReadOutcome {
+    Read(std::result::Result<Result<usize>, tokio::time::error::Elapsed>),
+    CloseRequested,
+}
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
 const OUTPUT_END_MARKER: &str = "<<<END_CHAINWORKS_OUTPUT>>>";
@@ -234,7 +249,7 @@ const MAX_STREAMED_TRANSCRIPT_BYTES: usize = 10 * 1024 * 1024;
 const STREAMED_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[chainworks transcript truncated at 10485760 bytes]\n";
 
-fn handshake_timeout_for_provider(provider: &str) -> Duration {
+pub(crate) fn handshake_timeout_for_provider(provider: &str) -> Duration {
     if provider.eq_ignore_ascii_case("gemini") {
         GEMINI_HANDSHAKE_TIMEOUT
     } else {
@@ -1034,7 +1049,14 @@ async fn diagnose_late_handshake_response(
     }
 }
 
-pub async fn probe_initialize(mut child: Child) -> Result<Value> {
+pub async fn probe_initialize(child: Child) -> Result<Value> {
+    probe_initialize_with_timeout(child, HANDSHAKE_TIMEOUT).await
+}
+
+pub(crate) async fn probe_initialize_with_timeout(
+    mut child: Child,
+    handshake_timeout: Duration,
+) -> Result<Value> {
     let mut stdin = child
         .stdin
         .take()
@@ -1064,7 +1086,7 @@ pub async fn probe_initialize(mut child: Child) -> Result<Value> {
     .await
     .context("ACP: send capability probe initialize")?;
 
-    let result = await_response(&mut reader, 1, HANDSHAKE_TIMEOUT)
+    let result = await_response(&mut reader, 1, handshake_timeout)
         .await
         .context("ACP: capability probe initialize handshake")?;
 
@@ -1073,6 +1095,10 @@ pub async fn probe_initialize(mut child: Child) -> Result<Value> {
     match timeout(SHUTDOWN_WAIT, child.wait()).await {
         Ok(Ok(_)) => {}
         _ => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                signal_process_group(pid, libc::SIGTERM);
+            }
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -1322,6 +1348,27 @@ impl AcpTransportSession {
             .as_ref()
             .map(|_| startup_started.elapsed().as_millis() as i64);
 
+        if config.set_mode_after_session_new {
+            let set_mode_id = next_id!();
+            send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": set_mode_id,
+                    "method": "session/set_mode",
+                    "params": {
+                        "sessionId": session_id,
+                        "modeId": config.mode,
+                    }
+                }),
+            )
+            .await
+            .context("ACP: send session/set_mode")?;
+            await_response(&mut reader, set_mode_id, HANDSHAKE_TIMEOUT)
+                .await
+                .context("ACP: session/set_mode handshake")?;
+        }
+
         for (config_id, value) in &config.config_options {
             let sco_id = next_id!();
             if let Err(e) = send_ndjson(
@@ -1464,6 +1511,55 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
+        self.prompt_with_optional_close_signal(req, None).await
+    }
+
+    pub async fn prompt_with_close_signal(
+        &mut self,
+        req: &ExecutionRequest,
+        close_rx: &mut watch::Receiver<bool>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
+        self.prompt_with_optional_close_signal(req, Some(close_rx))
+            .await
+    }
+
+    async fn prompt_with_optional_close_signal(
+        &mut self,
+        req: &ExecutionRequest,
+        mut close_rx: Option<&mut watch::Receiver<bool>>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
         let typed_expected_outputs = !req.expected_outputs.is_empty();
         let expected_baseline_paths: Vec<&str> = if typed_expected_outputs {
             Vec::new()
@@ -1561,6 +1657,7 @@ impl AcpTransportSession {
 
         let mut line = String::new();
         let mut last_activity = Instant::now();
+        let mut last_progress = Instant::now();
         let mut streamed_text = String::new();
         let mut streamed_text_truncated = false;
         let mut latest_usage_snapshot = None;
@@ -1576,21 +1673,52 @@ impl AcpTransportSession {
                     self.session_id
                 );
             }
+            let progress_idle = last_progress.elapsed();
+            if progress_idle >= PROGRESS_TIMEOUT {
+                bail!(
+                    "ACP session progress timeout: no meaningful progress for {}s (session={})",
+                    PROGRESS_TIMEOUT.as_secs(),
+                    self.session_id
+                );
+            }
             let remaining = IDLE_TIMEOUT - idle;
 
             line.clear();
-            let n = timeout(
-                remaining,
-                read_capped_ndjson_line(
-                    &mut self.reader,
-                    &mut line,
-                    ndjson_line_cap_bytes(&req.expected_outputs),
-                    "ACP prompt stream read_line",
-                ),
-            )
-            .await
-            .context("ACP session idle timeout — no message received")?
-            .context("ACP prompt stream read_line error")?;
+            let read_outcome = {
+                let read_line = timeout(
+                    remaining,
+                    read_capped_ndjson_line(
+                        &mut self.reader,
+                        &mut line,
+                        ndjson_line_cap_bytes(&req.expected_outputs),
+                        "ACP prompt stream read_line",
+                    ),
+                );
+                match close_rx.as_deref_mut() {
+                    Some(close_rx) => {
+                        if *close_rx.borrow() {
+                            AcpPromptReadOutcome::CloseRequested
+                        } else {
+                            tokio::select! {
+                                _ = close_rx.changed() => AcpPromptReadOutcome::CloseRequested,
+                                result = read_line => AcpPromptReadOutcome::Read(result),
+                            }
+                        }
+                    }
+                    None => AcpPromptReadOutcome::Read(read_line.await),
+                }
+            };
+
+            let n = match read_outcome {
+                AcpPromptReadOutcome::CloseRequested => {
+                    let session_id = self.session_id.clone();
+                    let _ = self.close().await;
+                    bail!("ACP session closed during active prompt (session={session_id})");
+                }
+                AcpPromptReadOutcome::Read(result) => result
+                    .context("ACP session idle timeout — no message received")?
+                    .context("ACP prompt stream read_line error")?,
+            };
 
             if n == 0 {
                 bail!(
@@ -1636,6 +1764,7 @@ impl AcpTransportSession {
                                         "ACP: failed to send permission grant: {e}"
                                     );
                                 }
+                                last_progress = Instant::now();
                             }
                         }
                         continue;
@@ -1652,6 +1781,9 @@ impl AcpTransportSession {
                             }
                         }
                         if let Some(chunk) = extract_text_chunk(&parsed) {
+                            if !strip_ansi(&chunk).trim().is_empty() {
+                                last_progress = Instant::now();
+                            }
                             push_streamed_transcript_chunk(
                                 &mut streamed_text,
                                 &chunk,
@@ -1935,6 +2067,10 @@ impl AcpTransportSession {
                     "ACP subprocess did not exit within {}s — force-killing",
                     SHUTDOWN_WAIT.as_secs()
                 );
+                #[cfg(unix)]
+                if let Some(pid) = self.child.id() {
+                    signal_process_group(pid, libc::SIGTERM);
+                }
                 let _ = self.child.kill().await;
                 let _ = self.child.wait().await;
                 merge_close_diagnostic(
@@ -2151,6 +2287,11 @@ mod tests {
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
             xcode_shim_injection_signal: false,
             requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
         };
 
         let captured = capture_pre_prompt_expected_outputs(&fake, &req, &context);

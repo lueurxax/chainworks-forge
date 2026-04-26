@@ -109,6 +109,24 @@ impl WorkQueue {
         Ok(())
     }
 
+    pub async fn requeue_after_transient_persistence_contention(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let requeued = work_items::requeue_running_after_transient_persistence_contention(
+            &self.pool,
+            id,
+            Utc::now(),
+            error,
+        )
+        .await?;
+        if requeued {
+            self.refresh_scheduler_projection().await?;
+        }
+        Ok(requeued)
+    }
+
     pub async fn refresh_scheduler_projection(&self) -> Result<()> {
         self.refresh_scheduler_projection_with_capacity(&self.capacity_config)
             .await

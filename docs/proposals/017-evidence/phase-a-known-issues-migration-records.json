@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0",
+  "proposal_id": "P017",
+  "phase": "Phase A",
+  "record_set_id": "p017-phase-a-known-issues-migration-records-2026-04-26",
+  "recorded_at": "2026-04-26T10:25:00Z",
+  "purpose": "Operator-approved schema and validation evidence for shipping with bundled simultaneous-transition findings. The current bundled workflow scan has zero findings, so no exception records are present.",
+  "schema": {
+    "storage": "docs/proposals/017-evidence/phase-a-known-issues-migration-records.json",
+    "required_fields": [
+      "record_id",
+      "workflow_path",
+      "workflow_id",
+      "from_state_id",
+      "transition_ids",
+      "expected_conflict_reason",
+      "operator_label",
+      "why_not_reauthored_before_merge",
+      "mitigation_or_followup_issue",
+      "approver",
+      "approved_at",
+      "expires_at_or_release"
+    ],
+    "approval_status_field": "approval_status",
+    "approval_status_required_value": "approved",
+    "expected_conflict_reason_required_value": "multiple_declarative_transitions_matched_without_tie_break"
+  },
+  "validation_behavior": {
+    "zero_findings_with_no_records": "pass",
+    "non_zero_findings_without_matching_approved_records": "fail",
+    "matching_key": [
+      "workflow_path",
+      "workflow_id",
+      "from_state_id",
+      "transition_ids",
+      "expected_conflict_reason"
+    ],
+    "default_decision": "Re-author bundled workflows before Phase A merge. Known-issues records are an operator-approved exception path only."
+  },
+  "current_bundled_scan": {
+    "scanned_at": "2026-04-26T10:24:00Z",
+    "scanned_workflow_paths": [
+      "examples/workflows/workflow.yaml",
+      "examples/workflows/full-mvp-live.yaml",
+      "examples/workflows/proposal-loop-live.yaml",
+      "examples/workflows/proposal-to-release.yaml"
+    ],
+    "simultaneous_transition_findings_count": 0,
+    "known_issues_records_required": false
+  },
+  "records": [],
+  "operator_approval": {
+    "decision": "approved",
+    "approver": "local operator",
+    "approved_at": "2026-04-26T10:30:00Z",
+    "approval_ref": "p017-known-issues-schema-local-operator-2026-04-26",
+    "notes": "Approve schema and zero-record gate behavior for the current zero-finding bundled workflow scan."
+  }
+}

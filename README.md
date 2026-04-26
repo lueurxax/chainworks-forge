@@ -48,7 +48,7 @@ In practice, Chainworks Forge sits between ad hoc AI chats and heavyweight orche
 The current direction is:
 
 - ACP-first runtime transport
-- thin GraphQL-only UI rewrite (P031) over server-owned projections
+- thin GraphQL-only operator UI over server-owned projections
 - frozen run truth and operator-visible recovery
 - backend-specific agent tuning through catalog-defined workflows
 - local-first execution with explicit provider/runtime diagnostics
@@ -71,11 +71,11 @@ It assumes that workflow truth, artifacts, approvals, and recovery matter more t
 
 ## Current Product Shape
 
-Today the app exposes these top-level operator surfaces (thin GraphQL read-only in P031):
+Today the app exposes these top-level operator surfaces through the thin GraphQL read boundary:
 
 - `Runs Home` for active, blocked, running, and completed runs (GraphQL-only)
-- `Ideas` for capturing and managing work (Create Idea removed from UI in P031)
-- `Approvals` for pending human decisions (diagnostic-only in P031)
+- `Ideas` for capturing and managing work (Create Idea is outside the governed thin UI write path)
+- `Approvals` for pending human decisions (diagnostic-only until a separate write transport is approved)
 - `Agent Catalog` for inspecting the resolved agent catalog
 - `Workflow Inspector` for YAML workflow inspection and validation
 - `Pilot Readiness` for readiness and sign-off support
@@ -91,9 +91,10 @@ The current MVP provider set is:
 
 The repository is past the scaffold stage. The implemented system now includes:
 
+- lead-mediated workflow conflict resolution and mandatory lead validation (Proposal 017 Phase B/C)
 - thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
-- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017)
+- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017 Phase A)
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
@@ -105,11 +106,12 @@ The repository is past the scaffold stage. The implemented system now includes:
 
 Active proposal work is currently concentrated in:
 
-- [`docs/proposals/031-thin-graphql-ui-rewrite.md`](docs/proposals/031-thin-graphql-ui-rewrite.md)
+- [`docs/proposals/032-polish-stabilization-and-productization-backlog.md`](docs/proposals/032-polish-stabilization-and-productization-backlog.md)
+- [`docs/proposals/036-ux-consolidation-and-navigation-simplification.md`](docs/proposals/036-ux-consolidation-and-navigation-simplification.md)
 - [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
-The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
+The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). New UI proposals should build on that reference rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
 
 ## Implemented Today
 
@@ -245,8 +247,7 @@ Start here:
 - [`docs/reference/current-system-baseline.md`](docs/reference/current-system-baseline.md) — current-head subsystem map and baseline
 - [`docs/ps/chainworks-forge-mvp.md`](docs/ps/chainworks-forge-mvp.md) — MVP scope and requirements
 - [`docs/research/chainworks_core_idea.md`](docs/research/chainworks_core_idea.md) — product vision and positioning
-- [`docs/proposals/026-acp-first-runtime-transport-and-goose-decoupling.md`](docs/proposals/026-acp-first-runtime-transport-and-goose-decoupling.md) — additive ACP runtime rollout
-- [`docs/proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md`](docs/proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md) — target architecture after Goose stops being canonical
+- [`docs/reference/acp-runtime-transport.md`](docs/reference/acp-runtime-transport.md) — ACP runtime transport and adapter-family contract
 
 Implemented-system references:
 
@@ -270,7 +271,6 @@ Examples:
 
 - [`examples/README.md`](examples/README.md)
 - [`examples/agents/agents.yaml`](examples/agents/agents.yaml)
-- [`examples/agents/agents_with_gemini.yaml`](examples/agents/agents_with_gemini.yaml)
 - [`examples/workflows/workflow.yaml`](examples/workflows/workflow.yaml)
 - [`examples/workflows/proposal-loop-live.yaml`](examples/workflows/proposal-loop-live.yaml)
 - [`examples/workflows/full-mvp-live.yaml`](examples/workflows/full-mvp-live.yaml)

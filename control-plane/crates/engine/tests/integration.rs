@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifact_contracts, artifacts, ideas, runs, sessions, stages,
-    work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
+    ideas, projections, runs, sessions, stages, work_items, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
@@ -218,7 +221,7 @@ fn make_agent_execution(
 ) -> AgentExecution {
     AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id,
+        stage_execution_id: Some(stage_execution_id),
         agent_id: "worker".into(),
         provider: "claude".into(),
         model: None,
@@ -245,6 +248,10 @@ fn make_agent_execution(
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     }
 }
 
@@ -382,6 +389,58 @@ async fn test_startup_repair_skips_clean_runs() {
 }
 
 #[tokio::test]
+async fn proposal_017_startup_repair_requeues_abandoned_steward_analysis() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "abandoned-steward-analysis".into(),
+            kind: db::work_item::WorkItemKind::StewardAnalysis,
+            payload_json: serde_json::json!({
+                "reason": "config_change",
+                "completed_run_id": RunId::new().to_string()
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: None,
+            stage_id: None,
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_inspected, 0);
+    assert_eq!(summary.work_items_requeued, 1);
+
+    let row: (String, i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, attempt_count, started_at, last_error FROM work_items WHERE id = ?1",
+    )
+    .bind("abandoned-steward-analysis")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1, 2);
+    assert_eq!(row.2, None);
+    assert_eq!(
+        row.3.as_deref(),
+        Some("startup_repair_abandoned_steward_analysis")
+    );
+}
+
+#[tokio::test]
 async fn proposal_017_startup_repair_respects_conflict_cursor_resume_policy() {
     let pool = test_pool().await;
 
@@ -444,6 +503,80 @@ async fn proposal_017_startup_repair_respects_conflict_cursor_resume_policy() {
         .expect("cursor remains readable after startup repair");
     assert_eq!(stored.resume_policy, "await_conflict_resolution");
     assert_eq!(stored.conflict_id.as_deref(), Some("conflict-startup"));
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_cancels_stale_advance_for_conflict_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: "stage_test".into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some("conflict-startup".into()),
+            conflict_fingerprint: Some("sha256:startup-conflict".into()),
+            candidate_transition_hash: Some("sha256:candidates".into()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "stale-advance-cursor".into(),
+            kind: db::work_item::WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "reason": "startup_catchup"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: None,
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.work_items_requeued, 0);
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, db::work_item::WorkItemKind::AdvanceRun);
+    assert_eq!(items[0].status, db::work_item::WorkItemStatus::Cancelled);
+    assert_eq!(
+        items[0].last_error.as_deref(),
+        Some("startup_repair_transition_cursor_parked")
+    );
 }
 
 #[tokio::test]
@@ -567,6 +700,63 @@ async fn proposal_017_startup_repair_resumes_selected_transition_cursor() {
     assert_eq!(work.len(), 1);
     assert_eq!(work[0].kind, db::work_item::WorkItemKind::AdvanceRun);
     assert_eq!(work[0].stage_id, None);
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_requeues_abandoned_advance_without_blocking_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("review".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "abandoned-advance".into(),
+            kind: db::work_item::WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "reason": "startup_catchup"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: None,
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_repaired, 1);
+    assert_eq!(summary.work_items_requeued, 1);
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, db::work_item::WorkItemKind::AdvanceRun);
+    assert_eq!(items[0].status, db::work_item::WorkItemStatus::Pending);
+    assert_eq!(items[0].attempt_count, 2);
+    assert_eq!(
+        items[0].last_error.as_deref(),
+        Some("startup_repair_abandoned_advance_run")
+    );
 }
 
 #[tokio::test]
@@ -1546,6 +1736,110 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
 }
 
 #[tokio::test]
+async fn test_retry_stage_supersedes_workflow_conflict_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+    let current_state_id = "blocked_stage";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Completed);
+    stage.stage_id = current_state_id.into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: "blocked_stage__to__next_stage__0".into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: "next_stage".into(),
+        condition_expression_id: Some("required_artifact_present".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["audit_report_v1".into()],
+        missing_artifacts: vec!["audit_report_v1".into()],
+        missing_fields: Vec::new(),
+        source_artifact_ids: Vec::new(),
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some("required artifact missing".into()),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::Unresolved,
+    );
+    let conflict_id = conflict.conflict_id.clone();
+    let conflict_fingerprint = conflict.conflict_fingerprint.clone();
+    let candidate_hash = conflict.candidate_transition_hash.clone();
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(conflict_id.clone()),
+            conflict_fingerprint: Some(conflict_fingerprint),
+            candidate_transition_hash: Some(candidate_hash),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: current_state_id.into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let superseded = workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+        .await
+        .unwrap();
+    assert!(
+        superseded.is_none(),
+        "stage retry should supersede the stale blocking workflow conflict"
+    );
+
+    let cursor = workflow_conflicts::get_transition_cursor(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("retry must leave a non-blocking transition cursor");
+    assert_eq!(cursor.cursor_status, "stage_retry_scheduled");
+    assert_eq!(
+        cursor.resume_policy, "continue_from_selected_transition",
+        "startup recovery must not park a run on a superseded conflict after retry"
+    );
+    assert_eq!(cursor.conflict_id.as_deref(), Some(conflict_id.as_str()));
+    assert_eq!(
+        cursor.selected_next_state_id.as_deref(),
+        Some(current_state_id)
+    );
+}
+
+#[tokio::test]
 async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attempt() {
     let pool = test_pool().await;
 
@@ -2405,12 +2699,22 @@ states:
         &catalog_path,
         r#"
 artifacts:
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
 backend_profiles:
   code_writer_profile:
     provider: codex
+permission_profiles:
+  ORCH: {}
 contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
   implementation_self_assessment_v2:
     format: json
     required_fields:
@@ -2423,7 +2727,10 @@ contracts:
       - docs_impacted
 agents:
   - id: code_writer
+    system_role: lead
     backend_profile: code_writer_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     output_contract: implementation_self_assessment_v2
 "#,
     )
@@ -2545,12 +2852,22 @@ states:
         &catalog_path,
         r#"
 artifacts:
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
 backend_profiles:
   code_writer_profile:
     provider: codex
+permission_profiles:
+  ORCH: {}
 contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
   implementation_self_assessment_v2:
     format: json
     required_fields:
@@ -2563,7 +2880,10 @@ contracts:
       - docs_impacted
 agents:
   - id: code_writer
+    system_role: lead
     backend_profile: code_writer_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     output_contract: implementation_self_assessment_v2
 "#,
     )
@@ -3738,6 +4058,7 @@ async fn mcp_resolution_persistence_tests() {
 #[tokio::test]
 async fn xcode_broker_fail_closed_observation_is_persisted_from_acp_sink() {
     use acp::AcpRuntimeManager;
+    use domain::events::DomainEvent;
     use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservation};
     use engine::executor::BackgroundExecutor;
     use engine::orchestrator::Orchestrator;
@@ -3771,6 +4092,7 @@ mcp:
     stages::insert(&pool, &stage).await.unwrap();
 
     let events = event_bus::new_bus(64);
+    let mut event_rx = events.subscribe();
     let work_queue = WorkQueue::new(pool.clone());
     let orchestrator = Arc::new(Orchestrator::new(
         pool.clone(),
@@ -3782,7 +4104,7 @@ mcp:
         work_queue.clone(),
         orchestrator,
         Arc::new(AcpRuntimeManager::new()),
-        events,
+        events.clone(),
     );
     work_queue
         .enqueue(
@@ -3816,6 +4138,23 @@ mcp:
         error.to_string().contains("provider_http_mcp_unsupported"),
         "unexpected error: {error:#}"
     );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match event_rx.recv().await.unwrap() {
+                DomainEvent::StageStatusChanged {
+                    run_id: observed_run_id,
+                    stage_execution_id: observed_stage_execution_id,
+                    status,
+                } if observed_run_id == run_id && observed_stage_execution_id == stage_exec_id => {
+                    assert_eq!(status, StageStatus::Running);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("late Xcode observation append should notify stage subscribers");
 
     let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
         .await
@@ -5187,6 +5526,9 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "code_writer",
                 "provider": "claude",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "self-assessment",
                 "declared_outputs": [{
                     "output_name": "implementation_self_assessment",
                     "target_path": target_path.to_string_lossy(),
@@ -5453,7 +5795,28 @@ async fn blocked_implementation_assessment_synthesizes_release_hold_review_summa
     let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
     assert_eq!(
         updated.current_state.as_deref(),
-        Some("state_10_implementation_refined")
+        Some("state_11_manual_release")
+    );
+
+    orchestrator.advance_run(run_id).await.unwrap();
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(updated.status, RunStatus::WaitingApproval);
+
+    let release_stage = stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|stage| stage.stage_id == "state_11_manual_release")
+        .expect("non-code release blocker should create manual release gate stage");
+    assert_eq!(release_stage.status, StageStatus::WaitingApproval);
+
+    let release_approvals = approvals::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        release_approvals.iter().any(|approval| {
+            approval.stage_id == "state_11_manual_release"
+                && approval.decision == ApprovalDecision::Requested
+        }),
+        "non-code release blocker should request operator release approval"
     );
 
     let queued_invocations = work_items::list_by_run(&pool, run_id)
@@ -5663,8 +6026,19 @@ sys.exit(0)
         )
         .await
         .unwrap();
-    assert!(executor.process_next_item().await.unwrap());
-    assert!(executor.process_next_item().await.unwrap());
+    for _ in 0..8 {
+        let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+        if daemon_artifacts
+            .iter()
+            .any(|artifact| artifact.file_path.ends_with("second.json"))
+        {
+            break;
+        }
+        assert!(
+            executor.process_next_item().await.unwrap(),
+            "executor should process queued coordination or invoke work before second turn artifact appears"
+        );
+    }
 
     let generation_after = sessions::find_active_generation(&pool, &lineage.id)
         .await
@@ -5694,6 +6068,175 @@ sys.exit(0)
             .collect::<Vec<_>>()
     );
 
+    acp.close_session(&generation.id).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_agent_repairs_missing_required_output_in_same_live_session() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("contract-repair.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let output_path = tmp
+        .path()
+        .join(".chainworks/review/implementation-summary.json");
+    std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+
+    let script = tmp.path().join("acp_contract_repair_fixture.py");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+session_id = "contract-repair-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{"type":"text","text":"I forgot the required output."}]}}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+prompt_text = msg.get("params",{}).get("prompt",[{}])[0].get("text","")
+if "Output Contract Repair" not in prompt_text:
+    sys.exit(2)
+payload = {"status":"code_complete","open_blockers":0,"must_fix":[],"recommended_next_step":"continue"}
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{"type":"text","text":"<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>" + json.dumps(payload) + "<<<END_CHAINWORKS_OUTPUT>>>"}]}}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+if msg and msg.get("method") == "session/close":
+    sys.exit(0)
+sys.exit(0)
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "contract_repair_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("contract_repair_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "contract_repair_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "lead_orchestrator",
+                "provider": "claude",
+                "prompt": "aggregate implementation reviews",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "contract-repair",
+                "declared_outputs": [{
+                    "output_name": "implementation_review_summary",
+                    "target_path": output_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "implementation_review_summary_v1",
+                        "format": "json",
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "required_fields": ["status", "open_blockers", "must_fix", "recommended_next_step"]
+                    }
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let settled = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.status, StageStatus::Completed);
+    let output_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(output_json["status"], "code_complete");
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].status, AgentStatus::Completed);
+    let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, executions[0].id)
+        .await
+        .unwrap()
+        .expect("runtime facts should be persisted");
+    assert!(facts.valid_required_outputs);
+    assert_eq!(
+        facts.output_settlement,
+        domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution
+    );
+
+    let lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "contract-repair")
+            .await
+            .unwrap()
+            .expect("lineage should exist");
+    let generation = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should exist");
+    assert_eq!(generation.turn_count, 2);
     acp.close_session(&generation.id).await.unwrap();
 }
 
@@ -6353,7 +6896,7 @@ sys.exit(0)
 
     let running_exec = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: stage_exec_id,
+        stage_execution_id: Some(stage_exec_id),
         agent_id: "reuse-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -6380,6 +6923,10 @@ sys.exit(0)
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -6913,6 +7460,155 @@ sys.exit(0)
             .any(|artifact| artifact.file_path.ends_with("fresh.json")),
         "fresh artifact missing after missing-live-handle fallback"
     );
+}
+
+#[derive(Default)]
+struct ActivePromptCloseOnceAdapter {
+    attempts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
+    fn provider_name(&self) -> &str {
+        "active_prompt_close_once"
+    }
+
+    async fn execute(&self, req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            anyhow::bail!("ACP session closed during active prompt");
+        }
+        Ok(acp::ExecutionResult {
+            agent_execution_id: req
+                .agent_execution_id
+                .expect("test request should carry agent execution id"),
+            status: AgentStatus::Completed,
+            artifact_paths: Vec::new(),
+            discovered_artifacts: Vec::new(),
+            pre_prompt_expected_outputs: Vec::new(),
+            transcript_text: Some("recovered".into()),
+            cost_cents: None,
+            usage: None,
+            provider_session_id: Some("recovered-provider-session".into()),
+            reused_existing_session: false,
+            session_generation_id: req.session_generation_id.clone(),
+            mcp_observation: None,
+            actual_mcp_extensions: Vec::new(),
+            actual_mcp_runtime_ids: Vec::new(),
+            mcp_session_startup_latency_ms: None,
+            xcode_shim_warning_events: Vec::new(),
+            close_diagnostic: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt() {
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+    let workspace_root = tempfile::tempdir().unwrap();
+    let workspace_root = workspace_root.path().display().to_string();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "active_prompt_recovery_stage".into();
+    stage.started_at = now;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+        ActivePromptCloseOnceAdapter::default(),
+    )]));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("active_prompt_recovery_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "active_prompt_recovery_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "recovery-agent",
+                "provider": "active_prompt_close_once",
+                "prompt": "recover after active prompt close",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "recovery-family",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("InvokeAgent work item should exist after first attempt");
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Pending);
+    let requeued_payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    assert!(
+        requeued_payload.get("p058_claimed").is_none(),
+        "auto recovery must clear the failed preclaim so retry gets a new agent execution"
+    );
+    assert_eq!(
+        requeued_payload
+            .pointer("/acp_active_prompt_recovery/reason")
+            .and_then(|value| value.as_str()),
+        Some("active_prompt_transport_closed")
+    );
+
+    let executions_after_first = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions_after_first.len(), 1);
+    assert_eq!(executions_after_first[0].status, AgentStatus::Failed);
+
+    assert!(executor.process_next_item().await.unwrap());
+    let executions_after_second = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions_after_second.len(), 2);
+    assert!(
+        executions_after_second
+            .iter()
+            .any(|execution| execution.status == AgentStatus::Completed),
+        "second attempt should complete after automatic requeue"
+    );
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("InvokeAgent work item should exist after recovery");
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Completed);
 }
 
 #[cfg(unix)]
@@ -7886,6 +8582,15 @@ async fn test_post_approval_retry_requires_fresh_approval() {
         "retry must create exactly one fresh Requested approval record, got {}",
         fresh_requests.len()
     );
+    let pending_inbox = projections::list_pending_inbox_projection(&pool)
+        .await
+        .unwrap();
+    assert!(
+        pending_inbox
+            .iter()
+            .any(|row| row.id == fresh_requests[0].id.to_string()),
+        "fresh Requested approval must be visible in approval_inbox projection"
+    );
 
     // Run status must reflect the pending approval checkpoint.
     let refreshed_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
@@ -8689,6 +9394,11 @@ fn test_execution_request_carries_chainworks_meta_root() {
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
         xcode_shim_injection_signal: false,
         requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),
@@ -8831,4 +9541,398 @@ fn test_prompt_input_paths_point_to_per_run_meta_root() {
             resolved
         );
     }
+}
+
+// ── P017 Phase B: Lead mediation integration tests ──────────────────────
+
+/// P017 B1-005: Verify lead_conflict_mediations repo insert, find, and status
+/// update work end-to-end with both owner kinds.
+#[tokio::test]
+async fn p017_mediation_record_lifecycle() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: "med-001".to_string(),
+        run_id: "run-001".to_string(),
+        conflict_id: "conflict-001".to_string(),
+        conflict_fingerprint: "fp-001".to_string(),
+        lead_agent_id: "lead_agent".to_string(),
+        status: domain::mediation::LeadMediationStatus::Pending,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Queued for lead mediation".to_string()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    // Verify find_by_id
+    let found = db::repos::lead_conflict_mediations::find_by_id(&pool, "med-001")
+        .await
+        .expect("find_by_id")
+        .expect("should exist");
+    assert_eq!(
+        found.status,
+        domain::mediation::LeadMediationStatus::Pending
+    );
+    assert_eq!(found.lead_agent_id, "lead_agent");
+
+    // Verify find_active_for_conflict
+    let active =
+        db::repos::lead_conflict_mediations::find_active_for_conflict(&pool, "run-001", "fp-001")
+            .await
+            .expect("find_active_for_conflict");
+    assert!(active.is_some(), "should find active mediation");
+
+    // Verify list_by_run
+    let list = db::repos::lead_conflict_mediations::list_by_run(&pool, "run-001")
+        .await
+        .expect("list_by_run");
+    assert_eq!(list.len(), 1);
+
+    // Settle the mediation
+    let settlement_svc =
+        engine::mediation::settlement::MediationSettlementService::new(pool.clone());
+    settlement_svc
+        .settle_confirmed("med-001", now)
+        .await
+        .expect("settle_confirmed");
+
+    // Verify terminal status
+    let settled = db::repos::lead_conflict_mediations::find_by_id(&pool, "med-001")
+        .await
+        .expect("find settled")
+        .expect("should exist");
+    assert_eq!(
+        settled.status,
+        domain::mediation::LeadMediationStatus::Settled
+    );
+    assert_eq!(
+        settled.settlement_result.as_deref(),
+        Some("confirmed_by_operator")
+    );
+    assert!(settled.settled_at.is_some());
+
+    // Verify no longer active
+    let no_active =
+        db::repos::lead_conflict_mediations::find_active_for_conflict(&pool, "run-001", "fp-001")
+            .await
+            .expect("find_active after settlement");
+    assert!(
+        no_active.is_none(),
+        "settled mediation should not be active"
+    );
+}
+
+/// P017 B1-005: Verify lead_mediation_confirmations repo lifecycle including
+/// pending list, resolution, and deadline expiry.
+#[tokio::test]
+async fn p017_confirmation_lifecycle_and_expiry() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    // Insert a mediation record first (confirmations reference it)
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: "med-002".to_string(),
+        run_id: "run-002".to_string(),
+        conflict_id: "conflict-002".to_string(),
+        conflict_fingerprint: "fp-002".to_string(),
+        lead_agent_id: "lead_agent".to_string(),
+        status: domain::mediation::LeadMediationStatus::OperatorConfirmationRequired,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Awaiting operator confirmation".to_string()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: Some("conf-002".to_string()),
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    // Insert a pending confirmation
+    let confirmation = domain::mediation::LeadMediationConfirmation {
+        id: "conf-002".to_string(),
+        mediation_record_id: "med-002".to_string(),
+        run_id: "run-002".to_string(),
+        conflict_id: "conflict-002".to_string(),
+        conflict_fingerprint: "fp-002".to_string(),
+        status: domain::mediation::MediationConfirmationStatus::Pending,
+        suggested_action: Some("confirm_lead_resolution".to_string()),
+        requested_at: now,
+        deadline_at: Some(now + chrono::Duration::hours(1)),
+        readback_ref: Some("report://run-002/mediation/med-002".to_string()),
+        idempotency_scope_key: Some("scope-002".to_string()),
+        resolved_at: None,
+        resolved_by_principal_id: None,
+        resolution_decision: None,
+        resolution_comment: None,
+    };
+    db::repos::lead_mediation_confirmations::insert(&pool, &confirmation)
+        .await
+        .expect("insert confirmation");
+
+    // Verify list_pending returns the confirmation
+    let pending = db::repos::lead_mediation_confirmations::list_pending(&pool)
+        .await
+        .expect("list_pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "conf-002");
+
+    // Resolve the confirmation
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        db::repos::lead_mediation_confirmations::resolve_tx(
+            &mut tx,
+            "conf-002",
+            "confirm",
+            Some("Approved by operator"),
+            "principal-001",
+            now,
+        )
+        .await
+        .expect("resolve confirmation");
+        tx.commit().await.expect("commit");
+    }
+
+    // Verify resolved confirmation is no longer in pending list
+    let pending_after = db::repos::lead_mediation_confirmations::list_pending(&pool)
+        .await
+        .expect("list_pending after resolve");
+    assert!(
+        pending_after.is_empty(),
+        "resolved should not be in pending"
+    );
+
+    // Test expiry: insert a confirmation with a past deadline
+    let past = now - chrono::Duration::hours(2);
+    let expired_conf = domain::mediation::LeadMediationConfirmation {
+        id: "conf-expired".to_string(),
+        mediation_record_id: "med-002".to_string(),
+        run_id: "run-002".to_string(),
+        conflict_id: "conflict-002".to_string(),
+        conflict_fingerprint: "fp-002".to_string(),
+        status: domain::mediation::MediationConfirmationStatus::Pending,
+        suggested_action: Some("confirm_lead_resolution".to_string()),
+        requested_at: past,
+        deadline_at: Some(past + chrono::Duration::minutes(30)),
+        readback_ref: None,
+        idempotency_scope_key: Some("scope-expired".to_string()),
+        resolved_at: None,
+        resolved_by_principal_id: None,
+        resolution_decision: None,
+        resolution_comment: None,
+    };
+    db::repos::lead_mediation_confirmations::insert(&pool, &expired_conf)
+        .await
+        .expect("insert expired confirmation");
+
+    // Run expiry using the atomic find + expire_one_tx pattern (MF-PRE-ENABLE-001).
+    let candidates =
+        db::repos::lead_mediation_confirmations::find_pending_past_deadline(&pool, now)
+            .await
+            .expect("find_pending_past_deadline");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].id, "conf-expired");
+
+    // Expire atomically inside a transaction.
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        let rows =
+            db::repos::lead_mediation_confirmations::expire_one_tx(&mut tx, &candidates[0].id, now)
+                .await
+                .expect("expire_one_tx");
+        assert_eq!(rows, 1, "should expire exactly one row");
+        tx.commit().await.expect("commit");
+    }
+
+    // Verify expired confirmation is no longer pending
+    let pending_final = db::repos::lead_mediation_confirmations::list_pending(&pool)
+        .await
+        .expect("list_pending after expiry");
+    assert!(
+        pending_final.is_empty(),
+        "expired should not be in pending list"
+    );
+}
+
+/// P017 B1-005: Verify PhaseBLeadResolver fail-closed behavior with multiple
+/// entries and ambiguous matches.
+#[test]
+fn p017_lead_resolver_ambiguous_match_fails_closed() {
+    use engine::mediation::lead_resolver::*;
+
+    let map = PhaseBLeadResolverMap {
+        schema_version: "phase_b_lead_resolver_v1".to_string(),
+        mapping_version: "1".to_string(),
+        entries: vec![
+            LeadResolverEntry {
+                workflow_source_path: "workflows/a.yaml".to_string(),
+                catalog_source_path: "agents/a.yaml".to_string(),
+                lead_agent_id: "lead_1".to_string(),
+                lead_resolution_contract_ref: "contract_1".to_string(),
+                mapping_owner: "test".to_string(),
+                entry_attested_by: "test".to_string(),
+                reviewed_at: "2026-04-24".to_string(),
+                phase_c_removal_condition: "Phase C authoritative".to_string(),
+            },
+            LeadResolverEntry {
+                workflow_source_path: "workflows/a.yaml".to_string(),
+                catalog_source_path: "agents/a.yaml".to_string(),
+                lead_agent_id: "lead_2".to_string(),
+                lead_resolution_contract_ref: "contract_2".to_string(),
+                mapping_owner: "test".to_string(),
+                entry_attested_by: "test".to_string(),
+                reviewed_at: "2026-04-24".to_string(),
+                phase_c_removal_condition: "Phase C authoritative".to_string(),
+            },
+        ],
+        mapping_owner: "test".to_string(),
+        entry_attestation_rule: "Test".to_string(),
+        staleness_review_trigger: "30 days".to_string(),
+        fail_closed_behavior: "Block".to_string(),
+        upgrade_and_removal_criteria: "Phase C".to_string(),
+    };
+
+    let resolver = PhaseBLeadResolver::from_map(map);
+    match resolver.resolve("workflows/a.yaml", "agents/a.yaml") {
+        LeadResolution::FailedClosed { reason } => {
+            assert!(
+                reason.contains("Ambiguous"),
+                "Expected ambiguous match failure, got: {reason}"
+            );
+        }
+        LeadResolution::Resolved { .. } => {
+            panic!("Should fail closed on ambiguous match");
+        }
+    }
+}
+
+#[test]
+fn p017_phase_b_checked_in_lead_resolver_resolves_bundled_workflows() {
+    use engine::mediation::lead_resolver::*;
+
+    let resolver_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json");
+    let resolver = PhaseBLeadResolver::load_from_file(&resolver_path.to_string_lossy())
+        .expect("checked-in Phase B resolver loads");
+
+    for workflow_path in [
+        "examples/workflows/full-mvp-live.yaml",
+        "examples/workflows/workflow.yaml",
+        "examples/workflows/proposal-loop-live.yaml",
+    ] {
+        match resolver.resolve(workflow_path, "examples/agents/agents.yaml") {
+            LeadResolution::Resolved { lead_agent_id, .. } => {
+                assert_eq!(lead_agent_id, "lead_orchestrator");
+            }
+            LeadResolution::FailedClosed { reason } => {
+                panic!("{workflow_path} should resolve exactly one lead: {reason}");
+            }
+        }
+    }
+}
+
+/// P017 B1-005: Verify WorkflowConflictStatus::is_terminal_or_operator
+/// correctly classifies all status variants.
+#[test]
+fn p017_conflict_status_terminal_or_operator_classification() {
+    use domain::workflow_conflict::WorkflowConflictStatus;
+
+    // Unresolved is the only status eligible for mediation initiation
+    assert!(
+        !WorkflowConflictStatus::Unresolved.is_terminal_or_operator(),
+        "Unresolved should be eligible for mediation"
+    );
+
+    // All others should be ineligible
+    assert!(WorkflowConflictStatus::LeadMediationPending.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::OperatorConfirmationRequired.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::Resolved.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::Superseded.is_terminal_or_operator());
+    assert!(WorkflowConflictStatus::TerminalUnverifiable.is_terminal_or_operator());
+}
+
+/// P017 B2-003: Verify MediationSettlementService settle_expired correctly
+/// transitions mediation to terminal_unverifiable with proper settlement_result.
+#[tokio::test]
+async fn p017_settlement_service_expire_path() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: "med-expire".to_string(),
+        run_id: "run-expire".to_string(),
+        conflict_id: "conflict-expire".to_string(),
+        conflict_fingerprint: "fp-expire".to_string(),
+        lead_agent_id: "lead_agent".to_string(),
+        status: domain::mediation::LeadMediationStatus::OperatorConfirmationRequired,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Awaiting confirmation".to_string()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    let settlement_svc =
+        engine::mediation::settlement::MediationSettlementService::new(pool.clone());
+    let outcome = settlement_svc
+        .settle_expired("med-expire", now)
+        .await
+        .expect("settle_expired");
+
+    assert_eq!(outcome.settlement_result, "confirmation_deadline_expired");
+    assert_eq!(
+        outcome.recovery_action.as_deref(),
+        Some("clone_or_manual_fallback")
+    );
+
+    let settled = db::repos::lead_conflict_mediations::find_by_id(&pool, "med-expire")
+        .await
+        .expect("find")
+        .expect("should exist");
+    assert_eq!(
+        settled.status,
+        domain::mediation::LeadMediationStatus::TerminalUnverifiable
+    );
+    assert!(settled.settled_at.is_some());
 }

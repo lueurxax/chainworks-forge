@@ -285,7 +285,7 @@ fn make_session_environment(runtime_home: &Path) -> Vec<(String, String)> {
             });
     }
 
-    let path = format!("{}:{}", bin, std::env::var("PATH").unwrap_or_default());
+    let path = format!("{}:{}", bin, super::default_provider_path_value());
     let toolchain_home = toolchain_root.to_string_lossy().to_string();
     let tmp = tmp.to_string_lossy().to_string();
     let rustup_home = rustup_home.to_string_lossy().to_string();
@@ -462,5 +462,31 @@ multi_agent = true
         assert!(std::path::Path::new(value("RUSTUP_HOME")).is_dir());
         assert!(std::path::Path::new(value("CARGO_HOME")).is_dir());
         assert!(std::path::Path::new(value("CARGO_TARGET_DIR")).is_dir());
+    }
+
+    #[test]
+    fn session_environment_adds_provider_bins_when_daemon_path_is_minimal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_home = tmp.path().join(".forge-codex-acp").join("session-1");
+        std::fs::create_dir_all(&runtime_home).unwrap();
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+
+        let env = make_session_environment(&runtime_home);
+
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let path = env
+            .iter()
+            .find_map(|(name, value)| (name == "PATH").then_some(value.as_str()))
+            .expect("PATH should exist");
+
+        assert!(
+            path.contains("/opt/homebrew/bin"),
+            "PATH should include Homebrew bin for node-backed provider shims: {path}"
+        );
     }
 }

@@ -5,13 +5,16 @@ use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, ideas, runs, stages, workflow_conflicts,
+    approvals, artifact_contracts, artifacts, ideas, lead_conflict_mediations, projections, runs,
+    stages, workflow_conflicts,
 };
 use db::work_item::WorkItemKind;
 use domain::agent::AgentOutputSettlement;
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
-use domain::artifact_contracts::ImplementationSelfAssessmentStatus;
+use domain::artifact_contracts::{
+    contract_status_allowed_values, ImplementationSelfAssessmentStatus,
+};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, ArtifactId, RunId};
 use domain::run::RunStatus;
@@ -596,6 +599,9 @@ impl Orchestrator {
                                     status: RunStatus::WaitingApproval,
                                 });
                             }
+                            projections::rebuild_run_summary(&self.pool, run_id).await?;
+                            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+                            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
                             return Ok(());
                         }
                         // Non-manual-gate Pending stages are left to fall
@@ -684,6 +690,9 @@ impl Orchestrator {
                     status: RunStatus::WaitingApproval,
                 });
             }
+            projections::rebuild_run_summary(&self.pool, run_id).await?;
+            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
             return Ok(());
         }
 
@@ -2029,17 +2038,57 @@ impl Orchestrator {
                 });
             }
         }
+        // P017 Phase B: attempt mediation initiation for eligible conflicts.
+        let mut effective_status = stored.status.clone();
+        if crate::mediation::feature_flag::is_phase_b_mediation_enabled()
+            && !stored.status.is_terminal_or_operator()
+        {
+            match self
+                .try_initiate_mediation(&stored, run_id, current_state_id, now)
+                .await
+            {
+                Ok(Some(mediation_id)) => {
+                    effective_status = WorkflowConflictStatus::LeadMediationPending;
+                    info!(
+                        run_id = %run_id,
+                        conflict_id = %stored.conflict_id,
+                        mediation_id = %mediation_id,
+                        "Phase B mediation initiated for conflict"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        run_id = %run_id,
+                        conflict_id = %stored.conflict_id,
+                        "Phase B lead resolution failed closed; no mediation initiated"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run_id,
+                        conflict_id = %stored.conflict_id,
+                        error = %e,
+                        "Phase B mediation initiation failed; conflict remains unresolved"
+                    );
+                }
+            }
+        }
+
         self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
             schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
             run_id: run_id.to_string(),
             current_state_id: current_state_id.to_string(),
-            cursor_status: if stored.status == WorkflowConflictStatus::TerminalUnverifiable {
+            cursor_status: if effective_status == WorkflowConflictStatus::TerminalUnverifiable {
                 "terminal_unverifiable".to_string()
+            } else if effective_status == WorkflowConflictStatus::LeadMediationPending {
+                "lead_mediation_pending".to_string()
             } else {
                 "awaiting_conflict_resolution".to_string()
             },
-            resume_policy: if stored.status == WorkflowConflictStatus::TerminalUnverifiable {
+            resume_policy: if effective_status == WorkflowConflictStatus::TerminalUnverifiable {
                 "terminal_failure".to_string()
+            } else if effective_status == WorkflowConflictStatus::LeadMediationPending {
+                "await_mediation_settlement".to_string()
             } else {
                 "await_conflict_resolution".to_string()
             },
@@ -2052,6 +2101,299 @@ impl Orchestrator {
             updated_at: stored.updated_at,
         })
         .await?;
+        Ok(())
+    }
+
+    /// P017 Phase B: Attempt to initiate lead mediation for an eligible conflict.
+    /// Returns Some(mediation_id) if mediation was created, None if lead resolution
+    /// failed closed (which is a normal, expected outcome).
+    async fn try_initiate_mediation(
+        &self,
+        conflict: &WorkflowConflictRecord,
+        run_id: RunId,
+        _current_state_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>> {
+        use crate::mediation::lead_resolver::{LeadResolution, PhaseBLeadResolver};
+
+        // MF-PRE-ENABLE-002: Wrap find-active, insert, and update-pointer in a
+        // single IMMEDIATE transaction to prevent orphaned mediation records.
+        // Lead resolution (file I/O) happens outside the tx since it's read-only.
+
+        // Attempt Phase B lead resolution from the versioned compatibility map.
+        // If the map file doesn't exist or no match is found, resolution fails closed.
+        let resolver_path = "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json";
+        let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(
+                    run_id = %run_id,
+                    error = %e,
+                    "Phase B lead resolver map not available; mediation cannot start"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Resolve using the run's workflow and catalog paths.
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+        let workflow_path = run.workflow_yaml_path.as_deref().unwrap_or("");
+        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or("");
+
+        let lead_agent_id = match resolver.resolve(workflow_path, catalog_path) {
+            LeadResolution::Resolved { lead_agent_id, .. } => lead_agent_id,
+            LeadResolution::FailedClosed { reason } => {
+                debug!(
+                    run_id = %run_id,
+                    conflict_id = %conflict.conflict_id,
+                    reason = %reason,
+                    "Phase B lead resolution failed closed"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Begin IMMEDIATE transaction for the idempotency check + insert + pointer update.
+        let mut tx =
+            db::pool::begin_immediate_with_retry(&self.pool, "mediation.try_initiate").await?;
+
+        // Check for existing active mediation for this conflict fingerprint (idempotent).
+        if let Some(existing) = lead_conflict_mediations::find_active_for_conflict_tx(
+            &mut tx,
+            &run_id.to_string(),
+            &conflict.conflict_fingerprint,
+        )
+        .await?
+        {
+            // Existing active mediation — tx not needed, drop it.
+            return Ok(Some(existing.id));
+        }
+
+        // Create the mediation record inside the transaction.
+        let mediation_id = uuid::Uuid::new_v4().to_string();
+        let mediation = domain::mediation::LeadConflictMediationRecord {
+            id: mediation_id.clone(),
+            run_id: run_id.to_string(),
+            conflict_id: conflict.conflict_id.clone(),
+            conflict_fingerprint: conflict.conflict_fingerprint.clone(),
+            lead_agent_id: lead_agent_id.clone(),
+            status: domain::mediation::LeadMediationStatus::Pending,
+            settlement_result: None,
+            recovery_action: None,
+            chosen_action: None,
+            chosen_next_state_id: None,
+            chosen_next_state_label: None,
+            operator_rationale: None,
+            sanitized_progress: Some("Queued for lead mediation".to_string()),
+            validation_errors_json: None,
+            cost_summary_json: None,
+            metric_event_id: None,
+            superseded_by_event_ref: None,
+            agent_execution_id: None,
+            confirmation_subject_id: None,
+            created_at: now,
+            updated_at: now,
+            settled_at: None,
+        };
+        lead_conflict_mediations::insert_tx(&mut tx, &mediation).await?;
+
+        // Update conflict record with mediation pointer and lead_mediation_pending status.
+        workflow_conflicts::update_mediation_pointer_tx(
+            &mut tx,
+            &conflict.conflict_id,
+            &lead_agent_id,
+            &mediation_id,
+            WorkflowConflictStatus::LeadMediationPending,
+            now,
+        )
+        .await?;
+
+        // Commit the atomic find+insert+pointer-update.
+        tx.commit().await?;
+
+        // Enqueue InvokeAgent work item for the lead agent with owner-aware payload.
+        // MC-002: If enqueue fails after the mediation record was committed,
+        // transition the orphaned Pending mediation to terminal_unverifiable
+        // so it doesn't permanently block new mediation for the same fingerprint.
+        if let Err(enqueue_err) = self
+            .enqueue_mediation_invoke_agent(run_id, &run, &mediation_id, conflict, &lead_agent_id)
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id,
+                mediation_id = %mediation_id,
+                error = %enqueue_err,
+                "Failed to enqueue mediation work item; transitioning orphaned mediation to terminal"
+            );
+            // Best-effort recovery: mark the orphaned mediation as terminal.
+            let recovery_now = chrono::Utc::now();
+            if let Ok(mut recovery_tx) =
+                db::pool::begin_immediate_with_retry(&self.pool, "mediation.orphan_recovery").await
+            {
+                let _ = db::repos::lead_conflict_mediations::update_status_tx(
+                    &mut recovery_tx,
+                    &mediation_id,
+                    "terminal_unverifiable",
+                    Some("enqueue_failure"),
+                    Some("clone_or_manual_fallback"),
+                    recovery_now,
+                )
+                .await;
+                let _ = recovery_tx.commit().await;
+            }
+            return Err(enqueue_err);
+        }
+
+        Ok(Some(mediation_id))
+    }
+
+    /// P017 Phase B: Enqueue an InvokeAgent work item for the resolved lead agent,
+    /// with owner_kind=lead_conflict_mediation and the mediation record as owner_id.
+    async fn enqueue_mediation_invoke_agent(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        mediation_id: &str,
+        conflict: &WorkflowConflictRecord,
+        lead_agent_id: &str,
+    ) -> Result<()> {
+        // Look up the lead agent's config from the catalog.
+        let catalog_path = run
+            .agent_catalog_yaml_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Run has no agent catalog path"))?;
+        let catalog = workflow::catalog::load(catalog_path)?;
+        let agents = catalog
+            .agents
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Agent catalog has no agents list"))?;
+        let lead_agent = agents
+            .iter()
+            .find(|a| a.id == lead_agent_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Lead agent '{}' not found in catalog", lead_agent_id)
+            })?;
+
+        // Resolve provider from backend profile or agent entry.
+        let provider = resolve_agent_provider(lead_agent, &catalog);
+        let model = resolve_agent_model(lead_agent, &catalog);
+        let effort = resolve_agent_effort(lead_agent, &catalog);
+        let lead_resolution_contract_id = lead_agent
+            .lead_resolution_contract
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lead agent '{}' missing lead_resolution_contract",
+                    lead_agent_id
+                )
+            })?;
+        let lead_resolution_contract = catalog
+            .contracts
+            .as_ref()
+            .and_then(|contracts| contracts.get(lead_resolution_contract_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lead agent '{}' references missing lead_resolution_contract '{}'",
+                    lead_agent_id,
+                    lead_resolution_contract_id
+                )
+            })?;
+        let lead_resolution_target_path = catalog
+            .artifacts
+            .as_ref()
+            .and_then(|artifacts| artifacts.get("lead_resolution"))
+            .cloned()
+            .unwrap_or_else(|| {
+                "${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json".to_string()
+            });
+        let lead_resolution_output_schema = serde_json::json!({
+            "contract_id": lead_resolution_contract_id,
+            "format": lead_resolution_contract
+                .format
+                .clone()
+                .unwrap_or_else(|| "json".to_string()),
+            "human_format": lead_resolution_contract.human_format.clone(),
+            "machine_format": lead_resolution_contract.machine_format.clone(),
+            "validation_mode": lead_resolution_contract.validation_mode.clone(),
+            "normalized_artifact_name": lead_resolution_contract.normalized_artifact_name.clone(),
+            "raw_artifact_name": lead_resolution_contract.raw_artifact_name.clone(),
+            "required_fields": lead_resolution_contract.required_fields.clone(),
+        });
+        let declared_outputs = serde_json::json!([{
+            "output_name": "lead_resolution",
+            "target_path": lead_resolution_target_path,
+            "schema": lead_resolution_output_schema,
+            "reuse_policy": serde_json::Value::Null,
+            "companion_output_name": serde_json::Value::Null,
+            "companion_path": serde_json::Value::Null,
+        }]);
+
+        let prompt = format!(
+            "You are the system lead agent mediating workflow conflict {}. \
+             Conflict reason: {}. Current state: {}. \
+             Analyze the conflict and propose a resolution. Return the required \
+             LeadResolutionContract as CHAINWORKS_OUTPUT for lead_resolution.",
+            conflict.conflict_id, conflict.reason, conflict.current_state_id,
+        );
+
+        let work_item_id = format!("p017-mediation:{}:0", mediation_id);
+        self.work_queue
+            .enqueue_with_id(
+                work_item_id,
+                WorkItemKind::InvokeAgent,
+                Some(run_id),
+                Some(conflict.current_state_id.clone()),
+                serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": conflict.current_state_id,
+                    "stage_execution_id": serde_json::Value::Null,
+                    "task_name": format!("mediation_{}", mediation_id),
+                    "task_inputs": Vec::<String>::new(),
+                    "task_outputs": ["lead_resolution"],
+                    "declared_outputs": declared_outputs,
+                    "agent_id": lead_agent_id,
+                    "provider": provider,
+                    "model": model,
+                    "effort": effort,
+                    "output_contract": lead_resolution_contract_id,
+                    "prompt": prompt,
+                    "task_index": 0,
+                    "total_tasks": 1,
+                    // P017: Owner-aware execution identity fields.
+                    "owner_kind": "lead_conflict_mediation",
+                    "owner_id": mediation_id,
+                    "origin_stage_id": conflict.current_state_id,
+                    "origin_stage_execution_id": conflict.stage_execution_id,
+                    "mediation_record_id": mediation_id,
+                    "conflict_fingerprint": conflict.conflict_fingerprint,
+                }),
+            )
+            .await?;
+
+        // Update mediation status to queued.
+        let now = chrono::Utc::now();
+        let mut tx =
+            db::pool::begin_immediate_with_retry(&self.pool, "mediation.update_status_queued")
+                .await?;
+        db::repos::lead_conflict_mediations::update_status_tx(
+            &mut tx,
+            mediation_id,
+            "queued",
+            None,
+            None,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        info!(
+            run_id = %run_id,
+            mediation_id = %mediation_id,
+            lead_agent_id = %lead_agent_id,
+            "Enqueued lead agent invocation for mediation"
+        );
         Ok(())
     }
 
@@ -2869,6 +3211,9 @@ impl Orchestrator {
         let summary_json = serde_json::to_value(&active.summary).ok()?;
         if field_name == "seemingly_complete" {
             return extract_json_field(&summary_json, "implementation_complete");
+        }
+        if field_name == "blocking_remaining_code_tasks" {
+            return extract_json_field(&summary_json, "blocking_remaining_code_task_count");
         }
         extract_json_field(&summary_json, field_name)
     }
@@ -3840,6 +4185,18 @@ fn build_task_prompt(
             for field in &schema.required_fields {
                 parts.push(format!("- `{}`", field));
             }
+            if schema.required_fields.iter().any(|field| field == "status") {
+                if let Some(allowed_values) = contract_status_allowed_values(&schema.contract_id) {
+                    parts.push(format!(
+                        "Allowed values for `status`: {}.",
+                        allowed_values
+                            .iter()
+                            .map(|value| format!("`{value}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
             if schema.contract_id == "implementation_self_assessment_v2" {
                 parts.push(String::from(
                     "Required nested shapes for `implementation_self_assessment_v2`:\n\
@@ -3910,6 +4267,43 @@ fn effective_worktree_strategy_for_task(task: &workflow::plan::CompiledTask) -> 
     task.agent.worktree_strategy.clone().or_else(|| {
         task_reads_implementation_worktree(task).then_some("shared_implementation_worktree".into())
     })
+}
+
+/// P017: Resolve the provider for an agent entry from its backend profile.
+fn resolve_agent_provider(
+    agent: &workflow::catalog::AgentEntry,
+    catalog: &workflow::catalog::AgentCatalogFile,
+) -> String {
+    catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&agent.backend_profile))
+        .map(|bp| bp.provider.clone())
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// P017: Resolve the model for an agent entry from its backend profile.
+fn resolve_agent_model(
+    agent: &workflow::catalog::AgentEntry,
+    catalog: &workflow::catalog::AgentCatalogFile,
+) -> Option<String> {
+    catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&agent.backend_profile))
+        .and_then(|bp| bp.model.clone())
+}
+
+/// P017: Resolve the effort for an agent entry from its backend profile.
+fn resolve_agent_effort(
+    agent: &workflow::catalog::AgentEntry,
+    catalog: &workflow::catalog::AgentCatalogFile,
+) -> Option<String> {
+    catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&agent.backend_profile))
+        .and_then(|bp| bp.effort.clone())
 }
 
 fn task_reads_implementation_worktree(task: &workflow::plan::CompiledTask) -> bool {
@@ -4506,6 +4900,100 @@ mod tests {
             declared.target_path,
             format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json")
         );
+    }
+
+    #[test]
+    fn implementation_review_prompts_include_allowed_status_enums_for_each_role() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let mut plan = test_plan();
+        let fixtures = [
+            (
+                "proposal_implementation_auditor",
+                "audit_report",
+                "audit_report_v1",
+                vec!["implemented", "needs_code_fixes", "invalid", "unknown"],
+            ),
+            (
+                "security_checker",
+                "security_report",
+                "security_report_v1",
+                vec!["pass", "block", "invalid", "unknown"],
+            ),
+            (
+                "docs_guardian",
+                "docs_report",
+                "docs_report_v1",
+                vec!["pass", "not_needed", "block", "invalid", "unknown"],
+            ),
+            (
+                "prepush_code_reviewer",
+                "prepush_review_report",
+                "prepush_review_v1",
+                vec!["pass", "block", "invalid", "unknown"],
+            ),
+            (
+                "lead_orchestrator",
+                "implementation_review_summary",
+                "implementation_review_summary_v1",
+                vec![
+                    "code_complete",
+                    "needs_code_fixes",
+                    "release_evidence_blocked",
+                    "invalid",
+                ],
+            ),
+            (
+                "code_writer",
+                "implementation_self_assessment",
+                "implementation_self_assessment_v2",
+                vec![
+                    "complete",
+                    "needs_code_fixes",
+                    "blocked",
+                    "handoff_required",
+                    "unknown",
+                    "invalid",
+                ],
+            ),
+        ];
+
+        for (agent_id, output_name, contract_id, allowed_values) in fixtures {
+            plan.artifact_paths.insert(
+                output_name.to_string(),
+                format!("${{CHAINWORKS_META_ROOT:-.chainworks}}/{output_name}.json"),
+            );
+            let mut task = reviewer_task();
+            task.agent.agent_id = agent_id.to_string();
+            task.agent.output_contract = Some(contract_id.to_string());
+            task.outputs = vec![output_name.to_string()];
+            task.output_schemas.clear();
+            task.output_schemas.insert(
+                output_name.to_string(),
+                OutputSchema {
+                    contract_id: contract_id.to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: Some(output_name.to_string()),
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string()],
+                },
+            );
+
+            let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+            assert!(
+                prompt.contains("Allowed values for `status`:"),
+                "{agent_id} prompt should state allowed status values"
+            );
+            for allowed in allowed_values {
+                assert!(
+                    prompt.contains(&format!("`{allowed}`")),
+                    "{agent_id} prompt should include canonical status `{allowed}`"
+                );
+            }
+        }
     }
 
     #[test]

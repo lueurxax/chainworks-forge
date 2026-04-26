@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::approval::ApprovalDecision;
 use crate::ids::{ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use crate::lifecycle::DaemonStatus;
+use crate::mediation::MediationConfirmationDecision;
 use crate::run::RunStatus;
 use crate::stage::StageStatus;
 
@@ -49,6 +50,13 @@ pub enum DomainEvent {
     /// GraphQL subscription can push the updated snapshot.
     DaemonStatusChanged {
         status: DaemonStatus,
+    },
+    /// P017 Phase B: Lead mediation confirmation resolved.
+    MediationConfirmationResolved {
+        run_id: RunId,
+        mediation_record_id: String,
+        confirmation_subject_id: String,
+        decision: MediationConfirmationDecision,
     },
     /// Durable scheduler backpressure notification changed (P061).
     /// Payload mirrors the operator readback shape so GraphQL and MCP can

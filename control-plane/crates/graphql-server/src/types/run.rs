@@ -4,6 +4,7 @@ use domain::artifact_contracts::{
     HandoffTaskSummary, ImplementationSelfAssessmentSummary, RemainingCodeTaskSummary,
     TargetStageSummary, ValidationIssue,
 };
+use domain::mediation::LeadConflictMediationRecord;
 use domain::run::Run;
 use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
@@ -190,6 +191,69 @@ pub struct GqlWorkflowConflict {
     pub resolution_record_json: Option<Json<serde_json::Value>>,
     pub terminal_failure_reason: Option<String>,
     pub diagnostic_redaction_tier: String,
+    /// P017 Phase B: Lead mediation readback (read-only, no mutations).
+    pub lead_mediation: Option<GqlLeadMediation>,
+}
+
+/// P017 Phase B: Read-only mediation readback projected from the lead_conflict_mediations table.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlLeadMediation {
+    pub id: ID,
+    pub conflict_id: ID,
+    pub lead_agent_id: String,
+    pub status: String,
+    pub resolution_mode: Option<String>,
+    pub chosen_action: Option<String>,
+    pub chosen_next_state_id: Option<String>,
+    pub chosen_next_state_label: Option<String>,
+    pub sanitized_progress: Option<String>,
+    pub status_updates: Vec<GqlLeadMediationStatusUpdate>,
+    pub validation_errors: Option<Json<serde_json::Value>>,
+    pub confirmation_subject_id: Option<String>,
+    pub superseded_by_event_ref: Option<String>,
+    pub cost_summary: Option<Json<serde_json::Value>>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlLeadMediationStatusUpdate {
+    pub status: String,
+    pub sanitized_progress: Option<String>,
+    pub updated_at: String,
+    pub attempt_number: i32,
+}
+
+impl From<&LeadConflictMediationRecord> for GqlLeadMediation {
+    fn from(record: &LeadConflictMediationRecord) -> Self {
+        GqlLeadMediation {
+            id: ID(record.id.clone()),
+            conflict_id: ID(record.conflict_id.clone()),
+            lead_agent_id: record.lead_agent_id.clone(),
+            status: record.status.to_string(),
+            resolution_mode: domain::mediation::derive_resolution_mode(record),
+            chosen_action: record.chosen_action.clone(),
+            chosen_next_state_id: record.chosen_next_state_id.clone(),
+            chosen_next_state_label: record.chosen_next_state_label.clone(),
+            sanitized_progress: record.sanitized_progress.clone(),
+            status_updates: vec![GqlLeadMediationStatusUpdate {
+                status: record.status.to_string(),
+                sanitized_progress: record.sanitized_progress.clone(),
+                updated_at: record.updated_at.to_rfc3339(),
+                attempt_number: 1,
+            }],
+            validation_errors: record
+                .validation_errors_json
+                .as_ref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .map(Json),
+            confirmation_subject_id: record.confirmation_subject_id.clone(),
+            superseded_by_event_ref: record.superseded_by_event_ref.clone(),
+            cost_summary: record
+                .cost_summary_json
+                .as_ref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .map(Json),
+        }
+    }
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -265,6 +329,7 @@ impl From<WorkflowConflictRecord> for GqlWorkflowConflict {
             resolution_record_json: record.resolution_record_json.map(Json),
             terminal_failure_reason: record.terminal_failure_reason,
             diagnostic_redaction_tier: record.diagnostic_redaction_tier,
+            lead_mediation: None, // Populated by enrichment when mediation_record_id is present
         }
     }
 }

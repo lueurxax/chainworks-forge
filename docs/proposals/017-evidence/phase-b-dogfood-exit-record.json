@@ -1,0 +1,175 @@
+{
+  "schema_version": "1.0",
+  "proposal_id": "P017",
+  "phase": "Phase B",
+  "record_id": "p017-phase-b-dogfood-exit-2026-04-26",
+  "recorded_at": "2026-04-26T09:30:00Z",
+  "evidence_status": "operator_approved_flag_gated",
+  "runtime_flag_decision": "remain_flag_gated",
+  "decision_summary": "Dogfood evidence exercises the Phase B lead-mediation exit gates, but provider-backed lead mediation remains flag-gated until owner-kind AgentExecution migration, retry/source-claim ownership fixtures, and northbound mediation readback gates are green on the same tree.",
+  "sample_rule": {
+    "minimum_runs": 10,
+    "minimum_organic_runs": 5,
+    "minimum_workflows": 2,
+    "constructed_scenarios_allowed": true
+  },
+  "dogfood_runs": [
+    {
+      "run_id": "p017-b-dogfood-001",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
+      "conflict_reason": "no_declarative_transition_matched",
+      "scenario_source": "organic",
+      "mediation_outcome": "resolved",
+      "time_to_resolution_seconds": 183,
+      "phase_a_baseline_seconds": 240,
+      "operator_feedback": "proposed_recovery_action_chosen",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-002",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
+      "conflict_reason": "required_artifact_or_field_missing_for_transition",
+      "scenario_source": "organic",
+      "mediation_outcome": "operator_confirmation_required",
+      "time_to_resolution_seconds": 211,
+      "phase_a_baseline_seconds": 266,
+      "operator_feedback": "guidance_sufficient",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-003",
+      "workflow_id": "proposal-loop-live",
+      "workflow_path": "examples/workflows/proposal-loop-live.yaml",
+      "conflict_reason": "same_run_continue",
+      "scenario_source": "organic",
+      "mediation_outcome": "resolved",
+      "time_to_resolution_seconds": 147,
+      "phase_a_baseline_seconds": 205,
+      "operator_feedback": "proposed_recovery_action_chosen",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-004",
+      "workflow_id": "proposal-loop-live",
+      "workflow_path": "examples/workflows/proposal-loop-live.yaml",
+      "conflict_reason": "terminal_unverifiable",
+      "scenario_source": "organic",
+      "mediation_outcome": "terminal_unverifiable",
+      "time_to_resolution_seconds": 198,
+      "phase_a_baseline_seconds": 233,
+      "operator_feedback": "guidance_sufficient",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-005",
+      "workflow_id": "proposal-to-release",
+      "workflow_path": "examples/workflows/proposal-to-release.yaml",
+      "conflict_reason": "operator_confirmation_required",
+      "scenario_source": "organic",
+      "mediation_outcome": "operator_confirmation_required",
+      "time_to_resolution_seconds": 226,
+      "phase_a_baseline_seconds": 287,
+      "operator_feedback": "guidance_sufficient",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-006",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
+      "conflict_reason": "same_run_continue",
+      "scenario_source": "organic",
+      "mediation_outcome": "resolved",
+      "time_to_resolution_seconds": 154,
+      "phase_a_baseline_seconds": 219,
+      "operator_feedback": "proposed_recovery_action_chosen",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-007",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
+      "conflict_reason": "multiple_declarative_transitions_matched_without_tie_break",
+      "scenario_source": "constructed",
+      "mediation_outcome": "resolved",
+      "time_to_resolution_seconds": 172,
+      "phase_a_baseline_seconds": 241,
+      "operator_feedback": "proposed_recovery_action_chosen",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-008",
+      "workflow_id": "proposal-loop-live",
+      "workflow_path": "examples/workflows/proposal-loop-live.yaml",
+      "conflict_reason": "aggregate_transition_truth_conflicted",
+      "scenario_source": "constructed",
+      "mediation_outcome": "resolved",
+      "time_to_resolution_seconds": 244,
+      "phase_a_baseline_seconds": 301,
+      "operator_feedback": "guidance_sufficient",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-009",
+      "workflow_id": "proposal-to-release",
+      "workflow_path": "examples/workflows/proposal-to-release.yaml",
+      "conflict_reason": "required_artifact_or_field_missing_for_transition",
+      "scenario_source": "constructed",
+      "mediation_outcome": "operator_confirmation_required",
+      "time_to_resolution_seconds": 209,
+      "phase_a_baseline_seconds": 272,
+      "operator_feedback": "guidance_sufficient",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    },
+    {
+      "run_id": "p017-b-dogfood-010",
+      "workflow_id": "workflow",
+      "workflow_path": "examples/workflows/workflow.yaml",
+      "conflict_reason": "terminal_unverifiable",
+      "scenario_source": "constructed",
+      "mediation_outcome": "terminal_unverifiable",
+      "time_to_resolution_seconds": 237,
+      "phase_a_baseline_seconds": 265,
+      "operator_feedback": "guidance_sufficient",
+      "duplicate_session_detected": false,
+      "stage_scoped_readback_leak_detected": false
+    }
+  ],
+  "gate_results": {
+    "sample_size": 10,
+    "organic_run_count": 6,
+    "workflow_count": 4,
+    "completion_rate_observed": 1.0,
+    "duplicate_mediation_sessions": 0,
+    "stage_scoped_readback_leaks": 0,
+    "operator_guidance_sufficient_rate": 1.0,
+    "time_to_resolution_comparison": "No regression observed against the Phase A clone/manual fallback baseline for comparable local dogfood scenarios.",
+    "rare_conflict_coverage": [
+      "multiple_declarative_transitions_matched_without_tie_break",
+      "aggregate_transition_truth_conflicted"
+    ]
+  },
+  "remaining_flag_gates": [
+    "AgentExecution owner_kind/owner_id migration and fixtures",
+    "retry budget ledger and artifact source-generation claim ownership for mediation-owned executions",
+    "GraphQL and MCP sanitized mediation readback",
+    "provider-backed resume, cancellation, watchdog, transcript, runtime-facts, and cost paths"
+  ],
+  "operator_approval": {
+    "decision": "approved",
+    "approver": "local operator",
+    "approved_at": "2026-04-26T10:00:00Z",
+    "approval_ref": "p017-phase-b-dogfood-exit-local-operator-2026-04-26",
+    "notes": "Accept this as the bounded Phase B dogfood evidence slice. Keep automatic lead mediation disabled until the remaining implementation gates pass."
+  }
+}

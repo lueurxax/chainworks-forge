@@ -529,6 +529,103 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       ])
   }
 
+  @Test("Workflow read store surfaces artifact schema mismatch without fallback")
+  func workflowReadStoreSurfacesArtifactSchemaMismatchWithoutFallback() async throws {
+    let mismatchMessage = "Unknown field \"payloadText\" on type \"GqlArtifact\"."
+    let readTransport = CapturingP031ReadTransport(
+      responses: [
+        "P031RunDetail": Data(
+          """
+          {"errors":[{"message":"Unknown field \\"payloadText\\" on type \\"GqlArtifact\\"."}]}
+          """.utf8),
+      ])
+    let store = P031GraphQLWorkflowReadStore(
+      readTransport: readTransport,
+      subscriptionTransport: CapturingP031SubscriptionTransport()
+    )
+
+    await #expect(throws: P031GraphQLReadBoundaryError.graphqlErrors([mismatchMessage])) {
+      _ = try await store.fetchRunDetail(runID: "run-1")
+    }
+
+    let presentation = await P031ThinWorkflowScreenCoordinator(store: store).loadRunDetail(
+      runID: "run-1",
+      currentFreshness: P031FreshnessSnapshot(state: .live)
+    )
+
+    #expect(readTransport.requests.map(\.operationName) == ["P031RunDetail", "P031RunDetail"])
+    #expect(presentation.errorDescription?.contains("Daemon schema mismatch") == true)
+  }
+
+  @Test("Dashboard surfaces schema mismatch and restarts daemon only on explicit action")
+  @MainActor
+  func dashboardSurfacesSchemaMismatchAndRestartsDaemonOnExplicitAction() async {
+    let mismatchResponse = Data(
+      """
+      {"errors":[{"message":"Unknown field \\"payloadText\\" on type \\"GqlArtifact\\"."}]}
+      """.utf8)
+    let readTransport = CapturingP031ReadTransport(
+      responses: [
+        "P031RunsHome": mismatchResponse,
+        "P031ApprovalInbox": mismatchResponse,
+        "P031DaemonLifecycle": mismatchResponse,
+      ])
+    let store = P031GraphQLWorkflowReadStore(
+      readTransport: readTransport,
+      subscriptionTransport: CapturingP031SubscriptionTransport()
+    )
+    let restartRecorder = P031DaemonRestartRecorder()
+    let model = P031ThinReadDashboardModel(
+      coordinator: P031ThinWorkflowScreenCoordinator(store: store),
+      restartDaemonAction: {
+        await restartRecorder.restart()
+      }
+    )
+
+    await model.refreshAll()
+
+    #expect(model.daemonSchemaMismatchMessage?.contains("Daemon schema mismatch") == true)
+    #expect(restartRecorder.count == 0)
+
+    await model.restartDaemonForSchemaMismatch()
+
+    #expect(restartRecorder.count == 1)
+    #expect(model.daemonRestartError == nil)
+  }
+
+  @Test("Dashboard surfaces daemon build mismatch and restarts only on explicit action")
+  @MainActor
+  func dashboardSurfacesDaemonBuildMismatchAndRestartsOnExplicitAction() async {
+    let restartRecorder = P031DaemonRestartRecorder()
+    let model = P031ThinReadDashboardModel(
+      coordinator: P031ThinWorkflowScreenCoordinator(
+        store: P031InMemoryWorkflowReadStore(
+          daemonStatus: makeDaemonStatus(
+            state: .ready,
+            buildSHA: "old-live-build"
+          )
+        )
+      ),
+      restartDaemonAction: {
+        await restartRecorder.restart()
+      },
+      bundledDaemonBuildSHAAction: {
+        "new-bundled-build"
+      }
+    )
+
+    await model.refreshAll()
+
+    #expect(model.daemonBuildMismatchMessage?.contains("old-live-build") == true)
+    #expect(model.daemonBuildMismatchMessage?.contains("new-bundled-build") == true)
+    #expect(restartRecorder.count == 0)
+
+    await model.restartDaemonForUpdateRequired()
+
+    #expect(restartRecorder.count == 1)
+    #expect(model.daemonRestartError == nil)
+  }
+
   @Test("Workflow read store accepts injected P031 document sets")
   func workflowReadStoreUsesInjectedDocuments() async throws {
     let customDocuments = P031GraphQLDocumentSet(
@@ -1776,6 +1873,15 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         payloadText: #"{"status":"ready"}"#
       ),
       makeArtifact(
+        id: "artifact-json-markdown",
+        name: "idea_brief",
+        format: "json",
+        payloadAvailabilityState: .available,
+        payloadUnavailableReasonCode: nil,
+        diagnosticID: nil,
+        payloadText: "# Idea Brief\n\n## Goal\n\nFinish the proposal."
+      ),
+      makeArtifact(
         id: "artifact-report",
         name: "release report",
         format: "report",
@@ -1812,12 +1918,67 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       "Approval required",
     ])
     #expect(detail.stageTransitions.map(\.connectorState) == [.completed, .blocked, .pending])
-    #expect(detail.artifactViewerRows.map(\.renderMode) == [.markdown, .json])
-    #expect(detail.artifactViewerRows.map(\.payloadState) == [.available, .available])
+    #expect(detail.artifactViewerRows.map(\.renderMode) == [.markdown, .json, .markdown])
+    #expect(detail.artifactViewerRows.map(\.payloadState) == [.available, .available, .available])
     #expect(detail.reportRows.map(\.title) == ["release report"])
     #expect(detail.catalogContext?.workflowID == "full_mvp")
     #expect(detail.catalogContext?.workflowSnapshotHash == "workflow-sha")
     #expect(detail.catalogContext?.catalogSnapshotHash == "catalog-sha")
+  }
+
+  @Test("Artifact viewer presentation prepares capped payload previews before SwiftUI rendering")
+  func artifactViewerPresentationPreparesCappedPayloadPreviewsBeforeRendering() {
+    let entries = (0..<20_000)
+      .map { #""key\#($0)":"value\#($0)""# }
+      .joined(separator: ",")
+    let payload = "{\(entries)}"
+    let artifact = makeArtifact(
+      id: "artifact-large-json",
+      name: "large.json",
+      format: "json",
+      payloadAvailabilityState: .available,
+      payloadUnavailableReasonCode: nil,
+      diagnosticID: nil,
+      payloadText: payload
+    )
+
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+
+    #expect(presentation.renderMode == .plainText)
+    #expect(presentation.preparedPreview?.intent == .plainText(monospaced: true))
+    #expect(presentation.preparedPreview?.content.count ?? 0 < payload.count)
+    #expect(presentation.preparedPreview?.previewNotice?.renderedAsRawText == true)
+  }
+
+  @Test("P031 artifact viewer keeps artifact list and preview in independent scroll panes")
+  func artifactViewerUsesIndependentScrollPanes() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let sourceURL = repoRoot
+      .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift", isDirectory: false)
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-list-scroll")"#))
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-preview-scroll")"#))
+    #expect(source.contains(".frame(height: artifactViewerPaneHeight)"))
+  }
+
+  @Test("P031 artifact viewer restores grouping and filtering controls")
+  func artifactViewerRestoresGroupingAndFilteringControls() throws {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let sourceURL = repoRoot
+      .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift", isDirectory: false)
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-filter-search")"#))
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-stage-filter")"#))
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-agent-filter")"#))
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-type-filter")"#))
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-grouping-picker")"#))
+    #expect(source.contains(#".accessibilityIdentifier("p031-artifact-group-section")"#))
   }
 
   @Test("Thin workflow screen coordinator renders artifacts, reports, and daemon lifecycle")
@@ -2164,12 +2325,15 @@ private func daemonStatusGraphQLResponse(fieldName: String, status: String) thro
   ])
 }
 
-private func makeDaemonStatus(state: P031DaemonLifecycleState) -> P031DaemonStatusReadModel {
+private func makeDaemonStatus(
+  state: P031DaemonLifecycleState,
+  buildSHA: String = "test-sha"
+) -> P031DaemonStatusReadModel {
   P031DaemonStatusReadModel(
     state: state,
     schemaVersion: 1,
     binarySchemaVersion: 1,
-    buildSHA: "test-sha",
+    buildSHA: buildSHA,
     startedAt: "2026-04-22T00:00:00Z",
     lastStateChangeAt: "2026-04-22T00:00:01Z",
     restartCountSinceBoot: 0,
@@ -2274,6 +2438,16 @@ private final class CapturingP031SubscriptionTransport: P031GraphQLSubscriptionT
       }
       continuation.finish()
     }
+  }
+}
+
+@MainActor
+private final class P031DaemonRestartRecorder {
+  private(set) var count = 0
+
+  func restart() async -> String? {
+    count += 1
+    return nil
   }
 }
 

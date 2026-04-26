@@ -7,6 +7,8 @@ pub mod artifact_contracts;
 pub mod artifacts;
 pub mod command_journal;
 pub mod ideas;
+pub mod lead_conflict_mediations;
+pub mod lead_mediation_confirmations;
 pub mod legacy_discovery_overrides;
 pub mod projections;
 pub mod runs;

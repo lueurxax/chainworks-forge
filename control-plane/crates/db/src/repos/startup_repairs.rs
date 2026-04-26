@@ -101,6 +101,22 @@ pub async fn build_startup_recovery_readback(
     .map(|raw| parse_datetime(&raw))
     .transpose()?;
 
+    let recovered_work_affected_run_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(DISTINCT run_id)
+           FROM work_items
+           WHERE status = 'pending'
+             AND run_id IS NOT NULL
+             AND (
+               payload_json LIKE '%p061_startup_recovery%'
+               OR payload_json LIKE '%startup_repair%'
+               OR payload_json LIKE '%startup_catchup%'
+             )"#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("count startup recovery affected runs from requeued work")?;
+    let affected_run_count = affected_run_count.max(recovered_work_affected_run_count);
+
     Ok(StartupRecoveryReadback {
         id: uuid::Uuid::new_v4().to_string(),
         recovered_item_count,

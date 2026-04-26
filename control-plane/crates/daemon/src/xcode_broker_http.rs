@@ -54,12 +54,15 @@ async fn handle_xcode_mcp_post(
         .get("id")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let is_notification = request_json.get("id").is_none()
+        || matches!(request_json.get("id"), Some(serde_json::Value::Null));
     let activation = match route_state {
         XcodeBrokerHttpRouteState::Activated => "activated",
         XcodeBrokerHttpRouteState::AlreadyActive => "already_active",
     };
 
     match pool.forward_json_rpc_request(&lease_id, request_json).await {
+        Ok(_) if is_notification => StatusCode::ACCEPTED.into_response(),
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => route_backend_error_response(id, &lease_id, activation, &error.to_string()),
     }
@@ -240,6 +243,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["state"], "disabled");
+        assert_eq!(body["reason_code"], "xcode_mcp_broker_disabled");
+        assert_eq!(body["can_acquire_new_xcode_leases"], false);
+        assert_eq!(body["active_lease_count"], 0);
+        assert_eq!(body["initialize_queue_depth"], 0);
+        assert_eq!(
+            body["last_transition_at"].as_str().unwrap().is_empty(),
+            false
+        );
+        assert_eq!(body["operator_message"], "Xcode broker disabled");
         assert_eq!(
             serde_json::from_value::<XcodeBrokerHealthState>(body["state"].clone()).unwrap(),
             XcodeBrokerHealthState::Disabled
@@ -441,6 +453,79 @@ mod tests {
         assert_eq!(body["result"]["tools"][0]["name"], "xcode.build");
     }
 
+    #[tokio::test]
+    async fn xcode_mcp_route_returns_accepted_without_body_for_notifications() {
+        struct RecordingBackend {
+            methods: tokio::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl XcodeMcpBackend for RecordingBackend {
+            async fn forward_json_rpc(
+                &self,
+                _context: XcodeMcpBackendRequestContext,
+                request: serde_json::Value,
+            ) -> anyhow::Result<serde_json::Value> {
+                self.methods.lock().await.push(
+                    request
+                        .get("method")
+                        .and_then(|method| method.as_str())
+                        .unwrap_or("<missing>")
+                        .to_string(),
+                );
+                Ok(json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::Value::Null,
+                    "result": serde_json::Value::Null
+                }))
+            }
+        }
+
+        let backend = Arc::new(RecordingBackend {
+            methods: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let pool = Arc::new(XcodeMcpBridgePool::new_with_sink_and_backend(
+            XcodeMcpBridgePoolConfig {
+                base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+                first_connect_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+            Arc::new(NoopXcodeRuntimeObservationSink),
+            backend.clone(),
+        ));
+        let req = brokered_xcode_request();
+        let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        let lease_id = attachment.lease_ids[0].clone();
+        let auth_header = match &attachment.request.mcp_servers[0].transport {
+            ResolvedMcpServerTransport::Http { headers, .. } => {
+                headers.get("Authorization").cloned().unwrap()
+            }
+            _ => panic!("expected broker lease to become HTTP transport"),
+        };
+
+        let response = routes(pool)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/xcode-mcp/{lease_id}"))
+                    .header("authorization", auth_header)
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(
+            backend.methods.lock().await.as_slice(),
+            ["notifications/initialized"]
+        );
+    }
+
     async fn response_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -489,6 +574,11 @@ mod tests {
             legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy::Disabled,
             xcode_shim_injection_signal: false,
             requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
         }
     }
 }

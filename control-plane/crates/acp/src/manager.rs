@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use anyhow::{bail, Result};
+use domain::agent::AgentStatus;
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate, XcodeShimEvent,
 };
@@ -243,29 +244,42 @@ impl AcpRuntimeManager {
         let session = opened.session;
         let session_req = opened.session_req;
         let lease_cleanup = opened.lease_cleanup;
-
-        let mut result = match session.prompt(&session_req).await {
-            Ok(result) => result,
-            Err(err) => {
-                let _ = session.close().await;
-                self.release_xcode_leases(lease_cleanup).await;
-                return Err(err);
-            }
-        };
-        if req.keep_session_alive {
-            let generation_id = req.session_generation_id.clone().ok_or_else(|| {
-                anyhow::anyhow!("keep_session_alive requested without session_generation_id")
-            })?;
+        let registered_generation_id = req.session_generation_id.clone();
+        if let Some(generation_id) = registered_generation_id.as_ref() {
             self.live_sessions
                 .lock()
                 .await
-                .insert(generation_id.clone(), session);
-            if let Some(cleanup) = lease_cleanup {
+                .insert(generation_id.clone(), session.clone());
+            if let Some(cleanup) = lease_cleanup.clone() {
                 self.live_xcode_leases
                     .lock()
                     .await
                     .insert(generation_id.clone(), cleanup);
             }
+        }
+
+        let mut result = match session.prompt(&session_req).await {
+            Ok(result) => result,
+            Err(err) => {
+                let cleanup = match registered_generation_id.as_ref() {
+                    Some(generation_id) => {
+                        self.live_xcode_leases.lock().await.remove(generation_id)
+                    }
+                    None => lease_cleanup,
+                };
+                if let Some(generation_id) = registered_generation_id.as_ref() {
+                    self.live_sessions.lock().await.remove(generation_id);
+                }
+                let _ = session.close().await;
+                self.release_xcode_leases(cleanup).await;
+                return Err(err);
+            }
+        };
+        let keep_session_alive = req.keep_session_alive && result.status == AgentStatus::Completed;
+        if keep_session_alive {
+            let generation_id = req.session_generation_id.clone().ok_or_else(|| {
+                anyhow::anyhow!("keep_session_alive requested without session_generation_id")
+            })?;
             result.session_generation_id = Some(generation_id);
             result.reused_existing_session = false;
             self.record_xcode_prompt_observations(&session_req, &result)
@@ -273,8 +287,15 @@ impl AcpRuntimeManager {
             return Ok(result);
         }
 
+        let cleanup = match registered_generation_id.as_ref() {
+            Some(generation_id) => self.live_xcode_leases.lock().await.remove(generation_id),
+            None => lease_cleanup,
+        };
+        if let Some(generation_id) = registered_generation_id.as_ref() {
+            self.live_sessions.lock().await.remove(generation_id);
+        }
         let close_result = session.close().await;
-        self.release_xcode_leases(lease_cleanup).await;
+        self.release_xcode_leases(cleanup).await;
         close_result?;
         result.session_generation_id = None;
         result.reused_existing_session = false;
@@ -427,7 +448,23 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: reusing live session"
         );
 
-        let mut result = session.prompt(&req).await?;
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(err) => {
+                self.live_sessions
+                    .lock()
+                    .await
+                    .remove(session_generation_id);
+                let cleanup = self
+                    .live_xcode_leases
+                    .lock()
+                    .await
+                    .remove(session_generation_id);
+                let _ = session.close().await;
+                self.release_xcode_leases(cleanup).await;
+                return Err(err);
+            }
+        };
         result.session_generation_id = Some(session_generation_id.to_string());
         result.reused_existing_session = true;
         self.record_xcode_prompt_observations(&req, &result).await;
@@ -440,17 +477,16 @@ impl AcpRuntimeManager {
             .live_sessions
             .lock()
             .await
-            .remove(session_generation_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No live ACP session registered for generation id '{session_generation_id}'"
-                )
-            })?;
+            .remove(session_generation_id);
         let lease_cleanup = self
             .live_xcode_leases
             .lock()
             .await
             .remove(session_generation_id);
+        let Some(session) = session else {
+            self.release_xcode_leases(lease_cleanup).await;
+            bail!("No live ACP session registered for generation id '{session_generation_id}'");
+        };
         let close_result = session.close().await;
         self.release_xcode_leases(lease_cleanup).await;
         close_result
@@ -462,6 +498,13 @@ impl AcpRuntimeManager {
             let mut live_sessions = self.live_sessions.lock().await;
             std::mem::take(&mut *live_sessions)
         };
+        let lease_cleanups = {
+            let mut live_xcode_leases = self.live_xcode_leases.lock().await;
+            std::mem::take(&mut *live_xcode_leases)
+        };
+        for cleanup in lease_cleanups.into_values() {
+            self.release_xcode_leases(Some(cleanup)).await;
+        }
         let mut closed = 0;
         for (generation_id, session) in sessions {
             match session.close().await {
@@ -667,6 +710,7 @@ impl Default for AcpRuntimeManager {
 mod tests {
     use super::*;
     use domain::ids::AgentExecutionId;
+    use tokio::sync::Mutex as TokioMutex;
 
     struct FixtureObservationSink;
 
@@ -692,6 +736,57 @@ mod tests {
             &sink,
             &manager.xcode_runtime_observation_sink()
         ));
+    }
+
+    struct RecordingLeaseAttacher {
+        released: Arc<TokioMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeBrokerLeaseAttacher for RecordingLeaseAttacher {
+        async fn attach_brokered_xcode_leases(
+            &self,
+            req: &ExecutionRequest,
+        ) -> anyhow::Result<BrokeredXcodeLeaseAttachment> {
+            Ok(BrokeredXcodeLeaseAttachment::new(req.clone()))
+        }
+
+        async fn release_brokered_xcode_leases(&self, lease_ids: &[String]) -> anyhow::Result<()> {
+            self.released.lock().await.extend_from_slice(lease_ids);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn close_session_releases_orphaned_xcode_lease_cleanup_when_live_session_is_missing() {
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        let released = Arc::new(TokioMutex::new(Vec::new()));
+        let attacher = Arc::new(RecordingLeaseAttacher {
+            released: Arc::clone(&released),
+        });
+        manager.live_xcode_leases.lock().await.insert(
+            "generation-orphaned".to_string(),
+            BrokeredXcodeLeaseCleanup {
+                attacher,
+                lease_ids: vec!["lease-orphaned".to_string()],
+            },
+        );
+
+        let result = manager.close_session("generation-orphaned").await;
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("No live ACP session")),
+            "close_session should still report the missing live session"
+        );
+        assert_eq!(released.lock().await.as_slice(), ["lease-orphaned"]);
+        assert!(manager
+            .live_xcode_leases
+            .lock()
+            .await
+            .get("generation-orphaned")
+            .is_none());
     }
 
     #[test]
@@ -729,6 +824,11 @@ mod tests {
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
             xcode_shim_injection_signal: true,
             requires_xcode_host_execution: true,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
         };
 
         manager

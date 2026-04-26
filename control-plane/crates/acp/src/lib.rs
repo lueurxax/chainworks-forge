@@ -129,6 +129,28 @@ pub struct ExecutionRequest {
     /// and included in session reuse/fingerprint decisions by the engine.
     #[serde(default)]
     pub requires_xcode_host_execution: bool,
+    /// P017 Phase B: Execution owner discriminator. For stage-owned executions
+    /// this is "stage_execution"; for mediation-owned it is "lead_conflict_mediation".
+    #[serde(default = "default_owner_kind")]
+    pub owner_kind: String,
+    /// P017 Phase B: Durable owner identifier. For stage-owned executions this
+    /// mirrors stage_execution_id; for mediation-owned it is the mediation record id.
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    /// P017 Phase B: Origin stage id for compatibility context. Present for
+    /// mediation-owned executions to aid prompt rendering and correlation.
+    #[serde(default)]
+    pub origin_stage_id: Option<String>,
+    /// P017 Phase B: Origin stage execution id for compatibility context.
+    #[serde(default)]
+    pub origin_stage_execution_id: Option<String>,
+    /// P017 Phase B: Mediation record id when this execution is mediation-owned.
+    #[serde(default)]
+    pub mediation_record_id: Option<String>,
+}
+
+fn default_owner_kind() -> String {
+    "stage_execution".to_string()
 }
 
 fn default_attempt_number() -> u32 {

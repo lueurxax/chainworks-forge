@@ -1286,7 +1286,7 @@ mod tests {
             pool,
             &domain::agent::AgentExecution {
                 id: agent_execution_id,
-                stage_execution_id,
+                stage_execution_id: Some(stage_execution_id),
                 agent_id: "validation_agent".to_string(),
                 provider: "system".to_string(),
                 model: None,
@@ -1315,6 +1315,10 @@ mod tests {
                 ),
                 actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: Some(17),
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
             },
         )
         .await

@@ -13,6 +13,7 @@ pub mod host_interruption;
 pub mod housekeeping;
 pub mod lifecycle_reporter;
 pub mod mcp;
+pub mod mediation;
 pub mod orchestrator;
 pub mod preflight;
 pub mod recovery;

@@ -5,9 +5,10 @@ pub mod gemini;
 pub mod junie;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -94,10 +95,15 @@ impl XcodeShimGrantCleanup {
 
 impl AcpLaunchSpec {
     pub fn new(binary_path: impl Into<String>) -> Self {
+        let binary_path = binary_path.into();
+        let binary_path = resolve_binary_path(&binary_path)
+            .unwrap_or_else(|| PathBuf::from(&binary_path))
+            .to_string_lossy()
+            .into_owned();
         Self {
-            binary_path: binary_path.into(),
+            binary_path,
             args: Vec::new(),
-            env: Vec::new(),
+            env: vec![("PATH".to_string(), default_provider_path_value())],
             cleanup_paths: Vec::new(),
             xcode_shim_runtime: None,
             expected_capability_fingerprint: None,
@@ -111,6 +117,7 @@ impl AcpLaunchSpec {
 
     pub fn with_envs(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
+        ensure_default_path_env(&mut self.env);
         self
     }
 
@@ -289,14 +296,65 @@ fn resolve_binary_path(binary_path: &str) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    for dir in default_provider_path_dirs(std::env::var_os("PATH"), dirs::home_dir()) {
         let candidate = dir.join(binary_path);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     None
+}
+
+const DEFAULT_PROVIDER_BIN_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
+
+fn default_provider_path_value() -> String {
+    std::env::join_paths(default_provider_path_dirs(
+        std::env::var_os("PATH"),
+        dirs::home_dir(),
+    ))
+    .unwrap_or_else(|_| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+    .to_string_lossy()
+    .into_owned()
+}
+
+fn default_provider_path_dirs(
+    path_var: Option<OsString>,
+    home_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path_var) = path_var {
+        dirs.extend(std::env::split_paths(&path_var));
+    }
+    if let Some(home_dir) = home_dir {
+        dirs.push(home_dir.join(".local/bin"));
+        dirs.push(home_dir.join(".cargo/bin"));
+    }
+    dirs.extend(DEFAULT_PROVIDER_BIN_DIRS.iter().map(PathBuf::from));
+
+    let mut unique = Vec::new();
+    for dir in dirs {
+        if dir.as_os_str().is_empty() || unique.iter().any(|seen| seen == &dir) {
+            continue;
+        }
+        unique.push(dir);
+    }
+    unique
+}
+
+fn ensure_default_path_env(env: &mut Vec<(String, String)>) {
+    if env.iter().any(|(name, _)| name == "PATH") {
+        return;
+    }
+    env.push(("PATH".to_string(), default_provider_path_value()));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -521,6 +579,7 @@ pub struct AcpSessionNewSpec {
     pub mode: String,
     pub extra: Option<Value>,
     pub config_options: Vec<(String, String)>,
+    pub set_mode_after_session_new: bool,
 }
 
 impl AcpSessionNewSpec {
@@ -530,6 +589,7 @@ impl AcpSessionNewSpec {
             mode: mode.into(),
             extra: None,
             config_options: Vec::new(),
+            set_mode_after_session_new: false,
         }
     }
 
@@ -539,6 +599,7 @@ impl AcpSessionNewSpec {
             mode: config.mode.to_string(),
             extra: config.extra,
             config_options: config.config_options,
+            set_mode_after_session_new: config.set_mode_after_session_new,
         }
     }
 
@@ -548,6 +609,7 @@ impl AcpSessionNewSpec {
             mode: &self.mode,
             extra: self.extra.clone(),
             config_options: self.config_options.clone(),
+            set_mode_after_session_new: self.set_mode_after_session_new,
         }
     }
 }
@@ -623,6 +685,10 @@ pub trait AcpAdapter: Send + Sync {
         true
     }
 
+    fn capability_probe_timeout(&self) -> Duration {
+        crate::transport::handshake_timeout_for_provider(self.provider_name())
+    }
+
     async fn probe_capabilities_from_launch_spec(
         &self,
         launch_spec: &AcpLaunchSpec,
@@ -636,6 +702,7 @@ pub trait AcpAdapter: Send + Sync {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        crate::transport::isolate_process_group(&mut command);
 
         let child = command.spawn().with_context(|| {
             format!(
@@ -644,7 +711,9 @@ pub trait AcpAdapter: Send + Sync {
                 launch_spec.binary_path
             )
         })?;
-        let initialize_result = crate::transport::probe_initialize(child).await?;
+        let initialize_result =
+            crate::transport::probe_initialize_with_timeout(child, self.capability_probe_timeout())
+                .await?;
         Ok(parse_provider_capabilities(&initialize_result))
     }
 
@@ -719,6 +788,7 @@ pub trait AcpAdapter: Send + Sync {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        crate::transport::isolate_process_group(&mut command);
 
         let args = if launch_spec.args.is_empty() {
             String::new()
@@ -822,11 +892,21 @@ fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpLaunchSpec, ProbeKey, ProviderCapabilities, ProviderCapabilityCache,
-        XcodeShimLaunchRuntime,
+        default_provider_path_dirs, AcpAdapter, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
+        ProviderCapabilityCache, XcodeShimLaunchRuntime,
     };
     use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct ProbeTimeoutAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for ProbeTimeoutAdapter {
+        fn provider_name(&self) -> &str {
+            self.0
+        }
+    }
 
     #[derive(Default)]
     struct CapturingGrantStore {
@@ -852,6 +932,18 @@ mod tests {
         fn remove_xcode_shim_grant(&self, _token_id: &str) -> Option<XcodeShimGrantRecord> {
             None
         }
+    }
+
+    #[test]
+    fn capability_probe_timeout_uses_provider_specific_handshake_budget() {
+        assert_eq!(
+            ProbeTimeoutAdapter("gemini").capability_probe_timeout(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            ProbeTimeoutAdapter("claude").capability_probe_timeout(),
+            Duration::from_secs(90)
+        );
     }
 
     #[test]
@@ -921,6 +1013,46 @@ mod tests {
     }
 
     #[test]
+    fn launch_spec_default_path_keeps_xcode_shim_attachment_fingerprint_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("provider-acp");
+        std::fs::write(&binary, "fixture").unwrap();
+
+        let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());
+        spec.record_capability_fingerprint(Some("profile-a"), None);
+
+        spec.env.push((
+            "CHAINWORKS_XCODE_SHIM_DIR".to_string(),
+            "/tmp/cw-shim".to_string(),
+        ));
+        super::prepend_path_env(&mut spec.env, "/tmp/cw-shim");
+
+        spec.verify_capability_fingerprint()
+            .expect("shim-only PATH prefix must not invalidate capability fingerprint");
+    }
+
+    #[test]
+    fn provider_path_adds_interactive_tool_dirs_to_launchd_path() {
+        let dirs = default_provider_path_dirs(
+            Some(std::ffi::OsString::from("/usr/bin:/bin:/usr/bin")),
+            Some(std::path::PathBuf::from("/Users/operator")),
+        );
+
+        assert_eq!(dirs[0], std::path::PathBuf::from("/usr/bin"));
+        assert_eq!(dirs[1], std::path::PathBuf::from("/bin"));
+        assert!(dirs.contains(&std::path::PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/usr/local/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/Users/operator/.local/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/Users/operator/.cargo/bin")));
+        assert_eq!(
+            dirs.iter()
+                .filter(|dir| dir.as_path() == std::path::Path::new("/usr/bin"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn chainworks_meta_root_is_frozen_before_capability_fingerprint() {
         let tmp = tempfile::tempdir().unwrap();
         let binary = tmp.path().join("provider-acp");
@@ -952,6 +1084,11 @@ mod tests {
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
             xcode_shim_injection_signal: false,
             requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
         };
 
         let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());

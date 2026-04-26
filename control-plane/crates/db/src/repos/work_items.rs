@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::time::Instant;
 
+use domain::agent::{AgentStatus, ArtifactSourceClaimState};
+use domain::artifact_contracts::ArtifactSourceGenerationClaimKey;
 use domain::ids::{RunId, StageExecutionId};
 use domain::provider::InvokeAgentCapacityConfig;
 
@@ -387,6 +389,338 @@ pub async fn has_pending_or_running_by_run_tx(
     Ok(count > 0)
 }
 
+pub async fn settle_terminal_preclaimed_invoke_agent_executions(
+    pool: &SqlitePool,
+    fallback_completed_at: DateTime<Utc>,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx = begin_immediate_with_retry(
+        pool,
+        "work_items.settle_terminal_preclaimed_invoke_agent_executions",
+    )
+    .await?;
+    let settled =
+        settle_terminal_preclaimed_invoke_agent_executions_tx(&mut tx, fallback_completed_at)
+            .await?;
+    tx.commit()
+        .await
+        .context("commit terminal preclaimed InvokeAgent execution settlement")?;
+    log_write_transaction(
+        "work_items.settle_terminal_preclaimed_invoke_agent_executions",
+        tx_started,
+    );
+    Ok(settled)
+}
+
+pub async fn settle_terminal_preclaimed_invoke_agent_executions_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    fallback_completed_at: DateTime<Utc>,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        r#"SELECT id, payload_json, status, completed_at, failed_at
+           FROM work_items
+           WHERE kind = ?1 AND status IN (?2, ?3, ?4)
+           ORDER BY created_at ASC, rowid ASC"#,
+    )
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Completed.to_string())
+    .bind(WorkItemStatus::Failed.to_string())
+    .bind(WorkItemStatus::Cancelled.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .context("load terminal preclaimed InvokeAgent work items")?;
+
+    let mut settled = 0_u64;
+    for row in rows {
+        let payload_json: String = row.get("payload_json");
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else {
+            continue;
+        };
+        let Some(agent_execution_id) = payload
+            .pointer("/p058_claimed/agent_execution_id")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+
+        let work_item_status: String = row.get("status");
+        let agent_status = match work_item_status.as_str() {
+            "completed" => AgentStatus::Completed,
+            "failed" => AgentStatus::Failed,
+            "cancelled" => AgentStatus::Cancelled,
+            _ => continue,
+        };
+        let completed_at = row
+            .get::<Option<String>, _>("completed_at")
+            .or_else(|| row.get::<Option<String>, _>("failed_at"))
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or(fallback_completed_at);
+
+        let result = sqlx::query(
+            r#"UPDATE agent_executions
+               SET status = ?1, completed_at = ?2
+               WHERE id = ?3 AND status = ?4"#,
+        )
+        .bind(agent_status.to_string())
+        .bind(completed_at.to_rfc3339())
+        .bind(agent_execution_id)
+        .bind(AgentStatus::Running.to_string())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "settle terminal preclaimed InvokeAgent execution for work item {}",
+                row.get::<String, _>("id")
+            )
+        })?;
+        settled += result.rows_affected();
+        sqlx::query(
+            r#"UPDATE artifact_source_generation_claims
+               SET claim_state = ?1,
+                   closed_at = COALESCE(closed_at, ?2),
+                   updated_at = ?2
+               WHERE source_work_item_id = ?3
+                 AND agent_execution_id = ?4
+                 AND claim_state = ?5"#,
+        )
+        .bind("closed")
+        .bind(completed_at.to_rfc3339())
+        .bind(row.get::<String, _>("id"))
+        .bind(agent_execution_id)
+        .bind("active")
+        .execute(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "close terminal preclaimed InvokeAgent source-generation claim for work item {}",
+                row.get::<String, _>("id")
+            )
+        })?;
+    }
+
+    Ok(settled)
+}
+
+pub async fn requeue_running_advance_by_run(
+    pool: &SqlitePool,
+    run_id: RunId,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx =
+        begin_immediate_with_retry(pool, "work_items.requeue_running_advance_by_run").await?;
+    let requeued = requeue_running_advance_by_run_tx(&mut tx, run_id, scheduled_at, reason).await?;
+    tx.commit()
+        .await
+        .context("commit requeue running AdvanceRun work items by run")?;
+    log_write_transaction("work_items.requeue_running_advance_by_run", tx_started);
+    Ok(requeued)
+}
+
+pub async fn requeue_running_advance_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let pending = WorkItemStatus::Pending.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    let result = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1,
+               scheduled_at = ?2,
+               attempt_count = attempt_count + 1,
+               last_error = ?3
+           WHERE run_id = ?4
+             AND kind = ?5
+             AND status = ?6"#,
+    )
+    .bind(pending)
+    .bind(scheduled_at.to_rfc3339())
+    .bind(reason)
+    .bind(run_id.to_string())
+    .bind(WorkItemKind::AdvanceRun.to_string())
+    .bind(running)
+    .execute(&mut **tx)
+    .await
+    .context("requeue running AdvanceRun work items by run")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn requeue_running_steward_analysis_on_startup(
+    pool: &SqlitePool,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx = begin_immediate_with_retry(
+        pool,
+        "work_items.requeue_running_steward_analysis_on_startup",
+    )
+    .await?;
+    let requeued =
+        requeue_running_steward_analysis_on_startup_tx(&mut tx, scheduled_at, reason).await?;
+    tx.commit()
+        .await
+        .context("commit requeue running StewardAnalysis work items")?;
+    log_write_transaction(
+        "work_items.requeue_running_steward_analysis_on_startup",
+        tx_started,
+    );
+    Ok(requeued)
+}
+
+pub async fn requeue_running_steward_analysis_on_startup_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let pending = WorkItemStatus::Pending.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    let result = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1,
+               scheduled_at = ?2,
+               started_at = NULL,
+               completed_at = NULL,
+               failed_at = NULL,
+               attempt_count = attempt_count + 1,
+               last_error = ?3
+           WHERE kind = ?4
+             AND status = ?5"#,
+    )
+    .bind(pending)
+    .bind(scheduled_at.to_rfc3339())
+    .bind(reason)
+    .bind(WorkItemKind::StewardAnalysis.to_string())
+    .bind(running)
+    .execute(&mut **tx)
+    .await
+    .context("requeue running StewardAnalysis work items on startup")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn requeue_running_invoke_agent_on_startup(
+    pool: &SqlitePool,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx =
+        begin_immediate_with_retry(pool, "work_items.requeue_running_invoke_on_startup").await?;
+    let requeued =
+        requeue_running_invoke_agent_on_startup_tx(&mut tx, scheduled_at, reason).await?;
+    tx.commit()
+        .await
+        .context("commit requeue running InvokeAgent work items")?;
+    log_write_transaction("work_items.requeue_running_invoke_on_startup", tx_started);
+    Ok(requeued)
+}
+
+pub async fn requeue_running_invoke_agent_on_startup_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        r#"SELECT id, payload_json
+           FROM work_items
+           WHERE kind = ?1 AND status = ?2
+           ORDER BY scheduled_at ASC, rowid ASC"#,
+    )
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .context("load running InvokeAgent work items on startup")?;
+
+    let pending = WorkItemStatus::Pending.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    let scheduled_at = scheduled_at.to_rfc3339();
+    let mut requeued = 0_u64;
+    for row in rows {
+        let item_id: String = row.get("id");
+        let payload_json: String = row.get("payload_json");
+        let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        payload["p061_startup_recovery"] = serde_json::json!({
+            "requeued_at": scheduled_at.clone(),
+            "reason": reason,
+        });
+        let updated = sqlx::query(
+            r#"UPDATE work_items
+               SET status = ?1,
+                   payload_json = ?2,
+                   started_at = NULL,
+                   completed_at = NULL,
+                   failed_at = NULL,
+                   last_error = ?3
+               WHERE id = ?4 AND status = ?5"#,
+        )
+        .bind(&pending)
+        .bind(serde_json::to_string(&payload)?)
+        .bind(reason)
+        .bind(&item_id)
+        .bind(&running)
+        .execute(&mut **tx)
+        .await
+        .context("requeue running InvokeAgent work item on startup")?
+        .rows_affected();
+        requeued += updated;
+    }
+    Ok(requeued)
+}
+
+pub async fn cancel_pending_or_running_advance_by_run(
+    pool: &SqlitePool,
+    run_id: RunId,
+    completed_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx =
+        begin_immediate_with_retry(pool, "work_items.cancel_advance_for_parked_cursor").await?;
+    let cancelled =
+        cancel_pending_or_running_advance_by_run_tx(&mut tx, run_id, completed_at, reason).await?;
+    tx.commit()
+        .await
+        .context("commit cancel pending/running AdvanceRun work items by run")?;
+    log_write_transaction("work_items.cancel_advance_for_parked_cursor", tx_started);
+    Ok(cancelled)
+}
+
+pub async fn cancel_pending_or_running_advance_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    completed_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let cancelled = WorkItemStatus::Cancelled.to_string();
+    let pending = WorkItemStatus::Pending.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    let result = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1, completed_at = ?2, last_error = ?3
+           WHERE run_id = ?4
+             AND kind = ?5
+             AND status IN (?6, ?7)"#,
+    )
+    .bind(cancelled)
+    .bind(completed_at.to_rfc3339())
+    .bind(reason)
+    .bind(run_id.to_string())
+    .bind(WorkItemKind::AdvanceRun.to_string())
+    .bind(pending)
+    .bind(running)
+    .execute(&mut **tx)
+    .await
+    .context("cancel pending/running AdvanceRun work items by run")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption(
     pool: &SqlitePool,
     run_id: RunId,
@@ -493,6 +827,124 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
     Ok(requeued)
 }
 
+pub async fn requeue_running_invoke_agent_after_active_prompt_close(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    claim_key: &ArtifactSourceGenerationClaimKey,
+    failed_session_generation_id: Option<&str>,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<bool> {
+    let tx_started = Instant::now();
+    let mut tx =
+        begin_immediate_with_retry(pool, "work_items.requeue_active_prompt_closed_invoke").await?;
+    let requeued = requeue_running_invoke_agent_after_active_prompt_close_tx(
+        &mut tx,
+        work_item_id,
+        claim_key,
+        failed_session_generation_id,
+        scheduled_at,
+        reason,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit active prompt close InvokeAgent requeue")?;
+    log_write_transaction("work_items.requeue_active_prompt_closed_invoke", tx_started);
+    Ok(requeued)
+}
+
+pub async fn requeue_running_invoke_agent_after_active_prompt_close_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    claim_key: &ArtifactSourceGenerationClaimKey,
+    failed_session_generation_id: Option<&str>,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT payload_json
+           FROM work_items
+           WHERE id = ?1 AND kind = ?2 AND status = ?3"#,
+    )
+    .bind(work_item_id)
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load running InvokeAgent work item for active prompt close requeue")?;
+
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let payload_json: String = row.get("payload_json");
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&payload_json).context("parse InvokeAgent payload for requeue")?;
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("p058_claimed");
+        object.insert(
+            "acp_active_prompt_recovery".to_string(),
+            serde_json::json!({
+                "reason": reason,
+                "failed_agent_execution_id": claim_key.agent_execution_id.to_string(),
+                "failed_session_generation_id": failed_session_generation_id,
+                "requeued_at": scheduled_at.to_rfc3339(),
+            }),
+        );
+    }
+
+    let scheduled_at_rfc3339 = scheduled_at.to_rfc3339();
+    let updated = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1,
+               payload_json = ?2,
+               scheduled_at = ?3,
+               started_at = NULL,
+               completed_at = NULL,
+               failed_at = NULL,
+               last_error = NULL
+           WHERE id = ?4 AND status = ?5"#,
+    )
+    .bind(WorkItemStatus::Pending.to_string())
+    .bind(serde_json::to_string(&payload)?)
+    .bind(&scheduled_at_rfc3339)
+    .bind(work_item_id)
+    .bind(WorkItemStatus::Running.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("requeue running InvokeAgent work item after active prompt close")?
+    .rows_affected();
+
+    if updated != 1 {
+        return Ok(false);
+    }
+
+    let now = scheduled_at_rfc3339;
+    sqlx::query(
+        r#"UPDATE artifact_source_generation_claims
+           SET claim_state = ?1,
+               superseding_work_item_id = ?2,
+               superseded_at = ?3,
+               updated_at = ?3
+           WHERE run_id = ?4 AND owner_kind = ?5 AND owner_id = ?6 AND agent_execution_id = ?7
+             AND source_work_item_id = ?8 AND claim_state = ?9"#,
+    )
+    .bind(ArtifactSourceClaimState::SupersededPendingRetry.to_string())
+    .bind(work_item_id)
+    .bind(&now)
+    .bind(claim_key.run_id.to_string())
+    .bind(claim_key.owner_kind.to_string())
+    .bind(&claim_key.owner_id)
+    .bind(claim_key.agent_execution_id.to_string())
+    .bind(&claim_key.source_work_item_id)
+    .bind(ArtifactSourceClaimState::Active.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("mark active source-generation claim superseded for active prompt close retry")?;
+
+    Ok(true)
+}
+
 pub async fn complete(
     pool: &SqlitePool,
     id: &str,
@@ -511,26 +963,73 @@ pub async fn complete_with_capacity(
     let now = Utc::now().to_rfc3339();
     let status = WorkItemStatus::Completed.to_string();
     let mut refresh_scheduler = false;
-    let existing = sqlx::query(r#"SELECT kind, run_id, status FROM work_items WHERE id = ?1"#)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("select work item before complete")?;
-    sqlx::query(r#"UPDATE work_items SET status = ?1, completed_at = ?2 WHERE id = ?3"#)
-        .bind(status)
-        .bind(&now)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .context("complete work item")?;
+    let existing =
+        sqlx::query(r#"SELECT kind, run_id, status, payload_json FROM work_items WHERE id = ?1"#)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("select work item before complete")?;
     if let Some(row) = existing {
         let kind: String = row.get("kind");
         let run_id: Option<String> = row.get("run_id");
         let previous_status: String = row.get("status");
+        if !matches!(previous_status.as_str(), "pending" | "running") {
+            tx.commit()
+                .await
+                .context("commit terminal complete no-op")?;
+            log_write_transaction("work_items.complete.terminal_noop", tx_started);
+            return Ok(scheduler::RefreshQueueSummariesResult::default());
+        }
+        sqlx::query(r#"UPDATE work_items SET status = ?1, completed_at = ?2 WHERE id = ?3 AND status IN (?4, ?5)"#)
+            .bind(&status)
+            .bind(&now)
+            .bind(id)
+            .bind(WorkItemStatus::Pending.to_string())
+            .bind(WorkItemStatus::Running.to_string())
+            .execute(&mut *tx)
+            .await
+            .context("complete work item")?;
         if kind == WorkItemKind::InvokeAgent.to_string()
             && previous_status == WorkItemStatus::Running.to_string()
         {
             refresh_scheduler = true;
+            let payload_json: String = row.get("payload_json");
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) {
+                if let Some(agent_execution_id) = payload
+                    .pointer("/p058_claimed/agent_execution_id")
+                    .and_then(|value| value.as_str())
+                {
+                    sqlx::query(
+                        r#"UPDATE agent_executions
+                           SET status = ?1, completed_at = COALESCE(completed_at, ?2)
+                           WHERE id = ?3 AND status = ?4"#,
+                    )
+                    .bind(AgentStatus::Completed.to_string())
+                    .bind(&now)
+                    .bind(agent_execution_id)
+                    .bind(AgentStatus::Running.to_string())
+                    .execute(&mut *tx)
+                    .await
+                    .context("settle preclaimed InvokeAgent execution on work item complete")?;
+                    sqlx::query(
+                        r#"UPDATE artifact_source_generation_claims
+                           SET claim_state = ?1,
+                               closed_at = COALESCE(closed_at, ?2),
+                               updated_at = ?2
+                           WHERE source_work_item_id = ?3
+                             AND agent_execution_id = ?4
+                             AND claim_state = ?5"#,
+                    )
+                    .bind("closed")
+                    .bind(&now)
+                    .bind(id)
+                    .bind(agent_execution_id)
+                    .bind("active")
+                    .execute(&mut *tx)
+                    .await
+                    .context("close active source-generation claim on work item complete")?;
+                }
+            }
             if let Some(run_id) = run_id {
                 let advance_kind = WorkItemKind::AdvanceRun.to_string();
                 let pending_status = WorkItemStatus::Pending.to_string();
@@ -600,27 +1099,64 @@ pub async fn fail_with_capacity(
     let mut tx = begin_immediate_with_retry(pool, "work_items.fail").await?;
     let now = Utc::now().to_rfc3339();
     let status = WorkItemStatus::Failed.to_string();
-    let existing = sqlx::query(r#"SELECT kind, status FROM work_items WHERE id = ?1"#)
+    let existing = sqlx::query(r#"SELECT kind, run_id, status FROM work_items WHERE id = ?1"#)
         .bind(id)
         .fetch_optional(&mut *tx)
         .await
         .context("select work item before fail")?;
-    sqlx::query(
-        r#"UPDATE work_items SET status = ?1, failed_at = ?2, last_error = ?3 WHERE id = ?4"#,
-    )
-    .bind(status)
-    .bind(now)
-    .bind(error)
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .context("fail work item")?;
     let refresh = if let Some(row) = existing {
         let kind: String = row.get("kind");
+        let run_id: Option<String> = row.get("run_id");
         let previous_status: String = row.get("status");
+        if !matches!(previous_status.as_str(), "pending" | "running") {
+            tx.commit().await.context("commit terminal fail no-op")?;
+            log_write_transaction("work_items.fail.terminal_noop", tx_started);
+            return Ok(scheduler::RefreshQueueSummariesResult::default());
+        }
+        sqlx::query(
+            r#"UPDATE work_items
+               SET status = ?1, failed_at = ?2, last_error = ?3
+               WHERE id = ?4 AND status IN (?5, ?6)"#,
+        )
+        .bind(&status)
+        .bind(&now)
+        .bind(error)
+        .bind(id)
+        .bind(WorkItemStatus::Pending.to_string())
+        .bind(WorkItemStatus::Running.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("fail work item")?;
         if kind == WorkItemKind::InvokeAgent.to_string()
             && matches!(previous_status.as_str(), "pending" | "running")
         {
+            if let Some(run_id) = run_id {
+                let advance_kind = WorkItemKind::AdvanceRun.to_string();
+                let pending_status = WorkItemStatus::Pending.to_string();
+                let advance_id = format!("advance-after-invoke:{id}");
+                let payload_json = serde_json::json!({
+                    "run_id": run_id,
+                    "reason": "invoke_agent_failed",
+                    "failed_invoke_work_item_id": id,
+                })
+                .to_string();
+                sqlx::query(
+                    r#"
+                    INSERT OR IGNORE INTO work_items
+                      (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error)
+                    VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, 0, NULL)
+                    "#,
+                )
+                .bind(advance_id)
+                .bind(advance_kind)
+                .bind(payload_json)
+                .bind(pending_status)
+                .bind(run_id)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .context("enqueue post-failure AdvanceRun for InvokeAgent")?;
+            }
             scheduler::refresh_queue_summaries_for_notification_tx(
                 &mut tx,
                 capacity,
@@ -648,16 +1184,81 @@ pub async fn fail_tx(
 ) -> Result<()> {
     let status = WorkItemStatus::Failed.to_string();
     sqlx::query(
-        r#"UPDATE work_items SET status = ?1, failed_at = ?2, last_error = ?3 WHERE id = ?4"#,
+        r#"UPDATE work_items
+           SET status = ?1, failed_at = ?2, last_error = ?3
+           WHERE id = ?4 AND status IN (?5, ?6)"#,
     )
     .bind(status)
     .bind(now.to_rfc3339())
     .bind(error)
     .bind(id)
+    .bind(WorkItemStatus::Pending.to_string())
+    .bind(WorkItemStatus::Running.to_string())
     .execute(&mut **tx)
     .await
     .context("fail work item")?;
     Ok(())
+}
+
+pub async fn requeue_running_after_transient_persistence_contention(
+    pool: &SqlitePool,
+    id: &str,
+    now: DateTime<Utc>,
+    error: &str,
+) -> Result<bool> {
+    let tx_started = Instant::now();
+    let mut tx =
+        begin_immediate_with_retry(pool, "work_items.requeue_transient_persistence_contention")
+            .await?;
+    let row = sqlx::query(r#"SELECT attempt_count FROM work_items WHERE id = ?1 AND status = ?2"#)
+        .bind(id)
+        .bind(WorkItemStatus::Running.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .context("load running work item for transient persistence requeue")?;
+
+    let Some(row) = row else {
+        tx.commit()
+            .await
+            .context("commit transient persistence requeue no-op")?;
+        log_write_transaction(
+            "work_items.requeue_transient_persistence_contention.noop",
+            tx_started,
+        );
+        return Ok(false);
+    };
+
+    let attempt_count: i64 = row.get("attempt_count");
+    let backoff_seconds = (1_i64 << attempt_count.clamp(0, 6)).min(60);
+    let scheduled_at = now + chrono::Duration::seconds(backoff_seconds);
+    let last_error = format!("transient_persistence_contention: {error}");
+    let updated = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1,
+               scheduled_at = ?2,
+               started_at = NULL,
+               failed_at = NULL,
+               last_error = ?3
+           WHERE id = ?4 AND status = ?5"#,
+    )
+    .bind(WorkItemStatus::Pending.to_string())
+    .bind(scheduled_at.to_rfc3339())
+    .bind(last_error)
+    .bind(id)
+    .bind(WorkItemStatus::Running.to_string())
+    .execute(&mut *tx)
+    .await
+    .context("requeue work item after transient persistence contention")?
+    .rows_affected();
+
+    tx.commit()
+        .await
+        .context("commit transient persistence requeue")?;
+    log_write_transaction(
+        "work_items.requeue_transient_persistence_contention",
+        tx_started,
+    );
+    Ok(updated == 1)
 }
 
 pub async fn cancel_running_by_run(pool: &SqlitePool, run_id: RunId) -> Result<()> {
@@ -779,6 +1380,33 @@ pub async fn cancel_pending_or_running_invoke_by_stage_execution_tx(
     Ok(cancelled)
 }
 
+pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<WorkItem>> {
+    let row = sqlx::query(
+        r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
+           FROM work_items WHERE id = ?1"#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("find work item by id")?;
+
+    row.map(|r| {
+        parse_work_item_row(
+            r.get("id"),
+            r.get("kind"),
+            r.get("payload_json"),
+            r.get("status"),
+            r.get("run_id"),
+            r.get("stage_id"),
+            r.get("created_at"),
+            r.get("scheduled_at"),
+            r.get("attempt_count"),
+            r.get("last_error"),
+        )
+    })
+    .transpose()
+}
+
 pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<WorkItem>> {
     let run_id_str = run_id.to_string();
     let rows = sqlx::query(
@@ -882,6 +1510,65 @@ fn parse_work_item_row(
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[tokio::test]
+    async fn invoke_agent_failure_enqueues_advance_run_for_fan_in() {
+        let pool = crate::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        let run_id = RunId::new();
+        let now = Utc::now();
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-startup-failed".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("review".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running invoke work item");
+
+        fail(&pool, "invoke-startup-failed", "xcode_target_not_found")
+            .await
+            .expect("fail invoke work item");
+
+        let items = list_by_run(&pool, run_id).await.expect("list by run");
+        let failed = items
+            .iter()
+            .find(|item| item.id == "invoke-startup-failed")
+            .expect("failed invoke item");
+        assert_eq!(failed.status, WorkItemStatus::Failed);
+        assert_eq!(failed.last_error.as_deref(), Some("xcode_target_not_found"));
+
+        let advance = items
+            .iter()
+            .find(|item| item.id == "advance-after-invoke:invoke-startup-failed")
+            .expect("post-failure advance");
+        assert_eq!(advance.kind, WorkItemKind::AdvanceRun);
+        assert_eq!(advance.status, WorkItemStatus::Pending);
+        assert_eq!(advance.stage_id, None);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&advance.payload_json).expect("advance payload");
+        assert_eq!(payload["run_id"], run_id.to_string());
+        assert_eq!(payload["reason"], "invoke_agent_failed");
+        assert_eq!(
+            payload["failed_invoke_work_item_id"],
+            "invoke-startup-failed"
+        );
+    }
 
     #[tokio::test]
     async fn proposal_061_host_interruption_requeue_strips_preclaim_and_reschedules() {

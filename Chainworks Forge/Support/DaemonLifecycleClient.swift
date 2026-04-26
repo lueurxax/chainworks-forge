@@ -96,15 +96,21 @@ nonisolated struct FailureReason: Codable, Sendable, Equatable {
     }
 }
 
-enum XcodeBrokerHealthState: String, Codable, Sendable {
+nonisolated enum XcodeBrokerHealthState: String, Codable, Sendable {
     case disabled
     case healthy
     case degraded
     case failed
 }
 
-struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
+nonisolated struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
     let state: XcodeBrokerHealthState
+    let reasonCode: String
+    let canAcquireNewXcodeLeases: Bool
+    let activeLeaseCount: Int
+    let initializeQueueDepth: Int
+    let lastTransitionAt: String
+    let operatorMessage: String
     let poolID: String
     let activeLeases: Int
     let queuedLeases: Int
@@ -116,6 +122,12 @@ struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case state
+        case reasonCode = "reason_code"
+        case canAcquireNewXcodeLeases = "can_acquire_new_xcode_leases"
+        case activeLeaseCount = "active_lease_count"
+        case initializeQueueDepth = "initialize_queue_depth"
+        case lastTransitionAt = "last_transition_at"
+        case operatorMessage = "operator_message"
         case poolID = "pool_id"
         case activeLeases = "active_leases"
         case queuedLeases = "queued_leases"
@@ -129,9 +141,20 @@ struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         state = try c.decode(XcodeBrokerHealthState.self, forKey: .state)
+        reasonCode = try c.decodeIfPresent(String.self, forKey: .reasonCode) ?? state.rawValue
+        canAcquireNewXcodeLeases = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .canAcquireNewXcodeLeases
+        ) ?? (state == .healthy)
         poolID = try c.decode(String.self, forKey: .poolID)
         activeLeases = try c.decode(Int.self, forKey: .activeLeases)
         queuedLeases = try c.decode(Int.self, forKey: .queuedLeases)
+        activeLeaseCount = try c.decodeIfPresent(Int.self, forKey: .activeLeaseCount)
+            ?? activeLeases
+        initializeQueueDepth = try c.decodeIfPresent(Int.self, forKey: .initializeQueueDepth)
+            ?? queuedLeases
+        lastTransitionAt = try c.decodeIfPresent(String.self, forKey: .lastTransitionAt) ?? ""
+        operatorMessage = try c.decodeIfPresent(String.self, forKey: .operatorMessage) ?? ""
         maxActiveLeases = try c.decode(Int.self, forKey: .maxActiveLeases)
         maxQueuedLeases = try c.decode(Int.self, forKey: .maxQueuedLeases)
         brokerDisabled = try c.decode(Bool.self, forKey: .brokerDisabled)

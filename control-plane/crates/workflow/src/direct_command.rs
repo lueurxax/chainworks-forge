@@ -500,10 +500,11 @@ fn has_unknown_xcrun_flag(argv_tokens: &[String]) -> bool {
         if matches!(token, "--find" | "-f" | "--run" | "-r") {
             return false;
         }
-        if matches!(
-            token,
-            "--show-sdk-path" | "--show-sdk-version" | "--show-sdk-build-version"
-        ) {
+        if token.starts_with("--show-sdk-") {
+            idx += 1;
+            continue;
+        }
+        if is_xcrun_non_consuming_flag(token) {
             idx += 1;
             continue;
         }
@@ -513,6 +514,19 @@ fn has_unknown_xcrun_flag(argv_tokens: &[String]) -> bool {
         return false;
     }
     false
+}
+
+fn is_xcrun_non_consuming_flag(token: &str) -> bool {
+    matches!(
+        token,
+        "-l" | "--log"
+            | "--verbose"
+            | "--no-cache"
+            | "--kill-cache"
+            | "--help"
+            | "-h"
+            | "--version"
+    )
 }
 
 fn is_xcrun_find_guarded_tool(argv_tokens: &[String]) -> bool {
@@ -746,6 +760,13 @@ mod tests {
             "xcrun --sdk iphonesimulator simctl list devices --json",
             "xcrun --toolchain default --run swift --version",
             "xcrun --show-sdk-version --sdk=iphoneos",
+            "xcrun --show-sdk-platform-path --sdk iphoneos",
+            "xcrun --verbose --log simctl list devices",
+            "xcrun --no-cache --kill-cache xcodebuild -version",
+            "xcrun -l swift --version",
+            "xcrun --help",
+            "xcrun -h",
+            "xcrun --version",
         ] {
             let classified = classify_command(command);
             assert!(

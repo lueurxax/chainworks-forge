@@ -290,7 +290,7 @@ mod tests {
             &pool,
             &AgentExecution {
                 id: agent_execution_id,
-                stage_execution_id,
+                stage_execution_id: Some(stage_execution_id),
                 agent_id: "agent_1".into(),
                 provider: "system".into(),
                 model: None,
@@ -317,6 +317,10 @@ mod tests {
                 actual_mcp_observation_json: None,
                 actual_xcode_runtime_observation_json: None,
                 mcp_session_startup_latency_ms: None,
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
             },
         )
         .await

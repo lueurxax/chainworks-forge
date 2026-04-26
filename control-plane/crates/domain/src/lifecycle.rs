@@ -179,6 +179,12 @@ pub enum XcodeBrokerHealthState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XcodeBrokerHealthSnapshot {
     pub state: XcodeBrokerHealthState,
+    pub reason_code: String,
+    pub can_acquire_new_xcode_leases: bool,
+    pub active_lease_count: usize,
+    pub initialize_queue_depth: usize,
+    pub last_transition_at: String,
+    pub operator_message: String,
     pub pool_id: String,
     pub active_leases: usize,
     pub queued_leases: usize,

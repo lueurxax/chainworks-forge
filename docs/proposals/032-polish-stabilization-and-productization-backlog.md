@@ -5,7 +5,7 @@
 | Date | 2026-04-01 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposals 027, 029, 031, 041, 042, and 043 |
+| Depends on | Proposals 027, 029, 041, 042, and the canonical thin UI read contract in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md) |
 | Goal | Collect and organize all remaining polish, stabilization, productization, and follow-on improvements after parity extraction, MCP exposure, query contracts, daemon lifecycle, and thin-client cutover land. |
 
 ## 1. Why this proposal exists
@@ -75,6 +75,21 @@ It is supposed to stay partially open and grow over time.
 - runtime adapter docs
 - migration docs
 - internal troubleshooting docs
+
+### 2.8 P031 stop-tail stabilization
+
+P031 is stopped at the GraphQL-only read-boundary cutover, and that boundary is now treated as repository truth through [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). The following tails move here instead of keeping P031 open:
+
+- Phase 3 dogfood/sign-off for the thin read UI after P036 restores enough operator ergonomics to dogfood honestly.
+- Degraded-state drill or explicit release-owner waiver for daemon/schema/projection unavailable states.
+- Human VoiceOver/Assistive Access spot check or explicit dated waiver.
+- Projection freshness evidence, including p50/p95 read freshness under representative local runs.
+- Release-readiness evidence for daemon lifecycle behavior, schema mismatch detection, and the operator-facing "update daemon" flow.
+- Documentation cleanup after the P031 stop decision, including references that still imply P031 must restore full visual parity or interactive write paths.
+- Readiness gate cleanup so `proposal-031-readiness` can distinguish architectural cutover evidence from deferred product polish.
+- Audit closeout notes that explain why visual polish moved to P036 and why remaining write-path restoration requires separate transport proposals.
+
+These items are stabilization/productization work. They must not reintroduce MCP reads/writes, GraphQL mutations, local workflow truth, or old Swift-local execution paths into the governed macOS UI.
 
 ## 3. How to use this proposal
 

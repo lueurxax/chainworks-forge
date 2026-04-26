@@ -67,9 +67,9 @@ An `Idea` + YAML `Workflow` + YAML `AgentCatalog` compiles into a **`RunPlanSnap
 Key engine pieces (under `Chainworks Forge/Engine/`):
 
 - `RunPlanCompiler.swift` — compiles idea + YAML → frozen `RunPlan` with resolved agent bindings
-- `WorkflowOrchestrator.swift` — state machine driver, lazy stage creation, fan-out via `TaskGroup`
+- `WorkflowOrchestrator.swift` — state machine driver, lazy stage creation, fan-out via `TaskGroup`, transition authority resolver
 - `TransitionEvaluator.swift` — canonical `when:` expression evaluator (ARCH-031): `exists()`, comparisons, `vars.*`, `artifact.field`, `and/or`
-- `RuntimeAgentExecutor.swift` — single-agent execution with retries, watchdog, session reuse
+- `RuntimeAgentExecutor.swift` — single-agent execution with retries, watchdog, owner-aware execution identity (P017)
 - `AgentSessionManager.swift` — per-run session lineage, reuse scopes, generation tracking
 - `ExecutionService.swift` — top-level coordinator, transport factory
 - `RecoveryCoordinator.swift` / `ResumeManager.swift` — startup repair, drift handling
@@ -91,13 +91,13 @@ daemon ─┬─► graphql-server ─┐
         └─► (single binary, both northbound servers on :4000)
 ```
 
-- `domain` — IDs, enums, command/event types (no I/O)
-- `db` — SQLite repos + projection rebuild logic; 3 migrations; WAL mode for concurrent reads
+- `domain` — IDs, enums, command/event types (no I/O), mediation types
+- `db` — SQLite repos + projection rebuild logic; owner-aware `agent_executions` migration; 3 migrations; WAL mode for concurrent reads
 - `workflow` — parses `examples/workflows/*.yaml` + `examples/agents/*.yaml`, builds `RunPlan` with resolved `ResolvedAgent { provider, model, effort, prompt }`
-- `engine` — `Orchestrator` (state machine), `BackgroundExecutor` (work-queue worker that spawns InvokeAgent items as concurrent tokio tasks for fan-out), `CommandHandler` (writes to `command_journal`), `RecoveryService`
+- `engine` — `Orchestrator` (state machine), `BackgroundExecutor` (work-queue worker), `CommandHandler` (writes to `command_journal`), `MediationSettlementService`, `RecoveryService`
 - `acp` — JSON-RPC 2.0 ndjson transport with permission auto-grant, 5 provider adapters
-- `graphql-server` — async-graphql + axum; queries, mutations, subscriptions (including `runtime_status_changed`)
-- `mcp-server` — MCP Streamable HTTP transport (POST /mcp) + stdio fallback
+- `graphql-server` — async-graphql + axum; queries, mutations, subscriptions; workflow conflict readback
+- `mcp-server` — MCP Streamable HTTP transport (POST /mcp) + stdio fallback; mixed inbox (`approvals.list`) for stage approvals and mediation confirmations
 
 Key reference: [`docs/reference/rust-control-plane.md`](docs/reference/rust-control-plane.md).
 

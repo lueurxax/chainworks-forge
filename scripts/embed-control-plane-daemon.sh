@@ -29,22 +29,6 @@
 
 set -euo pipefail
 
-# Xcode build phases do NOT inherit the user's shell profile, so `cargo`
-# (installed by rustup into `~/.cargo/bin/`) is not on PATH by default.
-# Add the standard rustup paths if they exist before anything else.
-for candidate in "$HOME/.cargo/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
-    if [ -d "$candidate" ]; then
-        PATH="$candidate:$PATH"
-    fi
-done
-export PATH
-
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "error: cargo not found on PATH ($PATH)" >&2
-    echo "       install Rust via https://rustup.rs and rerun the build" >&2
-    exit 127
-fi
-
 if [ -z "${TARGET_BUILD_DIR:-}" ] || [ -z "${EXECUTABLE_FOLDER_PATH:-}" ]; then
     echo "error: this script must run inside an Xcode build phase" >&2
     exit 64
@@ -69,6 +53,39 @@ if [ ! -d "${CONTROL_PLANE_DIR}" ]; then
     echo "error: control-plane directory not found at ${CONTROL_PLANE_DIR}" >&2
     exit 65
 fi
+
+# Xcode Cloud does not provide Rust/Cargo in the Xcode build phase. Its
+# repository custom scripts run before xcodebuild and can leave a compiled
+# daemon in a stable workspace path. Prefer that binary when present, then
+# fall back to a local cargo build for developer machines and proposal gates.
+PREBUILT_CANDIDATES=()
+append_prebuilt_candidate() {
+    local candidate="$1"
+    local existing
+    if [ "${#PREBUILT_CANDIDATES[@]}" -gt 0 ]; then
+        for existing in "${PREBUILT_CANDIDATES[@]}"; do
+            if [ "${existing}" = "${candidate}" ]; then
+                return
+            fi
+        done
+    fi
+    PREBUILT_CANDIDATES+=("${candidate}")
+}
+
+if [ -n "${CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON:-}" ]; then
+    append_prebuilt_candidate "${CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON}"
+fi
+append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/${PROFILE_DIR}/control-plane"
+append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/release/control-plane"
+append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/control-plane"
+
+SOURCE_BIN=""
+for candidate in "${PREBUILT_CANDIDATES[@]}"; do
+    if [ -x "${candidate}" ]; then
+        SOURCE_BIN="${candidate}"
+        break
+    fi
+done
 
 # Cargo locks its `target/` directory, so a concurrent `cargo test`
 # from the terminal or test-gate.sh blocks this build phase. Redirect
@@ -102,13 +119,38 @@ echo "                           source=${CONTROL_PLANE_DIR}"
 echo "                           target=${CARGO_TARGET_DIR}"
 echo "                           GIT_SHA=${GIT_SHA}"
 
-(
-    cd "${CONTROL_PLANE_DIR}"
-    # shellcheck disable=SC2086
-    cargo build ${CARGO_PROFILE_FLAG} --bin control-plane
-)
+if [ -n "${SOURCE_BIN}" ]; then
+    echo "embed-control-plane-daemon: using prebuilt daemon ${SOURCE_BIN}"
+else
+    # Xcode build phases do NOT inherit the user's shell profile, so `cargo`
+    # (installed by rustup into `~/.cargo/bin/`) is not on PATH by default.
+    # Add the standard rustup paths if they exist before anything else.
+    for candidate in "$HOME/.cargo/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+        if [ -d "$candidate" ]; then
+            PATH="$candidate:$PATH"
+        fi
+    done
+    export PATH
 
-SOURCE_BIN="${CARGO_TARGET_DIR}/${PROFILE_DIR}/control-plane"
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "error: cargo not found on PATH ($PATH)" >&2
+        echo "       no prebuilt daemon was found in:" >&2
+        for candidate in "${PREBUILT_CANDIDATES[@]}"; do
+            echo "         - ${candidate}" >&2
+        done
+        echo "       Xcode Cloud should run ci_scripts/ci_post_clone.sh before xcodebuild" >&2
+        echo "       local builds need Rust installed via https://rustup.rs" >&2
+        exit 127
+    fi
+
+    (
+        cd "${CONTROL_PLANE_DIR}"
+        # shellcheck disable=SC2086
+        cargo build ${CARGO_PROFILE_FLAG} --bin control-plane
+    )
+
+    SOURCE_BIN="${CARGO_TARGET_DIR}/${PROFILE_DIR}/control-plane"
+fi
 if [ ! -x "${SOURCE_BIN}" ]; then
     echo "error: expected daemon binary not found at ${SOURCE_BIN}" >&2
     exit 65
@@ -154,5 +196,12 @@ fi
 # now has a compile-time literal. The post-build echo below stays
 # informational only — the value in the binary is the exported one.
 echo "embed-control-plane-daemon: bundled daemon sha ${GIT_SHA}"
+
+# App-side lifecycle/read surfaces compare this stamp with the live
+# daemon's `/ready` build_sha so operators see an explicit update-required
+# state even when the GraphQL schema version did not change.
+BUNDLED_SHA_RESOURCE_DIR="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH:-${CONTENTS_FOLDER_PATH:-Contents}/Resources}"
+mkdir -p "${BUNDLED_SHA_RESOURCE_DIR}"
+printf '%s\n' "${GIT_SHA}" > "${BUNDLED_SHA_RESOURCE_DIR}/bundled-daemon-build-sha.txt"
 
 echo "embed-control-plane-daemon: ok → ${DEST_BIN}"

@@ -122,7 +122,7 @@ async fn seed_execution(
         pool,
         &AgentExecution {
             id: agent_execution_id,
-            stage_execution_id,
+            stage_execution_id: Some(stage_execution_id),
             agent_id: "code_writer".into(),
             provider: "claude".into(),
             model: Some("sonnet".into()),
@@ -151,6 +151,10 @@ async fn seed_execution(
             ),
             actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: Some(17),
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
         },
     )
     .await

@@ -298,6 +298,10 @@ impl HostInterruptionService {
         event: HostInterruptionEvent,
     ) -> Result<HostInterruptionRecoverySummary> {
         let now = Utc::now();
+        if event.kind == HostInterruptionKind::NetworkMigration {
+            return self.record_non_disruptive_epoch(event, now).await;
+        }
+
         let cleanup_summary = self.cleanup_runtime_sessions_for_event(&event, now).await?;
         let transaction_started = Instant::now();
         let writer_wait_started_at = Instant::now();
@@ -459,6 +463,60 @@ impl HostInterruptionService {
         );
         self.work_queue.publish_scheduler_notification(refresh);
         Ok(summary)
+    }
+
+    async fn record_non_disruptive_epoch(
+        &self,
+        event: HostInterruptionEvent,
+        now: DateTime<Utc>,
+    ) -> Result<HostInterruptionRecoverySummary> {
+        let transaction_started = Instant::now();
+        let writer_wait_started_at = Instant::now();
+        let mut tx = db::pool::begin_immediate_with_retry(
+            &self.pool,
+            "host_interruption.record_non_disruptive_epoch",
+        )
+        .await?;
+        let writer_wait_ms = writer_wait_started_at.elapsed().as_millis() as i64;
+        let epoch = scheduler::HostInterruptionEpoch {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: event.kind.as_str().to_string(),
+            started_at: event.started_at,
+            ended_at: event.ended_at,
+            monotonic_gap_ms: event.monotonic_gap_ms,
+            wall_clock_gap_ms: event.wall_clock_gap_ms,
+            details_json: event.details_json,
+            created_at: now,
+        };
+        scheduler::insert_host_interruption_epoch_tx(&mut tx, &epoch).await?;
+        let refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &self.capacity_config,
+            now,
+            "host_interruption.record_non_disruptive_epoch",
+            writer_wait_ms,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit non-disruptive host interruption epoch")?;
+        db::pool::log_write_transaction(
+            "host_interruption.record_non_disruptive_epoch",
+            transaction_started,
+        );
+        self.work_queue.publish_scheduler_notification(refresh);
+        Ok(HostInterruptionRecoverySummary {
+            epoch_id: epoch.id,
+            affected_executions: 0,
+            cancelled_executions: 0,
+            retries_enqueued: 0,
+            retries_deferred_capacity: 0,
+            retries_deferred_cleanup_failed: 0,
+            retries_missing_work_item: 0,
+            runtime_cleanup_attempted: 0,
+            runtime_cleanup_succeeded: 0,
+            runtime_cleanup_failed: 0,
+        })
     }
 
     async fn cleanup_runtime_sessions_for_event(

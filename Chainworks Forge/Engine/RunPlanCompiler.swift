@@ -228,6 +228,10 @@ final class RunPlanCompiler {
                 )
             }
 
+            let requestedMCPServerIDs = agentDef.mode == "prepush_review"
+                ? backend.mcp.filter { $0 != "xcode" }
+                : backend.mcp
+
             bindings[agentID] = ResolvedAgent(
                 id: agentDef.id,
                 title: agentDef.title,
@@ -239,8 +243,8 @@ final class RunPlanCompiler {
                 maxTurns: backend.maxTurns,
                 temperature: backend.temperature,
                 permissionProfile: agentDef.permissionProfile,
-                mcpProfileID: backend.mcp.isEmpty ? nil : agentDef.backendProfile,
-                requestedMCPServerIDs: backend.mcp,
+                mcpProfileID: requestedMCPServerIDs.isEmpty ? nil : agentDef.backendProfile,
+                requestedMCPServerIDs: requestedMCPServerIDs,
                 skillRef: agentDef.skillRef,
                 skillRole: agentDef.skillRole,
                 resolvedSkill: resolvedSkill,

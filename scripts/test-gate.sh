@@ -1592,7 +1592,7 @@ Available gates:
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-015    Proposal 015 skill resolution and runtime injection gate
-  proposal-017    Proposal 017 Phase A workflow conflict truth gate
+  proposal-017    Proposal 017 Phase A/B/C workflow authority, conflict truth, and lead mediation gate
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
@@ -1779,19 +1779,74 @@ case "$GATE" in
     run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
     ;;
   proposal-017|p017)
-    log "Proposal 017 gate: Phase A Swift bridge/report readback plus control-plane conflict truth"
+    log "Proposal 017 gate: Phase A/B/C workflow authority, conflict truth, and lead mediation"
     check_idle_environment allow_app
+
+    # Phase 0 Contract Freeze: verify existence of required backend artifacts
+    log "Verifying Phase 0 backend contract artifacts..."
+    required_artifacts=(
+      "docs/proposals/017-evidence/phase-0-approval-mediation-contract.json"
+      "docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md"
+      "docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json"
+      "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json"
+      "docs/proposals/017-evidence/phase-0-settlement-service-boundary.md"
+      "docs/proposals/017-evidence/phase-0-artifact-manifest.json"
+    )
+    for art in "${required_artifacts[@]}"; do
+      if [[ ! -f "$ROOT_DIR/$art" ]]; then
+        die "Missing required Phase 0 artifact: $art"
+      fi
+    done
+    python3 - "$ROOT_DIR/docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+entries = payload.get("entries") or []
+if not entries:
+    raise SystemExit("Phase B lead resolver must have at least one attested entry")
+
+seen = set()
+for index, entry in enumerate(entries, 1):
+    required = [
+        "workflow_source_path",
+        "catalog_source_path",
+        "lead_agent_id",
+        "lead_resolution_contract_ref",
+        "mapping_owner",
+        "entry_attested_by",
+        "reviewed_at",
+    ]
+    missing = [field for field in required if not entry.get(field)]
+    if missing:
+        raise SystemExit(f"Phase B lead resolver entry {index} missing: {', '.join(missing)}")
+    key = (entry["workflow_source_path"], entry["catalog_source_path"])
+    if key in seen:
+        raise SystemExit(
+            "Phase B lead resolver has duplicate workflow/catalog entry: "
+            f"{entry['workflow_source_path']} + {entry['catalog_source_path']}"
+        )
+    seen.add(key)
+PY
+
     run_targeted_tests "proposal-017-swift" "${PROPOSAL_017_SWIFT_TESTS[@]}"
     (
       cd "$ROOT_DIR/control-plane"
       export CARGO_TARGET_DIR=target/proposal-017-gate
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      # Phase A: Workflow authority and conflict truth
       cargo test -p workflow proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p workflow --test proposal_017_evidence_gate -- --test-threads=1 --nocapture
       cargo test -p domain --test proposal_017_workflow_conflict -- --test-threads=1 --nocapture
       cargo test -p db --test proposal_017_workflow_conflict_persistence -- --test-threads=1 --nocapture
-      cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p mcp-server proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p graphql-server proposal_017_ -- --test-threads=1 --nocapture
+
+      # Phase B/C: Lead mediation and owner-aware execution
+      cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p engine p017_mediation_ -- --test-threads=1 --nocapture
     )
     log "Proposal 017 gate passed"
     ;;
@@ -2423,9 +2478,9 @@ PY
     python3 - <<'PY'
 from pathlib import Path
 
-source = Path("docs/proposals/051-shared-xcode-mcp-bridge-pool.md")
+source = Path("docs/reference/xcode-mcp-bridge-pool.md")
 if not source.exists():
-    raise SystemExit(f"p051-scaffold: missing source proposal {source}")
+    raise SystemExit(f"p051-scaffold: missing stable bridge-pool reference {source}")
 
 lines = source.read_text().splitlines()
 stale_checks = [
@@ -2435,6 +2490,12 @@ stale_checks = [
     ("drop-on-corrupt observation behavior", ["drop-on-corrupt", "drop on corrupt", "drop corrupt"]),
     ("direct pgrep newest-Xcode selection", ["pgrep", "newest xcode"]),
     ("unbound same-uid-only shim authorization", ["same-uid-only", "same uid only"]),
+]
+strict_stale_checks = [
+    ("backend per provider HTTP lease", ["per provider http lease", "per-provider http lease", "per active provider http lease"]),
+    ("independent same-target leases/backends", ["independent leases and backends", "across independent leases and backends", "isolated leases/backends"]),
+    ("lease-owned stdio backend", ["each lease has one stdio backend"]),
+    ("per-lease backend failure semantics", ["fail only that lease", "fail only that lease with per-lease backend failure"]),
 ]
 allowed_context_markers = [
     "absent",
@@ -2468,9 +2529,18 @@ for label, needles in stale_checks:
     if offending_lines:
         stale.append(label)
 
+for label, needles in strict_stale_checks:
+    offending_lines = []
+    for line_number, line in enumerate(lines, start=1):
+        normalized = line.lower()
+        if any(needle in normalized for needle in needles):
+            offending_lines.append(line_number)
+    if offending_lines:
+        stale.append(f"{label} at lines {offending_lines}")
+
 if stale:
     raise SystemExit(
-        "p051-scaffold: docs/proposals/051-shared-xcode-mcp-bridge-pool.md still contains "
+        "p051-scaffold: docs/reference/xcode-mcp-bridge-pool.md still contains "
         "stale contrary guidance: " + ", ".join(stale)
     )
 PY
@@ -2936,6 +3006,7 @@ PY
     # the 2 most recent in case an in-flight build or the `xcresult`
     # viewer still has a handle on one.
     if [[ -d "$TMP_BASE" ]]; then
+      compgen -G "$TMP_BASE/p042-swift-*-DerivedData" >/dev/null && \
       ls -dt "$TMP_BASE"/p042-swift-*-DerivedData 2>/dev/null \
         | tail -n +3 \
         | while read -r stale; do

@@ -134,7 +134,12 @@ async fn seed_execution(pool: &sqlx::SqlitePool) -> (RunId, AgentExecutionId) {
             denied_mcp_extensions_json: None,
             mcp_blocking_issues_json: None,
             actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
             mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
         },
     )
     .await

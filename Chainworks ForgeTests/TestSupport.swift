@@ -290,6 +290,10 @@ func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throw
 @discardableResult
 func writePortableWorkflowCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
     let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    try FileManager.default.createDirectory(
+        at: destinationURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
     try source.write(to: destinationURL, atomically: true, encoding: .utf8)
     return destinationURL
 }
@@ -303,7 +307,11 @@ func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
             Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
             "workflow.yaml fixture must be bundled with tests"
         )
-    return try YAMLParser.loadWorkflow(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("examples/workflows", isDirectory: true)
+        .appendingPathComponent("chainworks-test-workflow-\(UUID().uuidString).yaml")
+    try writePortableWorkflowCopy(from: url, to: portableURL)
+    return try YAMLParser.loadWorkflow(from: portableURL)
 }
 
 /// Loads the canonical agent catalog fixture from the test bundle.
@@ -317,6 +325,7 @@ func loadTestCanonicalCatalog() throws -> AgentCatalog {
             "agents.yaml fixture must be bundled with tests"
         )
     let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("examples/agents", isDirectory: true)
         .appendingPathComponent("chainworks-test-catalog-\(UUID().uuidString).yaml")
     try writePortableCatalogCopy(from: url, to: portableURL)
     return try YAMLParser.loadAgentCatalog(from: portableURL)

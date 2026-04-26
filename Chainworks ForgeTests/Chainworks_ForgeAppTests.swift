@@ -12,6 +12,45 @@ struct Chainworks_ForgeAppTests {
         ]))
     }
 
+    @Test("Window restoration defaults disable AppKit persistent UI snapshots")
+    func windowRestorationDefaultsDisablePersistentUISnapshots() {
+        let suiteName = "ChainworksForgeAppTests-\(UUID().uuidString)"
+        let defaults = try! #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        Chainworks_ForgeApp.applyWindowRestorationDefaults(userDefaults: defaults)
+
+        #expect(defaults.bool(forKey: "NSQuitAlwaysKeepsWindows") == false)
+        #expect(defaults.bool(forKey: "ApplePersistenceIgnoreState") == true)
+    }
+
+    @Test("Saved application state cleanup removes only the app snapshot directory")
+    func savedApplicationStateCleanupRemovesOnlyAppSnapshotDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChainworksForgeAppTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let appState = Chainworks_ForgeApp.savedApplicationStateURL(
+            bundleIdentifier: "xax.Chainworks-Forge",
+            homeDirectory: root
+        )
+        let otherState = Chainworks_ForgeApp.savedApplicationStateURL(
+            bundleIdentifier: "xax.Other-App",
+            homeDirectory: root
+        )
+        try FileManager.default.createDirectory(at: appState, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: otherState, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: appState.appendingPathComponent("windows.plist"))
+
+        Chainworks_ForgeApp.clearSavedWindowState(
+            bundleIdentifier: "xax.Chainworks-Forge",
+            homeDirectory: root
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: appState.path))
+        #expect(FileManager.default.fileExists(atPath: otherState.path))
+    }
+
     @Test("UI automation host detection stays environment scoped")
     func uiAutomationHostDetectionIsEnvironmentScoped() {
         #expect(Chainworks_ForgeApp.isUIAutomationHost(for: [
@@ -19,6 +58,16 @@ struct Chainworks_ForgeAppTests {
         ]))
         #expect(!Chainworks_ForgeApp.isUIAutomationHost(for: [
             "CHAINWORKS_ENABLE_WINDOW_RESTORATION": "1"
+        ]))
+    }
+
+    @Test("Unit test host detection treats an empty XCTest configuration path as active")
+    func testHostDetectionUsesEnvironmentKeyPresence() {
+        #expect(Chainworks_ForgeApp.isTestHost(for: [
+            "XCTestConfigurationFilePath": ""
+        ]))
+        #expect(!Chainworks_ForgeApp.isTestHost(for: [
+            "CHAINWORKS_UI_TEST_MODE": "1"
         ]))
     }
 
@@ -39,5 +88,29 @@ struct Chainworks_ForgeAppTests {
         try Data("<plist/>".utf8).write(to: plistURL)
 
         #expect(Chainworks_ForgeApp.packagedDaemonAgentPlistURL(in: bundleURL) == plistURL)
+    }
+
+    @Test("LaunchAgent kickstart targets the submitted GUI service without forcing restart")
+    func launchAgentKickstartArgumentsDoNotForceRestart() {
+        #if os(macOS)
+        #expect(
+            Chainworks_ForgeApp.launchctlKickstartArguments(
+                label: "com.chainworks.forge.daemon",
+                uid: 501
+            ) == [
+                "kickstart",
+                "gui/501/com.chainworks.forge.daemon",
+            ])
+        #expect(
+            Chainworks_ForgeApp.launchctlKickstartArguments(
+                label: "com.chainworks.forge.daemon",
+                uid: 501,
+                force: true
+            ) == [
+                "kickstart",
+                "-k",
+                "gui/501/com.chainworks.forge.daemon",
+            ])
+        #endif
     }
 }

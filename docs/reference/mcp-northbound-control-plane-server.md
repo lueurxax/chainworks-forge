@@ -77,12 +77,35 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 | `ApprovalsList` | `approvals.list` | no (direct) |
 | `ApprovalsResolve` | `approvals.resolve` | yes |
 | `StagesRetry` | `stages.retry` | yes |
+| `WorkflowConflictsResolve` | `workflow_conflicts.resolve` | yes |
+| `LegacyDiscoveryOverrideCreate` | `legacy_discovery_override_create` | yes |
 | `ReportsGet` | `reports.get` | no (direct) |
+| `ArtifactsOverrideContract` | `artifacts.override_contract` | yes |
 | `StewardRunAnalysis` | `steward.run_analysis` | yes |
 | `StewardListAnalyses` | `steward.list_analyses` | no (direct) |
 | `StewardGetAnalysis` | `steward.get_analysis` | no (direct) |
 
 Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
+
+### MCP tool payloads
+
+#### `approvals.resolve`
+
+The `approvals.resolve` tool supports additive evolution to handle both legacy stage approvals and new lead mediation confirmations.
+
+**Legacy Stage Approval (subject_kind implicitly stage_approval):**
+- `run_id`: UUID
+- `stage_id`: String
+- `decision`: `"granted"` | `"rejected"`
+- `comment`: String (optional)
+
+**Lead Mediation Confirmation:**
+- `subject_kind`: `"lead_mediation_confirmation"` (required)
+- `subject_id`: UUID
+- `decision`: `"confirm"` | `"manual_fallback"`
+- `conflict_fingerprint`: String (must match current mediation truth)
+- `idempotency_key`: UUID
+- `comment`: String (optional)
 
 ### Registered resource templates
 
@@ -239,10 +262,13 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `runs.list` | yes | yes | yes |
 | `runs.get` | yes | yes | yes |
 | `runs.cancel` | yes | no | no |
-| `approvals.list` | yes | no | yes |
-| `approvals.resolve` | yes | no | no |
+| `approvals.list` | yes | no | yes | (Mixed inbox: stage approvals + lead mediation confirmations) |
+| `approvals.resolve` | yes | no | no | (Resolves stage approvals or lead mediation confirmations) |
 | `stages.retry` | yes | no | no |
+| `workflow_conflicts.resolve` | yes | no | no |
+| `legacy_discovery_override_create` | yes | no | no |
 | `reports.get` | yes | yes | yes |
+| `artifacts.override_contract` | yes | no | no |
 | `steward.run_analysis` | yes | no | no |
 | `steward.list_analyses` | yes | no | yes |
 | `steward.get_analysis` | yes | no | yes |
@@ -368,9 +394,13 @@ Each decision is one of:
 | `RejectStage` | `run_id`, `stage_id` | preserve | Audit: which approval was rejected. |
 | `RejectStage` | `comment` | **redact** | Same rationale as `ApproveStage.comment`. |
 | `RetryStage` | all fields | preserve | No sensitive payload. |
+| `ResolveWorkflowConflictTransition` | all fields | preserve | Operator selections are audit material. |
+| `OverrideLegacyDiscoveryPolicy` | all fields | preserve | Typed override fields are audit material. |
 | `CancelRun` | all fields | preserve | No sensitive payload. |
 | `ResetSession` | all fields | preserve | No sensitive payload. |
 | `RunStewardAnalysis` | `reason`, `artifact_base` | preserve | Operator label + optional output path override. |
+| `OverrideArtifactContract` | all fields | preserve | Typed override fields are audit material. |
+| `ResolveLeadMediationConfirmation` | `comment` | **redact** | Redact operator-submitted text. |
 
 Variants with no sensitive fields (`RetryStage`, `CancelRun`, `ResetSession`, `RunStewardAnalysis`) correctly preserve every field — the contract does not require every variant to hide something.
 

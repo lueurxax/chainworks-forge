@@ -230,10 +230,16 @@ pub fn probe_local_xcode_host(config: LocalXcodeHostProbeConfig) -> HostProbeCon
         darwin_tmpdir.as_deref(),
         developer_dir.as_deref(),
     );
+    let applescript_workspace_identity = if candidate_xcodes.len() == 1 {
+        discover_xcode_workspace_identity_from_documents(&config.workspace_roots)
+    } else {
+        None
+    };
     for candidate in &mut candidate_xcodes {
         if candidate.workspace_identity.is_none() {
             candidate.workspace_identity =
-                discover_xcode_workspace_identity(candidate.pid, &config.workspace_roots);
+                discover_xcode_workspace_identity(candidate.pid, &config.workspace_roots)
+                    .or_else(|| applescript_workspace_identity.clone());
         }
     }
 
@@ -352,6 +358,12 @@ fn discover_xcode_workspace_identity(pid: i64, workspace_roots: &[String]) -> Op
     parse_lsof_workspace_identity(&output, workspace_roots)
 }
 
+fn discover_xcode_workspace_identity_from_documents(workspace_roots: &[String]) -> Option<String> {
+    let script = r#"tell application "Xcode" to get path of documents"#;
+    let output = command_stdout_utf8("osascript", &["-e", script])?;
+    workspace_identity_from_xcode_document_paths(&output, workspace_roots)
+}
+
 fn parse_lsof_workspace_identity(lsof_output: &str, workspace_roots: &[String]) -> Option<String> {
     let open_paths = lsof_output
         .lines()
@@ -368,6 +380,32 @@ fn parse_lsof_workspace_identity(lsof_output: &str, workspace_roots: &[String]) 
         .cloned()
         .or_else(|| {
             open_paths
+                .iter()
+                .find(|path| path.ends_with(".xcworkspace") || path.ends_with(".xcodeproj"))
+                .map(|path| (*path).to_string())
+        })
+}
+
+fn workspace_identity_from_xcode_document_paths(
+    document_paths: &str,
+    workspace_roots: &[String],
+) -> Option<String> {
+    let paths = document_paths
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    workspace_roots
+        .iter()
+        .filter(|root| !root.is_empty())
+        .find(|root| {
+            paths
+                .iter()
+                .any(|path| path_is_under(path, root) || *path == root.as_str())
+        })
+        .cloned()
+        .or_else(|| {
+            paths
                 .iter()
                 .find(|path| path.ends_with(".xcworkspace") || path.ends_with(".xcodeproj"))
                 .map(|path| (*path).to_string())
@@ -531,6 +569,19 @@ n/Applications/Xcode.app/Contents/MacOS/Xcode
 
         assert_eq!(
             parse_lsof_workspace_identity(lsof_output, &workspace_roots).as_deref(),
+            Some("/Users/gui/Work/App")
+        );
+    }
+
+    #[test]
+    fn xcode_document_paths_parser_prefers_declared_workspace_roots() {
+        let workspace_roots = vec!["/Users/gui/Work/App".to_string()];
+        let document_paths = "\
+/Users/gui/Work/App/App.xcodeproj, /E4262B49-42DE-4A9E-AD50-8E2C86983AE2, /Users/gui/Work/App/Sources/App.swift";
+
+        assert_eq!(
+            workspace_identity_from_xcode_document_paths(document_paths, &workspace_roots)
+                .as_deref(),
             Some("/Users/gui/Work/App")
         );
     }

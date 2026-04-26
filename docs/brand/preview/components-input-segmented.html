@@ -1,0 +1,206 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Inputs & segmented</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{
+    font-family:var(--font-text);color:var(--label);
+    -webkit-font-smoothing:antialiased;
+    padding:20px 24px;box-sizing:border-box;
+  }
+  .stack{display:flex;flex-direction:column;gap:14px;}
+  .lbl{font:var(--t-caption2);letter-spacing:0.05em;color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .meta{font:var(--t-caption1);color:var(--label-secondary);margin-top:2px;}
+
+  .stage-dark{
+    position:relative;border-radius:14px;overflow:hidden;padding:28px 32px;
+    background:radial-gradient(120% 80% at 50% 50%, #1A2433 0%, #0E1623 55%, #04080D 100%);
+    box-shadow:0 1px 2px rgba(4,8,13,0.20), 0 14px 36px rgba(4,8,13,0.32);
+  }
+  .stage-dark::after{content:"";position:absolute;inset:0;background:radial-gradient(60% 40% at 30% 35%, rgba(255,255,255,0.05), transparent 70%);pointer-events:none;}
+  .stage-light{
+    position:relative;border-radius:14px;overflow:hidden;padding:28px 32px;
+    background:
+      radial-gradient(70% 110% at 10% 16%, #FFD8A8 0%, transparent 55%),
+      radial-gradient(60% 100% at 90% 22%, #B7D4FF 0%, transparent 55%),
+      radial-gradient(60% 100% at 32% 92%, #C9F0D8 0%, transparent 55%),
+      radial-gradient(70% 110% at 80% 88%, #F4C7E2 0%, transparent 55%),
+      linear-gradient(180deg, #F2F2F7 0%, #E9E9F0 100%);
+    box-shadow:0 1px 2px rgba(4,8,13,0.06), 0 12px 28px rgba(4,8,13,0.10);
+  }
+  .eyebrow{font:var(--t-caption2);letter-spacing:0.18em;text-transform:uppercase;font-weight:600;margin-bottom:18px;}
+  .stage-dark  .eyebrow{color:rgba(235,235,245,0.55);}
+  .stage-light .eyebrow{color:var(--label-tertiary);}
+
+  .group{display:flex;flex-direction:column;gap:8px;}
+  .group + .group{margin-top:18px;}
+  .grouplbl{font:var(--t-caption2);letter-spacing:0.05em;text-transform:uppercase;font-weight:600;}
+  .stage-dark  .grouplbl{color:rgba(235,235,245,0.42);}
+  .stage-light .grouplbl{color:var(--label-tertiary);}
+
+  /* —— Liquid Glass field —————————————————— */
+  .gfield{
+    position:relative;isolation:isolate;
+    max-width:520px;padding:9px 14px;border-radius:11px;
+    font:var(--t-body);color:var(--label);
+    background:linear-gradient(180deg, rgba(255,255,255,0.70), rgba(255,255,255,0.38));
+    backdrop-filter: blur(18px) saturate(180%);
+    -webkit-backdrop-filter: blur(18px) saturate(180%);
+    box-shadow:
+      0 1px 2px rgba(15,20,30,0.08),
+      0 6px 18px rgba(15,20,30,0.06),
+      inset 0 1px 0 rgba(255,255,255,0.85),
+      inset 0 -0.5px 0 rgba(0,0,0,0.05),
+      inset 0 0 0 0.5px rgba(0,0,0,0.10);
+  }
+  .gfield::before{
+    content:"";position:absolute;inset:0.5px 0.5px auto 0.5px;height:42%;
+    border-radius:11px 11px 16px 16px / 11px 11px 80% 80%;
+    background:linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0));
+    pointer-events:none;
+  }
+  .gfield.focus{
+    box-shadow:
+      0 1px 2px rgba(10,132,255,0.10),
+      0 8px 24px rgba(10,132,255,0.18),
+      inset 0 1px 0 rgba(255,255,255,0.85),
+      inset 0 0 0 0.5px rgba(10,132,255,0.55),
+      0 0 0 3px rgba(10,132,255,0.18);
+  }
+  .stage-dark .gfield{
+    color:#FAFBFD;
+    background:linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.05));
+    box-shadow:
+      0 1px 2px rgba(0,0,0,0.30),
+      0 6px 18px rgba(0,0,0,0.25),
+      inset 0 1px 0 rgba(255,255,255,0.20),
+      inset 0 -0.5px 0 rgba(0,0,0,0.20),
+      inset 0 0 0 0.5px rgba(255,255,255,0.14);
+  }
+  .stage-dark .gfield.focus{
+    box-shadow:
+      0 1px 2px rgba(90,200,250,0.20),
+      0 8px 24px rgba(90,200,250,0.25),
+      inset 0 1px 0 rgba(255,255,255,0.22),
+      inset 0 0 0 0.5px rgba(90,200,250,0.65),
+      0 0 0 3px rgba(90,200,250,0.20);
+  }
+  .stage-dark .gfield input::placeholder{color:rgba(235,235,245,0.45);}
+  .stage-dark .gfield input{color:#FAFBFD;}
+  .caret{display:inline-block;width:1.5px;height:15px;background:#0A84FF;vertical-align:-3px;margin-left:1px;animation:caret 1s steps(1) infinite;}
+  .stage-dark .caret{background:#5AC8FA;}
+  @keyframes caret{50%{opacity:0;}}
+
+  /* —— Liquid Glass segmented —————————————— */
+  .gseg{
+    position:relative;isolation:isolate;
+    display:inline-flex;padding:3px;gap:0;border-radius:11px;
+    background:linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0.25));
+    backdrop-filter: blur(18px) saturate(180%);
+    -webkit-backdrop-filter: blur(18px) saturate(180%);
+    box-shadow:
+      inset 0 0.5px 0 rgba(255,255,255,0.7),
+      inset 0 0 0 0.5px rgba(0,0,0,0.08),
+      0 1px 2px rgba(15,20,30,0.06);
+  }
+  .gseg .seg{
+    position:relative;
+    font:600 12px/16px var(--font-text);
+    padding:6px 14px;border-radius:8px;color:var(--label-secondary);cursor:pointer;
+  }
+  .gseg .seg.active{
+    color:var(--label);
+    background:linear-gradient(180deg, rgba(255,255,255,0.95), rgba(255,255,255,0.78));
+    box-shadow:
+      0 1px 2px rgba(15,20,30,0.10),
+      0 2px 6px rgba(15,20,30,0.06),
+      inset 0 1px 0 rgba(255,255,255,0.95),
+      inset 0 0 0 0.5px rgba(0,0,0,0.06);
+    text-shadow: 0 0.5px 0 rgba(255,255,255,0.6);
+  }
+  .stage-dark .gseg{
+    background:linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04));
+    box-shadow:
+      inset 0 0.5px 0 rgba(255,255,255,0.18),
+      inset 0 0 0 0.5px rgba(255,255,255,0.10),
+      0 1px 2px rgba(0,0,0,0.25);
+  }
+  .stage-dark .gseg .seg{color:rgba(235,235,245,0.55);}
+  .stage-dark .gseg .seg.active{
+    color:#FAFBFD;
+    background:linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,255,255,0.12));
+    box-shadow:
+      0 1px 2px rgba(0,0,0,0.30),
+      0 2px 6px rgba(0,0,0,0.20),
+      inset 0 1px 0 rgba(255,255,255,0.30),
+      inset 0 0 0 0.5px rgba(255,255,255,0.18);
+    text-shadow:none;
+  }
+
+  /* —— Search field —————————————————— */
+  .gsearch{display:inline-flex;align-items:center;gap:7px;padding:7px 12px 7px 11px;}
+  .gsearch .ic{width:13px;height:13px;color:var(--label-tertiary);}
+  .stage-dark .gsearch .ic{color:rgba(235,235,245,0.45);}
+  .gsearch input{border:0;background:transparent;outline:none;font:var(--t-callout);color:var(--label);min-width:240px;}
+</style></head>
+<body>
+
+<div class="stack">
+  <div>
+    <div class="lbl">Inputs &amp; segmented · Liquid Glass</div>
+    <div class="meta">Glass refracts what's underneath — same chrome on cinematic dark or daylight light.</div>
+  </div>
+
+  <div class="stage-dark">
+    <div class="eyebrow">On dark surface</div>
+
+    <div class="group">
+      <div class="grouplbl">Text field · idea</div>
+      <div class="gfield focus">Refactor stage settlement so artifact discovery is bounded<span class="caret"></span></div>
+    </div>
+
+    <div class="group">
+      <div class="grouplbl">Segmented control</div>
+      <div class="gseg">
+        <div class="seg">All runs</div>
+        <div class="seg active">Active</div>
+        <div class="seg">Blocked</div>
+        <div class="seg">Completed</div>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="grouplbl">Search</div>
+      <div class="gfield gsearch" style="max-width:340px;">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M16 16l5 5"/></svg>
+        <input placeholder="Find a run, agent, or artifact" />
+      </div>
+    </div>
+  </div>
+
+  <div class="stage-light">
+    <div class="eyebrow">On light surface</div>
+
+    <div class="group">
+      <div class="grouplbl">Text field · idea</div>
+      <div class="gfield focus">Refactor stage settlement so artifact discovery is bounded<span class="caret"></span></div>
+    </div>
+
+    <div class="group">
+      <div class="grouplbl">Segmented · search</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+        <div class="gseg">
+          <div class="seg">All</div>
+          <div class="seg active">Active</div>
+          <div class="seg">Done</div>
+        </div>
+        <div class="gfield gsearch" style="max-width:280px;">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M16 16l5 5"/></svg>
+          <input placeholder="Find a run" />
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body></html>

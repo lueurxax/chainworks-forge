@@ -12,17 +12,17 @@ All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
 `control-plane/crates/engine/` (Rust daemon).
 
 **P031 Thin UI Boundary:**
-Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's 
-state via GraphQL projections. While the Swift engine remains implemented for 
-parity, the governed UI is prohibited from calling mutation paths in 
-`ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and 
+Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's
+state via GraphQL projections. While the Swift engine remains implemented for
+parity, the governed UI is prohibited from calling mutation paths in
+`ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and
 Approval actions move to external CLI/MCP workflows.
 
 **Rust Daemon Implementation:**
-The Rust control-plane daemon implements the same state machine and transition 
-semantics while adding robust capacity-aware scheduling, scheduler fairness, 
-executor backpressure, and host interruption recovery to handle concurrent runs 
-on a single host. See [rust-control-plane.md](rust-control-plane.md) for details 
+The Rust control-plane daemon implements the same state machine and transition
+semantics while adding robust capacity-aware scheduling, scheduler fairness,
+executor backpressure, and host interruption recovery to handle concurrent runs
+on a single host. See [rust-control-plane.md](rust-control-plane.md) for details
 on the daemon's scheduler, write serialization, and recovery logic.
 
 Related stable docs:
@@ -218,32 +218,32 @@ as the sole authority for stage progression.
 
 **Authority Rules:**
 - The compiled workflow graph is the only authority for legal next state selection.
-- Agent-authored `next_stage`, `next_action`, `run_state.json`, and narrative 
+- Agent-authored `next_stage`, `next_action`, `run_state.json`, and narrative
   transition hints are treated as **advisory evidence only**.
-- A legal declarative transition always takes precedence over a conflicting 
+- A legal declarative transition always takes precedence over a conflicting
   advisory hint.
 - An advisory `next_stage` absent from the graph never creates a synthetic state.
-- Multiple matched declarative transitions without a tie-break result in a 
+- Multiple matched declarative transitions without a tie-break result in a
   blocking conflict.
-- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate 
-  to true; they are classified as `invalid_expression` (undeclared) or 
+- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate
+  to true; they are classified as `invalid_expression` (undeclared) or
   `missing_input` (declared but absent).
 
 ### Aggregate Artifact Field Authority
 
-To ensure deterministic evaluation, aggregate artifact fields are classified by 
+To ensure deterministic evaluation, aggregate artifact fields are classified by
 authority (ARCH-035). For example, in `proposal_review_summary_v1`:
 
-- **Transition Authoritative**: `pass`, `blocker_count`, `blocking_issues`, 
+- **Transition Authoritative**: `pass`, `blocker_count`, `blocking_issues`,
   `required_changes`. These drive graph transitions.
-- **Advisory Only**: `next_action`, `next_stage`. These are recorded as 
+- **Advisory Only**: `next_action`, `next_stage`. These are recorded as
   advisory evidence but cannot select a graph transition alone.
-- **Contradiction Bearing**: `decision`. Used to detect internal aggregate 
+- **Contradiction Bearing**: `decision`. Used to detect internal aggregate
   inconsistency.
 
 ### Candidate Transition Evaluation
 
-Every transition evaluation produces a `CandidateTransitionEvaluation` record 
+Every transition evaluation produces a `CandidateTransitionEvaluation` record
 detailing why a transition matched or failed (ARCH-033).
 
 Results include:
@@ -256,14 +256,14 @@ Results include:
 ### Transition Input Dependency Classification
 
 Fail-closed behavior applies to all transition inputs (ARCH-036):
-- If a referenced artifact is not declared by the workflow/catalog contract, 
+- If a referenced artifact is not declared by the workflow/catalog contract,
   it is `invalid_expression`.
 - If declared but absent, it is `missing_input`.
 - `exists(unknown_artifact)` never returns true in graph-authoritative evaluation.
 
-### Workflow Conflict and Advisory Rejection
+#### Workflow Conflict and Advisory Rejection
 
-If graph authority cannot determine a single valid next state, the engine persists 
+If graph authority cannot determine a single valid next state, the engine persists
 a `WorkflowConflictRecord`:
 - `no_declarative_transition_matched`
 - `multiple_declarative_transitions_matched_without_tie_break`
@@ -272,10 +272,49 @@ a `WorkflowConflictRecord`:
 - `workflow_conflict_unverifiable`
 - `implementation_handoff_unavailable`
 
-If the graph advances legally despite a conflicting agent hint, the hint is 
+If the graph advances legally despite a conflicting agent hint, the hint is
 persisted as a `WorkflowAdvisoryRejectionRecord` for historical truth.
 
+#### Lead Conflict Mediation
+
+The engine provides automated conflict resolution through **Lead Conflict Mediation**.
+Eligible conflicts are routed to a system lead for same-run resolution before
+falling back to manual intervention.
+
+**Mediation Lifecycle:**
+1. **Detection**: A blocking conflict is detected and persisted.
+2. **Escalation**: If mediation is enabled and a system lead is resolvable via
+   `PhaseBLeadResolver`, the engine creates a `LeadConflictMediationRecord`.
+3. **Execution**: The system lead is invoked with the conflict context. The
+   execution is owned by the mediation record (`owner_kind: lead_conflict_mediation`).
+4. **Settlement**: Lead output must satisfy the lead agent's
+   `LeadResolutionContract`; malformed or absent output moves the mediation and
+   conflict to `terminal_unverifiable`.
+5. **Confirmation**: If the resolution requires operator sign-off, a
+   `lead_mediation_confirmation` is created in the separate mediation confirmation
+   store and appears in the mixed `approvals.list` inbox.
+6. **Resolution**: Once confirmed or auto-settled, the mediation outcome resolves
+    the conflict, enabling the orchestrator to advance the transition cursor.
+
+**Phase B Lead Resolver:**
+During Phase B, lead resolution uses a **versioned JSON compatibility map** (`docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`) as the sole machine-authoritative source for lead selection. This map defines exact matches between workflow/catalog pairs and their designated system lead. Fail-closed rules apply if no match or multiple matches exist.
+
+**Validation and Preflight**:
+Mandatory static validation and runtime preflight ensure exactly-one lead
+resolution and `LeadResolutionContract` coverage. Failure to resolve a valid
+lead results in a `terminal_unverifiable` conflict.
+
+**Observability**:
+P017 records workflow-conflict rollout metrics in durable
+`workflow_conflict_metric_events` rows. Phase C adds
+`phase_c_validation_outcome_total` for lead validation outcomes
+(`static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`), while
+conflict resolution records `workflow_conflict_time_to_resolution_seconds`,
+`conflict_reason_to_action_outcome_total`, and
+`recovery_action_chosen_total`.
+
 #### Status-based implementation handoff transitions
+
 
 The implementation completeness and handoff contract uses status-based
 transitions for the implementation loop. The `code_writer` exits the implementation
@@ -295,8 +334,8 @@ Classifies interrupted runs at app launch (ARCH-029). Three outcomes per run:
 
 ### Transition Cursor Authority
 
-Transition completion and cursor update are one atomic settlement unit (ARCH-034). 
-The run-level transition cursor is the authoritative continuation signal, 
+Transition completion and cursor update are one atomic settlement unit (ARCH-034).
+The run-level transition cursor is the authoritative continuation signal,
 anchoring the run at the current state when a blocking conflict exists.
 
 ---

@@ -1,14 +1,17 @@
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifact_contracts as artifact_contract_repos, artifacts, ideas,
-    projections, runs, stages, steward, validation,
+    agent_executions, agent_retry_budget_ledger, approvals,
+    artifact_contracts as artifact_contract_repos, artifacts, ideas, projections, runs, stages,
+    steward, validation,
 };
-use domain::agent::{AgentExecution, AgentStatus};
+use domain::agent::{AgentExecution, AgentStatus, ArtifactSourceClaimState};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
+use domain::artifact_contracts::{ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::mediation::OwnerKind;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::steward::{
@@ -29,6 +32,56 @@ async fn test_pool() -> sqlx::SqlitePool {
     create_pool("sqlite::memory:")
         .await
         .expect("in-memory pool failed")
+}
+
+async fn insert_p017_run(pool: &sqlx::SqlitePool) -> RunId {
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "P017".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(pool, &idea).await.unwrap();
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-p017".into(),
+        workflow_title: "P017".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(pool, &run).await.unwrap();
+    run.id
 }
 
 async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecutionId {
@@ -104,10 +157,11 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
 
     let execution = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: stage.id,
+        stage_execution_id: Some(stage.id),
         agent_id: "xcode_agent".into(),
         provider: "codex".into(),
         model: None,
+
         started_at: Utc::now(),
         completed_at: None,
         status: AgentStatus::Running,
@@ -131,10 +185,177 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
     execution.id
+}
+
+#[tokio::test]
+async fn p017_mediation_owned_agent_execution_does_not_require_stage_execution() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: None,
+        agent_id: "lead_orchestrator".into(),
+        provider: "codex".into(),
+        model: Some("test-model".into()),
+        started_at: now,
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: Some("mediation-001".into()),
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+        owner_kind: Some("lead_conflict_mediation".into()),
+        owner_id: Some("mediation-001".into()),
+        lead_mediation_record_id: Some("mediation-001".into()),
+        origin_stage_execution_id: None,
+    };
+
+    agent_executions::insert(&pool, &execution)
+        .await
+        .expect("insert mediation-owned execution");
+
+    let stored = agent_executions::find_by_id(&pool, execution.id)
+        .await
+        .expect("find execution")
+        .expect("execution exists");
+
+    assert_eq!(stored.stage_execution_id, None);
+    assert_eq!(
+        stored.owner_kind.as_deref(),
+        Some("lead_conflict_mediation")
+    );
+    assert_eq!(stored.owner_id.as_deref(), Some("mediation-001"));
+}
+
+#[tokio::test]
+async fn p017_mediation_owned_retry_budget_and_artifact_claims_are_owner_keyed() {
+    let pool = test_pool().await;
+    let run_id = insert_p017_run(&pool).await;
+    let now = Utc::now();
+    let execution = AgentExecution {
+        id: AgentExecutionId::new(),
+        stage_execution_id: None,
+        agent_id: "lead_orchestrator".into(),
+        provider: "codex".into(),
+        model: Some("test-model".into()),
+        started_at: now,
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: Some("mediation-claim-001".into()),
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+        owner_kind: Some("lead_conflict_mediation".into()),
+        owner_id: Some("mediation-claim-001".into()),
+        lead_mediation_record_id: Some("mediation-claim-001".into()),
+        origin_stage_execution_id: None,
+    };
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure_for_owner_tx(
+        &mut tx,
+        run_id,
+        OwnerKind::LeadConflictMediation,
+        "mediation-claim-001".into(),
+        None,
+        execution.id,
+        None,
+    )
+    .await
+    .unwrap();
+    let owner_rows = agent_retry_budget_ledger::list_quota_for_owner_tx(
+        &mut tx,
+        run_id,
+        OwnerKind::LeadConflictMediation,
+        "mediation-claim-001",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(ledger.stage_execution_id, None);
+    assert_eq!(ledger.owner_kind, OwnerKind::LeadConflictMediation);
+    assert_eq!(ledger.owner_id, "mediation-claim-001");
+    assert_eq!(owner_rows.len(), 1);
+    assert_eq!(owner_rows[0].id, ledger.id);
+
+    let key = ArtifactSourceGenerationClaimKey {
+        run_id,
+        owner_kind: OwnerKind::LeadConflictMediation,
+        owner_id: "mediation-claim-001".into(),
+        stage_execution_id: None,
+        agent_execution_id: execution.id,
+        source_work_item_id: "lead-mediation-work-item".into(),
+    };
+    artifact_contract_repos::insert_source_generation_claim(
+        &pool,
+        ArtifactSourceGenerationClaim {
+            key: key.clone(),
+            current_session_generation_id: Some("generation-1".into()),
+            claim_state: ArtifactSourceClaimState::Active,
+            superseding_work_item_id: None,
+            superseded_by_agent_execution_id: None,
+            supersession_journal_id: None,
+            superseded_at: None,
+            closed_at: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored_claim = artifact_contract_repos::load_source_generation_claim(&pool, &key)
+        .await
+        .unwrap()
+        .expect("mediation-owned claim");
+    assert_eq!(stored_claim.key.stage_execution_id, None);
+    assert_eq!(
+        stored_claim.key.owner_kind,
+        OwnerKind::LeadConflictMediation
+    );
+    assert_eq!(stored_claim.key.owner_id, "mediation-claim-001");
 }
 
 #[tokio::test]
@@ -600,7 +821,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
 
     let execution = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: stage.id,
+        stage_execution_id: Some(stage.id),
         agent_id: "proposal_writer".into(),
         provider: "claude".into(),
         model: Some("sonnet".into()),
@@ -627,6 +848,10 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -744,7 +969,7 @@ async fn proposal_048_persistence_fields_round_trip() {
 
     let execution = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: stage.id,
+        stage_execution_id: Some(stage.id),
         agent_id: "agent-p048".into(),
         provider: "codex".into(),
         model: Some("gpt-5.4".into()),
@@ -773,6 +998,10 @@ async fn proposal_048_persistence_fields_round_trip() {
         ),
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: Some(42),
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -898,7 +1127,7 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
 
     let execution = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: stage.id,
+        stage_execution_id: Some(stage.id),
         agent_id: "xcode_agent".into(),
         provider: "codex".into(),
         model: None,
@@ -925,6 +1154,10 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1056,6 +1289,70 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         recovered_observation.storage.corrupt_json_quarantined_bytes,
         "{not-json".len()
     );
+}
+
+#[tokio::test]
+async fn proposal_051_xcode_runtime_observation_append_serializes_parallel_writers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_file = tmp.path().join("p051-observation-contention.db");
+    let db_url = format!("sqlite://{}", db_file.display());
+    let pool = create_pool(&db_url).await.unwrap();
+    let execution_id = insert_p051_test_agent_execution(&pool).await;
+    let writer_count = 12usize;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writer_count));
+
+    let mut handles = Vec::new();
+    for idx in 0..writer_count {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            agent_executions::append_xcode_runtime_observation(
+                &pool,
+                execution_id,
+                XcodeRuntimeObservationUpdate::McpBrokerObservation(McpBrokerObservation {
+                    source: "xcode_mcp_broker".into(),
+                    backend_start_disposition: "lease_active".into(),
+                    pool_id: Some("pool-1".into()),
+                    lease_id: Some(format!("lease-{idx}")),
+                    xcode_pid: Some("36971".into()),
+                    backend_process_id: Some(25000 + idx as i64),
+                    http_endpoint: Some(format!("http://127.0.0.1:4000/xcode-mcp/lease-{idx}")),
+                    xcode_home_disposition: Some("host_operator_home_available".into()),
+                    xcode_tmpdir_disposition: Some("darwin_tmpdir_available".into()),
+                    simulator_selection: None,
+                    sibling_leases_at_spawn: Some(idx as i64),
+                    backend_initialize_wait_ms: Some(0),
+                    backend_startup_latency_ms: None,
+                    http_session_startup_latency_ms: None,
+                    backend_failure_class: None,
+                    originating_execution_id: Some(execution_id.to_string()),
+                    prompt_cycle_index: None,
+                    status_update: Some(format!("parallel observation {idx}")),
+                }),
+            )
+            .await
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+
+    let execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .expect("execution should exist");
+    let observation: XcodeRuntimeObservation = serde_json::from_str(
+        execution
+            .actual_xcode_runtime_observation_json
+            .as_deref()
+            .expect("observation should be persisted"),
+    )
+    .unwrap();
+    assert_eq!(observation.mcp_broker_observations.len(), writer_count);
+    assert!(!observation.storage.truncated);
+    assert_eq!(observation.storage.total_events_dropped, 0);
 }
 
 #[tokio::test]
@@ -1245,7 +1542,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
 
     let failed_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: failed_attempt.id,
+        stage_execution_id: Some(failed_attempt.id),
         agent_id: "reviewer".into(),
         provider: "claude".into(),
         model: None,
@@ -1272,10 +1569,14 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: successful_retry.id,
+        stage_execution_id: Some(successful_retry.id),
         agent_id: "reviewer".into(),
         provider: "claude".into(),
         model: None,
@@ -1302,6 +1603,10 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         actual_mcp_observation_json: None,
         actual_xcode_runtime_observation_json: None,
         mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await
@@ -1672,6 +1977,88 @@ async fn test_projection_parity_after_rebuild() {
 
     let stage_b = stage_rows.iter().find(|s| s.stage_id == "stage_b").unwrap();
     assert_eq!(stage_b.status, StageStatus::Failed.to_string());
+}
+
+/// Northbound projections must expose canonical run status even when the
+/// denormalized summary row has not caught up yet.
+#[tokio::test]
+async fn test_projection_status_uses_canonical_run_when_summary_lags() {
+    let pool = test_pool().await;
+
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Lagging summary idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-lag".into(),
+        workflow_title: "Lag Workflow".into(),
+        workspace_root: "/tmp/lag".into(),
+        artifact_root: "/tmp/lag/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("review".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
+    runs::update_status(&pool, run.id, RunStatus::Blocked)
+        .await
+        .unwrap();
+
+    let active = projections::list_active_projection(&pool).await.unwrap();
+    let active_row = active
+        .iter()
+        .find(|row| row.id == run.id.to_string())
+        .expect("active projection row");
+    assert_eq!(active_row.status, "blocked");
+    assert!(active_row.projection_lag);
+
+    let by_idea = projections::list_by_idea_projection(&pool, &idea.id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(by_idea[0].status, "blocked");
+    assert!(by_idea[0].projection_lag);
+
+    let found = projections::find_run_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap()
+        .expect("run projection");
+    assert_eq!(found.status, "blocked");
+    assert!(found.projection_lag);
 }
 
 // ---------------------------------------------------------------------------

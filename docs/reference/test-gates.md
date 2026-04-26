@@ -253,7 +253,7 @@ Important:
 
 ### `proposal-017`
 
-Proposal 017 Phase A workflow-authority and conflict-truth gate.
+Proposal 017 Phase A/B/C workflow-authority, conflict-truth, and lead-mediation gate.
 
 Scope:
 
@@ -265,14 +265,21 @@ Scope:
 - fail-closed unknown transition-input classification
 - per-surface `workflow_conflict` report shape parity (Swift/MCP/GraphQL)
 - transition cursor and resume consistency with conflict truth
-- Phase A only: this gate does not prove Phase B lead mediation or Phase C lead-validation coverage
+- **Lead Conflict Mediation**: Lead selection, mediation lifecycle,
+  owner-aware execution, and settlement validation.
+- **Mandatory Lead Validation**: Static workflow validation and runtime
+  preflight for lead resolution.
+- Phase B dogfood exit evidence, Phase C external catalog enforcement
+  inventory, known-issues migration record validation, and workflow-conflict
+  rollout metric fixtures.
 
 Use when:
 
 - changing workflow authority, transition evaluation, or conflict/advisory persistence
 - changing implementation-entry handoff or approved proposal freeze logic
-- changing report/API shapes for workflow conflicts
-- changing the Phase A workflow-conflict persistence/readback slice
+- changing lead mediation selection, lifecycle, or settlement
+- changing Phase C lead-validation or runtime preflight logic
+- changing report/API shapes for workflow conflicts or mediation records
 
 Host policy:
 
@@ -286,10 +293,25 @@ Command:
 
 Important:
 
-- this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
+- this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict/mediation) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
 - it validates that agent-authored `next_stage` cannot override the compiled graph
-- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the current Phase A slice
-- it must not be cited as proof for Rust `agent_executions` owner-kind migration, lead mediation runtime, or Phase C lead-validation requirements until those surfaces and tests exist
+- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the full P017 slice
+- it proves Rust `agent_executions` owner-kind migration, lead mediation runtime, and lead-validation requirements
+- it verifies the P017 evidence bundle under `docs/proposals/017-evidence/`,
+  including flag-gated dogfood closeout and external catalog attestation
+
+### Phase 0 Contract Freeze
+
+The `proposal-017` gate verifies the existence and approval status of required Phase 0 backend contract artifacts before implementation proceeds. These artifacts are the canonical sources of truth for major migration seams:
+
+- **Approval Mediation**: `docs/proposals/017-evidence/phase-0-approval-mediation-contract.json`
+- **Execution Identity**: `docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md`
+- **Work Item Owner**: `docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json`
+- **Lead Resolver**: `docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`
+- **Settlement Boundary**: `docs/proposals/017-evidence/phase-0-settlement-service-boundary.md`
+- **Dogfood Exit Record**: `docs/proposals/017-evidence/phase-b-dogfood-exit-record.json`
+- **Phase C Inventory**: `docs/proposals/017-evidence/phase-c-external-catalog-enforcement-inventory.json`
+- **Known Issues Migration Records**: `docs/proposals/017-evidence/phase-a-known-issues-migration-records.json`
 
 ### `proposal-019`
 
@@ -919,12 +941,12 @@ Command:
 
 ### `p051-scaffold`
 
-Proposal 051 scaffold gate for the shared Xcode MCP bridge pool substrate.
+Historical bridge-pool scaffold gate alias for the shared Xcode MCP bridge pool substrate.
 
 Scope:
 
-- static stale-guidance check for the checked-in P051 proposal
-- workflow/catalog P051 field and lint fixtures
+- static stale-guidance check for the stable Xcode MCP bridge pool reference
+- workflow/catalog Xcode broker field and lint fixtures
 - DB/domain Xcode runtime observation append and persistence fixtures
 - ACP provider capability / brokered Xcode intent fixtures
 - Xcode MCP bridge pool lease, capacity, target-resolution, and observation fixtures
@@ -935,14 +957,14 @@ Use when:
 
 - changing brokered Xcode MCP intent resolution, provider HTTP MCP capability checks, or session/new lease attachment
 - changing Xcode runtime observation shape, append semantics, or broker failure classes
-- changing daemon/API scaffolding that must remain compatible with the full P051 gate
+- changing daemon/API scaffolding that must remain compatible with the full bridge-pool gate
 - reproving scaffold readiness before broader live Xcode proof
 
 Host policy:
 
 - local Rust toolchain required
 - no live provider account, Xcode consent interaction, simulator, remote UI host, or live dogfood run required
-- fixture evidence only; this gate does not satisfy P051 pre-ship dogfood/sign-off
+- fixture evidence only; this gate does not prove production packaged-daemon release readiness
 
 Command:
 
@@ -952,18 +974,18 @@ Command:
 
 Important:
 
-- the gate fails if `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` reintroduces stale contrary guidance for the implemented contract
-- P051 dependency/readiness artifacts live under [../evidence/051-shared-xcode-mcp-bridge-pool/](../evidence/051-shared-xcode-mcp-bridge-pool/)
+- the gate fails if [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md) reintroduces stale contrary guidance for the implemented contract
+- bridge-pool dependency/readiness evidence lives under [../evidence/051-shared-xcode-mcp-bridge-pool/](../evidence/051-shared-xcode-mcp-bridge-pool/)
 
 ### `proposal-051|p051`
 
-Proposal 051 shared Xcode MCP bridge pool fixture/readback gate.
+Historical gate aliases for the shared Xcode MCP bridge pool fixture/readback gate.
 
 Scope:
 
 - all `p051-scaffold` checks
-- domain artifact-contract compatibility fixture used by P051 readback
-- repeated workflow/DB/ACP/engine P051 fixture inventory under the full gate target directory
+- domain artifact-contract compatibility fixture used by bridge-pool readback
+- repeated workflow/DB/ACP/engine bridge-pool fixture inventory under the full gate target directory
 - GraphQL and MCP server compile checks
 - focused Swift readback tests for timeline inspector and daemon lifecycle broker health consumption
 
@@ -971,13 +993,13 @@ Use when:
 
 - changing implemented shared Xcode MCP bridge pool behavior
 - changing Xcode runtime observation readback in GraphQL, MCP reports, or Swift operator surfaces
-- preparing fixture-level P051 readiness evidence before live dogfood
+- preparing fixture/readback evidence for the implemented bridge-pool contract
 
 Host policy:
 
 - local Rust and macOS Swift test toolchains required
 - no remote UI host or app-launched dogfood proof is run by this gate
-- this is a fixture/readback gate, not release-owner sign-off
+- this is a fixture/readback gate, not production packaged-daemon release proof
 
 Command:
 
@@ -990,8 +1012,8 @@ Important:
 
 - `proposal-051` and `p051` are aliases
 - the stable behavior reference is [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md)
-- P051 pre-ship readiness still requires a separate live dogfood/sign-off artifact; do not mark the proposal fully complete from this gate alone
-- the current dogfood stop sign is [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md)
+- scoped broker/readback closeout sign-off is recorded in [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md)
+- broad release or broad `shim_enforced` rollout still requires the P042 `proposal-042-packaging` release-host proof
 
 ### `proposal-054|p054`
 

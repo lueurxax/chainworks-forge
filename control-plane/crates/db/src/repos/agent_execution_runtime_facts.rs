@@ -94,6 +94,8 @@ pub async fn list_by_run(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Vec<AgentExecutionRuntimeFacts>> {
+    // P017: Include both stage-owned executions (via stage_executions join)
+    // and mediation-owned executions (via lead_conflict_mediations join).
     let rows = sqlx::query(
         r#"SELECT arf.agent_execution_id, arf.failure_kind, arf.failure_kind_raw_debug,
                   arf.failure_kind_version, arf.failure_message_redacted,
@@ -105,8 +107,11 @@ pub async fn list_by_run(
                   arf.session_reuse_reason, arf.quota_ledger_id, arf.created_at, arf.updated_at
            FROM agent_execution_runtime_facts arf
            INNER JOIN agent_executions ae ON ae.id = arf.agent_execution_id
-           INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-           WHERE se.run_id = ?1
+           LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+           LEFT JOIN lead_conflict_mediations lcm
+               ON ae.owner_kind = 'lead_conflict_mediation'
+               AND ae.lead_mediation_record_id = lcm.id
+           WHERE se.run_id = ?1 OR lcm.run_id = ?1
            ORDER BY ae.started_at ASC"#,
     )
     .bind(run_id.to_string())

@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Display type</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{font-family:var(--font-text);color:var(--label);-webkit-font-smoothing:antialiased;height:220px;overflow:hidden;}
+  .card{padding:20px 24px;height:100%;box-sizing:border-box;}
+  .lbl{font:var(--t-caption2);letter-spacing:var(--tracking-wide);color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .row{display:flex;gap:12px;align-items:center;}
+  .row.tight{gap:6px;}
+  .stack{display:flex;flex-direction:column;gap:12px;}
+  .meta{display:flex;flex-direction:column;gap:2px;}
+  .meta .name{font:var(--t-caption1);font-weight:600;color:var(--label);}
+  .meta .val{font-family:var(--font-mono);font-size:10.5px;color:var(--label-secondary);}
+  .capsule{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;font:var(--t-caption1);font-weight:600;border-radius:999px;}
+</style></head>
+<body><div class="card">
+<div class="stack" style="gap:8px;">
+  <div style="font:700 34px/41px var(--font-display);letter-spacing:-0.022em;">Large Title — Run started</div>
+  <div style="font:600 28px/34px var(--font-display);letter-spacing:-0.022em;">Title 1 — Approval gate</div>
+  <div style="font:600 22px/28px var(--font-display);letter-spacing:-0.022em;">Title 2 — screenTitle</div>
+  <div style="font:600 17px/22px var(--font-display);letter-spacing:-0.022em;">Title 3 — Run #248</div>
+</div>
+</div></body></html>
