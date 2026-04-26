@@ -9,9 +9,21 @@ app:
     - gemini_acp
 artifacts:
   idea_brief: ${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
   proposal_review_ux: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ux.json
   proposal_review_ui: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json
 contracts:
+  LeadResolutionContract:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: lead_resolution_raw
+    normalized_artifact_name: lead_resolution
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
   proposal_review_v1:
     format: json
     machine_format: json
@@ -119,8 +131,10 @@ agents:
   - id: p051_dogfood_orchestrator
     title: P051 Dogfood Orchestrator
     mode: orchestration
+    system_role: lead
     backend_profile: claude_orchestrator_p051
     permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     inputs:
       - input.idea
     outputs:

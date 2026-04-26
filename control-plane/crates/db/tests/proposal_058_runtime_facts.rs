@@ -16,6 +16,7 @@ use domain::artifact_contracts::{
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::mediation::OwnerKind;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 
@@ -111,7 +112,7 @@ async fn seed_execution(
         pool,
         &AgentExecution {
             id: agent_execution_id,
-            stage_execution_id,
+            stage_execution_id: Some(stage_execution_id),
             agent_id: "code_writer".into(),
             provider: "claude".into(),
             model: Some("sonnet".into()),
@@ -315,7 +316,9 @@ async fn proposal_058_retry_enqueue_pending_supersession_blocks_late_import() {
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id,
         source_work_item_id: source_work_item_id.clone(),
     };
@@ -433,7 +436,9 @@ async fn proposal_058_import_before_supersession_keeps_accepted_active_truth() {
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id,
         source_work_item_id: source_work_item_id.clone(),
     };
@@ -516,7 +521,9 @@ async fn proposal_058_ignored_late_projection_and_runtime_facts_commit_or_rollba
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id,
         source_work_item_id: source_work_item_id.clone(),
     };
@@ -633,7 +640,9 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id,
         source_work_item_id: source_work_item_id.clone(),
     };

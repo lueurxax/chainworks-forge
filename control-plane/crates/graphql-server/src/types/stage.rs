@@ -163,7 +163,10 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
     fn from(execution: domain::agent::AgentExecution) -> Self {
         GqlAgentExecution {
             id: ID(execution.id.to_string()),
-            stage_execution_id: ID(execution.stage_execution_id.to_string()),
+            stage_execution_id: ID(execution
+                .stage_execution_id
+                .expect("stage-scoped GraphQL agent execution requires stage_execution_id")
+                .to_string()),
             agent_id: execution.agent_id,
             provider: execution.provider,
             model: execution.model,
@@ -770,7 +773,7 @@ mod tests {
         .to_string();
         let execution = AgentExecution {
             id: AgentExecutionId::new(),
-            stage_execution_id: StageExecutionId::new(),
+            stage_execution_id: Some(StageExecutionId::new()),
             agent_id: "code_writer".into(),
             provider: "codex".into(),
             model: Some("gpt-5".into()),

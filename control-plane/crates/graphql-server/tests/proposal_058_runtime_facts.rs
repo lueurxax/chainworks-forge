@@ -122,7 +122,7 @@ async fn seed_execution(
         pool,
         &AgentExecution {
             id: agent_execution_id,
-            stage_execution_id,
+            stage_execution_id: Some(stage_execution_id),
             agent_id: "code_writer".into(),
             provider: "claude".into(),
             model: Some("sonnet".into()),

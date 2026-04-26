@@ -379,6 +379,7 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `workflow_advisory_rejections` | Non-blocking historical records of rejected agent hints |
 | `lead_conflict_mediations` | Durable mediation lifecycle (id, run_id, conflict_id, status, lead_agent_id, settlement_result) |
 | `lead_mediation_confirmations` | Separate store for mediation confirmations (id, mediation_id, status, deadline_at, suggested_action) |
+| `workflow_conflict_metric_events` | Durable rollout metric events for workflow conflict recovery, mediation, Phase C validation, and dogfood decisions |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
@@ -426,15 +427,17 @@ This keeps projections eventually consistent with canonical tables within a sing
 
 ## Metrics and Observability
 
-The control plane emits rollout metrics to track conflict resolution and mediation effectiveness.
+The control plane records rollout metrics as durable `workflow_conflict_metric_events`
+rows so operator feedback and dogfood gates are auditable from repository-backed
+state, not only process logs.
 
 ### Rollout Metrics
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `workflow_conflict_time_to_resolution_seconds` | Histogram | `conflict_reason` | Time from conflict detection to resolution or terminal settlement. |
-| `conflict_reason_to_action_outcome_total` | Counter | `conflict_reason`, `outcome` | Counts outcomes (resolved, terminal, superseded) per conflict reason. |
-| `recovery_action_chosen_total` | Counter | `action_kind` | Counts chosen recovery actions (retry, clone, manual_fallback). |
+| `workflow_conflict_time_to_resolution_seconds` | Histogram event | `conflict_reason`, `resolution_mode` | Time from conflict detection to resolution or terminal settlement. |
+| `conflict_reason_to_action_outcome_total` | Counter event | `conflict_reason`, `action_class`, `terminal_status` | Counts outcomes (resolved, terminal, superseded) per conflict reason. |
+| `recovery_action_chosen_total` | Counter event | `conflict_reason`, `action_class`, `source_surface`, `result` | Counts chosen recovery actions (retry, clone, manual_fallback). |
 | `phase_c_validation_outcome_total` | Counter | `outcome` | Phase C validation results: `static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`. |
 
 ## Work queue

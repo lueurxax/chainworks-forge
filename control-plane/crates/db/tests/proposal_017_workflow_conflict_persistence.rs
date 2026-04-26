@@ -403,6 +403,69 @@ async fn p017_advisory_rejection_persists_selected_graph_transition() {
 }
 
 #[tokio::test]
+async fn p017_workflow_conflict_resolution_records_operator_feedback_metrics() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let conflict = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-metrics",
+        "No declarative transition matched",
+        WorkflowConflictStatus::Unresolved,
+        -90,
+    );
+    let stored = workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+    let resolved_at = Utc::now();
+
+    let mut tx = pool.begin().await.unwrap();
+    let resolved = workflow_conflicts::transition_conflict_status_tx(
+        &mut tx,
+        &stored.conflict_id,
+        WorkflowConflictStatus::Resolved,
+        resolved_at,
+        Some(serde_json::json!({
+            "resolution_kind": "operator_selected_candidate_transition",
+            "action_class": "operator_selected_candidate_transition",
+        })),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    workflow_conflicts::record_recovery_action_chosen_tx(
+        &mut tx,
+        &resolved,
+        "operator_selected_candidate_transition",
+        "mcp",
+        "accepted",
+        resolved_at,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let names: Vec<&str> = events
+        .iter()
+        .map(|event| event.metric_name.as_str())
+        .collect();
+
+    assert!(names.contains(&"workflow_conflict_time_to_resolution_seconds"));
+    assert!(names.contains(&"conflict_reason_to_action_outcome_total"));
+    assert!(names.contains(&"recovery_action_chosen_total"));
+    assert!(events.iter().any(|event| {
+        event.metric_name == "recovery_action_chosen_total"
+            && event.labels_json["conflict_reason"] == "no_declarative_transition_matched"
+            && event.labels_json["action_class"] == "operator_selected_candidate_transition"
+            && event.labels_json["source_surface"] == "mcp"
+    }));
+}
+
+#[tokio::test]
 async fn p017_transition_cursor_upserts_run_settlement_boundary() {
     let pool = test_pool().await;
     let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;

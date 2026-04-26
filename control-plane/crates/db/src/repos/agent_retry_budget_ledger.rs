@@ -4,12 +4,15 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::agent::AgentFailureKind;
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
+use domain::mediation::OwnerKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRetryBudgetLedgerRow {
     pub id: String,
     pub run_id: RunId,
-    pub stage_execution_id: StageExecutionId,
+    pub owner_kind: OwnerKind,
+    pub owner_id: String,
+    pub stage_execution_id: Option<StageExecutionId>,
     pub agent_execution_id: AgentExecutionId,
     pub failure_kind: AgentFailureKind,
     pub retry_after: Option<DateTime<Utc>>,
@@ -48,13 +51,34 @@ pub async fn upsert_quota_failure_tx(
     agent_execution_id: AgentExecutionId,
     retry_after: Option<DateTime<Utc>>,
 ) -> Result<AgentRetryBudgetLedgerRow> {
+    upsert_quota_failure_for_owner_tx(
+        tx,
+        run_id,
+        OwnerKind::StageExecution,
+        stage_execution_id.to_string(),
+        Some(stage_execution_id),
+        agent_execution_id,
+        retry_after,
+    )
+    .await
+}
+
+pub async fn upsert_quota_failure_for_owner_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    owner_kind: OwnerKind,
+    owner_id: String,
+    stage_execution_id: Option<StageExecutionId>,
+    agent_execution_id: AgentExecutionId,
+    retry_after: Option<DateTime<Utc>>,
+) -> Result<AgentRetryBudgetLedgerRow> {
     let failure_kind = AgentFailureKind::ProviderQuota;
     let retry_after_key = retry_after
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(|| "none".to_string());
     let idempotency_key = format!(
-        "{}:{}:{}:{}:{}",
-        run_id, stage_execution_id, agent_execution_id, retry_after_key, failure_kind
+        "{}:{}:{}:{}:{}:{}",
+        run_id, owner_kind, owner_id, agent_execution_id, retry_after_key, failure_kind
     );
     let now = Utc::now();
     let state = match retry_after {
@@ -64,9 +88,9 @@ pub async fn upsert_quota_failure_tx(
 
     sqlx::query(
         r#"INSERT INTO agent_retry_budget_ledger
-           (id, run_id, stage_execution_id, agent_execution_id, failure_kind, retry_after,
+           (id, run_id, owner_kind, owner_id, stage_execution_id, agent_execution_id, failure_kind, retry_after,
             normal_budget_consumed, early_retry_journal_id, idempotency_key, state, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7, ?8, ?9, ?9)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, ?10, ?11, ?11)
            ON CONFLICT(idempotency_key) DO UPDATE SET
              retry_after = excluded.retry_after,
              state = excluded.state,
@@ -74,7 +98,9 @@ pub async fn upsert_quota_failure_tx(
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(run_id.to_string())
-    .bind(stage_execution_id.to_string())
+    .bind(owner_kind.to_string())
+    .bind(&owner_id)
+    .bind(stage_execution_id.map(|id| id.to_string()))
     .bind(agent_execution_id.to_string())
     .bind(failure_kind.to_string())
     .bind(retry_after.map(|dt| dt.to_rfc3339()))
@@ -93,7 +119,7 @@ pub async fn find_by_idempotency_key_tx(
 ) -> Result<AgentRetryBudgetLedgerRow> {
     let row = sqlx::query(
         r#"SELECT id, run_id, stage_execution_id, agent_execution_id, failure_kind,
-                  retry_after, normal_budget_consumed, early_retry_journal_id,
+                  owner_kind, owner_id, retry_after, normal_budget_consumed, early_retry_journal_id,
                   idempotency_key, state, created_at, updated_at
            FROM agent_retry_budget_ledger
            WHERE idempotency_key = ?1"#,
@@ -109,16 +135,32 @@ pub async fn list_quota_for_stage_tx(
     run_id: RunId,
     stage_execution_id: StageExecutionId,
 ) -> Result<Vec<AgentRetryBudgetLedgerRow>> {
+    list_quota_for_owner_tx(
+        tx,
+        run_id,
+        OwnerKind::StageExecution,
+        &stage_execution_id.to_string(),
+    )
+    .await
+}
+
+pub async fn list_quota_for_owner_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    owner_kind: OwnerKind,
+    owner_id: &str,
+) -> Result<Vec<AgentRetryBudgetLedgerRow>> {
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_execution_id, agent_execution_id, failure_kind,
-                  retry_after, normal_budget_consumed, early_retry_journal_id,
+                  owner_kind, owner_id, retry_after, normal_budget_consumed, early_retry_journal_id,
                   idempotency_key, state, created_at, updated_at
            FROM agent_retry_budget_ledger
-           WHERE run_id = ?1 AND stage_execution_id = ?2 AND failure_kind = ?3
+           WHERE run_id = ?1 AND owner_kind = ?2 AND owner_id = ?3 AND failure_kind = ?4
            ORDER BY created_at ASC"#,
     )
     .bind(run_id.to_string())
-    .bind(stage_execution_id.to_string())
+    .bind(owner_kind.to_string())
+    .bind(owner_id)
     .bind(AgentFailureKind::ProviderQuota.to_string())
     .fetch_all(&mut **tx)
     .await?;
@@ -171,7 +213,7 @@ pub async fn find_by_id_tx(
 ) -> Result<AgentRetryBudgetLedgerRow> {
     let row = sqlx::query(
         r#"SELECT id, run_id, stage_execution_id, agent_execution_id, failure_kind,
-                  retry_after, normal_budget_consumed, early_retry_journal_id,
+                  owner_kind, owner_id, retry_after, normal_budget_consumed, early_retry_journal_id,
                   idempotency_key, state, created_at, updated_at
            FROM agent_retry_budget_ledger
            WHERE id = ?1"#,
@@ -184,7 +226,8 @@ pub async fn find_by_id_tx(
 
 fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentRetryBudgetLedgerRow> {
     let run_id: String = row.get("run_id");
-    let stage_execution_id: String = row.get("stage_execution_id");
+    let owner_kind: String = row.get("owner_kind");
+    let stage_execution_id: Option<String> = row.get("stage_execution_id");
     let agent_execution_id: String = row.get("agent_execution_id");
     let failure_kind: String = row.get("failure_kind");
     let retry_after: Option<String> = row.get("retry_after");
@@ -193,9 +236,11 @@ fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentRetryBudgetLedgerRow>
     Ok(AgentRetryBudgetLedgerRow {
         id: row.get("id"),
         run_id: run_id.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
+        owner_kind: owner_kind.parse().map_err(anyhow::Error::msg)?,
+        owner_id: row.get("owner_id"),
         stage_execution_id: stage_execution_id
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+            .map(|value| value.parse().map_err(|e| anyhow::anyhow!("{e}")))
+            .transpose()?,
         agent_execution_id: agent_execution_id
             .parse()
             .map_err(|e| anyhow::anyhow!("{e}"))?,

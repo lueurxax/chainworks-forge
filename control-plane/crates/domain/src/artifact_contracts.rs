@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::agent::{AgentOutputSettlement, ArtifactSourceClaimState};
 use crate::ids::{AgentExecutionId, ArtifactId, RunId, StageExecutionId};
+use crate::mediation::OwnerKind;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedContractStatus {
@@ -238,7 +239,9 @@ pub struct ActiveArtifactGenerationInput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactSourceGenerationClaimKey {
     pub run_id: RunId,
-    pub stage_execution_id: StageExecutionId,
+    pub owner_kind: OwnerKind,
+    pub owner_id: String,
+    pub stage_execution_id: Option<StageExecutionId>,
     pub agent_execution_id: AgentExecutionId,
     pub source_work_item_id: String,
 }

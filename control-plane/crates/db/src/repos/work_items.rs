@@ -926,14 +926,15 @@ pub async fn requeue_running_invoke_agent_after_active_prompt_close_tx(
                superseding_work_item_id = ?2,
                superseded_at = ?3,
                updated_at = ?3
-           WHERE run_id = ?4 AND stage_execution_id = ?5 AND agent_execution_id = ?6
-             AND source_work_item_id = ?7 AND claim_state = ?8"#,
+           WHERE run_id = ?4 AND owner_kind = ?5 AND owner_id = ?6 AND agent_execution_id = ?7
+             AND source_work_item_id = ?8 AND claim_state = ?9"#,
     )
     .bind(ArtifactSourceClaimState::SupersededPendingRetry.to_string())
     .bind(work_item_id)
     .bind(&now)
     .bind(claim_key.run_id.to_string())
-    .bind(claim_key.stage_execution_id.to_string())
+    .bind(claim_key.owner_kind.to_string())
+    .bind(&claim_key.owner_id)
     .bind(claim_key.agent_execution_id.to_string())
     .bind(&claim_key.source_work_item_id)
     .bind(ArtifactSourceClaimState::Active.to_string())

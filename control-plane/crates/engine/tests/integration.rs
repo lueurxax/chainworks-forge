@@ -221,7 +221,7 @@ fn make_agent_execution(
 ) -> AgentExecution {
     AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id,
+        stage_execution_id: Some(stage_execution_id),
         agent_id: "worker".into(),
         provider: "claude".into(),
         model: None,
@@ -2699,12 +2699,22 @@ states:
         &catalog_path,
         r#"
 artifacts:
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
 backend_profiles:
   code_writer_profile:
     provider: codex
+permission_profiles:
+  ORCH: {}
 contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
   implementation_self_assessment_v2:
     format: json
     required_fields:
@@ -2717,7 +2727,10 @@ contracts:
       - docs_impacted
 agents:
   - id: code_writer
+    system_role: lead
     backend_profile: code_writer_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     output_contract: implementation_self_assessment_v2
 "#,
     )
@@ -2839,12 +2852,22 @@ states:
         &catalog_path,
         r#"
 artifacts:
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
   approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
 backend_profiles:
   code_writer_profile:
     provider: codex
+permission_profiles:
+  ORCH: {}
 contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
   implementation_self_assessment_v2:
     format: json
     required_fields:
@@ -2857,7 +2880,10 @@ contracts:
       - docs_impacted
 agents:
   - id: code_writer
+    system_role: lead
     backend_profile: code_writer_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     output_contract: implementation_self_assessment_v2
 "#,
     )
@@ -6870,7 +6896,7 @@ sys.exit(0)
 
     let running_exec = AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id: stage_exec_id,
+        stage_execution_id: Some(stage_exec_id),
         agent_id: "reuse-agent".into(),
         provider: "claude".into(),
         model: None,
@@ -9803,6 +9829,31 @@ fn p017_lead_resolver_ambiguous_match_fails_closed() {
         }
         LeadResolution::Resolved { .. } => {
             panic!("Should fail closed on ambiguous match");
+        }
+    }
+}
+
+#[test]
+fn p017_phase_b_checked_in_lead_resolver_resolves_bundled_workflows() {
+    use engine::mediation::lead_resolver::*;
+
+    let resolver_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json");
+    let resolver = PhaseBLeadResolver::load_from_file(&resolver_path.to_string_lossy())
+        .expect("checked-in Phase B resolver loads");
+
+    for workflow_path in [
+        "examples/workflows/full-mvp-live.yaml",
+        "examples/workflows/workflow.yaml",
+        "examples/workflows/proposal-loop-live.yaml",
+    ] {
+        match resolver.resolve(workflow_path, "examples/agents/agents.yaml") {
+            LeadResolution::Resolved { lead_agent_id, .. } => {
+                assert_eq!(lead_agent_id, "lead_orchestrator");
+            }
+            LeadResolution::FailedClosed { reason } => {
+                panic!("{workflow_path} should resolve exactly one lead: {reason}");
+            }
         }
     }
 }

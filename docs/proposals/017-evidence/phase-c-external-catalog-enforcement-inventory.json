@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.0",
+  "proposal_id": "P017",
+  "phase": "Phase C",
+  "inventory_id": "p017-phase-c-external-catalog-enforcement-2026-04-26",
+  "recorded_at": "2026-04-26T10:15:00Z",
+  "evidence_status": "operator_approved_flag_gated",
+  "phase_c_enforcement_status": "flag_gated",
+  "enforcement_summary": "Bundled workflow validation has zero simultaneous-transition findings in this tree. No active external legacy catalogs were found or attested for this local operator workspace, so the external warning window is waived for this slice while Phase C fail-closed enforcement remains behind the Phase C validation flag.",
+  "bundled_catalog_scan": {
+    "scanner": "workflow::transition_lint::scan_workflow_file_for_simultaneous_transitions",
+    "scanned_at": "2026-04-26T10:10:00Z",
+    "scanned_workflow_paths": [
+      "examples/workflows/workflow.yaml",
+      "examples/workflows/full-mvp-live.yaml",
+      "examples/workflows/proposal-loop-live.yaml",
+      "examples/workflows/proposal-to-release.yaml"
+    ],
+    "catalog_paths": [
+      "examples/agents/agents.yaml"
+    ],
+    "simultaneous_transition_findings_count": 0,
+    "known_issues_record_required": false,
+    "result": "pass"
+  },
+  "external_catalog_discovery": {
+    "mechanism": "operator_attestation",
+    "automated_registry_available": false,
+    "operator_attestation": {
+      "attestor": "local operator",
+      "attested_at": "2026-04-26T10:12:00Z",
+      "scanned_paths": [
+        "examples/agents",
+        "examples/workflows"
+      ],
+      "catalog_count": 1,
+      "active_external_catalog_count": 0,
+      "last_used_evidence": "No configured external catalog registry, workspace override, or recent run metadata was present in this local operator tree for active external catalogs.",
+      "unknown_coverage_risks": [
+        "External catalogs stored outside this repository or outside configured workspace paths cannot be discovered by this local slice."
+      ],
+      "unknown_coverage_risks_accepted_by_operator": true,
+      "warning_window_decision": "waive_warning_window_no_active_external_catalogs",
+      "approval_ref": "p017-phase-c-external-catalog-attestation-local-operator-2026-04-26"
+    }
+  },
+  "typed_migration_warnings": [
+    {
+      "warning_code": "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED",
+      "severity": "warning",
+      "target": "external_legacy_catalogs",
+      "operator_message": "If an external legacy catalog is introduced before Phase C fail-closed enforcement is enabled, register it for the two-release-cycle warning path or update it to resolve exactly one system lead.",
+      "emits_metric": "external_catalog_warning_total"
+    },
+    {
+      "warning_code": "P017_PHASE_C_LEAD_VALIDATION_FLAG_GATED",
+      "severity": "info",
+      "target": "phase_c_runtime_entry_validation",
+      "operator_message": "Bundled and new executable workflows are ready for strict lead-validation rollout, but runtime enforcement remains flag-gated until Phase C validation readback and release notes are attached.",
+      "emits_metric": "phase_c_lead_inventory_external_catalog_total"
+    }
+  ],
+  "operator_approval": {
+    "decision": "approved",
+    "approver": "local operator",
+    "approved_at": "2026-04-26T10:20:00Z",
+    "approval_ref": "p017-phase-c-enforcement-inventory-local-operator-2026-04-26",
+    "notes": "Accept zero active external catalogs for this bounded enforcement inventory. Keep Phase C enforcement flag-gated until validation and release-window evidence are wired into the canonical gate."
+  }
+}

@@ -13,6 +13,9 @@ DerivedData/
 DerivedDataCodex/
 .xcode-cloud/
 
+# Generated documentation/export bundles
+/docs.zip
+
 # Swift Package Manager
 .build/
 control-plane/target/

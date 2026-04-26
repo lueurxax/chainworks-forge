@@ -15,6 +15,7 @@ use domain::artifact_contracts::{
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::ids::{AgentExecutionId, ArtifactId, RunId};
+use domain::mediation::OwnerKind;
 
 use crate::pool::{begin_immediate_with_retry, log_write_transaction};
 
@@ -264,14 +265,16 @@ pub async fn insert_source_generation_claim_tx(
 ) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO artifact_source_generation_claims
-           (run_id, stage_execution_id, agent_execution_id, source_work_item_id,
+           (run_id, owner_kind, owner_id, stage_execution_id, agent_execution_id, source_work_item_id,
             current_session_generation_id, claim_state, superseding_work_item_id,
             superseded_by_agent_execution_id, supersession_journal_id, superseded_at,
             closed_at, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
     )
     .bind(claim.key.run_id.to_string())
-    .bind(claim.key.stage_execution_id.to_string())
+    .bind(claim.key.owner_kind.to_string())
+    .bind(&claim.key.owner_id)
+    .bind(claim.key.stage_execution_id.map(|id| id.to_string()))
     .bind(claim.key.agent_execution_id.to_string())
     .bind(&claim.key.source_work_item_id)
     .bind(&claim.current_session_generation_id)
@@ -303,16 +306,17 @@ pub async fn load_source_generation_claim_tx(
     key: &ArtifactSourceGenerationClaimKey,
 ) -> Result<Option<ArtifactSourceGenerationClaim>> {
     let row = sqlx::query(
-        r#"SELECT run_id, stage_execution_id, agent_execution_id, source_work_item_id,
+        r#"SELECT run_id, owner_kind, owner_id, stage_execution_id, agent_execution_id, source_work_item_id,
                   current_session_generation_id, claim_state, superseding_work_item_id,
                   superseded_by_agent_execution_id, supersession_journal_id, superseded_at,
                   closed_at, created_at, updated_at
            FROM artifact_source_generation_claims
-           WHERE run_id = ?1 AND stage_execution_id = ?2 AND agent_execution_id = ?3
-             AND source_work_item_id = ?4"#,
+           WHERE run_id = ?1 AND owner_kind = ?2 AND owner_id = ?3 AND agent_execution_id = ?4
+             AND source_work_item_id = ?5"#,
     )
     .bind(key.run_id.to_string())
-    .bind(key.stage_execution_id.to_string())
+    .bind(key.owner_kind.to_string())
+    .bind(&key.owner_id)
     .bind(key.agent_execution_id.to_string())
     .bind(&key.source_work_item_id)
     .fetch_optional(&mut **tx)
@@ -353,15 +357,16 @@ pub async fn mark_claim_superseded_pending_retry_tx(
                supersession_journal_id = ?3,
                superseded_at = ?4,
                updated_at = ?4
-           WHERE run_id = ?5 AND stage_execution_id = ?6 AND agent_execution_id = ?7
-             AND source_work_item_id = ?8 AND claim_state = ?9"#,
+           WHERE run_id = ?5 AND owner_kind = ?6 AND owner_id = ?7 AND agent_execution_id = ?8
+             AND source_work_item_id = ?9 AND claim_state = ?10"#,
     )
     .bind(ArtifactSourceClaimState::SupersededPendingRetry.to_string())
     .bind(superseding_work_item_id)
     .bind(supersession_journal_id)
     .bind(&now)
     .bind(key.run_id.to_string())
-    .bind(key.stage_execution_id.to_string())
+    .bind(key.owner_kind.to_string())
+    .bind(&key.owner_id)
     .bind(key.agent_execution_id.to_string())
     .bind(&key.source_work_item_id)
     .bind(ArtifactSourceClaimState::Active.to_string())
@@ -377,6 +382,25 @@ pub async fn mark_active_claims_superseded_pending_retry_for_stage_tx(
     superseding_work_item_id: &str,
     supersession_journal_id: &str,
 ) -> Result<u64> {
+    mark_active_claims_superseded_pending_retry_for_owner_tx(
+        tx,
+        run_id,
+        OwnerKind::StageExecution,
+        stage_execution_id,
+        superseding_work_item_id,
+        supersession_journal_id,
+    )
+    .await
+}
+
+pub async fn mark_active_claims_superseded_pending_retry_for_owner_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    owner_kind: OwnerKind,
+    owner_id: &str,
+    superseding_work_item_id: &str,
+    supersession_journal_id: &str,
+) -> Result<u64> {
     let now = Utc::now().to_rfc3339();
     let result = sqlx::query(
         r#"UPDATE artifact_source_generation_claims
@@ -385,14 +409,15 @@ pub async fn mark_active_claims_superseded_pending_retry_for_stage_tx(
                supersession_journal_id = ?3,
                superseded_at = ?4,
                updated_at = ?4
-           WHERE run_id = ?5 AND stage_execution_id = ?6 AND claim_state = ?7"#,
+           WHERE run_id = ?5 AND owner_kind = ?6 AND owner_id = ?7 AND claim_state = ?8"#,
     )
     .bind(ArtifactSourceClaimState::SupersededPendingRetry.to_string())
     .bind(superseding_work_item_id)
     .bind(supersession_journal_id)
     .bind(&now)
     .bind(run_id.to_string())
-    .bind(stage_execution_id)
+    .bind(owner_kind.to_string())
+    .bind(owner_id)
     .bind(ArtifactSourceClaimState::Active.to_string())
     .execute(&mut **tx)
     .await?;
@@ -456,13 +481,14 @@ pub async fn close_source_generation_claim_tx(
     sqlx::query(
         r#"UPDATE artifact_source_generation_claims
            SET claim_state = ?1, closed_at = ?2, updated_at = ?2
-           WHERE run_id = ?3 AND stage_execution_id = ?4 AND agent_execution_id = ?5
-             AND source_work_item_id = ?6 AND claim_state = ?7"#,
+           WHERE run_id = ?3 AND owner_kind = ?4 AND owner_id = ?5 AND agent_execution_id = ?6
+             AND source_work_item_id = ?7 AND claim_state = ?8"#,
     )
     .bind(ArtifactSourceClaimState::Closed.to_string())
     .bind(&now)
     .bind(key.run_id.to_string())
-    .bind(key.stage_execution_id.to_string())
+    .bind(key.owner_kind.to_string())
+    .bind(&key.owner_id)
     .bind(key.agent_execution_id.to_string())
     .bind(&key.source_work_item_id)
     .bind(ArtifactSourceClaimState::Active.to_string())
@@ -480,13 +506,14 @@ pub async fn update_source_generation_claim_session(
     sqlx::query(
         r#"UPDATE artifact_source_generation_claims
            SET current_session_generation_id = ?1, updated_at = ?2
-           WHERE run_id = ?3 AND stage_execution_id = ?4 AND agent_execution_id = ?5
-             AND source_work_item_id = ?6 AND claim_state = ?7"#,
+           WHERE run_id = ?3 AND owner_kind = ?4 AND owner_id = ?5 AND agent_execution_id = ?6
+             AND source_work_item_id = ?7 AND claim_state = ?8"#,
     )
     .bind(current_session_generation_id)
     .bind(&now)
     .bind(key.run_id.to_string())
-    .bind(key.stage_execution_id.to_string())
+    .bind(key.owner_kind.to_string())
+    .bind(&key.owner_id)
     .bind(key.agent_execution_id.to_string())
     .bind(&key.source_work_item_id)
     .bind(ArtifactSourceClaimState::Active.to_string())
@@ -544,11 +571,12 @@ pub async fn import_generation_with_claim_cas_tx(
     let claim = sqlx::query(
         r#"SELECT claim_state, current_session_generation_id
            FROM artifact_source_generation_claims
-           WHERE run_id = ?1 AND stage_execution_id = ?2 AND agent_execution_id = ?3
-             AND source_work_item_id = ?4"#,
+           WHERE run_id = ?1 AND owner_kind = ?2 AND owner_id = ?3 AND agent_execution_id = ?4
+             AND source_work_item_id = ?5"#,
     )
     .bind(key.run_id.to_string())
-    .bind(key.stage_execution_id.to_string())
+    .bind(key.owner_kind.to_string())
+    .bind(&key.owner_id)
     .bind(key.agent_execution_id.to_string())
     .bind(&key.source_work_item_id)
     .fetch_optional(&mut **tx)
@@ -1529,7 +1557,8 @@ fn parse_source_generation_claim_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ArtifactSourceGenerationClaim> {
     let run_id: String = row.get("run_id");
-    let stage_execution_id: String = row.get("stage_execution_id");
+    let owner_kind: String = row.get("owner_kind");
+    let stage_execution_id: Option<String> = row.get("stage_execution_id");
     let agent_execution_id: String = row.get("agent_execution_id");
     let claim_state: String = row.get("claim_state");
     let superseded_at: Option<String> = row.get("superseded_at");
@@ -1539,7 +1568,11 @@ fn parse_source_generation_claim_row(
     Ok(ArtifactSourceGenerationClaim {
         key: ArtifactSourceGenerationClaimKey {
             run_id: run_id.parse::<uuid::Uuid>()?.into(),
-            stage_execution_id: stage_execution_id.parse::<uuid::Uuid>()?.into(),
+            owner_kind: owner_kind.parse().map_err(anyhow::Error::msg)?,
+            owner_id: row.get("owner_id"),
+            stage_execution_id: stage_execution_id
+                .map(|value| value.parse::<uuid::Uuid>().map(Into::into))
+                .transpose()?,
             agent_execution_id: agent_execution_id.parse::<uuid::Uuid>()?.into(),
             source_work_item_id: row.get("source_work_item_id"),
         },

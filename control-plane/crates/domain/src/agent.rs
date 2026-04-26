@@ -40,7 +40,7 @@ impl std::str::FromStr for AgentStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentExecution {
     pub id: AgentExecutionId,
-    pub stage_execution_id: StageExecutionId,
+    pub stage_execution_id: Option<StageExecutionId>,
     pub agent_id: String,
     pub provider: String,
     pub model: Option<String>,

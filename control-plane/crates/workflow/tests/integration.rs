@@ -28,7 +28,38 @@ fn write_temp_fixture(filename: &str, content: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn compile_result_from_strings(
+fn catalog_with_default_system_lead(catalog_yaml: &str) -> String {
+    let mut catalog: serde_yaml::Value =
+        serde_yaml::from_str(catalog_yaml).expect("test catalog fixture should parse as YAML");
+    let has_system_lead = catalog
+        .get("agents")
+        .and_then(|agents| agents.as_sequence())
+        .map(|agents| {
+            agents.iter().any(|agent| {
+                agent.get("system_role").and_then(|role| role.as_str()) == Some("lead")
+            })
+        })
+        .unwrap_or(false);
+    if has_system_lead {
+        return catalog_yaml.to_string();
+    }
+
+    if let Some(agents) = catalog
+        .get_mut("agents")
+        .and_then(|agents| agents.as_sequence_mut())
+    {
+        if let Some(first_agent) = agents.first_mut().and_then(|agent| agent.as_mapping_mut()) {
+            first_agent.insert(
+                serde_yaml::Value::String("system_role".to_string()),
+                serde_yaml::Value::String("lead".to_string()),
+            );
+        }
+    }
+
+    serde_yaml::to_string(&catalog).expect("test catalog fixture should serialize")
+}
+
+fn compile_result_from_raw_strings(
     workflow_yaml: &str,
     catalog_yaml: &str,
 ) -> anyhow::Result<workflow::plan::RunPlan> {
@@ -42,6 +73,16 @@ fn compile_result_from_strings(
     compiler::compile(&wf_path, &cat_path)
 }
 
+fn compile_result_from_strings(
+    workflow_yaml: &str,
+    catalog_yaml: &str,
+) -> anyhow::Result<workflow::plan::RunPlan> {
+    compile_result_from_raw_strings(
+        workflow_yaml,
+        &catalog_with_default_system_lead(catalog_yaml),
+    )
+}
+
 fn compile_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> workflow::plan::RunPlan {
     compile_result_from_strings(workflow_yaml, catalog_yaml).expect("should compile plan")
 }
@@ -53,7 +94,8 @@ fn compile_error_from_strings(workflow_yaml: &str, catalog_yaml: &str) -> String
         format!("workflow:\n  id: contract-fixture\n  family: contract_fixture\n{workflow_yaml}")
     };
     let wf_path = write_temp_fixture("workflow.yaml", &workflow_yaml);
-    let cat_path = write_temp_fixture("catalog.yaml", catalog_yaml);
+    let catalog_yaml = catalog_with_default_system_lead(catalog_yaml);
+    let cat_path = write_temp_fixture("catalog.yaml", &catalog_yaml);
     compiler::compile(&wf_path, &cat_path)
         .expect_err("plan should fail direct-command lint")
         .to_string()
@@ -108,6 +150,11 @@ fn test_parse_agent_catalog() {
     assert!(agent_ids.contains(&"proposal_writer"));
     assert!(agent_ids.contains(&"proposal_reviewer_ux"));
 
+    let lead = workflow::catalog::validate_catalog_has_exactly_one_system_lead(&cat)
+        .expect("bundled catalog should declare exactly one system lead");
+    assert_eq!(lead.id, "lead_orchestrator");
+    assert_eq!(lead.system_role, Some(workflow::catalog::SystemRole::Lead));
+
     let proposal_writer = agents
         .iter()
         .find(|agent| agent.id == "proposal_writer")
@@ -119,6 +166,168 @@ fn test_parse_agent_catalog() {
     assert_eq!(
         proposal_writer.session_family_id.as_deref(),
         Some("proposal_authoring_loop")
+    );
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_rejects_missing_system_lead() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: reviewer
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: reviewer
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+agents:
+  - id: reviewer
+    backend_profile: claude_review
+"#;
+
+    let error = compile_result_from_raw_strings(workflow, catalog)
+        .expect_err("catalog without system_role=lead should fail executable validation")
+        .to_string();
+
+    assert!(
+        error.contains("lead_missing"),
+        "expected typed missing-lead validation error, got: {error}"
+    );
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_rejects_duplicate_system_leads() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: lead_one
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: lead_one
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+agents:
+  - id: lead_one
+    system_role: lead
+    backend_profile: claude_review
+  - id: lead_two
+    system_role: lead
+    backend_profile: claude_review
+"#;
+
+    let error = compile_result_from_raw_strings(workflow, catalog)
+        .expect_err("catalog with duplicate system leads should fail executable validation")
+        .to_string();
+
+    assert!(
+        error.contains("lead_ambiguous"),
+        "expected typed duplicate-lead validation error, got: {error}"
+    );
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_allows_exactly_one_system_lead() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: lead
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: lead
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_review
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+  - id: reviewer
+    backend_profile: claude_review
+"#;
+
+    let plan = compile_result_from_raw_strings(workflow, catalog).expect("plan should compile");
+
+    assert_eq!(plan.initial_state, "start");
+}
+
+#[test]
+fn proposal_017_phase_c_executable_catalog_rejects_lead_without_resolution_contract() {
+    let workflow = r#"
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: lead
+    transitions:
+      - to: done
+        when: "true"
+  done:
+    label: Done
+    type: end
+    owner: lead
+"#;
+    let catalog = r#"
+backend_profiles:
+  claude_review:
+    provider: claude_acp
+permission_profiles:
+  ORCH: {}
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_review
+    permission_profile: ORCH
+"#;
+
+    let error = compile_result_from_raw_strings(workflow, catalog)
+        .expect_err("lead without LeadResolutionContract should fail executable validation")
+        .to_string();
+
+    assert!(
+        error.contains("lead_resolution_contract_missing"),
+        "expected typed missing lead resolution contract error, got: {error}"
     );
 }
 
@@ -802,6 +1011,7 @@ backend_profiles:
     model: steward-model
 agents:
   - id: steward
+    system_role: lead
     backend_profile: steward_profile
     prompt: "observe"
 "#;
@@ -809,6 +1019,7 @@ agents:
 agents:
   - prompt: "observe"
     backend_profile: steward_profile
+    system_role: lead
     id: steward
 backend_profiles:
   steward_profile:

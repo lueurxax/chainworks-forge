@@ -1286,7 +1286,7 @@ mod tests {
             pool,
             &domain::agent::AgentExecution {
                 id: agent_execution_id,
-                stage_execution_id,
+                stage_execution_id: Some(stage_execution_id),
                 agent_id: "validation_agent".to_string(),
                 provider: "system".to_string(),
                 model: None,

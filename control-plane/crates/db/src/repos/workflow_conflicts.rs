@@ -1,12 +1,25 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use uuid::Uuid;
 
 use domain::ids::RunId;
 use domain::workflow_conflict::{
     ImplementationHandoffStatus, WorkflowAdvisoryRejectionRecord, WorkflowConflictRecord,
     WorkflowConflictStatus, WorkflowTransitionCursorRecord,
 };
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowConflictMetricEvent {
+    pub event_id: String,
+    pub run_id: String,
+    pub conflict_id: Option<String>,
+    pub metric_name: String,
+    pub labels_json: serde_json::Value,
+    pub value: f64,
+    pub unit: String,
+    pub occurred_at: DateTime<Utc>,
+}
 
 pub async fn upsert_conflict_by_fingerprint(
     pool: &SqlitePool,
@@ -282,6 +295,97 @@ pub async fn get_transition_cursor(
     .transpose()
 }
 
+pub async fn list_metric_events_for_run(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<Vec<WorkflowConflictMetricEvent>> {
+    let rows = sqlx::query(
+        r#"SELECT event_id, run_id, conflict_id, metric_name, labels_json,
+                  value, unit, occurred_at
+           FROM workflow_conflict_metric_events
+           WHERE run_id = ?1
+           ORDER BY occurred_at ASC, event_id ASC"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await
+    .context("list workflow conflict metric events for run")?;
+
+    rows.iter().map(decode_metric_event_row).collect()
+}
+
+pub async fn record_recovery_action_chosen_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conflict: &WorkflowConflictRecord,
+    action_class: &str,
+    source_surface: &str,
+    result: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: conflict.run_id.clone(),
+            conflict_id: Some(conflict.conflict_id.clone()),
+            metric_name: "recovery_action_chosen_total".to_string(),
+            labels_json: serde_json::json!({
+                "conflict_reason": conflict.reason.to_string(),
+                "action_class": action_class,
+                "source_surface": source_surface,
+                "result": result,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+pub async fn record_phase_c_validation_outcome_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    outcome: &str,
+    source: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            conflict_id: None,
+            metric_name: "phase_c_validation_outcome_total".to_string(),
+            labels_json: serde_json::json!({
+                "outcome": outcome,
+                "source": source,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+pub async fn find_conflict_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conflict_id: &str,
+) -> Result<Option<WorkflowConflictRecord>> {
+    let row = sqlx::query(
+        r#"SELECT record_json
+           FROM workflow_conflicts
+           WHERE conflict_id = ?1"#,
+    )
+    .bind(conflict_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find workflow conflict by id")?;
+
+    row.map(|row| decode_conflict_row(&row)).transpose()
+}
+
 pub async fn transition_conflict_status(
     pool: &SqlitePool,
     conflict_id: &str,
@@ -341,6 +445,7 @@ pub async fn transition_conflict_status_tx(
     record.superseded_by_conflict_id = superseded_by_conflict_id;
 
     write_conflict_update_tx(tx, &record).await?;
+    record_terminal_metric_events_tx(tx, &record, transitioned_at).await?;
     Ok(record)
 }
 
@@ -501,6 +606,136 @@ fn conflict_update_sql() -> &'static str {
            diagnostic_redaction_tier = ?19,
            record_json = ?20
        WHERE conflict_id = ?21"#
+}
+
+async fn record_terminal_metric_events_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &WorkflowConflictRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    if !matches!(
+        record.status,
+        WorkflowConflictStatus::Resolved
+            | WorkflowConflictStatus::Superseded
+            | WorkflowConflictStatus::TerminalUnverifiable
+    ) {
+        return Ok(());
+    }
+
+    let resolution_mode = resolution_mode(record);
+    let action_class = action_class(record);
+    let elapsed_seconds =
+        (occurred_at - record.created_at).num_milliseconds().max(0) as f64 / 1000.0;
+
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: record.run_id.clone(),
+            conflict_id: Some(record.conflict_id.clone()),
+            metric_name: "workflow_conflict_time_to_resolution_seconds".to_string(),
+            labels_json: serde_json::json!({
+                "conflict_reason": record.reason.to_string(),
+                "resolution_mode": resolution_mode,
+            }),
+            value: elapsed_seconds,
+            unit: "seconds".to_string(),
+            occurred_at,
+        },
+    )
+    .await?;
+
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: record.run_id.clone(),
+            conflict_id: Some(record.conflict_id.clone()),
+            metric_name: "conflict_reason_to_action_outcome_total".to_string(),
+            labels_json: serde_json::json!({
+                "conflict_reason": record.reason.to_string(),
+                "action_class": action_class,
+                "terminal_status": record.status.to_string(),
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+fn resolution_mode(record: &WorkflowConflictRecord) -> &'static str {
+    match record.status {
+        WorkflowConflictStatus::Resolved => "graph_settlement",
+        WorkflowConflictStatus::Superseded => "superseded",
+        WorkflowConflictStatus::TerminalUnverifiable => "terminal_unverifiable",
+        WorkflowConflictStatus::LeadMediationPending => "lead_mediation",
+        WorkflowConflictStatus::OperatorConfirmationRequired => "operator_confirmation",
+        WorkflowConflictStatus::Unresolved => "unresolved",
+    }
+}
+
+fn action_class(record: &WorkflowConflictRecord) -> String {
+    record
+        .resolution_record_json
+        .as_ref()
+        .and_then(|json| {
+            json.get("action_class")
+                .or_else(|| json.get("recovery_action"))
+                .or_else(|| json.get("selected_action"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_else(|| match record.status {
+            WorkflowConflictStatus::Resolved => "graph_settlement",
+            WorkflowConflictStatus::Superseded => "superseded",
+            WorkflowConflictStatus::TerminalUnverifiable => "manual_or_clone_fallback",
+            WorkflowConflictStatus::LeadMediationPending => "lead_mediation",
+            WorkflowConflictStatus::OperatorConfirmationRequired => "operator_confirmation",
+            WorkflowConflictStatus::Unresolved => "unresolved",
+        })
+        .to_string()
+}
+
+async fn insert_metric_event_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &WorkflowConflictMetricEvent,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO workflow_conflict_metric_events
+           (event_id, run_id, conflict_id, metric_name, labels_json,
+            value, unit, occurred_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+    )
+    .bind(&event.event_id)
+    .bind(&event.run_id)
+    .bind(&event.conflict_id)
+    .bind(&event.metric_name)
+    .bind(serde_json::to_string(&event.labels_json)?)
+    .bind(event.value)
+    .bind(&event.unit)
+    .bind(event.occurred_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await
+    .context("insert workflow conflict metric event")?;
+    Ok(())
+}
+
+fn decode_metric_event_row(row: &sqlx::sqlite::SqliteRow) -> Result<WorkflowConflictMetricEvent> {
+    let labels_raw: String = row.get("labels_json");
+    let occurred_raw: String = row.get("occurred_at");
+    Ok(WorkflowConflictMetricEvent {
+        event_id: row.get("event_id"),
+        run_id: row.get("run_id"),
+        conflict_id: row.get("conflict_id"),
+        metric_name: row.get("metric_name"),
+        labels_json: serde_json::from_str(&labels_raw).context("decode metric labels_json")?,
+        value: row.get("value"),
+        unit: row.get("unit"),
+        occurred_at: DateTime::parse_from_rfc3339(&occurred_raw)
+            .context("parse metric occurred_at")?
+            .with_timezone(&Utc),
+    })
 }
 
 /// Update the lead_agent_id, mediation_record_id, and status on a conflict record

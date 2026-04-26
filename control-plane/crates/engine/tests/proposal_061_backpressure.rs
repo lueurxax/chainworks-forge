@@ -22,6 +22,7 @@ use domain::commands::{
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::mediation::OwnerKind;
 use domain::provider::{
     InvokeAgentCapacityConfig as DomainInvokeAgentCapacityConfig, ProviderFamily,
 };
@@ -106,7 +107,7 @@ fn make_stage(
 fn make_running_execution(stage_execution_id: StageExecutionId, provider: &str) -> AgentExecution {
     AgentExecution {
         id: AgentExecutionId::new(),
-        stage_execution_id,
+        stage_execution_id: Some(stage_execution_id),
         agent_id: format!("{provider}_agent"),
         provider: provider.into(),
         model: Some("default".into()),
@@ -2235,7 +2236,9 @@ async fn host_interruption_late_output_from_superseded_attempt_cannot_promote_ov
 
     let old_claim_key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id: old_agent_execution_id,
         source_work_item_id: source_work_item_id.into(),
     };
@@ -2293,7 +2296,9 @@ async fn host_interruption_late_output_from_superseded_attempt_cannot_promote_ov
         .unwrap();
     let new_claim_key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id: new_agent_execution_id,
         source_work_item_id: source_work_item_id.into(),
     };

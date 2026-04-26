@@ -1,7 +1,38 @@
 {
   "schema_version": "1.0",
   "mapping_version": "1.0",
-  "entries": [],
+  "entries": [
+    {
+      "workflow_source_path": "examples/workflows/full-mvp-live.yaml",
+      "catalog_source_path": "examples/agents/agents.yaml",
+      "lead_agent_id": "lead_orchestrator",
+      "lead_resolution_contract_ref": "LeadResolutionContract",
+      "mapping_owner": "P017 implementation lead",
+      "entry_attested_by": "P017 implementation lead",
+      "reviewed_at": "2026-04-26",
+      "phase_c_removal_condition": "Phase C static catalog validation is authoritative for this workflow/catalog pair."
+    },
+    {
+      "workflow_source_path": "examples/workflows/workflow.yaml",
+      "catalog_source_path": "examples/agents/agents.yaml",
+      "lead_agent_id": "lead_orchestrator",
+      "lead_resolution_contract_ref": "LeadResolutionContract",
+      "mapping_owner": "P017 implementation lead",
+      "entry_attested_by": "P017 implementation lead",
+      "reviewed_at": "2026-04-26",
+      "phase_c_removal_condition": "Phase C static catalog validation is authoritative for this workflow/catalog pair."
+    },
+    {
+      "workflow_source_path": "examples/workflows/proposal-loop-live.yaml",
+      "catalog_source_path": "examples/agents/agents.yaml",
+      "lead_agent_id": "lead_orchestrator",
+      "lead_resolution_contract_ref": "LeadResolutionContract",
+      "mapping_owner": "P017 implementation lead",
+      "entry_attested_by": "P017 implementation lead",
+      "reviewed_at": "2026-04-26",
+      "phase_c_removal_condition": "Phase C static catalog validation is authoritative for this workflow/catalog pair."
+    }
+  ],
   "mapping_owner": "P017 implementation lead",
   "entry_attestation_rule": "architect-reviewed",
   "staleness_review_trigger": "Phase C slip",

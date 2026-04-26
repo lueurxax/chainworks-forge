@@ -1823,6 +1823,39 @@ case "$GATE" in
         die "Missing required Phase 0 artifact: $art"
       fi
     done
+    python3 - "$ROOT_DIR/docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+entries = payload.get("entries") or []
+if not entries:
+    raise SystemExit("Phase B lead resolver must have at least one attested entry")
+
+seen = set()
+for index, entry in enumerate(entries, 1):
+    required = [
+        "workflow_source_path",
+        "catalog_source_path",
+        "lead_agent_id",
+        "lead_resolution_contract_ref",
+        "mapping_owner",
+        "entry_attested_by",
+        "reviewed_at",
+    ]
+    missing = [field for field in required if not entry.get(field)]
+    if missing:
+        raise SystemExit(f"Phase B lead resolver entry {index} missing: {', '.join(missing)}")
+    key = (entry["workflow_source_path"], entry["catalog_source_path"])
+    if key in seen:
+        raise SystemExit(
+            "Phase B lead resolver has duplicate workflow/catalog entry: "
+            f"{entry['workflow_source_path']} + {entry['catalog_source_path']}"
+        )
+    seen.add(key)
+PY
 
     run_targeted_tests "proposal-017-swift" "${PROPOSAL_017_SWIFT_TESTS[@]}"
     (
@@ -1831,6 +1864,7 @@ case "$GATE" in
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
       # Phase A: Workflow authority and conflict truth
       cargo test -p workflow proposal_017_ -- --test-threads=1 --nocapture
+      cargo test -p workflow --test proposal_017_evidence_gate -- --test-threads=1 --nocapture
       cargo test -p domain --test proposal_017_workflow_conflict -- --test-threads=1 --nocapture
       cargo test -p db --test proposal_017_workflow_conflict_persistence -- --test-threads=1 --nocapture
       cargo test -p mcp-server proposal_017_ -- --test-threads=1 --nocapture

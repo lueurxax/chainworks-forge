@@ -37,6 +37,39 @@ pub async fn insert(pool: &SqlitePool, record: &LeadMediationConfirmation) -> Re
     Ok(())
 }
 
+pub async fn insert_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &LeadMediationConfirmation,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO lead_mediation_confirmations
+           (id, mediation_record_id, run_id, conflict_id, conflict_fingerprint,
+            status, suggested_action, requested_at, deadline_at, readback_ref,
+            idempotency_scope_key, resolved_at, resolved_by_principal_id,
+            resolution_decision, resolution_comment)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+    )
+    .bind(&record.id)
+    .bind(&record.mediation_record_id)
+    .bind(&record.run_id)
+    .bind(&record.conflict_id)
+    .bind(&record.conflict_fingerprint)
+    .bind(record.status.to_string())
+    .bind(&record.suggested_action)
+    .bind(record.requested_at.to_rfc3339())
+    .bind(record.deadline_at.map(|t| t.to_rfc3339()))
+    .bind(&record.readback_ref)
+    .bind(&record.idempotency_scope_key)
+    .bind(record.resolved_at.map(|t| t.to_rfc3339()))
+    .bind(&record.resolved_by_principal_id)
+    .bind(&record.resolution_decision)
+    .bind(&record.resolution_comment)
+    .execute(&mut **tx)
+    .await
+    .context("insert lead_mediation_confirmation (tx)")?;
+    Ok(())
+}
+
 pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<LeadMediationConfirmation>> {
     let row = sqlx::query(
         r#"SELECT id, mediation_record_id, run_id, conflict_id, conflict_fingerprint,

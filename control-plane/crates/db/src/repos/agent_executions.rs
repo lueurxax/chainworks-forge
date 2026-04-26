@@ -38,6 +38,13 @@ pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
 }
 
 pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) -> Result<()> {
+    let owner_kind = exec.owner_kind.as_deref().unwrap_or("stage_execution");
+    let stage_execution_id = exec.stage_execution_id.map(|id| id.to_string());
+    let owner_id = exec.owner_id.clone().or_else(|| {
+        (owner_kind == "stage_execution")
+            .then(|| stage_execution_id.clone())
+            .flatten()
+    });
     sqlx::query(
         "INSERT INTO agent_executions
          (id, stage_execution_id, agent_id, provider, provider_family, model, status, started_at, completed_at,
@@ -53,7 +60,7 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
-    .bind(exec.stage_execution_id.to_string())
+    .bind(&stage_execution_id)
     .bind(&exec.agent_id)
     .bind(&exec.provider)
     .bind(ProviderFamily::canonicalize_known_alias(&exec.provider))
@@ -81,8 +88,8 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
     .bind(&exec.actual_mcp_observation_json)
     .bind(&exec.actual_xcode_runtime_observation_json)
     .bind(exec.mcp_session_startup_latency_ms)
-    .bind(exec.owner_kind.as_deref().unwrap_or("stage_execution"))
-    .bind(&exec.owner_id)
+    .bind(owner_kind)
+    .bind(&owner_id)
     .bind(&exec.lead_mediation_record_id)
     .bind(&exec.origin_stage_execution_id)
     .execute(&mut **tx)
@@ -530,14 +537,16 @@ fn parse_running_agent_execution_row(
 
 fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecution> {
     let id: String = row.get("id");
-    let seid: String = row.get("stage_execution_id");
+    let seid: Option<String> = row.get("stage_execution_id");
     let status_str: String = row.get("status");
     let started_str: String = row.get("started_at");
     let completed_str: Option<String> = row.get("completed_at");
 
     Ok(AgentExecution {
         id: id.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
-        stage_execution_id: seid.parse().map_err(|e| anyhow::anyhow!("{}", e))?,
+        stage_execution_id: seid
+            .map(|id| id.parse().map_err(|e| anyhow::anyhow!("{}", e)))
+            .transpose()?,
         agent_id: row.get("agent_id"),
         provider: row.get("provider"),
         model: row.get("model"),

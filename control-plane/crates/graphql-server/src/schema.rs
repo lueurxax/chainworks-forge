@@ -124,28 +124,7 @@ async fn enrich_run_with_artifact_contracts(
             if let Ok(Some(med)) =
                 db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
             {
-                // MC-004: Use shared domain derivation for consistent resolution_mode.
-                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation {
-                    status: med.status.to_string(),
-                    resolution_mode: domain::mediation::derive_resolution_mode(&med),
-                    chosen_action: med.chosen_action.clone(),
-                    chosen_next_state_id: med.chosen_next_state_id.clone(),
-                    chosen_next_state_label: med.chosen_next_state_label.clone(),
-                    operator_rationale: med.operator_rationale.clone(),
-                    sanitized_progress: med.sanitized_progress.clone(),
-                    validation_errors: med
-                        .validation_errors_json
-                        .as_ref()
-                        .and_then(|json| serde_json::from_str(json).ok())
-                        .map(async_graphql::Json),
-                    confirmation_subject_id: med.confirmation_subject_id.clone(),
-                    superseded_by_event_ref: med.superseded_by_event_ref.clone(),
-                    cost_summary: med
-                        .cost_summary_json
-                        .as_ref()
-                        .and_then(|json| serde_json::from_str(json).ok())
-                        .map(async_graphql::Json),
-                });
+                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation::from(&med));
             }
         }
     }
@@ -640,28 +619,7 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
             if let Ok(Some(med)) =
                 db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
             {
-                // MC-004: Use shared domain derivation for consistent resolution_mode.
-                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation {
-                    status: med.status.to_string(),
-                    resolution_mode: domain::mediation::derive_resolution_mode(&med),
-                    chosen_action: med.chosen_action.clone(),
-                    chosen_next_state_id: med.chosen_next_state_id.clone(),
-                    chosen_next_state_label: med.chosen_next_state_label.clone(),
-                    operator_rationale: med.operator_rationale.clone(),
-                    sanitized_progress: med.sanitized_progress.clone(),
-                    validation_errors: med
-                        .validation_errors_json
-                        .as_ref()
-                        .and_then(|json| serde_json::from_str(json).ok())
-                        .map(async_graphql::Json),
-                    confirmation_subject_id: med.confirmation_subject_id.clone(),
-                    superseded_by_event_ref: med.superseded_by_event_ref.clone(),
-                    cost_summary: med
-                        .cost_summary_json
-                        .as_ref()
-                        .and_then(|json| serde_json::from_str(json).ok())
-                        .map(async_graphql::Json),
-                });
+                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation::from(&med));
             }
         }
     }
@@ -1510,6 +1468,7 @@ mod tests {
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
+    use domain::mediation::{LeadConflictMediationRecord, LeadMediationStatus};
     use domain::steward::{
         CohortQuality, StewardAnalysis, StewardAnalysisRunLink, StewardAnalysisStatus,
         StewardRecommendation,
@@ -1678,6 +1637,47 @@ mod tests {
         }
     }
 
+    fn make_lead_mediation_record(
+        run_id: RunId,
+        conflict: &WorkflowConflictRecord,
+        mediation_id: &str,
+    ) -> LeadConflictMediationRecord {
+        LeadConflictMediationRecord {
+            id: mediation_id.to_string(),
+            run_id: run_id.to_string(),
+            conflict_id: conflict.conflict_id.clone(),
+            conflict_fingerprint: conflict.conflict_fingerprint.clone(),
+            lead_agent_id: "lead-agent-1".into(),
+            status: LeadMediationStatus::OperatorConfirmationRequired,
+            settlement_result: Some("operator_confirmed".into()),
+            recovery_action: None,
+            chosen_action: Some("advance".into()),
+            chosen_next_state_id: Some("release".into()),
+            chosen_next_state_label: Some("Release".into()),
+            operator_rationale: Some("PRIVATE rationale must not leave storage".into()),
+            sanitized_progress: Some("Lead mediation selected a release transition.".into()),
+            validation_errors_json: Some(
+                serde_json::json!([{"field": "summary", "message": "safe validation note"}])
+                    .to_string(),
+            ),
+            cost_summary_json: Some(
+                serde_json::json!({
+                    "total_cost_cents": 42,
+                    "input_tokens": 100,
+                    "output_tokens": 25
+                })
+                .to_string(),
+            ),
+            metric_event_id: Some("metric-1".into()),
+            superseded_by_event_ref: Some("event-2".into()),
+            agent_execution_id: Some("agent-exec-1".into()),
+            confirmation_subject_id: Some("confirmation-1".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            settled_at: None,
+        }
+    }
+
     fn test_workflow_yaml_path() -> String {
         format!(
             "{}/../../../examples/workflows/workflow.yaml",
@@ -1818,7 +1818,7 @@ mod tests {
             pool,
             &domain::agent::AgentExecution {
                 id: agent_execution_id,
-                stage_execution_id: stage_id,
+                stage_execution_id: Some(stage_id),
                 agent_id: "validation_agent".to_string(),
                 provider: "system".to_string(),
                 model: None,
@@ -2276,6 +2276,143 @@ mod tests {
             conflict_json["candidateTransitions"][0]["result"],
             serde_json::json!("MISSING_INPUT")
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_run_query_exposes_sanitized_lead_mediation_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let mediation_id = "mediation-p017-readback";
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.status = WorkflowConflictStatus::OperatorConfirmationRequired;
+        conflict.mediation_record_id = Some(mediation_id.into());
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+        db::repos::lead_conflict_mediations::insert(
+            &pool,
+            &make_lead_mediation_record(run_id, &conflict, mediation_id),
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        assert!(!schema.sdl().contains("operatorRationale"));
+
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query P017LeadMediationReadback {{
+                  run(id: "{run_id}") {{
+                    workflowConflict {{
+                      mediationRecordId
+                      leadMediation {{
+                        id
+                        conflictId
+                        leadAgentId
+                        status
+                        resolutionMode
+                        chosenAction
+                        chosenNextStateId
+                        chosenNextStateLabel
+                        sanitizedProgress
+                        statusUpdates {{
+                          status
+                          sanitizedProgress
+                          updatedAt
+                          attemptNumber
+                        }}
+                        validationErrors
+                        confirmationSubjectId
+                        supersededByEventRef
+                        costSummary
+                      }}
+                    }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let mediation = &json["run"]["workflowConflict"]["leadMediation"];
+        assert_eq!(mediation["id"], serde_json::json!(mediation_id));
+        assert_eq!(
+            mediation["conflictId"],
+            serde_json::json!(conflict.conflict_id)
+        );
+        assert_eq!(mediation["leadAgentId"], serde_json::json!("lead-agent-1"));
+        assert_eq!(
+            mediation["status"],
+            serde_json::json!("operator_confirmation_required")
+        );
+        assert_eq!(
+            mediation["resolutionMode"],
+            serde_json::json!("operator_confirmation")
+        );
+        assert_eq!(mediation["chosenAction"], serde_json::json!("advance"));
+        assert_eq!(mediation["chosenNextStateId"], serde_json::json!("release"));
+        assert_eq!(
+            mediation["chosenNextStateLabel"],
+            serde_json::json!("Release")
+        );
+        assert_eq!(
+            mediation["sanitizedProgress"],
+            serde_json::json!("Lead mediation selected a release transition.")
+        );
+        assert_eq!(
+            mediation["statusUpdates"][0]["status"],
+            serde_json::json!("operator_confirmation_required")
+        );
+        assert_eq!(
+            mediation["statusUpdates"][0]["sanitizedProgress"],
+            serde_json::json!("Lead mediation selected a release transition.")
+        );
+        assert_eq!(
+            mediation["statusUpdates"][0]["attemptNumber"],
+            serde_json::json!(1)
+        );
+        assert!(mediation["statusUpdates"][0]["updatedAt"].is_string());
+        assert_eq!(
+            mediation["confirmationSubjectId"],
+            serde_json::json!("confirmation-1")
+        );
+        assert_eq!(
+            mediation["supersededByEventRef"],
+            serde_json::json!("event-2")
+        );
+        assert_eq!(
+            mediation["validationErrors"][0]["field"],
+            serde_json::json!("summary")
+        );
+        assert_eq!(
+            mediation["costSummary"]["total_cost_cents"],
+            serde_json::json!(42)
+        );
+
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("operatorRationale"));
+        assert!(!serialized.contains("operator_rationale"));
+        assert!(!serialized.contains("PRIVATE rationale"));
     }
 
     #[tokio::test]

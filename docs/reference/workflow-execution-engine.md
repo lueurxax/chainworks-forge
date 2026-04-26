@@ -287,7 +287,9 @@ falling back to manual intervention.
    `PhaseBLeadResolver`, the engine creates a `LeadConflictMediationRecord`.
 3. **Execution**: The system lead is invoked with the conflict context. The
    execution is owned by the mediation record (`owner_kind: lead_conflict_mediation`).
-4. **Settlement**: Lead output is evaluated through `MediationSettlementService`.
+4. **Settlement**: Lead output must satisfy the lead agent's
+   `LeadResolutionContract`; malformed or absent output moves the mediation and
+   conflict to `terminal_unverifiable`.
 5. **Confirmation**: If the resolution requires operator sign-off, a
    `lead_mediation_confirmation` is created in the separate mediation confirmation
    store and appears in the mixed `approvals.list` inbox.
@@ -303,9 +305,13 @@ resolution and `LeadResolutionContract` coverage. Failure to resolve a valid
 lead results in a `terminal_unverifiable` conflict.
 
 **Observability**:
-Phase C adds the `phase_c_validation_outcome_total` metric to track the effectiveness
-of lead validation, with labels for `static_fail`, `preflight_fail`,
-`legacy_catalog_warning`, and `pass`.
+P017 records workflow-conflict rollout metrics in durable
+`workflow_conflict_metric_events` rows. Phase C adds
+`phase_c_validation_outcome_total` for lead validation outcomes
+(`static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`), while
+conflict resolution records `workflow_conflict_time_to_resolution_seconds`,
+`conflict_reason_to_action_outcome_total`, and
+`recovery_action_chosen_total`.
 
 #### Status-based implementation handoff transitions
 

@@ -290,7 +290,7 @@ mod tests {
             &pool,
             &AgentExecution {
                 id: agent_execution_id,
-                stage_execution_id,
+                stage_execution_id: Some(stage_execution_id),
                 agent_id: "agent_1".into(),
                 provider: "system".into(),
                 model: None,

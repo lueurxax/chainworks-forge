@@ -13,6 +13,7 @@ use domain::artifact_contracts::{
 use domain::commands::{CallerContext, Command, RetryStageCmd};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::mediation::OwnerKind;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
@@ -446,7 +447,9 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
 
     let claim_key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id,
         source_work_item_id: "legacy-preclaimed-no-session".into(),
     };
@@ -455,7 +458,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
         &pool,
         &AgentExecution {
             id: agent_execution_id,
-            stage_execution_id,
+            stage_execution_id: Some(stage_execution_id),
             agent_id: "docs_guardian".into(),
             provider: "gemini".into(),
             model: Some("gemini-2.5-flash".into()),
@@ -1300,7 +1303,9 @@ async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
     assert_eq!(generation.runtime_model, "fixture");
     let claim_key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id: executions[0].id,
         source_work_item_id: "production-loop-invoke".into(),
     };
@@ -1371,7 +1376,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
         &pool,
         &AgentExecution {
             id: old_agent_execution_id,
-            stage_execution_id: old_stage_execution_id,
+            stage_execution_id: Some(old_stage_execution_id),
             agent_id: "code_writer".into(),
             provider: "claude".into(),
             model: Some("sonnet".into()),
@@ -1409,7 +1414,9 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
 
     let old_claim_key = ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id: old_stage_execution_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: old_stage_execution_id.to_string(),
+        stage_execution_id: Some(old_stage_execution_id),
         agent_execution_id: old_agent_execution_id,
         source_work_item_id: source_work_item_id.clone(),
     };
@@ -1561,7 +1568,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
         &pool,
         &AgentExecution {
             id: old_agent_execution_id,
-            stage_execution_id: old_stage_execution_id,
+            stage_execution_id: Some(old_stage_execution_id),
             agent_id: "code_writer".into(),
             provider: "claude".into(),
             model: Some("sonnet".into()),

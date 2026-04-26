@@ -47,6 +47,7 @@ artifacts:
   run_state: ${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json
   orchestrator_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/orchestrator.md
   approval_request: ${CHAINWORKS_META_ROOT:-.chainworks}/approvals/current-request.json
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
   release_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/manifest.json
   git_push_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/git-push.json
   release_bundle_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/bundle.json
@@ -124,6 +125,17 @@ contracts:
       - non_blocking_issues
       - suggestions
       - assumptions
+  LeadResolutionContract:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: lead_resolution_raw
+    normalized_artifact_name: lead_resolution
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
   proposal_review_summary_v1:
     format: json
     machine_format: json
@@ -1085,8 +1097,10 @@ agents:
   - id: lead_orchestrator
     title: Lead / Orchestrator
     mode: orchestration
+    system_role: lead
     backend_profile: claude_orchestrator_high
     permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     skill_ref: orchestrator_core
     session_reuse_scope: same_agent_family_within_run
     session_family_id: orchestration_loop

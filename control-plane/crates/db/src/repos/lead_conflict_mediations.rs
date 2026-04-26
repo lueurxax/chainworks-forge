@@ -136,6 +136,27 @@ pub async fn find_by_id(
     row.map(|r| parse_row(&r)).transpose()
 }
 
+pub async fn find_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> Result<Option<LeadConflictMediationRecord>> {
+    let row = sqlx::query(
+        r#"SELECT id, run_id, conflict_id, conflict_fingerprint, lead_agent_id, status,
+                  settlement_result, recovery_action, chosen_action, chosen_next_state_id,
+                  chosen_next_state_label, operator_rationale, sanitized_progress,
+                  validation_errors_json, cost_summary_json, metric_event_id,
+                  superseded_by_event_ref, agent_execution_id, confirmation_subject_id,
+                  created_at, updated_at, settled_at
+           FROM lead_conflict_mediations WHERE id = ?1"#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find lead_conflict_mediation by id (tx)")?;
+
+    row.map(|r| parse_row(&r)).transpose()
+}
+
 pub async fn find_active_for_conflict(
     pool: &SqlitePool,
     run_id: &str,
@@ -234,6 +255,64 @@ pub async fn update_status_tx(
     }
 
     Ok(rows)
+}
+
+pub async fn update_after_lead_output_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    status: &str,
+    settlement_result: Option<&str>,
+    recovery_action: Option<&str>,
+    chosen_action: Option<&str>,
+    chosen_next_state_id: Option<&str>,
+    chosen_next_state_label: Option<&str>,
+    sanitized_progress: Option<&str>,
+    validation_errors_json: Option<&str>,
+    confirmation_subject_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let settled_at = if matches!(
+        status,
+        "settled" | "terminal_unverifiable" | "canceled" | "superseded"
+    ) {
+        Some(now.to_rfc3339())
+    } else {
+        None
+    };
+
+    let result = sqlx::query(
+        r#"UPDATE lead_conflict_mediations
+           SET status = ?1,
+               settlement_result = COALESCE(?2, settlement_result),
+               recovery_action = COALESCE(?3, recovery_action),
+               chosen_action = COALESCE(?4, chosen_action),
+               chosen_next_state_id = COALESCE(?5, chosen_next_state_id),
+               chosen_next_state_label = COALESCE(?6, chosen_next_state_label),
+               sanitized_progress = COALESCE(?7, sanitized_progress),
+               validation_errors_json = COALESCE(?8, validation_errors_json),
+               confirmation_subject_id = COALESCE(?9, confirmation_subject_id),
+               updated_at = ?10,
+               settled_at = COALESCE(?11, settled_at)
+           WHERE id = ?12
+             AND status NOT IN ('settled', 'terminal_unverifiable', 'canceled', 'superseded')"#,
+    )
+    .bind(status)
+    .bind(settlement_result)
+    .bind(recovery_action)
+    .bind(chosen_action)
+    .bind(chosen_next_state_id)
+    .bind(chosen_next_state_label)
+    .bind(sanitized_progress)
+    .bind(validation_errors_json)
+    .bind(confirmation_subject_id)
+    .bind(now.to_rfc3339())
+    .bind(settled_at)
+    .bind(id)
+    .execute(&mut **tx)
+    .await
+    .context("update mediation after lead output")?;
+
+    Ok(result.rows_affected())
 }
 
 fn parse_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeadConflictMediationRecord> {

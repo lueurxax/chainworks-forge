@@ -1241,7 +1241,7 @@ impl CommandHandler {
                 validate_operator_selected_candidate(selected_candidate)?;
                 let selected_next_state_id = selected_candidate.to_state_id.clone();
 
-                workflow_conflicts::transition_conflict_status_tx(
+                let resolved_conflict = workflow_conflicts::transition_conflict_status_tx(
                     &mut tx,
                     &conflict.conflict_id,
                     WorkflowConflictStatus::Resolved,
@@ -1257,6 +1257,15 @@ impl CommandHandler {
                     })),
                     None,
                     None,
+                )
+                .await?;
+                workflow_conflicts::record_recovery_action_chosen_tx(
+                    &mut tx,
+                    &resolved_conflict,
+                    "operator_selected_candidate_transition",
+                    &caller.surface.to_string(),
+                    "accepted",
+                    now,
                 )
                 .await?;
 
@@ -1792,6 +1801,28 @@ impl CommandHandler {
                         .await?;
                     }
                 };
+                if let Some(conflict) =
+                    workflow_conflicts::find_conflict_by_id_tx(&mut tx, &confirmation.conflict_id)
+                        .await?
+                {
+                    let action_class = match c.decision {
+                        domain::mediation::MediationConfirmationDecision::Confirm => {
+                            "lead_mediation_confirmed"
+                        }
+                        domain::mediation::MediationConfirmationDecision::ManualFallback => {
+                            "manual_fallback"
+                        }
+                    };
+                    workflow_conflicts::record_recovery_action_chosen_tx(
+                        &mut tx,
+                        &conflict,
+                        action_class,
+                        &caller.surface.to_string(),
+                        "accepted",
+                        now,
+                    )
+                    .await?;
+                }
 
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
@@ -2112,12 +2143,18 @@ impl CommandHandler {
         let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
             .await?
             .ok_or_else(|| anyhow!("Agent execution {} not found", agent_execution_id))?;
-        let old_stage = stages::find_by_id(&self.pool, target_exec.stage_execution_id)
+        let old_stage_execution_id = target_exec.stage_execution_id.ok_or_else(|| {
+            anyhow!(
+                "Agent execution {} is not stage-owned and cannot be retried as a stage",
+                agent_execution_id
+            )
+        })?;
+        let old_stage = stages::find_by_id(&self.pool, old_stage_execution_id)
             .await?
             .ok_or_else(|| {
                 anyhow!(
                     "Stage execution {} for agent execution {} not found",
-                    target_exec.stage_execution_id,
+                    old_stage_execution_id,
                     agent_execution_id
                 )
             })?;

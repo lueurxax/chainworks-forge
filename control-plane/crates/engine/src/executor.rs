@@ -8,7 +8,7 @@ use anyhow::{Context, Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::SqlitePool;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -32,9 +32,9 @@ use domain::agent::{
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
     contract_status_allowed_values, known_contract_id, parse_implementation_self_assessment_v2,
-    ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey,
-    ContractParseContext, SourceGenerationImportDecision,
-    IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH, IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    ActiveArtifactGenerationInput, ArtifactSourceGenerationClaimKey, ContractParseContext,
+    SourceGenerationImportDecision, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
@@ -58,7 +58,6 @@ use crate::contracts::{
 use crate::event_bus::EventSender;
 use crate::failure_classifier::{
     classify_observation, observation_from_acp_error_message, RuntimeFailureClassification,
-    RuntimeFailureObservation,
 };
 use crate::git_manifest::generate_changed_files_manifest_if_declared;
 use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
@@ -133,12 +132,15 @@ impl DbXcodeRuntimeObservationSink {
                 return;
             }
         };
-        let stage = match stages::find_by_id(&self.pool, execution.stage_execution_id).await {
+        let Some(stage_execution_id) = execution.stage_execution_id else {
+            return;
+        };
+        let stage = match stages::find_by_id(&self.pool, stage_execution_id).await {
             Ok(Some(stage)) => stage,
             Ok(None) => {
                 warn!(
                     agent_execution_id = %agent_execution_id,
-                    stage_execution_id = %execution.stage_execution_id,
+                    stage_execution_id = %stage_execution_id,
                     "Xcode runtime observation append notification skipped: stage missing"
                 );
                 return;
@@ -146,7 +148,7 @@ impl DbXcodeRuntimeObservationSink {
             Err(error) => {
                 warn!(
                     agent_execution_id = %agent_execution_id,
-                    stage_execution_id = %execution.stage_execution_id,
+                    stage_execution_id = %stage_execution_id,
                     error = %error,
                     "Xcode runtime observation append notification skipped: stage lookup failed"
                 );
@@ -157,7 +159,7 @@ impl DbXcodeRuntimeObservationSink {
             .events
             .send(domain::events::DomainEvent::StageStatusChanged {
                 run_id: stage.run_id,
-                stage_execution_id: execution.stage_execution_id,
+                stage_execution_id,
                 status: stage.status,
             });
     }
@@ -498,7 +500,7 @@ async fn claim_invoke_agent_work_item_with_start(
         pool,
         &domain::agent::AgentExecution {
             id: agent_execution_id,
-            stage_execution_id,
+            stage_execution_id: Some(stage_execution_id),
             agent_id,
             provider,
             model,
@@ -540,7 +542,9 @@ async fn claim_invoke_agent_work_item_with_start(
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
-        stage_execution_id,
+        owner_kind: domain::mediation::OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
         agent_execution_id,
         source_work_item_id: item.id.clone(),
     };
@@ -624,7 +628,9 @@ fn claimed_invoke_agent_start_from_payload(
         work_item_id: item.id.clone(),
         source_work_item_id: artifact_claim_key.source_work_item_id.clone(),
         run_id: artifact_claim_key.run_id,
-        stage_execution_id: artifact_claim_key.stage_execution_id,
+        stage_execution_id: artifact_claim_key.stage_execution_id.ok_or_else(|| {
+            anyhow::anyhow!("preclaimed InvokeAgent start requires stage-owned artifact claim")
+        })?,
         agent_execution_id,
         session_generation_id,
         artifact_claim_key,
@@ -2821,26 +2827,24 @@ impl BackgroundExecutor {
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                let stage_execution_id: domain::ids::StageExecutionId =
+                let stage_execution_id: Option<domain::ids::StageExecutionId> =
                     if stage_execution_id_str.is_empty() {
                         if is_mediation_owned {
-                            // MF-PRE-ENABLE-003: Guard — mediation-owned executions
-                            // must have owner_id set and must not synthesize stage IDs.
                             if owner_id.is_none() {
                                 return Err(anyhow::anyhow!(
                                     "Mediation-owned execution requires owner_id in payload"
                                 ));
                             }
-                            // Use a sentinel that clearly signals "no stage execution".
-                            // This value is never used as a durable identity anchor.
-                            domain::ids::StageExecutionId::new()
+                            None
                         } else {
-                            domain::ids::StageExecutionId::new()
+                            Some(domain::ids::StageExecutionId::new())
                         }
                     } else {
-                        stage_execution_id_str
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("{}", e))?
+                        Some(
+                            stage_execution_id_str
+                                .parse()
+                                .map_err(|e| anyhow::anyhow!("{}", e))?,
+                        )
                     };
 
                 let origin_stage_id = payload["origin_stage_id"].as_str().map(String::from);
@@ -3013,11 +3017,15 @@ impl BackgroundExecutor {
                 // owner_id (mediation record id) is the lineage anchor; for stage-owned
                 // executions, the stage_execution_id remains the lineage anchor.
                 let owner_execution_lineage_id = if owner_kind == "lead_conflict_mediation" {
-                    owner_id
-                        .clone()
-                        .unwrap_or_else(|| stage_execution_id.to_string())
+                    owner_id.clone().ok_or_else(|| {
+                        anyhow::anyhow!("Mediation-owned execution requires owner_id in payload")
+                    })?
                 } else {
-                    stage_execution_id.to_string()
+                    stage_execution_id
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Stage-owned execution requires stage_execution_id")
+                        })?
+                        .to_string()
                 };
                 let policy_input = SessionPolicyInput {
                     run_id: run_id.to_string(),
@@ -3177,7 +3185,7 @@ impl BackgroundExecutor {
                         status: domain::agent::AgentStatus::Running,
                         started_at: now,
                         completed_at: None,
-                        owner_execution_lineage_id: Some(owner_execution_lineage_id),
+                        owner_execution_lineage_id: Some(owner_execution_lineage_id.clone()),
                         session_lineage_id: policy_decision
                             .as_ref()
                             .map(|decision| decision.lineage.id.clone()),
@@ -3226,7 +3234,7 @@ impl BackgroundExecutor {
                         } else {
                             owner_id
                                 .clone()
-                                .or_else(|| Some(stage_execution_id.to_string()))
+                                .or_else(|| stage_execution_id.map(|id| id.to_string()))
                         },
                         lead_mediation_record_id: mediation_record_id.clone(),
                         origin_stage_execution_id: origin_stage_execution_id.clone(),
@@ -3309,6 +3317,27 @@ impl BackgroundExecutor {
                         None,
                     )
                     .await?;
+                    let Some(stage_execution_id) = stage_execution_id else {
+                        if let Some(med_id) = mediation_record_id.as_deref() {
+                            let mut tx = db::pool::begin_immediate_with_retry(
+                                &self.pool,
+                                "mediation.mcp_resolution_blocked",
+                            )
+                            .await?;
+                            let _ = db::repos::lead_conflict_mediations::update_status_tx(
+                                &mut tx,
+                                med_id,
+                                "terminal_unverifiable",
+                                Some("mcp_resolution_blocked"),
+                                Some("clone_or_manual_fallback"),
+                                completed_at,
+                            )
+                            .await?;
+                            tx.commit().await?;
+                        }
+                        projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                        return Ok(());
+                    };
                     crate::recovery::persist_failed_stage_recovery_snapshot(
                         &self.pool,
                         stage_execution_id,
@@ -3379,6 +3408,9 @@ impl BackgroundExecutor {
                 }
 
                 if self.is_release_agent(&agent_id) {
+                    let stage_execution_id = stage_execution_id.ok_or_else(|| {
+                        anyhow::anyhow!("Release agent execution requires stage_execution_id")
+                    })?;
                     // Native release path: bypass ACP entirely and execute the
                     // deterministic git/publish services.
                     return self
@@ -3399,17 +3431,24 @@ impl BackgroundExecutor {
                         .await;
                 }
 
-                let stage_attempt_number = stages::find_by_id(&self.pool, stage_execution_id)
-                    .await?
-                    .map(|stage| stage.attempt_number)
-                    .unwrap_or(1);
+                let stage_attempt_number = if let Some(stage_execution_id) = stage_execution_id {
+                    stages::find_by_id(&self.pool, stage_execution_id)
+                        .await?
+                        .map(|stage| stage.attempt_number)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
                 let mut discovery_override_status =
                     if legacy_broad_discovery_policy.allows_broad_discovery() {
                         "workflow_opt_in".to_string()
                     } else {
                         "not_requested".to_string()
                     };
-                if !legacy_broad_discovery_policy.allows_broad_discovery() {
+                if !legacy_broad_discovery_policy.allows_broad_discovery()
+                    && stage_execution_id.is_some()
+                {
+                    let stage_execution_id = stage_execution_id.expect("checked is_some");
                     let mut tx = db::pool::begin_immediate_with_retry(
                         &self.pool,
                         "executor.consume_legacy_discovery_override",
@@ -3446,7 +3485,9 @@ impl BackgroundExecutor {
                         RuntimeInvocationContractInput {
                             run_id: run_id.to_string(),
                             stage_id: stage_id.clone(),
-                            stage_execution_id: stage_execution_id.to_string(),
+                            stage_execution_id: stage_execution_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| owner_execution_lineage_id.clone()),
                             agent_execution_id: agent_exec_id.to_string(),
                             work_item_id: item.id.clone(),
                             session_generation_id: policy_decision
@@ -3470,7 +3511,7 @@ impl BackgroundExecutor {
                 let req = acp::ExecutionRequest {
                     agent_execution_id: Some(agent_exec_id),
                     run_id,
-                    stage_execution_id: Some(stage_execution_id.to_string()),
+                    stage_execution_id: stage_execution_id.map(|id| id.to_string()),
                     stage_id: stage_id.clone(),
                     attempt_number: u32::try_from(stage_attempt_number).unwrap_or(1),
                     agent_id: agent_id.clone(),
@@ -3510,7 +3551,7 @@ impl BackgroundExecutor {
                     } else {
                         owner_id
                             .clone()
-                            .or_else(|| Some(stage_execution_id.to_string()))
+                            .or_else(|| stage_execution_id.map(|id| id.to_string()))
                     },
                     origin_stage_id: origin_stage_id.clone().or_else(|| Some(stage_id.clone())),
                     origin_stage_execution_id: if is_mediation_owned {
@@ -3518,7 +3559,7 @@ impl BackgroundExecutor {
                     } else {
                         origin_stage_execution_id
                             .clone()
-                            .or_else(|| Some(stage_execution_id.to_string()))
+                            .or_else(|| stage_execution_id.map(|id| id.to_string()))
                     },
                     mediation_record_id: mediation_record_id.clone(),
                 };
@@ -3626,6 +3667,67 @@ impl BackgroundExecutor {
                         );
                         return Ok(());
                     }
+                }
+
+                // P017 B2-004: Check mediation staleness for mediation-owned executions.
+                // If the mediation has been superseded or canceled while the agent ran,
+                // record the output as ignored_late_output and skip artifact persistence.
+                let mediation_stale = if owner_kind == "lead_conflict_mediation" {
+                    if let Some(ref med_id) = mediation_record_id {
+                        match db::repos::lead_conflict_mediations::find_by_id(&self.pool, med_id)
+                            .await
+                        {
+                            Ok(Some(med)) => med.status.is_terminal(),
+                            Ok(None) => {
+                                warn!(
+                                    mediation_id = %med_id,
+                                    "Mediation record not found; treating output as stale"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                // MC-003: Fail closed on DB error — if we can't verify
+                                // mediation status, treat output as stale to prevent
+                                // persisting against a terminal or superseded mediation.
+                                warn!(
+                                    mediation_id = %med_id,
+                                    error = %e,
+                                    "Failed to check mediation staleness; treating as stale (fail-closed)"
+                                );
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if mediation_stale {
+                    info!(
+                        run_id = %run_id,
+                        agent_id = %agent_id,
+                        mediation_record_id = ?mediation_record_id,
+                        "Mediation-owned execution output is stale; recording as ignored_late_output"
+                    );
+                    let completed_at = chrono::Utc::now();
+                    let mut facts =
+                        AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, completed_at);
+                    facts.output_settlement = AgentOutputSettlement::IgnoredLateOutputs;
+                    facts.ignored_late_output_count = 1;
+                    facts.late_output_count = 1;
+                    facts.valid_required_outputs = false;
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        completed_at,
+                    )
+                    .await?;
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    return Ok(());
                 }
 
                 // P017 B2-004: Check mediation staleness for mediation-owned executions.
@@ -3974,6 +4076,205 @@ impl BackgroundExecutor {
                     });
 
                 let completed_at = chrono::Utc::now();
+                if is_mediation_owned {
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        result.status.clone(),
+                        completed_at,
+                    )
+                    .await?;
+                    if let Some(med_id) = mediation_record_id.as_deref() {
+                        let mut tx = db::pool::begin_immediate_with_retry(
+                            &self.pool,
+                            "mediation.agent_execution_completed",
+                        )
+                        .await?;
+                        if let Some(mediation) =
+                            db::repos::lead_conflict_mediations::find_by_id_tx(&mut tx, med_id)
+                                .await?
+                        {
+                            let conflict = db::repos::workflow_conflicts::find_conflict_by_id_tx(
+                                &mut tx,
+                                &mediation.conflict_id,
+                            )
+                            .await?;
+                            if result.status == AgentStatus::Completed {
+                                let validation_summary =
+                                    declared_output_settlement.as_ref().map(|settlement| {
+                                        let captured =
+                                            build_captured_outputs_from_discovery_decisions(
+                                                &declared_outputs,
+                                                &settlement.decisions,
+                                                &settlement.accepted_payloads,
+                                            );
+                                        validate_task_outputs(&captured)
+                                    });
+                                let validation_failed = declared_outputs.is_empty()
+                                    || validation_summary
+                                        .as_ref()
+                                        .is_none_or(|summary| summary.failure_class.is_some());
+
+                                if validation_failed {
+                                    let validation_errors_json = serde_json::to_string(
+                                        &serde_json::json!({
+                                            "error": if declared_outputs.is_empty() {
+                                                "lead_resolution_contract_missing"
+                                            } else {
+                                                "lead_resolution_contract_validation_failed"
+                                            },
+                                            "summary": validation_summary
+                                                .as_ref()
+                                                .and_then(|summary| summary.failure_summary.clone()),
+                                            "output_results": validation_summary
+                                                .as_ref()
+                                                .map(|summary| &summary.output_results),
+                                        }),
+                                    )?;
+                                    let _ =
+                                        db::repos::lead_conflict_mediations::update_after_lead_output_tx(
+                                            &mut tx,
+                                            med_id,
+                                            "terminal_unverifiable",
+                                            Some("lead_output_validation_failed"),
+                                            Some("clone_or_manual_fallback"),
+                                            None,
+                                            None,
+                                            None,
+                                            Some("Lead output failed LeadResolutionContract validation"),
+                                            Some(&validation_errors_json),
+                                            None,
+                                            completed_at,
+                                        )
+                                        .await?;
+                                    if let Some(conflict) = conflict {
+                                        db::repos::workflow_conflicts::transition_conflict_status_tx(
+                                            &mut tx,
+                                            &conflict.conflict_id,
+                                            domain::workflow_conflict::WorkflowConflictStatus::TerminalUnverifiable,
+                                            completed_at,
+                                            Some(serde_json::json!({
+                                                "resolution_kind": "lead_mediation_output_validation_failed",
+                                                "action_class": "clone_or_manual_fallback",
+                                                "mediation_record_id": med_id,
+                                            })),
+                                            Some("lead_output_validation_failed".to_string()),
+                                            None,
+                                        )
+                                        .await?;
+                                    }
+                                } else {
+                                    let confirmation_id = mediation
+                                        .confirmation_subject_id
+                                        .clone()
+                                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                    if mediation.confirmation_subject_id.is_none() {
+                                        db::repos::lead_mediation_confirmations::insert_tx(
+                                            &mut tx,
+                                            &domain::mediation::LeadMediationConfirmation {
+                                                id: confirmation_id.clone(),
+                                                mediation_record_id: med_id.to_string(),
+                                                run_id: mediation.run_id.clone(),
+                                                conflict_id: mediation.conflict_id.clone(),
+                                                conflict_fingerprint: mediation
+                                                    .conflict_fingerprint
+                                                    .clone(),
+                                                status: domain::mediation::MediationConfirmationStatus::Pending,
+                                                suggested_action: Some(
+                                                    "confirm_lead_resolution".to_string(),
+                                                ),
+                                                requested_at: completed_at,
+                                                deadline_at: Some(
+                                                    completed_at + chrono::Duration::minutes(30),
+                                                ),
+                                                readback_ref: Some(format!(
+                                                    "workflow_conflict.current.lead_mediation:{}",
+                                                    med_id
+                                                )),
+                                                idempotency_scope_key: Some(format!(
+                                                    "{}:{}:{}",
+                                                    mediation.run_id,
+                                                    mediation.conflict_fingerprint,
+                                                    med_id
+                                                )),
+                                                resolved_at: None,
+                                                resolved_by_principal_id: None,
+                                                resolution_decision: None,
+                                                resolution_comment: None,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                    let _ =
+                                        db::repos::lead_conflict_mediations::update_after_lead_output_tx(
+                                            &mut tx,
+                                            med_id,
+                                            "operator_confirmation_required",
+                                            Some("lead_output_validated"),
+                                            None,
+                                            Some("confirm_lead_resolution"),
+                                            None,
+                                            None,
+                                            Some("Lead output validated; awaiting operator confirmation"),
+                                            None,
+                                            Some(&confirmation_id),
+                                            completed_at,
+                                        )
+                                        .await?;
+                                    if let Some(conflict) = conflict {
+                                        db::repos::workflow_conflicts::update_mediation_pointer_tx(
+                                            &mut tx,
+                                            &conflict.conflict_id,
+                                            &mediation.lead_agent_id,
+                                            med_id,
+                                            domain::workflow_conflict::WorkflowConflictStatus::OperatorConfirmationRequired,
+                                            completed_at,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            } else {
+                                let _ = db::repos::lead_conflict_mediations::update_after_lead_output_tx(
+                                    &mut tx,
+                                    med_id,
+                                    "terminal_unverifiable",
+                                    Some("agent_failed"),
+                                    Some("clone_or_manual_fallback"),
+                                    None,
+                                    None,
+                                    None,
+                                    Some("Lead mediation agent failed"),
+                                    None,
+                                    None,
+                                    completed_at,
+                                )
+                                .await?;
+                                if let Some(conflict) = conflict {
+                                    db::repos::workflow_conflicts::transition_conflict_status_tx(
+                                        &mut tx,
+                                        &conflict.conflict_id,
+                                        domain::workflow_conflict::WorkflowConflictStatus::TerminalUnverifiable,
+                                        completed_at,
+                                        Some(serde_json::json!({
+                                            "resolution_kind": "lead_mediation_agent_failed",
+                                            "action_class": "clone_or_manual_fallback",
+                                            "mediation_record_id": med_id,
+                                        })),
+                                        Some("lead_mediation_agent_failed".to_string()),
+                                        None,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                        tx.commit().await?;
+                    }
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    return Ok(());
+                }
+                let stage_execution_id = stage_execution_id.ok_or_else(|| {
+                    anyhow::anyhow!("Stage-owned execution requires stage_execution_id")
+                })?;
                 let mut persisted_paths = std::collections::HashSet::new();
                 let mut persisted_artifacts = Vec::new();
                 let artifact_claim_key = preclaimed_start
@@ -3981,7 +4282,9 @@ impl BackgroundExecutor {
                     .map(|claimed| claimed.artifact_claim_key.clone())
                     .unwrap_or_else(|| ArtifactSourceGenerationClaimKey {
                         run_id,
-                        stage_execution_id,
+                        owner_kind: domain::mediation::OwnerKind::StageExecution,
+                        owner_id: stage_execution_id.to_string(),
+                        stage_execution_id: Some(stage_execution_id),
                         agent_execution_id: agent_exec_id,
                         source_work_item_id: item.id.clone(),
                     });
@@ -4009,7 +4312,7 @@ impl BackgroundExecutor {
                         result.transcript_text.as_deref(),
                     )
                     .await?;
-                let transcript_exists = transcript_artifact.is_some();
+                let _transcript_exists = transcript_artifact.is_some();
                 if let Some(artifact) = transcript_artifact {
                     persisted_artifacts.push(artifact);
                 }
@@ -4155,7 +4458,7 @@ impl BackgroundExecutor {
                     .await?;
                 let validation_summary = import_result.validation_summary;
                 let final_agent_status = import_result.final_agent_status;
-                let degraded_outputs_satisfy_stage = import_result.degraded_outputs_satisfy_stage;
+                let _degraded_outputs_satisfy_stage = import_result.degraded_outputs_satisfy_stage;
 
                 if let Some(summary) = validation_summary {
                     if summary.failure_class.is_some() {
@@ -6485,7 +6788,9 @@ mod tests {
             AgentStatus::Failed,
             Some(&validation),
             Some(classify_observation(
-                RuntimeFailureObservation::ProviderQuota { retry_after: None },
+                crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
+                    retry_after: None,
+                },
             )),
             chrono::Utc::now(),
             None,
@@ -6516,7 +6821,7 @@ mod tests {
             AgentStatus::Failed,
             Some(&validation),
             Some(classify_observation(
-                RuntimeFailureObservation::ProviderQuota {
+                crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
                     retry_after: Some(retry_after),
                 },
             )),

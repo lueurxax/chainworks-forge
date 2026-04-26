@@ -269,6 +269,9 @@ Scope:
   owner-aware execution, and settlement validation.
 - **Mandatory Lead Validation**: Static workflow validation and runtime
   preflight for lead resolution.
+- Phase B dogfood exit evidence, Phase C external catalog enforcement
+  inventory, known-issues migration record validation, and workflow-conflict
+  rollout metric fixtures.
 
 Use when:
 
@@ -294,6 +297,8 @@ Important:
 - it validates that agent-authored `next_stage` cannot override the compiled graph
 - it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the full P017 slice
 - it proves Rust `agent_executions` owner-kind migration, lead mediation runtime, and lead-validation requirements
+- it verifies the P017 evidence bundle under `docs/proposals/017-evidence/`,
+  including flag-gated dogfood closeout and external catalog attestation
 
 ### Phase 0 Contract Freeze
 
@@ -304,6 +309,9 @@ The `proposal-017` gate verifies the existence and approval status of required P
 - **Work Item Owner**: `docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json`
 - **Lead Resolver**: `docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`
 - **Settlement Boundary**: `docs/proposals/017-evidence/phase-0-settlement-service-boundary.md`
+- **Dogfood Exit Record**: `docs/proposals/017-evidence/phase-b-dogfood-exit-record.json`
+- **Phase C Inventory**: `docs/proposals/017-evidence/phase-c-external-catalog-enforcement-inventory.json`
+- **Known Issues Migration Records**: `docs/proposals/017-evidence/phase-a-known-issues-migration-records.json`
 
 ### `proposal-019`
 

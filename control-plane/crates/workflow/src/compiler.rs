@@ -27,6 +27,7 @@ use crate::plan::*;
 pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
     let wf = definition::load(workflow_path).context("loading workflow definition")?;
     let cat = catalog::load(catalog_path).context("loading agent catalog")?;
+    catalog::validate_catalog_has_exactly_one_system_lead(&cat)?;
     let workflow_raw =
         load_raw_yaml_value(workflow_path).context("loading raw workflow YAML for P051 lint")?;
     let catalog_raw =

@@ -2280,11 +2280,61 @@ impl Orchestrator {
         let provider = resolve_agent_provider(lead_agent, &catalog);
         let model = resolve_agent_model(lead_agent, &catalog);
         let effort = resolve_agent_effort(lead_agent, &catalog);
+        let lead_resolution_contract_id = lead_agent
+            .lead_resolution_contract
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lead agent '{}' missing lead_resolution_contract",
+                    lead_agent_id
+                )
+            })?;
+        let lead_resolution_contract = catalog
+            .contracts
+            .as_ref()
+            .and_then(|contracts| contracts.get(lead_resolution_contract_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lead agent '{}' references missing lead_resolution_contract '{}'",
+                    lead_agent_id,
+                    lead_resolution_contract_id
+                )
+            })?;
+        let lead_resolution_target_path = catalog
+            .artifacts
+            .as_ref()
+            .and_then(|artifacts| artifacts.get("lead_resolution"))
+            .cloned()
+            .unwrap_or_else(|| {
+                "${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json".to_string()
+            });
+        let lead_resolution_output_schema = serde_json::json!({
+            "contract_id": lead_resolution_contract_id,
+            "format": lead_resolution_contract
+                .format
+                .clone()
+                .unwrap_or_else(|| "json".to_string()),
+            "human_format": lead_resolution_contract.human_format.clone(),
+            "machine_format": lead_resolution_contract.machine_format.clone(),
+            "validation_mode": lead_resolution_contract.validation_mode.clone(),
+            "normalized_artifact_name": lead_resolution_contract.normalized_artifact_name.clone(),
+            "raw_artifact_name": lead_resolution_contract.raw_artifact_name.clone(),
+            "required_fields": lead_resolution_contract.required_fields.clone(),
+        });
+        let declared_outputs = serde_json::json!([{
+            "output_name": "lead_resolution",
+            "target_path": lead_resolution_target_path,
+            "schema": lead_resolution_output_schema,
+            "reuse_policy": serde_json::Value::Null,
+            "companion_output_name": serde_json::Value::Null,
+            "companion_path": serde_json::Value::Null,
+        }]);
 
         let prompt = format!(
             "You are the system lead agent mediating workflow conflict {}. \
              Conflict reason: {}. Current state: {}. \
-             Analyze the conflict and propose a resolution.",
+             Analyze the conflict and propose a resolution. Return the required \
+             LeadResolutionContract as CHAINWORKS_OUTPUT for lead_resolution.",
             conflict.conflict_id, conflict.reason, conflict.current_state_id,
         );
 
@@ -2301,11 +2351,13 @@ impl Orchestrator {
                     "stage_execution_id": serde_json::Value::Null,
                     "task_name": format!("mediation_{}", mediation_id),
                     "task_inputs": Vec::<String>::new(),
-                    "task_outputs": Vec::<String>::new(),
+                    "task_outputs": ["lead_resolution"],
+                    "declared_outputs": declared_outputs,
                     "agent_id": lead_agent_id,
                     "provider": provider,
                     "model": model,
                     "effort": effort,
+                    "output_contract": lead_resolution_contract_id,
                     "prompt": prompt,
                     "task_index": 0,
                     "total_tasks": 1,
