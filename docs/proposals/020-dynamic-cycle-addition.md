@@ -1,4 +1,4 @@
-# 20. Dynamic Cycle Addition
+# Proposal 020: Dynamic Cycle Addition
 
 *   **Status**: Draft
 *   **Author**: Goose

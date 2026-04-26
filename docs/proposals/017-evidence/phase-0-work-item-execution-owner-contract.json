@@ -1,0 +1,47 @@
+{
+  "artifact_id": "phase_0_work_item_execution_owner_contract",
+  "path": "docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json",
+  "schema_version": "phase_0_work_item_execution_owner_contract_v1",
+  "canonical_payload_fields": [
+    "run_id",
+    "work_item_id",
+    "work_item_kind",
+    "owner_kind",
+    "owner_id",
+    "agent_execution_id",
+    "claim_scope_key",
+    "cancellation_scope_key",
+    "requeue_scope_key",
+    "repair_scope_key",
+    "origin_stage_id",
+    "origin_stage_execution_id",
+    "mediation_record_id",
+    "conflict_fingerprint"
+  ],
+  "storage_rules": [
+    "For invoke_agent work items, payload_json carries owner_kind and owner_id as canonical execution ownership. The work_items.stage_id column remains an optional origin-stage compatibility hint and may not become the durable owner key for mediation-owned work.",
+    "claim_scope_key, cancellation_scope_key, requeue_scope_key, and repair_scope_key are deterministic functions of run_id plus owner_kind plus owner_id plus work_item_kind, so startup recovery and duplicate claim repair can make the same decision after crash or host interruption.",
+    "artifact source-generation claims, retry budgets, and ignored-late-output settlement must consume the same owner-aware keys as the work-item contract rather than deriving identity from stage_execution_id."
+  ],
+  "owner_kind_behavior_matrix": [
+    {
+      "owner_kind": "stage_execution",
+      "required_payload_fields": [
+        "owner_id=stage_execution_id",
+        "origin_stage_id",
+        "origin_stage_execution_id"
+      ],
+      "claim_cancel_repair_rule": "Claim, cancel, retry, and repair remain scoped to the stage execution owner key. Existing stage-only scheduling behavior is preserved."
+    },
+    {
+      "owner_kind": "lead_conflict_mediation",
+      "required_payload_fields": [
+        "owner_id=lead_conflict_mediation_id",
+        "mediation_record_id",
+        "conflict_fingerprint",
+        "origin_stage_id"
+      ],
+      "claim_cancel_repair_rule": "Claim, cancel, requeue, repair, and ignored-late-output handling are scoped to the mediation owner key. stage_execution_id may be null and may never be synthesized to preserve queue compatibility."
+    }
+  ]
+}

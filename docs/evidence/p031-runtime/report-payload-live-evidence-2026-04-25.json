@@ -1,0 +1,161 @@
+{
+  "schema_version": "p031-report-payload-live-evidence-v1",
+  "measured_at_utc": "2026-04-25T04:27:00Z",
+  "endpoint": "http://127.0.0.1:4000/graphql",
+  "run_id": "6ad4e80a-8341-42a5-9809-849f98d79779",
+  "errors": null,
+  "artifact_count": 876,
+  "report_metadata_count": 34,
+  "payload_availability_states": [
+    "metadata_only"
+  ],
+  "payload_unavailable_reason_codes": [
+    "PAYLOAD_DEFERRED_BY_P031"
+  ],
+  "samples": [
+    {
+      "id": "54ad5d6d-be7b-4c99-81f5-0ff41f5c996a",
+      "name": "validation_failure_proposal_reviewer_ux_d938e635-c73e-46ba-9f55-62648248a816",
+      "format": "json",
+      "reportKind": "validation_failure",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "54ad5d6d-be7b-4c99-81f5-0ff41f5c996a",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "0369db28-b540-4de0-96e1-93e14ad72099",
+      "name": "failed_stage_evidence_caae1a07-7ea6-4da8-828c-e8faf1e3519c",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "0369db28-b540-4de0-96e1-93e14ad72099",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "fa9bc5dd-bc7a-41d4-b301-5d7132a60608",
+      "name": "validation_failure_proposal_reviewer_ui_d06db950-eec2-4dce-9b31-23b89ca287ea",
+      "format": "json",
+      "reportKind": "validation_failure",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "fa9bc5dd-bc7a-41d4-b301-5d7132a60608",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "c81981ed-08ad-462c-9ba2-9a15b46e4784",
+      "name": "failed_stage_evidence_caae1a07-7ea6-4da8-828c-e8faf1e3519c",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "c81981ed-08ad-462c-9ba2-9a15b46e4784",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "54ecdca5-e964-4d80-8d7c-bef8b83aaff7",
+      "name": "failed_stage_evidence_7268622c-bd4d-4bf7-8edc-c164b755a042",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "54ecdca5-e964-4d80-8d7c-bef8b83aaff7",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "3afed7e2-23cc-4698-b15b-d7de515ccc83",
+      "name": "failed_stage_evidence_7268622c-bd4d-4bf7-8edc-c164b755a042",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "3afed7e2-23cc-4698-b15b-d7de515ccc83",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "cdd176d0-ebe2-476d-a24d-fc7da92da288",
+      "name": "failed_stage_evidence_35aec68d-3b5a-47b6-aba9-0f08575602f7",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "cdd176d0-ebe2-476d-a24d-fc7da92da288",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "60fa87ec-c646-4c5c-b04b-18cc2e6550ea",
+      "name": "session_checkpoint",
+      "format": "json",
+      "reportKind": "session_checkpoint",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "60fa87ec-c646-4c5c-b04b-18cc2e6550ea",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "9be81f9e-6dda-4445-b4f7-7e9eacddd868",
+      "name": "failed_stage_evidence_35aec68d-3b5a-47b6-aba9-0f08575602f7",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "9be81f9e-6dda-4445-b4f7-7e9eacddd868",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "5646aae6-011b-4c40-b236-3844d41a7e61",
+      "name": "failed_stage_evidence_d9086d24-e583-421f-9574-660ad996d446",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "5646aae6-011b-4c40-b236-3844d41a7e61",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "e38d6e2d-e860-47f8-80cd-5a338d3b3c6d",
+      "name": "failed_stage_evidence_57bbc604-db7b-4721-b67f-757d78feabf0",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "e38d6e2d-e860-47f8-80cd-5a338d3b3c6d",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    },
+    {
+      "id": "3716f21f-c3a5-4644-ba9e-9a76fa1ac053",
+      "name": "failed_stage_evidence_57bbc604-db7b-4721-b67f-757d78feabf0",
+      "format": "json",
+      "reportKind": "failed_stage_evidence",
+      "reportVersion": 1,
+      "freshnessState": "live",
+      "payloadAvailabilityState": "metadata_only",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "diagnosticId": "3716f21f-c3a5-4644-ba9e-9a76fa1ac053",
+      "serverDebugDetail": "P031 exposes report metadata only; payload rendering is deferred"
+    }
+  ]
+}

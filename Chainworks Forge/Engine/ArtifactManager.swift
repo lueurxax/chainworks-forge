@@ -123,7 +123,8 @@ final class ArtifactManager {
             artifacts.append(artifact)
         }
 
-        return artifacts
+        try modelContext.save()
+        return try refetchArtifacts(withIDs: artifacts.map(\.id))
     }
 
     /// Read artifact data from disk, validating path boundaries.
@@ -207,7 +208,8 @@ final class ArtifactManager {
         artifact.agentExecution = agentExecution
         
         modelContext.insert(artifact)
-        return artifact
+        try modelContext.save()
+        return try refetchArtifact(id: artifact.id)
     }
 
     /// Persist a system-generated artifact that is not attached to a specific agent execution.
@@ -255,7 +257,8 @@ final class ArtifactManager {
         artifact.effort = effort
 
         modelContext.insert(artifact)
-        return artifact
+        try modelContext.save()
+        return try refetchArtifact(id: artifact.id)
     }
 
     // MARK: - Format Resolution
@@ -287,5 +290,36 @@ final class ArtifactManager {
         }
 
         return ArtifactFormat.detect(from: outputName, contract: contract)
+    }
+
+    @MainActor
+    private func refetchArtifact(id: UUID) throws -> Artifact {
+        let descriptor = FetchDescriptor<Artifact>(
+            predicate: #Predicate<Artifact> { $0.id == id }
+        )
+        guard let artifact = try modelContext.fetch(descriptor).first else {
+            throw ArtifactManagerError.refetchFailed(id: id)
+        }
+        return artifact
+    }
+
+    @MainActor
+    private func refetchArtifacts(withIDs ids: [UUID]) throws -> [Artifact] {
+        let persisted = try ids.map { try refetchArtifact(id: $0) }
+        let order = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, $0) })
+        return persisted.sorted { lhs, rhs in
+            (order[lhs.id] ?? .max) < (order[rhs.id] ?? .max)
+        }
+    }
+}
+
+enum ArtifactManagerError: LocalizedError {
+    case refetchFailed(id: UUID)
+
+    var errorDescription: String? {
+        switch self {
+        case .refetchFailed(let id):
+            return "Failed to refetch persisted artifact \(id.uuidString) after save."
+        }
     }
 }

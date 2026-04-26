@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 enum SecurityScopedBookmarkKind: String, Codable, CaseIterable {
     case workspaceRoot
@@ -16,22 +17,45 @@ private struct SecurityScopedBookmarkRecord: Codable {
 }
 
 enum SecurityScopedAccess {
-    private static let defaultsKey = "securityScopedBookmarks.v1"
+    private nonisolated static let defaultsKey = "securityScopedBookmarks.v1"
+    private nonisolated static let logger = Logger(subsystem: "xax.Chainworks-Forge", category: "App")
+    #if DEBUG
+    private nonisolated(unsafe) static var bookmarkDataProviderForTesting: ((URL) throws -> Data)? = nil
+    #endif
 
-    static func remember(path: String?, kind: SecurityScopedBookmarkKind) {
-        guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        remember(url: URL(fileURLWithPath: path), kind: kind)
+    @discardableResult
+    nonisolated static func remember(path: String?, kind: SecurityScopedBookmarkKind) -> Bool {
+        guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return remember(url: URL(fileURLWithPath: path), kind: kind)
     }
 
-    static func remember(url: URL, kind: SecurityScopedBookmarkKind) {
+    @discardableResult
+    nonisolated static func remember(url: URL, kind: SecurityScopedBookmarkKind) -> Bool {
         let standardized = url.standardizedFileURL
-        guard standardized.isFileURL, !standardized.path.isEmpty else { return }
-        guard let bookmarkData = try? standardized.bookmarkData(
-            options: .withSecurityScope,
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        ) else {
-            return
+        guard standardized.isFileURL, !standardized.path.isEmpty else { return false }
+
+        let bookmarkData: Data
+        do {
+            #if DEBUG
+            if let bookmarkDataProviderForTesting {
+                bookmarkData = try bookmarkDataProviderForTesting(standardized)
+            } else {
+                bookmarkData = try standardized.bookmarkData(
+                    options: .withSecurityScope,
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+            }
+            #else
+            bookmarkData = try standardized.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            #endif
+        } catch {
+            logError("Failed to create security-scoped bookmark for \(standardized.path): \(error.localizedDescription)")
+            return false
         }
 
         var records = loadRecords()
@@ -43,16 +67,16 @@ enum SecurityScopedAccess {
                 bookmarkData: bookmarkData
             )
         )
-        saveRecords(records)
+        return saveRecords(records)
     }
 
-    static func rememberConfiguredPaths(in configuration: AppConfiguration) {
+    nonisolated static func rememberConfiguredPaths(in configuration: AppConfiguration) {
         remember(path: configuration.workflowSourcePath, kind: .workflowSource)
         remember(path: configuration.agentCatalogSourcePath, kind: .catalogSource)
         remember(path: configuration.supportBundleExportPath, kind: .supportBundleRoot)
     }
 
-    static func withAccess<T>(to url: URL, perform: (URL) throws -> T) rethrows -> T {
+    nonisolated static func withAccess<T>(to url: URL, perform: (URL) throws -> T) rethrows -> T {
         guard let securedURL = resolvedURL(for: url) else {
             return try perform(url)
         }
@@ -67,11 +91,19 @@ enum SecurityScopedAccess {
         return try perform(securedURL)
     }
 
-    static func loadData(from url: URL) throws -> Data {
-        try withAccess(to: url) { try Data(contentsOf: $0) }
+    nonisolated static func loadData(from url: URL) throws -> Data {
+        do {
+            return try withAccess(to: url) { try Data(contentsOf: $0) }
+        } catch {
+            let originalURL = url.standardizedFileURL
+            if FileManager.default.isReadableFile(atPath: originalURL.path) {
+                return try Data(contentsOf: originalURL)
+            }
+            throw error
+        }
     }
 
-    static func loadString(from url: URL, encoding: String.Encoding = .utf8) throws -> String {
+    nonisolated static func loadString(from url: URL, encoding: String.Encoding = .utf8) throws -> String {
         let data = try loadData(from: url)
         guard let string = String(data: data, encoding: encoding) else {
             throw CocoaError(.fileReadInapplicableStringEncoding)
@@ -79,24 +111,30 @@ enum SecurityScopedAccess {
         return string
     }
 
-    static func fileExists(at url: URL) -> Bool {
-        (try? withAccess(to: url) { FileManager.default.fileExists(atPath: $0.path) }) ?? false
+    nonisolated static func fileExists(at url: URL) -> Bool {
+        let existsWithAccess = withAccess(to: url) { securedURL in
+            FileManager.default.fileExists(atPath: securedURL.path)
+        }
+        if existsWithAccess {
+            return true
+        }
+        return FileManager.default.fileExists(atPath: url.standardizedFileURL.path)
     }
 
-    static func itemStatus(atPath path: String) -> (exists: Bool, isDirectory: Bool) {
+    nonisolated static func itemStatus(atPath path: String) -> (exists: Bool, isDirectory: Bool) {
         let url = URL(fileURLWithPath: path)
-        return (try? withAccess(to: url) { scopedURL in
+        return withAccess(to: url) { scopedURL in
             var isDirectory: ObjCBool = false
             let exists = FileManager.default.fileExists(atPath: scopedURL.path, isDirectory: &isDirectory)
             return (exists, isDirectory.boolValue)
-        }) ?? (false, false)
+        }
     }
 
-    static func hasBookmark(for url: URL) -> Bool {
+    nonisolated static func hasBookmark(for url: URL) -> Bool {
         nearestRecord(for: url) != nil
     }
 
-    static func authorizedRepositoryRoots() -> [URL] {
+    nonisolated static func authorizedRepositoryRoots() -> [URL] {
         var seen: Set<String> = []
         var roots: [URL] = []
 
@@ -111,7 +149,12 @@ enum SecurityScopedAccess {
         return roots
     }
 
-    private static func resolvedURL(for requestedURL: URL) -> URL? {
+    private nonisolated static func resolvedURL(for requestedURL: URL) -> URL? {
+        if shouldBypassBookmarkResolution(for: requestedURL) {
+            removeRecordsMatching(path: requestedURL.standardizedFileURL.path)
+            return nil
+        }
+
         guard let record = nearestRecord(for: requestedURL) else { return nil }
         var isStale = false
         guard let resolved = try? URL(
@@ -120,6 +163,11 @@ enum SecurityScopedAccess {
             relativeTo: nil,
             bookmarkDataIsStale: &isStale
         ) else {
+            if shouldQuietlyDiscardBookmarkFailure(for: requestedURL) {
+                removeRecordsMatching(path: record.path)
+            } else {
+                logError("Failed to resolve security-scoped bookmark for \(requestedURL.standardizedFileURL.path)")
+            }
             return nil
         }
 
@@ -130,14 +178,14 @@ enum SecurityScopedAccess {
         return resolved
     }
 
-    private static func nearestRecord(for requestedURL: URL) -> SecurityScopedBookmarkRecord? {
+    private nonisolated static func nearestRecord(for requestedURL: URL) -> SecurityScopedBookmarkRecord? {
         let requestedPath = requestedURL.standardizedFileURL.path
         return loadRecords()
             .filter { requestedPath == $0.path || requestedPath.hasPrefix($0.path + "/") }
             .max { $0.path.count < $1.path.count }
     }
 
-    private static func isDirectoryBookmarkKind(_ kind: SecurityScopedBookmarkKind) -> Bool {
+    private nonisolated static func isDirectoryBookmarkKind(_ kind: SecurityScopedBookmarkKind) -> Bool {
         switch kind {
         case .workspaceRoot, .supportBundleRoot, .artifactRoot:
             return true
@@ -146,26 +194,77 @@ enum SecurityScopedAccess {
         }
     }
 
-    private static func loadRecords() -> [SecurityScopedBookmarkRecord] {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let records = try? JSONDecoder().decode([SecurityScopedBookmarkRecord].self, from: data) else {
+    private nonisolated static func shouldBypassBookmarkResolution(for requestedURL: URL) -> Bool {
+        isTemporaryExampleFixturePath(requestedURL.standardizedFileURL.path)
+    }
+
+    private nonisolated static func shouldQuietlyDiscardBookmarkFailure(for requestedURL: URL) -> Bool {
+        let requestedPath = requestedURL.standardizedFileURL.path
+        if isTemporaryExampleFixturePath(requestedPath) {
+            return true
+        }
+        return false
+    }
+
+    private nonisolated static func isTemporaryPath(_ path: String) -> Bool {
+        let tempRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        return path == tempRoot || path.hasPrefix(tempRoot + "/")
+    }
+
+    private nonisolated static func isTemporaryExampleFixturePath(_ path: String) -> Bool {
+        guard isTemporaryPath(path) else { return false }
+        return path.contains("/examples/")
+    }
+
+    private nonisolated static func removeRecordsMatching(path: String) {
+        let standardizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+        let records = loadRecords()
+        let filtered = records.filter { $0.path != standardizedPath }
+        guard filtered.count != records.count else { return }
+        _ = saveRecords(filtered)
+    }
+
+    private nonisolated static func loadRecords() -> [SecurityScopedBookmarkRecord] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey) else {
+            return []
+        }
+        guard let records = try? JSONDecoder().decode([SecurityScopedBookmarkRecord].self, from: data) else {
+            logError("Security-scoped bookmark store could not be decoded; ignoring persisted bookmarks")
             return []
         }
         return records
     }
 
-    private static func saveRecords(_ records: [SecurityScopedBookmarkRecord]) {
-        guard let data = try? JSONEncoder().encode(records) else { return }
+    @discardableResult
+    private nonisolated static func saveRecords(_ records: [SecurityScopedBookmarkRecord]) -> Bool {
+        guard let data = try? JSONEncoder().encode(records) else {
+            logError("Security-scoped bookmark store could not be encoded")
+            return false
+        }
         UserDefaults.standard.set(data, forKey: defaultsKey)
+        return true
+    }
+
+    private nonisolated static func logError(_ message: String) {
+        logger.error("\(message, privacy: .public)")
     }
 
 #if DEBUG
-    static func resetForTesting() {
+    nonisolated static func resetForTesting() {
         UserDefaults.standard.removeObject(forKey: defaultsKey)
+        bookmarkDataProviderForTesting = nil
     }
 
-    static func bookmarkedPathsForTesting() -> [String] {
+    nonisolated static func bookmarkedPathsForTesting() -> [String] {
         loadRecords().map(\.path).sorted()
+    }
+
+    nonisolated static func setRawBookmarkStoreDataForTesting(_ data: Data?) {
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+
+    nonisolated static func installBookmarkDataProviderForTesting(_ provider: ((URL) throws -> Data)?) {
+        bookmarkDataProviderForTesting = provider
     }
 #endif
 }

@@ -115,6 +115,38 @@ import SwiftData
         lifecycleStatusLabel
     }
 
+    /// Detail surfaces should prefer the newest still-active run over a stale
+    /// previously selected run, so Ideas stays aligned with Runs Home.
+    @MainActor var latestDetailRunCandidate: Run? {
+        runs
+            .filter {
+                switch $0.presentationStatus {
+                case .pending, .ready, .running, .waitingApproval, .blocked, .cancelling:
+                    return true
+                case .completed, .cancelled:
+                    return false
+                case .failed:
+                    return true
+                }
+            }
+            .sorted { $0.startedAt > $1.startedAt }
+            .first
+    }
+
+    @MainActor func preferredDetailRun(selectedRun: Run?) -> Run? {
+        if let latestDetailRunCandidate {
+            return latestDetailRunCandidate
+        }
+
+        guard let selectedRun else { return nil }
+        switch selectedRun.presentationStatus {
+        case .pending, .ready, .running, .waitingApproval, .blocked, .failed, .cancelling:
+            return selectedRun
+        case .completed, .cancelled:
+            return nil
+        }
+    }
+
     /// Keeps the persisted legacy idea status aligned with the latest run without
     /// forcing the UI to collapse terminal run truth into the old four-state enum.
     @MainActor func synchronizePersistedStatusFromRuns() {

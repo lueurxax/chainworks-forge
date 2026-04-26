@@ -14,7 +14,7 @@ import os
 /// responses and event streams) and do NOT assert on transport-side effects.
 ///
 /// Applicable to: RuntimeStreamEventMapperTests, SimulatedAgentExecutorTests,
-/// stream-only tests in GooseServerTransportTests, EndToEndTests, and any
+/// stream-only tests in RuntimeTransportTests, EndToEndTests, and any
 /// new test that does not need observation.
 struct StubRuntimeTransport: RuntimeTransportProtocol, Sendable {
     var onCreateSession: @Sendable (RuntimeSessionRequest) async throws -> RuntimeSessionResponse = { _ in
@@ -50,8 +50,8 @@ struct StubRuntimeTransport: RuntimeTransportProtocol, Sendable {
 /// Lock-backed observable mock for tests that need to assert on request content,
 /// session lifecycle, and call counts after execution.
 ///
-/// Applicable to: RuntimeAgentExecutorTests, GooseSessionBridgeTests, OrchestratorTests,
-/// and session-lifecycle tests in GooseServerTransportTests.
+/// Applicable to: RuntimeAgentExecutorTests, RuntimeSessionBridgeTests, OrchestratorTests,
+/// and session-lifecycle tests in RuntimeTransportTests.
 ///
 /// Keep the surface async-friendly for tests, but avoid actor/protocol isolation
 /// mismatches with the synchronous `submitPrompt` requirement.
@@ -60,6 +60,7 @@ final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sen
         var createSessionResult: RuntimeSessionResponse?
         var createSessionError: Error?
         var streamEvents: [RuntimeStreamEvent] = []
+        var runtimeState: RuntimeSessionRuntimeState?
         var closeSessionCalled = false
         var lastSessionID: String?
         var lastSessionRequest: RuntimeSessionRequest?
@@ -73,12 +74,14 @@ final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sen
     func configure(
         sessionResult: RuntimeSessionResponse? = nil,
         sessionError: Error? = nil,
-        events: [RuntimeStreamEvent] = []
+        events: [RuntimeStreamEvent] = [],
+        runtimeState: RuntimeSessionRuntimeState? = nil
     ) async {
         state.withLock { state in
             state.createSessionResult = sessionResult
             state.createSessionError = sessionError
             state.streamEvents = events
+            state.runtimeState = runtimeState
         }
     }
 
@@ -114,6 +117,10 @@ final class ObservableRuntimeTransport: RuntimeTransportProtocol, @unchecked Sen
 
     func closeSession(sessionID: String) async throws {
         state.withLock { $0.closeSessionCalled = true }
+    }
+
+    func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+        state.withLock { $0.runtimeState }
     }
 
     func reset() async {

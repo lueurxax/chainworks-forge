@@ -1,7 +1,7 @@
 import Foundation
 import OSLog
 
-enum ForgeLogCategory: String {
+nonisolated enum ForgeLogCategory: String, Sendable {
     case steward = "Steward"
     case recovery = "Recovery"
     case execution = "Execution"
@@ -17,45 +17,45 @@ enum ForgeLogCategory: String {
     case general = "General"
 }
 
-struct ForgeLogger {
+nonisolated struct ForgeLogger: Sendable {
     private let logger: Logger
     private let category: ForgeLogCategory
 
-    init(category: ForgeLogCategory) {
+    nonisolated init(category: ForgeLogCategory) {
         self.category = category
         self.logger = Logger(subsystem: "xax.Chainworks-Forge", category: category.rawValue)
     }
 
-    func debug(_ message: String) {
+    nonisolated func debug(_ message: String) {
         logger.debug("\(message, privacy: .public)")
     }
 
-    func info(_ message: String) {
+    nonisolated func info(_ message: String) {
         logger.info("\(message, privacy: .public)")
     }
 
-    func error(_ message: String) {
+    nonisolated func error(_ message: String) {
         logger.error("\(message, privacy: .public)")
     }
 
-    func fault(_ message: String) {
+    nonisolated func fault(_ message: String) {
         logger.fault("\(message, privacy: .public)")
     }
 }
 
 // Global loggers for common categories
 extension ForgeLogger {
-    static let steward = ForgeLogger(category: .steward)
-    static let recovery = ForgeLogger(category: .recovery)
-    static let execution = ForgeLogger(category: .execution)
-    static let session = ForgeLogger(category: .session)
-    static let claudeACP = ForgeLogger(category: .claudeACP)
-    static let acpSubprocess = ForgeLogger(category: .acpSubprocess)
-    static let notification = ForgeLogger(category: .notification)
-    static let compiler = ForgeLogger(category: .compiler)
-    static let bridge = ForgeLogger(category: .bridge)
-    static let ui = ForgeLogger(category: .ui)
-    static let app = ForgeLogger(category: .app)
-    static let test = ForgeLogger(category: .test)
-    static let general = ForgeLogger(category: .general)
+    nonisolated static let steward = ForgeLogger(category: .steward)
+    nonisolated static let recovery = ForgeLogger(category: .recovery)
+    nonisolated static let execution = ForgeLogger(category: .execution)
+    nonisolated static let session = ForgeLogger(category: .session)
+    nonisolated static let claudeACP = ForgeLogger(category: .claudeACP)
+    nonisolated static let acpSubprocess = ForgeLogger(category: .acpSubprocess)
+    nonisolated static let notification = ForgeLogger(category: .notification)
+    nonisolated static let compiler = ForgeLogger(category: .compiler)
+    nonisolated static let bridge = ForgeLogger(category: .bridge)
+    nonisolated static let ui = ForgeLogger(category: .ui)
+    nonisolated static let app = ForgeLogger(category: .app)
+    nonisolated static let test = ForgeLogger(category: .test)
+    nonisolated static let general = ForgeLogger(category: .general)
 }

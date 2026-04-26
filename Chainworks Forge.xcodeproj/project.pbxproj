@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		CEAPPINT2F95D001006EC77C /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CEAPPINT2F95D000006EC77C /* AppIntents.framework */; };
 		CE8914952F6FFF06006EC77C /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = CE8913712F6FC400006EC77C /* Yams */; };
 		CE8914962F6FFF06006EC77C /* Yams in Frameworks */ = {isa = PBXBuildFile; productRef = CE8913722F6FC400006EC77C /* Yams */; };
 		CE8915702F700957006EC77C /* proposal-po-reviewer.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915692F700957006EC77C /* proposal-po-reviewer.yaml */; };
@@ -35,7 +36,21 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		CE5347FF2F94338F00F5D470 /* Embed LaunchDaemon Plist */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Contents/Library/LaunchAgents;
+			dstSubfolderSpec = 1;
+			files = (
+			);
+			name = "Embed LaunchDaemon Plist";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		CEAPPINT2F95D000006EC77C /* AppIntents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppIntents.framework; path = System/Library/Frameworks/AppIntents.framework; sourceTree = SDKROOT; };
 		CE8913392F6FC308006EC77C /* Chainworks Forge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Chainworks Forge.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE8913482F6FC30A006EC77C /* Chainworks ForgeTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Chainworks ForgeTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE8913522F6FC30A006EC77C /* Chainworks ForgeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Chainworks ForgeUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -48,9 +63,22 @@
 		CE8915782F700957006EC77C /* full-mvp-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "full-mvp-live.yaml"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		CE5348012F9433E200F5D470 /* Exceptions for "Chainworks Forge" folder in "Embed LaunchDaemon Plist" phase from "Chainworks Forge" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = CE5347FF2F94338F00F5D470 /* Embed LaunchDaemon Plist */;
+			membershipExceptions = (
+				Resources/LaunchDaemons/com.chainworks.forge.daemon.plist,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		CE89133B2F6FC308006EC77C /* Chainworks Forge */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				CE5348012F9433E200F5D470 /* Exceptions for "Chainworks Forge" folder in "Embed LaunchDaemon Plist" phase from "Chainworks Forge" target */,
+			);
 			path = "Chainworks Forge";
 			sourceTree = "<group>";
 		};
@@ -71,6 +99,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CEAPPINT2F95D001006EC77C /* AppIntents.framework in Frameworks */,
 				CE8914952F6FFF06006EC77C /* Yams in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -152,6 +181,8 @@
 			buildConfigurationList = CE89135C2F6FC30A006EC77C /* Build configuration list for PBXNativeTarget "Chainworks Forge" */;
 			buildPhases = (
 				CE8913352F6FC308006EC77C /* Sources */,
+				CE5347FE2F94332200F5D470 /* Embed Control-Plane Daemon */,
+				CE5347FF2F94338F00F5D470 /* Embed LaunchDaemon Plist */,
 				CE8913362F6FC308006EC77C /* Frameworks */,
 				CE8913372F6FC308006EC77C /* Resources */,
 			);
@@ -295,6 +326,28 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		CE5347FE2F94332200F5D470 /* Embed Control-Plane Daemon */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Embed Control-Plane Daemon";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/scripts/embed-control-plane-daemon.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		CE8913352F6FC308006EC77C /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -372,7 +425,7 @@
 				DEVELOPMENT_TEAM = R859U8DTY9;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -438,7 +491,7 @@
 				DEVELOPMENT_TEAM = R859U8DTY9;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -471,6 +524,7 @@
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Chainworks Forge";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -506,6 +560,7 @@
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Chainworks Forge";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";

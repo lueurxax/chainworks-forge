@@ -1,0 +1,6290 @@
+use anyhow::{Context, Result};
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
+use tracing::{debug, error, info, warn};
+
+use db::repos::{
+    approvals, artifact_contracts, artifacts, ideas, lead_conflict_mediations, projections, runs,
+    stages, workflow_conflicts,
+};
+use db::work_item::WorkItemKind;
+use domain::agent::AgentOutputSettlement;
+use domain::approval::{Approval, ApprovalDecision};
+use domain::artifact::{Artifact, ArtifactFormat};
+use domain::artifact_contracts::{
+    contract_status_allowed_values, ImplementationSelfAssessmentStatus,
+};
+use domain::events::DomainEvent;
+use domain::ids::{ApprovalId, ArtifactId, RunId};
+use domain::run::RunStatus;
+use domain::stage::{StageExecution, StageStatus};
+use domain::workflow_conflict::{
+    candidate_transition_hash, classify_workflow_conflict_reason, workflow_conflict_fingerprint,
+    AdvisoryHintExtraction, CandidateTransitionEvaluation, CandidateTransitionResult,
+    ImplementationHandoffStatus, WorkflowAdvisoryRejectionRecord, WorkflowConflictReason,
+    WorkflowConflictRecord, WorkflowConflictStatus, WorkflowTransitionCursorRecord,
+};
+
+use crate::domain_engine::{DomainEngine, RunEvaluation};
+use crate::event_bus::EventSender;
+use crate::work_queue::WorkQueue;
+
+pub struct Orchestrator {
+    pool: SqlitePool,
+    events: EventSender,
+    work_queue: WorkQueue,
+}
+
+impl Orchestrator {
+    pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
+        Self {
+            pool,
+            events,
+            work_queue,
+        }
+    }
+
+    async fn enqueue_steward_analysis(&self, completed_run_id: Option<RunId>) -> Result<()> {
+        let pending_config_change =
+            db::repos::steward::take_config_change_pending(&self.pool).await?;
+        let reason = if pending_config_change.is_some() {
+            db::repos::steward::reset_completed_run_counter(&self.pool).await?;
+            "config_change"
+        } else {
+            let (enabled, run_interval) =
+                db::repos::steward::post_run_trigger_config(&self.pool).await?;
+            if !enabled {
+                return Ok(());
+            }
+            let completed_count =
+                db::repos::steward::increment_completed_run_counter(&self.pool).await?;
+            if completed_count < run_interval {
+                return Ok(());
+            }
+            db::repos::steward::reset_completed_run_counter(&self.pool).await?;
+            "post_run_hook"
+        };
+        self.work_queue
+            .enqueue(
+                WorkItemKind::StewardAnalysis,
+                None,
+                None,
+                serde_json::json!({
+                    "reason": reason,
+                    "completed_run_id": completed_run_id.map(|id| id.to_string()),
+                }),
+            )
+            .await
+    }
+
+    pub async fn advance_run(&self, run_id: RunId) -> Result<()> {
+        let run = match runs::find_by_id(&self.pool, run_id).await? {
+            Some(r) => r,
+            None => {
+                warn!(run_id = %run_id, "advance_run: run not found");
+                return Ok(());
+            }
+        };
+
+        if run.status.is_terminal() {
+            return Ok(());
+        }
+
+        // ── Workflow-driven state machine ────────────────────────────────
+        if run.workflow_yaml_path.is_some() && run.agent_catalog_yaml_path.is_some() {
+            return self.advance_run_workflow(run_id, &run).await;
+        }
+
+        // ── Legacy flat-stage orchestration ──────────────────────────────
+        self.advance_run_flat(run_id, &run).await
+    }
+
+    // =====================================================================
+    // Workflow-driven state machine (matches Swift WorkflowOrchestrator)
+    // =====================================================================
+
+    async fn advance_run_workflow(&self, run_id: RunId, run: &domain::run::Run) -> Result<()> {
+        let plan = workflow::compiler::compile(
+            run.workflow_yaml_path.as_deref().unwrap(),
+            run.agent_catalog_yaml_path.as_deref().unwrap(),
+        )?;
+
+        let current_state_id = run
+            .current_state
+            .clone()
+            .unwrap_or_else(|| plan.initial_state.clone());
+
+        let state = match plan.states.get(&current_state_id) {
+            Some(s) => s,
+            None => {
+                warn!(run_id = %run_id, state = %current_state_id, "State not in plan");
+                return Ok(());
+            }
+        };
+
+        let all_stages = stages::list_by_run(&self.pool, run_id).await?;
+
+        // Find the latest stage for the current state (highest iteration).
+        let current_stage = all_stages
+            .iter()
+            .filter(|s| s.stage_id == current_state_id)
+            .last();
+
+        // ── Case 1: stage in progress — wait or check task completion ──
+        //
+        // IMPORTANT: A stage that is Completed from a **previous** iteration
+        // after a cross-state loop-back must NOT be re-evaluated. Instead we
+        // fall through to Case 2 (lazy creation) so a new stage is created for
+        // the next iteration. Without this check, loop-backs (e.g. state_5→state_4)
+        // cause an infinite advance_run cycle because the orchestrator sees the
+        // old Completed stage and immediately calls evaluate_and_transition,
+        // which transitions again, etc. Same-state self-loops are handled at
+        // transition time by pre-creating the next Pending iteration.
+        //
+        // We detect "stale" completed stages by checking whether any LATER state
+        // has a stage (meaning the workflow already moved past this state and
+        // looped back). If so, this Completed stage belongs to a prior cycle.
+        // Stale detection: a Completed stage from a prior loop iteration must
+        // not be re-evaluated — we need to create a new stage instead.
+        // We use iteration count: if the stage's iteration is less than the
+        // total number of stages for that state_id, it's from a prior cycle.
+        let stage_is_stale = current_stage
+            .filter(|s| s.status == StageStatus::Completed)
+            .map(|completed_stage| {
+                // If any other stage (different state_id) was started AFTER
+                // this one, the workflow has moved past this state and looped back.
+                all_stages.iter().any(|other| {
+                    other.stage_id != current_state_id
+                        && other.started_at > completed_stage.started_at
+                })
+            })
+            .unwrap_or(false);
+
+        if let Some(stage) = current_stage {
+            // BUG 4 fix: Deduplication guard. When multiple AdvanceRun items
+            // fire concurrently (e.g. 5 parallel tasks each enqueue one), the
+            // first one advances the state. The remaining ones find a Running
+            // or WaitingApproval stage that is NOT stale — just return early.
+            //
+            // P044 carve-out: A manual_gate stage that just transitioned to
+            // Running after approval may have zero InvokeAgent work items yet.
+            // The post-approval kickstart (below) needs to fire in that case,
+            // so we must NOT skip when is_manual_gate + Running + no invokes.
+            //
+            // P044 refinement: When all enqueued InvokeAgent items for the
+            // stage are settled (Completed/Failed), we must NOT skip — phase
+            // advancement and stage settlement happen in the match block below.
+            if !stage_is_stale
+                && matches!(
+                    stage.status,
+                    StageStatus::Running | StageStatus::WaitingApproval
+                )
+            {
+                let should_skip = if stage.status == StageStatus::Running {
+                    let se_id_str = stage.id.to_string();
+                    let work_items = db::repos::work_items::list_by_run(&self.pool, run_id)
+                        .await
+                        .unwrap_or_default();
+                    let invokes: Vec<_> = work_items
+                        .iter()
+                        .filter(|w| {
+                            w.kind == db::work_item::WorkItemKind::InvokeAgent
+                                && payload_matches_stage_execution(&w.payload_json, &se_id_str)
+                        })
+                        .collect();
+                    if invokes.is_empty() {
+                        // No tasks enqueued yet. For manual_gate Running stages
+                        // this is the post-approval kickstart moment — must
+                        // fall through. For non-manual-gate Running without
+                        // invokes (rare, shouldn't normally happen), fall
+                        // through too so the match block can handle it.
+                        false
+                    } else {
+                        // Tasks exist: skip only if any are still in flight.
+                        // Once all are Completed/Failed, phase advancement
+                        // or stage settlement needs the logic below.
+                        invokes.iter().any(|w| {
+                            matches!(
+                                w.status,
+                                db::work_item::WorkItemStatus::Pending
+                                    | db::work_item::WorkItemStatus::Running
+                            )
+                        })
+                    }
+                } else {
+                    // WaitingApproval — always skip (waiting for operator).
+                    true
+                };
+
+                if should_skip {
+                    debug!(
+                        run_id = %run_id,
+                        state = %current_state_id,
+                        status = ?stage.status,
+                        "Stage already active — skipping redundant AdvanceRun"
+                    );
+                    return Ok(());
+                }
+            }
+
+            if stage_is_stale {
+                info!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    iteration = stage.iteration,
+                    "Stale completed stage from prior loop iteration — creating new stage"
+                );
+                // Fall through to Case 2 (lazy creation)
+            } else {
+                match stage.status {
+                    StageStatus::Running => {
+                        // For multi-task stages (fan-out), check if ALL InvokeAgent
+                        // work items for THIS SPECIFIC stage execution have completed.
+                        // We filter by stage_execution_id (UUID) from each item's payload
+                        // rather than stage_id (logical name) to avoid cross-iteration
+                        // contamination — e.g. state_4 iter1 items being counted with
+                        // state_4 iter2 items.
+                        let se_id_str = stage.id.to_string();
+                        let work_items =
+                            db::repos::work_items::list_by_run(&self.pool, run_id).await?;
+                        let stage_invokes: Vec<_> = work_items
+                            .iter()
+                            .filter(|w| {
+                                w.kind == db::work_item::WorkItemKind::InvokeAgent
+                                    && payload_matches_stage_execution(&w.payload_json, &se_id_str)
+                            })
+                            .collect();
+                        let total = stage_invokes.len();
+                        let completed = stage_invokes
+                            .iter()
+                            .filter(|w| w.status == db::work_item::WorkItemStatus::Completed)
+                            .count();
+                        let failed = stage_invokes
+                            .iter()
+                            .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
+                            .count();
+
+                        // Determine if this is a post-approval context (manual_gate
+                        // with a Granted approval) so we use the right task list.
+                        let is_post_approval = state.is_manual_gate && {
+                            let stage_approvals = approvals::list_by_run(&self.pool, run_id)
+                                .await
+                                .unwrap_or_default();
+                            stage_approvals.iter().any(|a| {
+                                a.stage_id == current_state_id
+                                    && a.decision == ApprovalDecision::Granted
+                            })
+                        };
+                        let effective = effective_tasks(state, is_post_approval);
+
+                        // ── Post-approval kickstart ─────────────────────────
+                        // When a manual_gate stage transitions to Running after
+                        // approval but has zero InvokeAgent work items yet,
+                        // enqueue phase 0 from the post-approval task list.
+                        if total == 0 && is_post_approval {
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                "Enqueuing post-approval phase 0 tasks"
+                            );
+                            let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+                                .await
+                                .ok()
+                                .flatten();
+                            let effective_total = effective.len();
+                            for (i, task) in
+                                effective.iter().enumerate().filter(|(_, t)| t.phase == 0)
+                            {
+                                let approval_rejection_context = self
+                                    .approval_rejection_context_for_state(run_id, &current_state_id)
+                                    .await?;
+                                let prompt = build_task_prompt(
+                                    task,
+                                    &plan,
+                                    run,
+                                    idea_opt.as_ref(),
+                                    None,
+                                    approval_rejection_context.as_deref(),
+                                );
+                                self.enqueue_invoke_agent(
+                                    run_id,
+                                    stage,
+                                    task,
+                                    &prompt,
+                                    i,
+                                    effective_total,
+                                    &plan,
+                                    run,
+                                )
+                                .await?;
+                            }
+                            return Ok(());
+                        }
+
+                        if total > 0 && completed + failed == total {
+                            // All enqueued tasks finished. Generalized N-phase
+                            // gating: determine which phase just completed, then
+                            // check if a subsequent phase exists and needs enqueuing.
+
+                            // Determine the current (just-completed) phase from
+                            // the work items that were enqueued.
+                            let current_phase: u32 = stage_invokes
+                                .iter()
+                                .filter_map(|w| {
+                                    serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                        .ok()
+                                        .and_then(|v| v.get("task_index")?.as_u64())
+                                        .and_then(|idx| {
+                                            effective.get(idx as usize).map(|t| t.phase)
+                                        })
+                                })
+                                .max()
+                                .unwrap_or(0);
+
+                            // Find the next phase (if any) that hasn't been enqueued.
+                            let next_phase: Option<u32> = effective
+                                .iter()
+                                .map(|t| t.phase)
+                                .filter(|&p| p > current_phase)
+                                .min();
+
+                            // Check if any tasks from the next phase are already enqueued.
+                            let next_phase_already_enqueued = next_phase.map_or(true, |np| {
+                                stage_invokes.iter().any(|w| {
+                                    serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                        .ok()
+                                        .and_then(|v| v.get("task_index")?.as_u64())
+                                        .map(|idx| {
+                                            effective
+                                                .get(idx as usize)
+                                                .map_or(false, |t| t.phase == np)
+                                        })
+                                        .unwrap_or(false)
+                                })
+                            });
+
+                            if let Some(np) = next_phase {
+                                if !next_phase_already_enqueued {
+                                    // Current phase complete — enqueue next phase.
+                                    if failed > 0 {
+                                        warn!(
+                                            run_id = %run_id,
+                                            state = %current_state_id,
+                                            phase = current_phase,
+                                            failed = failed,
+                                            "Phase {} had failures — skipping phase {}, settling as Failed",
+                                            current_phase, np
+                                        );
+                                    } else {
+                                        info!(
+                                            run_id = %run_id,
+                                            state = %current_state_id,
+                                            completed_phase = current_phase,
+                                            next_phase = np,
+                                            "Phase {} complete — enqueuing phase {} tasks",
+                                            current_phase, np
+                                        );
+                                        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                        let effective_total = effective.len();
+                                        let approval_rejection_context = self
+                                            .approval_rejection_context_for_state(
+                                                run_id,
+                                                &current_state_id,
+                                            )
+                                            .await?;
+                                        for (i, task) in effective.iter().enumerate() {
+                                            if task.phase != np {
+                                                continue;
+                                            }
+                                            if self
+                                                .block_code_writer_handoff_if_unavailable(
+                                                    run_id,
+                                                    &current_state_id,
+                                                    stage,
+                                                    task,
+                                                    &plan,
+                                                    run,
+                                                )
+                                                .await?
+                                            {
+                                                return Ok(());
+                                            }
+                                            let prompt = build_task_prompt(
+                                                task,
+                                                &plan,
+                                                run,
+                                                idea_opt.as_ref(),
+                                                None,
+                                                approval_rejection_context.as_deref(),
+                                            );
+                                            self.enqueue_invoke_agent(
+                                                run_id,
+                                                stage,
+                                                task,
+                                                &prompt,
+                                                i,
+                                                effective_total,
+                                                &plan,
+                                                run,
+                                            )
+                                            .await?;
+                                        }
+                                        return Ok(()); // wait for next phase to complete
+                                    }
+                                }
+                            }
+
+                            // All phases finished — settle stage.
+                            let now = Utc::now();
+                            let (kind, settle_status) = if failed > 0 {
+                                (
+                                    domain::stage::StageSettlementKind::Failed,
+                                    StageStatus::Failed,
+                                )
+                            } else {
+                                (
+                                    domain::stage::StageSettlementKind::Completed,
+                                    StageStatus::Completed,
+                                )
+                            };
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                total = total,
+                                completed = completed,
+                                failed = failed,
+                                "All tasks finished — settling stage"
+                            );
+                            if kind == domain::stage::StageSettlementKind::Failed {
+                                crate::recovery::persist_failed_stage_recovery_snapshot(
+                                    &self.pool, stage.id, now,
+                                )
+                                .await?;
+                                if let Some(evidence_artifact) =
+                                    crate::evidence::build_failed_stage_evidence_for_latest_execution(
+                                        &self.pool, run, stage, now,
+                                    )
+                                    .await?
+                                {
+                                    let _ = self.events.send(DomainEvent::ArtifactCreated {
+                                        run_id,
+                                        artifact_id: evidence_artifact.id,
+                                    });
+                                }
+                            }
+                            stages::settle(&self.pool, stage.id, kind, now).await?;
+                            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                                run_id,
+                                stage_execution_id: stage.id,
+                                status: settle_status.clone(),
+                            });
+                            if settle_status == StageStatus::Completed {
+                                // P044 §3h: End states with tasks complete the run
+                                // directly after their tasks finish. We must not
+                                // evaluate transitions — state_12 declares a
+                                // `when: "true"` self-transition that would loop
+                                // forever otherwise.
+                                if state.is_end {
+                                    info!(
+                                        run_id = %run_id,
+                                        state = %current_state_id,
+                                        "End state with tasks complete — marking run Completed"
+                                    );
+                                    runs::mark_completed(&self.pool, run_id, now).await?;
+                                    self.enqueue_steward_analysis(Some(run_id)).await?;
+                                    self.cleanup_worktree_if_needed(&run).await;
+                                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                        run_id,
+                                        status: RunStatus::Completed,
+                                    });
+                                    return Ok(());
+                                }
+                                return self
+                                    .evaluate_and_transition(
+                                        run_id,
+                                        &current_state_id,
+                                        &plan,
+                                        &all_stages,
+                                    )
+                                    .await;
+                            }
+                            // Failed — run blocked
+                            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                            return Ok(());
+                        }
+
+                        // Tasks still running — wait
+                        return Ok(());
+                    }
+                    StageStatus::WaitingApproval => {
+                        return Ok(()); // wait for approval
+                    }
+                    StageStatus::Completed => {
+                        // Stage done — evaluate transitions
+                        return self
+                            .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                            .await;
+                    }
+                    StageStatus::Failed | StageStatus::Blocked => {
+                        // Stage failed — update run status
+                        if run.status != RunStatus::Blocked {
+                            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                run_id,
+                                status: RunStatus::Blocked,
+                            });
+                        }
+                        return Ok(());
+                    }
+                    StageStatus::Skipped => {
+                        // Skipped (e.g. retry) — re-evaluate
+                        return self
+                            .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                            .await;
+                    }
+                    StageStatus::Pending => {
+                        // P044 §3g: A retried manual_gate stage was inserted as
+                        // Pending by RetryStage. We must restore it to
+                        // WaitingApproval with a fresh Approval record on the
+                        // same stage execution instead of falling through to
+                        // Case 2, which would fork lineage by creating another
+                        // stage via create_stage_for_state.
+                        if state.is_manual_gate {
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                stage_execution_id = %stage.id,
+                                attempt = stage.attempt_number,
+                                "Retried manual gate — restoring to WaitingApproval with fresh approval"
+                            );
+                            stages::update_status(
+                                &self.pool,
+                                stage.id,
+                                StageStatus::WaitingApproval,
+                            )
+                            .await?;
+
+                            let approval = Approval {
+                                id: ApprovalId::new(),
+                                run_id,
+                                stage_id: current_state_id.clone(),
+                                decision: ApprovalDecision::Requested,
+                                requested_at: Utc::now(),
+                                decided_at: None,
+                                comment: None,
+                                expires_at: None,
+                            };
+                            approvals::insert(&self.pool, &approval).await?;
+
+                            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                                run_id,
+                                stage_execution_id: stage.id,
+                                status: StageStatus::WaitingApproval,
+                            });
+                            let _ = self.events.send(DomainEvent::ApprovalRequested {
+                                run_id,
+                                approval_id: approval.id,
+                                stage_id: current_state_id.clone(),
+                            });
+
+                            if run.status != RunStatus::WaitingApproval {
+                                runs::update_status(&self.pool, run_id, RunStatus::WaitingApproval)
+                                    .await?;
+                                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                    run_id,
+                                    status: RunStatus::WaitingApproval,
+                                });
+                            }
+                            projections::rebuild_run_summary(&self.pool, run_id).await?;
+                            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+                            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
+                            return Ok(());
+                        }
+                        // Non-manual-gate Pending stages are left to fall
+                        // through to Case 2 (preserves existing retry
+                        // semantics for compute states, which are not in
+                        // P044's scope).
+                    }
+                    _ => {}
+                }
+            } // end if !stage_is_stale
+        }
+
+        // ── Case 2: no stage yet — lazy creation ────────────────────────
+
+        // End state — mark run complete (or fall through if it has tasks)
+        if state.is_end {
+            if state.tasks.is_empty() {
+                // Bare end state — settle immediately (no tasks to run).
+                info!(run_id = %run_id, state = %current_state_id, "Reached bare end state");
+                self.create_stage_for_state(run_id, &current_state_id, state)
+                    .await?;
+                let now = Utc::now();
+                let end_stage = stages::list_by_run(&self.pool, run_id)
+                    .await?
+                    .into_iter()
+                    .find(|s| s.stage_id == current_state_id)
+                    .unwrap();
+                stages::settle(
+                    &self.pool,
+                    end_stage.id,
+                    domain::stage::StageSettlementKind::Completed,
+                    now,
+                )
+                .await?;
+                runs::mark_completed(&self.pool, run_id, now).await?;
+                self.enqueue_steward_analysis(Some(run_id)).await?;
+                // Worktree cleanup on completion (Proposal 007).
+                self.cleanup_worktree_if_needed(&run).await;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Completed,
+                });
+                return Ok(());
+            }
+            // End state with tasks — fall through to regular compute-state
+            // handling. evaluate_and_transition will see is_end and mark
+            // the run completed after tasks finish.
+            info!(run_id = %run_id, state = %current_state_id, "End state with tasks — entering compute path");
+        }
+
+        // Manual gate — create stage as WaitingApproval + Approval record
+        if state.is_manual_gate {
+            info!(run_id = %run_id, state = %current_state_id, "Entering manual gate");
+            let stage = self
+                .create_stage_for_state(run_id, &current_state_id, state)
+                .await?;
+            stages::update_status(&self.pool, stage.id, StageStatus::WaitingApproval).await?;
+
+            let approval = Approval {
+                id: ApprovalId::new(),
+                run_id,
+                stage_id: current_state_id.clone(),
+                decision: ApprovalDecision::Requested,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            };
+            approvals::insert(&self.pool, &approval).await?;
+
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: stage.id,
+                status: StageStatus::WaitingApproval,
+            });
+            let _ = self.events.send(DomainEvent::ApprovalRequested {
+                run_id,
+                approval_id: approval.id,
+                stage_id: current_state_id.clone(),
+            });
+
+            if run.status != RunStatus::WaitingApproval {
+                runs::update_status(&self.pool, run_id, RunStatus::WaitingApproval).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::WaitingApproval,
+                });
+            }
+            projections::rebuild_run_summary(&self.pool, run_id).await?;
+            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
+            return Ok(());
+        }
+
+        if self
+            .blocked_implementation_review_available(run_id, state)
+            .await?
+        {
+            let stage = self
+                .create_stage_for_state(run_id, &current_state_id, state)
+                .await?;
+            stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: stage.id,
+                status: StageStatus::Running,
+            });
+            if self
+                .synthesize_blocked_implementation_review_if_needed(
+                    run_id, &stage, state, &plan, run,
+                )
+                .await?
+            {
+                let now = Utc::now();
+                stages::settle(
+                    &self.pool,
+                    stage.id,
+                    domain::stage::StageSettlementKind::Completed,
+                    now,
+                )
+                .await?;
+                let _ = self.events.send(DomainEvent::StageStatusChanged {
+                    run_id,
+                    stage_execution_id: stage.id,
+                    status: StageStatus::Completed,
+                });
+                let all_stages = stages::list_by_run(&self.pool, run_id).await?;
+                return self
+                    .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                    .await;
+            }
+        }
+
+        // ── Worktree provisioning (Proposal 007) ────────────────────────
+        // If any agent in this state needs a real git worktree (dedicated or
+        // shared — NOT meta_only), provision one before creating the stage.
+        let needs_git_worktree = {
+            let needs_wt = |a: &workflow::plan::ResolvedAgent| -> bool {
+                a.worktree_write_enabled && a.worktree_strategy.as_deref() != Some("meta_only")
+            };
+            state.tasks.iter().any(|t| needs_wt(&t.agent))
+                || state.post_approval_tasks.iter().any(|t| needs_wt(&t.agent))
+                || needs_wt(&state.owner)
+        };
+        // Re-bind `run` as mutable reference so we can refresh it after provisioning.
+        let mut run = run.clone();
+        if needs_git_worktree && run.worktree_root.is_none() {
+            let idea_opt_for_slug = ideas::find_by_id(&self.pool, run.idea_id)
+                .await
+                .ok()
+                .flatten();
+            let idea_title = idea_opt_for_slug
+                .as_ref()
+                .map(|i| i.title.as_str())
+                .unwrap_or("untitled");
+
+            // Extract base_branch from the first agent with a worktree_policy in the catalog.
+            let base_branch = self.resolve_base_branch_from_catalog(&run);
+
+            info!(
+                run_id = %run_id,
+                state = %current_state_id,
+                base_branch = ?base_branch,
+                "Provisioning worktree for write-enabled state"
+            );
+            match crate::worktree::WorktreeProvisioner::provision(
+                &run.workspace_root,
+                run_id,
+                idea_title,
+                base_branch.as_deref(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    runs::update_worktree_fields(
+                        &self.pool,
+                        run_id,
+                        &result.worktree_root,
+                        &result.base_branch,
+                        &result.base_revision,
+                        &result.target_branch,
+                    )
+                    .await?;
+                    // Re-read run so prompt building sees worktree_root.
+                    run = runs::find_by_id(&self.pool, run_id).await?.ok_or_else(|| {
+                        anyhow::anyhow!("Run vanished after provisioning: {}", run_id)
+                    })?;
+                    info!(
+                        run_id = %run_id,
+                        worktree_root = %result.worktree_root,
+                        target_branch = %result.target_branch,
+                        "Worktree provisioned"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        run_id = %run_id,
+                        state = %current_state_id,
+                        error = %e,
+                        "Worktree provisioning failed — blocking run"
+                    );
+                    runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                        run_id,
+                        status: RunStatus::Blocked,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+
+        // Regular compute state — start an existing pending retry attempt, or
+        // lazily create the first stage execution when no attempt exists.
+        let stage = if let Some(pending_stage) =
+            current_stage.filter(|s| !stage_is_stale && s.status == StageStatus::Pending)
+        {
+            info!(
+                run_id = %run_id,
+                state = %current_state_id,
+                stage_execution_id = %pending_stage.id,
+                attempt = pending_stage.attempt_number,
+                provider = %state.owner.provider,
+                "Entering compute state from pending retry stage"
+            );
+            pending_stage.clone()
+        } else {
+            info!(run_id = %run_id, state = %current_state_id, provider = %state.owner.provider, "Entering compute state");
+            self.create_stage_for_state(run_id, &current_state_id, state)
+                .await?
+        };
+        stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
+
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Running,
+        });
+
+        if !matches!(run.status, RunStatus::Running) {
+            runs::update_status(&self.pool, run_id, RunStatus::Running).await?;
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Running,
+            });
+        }
+
+        if self
+            .synthesize_blocked_implementation_review_if_needed(run_id, &stage, state, &plan, &run)
+            .await?
+        {
+            let now = Utc::now();
+            stages::settle(
+                &self.pool,
+                stage.id,
+                domain::stage::StageSettlementKind::Completed,
+                now,
+            )
+            .await?;
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: stage.id,
+                status: StageStatus::Completed,
+            });
+            let all_stages = stages::list_by_run(&self.pool, run_id).await?;
+            return self
+                .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
+                .await;
+        }
+
+        // Fetch the originating idea so we can inject its title+body into
+        // prompts that consume `input.idea`. Without this, the agent only
+        // sees a placeholder line ("path not defined in catalog") and has no
+        // access to what the user actually asked for.
+        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+            .await
+            .ok()
+            .flatten();
+
+        // Proposal 007 §7.7: Validate worktree readiness before write-enabled execution.
+        // Also validates for release agents that need worktree (strategy=dedicated,
+        // even if write_enabled=false — they read from the worktree to commit/push).
+        let any_agent_needs_worktree = needs_git_worktree
+            || state.tasks.iter().any(|t| {
+                t.agent.worktree_strategy.as_deref() == Some("dedicated")
+                    || t.agent.worktree_strategy.as_deref()
+                        == Some("shared_implementation_worktree")
+            })
+            || state.post_approval_tasks.iter().any(|t| {
+                t.agent.worktree_strategy.as_deref() == Some("dedicated")
+                    || t.agent.worktree_strategy.as_deref()
+                        == Some("shared_implementation_worktree")
+            })
+            || matches!(
+                state.owner.worktree_strategy.as_deref(),
+                Some("dedicated") | Some("shared_implementation_worktree")
+            );
+
+        if any_agent_needs_worktree {
+            if let Err(e) = crate::worktree::RepoSafetyGuard::validate_worktree_ready(
+                run.worktree_root.as_deref(),
+            ) {
+                error!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    error = %e,
+                    "RepoSafetyGuard failed — blocking run"
+                );
+                runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Blocked,
+                });
+                return Ok(());
+            }
+        }
+
+        // Proposal 007: gather source context (changed files manifest) for
+        // write-enabled states so implementation agents see what's already changed.
+        let source_ctx = if needs_git_worktree {
+            if let (Some(wt), Some(bb)) = (run.worktree_root.as_deref(), run.base_branch.as_deref())
+            {
+                crate::worktree::build_source_context(wt, bb).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if state.tasks.is_empty() {
+            // No tasks defined — run the owner agent as a single task
+            let prompt = build_task_prompt_for_owner(state, &plan, &run, idea_opt.as_ref());
+            self.enqueue_invoke_agent_for_owner(run_id, &stage, &state.owner, &prompt, 0, 1)
+                .await?;
+        } else {
+            // Phase-aware enqueuing: phase 0 tasks (parallel + initial sequence)
+            // are enqueued immediately. Phase 1 tasks (`then` blocks — sequential
+            // after parallel) are deferred until all phase 0 tasks complete.
+            // This prevents aggregators from racing with the tasks they aggregate.
+            let phase0_tasks: Vec<_> = state
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.phase == 0)
+                .collect();
+            let total = state.tasks.len();
+            let approval_rejection_context = self
+                .approval_rejection_context_for_state(run_id, &current_state_id)
+                .await?;
+            for (i, task) in &phase0_tasks {
+                if self
+                    .block_code_writer_handoff_if_unavailable(
+                        run_id,
+                        &current_state_id,
+                        &stage,
+                        task,
+                        &plan,
+                        &run,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                let prompt = build_task_prompt(
+                    task,
+                    &plan,
+                    &run,
+                    idea_opt.as_ref(),
+                    source_ctx.as_ref(),
+                    approval_rejection_context.as_deref(),
+                );
+                info!(
+                    run_id = %run_id,
+                    task = %task.task_name,
+                    agent = %task.agent.agent_id,
+                    provider = %task.agent.provider,
+                    parallel = task.parallel,
+                    phase = task.phase,
+                    index = i,
+                    total = total,
+                    "Enqueuing task (phase 0)"
+                );
+                self.enqueue_invoke_agent(run_id, &stage, task, &prompt, *i, total, &plan, &run)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn synthesize_blocked_implementation_review_if_needed(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        state: &workflow::plan::CompiledState,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+    ) -> Result<bool> {
+        if !state_produces_implementation_review(state) {
+            return Ok(false);
+        }
+
+        let Some(active) = artifact_contracts::find_active_implementation_self_assessment_summary(
+            &self.pool, run_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        if active.summary.status != ImplementationSelfAssessmentStatus::Blocked {
+            return Ok(false);
+        }
+
+        let target_path = plan
+            .artifact_paths
+            .get("implementation_review_summary")
+            .map(|template| {
+                resolve_path_template(
+                    template,
+                    &run.workspace_root,
+                    run.chainworks_meta_root.as_deref(),
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/review/implementation-summary.json",
+                    run.artifact_root.trim_end_matches('/')
+                )
+            });
+        if let Some(parent) = std::path::Path::new(&target_path).parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create implementation review summary directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let implementation_self_assessment_summary = serde_json::to_value(&active.summary)
+            .context("serialize implementation self-assessment summary for release hold")?;
+        let payload = serde_json::json!({
+            "status": "release_evidence_blocked",
+            "open_blockers": 0,
+            "must_fix": [],
+            "recommended_next_step": "hold_release_until_verification_green",
+            "source": "implementation_self_assessment_v2",
+            "implementation_self_assessment_status": active.summary.status.as_str(),
+            "verification_green": active.summary.verification_green,
+            "implementation_self_assessment_summary": implementation_self_assessment_summary,
+            "owner_class_counts": &active.summary.owner_class_counts,
+            "target_stage_summaries": &active.summary.target_stage_summaries,
+            "remaining_code_tasks": &active.summary.remaining_code_tasks,
+            "handoff_tasks": &active.summary.handoff_tasks,
+            "known_risks": &active.summary.known_risks,
+            "tests_run": &active.summary.tests_run,
+            "docs_impacted": &active.summary.docs_impacted,
+            "validation_errors": &active.summary.validation_errors,
+            "warnings": &active.summary.warnings
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)
+            .context("serialize blocked implementation review summary")?;
+        std::fs::write(&target_path, &bytes)
+            .with_context(|| format!("write implementation review summary {target_path}"))?;
+
+        let artifact = Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id,
+            stage_id: stage.stage_id.clone(),
+            agent_id: "lead_orchestrator".to_string(),
+            name: "implementation_review_summary".to_string(),
+            contract_id: "implementation_review_summary_v1".to_string(),
+            format: ArtifactFormat::Json,
+            file_path: target_path,
+            checksum_sha256: None,
+            size_bytes: Some(bytes.len() as i64),
+            provider: "engine".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        artifact_contracts::upsert_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: artifact.id,
+                contract_id: artifact.contract_id.clone(),
+                canonical_path: artifact.name.clone(),
+                raw_path: artifact.file_path.clone(),
+                raw_status: "release_evidence_blocked".to_string(),
+                generation_id: format!("engine-synthesized:{}:{}", stage.id, artifact.id),
+                source_agent_execution_id: None,
+                source_stage_execution_id: Some(stage.id.to_string()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![
+                    "implementation_review_summary was synthesized from active implementation_self_assessment_v2 release-hold truth"
+                        .to_string(),
+                ],
+            },
+        )
+        .await?;
+        let _ = self.events.send(DomainEvent::ArtifactCreated {
+            run_id,
+            artifact_id: artifact.id,
+        });
+        Ok(true)
+    }
+
+    async fn blocked_implementation_review_available(
+        &self,
+        run_id: RunId,
+        state: &workflow::plan::CompiledState,
+    ) -> Result<bool> {
+        if !state_produces_implementation_review(state) {
+            return Ok(false);
+        }
+        let Some(active) = artifact_contracts::find_active_implementation_self_assessment_summary(
+            &self.pool, run_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        Ok(active.summary.status == ImplementationSelfAssessmentStatus::Blocked)
+    }
+
+    async fn block_code_writer_handoff_if_unavailable(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        stage: &StageExecution,
+        task: &workflow::plan::CompiledTask,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+    ) -> Result<bool> {
+        if !is_code_writer_implementation_task(task) {
+            return Ok(false);
+        }
+
+        let required_artifacts: Vec<String> = task
+            .inputs
+            .iter()
+            .filter(|name| !is_inline_runtime_input(name))
+            .cloned()
+            .collect();
+        let mut available_artifacts = Vec::new();
+        let mut missing_artifacts = Vec::new();
+        let mut persisted_artifacts = artifacts::list_by_run(&self.pool, run_id).await?;
+        let mut approved_proposal_artifact_id = None;
+        let mut approved_proposal_digest = None;
+
+        for artifact_name in &required_artifacts {
+            let (artifact_available, ensured_artifact) = self
+                .ensure_implementation_handoff_artifact(
+                    artifact_name,
+                    run,
+                    plan,
+                    stage,
+                    &persisted_artifacts,
+                )
+                .await?;
+            if artifact_available {
+                if let Some(artifact) = ensured_artifact {
+                    if artifact.name == "approved_proposal" {
+                        approved_proposal_artifact_id = Some(artifact.id.to_string());
+                        approved_proposal_digest = artifact.checksum_sha256.clone();
+                    }
+                    if !persisted_artifacts
+                        .iter()
+                        .any(|existing| existing.id == artifact.id)
+                    {
+                        persisted_artifacts.push(artifact);
+                    }
+                }
+                available_artifacts.push(artifact_name.clone());
+            } else {
+                missing_artifacts.push(artifact_name.clone());
+            }
+        }
+
+        let now = Utc::now();
+        let code_writer_start_status = if missing_artifacts.is_empty() {
+            "not_queued"
+        } else {
+            "blocked_before_code"
+        };
+        let status = if required_artifacts.is_empty() {
+            "not_required"
+        } else if missing_artifacts.is_empty() {
+            "ready"
+        } else {
+            "blocked_before_code"
+        };
+        let handoff_status = ImplementationHandoffStatus {
+            schema_version: ImplementationHandoffStatus::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            task_name: task.task_name.clone(),
+            required_input_artifacts: required_artifacts.clone(),
+            available_input_artifacts: available_artifacts.clone(),
+            missing_input_artifacts: missing_artifacts.clone(),
+            approved_proposal_present: available_artifacts
+                .iter()
+                .any(|artifact| artifact == "approved_proposal"),
+            approved_proposal_artifact_id,
+            approved_proposal_digest,
+            worktree_root: run.worktree_root.clone(),
+            workspace_root: run.workspace_root.clone(),
+            artifact_root: run.artifact_root.clone(),
+            code_writer_start_status: code_writer_start_status.to_string(),
+            status: status.to_string(),
+            missing_handoff_outputs: missing_artifacts.clone(),
+            last_handoff_agent_execution_id: None,
+            retryable_from: Some(format!("implementation_handoff:{current_state_id}")),
+            blocked_before_code_reason: (!missing_artifacts.is_empty())
+                .then(|| "implementation_handoff_unavailable".to_string()),
+            updated_at: now,
+        };
+        workflow_conflicts::upsert_implementation_handoff_status(&self.pool, &handoff_status)
+            .await?;
+
+        if missing_artifacts.is_empty() {
+            return Ok(false);
+        }
+
+        self.persist_implementation_handoff_unavailable_conflict(
+            run_id,
+            current_state_id,
+            stage,
+            &required_artifacts,
+            &missing_artifacts,
+            now,
+        )
+        .await?;
+        stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+        if run.status != RunStatus::Blocked {
+            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+        }
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Blocked,
+        });
+        let _ = self.events.send(DomainEvent::RunStatusChanged {
+            run_id,
+            status: RunStatus::Blocked,
+        });
+        warn!(
+            run_id = %run_id,
+            state = current_state_id,
+            task = %task.task_name,
+            missing_artifacts = ?missing_artifacts,
+            "Implementation handoff unavailable — code_writer not enqueued"
+        );
+        Ok(true)
+    }
+
+    async fn ensure_implementation_handoff_artifact(
+        &self,
+        artifact_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        stage: &StageExecution,
+        persisted_artifacts: &[Artifact],
+    ) -> Result<(bool, Option<Artifact>)> {
+        if let Some(artifact) = persisted_artifacts
+            .iter()
+            .rev()
+            .find(|artifact| artifact.name == artifact_name)
+        {
+            return Ok((true, Some(artifact.clone())));
+        }
+
+        if artifact_name == "approved_proposal" {
+            if let Some(artifact) = self
+                .snapshot_approved_proposal_handoff_artifact(run, plan, stage, persisted_artifacts)
+                .await?
+            {
+                return Ok((true, Some(artifact)));
+            }
+        }
+
+        match artifact_contracts::active_contract_exists_result(&self.pool, run.id, artifact_name)
+            .await
+        {
+            Ok(artifact_contracts::CanonicalContractField::Resolved(_)) => return Ok((true, None)),
+            Ok(artifact_contracts::CanonicalContractField::MissingControlled { .. }) => {
+                return Ok((false, None))
+            }
+            Ok(artifact_contracts::CanonicalContractField::UncontrolledAlias) => {}
+            Err(error) => {
+                if artifact_contracts::contract_id_for_alias(artifact_name).is_some() {
+                    warn!(
+                        run_id = %run.id,
+                        artifact_name,
+                        error = %error,
+                        "Controlled implementation handoff artifact lookup failed"
+                    );
+                    return Ok((false, None));
+                }
+            }
+        }
+
+        let Some(path_template) = plan.artifact_paths.get(artifact_name) else {
+            return Ok((false, None));
+        };
+        let resolved = resolve_path_template(
+            path_template,
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        if std::path::Path::new(&resolved).exists() {
+            return Ok((true, None));
+        }
+        Ok((false, None))
+    }
+
+    async fn snapshot_approved_proposal_handoff_artifact(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        stage: &StageExecution,
+        persisted_artifacts: &[Artifact],
+    ) -> Result<Option<Artifact>> {
+        let Some(path_template) = plan.artifact_paths.get("approved_proposal") else {
+            return Ok(None);
+        };
+        let target_path = resolve_path_template(
+            path_template,
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        let target_path = std::path::PathBuf::from(target_path);
+        if !target_path.exists() {
+            let Some(source) = persisted_artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.name == "proposal_current")
+            else {
+                return Ok(None);
+            };
+            let source_path = Self::absolute_artifact_path(&source.file_path, &run.workspace_root);
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "create approved_proposal handoff directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            std::fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "snapshot proposal_current {} to approved_proposal {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+
+        let data = std::fs::read(&target_path).with_context(|| {
+            format!(
+                "read engine-owned approved_proposal handoff artifact {}",
+                target_path.display()
+            )
+        })?;
+        let digest = Sha256::digest(&data);
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id: run.id,
+            stage_id: stage.stage_id.clone(),
+            agent_id: "engine".to_string(),
+            name: "approved_proposal".to_string(),
+            contract_id: "approved_proposal".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: target_path.to_string_lossy().into_owned(),
+            checksum_sha256: Some(format!("{digest:x}")),
+            size_bytes: Some(data.len() as i64),
+            provider: "engine".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        Ok(Some(artifact))
+    }
+
+    fn absolute_artifact_path(file_path: &str, workspace_root: &str) -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(file_path);
+        if path.is_absolute() {
+            path
+        } else {
+            std::path::Path::new(workspace_root).join(path)
+        }
+    }
+
+    async fn persist_implementation_handoff_unavailable_conflict(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        stage: &StageExecution,
+        required_artifacts: &[String],
+        missing_artifacts: &[String],
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let candidate = CandidateTransitionEvaluation {
+            transition_id: format!("{current_state_id}__implementation_handoff"),
+            from_state_id: current_state_id.to_string(),
+            to_state_id: current_state_id.to_string(),
+            condition_expression_id: Some("implementation_handoff.required_inputs".to_string()),
+            result: CandidateTransitionResult::MissingInput,
+            required_artifacts: required_artifacts.to_vec(),
+            missing_artifacts: missing_artifacts.to_vec(),
+            missing_fields: Vec::new(),
+            source_artifact_ids: Vec::new(),
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(format!(
+                "Implementation handoff is missing required input artifact(s): {}",
+                missing_artifacts.join(", ")
+            )),
+        };
+        let candidates = vec![candidate];
+        let candidate_hash = candidate_transition_hash(&candidates);
+        let reason = WorkflowConflictReason::ImplementationHandoffUnavailable;
+        let fingerprint = workflow_conflict_fingerprint(
+            &run_id.to_string(),
+            current_state_id,
+            &reason,
+            &candidate_hash,
+            &[],
+        );
+        let stage_execution_id = stage.id.to_string();
+        let record = WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: fingerprint,
+            run_id: run_id.to_string(),
+            stage_execution_id: Some(stage_execution_id.clone()),
+            lineage_id: Some(stage_execution_id),
+            current_state_id: current_state_id.to_string(),
+            operator_label: workflow_conflict_operator_label(&reason).to_string(),
+            reason,
+            status: WorkflowConflictStatus::Unresolved,
+            candidate_transitions: candidates,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs: Vec::new(),
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".to_string(),
+        };
+        let stored =
+            workflow_conflicts::upsert_conflict_by_fingerprint(&self.pool, &record).await?;
+        self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            cursor_status: "awaiting_conflict_resolution".to_string(),
+            resume_policy: "await_conflict_resolution".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(stored.conflict_id),
+            conflict_fingerprint: Some(stored.conflict_fingerprint),
+            candidate_transition_hash: Some(stored.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: stored.updated_at,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn approval_rejection_context_for_state(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+    ) -> Result<Option<String>> {
+        if current_state_id != "state_5_proposal_refined" {
+            return Ok(None);
+        }
+
+        let approvals = approvals::list_by_run(&self.pool, run_id).await?;
+        let Some(rejection) = approvals
+            .iter()
+            .filter(|approval| {
+                approval.stage_id == "state_6_implementation_approval"
+                    && approval.decision == ApprovalDecision::Rejected
+            })
+            .filter(|approval| {
+                approval
+                    .comment
+                    .as_deref()
+                    .map(|comment| !comment.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .max_by_key(|approval| approval.decided_at.unwrap_or(approval.requested_at))
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(format!(
+            "### Rejected Implementation Approval Context\n\
+             The previous state_6_implementation_approval gate was rejected. \
+             Use the operator comment below together with the proposal and review \
+             input artifacts when refining the proposal.\n\
+             - stage_id: {}\n\
+             - decided_at: {}\n\
+             - comment: {}",
+            rejection.stage_id,
+            rejection
+                .decided_at
+                .unwrap_or(rejection.requested_at)
+                .to_rfc3339(),
+            rejection.comment.as_deref().unwrap_or_default().trim()
+        )))
+    }
+
+    /// Enqueue a single InvokeAgent work item for a task.
+    async fn enqueue_invoke_agent(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        task: &workflow::plan::CompiledTask,
+        prompt: &str,
+        task_index: usize,
+        total_tasks: usize,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+    ) -> Result<()> {
+        let declared_outputs = build_declared_outputs(task, plan, run);
+        let work_item_id = format!("p058-invoke:{}:{}", stage.id, task_index);
+        self.work_queue
+            .enqueue_with_id(
+                work_item_id,
+                WorkItemKind::InvokeAgent,
+                Some(run_id),
+                Some(stage.stage_id.clone()),
+                serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": stage.stage_id,
+                    "stage_execution_id": stage.id.to_string(),
+                    "task_name": task.task_name,
+                    "task_inputs": task.inputs,
+                    "task_outputs": task.outputs,
+                    "agent_id": task.agent.agent_id,
+                    "backend_profile_id": task.agent.backend_profile_id,
+                    "provider": task.agent.provider,
+                    "model": task.agent.model,
+                    "effort": task.agent.effort,
+                    "max_turns": task.agent.max_turns,
+                    "temperature": task.agent.temperature,
+                    "permission_profile": task.agent.permission_profile,
+                    "skill_ref": task.agent.skill_ref,
+                    "skill_role": task.agent.skill_role,
+                    "skill_snapshot_hash": task.agent.skill_snapshot_hash,
+                    "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
+                    "xcode_broker_required": task.agent.xcode_broker_required,
+                    "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
+                    "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
+                    "output_contract": task.agent.output_contract,
+                    "prompt": prompt,
+                    "task_index": task_index,
+                    "total_tasks": total_tasks,
+                    "worktree_write_enabled": task.agent.worktree_write_enabled,
+                    "worktree_strategy": effective_worktree_strategy_for_task(task),
+                    "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
+                    "session_reuse_scope": task.agent.session_reuse_scope,
+                    "session_family_id": task.agent.session_family_id,
+                    "declared_outputs": declared_outputs,
+                    "stage_degraded_output_policy": plan
+                        .states
+                        .get(&stage.stage_id)
+                        .map(|state| state.degraded_output_policy.clone())
+                        .unwrap_or_default(),
+                }),
+            )
+            .await?;
+        if is_code_writer_implementation_task(task) {
+            self.mark_code_writer_start_status_queued(run_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_code_writer_start_status_queued(&self, run_id: RunId) -> Result<()> {
+        let Some(mut status) =
+            workflow_conflicts::get_implementation_handoff_status(&self.pool, run_id).await?
+        else {
+            return Ok(());
+        };
+        if status.status == "blocked_before_code" {
+            return Ok(());
+        }
+        status.code_writer_start_status = "queued".to_string();
+        status.updated_at = Utc::now();
+        workflow_conflicts::upsert_implementation_handoff_status(&self.pool, &status).await
+    }
+
+    async fn enqueue_invoke_agent_for_owner(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        agent: &workflow::plan::ResolvedAgent,
+        prompt: &str,
+        task_index: usize,
+        total_tasks: usize,
+    ) -> Result<()> {
+        let work_item_id = format!("p058-invoke:{}:{}", stage.id, task_index);
+        self.work_queue
+            .enqueue_with_id(
+                work_item_id,
+                WorkItemKind::InvokeAgent,
+                Some(run_id),
+                Some(stage.stage_id.clone()),
+                serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": stage.stage_id,
+                    "stage_execution_id": stage.id.to_string(),
+                    "task_name": stage.stage_id,
+                    "task_inputs": Vec::<String>::new(),
+                    "task_outputs": Vec::<String>::new(),
+                    "agent_id": agent.agent_id,
+                    "backend_profile_id": agent.backend_profile_id,
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "effort": agent.effort,
+                    "max_turns": agent.max_turns,
+                    "temperature": agent.temperature,
+                    "permission_profile": agent.permission_profile,
+                    "skill_ref": agent.skill_ref,
+                    "skill_role": agent.skill_role,
+                    "skill_snapshot_hash": agent.skill_snapshot_hash,
+                    "requested_mcp_server_ids": agent.requested_mcp_server_ids,
+                    "xcode_broker_required": agent.xcode_broker_required,
+                    "xcode_shim_injection_signal": agent.xcode_shim_injection_signal,
+                    "requires_xcode_host_execution": agent.requires_xcode_host_execution,
+                    "output_contract": agent.output_contract,
+                    "prompt": prompt,
+                    "task_index": task_index,
+                    "total_tasks": total_tasks,
+                    "worktree_write_enabled": agent.worktree_write_enabled,
+                    "worktree_strategy": agent.worktree_strategy,
+                    "legacy_broad_discovery_policy": workflow::plan::LegacyBroadDiscoveryPolicy::Disabled,
+                    "session_reuse_scope": agent.session_reuse_scope,
+                    "session_family_id": agent.session_family_id,
+                    "declared_outputs": Vec::<crate::contracts::DeclaredOutput>::new(),
+                }),
+            )
+            .await
+    }
+
+    /// Resolve the base_branch from the first agent with a worktree_policy
+    /// in the catalog. Falls back to None (which the provisioner treats as "main").
+    fn resolve_base_branch_from_catalog(&self, run: &domain::run::Run) -> Option<String> {
+        let catalog_path = run.agent_catalog_yaml_path.as_ref()?;
+        let catalog = workflow::catalog::load(catalog_path).ok()?;
+        let agents = catalog.agents.as_ref()?;
+        for agent in agents {
+            if let Some(ref wp) = agent.worktree_policy {
+                if let Some(ref bb) = wp.base_branch {
+                    // Resolve ${VAR:-default} patterns without path-normalizing branch names.
+                    let resolved = resolve_scalar_template(bb);
+                    return Some(resolved);
+                }
+            }
+        }
+        None
+    }
+
+    /// Clean up the worktree if one was provisioned for this run.
+    /// Best-effort: logs warnings on failure, never propagates errors.
+    async fn cleanup_worktree_if_needed(&self, run: &domain::run::Run) {
+        if let Some(ref wt) = run.worktree_root {
+            if let Err(e) =
+                crate::worktree::WorktreeProvisioner::cleanup(wt, &run.workspace_root).await
+            {
+                warn!(
+                    run_id = %run.id,
+                    worktree = %wt,
+                    error = %e,
+                    "Worktree cleanup failed — manual removal may be needed"
+                );
+            }
+        }
+    }
+
+    /// Create a StageExecution for the given state.
+    async fn create_stage_for_state(
+        &self,
+        run_id: RunId,
+        state_id: &str,
+        state: &workflow::plan::CompiledState,
+    ) -> Result<StageExecution> {
+        let now = Utc::now();
+        db::repos::artifact_contracts::expire_overrides_for_stage(&self.pool, run_id, state_id)
+            .await?;
+
+        // Determine iteration: count how many stages for this state_id already exist.
+        let all_stages = stages::list_by_run(&self.pool, run_id).await?;
+        let iteration = all_stages.iter().filter(|s| s.stage_id == state_id).count() as i64 + 1;
+
+        let stage = StageExecution {
+            id: domain::ids::StageExecutionId::new(),
+            run_id,
+            stage_id: state_id.to_string(),
+            label: state.label.clone(),
+            status: StageStatus::Pending,
+            iteration,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: None,
+            owner_agent: Some(state.owner.agent_id.clone()),
+            provider: Some(state.owner.provider.clone()),
+            model: state.owner.model.clone(),
+            stage_type: state.state_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&self.pool, &stage).await?;
+        Ok(stage)
+    }
+
+    /// Evaluate transition conditions and advance to the next state.
+    async fn evaluate_and_transition(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        plan: &workflow::plan::RunPlan,
+        all_stages: &[StageExecution],
+    ) -> Result<()> {
+        let state = match plan.states.get(current_state_id) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Fetch run for condition evaluation context.
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+
+        // Evaluate transitions against compiled graph truth. P017 keeps the
+        // existing transition action path, but records a typed candidate result
+        // before choosing a graph-authoritative transition.
+        let mut candidate_evaluations = Vec::new();
+        for (transition_index, transition) in state.transitions.iter().enumerate() {
+            let mut evaluation = self
+                .evaluate_transition_candidate(
+                    transition_index,
+                    current_state_id,
+                    transition,
+                    &run,
+                    plan,
+                )
+                .await;
+            if evaluation.result == CandidateTransitionResult::Matched {
+                if let Some(exhaustion) =
+                    loop_budget_exhaustion_for_transition_target(transition, plan, all_stages)
+                {
+                    debug!(
+                        run_id = %run_id,
+                        from = current_state_id,
+                        to = %transition.to,
+                        counter = %exhaustion.counter,
+                        iterations = exhaustion.iterations,
+                        max = exhaustion.max,
+                        "Loop budget exhausted — blocking transition into loop state"
+                    );
+                    evaluation.result = CandidateTransitionResult::NotMatched;
+                    evaluation.sanitized_diagnostic = Some(format!(
+                        "Loop budget exhausted for {}: {}/{} iterations",
+                        exhaustion.counter, exhaustion.iterations, exhaustion.max
+                    ));
+                }
+            }
+            candidate_evaluations.push(evaluation);
+        }
+
+        if let Some(aggregate_diagnostic) = self
+            .proposal_review_summary_transition_truth_conflict(&candidate_evaluations, &run, plan)
+            .await?
+        {
+            warn!(
+                run_id = %run_id,
+                state = current_state_id,
+                diagnostic = %aggregate_diagnostic,
+                "Aggregate transition truth conflicted — run blocked"
+            );
+            annotate_aggregate_transition_truth_conflict(
+                &mut candidate_evaluations,
+                &aggregate_diagnostic,
+            );
+            self.record_workflow_conflict_and_block(
+                run_id,
+                current_state_id,
+                all_stages,
+                candidate_evaluations,
+                plan,
+                &run,
+                Some(WorkflowConflictReason::AggregateTransitionTruthConflicted),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let matched_transition_indexes: Vec<usize> = candidate_evaluations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, evaluation)| {
+                (evaluation.result == CandidateTransitionResult::Matched).then_some(index)
+            })
+            .collect();
+
+        if matched_transition_indexes.len() > 1 {
+            warn!(
+                run_id = %run_id,
+                state = current_state_id,
+                matched_transition_count = matched_transition_indexes.len(),
+                candidate_transitions = ?candidate_evaluations,
+                "Multiple declarative transitions matched without tie-break — run blocked"
+            );
+            self.record_workflow_conflict_and_block(
+                run_id,
+                current_state_id,
+                all_stages,
+                candidate_evaluations,
+                plan,
+                &run,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(transition_index) = matched_transition_indexes.first().copied() {
+            let transition = &state.transitions[transition_index];
+            let selected_transition_id =
+                transition_id_for(current_state_id, &transition.to, transition_index);
+            info!(
+                run_id = %run_id,
+                from = current_state_id,
+                to = %transition.to,
+                condition = %transition.condition,
+                "Transition matched"
+            );
+            self.record_advisory_rejections_for_selected_transition(
+                run_id,
+                current_state_id,
+                &selected_transition_id,
+                &transition.to,
+                plan,
+                all_stages,
+                &run,
+            )
+            .await?;
+            self.resolve_current_workflow_conflict_for_selected_transition(
+                run_id,
+                current_state_id,
+                &selected_transition_id,
+                &transition.to,
+            )
+            .await?;
+            self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
+                schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+                run_id: run_id.to_string(),
+                current_state_id: current_state_id.to_string(),
+                cursor_status: "graph_transition_selected".to_string(),
+                resume_policy: "continue_from_selected_transition".to_string(),
+                selected_transition_id: Some(selected_transition_id.clone()),
+                selected_next_state_id: Some(transition.to.clone()),
+                conflict_id: None,
+                conflict_fingerprint: None,
+                candidate_transition_hash: Some(candidate_transition_hash(&candidate_evaluations)),
+                terminal_failure_reason: None,
+                updated_at: Utc::now(),
+            })
+            .await?;
+            if transition.to == current_state_id {
+                let target_state = plan.states.get(&transition.to).ok_or_else(|| {
+                    anyhow::anyhow!("Transition target state not found: {}", transition.to)
+                })?;
+                let next_stage = self
+                    .create_stage_for_state(run_id, &transition.to, target_state)
+                    .await?;
+                info!(
+                    run_id = %run_id,
+                    state = %transition.to,
+                    stage_execution_id = %next_stage.id,
+                    iteration = next_stage.iteration,
+                    "Self-loop transition created next pending stage iteration"
+                );
+            }
+            runs::update_current_state(&self.pool, run_id, &transition.to).await?;
+            db::repos::artifact_contracts::expire_overrides_for_stage(
+                &self.pool,
+                run_id,
+                &transition.to,
+            )
+            .await?;
+            db::repos::projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+            // Re-enter advance_run for the new state
+            self.work_queue
+                .enqueue(
+                    WorkItemKind::AdvanceRun,
+                    Some(run_id),
+                    None,
+                    serde_json::json!({
+                        "run_id": run_id.to_string(),
+                        "reason": "state_transition",
+                        "from": current_state_id,
+                        "to": transition.to,
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        // No transition matched — check if run should complete or block.
+        if state.transitions.is_empty() || state.is_end {
+            let now = Utc::now();
+            runs::mark_completed(&self.pool, run_id, now).await?;
+            self.enqueue_steward_analysis(Some(run_id)).await?;
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Completed,
+            });
+        } else {
+            info!(
+                run_id = %run_id,
+                state = current_state_id,
+                candidate_transitions = ?candidate_evaluations,
+                "No transition matched — run blocked"
+            );
+            self.record_workflow_conflict_and_block(
+                run_id,
+                current_state_id,
+                all_stages,
+                candidate_evaluations,
+                plan,
+                &run,
+                None,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn record_workflow_conflict_and_block(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        all_stages: &[StageExecution],
+        candidate_evaluations: Vec<CandidateTransitionEvaluation>,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+        reason_override: Option<WorkflowConflictReason>,
+    ) -> Result<()> {
+        let reason = reason_override.unwrap_or_else(|| {
+            classify_workflow_conflict_reason(&candidate_evaluations)
+                .unwrap_or(WorkflowConflictReason::NoDeclarativeTransitionMatched)
+        });
+        let candidate_hash = candidate_transition_hash(&candidate_evaluations);
+        let advisory_evidence_refs = self
+            .collect_blocking_advisory_evidence_refs(run, plan)
+            .await?;
+        let fingerprint = workflow_conflict_fingerprint(
+            &run_id.to_string(),
+            current_state_id,
+            &reason,
+            &candidate_hash,
+            &advisory_evidence_refs,
+        );
+        let stage_execution_id = all_stages
+            .iter()
+            .filter(|stage| stage.stage_id == current_state_id)
+            .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at))
+            .map(|stage| stage.id.to_string());
+        let now = Utc::now();
+        let status = initial_workflow_conflict_status(&reason);
+        let terminal_failure_reason = initial_workflow_conflict_terminal_failure_reason(&reason);
+        let record = WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: fingerprint,
+            run_id: run_id.to_string(),
+            stage_execution_id: stage_execution_id.clone(),
+            lineage_id: stage_execution_id,
+            current_state_id: current_state_id.to_string(),
+            operator_label: workflow_conflict_operator_label(&reason).to_string(),
+            reason,
+            status,
+            candidate_transitions: candidate_evaluations,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs,
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason,
+            diagnostic_redaction_tier: "operator_safe".to_string(),
+        };
+        let stored =
+            workflow_conflicts::upsert_conflict_by_fingerprint(&self.pool, &record).await?;
+        info!(
+            run_id = %run_id,
+            state = current_state_id,
+            conflict_id = %stored.conflict_id,
+            conflict_fingerprint = %stored.conflict_fingerprint,
+            reason = %stored.reason,
+            "Persisted workflow conflict record"
+        );
+
+        if let Ok(Some(run)) = runs::find_by_id(&self.pool, run_id).await {
+            if run.status != RunStatus::Blocked {
+                runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Blocked,
+                });
+            }
+        }
+        // P017 Phase B: attempt mediation initiation for eligible conflicts.
+        let mut effective_status = stored.status.clone();
+        if crate::mediation::feature_flag::is_phase_b_mediation_enabled()
+            && !stored.status.is_terminal_or_operator()
+        {
+            match self
+                .try_initiate_mediation(&stored, run_id, current_state_id, now)
+                .await
+            {
+                Ok(Some(mediation_id)) => {
+                    effective_status = WorkflowConflictStatus::LeadMediationPending;
+                    info!(
+                        run_id = %run_id,
+                        conflict_id = %stored.conflict_id,
+                        mediation_id = %mediation_id,
+                        "Phase B mediation initiated for conflict"
+                    );
+                }
+                Ok(None) => {
+                    debug!(
+                        run_id = %run_id,
+                        conflict_id = %stored.conflict_id,
+                        "Phase B lead resolution failed closed; no mediation initiated"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run_id,
+                        conflict_id = %stored.conflict_id,
+                        error = %e,
+                        "Phase B mediation initiation failed; conflict remains unresolved"
+                    );
+                }
+            }
+        }
+
+        self.record_workflow_transition_cursor(WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            cursor_status: if effective_status == WorkflowConflictStatus::TerminalUnverifiable {
+                "terminal_unverifiable".to_string()
+            } else if effective_status == WorkflowConflictStatus::LeadMediationPending {
+                "lead_mediation_pending".to_string()
+            } else {
+                "awaiting_conflict_resolution".to_string()
+            },
+            resume_policy: if effective_status == WorkflowConflictStatus::TerminalUnverifiable {
+                "terminal_failure".to_string()
+            } else if effective_status == WorkflowConflictStatus::LeadMediationPending {
+                "await_mediation_settlement".to_string()
+            } else {
+                "await_conflict_resolution".to_string()
+            },
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(stored.conflict_id.clone()),
+            conflict_fingerprint: Some(stored.conflict_fingerprint.clone()),
+            candidate_transition_hash: Some(stored.candidate_transition_hash.clone()),
+            terminal_failure_reason: stored.terminal_failure_reason.clone(),
+            updated_at: stored.updated_at,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// P017 Phase B: Attempt to initiate lead mediation for an eligible conflict.
+    /// Returns Some(mediation_id) if mediation was created, None if lead resolution
+    /// failed closed (which is a normal, expected outcome).
+    async fn try_initiate_mediation(
+        &self,
+        conflict: &WorkflowConflictRecord,
+        run_id: RunId,
+        _current_state_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>> {
+        use crate::mediation::lead_resolver::{LeadResolution, PhaseBLeadResolver};
+
+        // MF-PRE-ENABLE-002: Wrap find-active, insert, and update-pointer in a
+        // single IMMEDIATE transaction to prevent orphaned mediation records.
+        // Lead resolution (file I/O) happens outside the tx since it's read-only.
+
+        // Attempt Phase B lead resolution from the versioned compatibility map.
+        // If the map file doesn't exist or no match is found, resolution fails closed.
+        let resolver_path = "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json";
+        let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(
+                    run_id = %run_id,
+                    error = %e,
+                    "Phase B lead resolver map not available; mediation cannot start"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Resolve using the run's workflow and catalog paths.
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+        let workflow_path = run.workflow_yaml_path.as_deref().unwrap_or("");
+        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or("");
+
+        let lead_agent_id = match resolver.resolve(workflow_path, catalog_path) {
+            LeadResolution::Resolved { lead_agent_id, .. } => lead_agent_id,
+            LeadResolution::FailedClosed { reason } => {
+                debug!(
+                    run_id = %run_id,
+                    conflict_id = %conflict.conflict_id,
+                    reason = %reason,
+                    "Phase B lead resolution failed closed"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Begin IMMEDIATE transaction for the idempotency check + insert + pointer update.
+        let mut tx =
+            db::pool::begin_immediate_with_retry(&self.pool, "mediation.try_initiate").await?;
+
+        // Check for existing active mediation for this conflict fingerprint (idempotent).
+        if let Some(existing) = lead_conflict_mediations::find_active_for_conflict_tx(
+            &mut tx,
+            &run_id.to_string(),
+            &conflict.conflict_fingerprint,
+        )
+        .await?
+        {
+            // Existing active mediation — tx not needed, drop it.
+            return Ok(Some(existing.id));
+        }
+
+        // Create the mediation record inside the transaction.
+        let mediation_id = uuid::Uuid::new_v4().to_string();
+        let mediation = domain::mediation::LeadConflictMediationRecord {
+            id: mediation_id.clone(),
+            run_id: run_id.to_string(),
+            conflict_id: conflict.conflict_id.clone(),
+            conflict_fingerprint: conflict.conflict_fingerprint.clone(),
+            lead_agent_id: lead_agent_id.clone(),
+            status: domain::mediation::LeadMediationStatus::Pending,
+            settlement_result: None,
+            recovery_action: None,
+            chosen_action: None,
+            chosen_next_state_id: None,
+            chosen_next_state_label: None,
+            operator_rationale: None,
+            sanitized_progress: Some("Queued for lead mediation".to_string()),
+            validation_errors_json: None,
+            cost_summary_json: None,
+            metric_event_id: None,
+            superseded_by_event_ref: None,
+            agent_execution_id: None,
+            confirmation_subject_id: None,
+            created_at: now,
+            updated_at: now,
+            settled_at: None,
+        };
+        lead_conflict_mediations::insert_tx(&mut tx, &mediation).await?;
+
+        // Update conflict record with mediation pointer and lead_mediation_pending status.
+        workflow_conflicts::update_mediation_pointer_tx(
+            &mut tx,
+            &conflict.conflict_id,
+            &lead_agent_id,
+            &mediation_id,
+            WorkflowConflictStatus::LeadMediationPending,
+            now,
+        )
+        .await?;
+
+        // Commit the atomic find+insert+pointer-update.
+        tx.commit().await?;
+
+        // Enqueue InvokeAgent work item for the lead agent with owner-aware payload.
+        // MC-002: If enqueue fails after the mediation record was committed,
+        // transition the orphaned Pending mediation to terminal_unverifiable
+        // so it doesn't permanently block new mediation for the same fingerprint.
+        if let Err(enqueue_err) = self
+            .enqueue_mediation_invoke_agent(run_id, &run, &mediation_id, conflict, &lead_agent_id)
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id,
+                mediation_id = %mediation_id,
+                error = %enqueue_err,
+                "Failed to enqueue mediation work item; transitioning orphaned mediation to terminal"
+            );
+            // Best-effort recovery: mark the orphaned mediation as terminal.
+            let recovery_now = chrono::Utc::now();
+            if let Ok(mut recovery_tx) =
+                db::pool::begin_immediate_with_retry(&self.pool, "mediation.orphan_recovery").await
+            {
+                let _ = db::repos::lead_conflict_mediations::update_status_tx(
+                    &mut recovery_tx,
+                    &mediation_id,
+                    "terminal_unverifiable",
+                    Some("enqueue_failure"),
+                    Some("clone_or_manual_fallback"),
+                    recovery_now,
+                )
+                .await;
+                let _ = recovery_tx.commit().await;
+            }
+            return Err(enqueue_err);
+        }
+
+        Ok(Some(mediation_id))
+    }
+
+    /// P017 Phase B: Enqueue an InvokeAgent work item for the resolved lead agent,
+    /// with owner_kind=lead_conflict_mediation and the mediation record as owner_id.
+    async fn enqueue_mediation_invoke_agent(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        mediation_id: &str,
+        conflict: &WorkflowConflictRecord,
+        lead_agent_id: &str,
+    ) -> Result<()> {
+        // Look up the lead agent's config from the catalog.
+        let catalog_path = run
+            .agent_catalog_yaml_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Run has no agent catalog path"))?;
+        let catalog = workflow::catalog::load(catalog_path)?;
+        let agents = catalog
+            .agents
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Agent catalog has no agents list"))?;
+        let lead_agent = agents
+            .iter()
+            .find(|a| a.id == lead_agent_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Lead agent '{}' not found in catalog", lead_agent_id)
+            })?;
+
+        // Resolve provider from backend profile or agent entry.
+        let provider = resolve_agent_provider(lead_agent, &catalog);
+        let model = resolve_agent_model(lead_agent, &catalog);
+        let effort = resolve_agent_effort(lead_agent, &catalog);
+        let lead_resolution_contract_id = lead_agent
+            .lead_resolution_contract
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lead agent '{}' missing lead_resolution_contract",
+                    lead_agent_id
+                )
+            })?;
+        let lead_resolution_contract = catalog
+            .contracts
+            .as_ref()
+            .and_then(|contracts| contracts.get(lead_resolution_contract_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Lead agent '{}' references missing lead_resolution_contract '{}'",
+                    lead_agent_id,
+                    lead_resolution_contract_id
+                )
+            })?;
+        let lead_resolution_target_path = catalog
+            .artifacts
+            .as_ref()
+            .and_then(|artifacts| artifacts.get("lead_resolution"))
+            .cloned()
+            .unwrap_or_else(|| {
+                "${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json".to_string()
+            });
+        let lead_resolution_output_schema = serde_json::json!({
+            "contract_id": lead_resolution_contract_id,
+            "format": lead_resolution_contract
+                .format
+                .clone()
+                .unwrap_or_else(|| "json".to_string()),
+            "human_format": lead_resolution_contract.human_format.clone(),
+            "machine_format": lead_resolution_contract.machine_format.clone(),
+            "validation_mode": lead_resolution_contract.validation_mode.clone(),
+            "normalized_artifact_name": lead_resolution_contract.normalized_artifact_name.clone(),
+            "raw_artifact_name": lead_resolution_contract.raw_artifact_name.clone(),
+            "required_fields": lead_resolution_contract.required_fields.clone(),
+        });
+        let declared_outputs = serde_json::json!([{
+            "output_name": "lead_resolution",
+            "target_path": lead_resolution_target_path,
+            "schema": lead_resolution_output_schema,
+            "reuse_policy": serde_json::Value::Null,
+            "companion_output_name": serde_json::Value::Null,
+            "companion_path": serde_json::Value::Null,
+        }]);
+
+        let prompt = format!(
+            "You are the system lead agent mediating workflow conflict {}. \
+             Conflict reason: {}. Current state: {}. \
+             Analyze the conflict and propose a resolution. Return the required \
+             LeadResolutionContract as CHAINWORKS_OUTPUT for lead_resolution.",
+            conflict.conflict_id, conflict.reason, conflict.current_state_id,
+        );
+
+        let work_item_id = format!("p017-mediation:{}:0", mediation_id);
+        self.work_queue
+            .enqueue_with_id(
+                work_item_id,
+                WorkItemKind::InvokeAgent,
+                Some(run_id),
+                Some(conflict.current_state_id.clone()),
+                serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": conflict.current_state_id,
+                    "stage_execution_id": serde_json::Value::Null,
+                    "task_name": format!("mediation_{}", mediation_id),
+                    "task_inputs": Vec::<String>::new(),
+                    "task_outputs": ["lead_resolution"],
+                    "declared_outputs": declared_outputs,
+                    "agent_id": lead_agent_id,
+                    "provider": provider,
+                    "model": model,
+                    "effort": effort,
+                    "output_contract": lead_resolution_contract_id,
+                    "prompt": prompt,
+                    "task_index": 0,
+                    "total_tasks": 1,
+                    // P017: Owner-aware execution identity fields.
+                    "owner_kind": "lead_conflict_mediation",
+                    "owner_id": mediation_id,
+                    "origin_stage_id": conflict.current_state_id,
+                    "origin_stage_execution_id": conflict.stage_execution_id,
+                    "mediation_record_id": mediation_id,
+                    "conflict_fingerprint": conflict.conflict_fingerprint,
+                }),
+            )
+            .await?;
+
+        // Update mediation status to queued.
+        let now = chrono::Utc::now();
+        let mut tx =
+            db::pool::begin_immediate_with_retry(&self.pool, "mediation.update_status_queued")
+                .await?;
+        db::repos::lead_conflict_mediations::update_status_tx(
+            &mut tx,
+            mediation_id,
+            "queued",
+            None,
+            None,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        info!(
+            run_id = %run_id,
+            mediation_id = %mediation_id,
+            lead_agent_id = %lead_agent_id,
+            "Enqueued lead agent invocation for mediation"
+        );
+        Ok(())
+    }
+
+    async fn record_workflow_transition_cursor(
+        &self,
+        cursor: WorkflowTransitionCursorRecord,
+    ) -> Result<()> {
+        workflow_conflicts::upsert_transition_cursor(&self.pool, &cursor).await
+    }
+
+    async fn record_advisory_rejections_for_selected_transition(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        selected_transition_id: &str,
+        selected_next_state_id: &str,
+        plan: &workflow::plan::RunPlan,
+        all_stages: &[StageExecution],
+        run: &domain::run::Run,
+    ) -> Result<()> {
+        let stage_execution_id = latest_stage_execution_id_for_state(all_stages, current_state_id);
+        for advisory in self.collect_transition_advisories(run, plan).await? {
+            let Some(next_stage_hint) = advisory.next_stage_hint.as_deref() else {
+                continue;
+            };
+            if next_stage_hint == selected_next_state_id {
+                continue;
+            }
+
+            let graph_membership_result =
+                advisory_graph_membership_result(plan, &advisory, Some(selected_next_state_id));
+            let advisory_hint_hash = sha256_prefixed_json(&serde_json::json!({
+                "schema": "workflow_advisory_hint_v1",
+                "source_artifact_id": advisory.source_artifact_id.clone(),
+                "next_stage": advisory.next_stage_hint.clone(),
+                "next_action": advisory.next_action.clone(),
+                "graph_membership_result": graph_membership_result,
+            }));
+            let mut provenance = Vec::new();
+            if let Some(next_stage) = advisory.next_stage_hint.clone() {
+                provenance.push(AdvisoryHintExtraction {
+                    source_artifact_id: advisory.source_artifact_id.clone(),
+                    source_agent_execution_id: advisory.source_agent_execution_id.clone(),
+                    advisory_path: "$.next_stage".to_string(),
+                    raw_value_hash: sha256_prefixed_json(&next_stage),
+                    redacted_value: Some(next_stage),
+                    graph_membership_result: graph_membership_result.to_string(),
+                    superseded_by_projection: advisory.superseded_by_projection,
+                    included_in_candidate_transition_hash: true,
+                });
+            }
+            if let Some(next_action) = advisory.next_action.clone() {
+                provenance.push(AdvisoryHintExtraction {
+                    source_artifact_id: advisory.source_artifact_id.clone(),
+                    source_agent_execution_id: advisory.source_agent_execution_id.clone(),
+                    advisory_path: "$.next_action".to_string(),
+                    raw_value_hash: sha256_prefixed_json(&next_action),
+                    redacted_value: Some(next_action),
+                    graph_membership_result: graph_membership_result.to_string(),
+                    superseded_by_projection: advisory.superseded_by_projection,
+                    included_in_candidate_transition_hash: true,
+                });
+            }
+
+            let record = WorkflowAdvisoryRejectionRecord {
+                rejection_id: uuid::Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                stage_execution_id: stage_execution_id.clone(),
+                lineage_id: stage_execution_id.clone(),
+                current_state_id: current_state_id.to_string(),
+                selected_transition_id: selected_transition_id.to_string(),
+                selected_next_state_id: selected_next_state_id.to_string(),
+                advisory_next_stage_hint: advisory.next_stage_hint.clone(),
+                advisory_next_action: advisory.next_action.clone(),
+                advisory_hint_hash,
+                advisory_hint_provenance: provenance,
+                graph_membership_result: graph_membership_result.to_string(),
+                created_at: Utc::now(),
+            };
+            workflow_conflicts::insert_advisory_rejection(&self.pool, &record).await?;
+            info!(
+                run_id = %run_id,
+                state = current_state_id,
+                selected_transition_id = selected_transition_id,
+                selected_next_state_id = selected_next_state_id,
+                advisory_next_stage_hint = ?record.advisory_next_stage_hint,
+                graph_membership_result = graph_membership_result,
+                "Persisted workflow advisory rejection"
+            );
+        }
+        Ok(())
+    }
+
+    async fn resolve_current_workflow_conflict_for_selected_transition(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        selected_transition_id: &str,
+        selected_next_state_id: &str,
+    ) -> Result<()> {
+        let Some(conflict) =
+            workflow_conflicts::get_current_blocking_conflict(&self.pool, run_id).await?
+        else {
+            return Ok(());
+        };
+        if conflict.current_state_id != current_state_id {
+            return Ok(());
+        }
+
+        workflow_conflicts::transition_conflict_status(
+            &self.pool,
+            &conflict.conflict_id,
+            WorkflowConflictStatus::Resolved,
+            Utc::now(),
+            Some(serde_json::json!({
+                "resolution_kind": "graph_authoritative_transition_selected",
+                "selected_transition_id": selected_transition_id,
+                "selected_next_state_id": selected_next_state_id,
+            })),
+            None,
+            None,
+        )
+        .await?;
+        info!(
+            run_id = %run_id,
+            state = current_state_id,
+            conflict_id = %conflict.conflict_id,
+            selected_transition_id = selected_transition_id,
+            selected_next_state_id = selected_next_state_id,
+            "Resolved current workflow conflict before graph-authoritative transition"
+        );
+        Ok(())
+    }
+
+    async fn collect_blocking_advisory_evidence_refs(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<Vec<String>> {
+        let mut refs = std::collections::BTreeSet::new();
+        for advisory in self.collect_transition_advisories(run, plan).await? {
+            let graph_membership_result = advisory_graph_membership_result(plan, &advisory, None);
+            for evidence_ref in advisory_evidence_refs_for_hint(&advisory, graph_membership_result)
+            {
+                refs.insert(evidence_ref);
+            }
+        }
+        Ok(refs.into_iter().collect())
+    }
+
+    async fn collect_transition_advisories(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<Vec<TransitionAdvisoryHint>> {
+        let mut advisories = Vec::new();
+        let mut seen_sources = std::collections::BTreeSet::new();
+
+        if let Some(projection) =
+            artifact_contracts::find_run_state_projection(&self.pool, run.id).await?
+        {
+            if let Some(items) = projection
+                .active_index_json
+                .get("advisory_artifacts")
+                .and_then(|value| value.as_array())
+            {
+                for item in items {
+                    let Some(path) = item.get("advisory_path").and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    if !seen_sources.insert(format!("projection:{path}")) {
+                        continue;
+                    }
+                    let Some(json) = read_json_file(path) else {
+                        continue;
+                    };
+                    if let Some(hint) = advisory_hint_from_json(
+                        item.get("advisory_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(path),
+                        item.get("source_agent_execution_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        true,
+                        &json,
+                    ) {
+                        advisories.push(hint);
+                    }
+                }
+            }
+        }
+
+        for (artifact_name, path_template) in &plan.artifact_paths {
+            let path = resolve_path_template(
+                path_template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            );
+            if !seen_sources.insert(format!("plan:{path}")) {
+                continue;
+            }
+            let Some(json) = read_json_file(&path) else {
+                continue;
+            };
+            if let Some(hint) = advisory_hint_from_json(artifact_name, None, false, &json) {
+                advisories.push(hint);
+            }
+        }
+
+        Ok(advisories)
+    }
+
+    async fn proposal_review_summary_transition_truth_conflict(
+        &self,
+        candidate_evaluations: &[CandidateTransitionEvaluation],
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<Option<String>> {
+        if !candidate_evaluations.iter().any(|candidate| {
+            candidate
+                .required_artifacts
+                .iter()
+                .any(|artifact| artifact == "proposal_review_summary")
+        }) {
+            return Ok(None);
+        }
+
+        let pass = self
+            .read_artifact_field("proposal_review_summary", "pass", run, plan)
+            .await
+            .and_then(|value| value.as_bool());
+        let blocker_count = self
+            .read_artifact_field("proposal_review_summary", "blocker_count", run, plan)
+            .await
+            .and_then(|value| json_value_to_u64(&value));
+        let blocking_issues = self
+            .read_artifact_field("proposal_review_summary", "blocking_issues", run, plan)
+            .await;
+        let required_changes = self
+            .read_artifact_field("proposal_review_summary", "required_changes", run, plan)
+            .await;
+        let decision = self
+            .read_artifact_field("proposal_review_summary", "decision", run, plan)
+            .await
+            .and_then(|value| value.as_str().map(str::to_string));
+
+        let has_blocker_count = blocker_count.is_some_and(|count| count > 0);
+        let has_blocking_issues = json_value_has_entries(blocking_issues.as_ref());
+        let has_required_changes = json_value_has_entries(required_changes.as_ref());
+        let has_blocking_evidence =
+            has_blocker_count || has_blocking_issues || has_required_changes;
+
+        if pass == Some(true) && has_blocking_evidence {
+            return Ok(Some(
+                "proposal_review_summary_v1 has pass=true while blocker evidence is non-empty"
+                    .to_string(),
+            ));
+        }
+
+        let explicitly_no_blocking_issues = blocking_issues
+            .as_ref()
+            .is_some_and(json_value_is_empty_collection);
+        let explicitly_no_required_changes = required_changes
+            .as_ref()
+            .is_some_and(json_value_is_empty_collection);
+        if pass == Some(false)
+            && blocker_count == Some(0)
+            && explicitly_no_blocking_issues
+            && explicitly_no_required_changes
+        {
+            return Ok(Some(
+                "proposal_review_summary_v1 has pass=false while blocker evidence is explicitly empty"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(decision) = decision.as_deref() {
+            let decision = decision.to_ascii_lowercase();
+            let decision_passes = decision.contains("pass")
+                || decision.contains("approve")
+                || decision.contains("approved");
+            let decision_blocks = decision.contains("fail")
+                || decision.contains("block")
+                || decision.contains("revise")
+                || decision.contains("changes_required");
+            if decision_passes && (pass == Some(false) || has_blocking_evidence) {
+                return Ok(Some(
+                    "proposal_review_summary_v1 decision indicates pass while authoritative fields block"
+                        .to_string(),
+                ));
+            }
+            if decision_blocks && pass == Some(true) && !has_blocking_evidence {
+                return Ok(Some(
+                    "proposal_review_summary_v1 decision indicates blocking while authoritative fields pass"
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn evaluate_transition_candidate(
+        &self,
+        transition_index: usize,
+        current_state_id: &str,
+        transition: &workflow::plan::CompiledTransition,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> CandidateTransitionEvaluation {
+        let condition = self
+            .evaluate_condition_classified(&transition.condition, run, plan, current_state_id)
+            .await;
+        CandidateTransitionEvaluation {
+            transition_id: transition_id_for(current_state_id, &transition.to, transition_index),
+            from_state_id: current_state_id.to_string(),
+            to_state_id: transition.to.clone(),
+            condition_expression_id: Some(format!("transition_condition_{}", transition_index)),
+            result: condition.result,
+            required_artifacts: condition.required_artifacts,
+            missing_artifacts: condition.missing_artifacts,
+            missing_fields: condition.missing_fields,
+            source_artifact_ids: condition.source_artifact_ids,
+            source_agent_execution_id: None,
+            sanitized_diagnostic: condition.sanitized_diagnostic,
+        }
+    }
+
+    async fn evaluate_condition_classified(
+        &self,
+        condition: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        current_state_id: &str,
+    ) -> ClassifiedConditionEvaluation {
+        let trimmed = condition.trim().trim_matches('"');
+
+        if trimmed == "true" || trimmed == "'true'" {
+            return ClassifiedConditionEvaluation::matched();
+        }
+        if trimmed == "false" || trimmed == "'false'" {
+            return ClassifiedConditionEvaluation::not_matched();
+        }
+
+        if let Some(split) = split_connective(trimmed, " and ") {
+            let left =
+                Box::pin(self.evaluate_condition_classified(split.0, run, plan, current_state_id))
+                    .await;
+            let right =
+                Box::pin(self.evaluate_condition_classified(split.1, run, plan, current_state_id))
+                    .await;
+            return ClassifiedConditionEvaluation::combine_and(left, right);
+        }
+        if let Some(split) = split_connective(trimmed, " or ") {
+            let left =
+                Box::pin(self.evaluate_condition_classified(split.0, run, plan, current_state_id))
+                    .await;
+            let right =
+                Box::pin(self.evaluate_condition_classified(split.1, run, plan, current_state_id))
+                    .await;
+            return ClassifiedConditionEvaluation::combine_or(left, right);
+        }
+
+        if trimmed.starts_with("exists(") && trimmed.ends_with(')') {
+            let artifact_name = trimmed[7..trimmed.len() - 1]
+                .trim_matches('\'')
+                .trim_matches('"');
+            return self
+                .evaluate_artifact_exists_classified(artifact_name, run, plan)
+                .await;
+        }
+
+        if trimmed == "approval.granted == true" {
+            let approvals = approvals::list_by_run(&self.pool, run.id)
+                .await
+                .unwrap_or_default();
+            return if approvals
+                .iter()
+                .any(|a| a.stage_id == current_state_id && a.decision == ApprovalDecision::Granted)
+            {
+                ClassifiedConditionEvaluation::matched()
+            } else {
+                ClassifiedConditionEvaluation::not_matched()
+            };
+        }
+        if trimmed == "approval.rejected == true" {
+            let approvals = approvals::list_by_run(&self.pool, run.id)
+                .await
+                .unwrap_or_default();
+            return if approvals
+                .iter()
+                .any(|a| a.stage_id == current_state_id && a.decision == ApprovalDecision::Rejected)
+            {
+                ClassifiedConditionEvaluation::matched()
+            } else {
+                ClassifiedConditionEvaluation::not_matched()
+            };
+        }
+
+        for (op_str, op) in &[
+            (" <= ", CompOp::Le),
+            (" >= ", CompOp::Ge),
+            (" != ", CompOp::Ne),
+            (" == ", CompOp::Eq),
+            (" < ", CompOp::Lt),
+            (" > ", CompOp::Gt),
+        ] {
+            if let Some(pos) = trimmed.find(op_str) {
+                let lhs = trimmed[..pos].trim();
+                let rhs = trimmed[pos + op_str.len()..].trim();
+                if let Some((artifact_name, field_name)) = artifact_field_ref(lhs) {
+                    return self
+                        .evaluate_artifact_field_comparison_classified(
+                            artifact_name,
+                            field_name,
+                            *op,
+                            rhs,
+                            run,
+                            plan,
+                        )
+                        .await;
+                }
+                let lv = self.resolve_value(lhs, run, plan).await;
+                let rv = self.resolve_value(rhs, run, plan).await;
+                return if apply_comparison(&lv, *op, &rv) {
+                    ClassifiedConditionEvaluation::matched()
+                } else {
+                    ClassifiedConditionEvaluation::not_matched()
+                };
+            }
+        }
+
+        ClassifiedConditionEvaluation::invalid_expression(format!(
+            "Unsupported transition condition: {trimmed}"
+        ))
+    }
+
+    async fn evaluate_artifact_exists_classified(
+        &self,
+        artifact_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> ClassifiedConditionEvaluation {
+        match db::repos::artifact_contracts::active_contract_exists_result(
+            &self.pool,
+            run.id,
+            artifact_name,
+        )
+        .await
+        {
+            Ok(db::repos::artifact_contracts::CanonicalContractField::Resolved(_)) => {
+                return ClassifiedConditionEvaluation::matched()
+                    .with_required_artifact(artifact_name)
+                    .with_source_artifact(artifact_name);
+            }
+            Ok(db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
+                contract_id,
+            }) => {
+                return ClassifiedConditionEvaluation::missing_input(format!(
+                    "Controlled artifact {contract_id} is missing canonical DB truth"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_artifact(artifact_name);
+            }
+            Ok(db::repos::artifact_contracts::CanonicalContractField::UncontrolledAlias) => {}
+            Err(error) => {
+                if let Some(contract_id) =
+                    db::repos::artifact_contracts::contract_id_for_alias(artifact_name)
+                {
+                    return ClassifiedConditionEvaluation::missing_input(format!(
+                        "Controlled artifact {contract_id} lookup failed: {error}"
+                    ))
+                    .with_required_artifact(artifact_name)
+                    .with_missing_artifact(artifact_name);
+                }
+            }
+        }
+
+        let Some(path_template) = plan.artifact_paths.get(artifact_name) else {
+            return ClassifiedConditionEvaluation::invalid_expression(format!(
+                "Artifact {artifact_name} is not declared by the workflow/catalog contract"
+            ))
+            .with_required_artifact(artifact_name);
+        };
+
+        let resolved = resolve_path_template(
+            path_template,
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        if std::path::Path::new(&resolved).exists() {
+            return ClassifiedConditionEvaluation::matched()
+                .with_required_artifact(artifact_name)
+                .with_source_artifact(artifact_name);
+        }
+        if run.chainworks_meta_root.is_none() {
+            for suffix in &[
+                artifact_name.to_string(),
+                format!("{}/{}", run.id, artifact_name),
+            ] {
+                let path = format!("{}/{}", run.artifact_root, suffix);
+                if std::path::Path::new(&path).exists() {
+                    return ClassifiedConditionEvaluation::matched()
+                        .with_required_artifact(artifact_name)
+                        .with_source_artifact(artifact_name);
+                }
+            }
+        }
+
+        ClassifiedConditionEvaluation::missing_input(format!(
+            "Declared artifact {artifact_name} is absent"
+        ))
+        .with_required_artifact(artifact_name)
+        .with_missing_artifact(artifact_name)
+    }
+
+    async fn evaluate_artifact_field_comparison_classified(
+        &self,
+        artifact_name: &str,
+        field_name: &str,
+        op: CompOp,
+        rhs: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> ClassifiedConditionEvaluation {
+        let field_ref = format!("{artifact_name}.{field_name}");
+        match db::repos::artifact_contracts::canonical_contract_field_result(
+            &self.pool,
+            run.id,
+            artifact_name,
+            field_name,
+        )
+        .await
+        {
+            Ok(db::repos::artifact_contracts::CanonicalContractField::Resolved(value)) => {
+                let rv = self.resolve_value(rhs, run, plan).await;
+                return if apply_comparison(&value, op, &rv) {
+                    ClassifiedConditionEvaluation::matched()
+                } else {
+                    ClassifiedConditionEvaluation::not_matched()
+                }
+                .with_required_artifact(artifact_name)
+                .with_source_artifact(artifact_name);
+            }
+            Ok(db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
+                contract_id,
+            }) => {
+                if is_implementation_self_assessment_alias(artifact_name) {
+                    if let Some(value) = self
+                        .active_implementation_self_assessment_summary_field(run.id, field_name)
+                        .await
+                    {
+                        let rv = self.resolve_value(rhs, run, plan).await;
+                        return if apply_comparison(&value, op, &rv) {
+                            ClassifiedConditionEvaluation::matched()
+                        } else {
+                            ClassifiedConditionEvaluation::not_matched()
+                        }
+                        .with_required_artifact(artifact_name)
+                        .with_source_artifact(artifact_name);
+                    }
+                }
+                return ClassifiedConditionEvaluation::missing_input(format!(
+                    "Controlled artifact field {contract_id}.{field_name} is missing canonical DB truth"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_field(&field_ref);
+            }
+            Ok(db::repos::artifact_contracts::CanonicalContractField::UncontrolledAlias) => {}
+            Err(error) => {
+                if let Some(contract_id) =
+                    db::repos::artifact_contracts::contract_id_for_alias(artifact_name)
+                {
+                    return ClassifiedConditionEvaluation::missing_input(format!(
+                        "Controlled artifact field {contract_id}.{field_name} lookup failed: {error}"
+                    ))
+                    .with_required_artifact(artifact_name)
+                    .with_missing_field(&field_ref);
+                }
+            }
+        }
+
+        if !plan.artifact_paths.contains_key(artifact_name) {
+            return ClassifiedConditionEvaluation::invalid_expression(format!(
+                "Artifact field {field_ref} references an undeclared artifact"
+            ))
+            .with_required_artifact(artifact_name);
+        }
+
+        let Some(value) = self
+            .read_artifact_field(artifact_name, field_name, run, plan)
+            .await
+        else {
+            let exists = self
+                .evaluate_artifact_exists_classified(artifact_name, run, plan)
+                .await;
+            return if exists.result == CandidateTransitionResult::MissingInput
+                && exists.missing_artifacts.iter().any(|a| a == artifact_name)
+            {
+                exists
+            } else {
+                ClassifiedConditionEvaluation::missing_input(format!(
+                    "Declared artifact field {field_ref} is absent"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_field(&field_ref)
+            };
+        };
+
+        let rv = self.resolve_value(rhs, run, plan).await;
+        if apply_comparison(&value, op, &rv) {
+            ClassifiedConditionEvaluation::matched()
+        } else {
+            ClassifiedConditionEvaluation::not_matched()
+        }
+        .with_required_artifact(artifact_name)
+        .with_source_artifact(artifact_name)
+    }
+
+    /// Resolve a value reference to a JSON Value.
+    /// Supports: `vars.name`, `artifact.field`, literals (int/float/string/bool).
+    async fn resolve_value(
+        &self,
+        ref_str: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> serde_json::Value {
+        let trimmed = ref_str.trim();
+
+        // vars.* → plan variables
+        if let Some(var_name) = trimmed.strip_prefix("vars.") {
+            return plan
+                .variables
+                .get(var_name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+
+        // artifact.field → read JSON file, extract field
+        if trimmed.contains('.') && !trimmed.starts_with("vars.") {
+            let parts: Vec<&str> = trimmed.splitn(2, '.').collect();
+            if parts.len() == 2 {
+                let artifact_name = parts[0];
+                let field_name = parts[1];
+                if artifact_name == "implementation_self_assessment_v2"
+                    || artifact_name == "implementation_self_assessment"
+                {
+                    if let Some(val) = self
+                        .read_artifact_field(artifact_name, field_name, run, plan)
+                        .await
+                    {
+                        return val;
+                    }
+                }
+                let controlled_contract_id =
+                    db::repos::artifact_contracts::contract_id_for_alias(artifact_name);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let can_block_in_place =
+                        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread;
+                    if can_block_in_place {
+                        if let Ok(result) = tokio::task::block_in_place(|| {
+                            handle.block_on(
+                                db::repos::artifact_contracts::canonical_contract_field_result(
+                                    &self.pool,
+                                    run.id,
+                                    artifact_name,
+                                    field_name,
+                                ),
+                            )
+                        }) {
+                            match result {
+                                db::repos::artifact_contracts::CanonicalContractField::Resolved(value) => {
+                                    return value;
+                                }
+                                db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
+                                    contract_id,
+                                } => {
+                                    warn!(
+                                        artifact = artifact_name,
+                                        field = field_name,
+                                        contract_id = %contract_id,
+                                        "P057-controlled artifact field missing canonical DB truth; raw artifact fallback disabled"
+                                    );
+                                    return serde_json::Value::Null;
+                                }
+                                db::repos::artifact_contracts::CanonicalContractField::UncontrolledAlias => {}
+                            }
+                        } else if let Some(contract_id) = controlled_contract_id {
+                            warn!(
+                                artifact = artifact_name,
+                                field = field_name,
+                                contract_id = %contract_id,
+                                "P057-controlled artifact lookup failed; raw artifact fallback disabled"
+                            );
+                            return serde_json::Value::Null;
+                        }
+                    } else if let Some(contract_id) = controlled_contract_id {
+                        warn!(
+                            artifact = artifact_name,
+                            field = field_name,
+                            contract_id = %contract_id,
+                            "P057-controlled artifact lookup unavailable on current-thread runtime; raw artifact fallback disabled"
+                        );
+                        return serde_json::Value::Null;
+                    }
+                } else if let Some(contract_id) = controlled_contract_id {
+                    warn!(
+                        artifact = artifact_name,
+                        field = field_name,
+                        contract_id = %contract_id,
+                        "P057-controlled artifact lookup unavailable outside Tokio runtime; raw artifact fallback disabled"
+                    );
+                    return serde_json::Value::Null;
+                }
+                if let Some(val) = self
+                    .read_artifact_field(artifact_name, field_name, run, plan)
+                    .await
+                {
+                    return val;
+                }
+            }
+        }
+
+        // Literal: true/false
+        if trimmed == "true" {
+            return serde_json::Value::Bool(true);
+        }
+        if trimmed == "false" {
+            return serde_json::Value::Bool(false);
+        }
+
+        // Literal: number
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return serde_json::json!(n);
+        }
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return serde_json::json!(f);
+        }
+
+        // Literal: quoted string
+        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        {
+            return serde_json::Value::String(trimmed[1..trimmed.len() - 1].to_string());
+        }
+
+        // Bare string
+        serde_json::Value::String(trimmed.to_string())
+    }
+
+    /// Read a field from a JSON artifact file on disk.
+    async fn read_artifact_field(
+        &self,
+        artifact_name: &str,
+        field_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Option<serde_json::Value> {
+        if is_implementation_self_assessment_alias(artifact_name) {
+            return self
+                .active_implementation_self_assessment_summary_field(run.id, field_name)
+                .await;
+        }
+
+        // Find the artifact file path
+        let path = if let Some(template) = plan.artifact_paths.get(artifact_name) {
+            let resolved = resolve_path_template(
+                template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            );
+            if std::path::Path::new(&resolved).exists() {
+                resolved
+            } else if run.chainworks_meta_root.is_none() {
+                // Legacy fallback: try artifact_root (only for pre-P050 runs).
+                // P050: Post-P050 runs must NOT fall back to shared artifact_root.
+                let alt = format!("{}/{}", run.artifact_root, artifact_name);
+                if std::path::Path::new(&alt).exists() {
+                    alt
+                } else {
+                    let alt2 = format!("{}/{}/{}", run.artifact_root, run.id, artifact_name);
+                    if std::path::Path::new(&alt2).exists() {
+                        alt2
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                // Post-P050 run: no artifact_root fallback — canonical path is the only truth.
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        // Read and parse JSON
+        let content = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+        extract_json_field(&json, field_name)
+    }
+
+    async fn active_implementation_self_assessment_summary_field(
+        &self,
+        run_id: RunId,
+        field_name: &str,
+    ) -> Option<serde_json::Value> {
+        let active = artifact_contracts::find_active_implementation_self_assessment_summary(
+            &self.pool, run_id,
+        )
+        .await
+        .ok()
+        .flatten()?;
+        let summary_json = serde_json::to_value(&active.summary).ok()?;
+        if field_name == "seemingly_complete" {
+            return extract_json_field(&summary_json, "implementation_complete");
+        }
+        if field_name == "blocking_remaining_code_tasks" {
+            return extract_json_field(&summary_json, "blocking_remaining_code_task_count");
+        }
+        extract_json_field(&summary_json, field_name)
+    }
+
+    // =====================================================================
+    // Legacy flat-stage orchestration (no YAML workflow)
+    // =====================================================================
+
+    async fn advance_run_flat(&self, run_id: RunId, run: &domain::run::Run) -> Result<()> {
+        let all_stages = stages::list_by_run(&self.pool, run_id).await?;
+        let all_approvals = approvals::list_by_run(&self.pool, run_id).await?;
+
+        let evaluation = DomainEngine::evaluate_run(run, &all_stages, &all_approvals);
+
+        match evaluation {
+            RunEvaluation::Terminal => {}
+
+            RunEvaluation::Complete => {
+                info!(run_id = %run_id, "Run complete, marking completed");
+                let now = Utc::now();
+                runs::mark_completed(&self.pool, run_id, now).await?;
+                self.enqueue_steward_analysis(Some(run_id)).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Completed,
+                });
+            }
+
+            RunEvaluation::Failed => {
+                info!(run_id = %run_id, "All stages terminal, none succeeded — marking failed");
+                runs::update_status(&self.pool, run_id, RunStatus::Failed).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Failed,
+                });
+            }
+
+            RunEvaluation::WaitingApproval { stage_id } => {
+                info!(run_id = %run_id, stage_id = %stage_id, "Run waiting for approval");
+                if run.status != RunStatus::WaitingApproval {
+                    runs::update_status(&self.pool, run_id, RunStatus::WaitingApproval).await?;
+                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                        run_id,
+                        status: RunStatus::WaitingApproval,
+                    });
+                }
+            }
+
+            RunEvaluation::Blocked { reason } => {
+                info!(run_id = %run_id, reason = %reason, "Run blocked");
+                if run.status == RunStatus::Cancelling {
+                    let now = Utc::now();
+                    runs::mark_cancelled(&self.pool, run_id, now).await?;
+                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                        run_id,
+                        status: RunStatus::Cancelled,
+                    });
+                } else if run.status != RunStatus::Blocked {
+                    runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                        run_id,
+                        status: RunStatus::Blocked,
+                    });
+                }
+            }
+
+            RunEvaluation::CanAdvance { next_stage_id } => {
+                let stage = all_stages.iter().find(|s| s.id == next_stage_id).cloned();
+
+                if let Some(stage) = stage {
+                    info!(run_id = %run_id, stage_id = %stage.stage_id, "Activating next stage");
+                    stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
+                    let _ = self.events.send(DomainEvent::StageStatusChanged {
+                        run_id,
+                        stage_execution_id: stage.id,
+                        status: StageStatus::Running,
+                    });
+
+                    if !matches!(run.status, RunStatus::Running) {
+                        runs::update_status(&self.pool, run_id, RunStatus::Running).await?;
+                        let _ = self.events.send(DomainEvent::RunStatusChanged {
+                            run_id,
+                            status: RunStatus::Running,
+                        });
+                    }
+
+                    // Use per-stage provider if available, else env default.
+                    let provider = stage.provider.clone().unwrap_or_else(|| {
+                        std::env::var("CHAINWORKS_DEFAULT_PROVIDER")
+                            .unwrap_or_else(|_| "claude".to_string())
+                    });
+                    let agent_id = stage
+                        .owner_agent
+                        .clone()
+                        .unwrap_or_else(|| stage.stage_id.clone());
+
+                    self.work_queue
+                        .enqueue_with_id(
+                            format!("p058-invoke:{}:0", stage.id),
+                            WorkItemKind::InvokeAgent,
+                            Some(run_id),
+                            Some(stage.stage_id.clone()),
+                            serde_json::json!({
+                                "run_id": run_id.to_string(),
+                                "stage_id": stage.stage_id,
+                                "stage_execution_id": stage.id.to_string(),
+                                "agent_id": agent_id.clone(),
+                                "provider": provider,
+                                "session_reuse_scope": "same_agent_family_within_run",
+                                "session_family_id": agent_id,
+                                "declared_outputs": Vec::<crate::contracts::DeclaredOutput>::new(),
+                            }),
+                        )
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Agent-authored transition hints are advisory evidence only. These values
+/// are compared against the selected graph transition and persisted as
+/// non-blocking rejection history when they diverge.
+#[derive(Clone, Debug)]
+struct TransitionAdvisoryHint {
+    source_artifact_id: String,
+    source_agent_execution_id: Option<String>,
+    next_stage_hint: Option<String>,
+    next_action: Option<String>,
+    superseded_by_projection: bool,
+}
+
+fn transition_id_for(current_state_id: &str, to_state_id: &str, transition_index: usize) -> String {
+    format!("{current_state_id}__to__{to_state_id}__{transition_index}")
+}
+
+fn latest_stage_execution_id_for_state(
+    all_stages: &[StageExecution],
+    current_state_id: &str,
+) -> Option<String> {
+    all_stages
+        .iter()
+        .filter(|stage| stage.stage_id == current_state_id)
+        .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at))
+        .map(|stage| stage.id.to_string())
+}
+
+fn read_json_file(path: &str) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn advisory_hint_from_json(
+    source_artifact_id: &str,
+    source_agent_execution_id: Option<String>,
+    superseded_by_projection: bool,
+    json: &serde_json::Value,
+) -> Option<TransitionAdvisoryHint> {
+    let next_stage_hint = json
+        .get("next_stage")
+        .or_else(|| json.get("nextStage"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let next_action = json
+        .get("next_action")
+        .or_else(|| json.get("nextAction"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+
+    if next_stage_hint.is_none() && next_action.is_none() {
+        return None;
+    }
+
+    Some(TransitionAdvisoryHint {
+        source_artifact_id: source_artifact_id.to_string(),
+        source_agent_execution_id,
+        next_stage_hint,
+        next_action,
+        superseded_by_projection,
+    })
+}
+
+fn advisory_graph_membership_result(
+    plan: &workflow::plan::RunPlan,
+    advisory: &TransitionAdvisoryHint,
+    selected_next_state_id: Option<&str>,
+) -> &'static str {
+    let Some(next_stage_hint) = advisory.next_stage_hint.as_deref() else {
+        return "no_next_stage_hint";
+    };
+    if !plan.states.contains_key(next_stage_hint) {
+        return "absent_from_graph";
+    }
+    if selected_next_state_id == Some(next_stage_hint) {
+        "graph_state_selected"
+    } else {
+        "graph_state_not_selected"
+    }
+}
+
+fn advisory_evidence_refs_for_hint(
+    advisory: &TransitionAdvisoryHint,
+    graph_membership_result: &str,
+) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(next_stage) = advisory.next_stage_hint.as_deref() {
+        refs.push(format!(
+            "{}:$.next_stage:{}:{}",
+            advisory.source_artifact_id,
+            graph_membership_result,
+            sha256_prefixed_json(next_stage)
+        ));
+    }
+    if let Some(next_action) = advisory.next_action.as_deref() {
+        refs.push(format!(
+            "{}:$.next_action:{}",
+            advisory.source_artifact_id,
+            sha256_prefixed_json(next_action)
+        ));
+    }
+    refs
+}
+
+fn sha256_prefixed_json<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    let json = serde_json::to_vec(value).expect("workflow advisory hash payload should serialize");
+    let digest = Sha256::digest(json);
+    format!("sha256:{digest:x}")
+}
+
+// ---------------------------------------------------------------------------
+// Expression evaluation helpers (match Swift TransitionEvaluator)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum CompOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Debug, Clone)]
+struct ClassifiedConditionEvaluation {
+    result: CandidateTransitionResult,
+    required_artifacts: Vec<String>,
+    missing_artifacts: Vec<String>,
+    missing_fields: Vec<String>,
+    source_artifact_ids: Vec<String>,
+    sanitized_diagnostic: Option<String>,
+}
+
+impl ClassifiedConditionEvaluation {
+    fn matched() -> Self {
+        Self::new(CandidateTransitionResult::Matched, None)
+    }
+
+    fn not_matched() -> Self {
+        Self::new(CandidateTransitionResult::NotMatched, None)
+    }
+
+    fn missing_input(diagnostic: String) -> Self {
+        Self::new(CandidateTransitionResult::MissingInput, Some(diagnostic))
+    }
+
+    fn invalid_expression(diagnostic: String) -> Self {
+        Self::new(
+            CandidateTransitionResult::InvalidExpression,
+            Some(diagnostic),
+        )
+    }
+
+    fn new(result: CandidateTransitionResult, sanitized_diagnostic: Option<String>) -> Self {
+        Self {
+            result,
+            required_artifacts: Vec::new(),
+            missing_artifacts: Vec::new(),
+            missing_fields: Vec::new(),
+            source_artifact_ids: Vec::new(),
+            sanitized_diagnostic,
+        }
+    }
+
+    fn with_required_artifact(mut self, artifact_name: &str) -> Self {
+        push_unique(&mut self.required_artifacts, artifact_name);
+        self
+    }
+
+    fn with_missing_artifact(mut self, artifact_name: &str) -> Self {
+        push_unique(&mut self.missing_artifacts, artifact_name);
+        self
+    }
+
+    fn with_missing_field(mut self, field_ref: &str) -> Self {
+        push_unique(&mut self.missing_fields, field_ref);
+        self
+    }
+
+    fn with_source_artifact(mut self, artifact_name: &str) -> Self {
+        push_unique(&mut self.source_artifact_ids, artifact_name);
+        self
+    }
+
+    fn combine_and(left: Self, right: Self) -> Self {
+        let result = dominant_result_for_all(&[&left, &right]).unwrap_or_else(|| {
+            if left.result == CandidateTransitionResult::Matched
+                && right.result == CandidateTransitionResult::Matched
+            {
+                CandidateTransitionResult::Matched
+            } else {
+                CandidateTransitionResult::NotMatched
+            }
+        });
+        Self::combine_with_result(result, left, right)
+    }
+
+    fn combine_or(left: Self, right: Self) -> Self {
+        let result = dominant_result_for_all(&[&left, &right]).unwrap_or_else(|| {
+            if left.result == CandidateTransitionResult::Matched
+                || right.result == CandidateTransitionResult::Matched
+            {
+                CandidateTransitionResult::Matched
+            } else {
+                CandidateTransitionResult::NotMatched
+            }
+        });
+        Self::combine_with_result(result, left, right)
+    }
+
+    fn combine_with_result(result: CandidateTransitionResult, left: Self, right: Self) -> Self {
+        let mut combined = Self::new(
+            result,
+            left.sanitized_diagnostic
+                .clone()
+                .or_else(|| right.sanitized_diagnostic.clone()),
+        );
+        for value in left
+            .required_artifacts
+            .iter()
+            .chain(right.required_artifacts.iter())
+        {
+            push_unique(&mut combined.required_artifacts, value);
+        }
+        for value in left
+            .missing_artifacts
+            .iter()
+            .chain(right.missing_artifacts.iter())
+        {
+            push_unique(&mut combined.missing_artifacts, value);
+        }
+        for value in left
+            .missing_fields
+            .iter()
+            .chain(right.missing_fields.iter())
+        {
+            push_unique(&mut combined.missing_fields, value);
+        }
+        for value in left
+            .source_artifact_ids
+            .iter()
+            .chain(right.source_artifact_ids.iter())
+        {
+            push_unique(&mut combined.source_artifact_ids, value);
+        }
+        combined
+    }
+}
+
+fn dominant_result_for_all(
+    evaluations: &[&ClassifiedConditionEvaluation],
+) -> Option<CandidateTransitionResult> {
+    for result in [
+        CandidateTransitionResult::EvaluationError,
+        CandidateTransitionResult::InvalidExpression,
+        CandidateTransitionResult::MissingInput,
+    ] {
+        if evaluations
+            .iter()
+            .any(|evaluation| evaluation.result == result)
+        {
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
+}
+
+fn workflow_conflict_operator_label(reason: &WorkflowConflictReason) -> &'static str {
+    match reason {
+        WorkflowConflictReason::InvalidNextStageHint => "Invalid next-stage advisory hint",
+        WorkflowConflictReason::NoDeclarativeTransitionMatched => {
+            "No declarative workflow transition matched"
+        }
+        WorkflowConflictReason::MultipleDeclarativeTransitionsMatchedWithoutTieBreak => {
+            "Multiple workflow transitions matched without a tie-break"
+        }
+        WorkflowConflictReason::RequiredArtifactOrFieldMissingForTransition => {
+            "Required transition artifact or field is missing"
+        }
+        WorkflowConflictReason::AggregateTransitionTruthConflicted => {
+            "Aggregate transition truth is conflicted"
+        }
+        WorkflowConflictReason::WorkflowConflictUnverifiable => {
+            "Workflow transition outcome is unverifiable"
+        }
+        WorkflowConflictReason::ImplementationHandoffUnavailable => {
+            "Implementation handoff is unavailable"
+        }
+    }
+}
+
+fn initial_workflow_conflict_status(reason: &WorkflowConflictReason) -> WorkflowConflictStatus {
+    match reason {
+        WorkflowConflictReason::AggregateTransitionTruthConflicted => {
+            WorkflowConflictStatus::OperatorConfirmationRequired
+        }
+        WorkflowConflictReason::WorkflowConflictUnverifiable => {
+            WorkflowConflictStatus::TerminalUnverifiable
+        }
+        _ => WorkflowConflictStatus::Unresolved,
+    }
+}
+
+fn initial_workflow_conflict_terminal_failure_reason(
+    reason: &WorkflowConflictReason,
+) -> Option<String> {
+    match reason {
+        WorkflowConflictReason::WorkflowConflictUnverifiable => Some(
+            "Workflow transition outcome could not be verified from declared graph inputs"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn annotate_aggregate_transition_truth_conflict(
+    candidate_evaluations: &mut [CandidateTransitionEvaluation],
+    diagnostic: &str,
+) {
+    for candidate in candidate_evaluations.iter_mut().filter(|candidate| {
+        candidate
+            .required_artifacts
+            .iter()
+            .any(|artifact| artifact == "proposal_review_summary")
+    }) {
+        candidate.result = CandidateTransitionResult::EvaluationError;
+        candidate.sanitized_diagnostic = Some(diagnostic.to_string());
+    }
+}
+
+fn json_value_to_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_value_has_entries(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Array(values)) => !values.is_empty(),
+        Some(serde_json::Value::Object(values)) => !values.is_empty(),
+        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn json_value_is_empty_collection(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => values.is_empty(),
+        serde_json::Value::String(value) => value.trim().is_empty(),
+        _ => false,
+    }
+}
+
+struct LoopBudgetExhaustion {
+    counter: String,
+    iterations: u64,
+    max: u64,
+}
+
+fn loop_budget_exhaustion_for_transition_target(
+    transition: &workflow::plan::CompiledTransition,
+    plan: &workflow::plan::RunPlan,
+    all_stages: &[StageExecution],
+) -> Option<LoopBudgetExhaustion> {
+    let target_state = plan.states.get(&transition.to)?;
+    let loop_config = target_state.loop_config.as_ref()?;
+    let iterations = loop_iterations_for_state(all_stages, &transition.to);
+    (iterations >= loop_config.max).then(|| LoopBudgetExhaustion {
+        counter: loop_config.counter.clone(),
+        iterations,
+        max: loop_config.max,
+    })
+}
+
+fn loop_iterations_for_state(all_stages: &[StageExecution], state_id: &str) -> u64 {
+    all_stages
+        .iter()
+        .filter(|stage| stage.stage_id == state_id)
+        .filter_map(|stage| u64::try_from(stage.iteration).ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Split on a connective keyword, respecting parentheses depth.
+fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0i32;
+    let conn_len = connective.len();
+    let bytes = expr.as_bytes();
+    let conn_bytes = connective.as_bytes();
+
+    for i in 0..bytes.len() {
+        if bytes[i] == b'(' {
+            depth += 1;
+        } else if bytes[i] == b')' {
+            depth -= 1;
+        }
+
+        if depth == 0 && i + conn_len <= bytes.len() && &bytes[i..i + conn_len] == conn_bytes {
+            let lhs = expr[..i].trim();
+            let rhs = expr[i + conn_len..].trim();
+            if !lhs.is_empty() && !rhs.is_empty() {
+                return Some((lhs, rhs));
+            }
+        }
+    }
+    None
+}
+
+fn artifact_field_ref(ref_str: &str) -> Option<(&str, &str)> {
+    if ref_str.starts_with("vars.") || ref_str.starts_with("approval.") {
+        return None;
+    }
+    let (artifact_name, field_name) = ref_str.split_once('.')?;
+    if artifact_name.is_empty() || field_name.is_empty() {
+        return None;
+    }
+    Some((artifact_name, field_name))
+}
+
+/// Apply a comparison operator to two JSON values.
+fn apply_comparison(lhs: &serde_json::Value, op: CompOp, rhs: &serde_json::Value) -> bool {
+    // Try numeric comparison first
+    let ln = to_f64(lhs);
+    let rn = to_f64(rhs);
+    if let (Some(l), Some(r)) = (ln, rn) {
+        return match op {
+            CompOp::Eq => (l - r).abs() < f64::EPSILON,
+            CompOp::Ne => (l - r).abs() >= f64::EPSILON,
+            CompOp::Lt => l < r,
+            CompOp::Le => l <= r,
+            CompOp::Gt => l > r,
+            CompOp::Ge => l >= r,
+        };
+    }
+
+    // String/bool equality
+    match op {
+        CompOp::Eq => lhs == rhs,
+        CompOp::Ne => lhs != rhs,
+        _ => false, // non-numeric values can't be ordered
+    }
+}
+
+fn to_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Return the effective task list for a state, accounting for post-approval tasks.
+/// For manual_gate states with a granted approval, use `post_approval_tasks` when non-empty;
+/// otherwise fall back to the regular `tasks` list.
+fn effective_tasks<'a>(
+    state: &'a workflow::plan::CompiledState,
+    is_post_approval: bool,
+) -> &'a [workflow::plan::CompiledTask] {
+    if is_post_approval && !state.post_approval_tasks.is_empty() {
+        &state.post_approval_tasks
+    } else {
+        &state.tasks
+    }
+}
+
+fn state_produces_implementation_review(state: &workflow::plan::CompiledState) -> bool {
+    state.tasks.iter().any(|task| {
+        task.outputs
+            .iter()
+            .any(|output| output == "implementation_review_summary")
+    }) || state.transitions.iter().any(|transition| {
+        transition
+            .condition
+            .contains("implementation_review_summary.")
+    })
+}
+
+fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bool {
+    task.agent.agent_id == "code_writer"
+        && matches!(
+            task.task_name.as_str(),
+            "start_implementation" | "initial_implementation" | "continue_implementation"
+        )
+}
+
+fn is_inline_runtime_input(input_name: &str) -> bool {
+    matches!(input_name, "input.idea" | "idea" | "input.file" | "file")
+}
+
+fn is_implementation_self_assessment_alias(artifact_name: &str) -> bool {
+    matches!(
+        artifact_name,
+        "implementation_self_assessment_v2" | "implementation_self_assessment"
+    )
+}
+
+fn extract_json_field(json: &serde_json::Value, field_name: &str) -> Option<serde_json::Value> {
+    if let Some(value) = json.get(field_name) {
+        return Some(value.clone());
+    }
+
+    let mut current = json;
+    for part in field_name.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current.clone())
+}
+
+/// Check if an InvokeAgent work item's payload belongs to a specific stage execution.
+/// Parses the `stage_execution_id` field from the JSON payload and compares it.
+fn payload_matches_stage_execution(payload_json: &str, expected_se_id: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|v| {
+            v.get("stage_execution_id")?
+                .as_str()
+                .map(|s| s == expected_se_id)
+        })
+        .unwrap_or(false)
+}
+
+/// Build prompt for a specific task. Mirrors Swift `RuntimeSessionBridge.buildTaskDirective`:
+/// - Agent system prompt
+/// - Task name
+/// - Input artifacts with resolved filesystem paths
+/// - Required outputs with resolved target paths (so the agent writes directly to canonical locations)
+/// - Workspace root
+/// - Boundaries (no shell redirection into artifact_root; use explicit absolute paths)
+/// Returns `true` when the task declares `input.idea` (with or without the
+/// `input.` prefix) as one of its inputs. Used to decide whether to inline the
+/// raw idea content into the prompt.
+fn task_uses_idea_input(task: &workflow::plan::CompiledTask) -> bool {
+    task.inputs.iter().any(|i| {
+        let name = i.as_str();
+        matches!(name, "input.idea" | "idea" | "input.file" | "file")
+    })
+}
+
+fn build_declared_outputs(
+    task: &workflow::plan::CompiledTask,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+) -> Vec<crate::contracts::DeclaredOutput> {
+    task.outputs
+        .iter()
+        .map(|output_name| {
+            let schema = task.output_schemas.get(output_name).cloned();
+            let machine_artifact_name = schema
+                .as_ref()
+                .and_then(|schema| schema.normalized_artifact_name.as_deref())
+                .unwrap_or(output_name.as_str());
+            let path_artifact_name = if plan.artifact_paths.contains_key(output_name) {
+                output_name.as_str()
+            } else {
+                machine_artifact_name
+            };
+            let target_path = resolved_artifact_path_for_task(path_artifact_name, plan, run, task);
+            let companion_output_name = schema
+                .as_ref()
+                .filter(|schema| {
+                    crate::contracts::validation_mode(schema) == "structured_with_human_companion"
+                })
+                .and_then(|schema| schema.raw_artifact_name.clone());
+            let companion_path = companion_output_name
+                .as_ref()
+                .and_then(|name| plan.artifact_paths.get(name))
+                .map(|template| {
+                    let resolved = resolve_path_template(
+                        template,
+                        &run.workspace_root,
+                        run.chainworks_meta_root.as_deref(),
+                    );
+                    let mr_abs = run.chainworks_meta_root.as_ref().map(|mr| {
+                        if mr.starts_with('/') {
+                            mr.clone()
+                        } else {
+                            format!("{}/{}", run.workspace_root, mr)
+                        }
+                    });
+                    normalize_path_for_worktree(
+                        &resolved,
+                        &run.workspace_root,
+                        run.worktree_root.as_deref(),
+                        task.agent.worktree_write_enabled,
+                        mr_abs.as_deref(),
+                    )
+                });
+
+            crate::contracts::DeclaredOutput {
+                output_name: output_name.clone(),
+                target_path,
+                schema,
+                reuse_policy: task.output_policies.get(output_name).map(|policy| {
+                    match policy.reuse_policy {
+                        workflow::plan::OutputReusePolicy::MustProduce => {
+                            domain::discovery::OutputReusePolicy::MustProduce
+                        }
+                        workflow::plan::OutputReusePolicy::AllowUnchangedExisting => {
+                            domain::discovery::OutputReusePolicy::AllowUnchangedExisting
+                        }
+                    }
+                }),
+                companion_output_name,
+                companion_path,
+            }
+        })
+        .collect()
+}
+
+fn resolved_artifact_path_for_task(
+    artifact_name: &str,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    task: &workflow::plan::CompiledTask,
+) -> String {
+    let resolved = plan
+        .artifact_paths
+        .get(artifact_name)
+        .map(|template| {
+            resolve_path_template(
+                template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            )
+        })
+        .unwrap_or_else(|| format!("{}/{}", run.artifact_root, artifact_name));
+    let meta_abs = run.chainworks_meta_root.as_ref().map(|mr| {
+        if mr.starts_with('/') {
+            mr.clone()
+        } else {
+            format!("{}/{}", run.workspace_root, mr)
+        }
+    });
+    normalize_path_for_worktree(
+        &resolved,
+        &run.workspace_root,
+        run.worktree_root.as_deref(),
+        task.agent.worktree_write_enabled,
+        meta_abs.as_deref(),
+    )
+}
+
+fn build_task_prompt(
+    task: &workflow::plan::CompiledTask,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    idea: Option<&domain::idea::Idea>,
+    source_ctx: Option<&crate::worktree::SourceContext>,
+    approval_rejection_context: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let agent_prompt = task.agent.prompt.as_deref().unwrap_or("").trim();
+    if !agent_prompt.is_empty() {
+        parts.push(format!("## System Instructions\n{agent_prompt}"));
+        parts.push(String::from("---"));
+    }
+
+    // Inject resolved skill content (matches Swift RuntimeSessionBridge line 501-505).
+    // Position: after system instructions, before task heading.
+    if let Some(skill) = &task.agent.resolved_skill {
+        if !skill.injected_content.trim().is_empty() {
+            parts.push(String::new());
+            parts.push(skill.injected_content.clone());
+        }
+    }
+
+    parts.push(format!("## Task: {}", task.task_name));
+    // P050: make the per-run meta root explicit because read-only worktree
+    // agents otherwise tend to resolve `.chainworks/runs/...` relative to the
+    // implementation worktree.
+    let meta_root_abs = run.chainworks_meta_root.as_ref().map(|mr| {
+        if mr.starts_with('/') {
+            mr.clone()
+        } else {
+            format!("{}/{}", run.workspace_root, mr)
+        }
+    });
+    if let Some(ref meta_root_abs) = meta_root_abs {
+        parts.push(format!("Run meta-root (absolute): {}", meta_root_abs));
+    }
+
+    // Proposal 007: write-enabled agents see worktree root as primary path.
+    if task.agent.worktree_write_enabled {
+        if let Some(ref wt) = run.worktree_root {
+            parts.push(format!("Worktree root: {}", wt));
+            parts.push(format!(
+                "Workspace root (read-only): {}",
+                run.workspace_root
+            ));
+        } else {
+            parts.push(format!("Workspace root: {}", run.workspace_root));
+        }
+    } else if task_reads_implementation_worktree(task) {
+        if let Some(ref wt) = run.worktree_root {
+            parts.push(format!("Implementation worktree root: {}", wt));
+            parts.push(format!(
+                "Workspace root (baseline only): {}",
+                run.workspace_root
+            ));
+        } else {
+            parts.push(format!("Workspace root: {}", run.workspace_root));
+        }
+    } else {
+        parts.push(format!("Workspace root: {}", run.workspace_root));
+    }
+
+    // When the task consumes `input.idea`, inline the idea title + body so the
+    // agent actually sees what the user asked for. Otherwise the placeholder
+    // line below ("path not defined in catalog") leaves the agent guessing.
+    if let Some(idea) = idea {
+        if task_uses_idea_input(task) {
+            parts.push(String::from("\n### Idea"));
+            parts.push(format!("Title: {}", idea.title));
+            parts.push(String::from("\nBody:"));
+            parts.push(idea.body.clone());
+            parts.push(String::from(
+                "\nUse this idea (title and body) as the authoritative source for \
+                 normalization. When the body references specific files, paths, \
+                 proposal names, or artifacts, those references take precedence \
+                 over any other candidates found in the workspace.",
+            ));
+        }
+    }
+
+    // Input artifacts with resolved paths.
+    // Proposal 007: normalize paths to worktree for write-enabled agents.
+    let wt_enabled = task.agent.worktree_write_enabled;
+    let wt_root = run.worktree_root.as_deref();
+    if !task.inputs.is_empty() {
+        parts.push(String::from("\n### Input Artifacts"));
+        for input_name in &task.inputs {
+            if let Some(template) = plan.artifact_paths.get(input_name) {
+                let resolved = resolve_path_template(
+                    template,
+                    &run.workspace_root,
+                    run.chainworks_meta_root.as_deref(),
+                );
+                let normalized = normalize_path_for_worktree(
+                    &resolved,
+                    &run.workspace_root,
+                    wt_root,
+                    wt_enabled,
+                    meta_root_abs.as_deref(),
+                );
+                parts.push(format!("- `{input_name}` → `{normalized}`"));
+            } else {
+                parts.push(format!("- `{input_name}` (path not defined in catalog)"));
+            }
+        }
+    }
+
+    if let Some(context) = approval_rejection_context {
+        parts.push(String::new());
+        parts.push(context.to_string());
+    }
+
+    // Required outputs with resolved target paths — agent must write here
+    if !task.outputs.is_empty() {
+        parts.push(String::from("\n### Required Outputs"));
+        parts.push(String::from(
+            "Write each output to its canonical path below. \
+             Create parent directories if missing.",
+        ));
+        for output_name in &task.outputs {
+            let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
+            parts.push(format!("- `{output_name}` → `{normalized}`"));
+            if let Some(schema) = task.output_schemas.get(output_name) {
+                if crate::contracts::validation_mode(schema) == "structured_with_human_companion" {
+                    if let Some(raw_name) = schema.raw_artifact_name.as_ref() {
+                        let companion_path = plan
+                            .artifact_paths
+                            .get(raw_name)
+                            .map(|template| {
+                                resolve_path_template(
+                                    template,
+                                    &run.workspace_root,
+                                    run.chainworks_meta_root.as_deref(),
+                                )
+                            })
+                            .map(|resolved| {
+                                normalize_path_for_worktree(
+                                    &resolved,
+                                    &run.workspace_root,
+                                    wt_root,
+                                    wt_enabled,
+                                    meta_root_abs.as_deref(),
+                                )
+                            });
+                        if let Some(companion_path) = companion_path {
+                            parts
+                                .push(format!("- `{}` companion → `{}`", raw_name, companion_path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Output contracts — schema each output must conform to.
+    // Matches Swift RuntimeSessionBridge "Structured Output Requirements" block.
+    if !task.output_schemas.is_empty() {
+        parts.push(String::from("\n### Structured Output Requirements"));
+        parts.push(String::from(
+            "CRITICAL: Each required output file must contain exactly one \
+             top-level JSON object and nothing else.\n\
+             - When returning outputs through `CHAINWORKS_OUTPUT`, the value \
+               for each canonical path is treated as that output file content.\n\
+             - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
+             - Do NOT emit markdown, prose, or companion files unless they \
+               are explicitly listed as required outputs.\n\
+             - If you want to explain your work, put the explanation inside \
+               JSON fields required by the contract.\n\
+             - Every listed field below MUST be present in the JSON, with \
+               its correct type.",
+        ));
+        // Sort for deterministic prompt output
+        let mut names: Vec<&String> = task.output_schemas.keys().collect();
+        names.sort();
+        for output_name in names {
+            let schema = &task.output_schemas[output_name];
+            parts.push(format!(
+                "\n#### `{}` → contract `{}` ({})",
+                output_name, schema.contract_id, schema.format
+            ));
+            if crate::contracts::validation_mode(schema) == "structured_with_human_companion" {
+                if let Some(raw_name) = schema.raw_artifact_name.as_deref() {
+                    parts.push(format!(
+                        "Human companion required: `{}` ({})",
+                        raw_name,
+                        crate::contracts::human_format(schema).unwrap_or("markdown")
+                    ));
+                }
+            }
+            parts.push(String::from("Required fields:"));
+            for field in &schema.required_fields {
+                parts.push(format!("- `{}`", field));
+            }
+            if schema.required_fields.iter().any(|field| field == "status") {
+                if let Some(allowed_values) = contract_status_allowed_values(&schema.contract_id) {
+                    parts.push(format!(
+                        "Allowed values for `status`: {}.",
+                        allowed_values
+                            .iter()
+                            .map(|value| format!("`{value}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            if schema.contract_id == "implementation_self_assessment_v2" {
+                parts.push(String::from(
+                    "Required nested shapes for `implementation_self_assessment_v2`:\n\
+                     - `remaining_code_tasks` must be an array of objects: \
+                     `{ \"summary\": string, \"owner\": string, \"blocking\": boolean, \"evidence\": string }`.\n\
+                     - `handoff_tasks` must be an array of objects: \
+                     `{ \"summary\": string, \"owner_class\": one of [\"docs\", \"manual_evidence\", \"release\", \"ops\", \"product\", \"human_operator\", \"unknown\"], \"target_stage\": string, \"blocking_review\": boolean, \"evidence\": string }`.\n\
+                     - `known_risks`, `tests_run`, and `docs_impacted` must be arrays of strings.\n\
+                     - Do not use strings in `remaining_code_tasks`; do not use booleans in `docs_impacted`; do not invent owner classes such as `docs-agent`, `operator`, `security-owner`, or `release-owner`.",
+                ));
+            }
+        }
+    }
+
+    // Boundaries (subset of Swift's buildBoundaryBlock)
+    parts.push(String::from("\n### Boundaries"));
+    if task.agent.worktree_write_enabled {
+        if let Some(ref wt) = run.worktree_root {
+            parts.push(format!(
+                "- This agent has write access to the worktree root: {wt}\n\
+                 - Do NOT write files outside the worktree root.\n\
+                 - Read source from the worktree, not the original workspace.\n\
+                 - Do not commit, push, or modify git state.\n\
+                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Do not rely on implicit working directory."
+            ));
+        } else {
+            parts.push(String::from(
+                "- Use explicit absolute paths from the workspace root above.\n\
+                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Do not rely on implicit working directory.\n\
+                 - Do not perform git operations unless the task explicitly requests them.",
+            ));
+        }
+    } else {
+        if task_reads_implementation_worktree(task) && run.worktree_root.is_some() {
+            parts.push(String::from(
+                "- Read source from the implementation worktree, not the original workspace.\n\
+                 - Treat `Run meta-root (absolute)` as the only valid base for run artifacts; do not use `.chainworks/runs/...` relative to the implementation worktree.\n\
+                 - Use meta-root input and output paths exactly as listed above.\n\
+                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Do not rely on implicit working directory.\n\
+                 - Do not perform git operations unless the task explicitly requests them.",
+            ));
+        } else {
+            parts.push(String::from(
+                "- Use explicit absolute paths from the workspace root above.\n\
+                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Do not rely on implicit working directory.\n\
+                 - Do not perform git operations unless the task explicitly requests them.",
+            ));
+        }
+    }
+
+    // ── Task-specific guidance (matching Swift RuntimeSessionBridge) ─────
+    append_task_specific_guidance(
+        &mut parts,
+        &task.task_name,
+        &task.agent.agent_id,
+        run,
+        source_ctx,
+    );
+
+    parts.join("\n")
+}
+
+fn effective_worktree_strategy_for_task(task: &workflow::plan::CompiledTask) -> Option<String> {
+    task.agent.worktree_strategy.clone().or_else(|| {
+        task_reads_implementation_worktree(task).then_some("shared_implementation_worktree".into())
+    })
+}
+
+/// P017: Resolve the provider for an agent entry from its backend profile.
+fn resolve_agent_provider(
+    agent: &workflow::catalog::AgentEntry,
+    catalog: &workflow::catalog::AgentCatalogFile,
+) -> String {
+    catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&agent.backend_profile))
+        .map(|bp| bp.provider.clone())
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// P017: Resolve the model for an agent entry from its backend profile.
+fn resolve_agent_model(
+    agent: &workflow::catalog::AgentEntry,
+    catalog: &workflow::catalog::AgentCatalogFile,
+) -> Option<String> {
+    catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&agent.backend_profile))
+        .and_then(|bp| bp.model.clone())
+}
+
+/// P017: Resolve the effort for an agent entry from its backend profile.
+fn resolve_agent_effort(
+    agent: &workflow::catalog::AgentEntry,
+    catalog: &workflow::catalog::AgentCatalogFile,
+) -> Option<String> {
+    catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&agent.backend_profile))
+        .and_then(|bp| bp.effort.clone())
+}
+
+fn task_reads_implementation_worktree(task: &workflow::plan::CompiledTask) -> bool {
+    if task.agent.worktree_write_enabled || task.agent.worktree_strategy.is_some() {
+        return false;
+    }
+    matches!(
+        task.agent.agent_id.as_str(),
+        "security_checker" | "proposal_implementation_auditor" | "prepush_code_reviewer"
+    )
+}
+
+/// Build prompt for the owner agent when no explicit tasks are defined.
+fn build_task_prompt_for_owner(
+    state: &workflow::plan::CompiledState,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    idea: Option<&domain::idea::Idea>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let agent_prompt = state.owner.prompt.as_deref().unwrap_or("").trim();
+    if !agent_prompt.is_empty() {
+        parts.push(format!("## System Instructions\n{agent_prompt}"));
+        parts.push(String::from("---"));
+    }
+
+    // Inject resolved skill content for the owner agent.
+    if let Some(skill) = &state.owner.resolved_skill {
+        if !skill.injected_content.trim().is_empty() {
+            parts.push(String::new());
+            parts.push(skill.injected_content.clone());
+        }
+    }
+
+    parts.push(format!("## State: {} — {}", state.id, state.label));
+    // Proposal 007: write-enabled owner agents see worktree root.
+    if state.owner.worktree_write_enabled {
+        if let Some(ref wt) = run.worktree_root {
+            parts.push(format!("Worktree root: {}", wt));
+            parts.push(format!(
+                "Workspace root (read-only): {}",
+                run.workspace_root
+            ));
+        } else {
+            parts.push(format!("Workspace root: {}", run.workspace_root));
+        }
+    } else {
+        parts.push(format!("Workspace root: {}", run.workspace_root));
+    }
+
+    // Owner-only states (typically the very first state) still need the idea
+    // context so the agent knows what the user submitted.
+    if let Some(idea) = idea {
+        parts.push(String::from("\n### Idea"));
+        parts.push(format!("Title: {}", idea.title));
+        parts.push(String::from("\nBody:"));
+        parts.push(idea.body.clone());
+        parts.push(String::from(
+            "\nUse this idea (title and body) as the authoritative source. \
+             When the body references specific files, paths, proposal names, \
+             or artifacts, those references take precedence over any other \
+             candidates found in the workspace.",
+        ));
+    }
+
+    if !plan.artifact_paths.is_empty() {
+        let owner_wt_enabled = state.owner.worktree_write_enabled;
+        let owner_wt_root = run.worktree_root.as_deref();
+        let owner_meta_abs = run.chainworks_meta_root.as_ref().map(|mr| {
+            if mr.starts_with('/') {
+                mr.clone()
+            } else {
+                format!("{}/{}", run.workspace_root, mr)
+            }
+        });
+        parts.push(String::from("\n### Available Artifact Paths"));
+        parts.push(String::from(
+            "Reference these when producing outputs (write to canonical paths):",
+        ));
+        for (name, template) in plan.artifact_paths.iter().take(15) {
+            let resolved = resolve_path_template(
+                template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            );
+            let normalized = normalize_path_for_worktree(
+                &resolved,
+                &run.workspace_root,
+                owner_wt_root,
+                owner_wt_enabled,
+                owner_meta_abs.as_deref(),
+            );
+            parts.push(format!("- `{name}` → `{normalized}`"));
+        }
+        if plan.artifact_paths.len() > 15 {
+            parts.push(format!("...and {} more", plan.artifact_paths.len() - 15));
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Normalize a resolved path for a write-enabled agent: replace workspace_root
+/// prefix with worktree_root so the agent reads/writes in the isolated worktree.
+/// Matches Swift `RuntimeSessionBridge.normalizedAttachmentContent`.
+/// Append task-specific guidance to prompt parts.
+/// Matches Swift `RuntimeSessionBridge` task-specific hints for freeze_proposal,
+/// initial_implementation, and continue_implementation tasks.
+fn append_task_specific_guidance(
+    parts: &mut Vec<String>,
+    task_name: &str,
+    agent_id: &str,
+    run: &domain::run::Run,
+    source_ctx: Option<&crate::worktree::SourceContext>,
+) {
+    if task_name == "freeze_proposal_and_provision_worktree" {
+        parts.push(String::new());
+        parts.push(String::from("### Task-Specific Guidance"));
+        parts.push(String::from(
+            "The dedicated worktree has already been provisioned by the engine. \
+             Do not spend your turn re-provisioning or narrating setup steps.",
+        ));
+        parts.push(String::from(
+            "Freeze `proposal_current` into `approved_proposal` and treat it as \
+             the frozen implementation source of truth.",
+        ));
+        parts.push(String::from(
+            "Use `proposal_review_summary` as the implementation gate verdict \
+             and planning context.",
+        ));
+        parts.push(String::from(
+            "Treat `run_state` as persisted workflow context, not unquestionable authority. \
+             If it contains stale stage identifiers or outdated next-step truth, correct it \
+             to match the current workflow before returning it.",
+        ));
+        parts.push(String::from(
+            "Return `implementation_plan`, `implementation_backlog`, and `run_state` \
+             together with `approved_proposal` in the final response envelope.",
+        ));
+        parts.push(String::from(
+            "Do not stop after read-only analysis. The task is incomplete until all \
+             required implementation-start outputs are present and non-empty.",
+        ));
+    }
+
+    if agent_id == "code_writer"
+        && matches!(
+            task_name,
+            "start_implementation" | "initial_implementation" | "continue_implementation"
+        )
+    {
+        parts.push(String::new());
+        parts.push(String::from("### Task-Specific Guidance"));
+        parts.push(String::from(
+            "Treat the provided worktree/project roots and canonical input artifact \
+             paths as the authoritative starting point for implementation.",
+        ));
+        if let Some(ref wt) = run.worktree_root {
+            parts.push(format!("Implementation worktree: {wt}"));
+        }
+        parts.push(String::from(
+            "Do not re-discover repository structure unless a referenced path is \
+             missing or clearly stale.",
+        ));
+        parts.push(String::from(
+            "If a referenced path has drifted, do one brief remap and continue. \
+             Do not spend the turn on broad search churn.",
+        ));
+        parts.push(String::from(
+            "Prefer moving directly from the approved plan/backlog into concrete \
+             edits and tests instead of repeated search/read passes.",
+        ));
+        parts.push(String::from(
+            "Before any `apply_patch` or edit, re-read the target file from the \
+             current worktree path so your patch context matches the live file, \
+             not the handoff snapshot.",
+        ));
+        parts.push(String::from(
+            "Keep patches narrow. Prefer small hunks with minimal surrounding \
+             context instead of large anchored rewrites.",
+        ));
+        parts.push(String::from(
+            "If `apply_patch` verification fails, do not retry the same patch \
+             blindly. Re-read the file, regenerate the hunk against the live \
+             contents, and continue with the smallest viable edit.",
+        ));
+        parts.push(String::from(
+            "Never emit shell commands that write required outputs into the run \
+             artifact directory. Required outputs must be returned only through \
+             the final JSON object envelope.",
+        ));
+        parts.push(String::from(
+            "Use exactly this final response shape, with no surrounding prose, \
+             markdown, or code fences:\n\
+             {\"CHAINWORKS_OUTPUT\":{\"<canonical path from Required Outputs>\":{...}}}",
+        ));
+        parts.push(String::from(
+            "Use the exact canonical output paths from Required Outputs as \
+             `CHAINWORKS_OUTPUT` keys. Do not use output names as keys unless \
+             a canonical path is unavailable.",
+        ));
+        parts.push(String::from(
+            "Set `seemingly_complete` based only on remaining code-writer-owned \
+             source or test work.",
+        ));
+        parts.push(String::from(
+            "If the code changes and code-owned verification for the approved \
+             proposal are done, set `seemingly_complete` to true even when manual \
+             evidence, release evidence, documentation-only work, CloudKit \
+             signed-in smoke checks, calendar/go-no-go decisions, or other \
+             operator/ops tasks remain.",
+        ));
+        parts.push(String::from(
+            "Do not make cosmetic polishing edits or rerun already-green tests \
+             solely to avoid returning `seemingly_complete: true`.",
+        ));
+        parts.push(String::from(
+            "Put non-code blockers into `remaining_tasks` or `known_risks` as \
+             handoff tasks with owner labels.",
+        ));
+        parts.push(String::from(
+            "When useful, include optional JSON fields `remaining_code_tasks`, \
+             `handoff_tasks`, `blocked_by_non_code_evidence`, and \
+             `verification_green` in the implementation self-assessment.",
+        ));
+
+        // Source context: changed files manifest (Proposal 007 SourceContextBuilder).
+        if let Some(ctx) = source_ctx {
+            if !ctx.changed_files.is_empty() {
+                parts.push(String::new());
+                parts.push(String::from(
+                    "### Changed Files (from prior implementation passes)",
+                ));
+                for f in &ctx.changed_files {
+                    parts.push(format!("- {f}"));
+                }
+                if !ctx.diff_summary.is_empty() {
+                    parts.push(String::new());
+                    parts.push(format!("Diff summary:\n```\n{}\n```", ctx.diff_summary));
+                }
+            }
+        }
+    }
+}
+
+/// Normalize a path for worktree agents.
+/// P050: meta-root paths (control-plane artifacts) are NOT rewritten into the worktree.
+pub fn normalize_path_for_worktree(
+    path: &str,
+    workspace_root: &str,
+    worktree_root: Option<&str>,
+    worktree_write_enabled: bool,
+    meta_root_absolute: Option<&str>,
+) -> String {
+    if !worktree_write_enabled {
+        return path.to_string();
+    }
+    // P050: Meta-root paths are control-plane artifacts, not source code.
+    // Do not rewrite them into the worktree.
+    if let Some(mr) = meta_root_absolute {
+        if path.starts_with(mr) {
+            return path.to_string();
+        }
+    }
+    let Some(wt) = worktree_root else {
+        return path.to_string();
+    };
+    if wt == workspace_root || wt.is_empty() {
+        return path.to_string();
+    }
+    if path.starts_with(workspace_root) {
+        return path.replacen(workspace_root, wt, 1);
+    }
+    path.to_string()
+}
+
+/// Resolve `${VAR:-default}` patterns in artifact path templates.
+///
+/// P050: When `meta_root` is `Some(val)`, `${CHAINWORKS_META_ROOT:-.chainworks}`
+/// resolves to `val` instead of consulting the process env or using the template
+/// default. This provides per-run isolation without changing YAML templates.
+pub fn resolve_path_template(
+    template: &str,
+    workspace_root: &str,
+    meta_root: Option<&str>,
+) -> String {
+    let mut result = template.to_string();
+
+    // Resolve ${VAR:-default} patterns
+    while let Some(start) = result.find("${") {
+        let Some(end) = result[start..].find('}') else {
+            break;
+        };
+        let end = start + end;
+        let inner = &result[start + 2..end]; // VAR:-default
+        let resolved = if let Some(colon_pos) = inner.find(":-") {
+            let var_name = &inner[..colon_pos];
+            let default_val = &inner[colon_pos + 2..];
+            // P050: For CHAINWORKS_META_ROOT, use per-run override if available.
+            // Do NOT consult process env for run artifact resolution.
+            if var_name == "CHAINWORKS_META_ROOT" {
+                if let Some(mr) = meta_root {
+                    mr.to_string()
+                } else {
+                    // Legacy run (NULL meta_root): use template default
+                    default_val.to_string()
+                }
+            } else {
+                std::env::var(var_name).unwrap_or_else(|_| default_val.to_string())
+            }
+        } else {
+            std::env::var(inner).unwrap_or_default()
+        };
+        result = format!("{}{}{}", &result[..start], resolved, &result[end + 1..]);
+    }
+
+    // If the path starts with "." make it relative to workspace_root
+    if result.starts_with("./") || result == "." {
+        result = format!("{}/{}", workspace_root, result.trim_start_matches("./"));
+    } else if !result.starts_with('/') {
+        result = format!("{}/{}", workspace_root, result);
+    }
+
+    result
+}
+
+/// Resolve `${VAR:-default}` patterns for non-path scalar templates.
+///
+/// Used for values such as git branch names where artifact path normalization
+/// would corrupt a valid default like `main` into `<workspace>/main`.
+pub fn resolve_scalar_template(template: &str) -> String {
+    let mut result = template.to_string();
+
+    while let Some(start) = result.find("${") {
+        let Some(end) = result[start..].find('}') else {
+            break;
+        };
+        let end = start + end;
+        let inner = &result[start + 2..end];
+        let resolved = if let Some(colon_pos) = inner.find(":-") {
+            let var_name = &inner[..colon_pos];
+            let default_val = &inner[colon_pos + 2..];
+            std::env::var(var_name).unwrap_or_else(|_| default_val.to_string())
+        } else {
+            std::env::var(inner).unwrap_or_default()
+        };
+        result = format!("{}{}{}", &result[..start], resolved, &result[end + 1..]);
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use domain::ids::{IdeaId, RunId, StageExecutionId};
+    use domain::run::{Run, RunStatus};
+    use domain::stage::StageStatus;
+    use std::collections::HashMap;
+    use workflow::plan::{
+        CompiledLoop, CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
+        OutputSchema, ResolvedAgent, RunPlan,
+    };
+
+    fn test_run(run_id: RunId) -> Run {
+        Run {
+            id: run_id,
+            idea_id: IdeaId::new(),
+            status: RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/workspace".into(),
+            artifact_root: "/artifact-root".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("review".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(format!(".chainworks/runs/{run_id}")),
+        }
+    }
+
+    fn test_plan() -> RunPlan {
+        let mut artifact_paths = HashMap::new();
+        artifact_paths.insert(
+            "proposal_review_po".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/product-owner.json".into(),
+        );
+        RunPlan {
+            initial_state: "review".into(),
+            states: HashMap::new(),
+            variables: HashMap::new(),
+            artifact_paths,
+            workflow_family: None,
+            risk_class: None,
+            stack: None,
+            legacy_broad_discovery_policy: workflow::plan::LegacyBroadDiscoveryPolicy::Disabled,
+            workflow_snapshot_hash: "workflow".into(),
+            catalog_snapshot_hash: "catalog".into(),
+            workflow_snapshot_json: "{}".into(),
+            catalog_snapshot_json: "{}".into(),
+        }
+    }
+
+    fn reviewer_task() -> CompiledTask {
+        let mut output_schemas = HashMap::new();
+        output_schemas.insert(
+            "proposal_review_po".into(),
+            OutputSchema {
+                contract_id: "proposal_review_v1".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: Some("proposal_review_normalized".into()),
+                raw_artifact_name: Some("proposal_review_raw".into()),
+                required_fields: vec!["agent_id".into(), "verdict".into()],
+            },
+        );
+
+        CompiledTask {
+            agent: ResolvedAgent {
+                agent_id: "proposal_reviewer_product_owner".into(),
+                backend_profile_id: None,
+                provider: "claude".into(),
+                model: None,
+                effort: None,
+                max_turns: None,
+                temperature: None,
+                prompt: None,
+                permission_profile: None,
+                skill_ref: None,
+                skill_role: None,
+                skill_snapshot_hash: None,
+                requested_mcp_server_ids: Vec::new(),
+                resolved_skill: None,
+                output_contract: Some("proposal_review_v1".into()),
+                worktree_write_enabled: false,
+                worktree_strategy: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                xcode_broker_required: false,
+                xcode_shim_injection_signal: false,
+                requires_xcode_host_execution: false,
+                xcode_prompt_lint_warnings: Vec::new(),
+            },
+            task_name: "review_proposal_as_product_owner".into(),
+            inputs: Vec::new(),
+            outputs: vec!["proposal_review_po".into()],
+            output_policies: HashMap::new(),
+            output_schemas,
+            parallel: true,
+            phase: 0,
+        }
+    }
+
+    fn compiled_state(
+        id: &str,
+        transitions: Vec<CompiledTransition>,
+        is_end: bool,
+    ) -> CompiledState {
+        let task = reviewer_task();
+        CompiledState {
+            id: id.into(),
+            label: id.into(),
+            state_type: None,
+            owner: task.agent.clone(),
+            is_manual_gate: false,
+            is_end,
+            tasks: vec![task],
+            post_approval_tasks: Vec::new(),
+            transitions,
+            loop_config: None,
+            degraded_output_policy: DegradedOutputPolicy::default(),
+        }
+    }
+
+    fn implementation_security_task() -> CompiledTask {
+        let mut task = reviewer_task();
+        task.agent.agent_id = "security_checker".into();
+        task.agent.permission_profile = Some("RO_VERIFY".into());
+        task.agent.output_contract = Some("security_report_v1".into());
+        task.task_name = "check_implementation_security".into();
+        task.inputs = vec!["approved_proposal".into(), "changed_files_manifest".into()];
+        task.outputs = vec!["security_report".into()];
+        task.output_schemas.clear();
+        task
+    }
+
+    #[test]
+    fn implementation_review_readonly_tasks_use_implementation_worktree_strategy() {
+        let task = implementation_security_task();
+
+        assert_eq!(
+            effective_worktree_strategy_for_task(&task).as_deref(),
+            Some("shared_implementation_worktree"),
+            "read-only implementation review agents must inspect the implementation worktree"
+        );
+    }
+
+    #[test]
+    fn implementation_summary_orchestrator_does_not_switch_to_worktree() {
+        let mut task = reviewer_task();
+        task.agent.agent_id = "lead_orchestrator".into();
+        task.task_name = "aggregate_implementation_reviews".into();
+        task.inputs = vec![
+            "security_report".into(),
+            "docs_report".into(),
+            "audit_report".into(),
+            "prepush_review_report".into(),
+            "implementation_review_summary".into(),
+        ];
+
+        assert_eq!(
+            effective_worktree_strategy_for_task(&task),
+            None,
+            "orchestrator summary tasks read artifacts but do not inspect implementation source"
+        );
+    }
+
+    #[test]
+    fn implementation_review_prompt_points_source_reads_at_worktree() {
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.worktree_root = Some("/workspace/.chainworks/worktrees/implementation".into());
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md".into(),
+        );
+        plan.artifact_paths.insert(
+            "changed_files_manifest".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/changed-files.json".into(),
+        );
+        let task = implementation_security_task();
+
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+
+        assert!(prompt.contains(
+            "Implementation worktree root: /workspace/.chainworks/worktrees/implementation"
+        ));
+        assert!(prompt.contains(&format!(
+            "Run meta-root (absolute): /workspace/.chainworks/runs/{run_id}"
+        )));
+        assert!(prompt.contains("Read source from the implementation worktree"));
+        assert!(prompt
+            .contains("do not use `.chainworks/runs/...` relative to the implementation worktree"));
+        assert!(prompt.contains(&format!(
+            "/workspace/.chainworks/runs/{run_id}/implementation/changed-files.json"
+        )));
+    }
+
+    #[test]
+    fn declared_output_target_path_uses_task_alias_not_normalized_identity() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let plan = test_plan();
+        let task = reviewer_task();
+
+        let declared_outputs = build_declared_outputs(&task, &plan, &run);
+
+        assert_eq!(declared_outputs.len(), 1);
+        let declared = &declared_outputs[0];
+        assert_eq!(declared.output_name, "proposal_review_po");
+        assert_eq!(
+            declared
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.normalized_artifact_name.as_deref()),
+            Some("proposal_review_normalized")
+        );
+        assert_eq!(
+            declared.target_path,
+            format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json")
+        );
+    }
+
+    #[test]
+    fn implementation_review_prompts_include_allowed_status_enums_for_each_role() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let mut plan = test_plan();
+        let fixtures = [
+            (
+                "proposal_implementation_auditor",
+                "audit_report",
+                "audit_report_v1",
+                vec!["implemented", "needs_code_fixes", "invalid", "unknown"],
+            ),
+            (
+                "security_checker",
+                "security_report",
+                "security_report_v1",
+                vec!["pass", "block", "invalid", "unknown"],
+            ),
+            (
+                "docs_guardian",
+                "docs_report",
+                "docs_report_v1",
+                vec!["pass", "not_needed", "block", "invalid", "unknown"],
+            ),
+            (
+                "prepush_code_reviewer",
+                "prepush_review_report",
+                "prepush_review_v1",
+                vec!["pass", "block", "invalid", "unknown"],
+            ),
+            (
+                "lead_orchestrator",
+                "implementation_review_summary",
+                "implementation_review_summary_v1",
+                vec![
+                    "code_complete",
+                    "needs_code_fixes",
+                    "release_evidence_blocked",
+                    "invalid",
+                ],
+            ),
+            (
+                "code_writer",
+                "implementation_self_assessment",
+                "implementation_self_assessment_v2",
+                vec![
+                    "complete",
+                    "needs_code_fixes",
+                    "blocked",
+                    "handoff_required",
+                    "unknown",
+                    "invalid",
+                ],
+            ),
+        ];
+
+        for (agent_id, output_name, contract_id, allowed_values) in fixtures {
+            plan.artifact_paths.insert(
+                output_name.to_string(),
+                format!("${{CHAINWORKS_META_ROOT:-.chainworks}}/{output_name}.json"),
+            );
+            let mut task = reviewer_task();
+            task.agent.agent_id = agent_id.to_string();
+            task.agent.output_contract = Some(contract_id.to_string());
+            task.outputs = vec![output_name.to_string()];
+            task.output_schemas.clear();
+            task.output_schemas.insert(
+                output_name.to_string(),
+                OutputSchema {
+                    contract_id: contract_id.to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: Some(output_name.to_string()),
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string()],
+                },
+            );
+
+            let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+            assert!(
+                prompt.contains("Allowed values for `status`:"),
+                "{agent_id} prompt should state allowed status values"
+            );
+            for allowed in allowed_values {
+                assert!(
+                    prompt.contains(&format!("`{allowed}`")),
+                    "{agent_id} prompt should include canonical status `{allowed}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_template_resolution_does_not_path_normalize_branch_names() {
+        assert_eq!(
+            resolve_scalar_template("${CHAINWORKS_BASE_BRANCH:-main}"),
+            "main"
+        );
+        assert_eq!(
+            resolve_scalar_template("release/candidate"),
+            "release/candidate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_057_controlled_artifact_does_not_fall_back_to_raw_file_truth() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let idea_id = IdeaId::new();
+        db::repos::ideas::insert(
+            &pool,
+            &domain::idea::Idea {
+                id: idea_id,
+                title: "Idea".into(),
+                body: "Body".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: domain::idea::IdeaStatus::Active,
+                created_at: Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut run = test_run(run_id);
+        run.idea_id = idea_id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+        let raw_path = tmp.path().join("review/prepush.json");
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, r#"{"status":"pass"}"#).unwrap();
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "prepush_review_report".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json".into(),
+        );
+
+        let missing = orchestrator
+            .resolve_value("prepush_review_report.status", &run, &plan)
+            .await;
+        assert_eq!(
+            missing,
+            serde_json::Value::Null,
+            "P057-controlled aliases must fail closed when SQLite has no active contract"
+        );
+
+        db::repos::artifact_contracts::upsert_generation_and_rebuild(
+            &pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: "prepush_review_v1".into(),
+                canonical_path: "review/prepush.json".into(),
+                raw_path: "review/prepush.json".into(),
+                raw_status: "PASS_WITH_NOTES".into(),
+                generation_id: "gen-1".into(),
+                source_agent_execution_id: None,
+                source_stage_execution_id: None,
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: domain::agent::AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let canonical = orchestrator
+            .resolve_value("prepush_review_report.status", &run, &plan)
+            .await;
+        assert_eq!(canonical, serde_json::json!("pass"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_057_controlled_exists_uses_active_contract_truth_not_raw_files() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let idea_id = IdeaId::new();
+        db::repos::ideas::insert(
+            &pool,
+            &domain::idea::Idea {
+                id: idea_id,
+                title: "Idea".into(),
+                body: "Body".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: domain::idea::IdeaStatus::Active,
+                created_at: Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut run = test_run(run_id);
+        run.idea_id = idea_id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let raw_path = tmp.path().join("review/prepush.json");
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, r#"{"status":"pass"}"#).unwrap();
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "prepush_review_report".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json".into(),
+        );
+
+        let missing = orchestrator
+            .evaluate_condition_classified(
+                "exists('prepush_review_report')",
+                &run,
+                &plan,
+                "state_8_implementation",
+            )
+            .await;
+        assert_eq!(
+            missing.result,
+            CandidateTransitionResult::MissingInput,
+            "P057-controlled exists() must fail closed when only raw file truth exists"
+        );
+
+        db::repos::artifact_contracts::upsert_generation_and_rebuild(
+            &pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: "prepush_review_v1".into(),
+                canonical_path: "review/prepush.json".into(),
+                raw_path: "review/prepush.json".into(),
+                raw_status: "PASS_WITH_NOTES".into(),
+                generation_id: "gen-exists".into(),
+                source_agent_execution_id: None,
+                source_stage_execution_id: None,
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: domain::agent::AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let resolved = orchestrator
+            .evaluate_condition_classified(
+                "exists('prepush_review_report')",
+                &run,
+                &plan,
+                "state_8_implementation",
+            )
+            .await;
+        assert_eq!(
+            resolved.result,
+            CandidateTransitionResult::Matched,
+            "P057-controlled exists() should read active SQLite contract truth"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proposal_057_controlled_artifact_fails_closed_without_async_lookup() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = test_run(RunId::new());
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+
+        let raw_path = tmp.path().join("review/prepush.json");
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, r#"{"status":"pass"}"#).unwrap();
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "prepush_review_report".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json".into(),
+        );
+
+        assert_eq!(
+            orchestrator
+                .resolve_value("prepush_review_report.status", &run, &plan)
+                .await,
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_exists_unknown_artifact_fails_closed() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool),
+        );
+        let run = test_run(RunId::new());
+        let plan = test_plan();
+
+        let evaluation = orchestrator
+            .evaluate_condition_classified("exists('unknown_artifact')", &run, &plan, "review")
+            .await;
+        assert_eq!(
+            evaluation.result,
+            CandidateTransitionResult::InvalidExpression,
+            "P017 requires unknown catalog artifact references to fail closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_budget_allows_final_cross_state_review_after_refinement() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "Loop budget".into(),
+            body: "final refinement should still be reviewed".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.current_state = Some("refine".into());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let mut plan = test_plan();
+        let mut refine = compiled_state(
+            "refine",
+            vec![CompiledTransition {
+                to: "review".into(),
+                condition: "true".into(),
+            }],
+            false,
+        );
+        refine.loop_config = Some(CompiledLoop {
+            counter: "proposal_revision_count".into(),
+            max: 2,
+        });
+        plan.states.insert("refine".into(), refine);
+        plan.states
+            .insert("review".into(), compiled_state("review", Vec::new(), false));
+
+        let first = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(10),
+            completed_at: Some(now - chrono::Duration::seconds(9)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let latest = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 2,
+            attempt_number: 3,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &first).await.unwrap();
+        db::repos::stages::insert(&pool, &latest).await.unwrap();
+
+        orchestrator
+            .evaluate_and_transition(run_id, "refine", &plan, &[first, latest])
+            .await
+            .unwrap();
+
+        let stored = db::repos::runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.current_state.as_deref(), Some("review"));
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "final allowed refinement must transition to review, not block before review"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_budget_blocks_entering_exhausted_loop_state() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "Loop budget".into(),
+            body: "do not enter exhausted loop".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.current_state = Some("review".into());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "true".into(),
+                }],
+                false,
+            ),
+        );
+        let mut refine = compiled_state("refine", Vec::new(), false);
+        refine.loop_config = Some(CompiledLoop {
+            counter: "proposal_revision_count".into(),
+            max: 2,
+        });
+        plan.states.insert("refine".into(), refine);
+
+        let review = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let skipped_retry = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Skipped,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(20),
+            completed_at: Some(now - chrono::Duration::seconds(19)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some("retry superseded prior attempt".into()),
+        };
+        let first = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 2,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(18),
+            completed_at: Some(now - chrono::Duration::seconds(17)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let second = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 2,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::seconds(10),
+            completed_at: Some(now - chrono::Duration::seconds(9)),
+            owner_agent: Some("proposal_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        for stage in [&review, &skipped_retry, &first, &second] {
+            db::repos::stages::insert(&pool, stage).await.unwrap();
+        }
+
+        orchestrator
+            .evaluate_and_transition(
+                run_id,
+                "review",
+                &plan,
+                &[review, skipped_retry, first, second],
+            )
+            .await
+            .unwrap();
+
+        let stored = db::repos::runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, RunStatus::Blocked);
+        assert_eq!(stored.current_state.as_deref(), Some("review"));
+        let conflict = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("exhausted loop entry should record a blocking conflict");
+        assert_eq!(conflict.candidate_transitions.len(), 1);
+        assert_eq!(
+            conflict.candidate_transitions[0].result,
+            CandidateTransitionResult::NotMatched
+        );
+        assert!(conflict.candidate_transitions[0]
+            .sanitized_diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains("Loop budget exhausted")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_persists_no_match_workflow_conflict() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "workflow conflict runtime wiring".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        let meta_root = tmp.path().join(".chainworks/runs").join(run_id.to_string());
+        run.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+        let advisory_path = meta_root.join("reviews/proposal/product-owner.json");
+        std::fs::create_dir_all(advisory_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &advisory_path,
+            r#"{"next_stage":"state_3_proposal_drafted","next_action":"revise_proposal"}"#,
+        )
+        .unwrap();
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "false".into(),
+                }],
+                false,
+            ),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage.clone()])
+            .await
+            .unwrap();
+
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("blocking workflow conflict should be persisted");
+        assert_eq!(
+            blocked.reason,
+            WorkflowConflictReason::NoDeclarativeTransitionMatched
+        );
+        assert_eq!(blocked.current_state_id, "review");
+        assert_eq!(blocked.stage_execution_id, Some(stage.id.to_string()));
+        assert_eq!(blocked.candidate_transitions.len(), 1);
+        assert_eq!(
+            blocked.candidate_transitions[0].result,
+            CandidateTransitionResult::NotMatched
+        );
+        assert!(
+            blocked
+                .advisory_evidence_refs
+                .iter()
+                .any(|evidence_ref| evidence_ref
+                    .starts_with("proposal_review_po:$.next_stage:absent_from_graph:sha256:")),
+            "blocking conflicts should retain invalid advisory next_stage provenance"
+        );
+        assert!(
+            blocked
+                .advisory_evidence_refs
+                .iter()
+                .any(|evidence_ref| evidence_ref
+                    .starts_with("proposal_review_po:$.next_action:sha256:")),
+            "blocking conflicts should retain advisory next_action provenance"
+        );
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+        let history = db::repos::workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "repeated blocking evaluations should upsert the same fingerprint"
+        );
+        assert_eq!(history[0].conflict_id, blocked.conflict_id);
+        assert_eq!(
+            history[0].advisory_evidence_refs,
+            blocked.advisory_evidence_refs
+        );
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("blocking conflict should anchor transition cursor");
+        assert_eq!(cursor.current_state_id, "review");
+        assert_eq!(cursor.cursor_status, "awaiting_conflict_resolution");
+        assert_eq!(cursor.resume_policy, "await_conflict_resolution");
+        assert_eq!(
+            cursor.conflict_id.as_deref(),
+            Some(blocked.conflict_id.as_str())
+        );
+        assert_eq!(
+            cursor.conflict_fingerprint.as_deref(),
+            Some(blocked.conflict_fingerprint.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_records_non_blocking_advisory_rejection() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "workflow advisory rejection runtime wiring".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let raw_run_state_path = tmp.path().join("state/run-state.json");
+        std::fs::create_dir_all(raw_run_state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &raw_run_state_path,
+            r#"{"next_stage":"state_3_proposal_drafted","next_action":"revise_proposal"}"#,
+        )
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        db::repos::artifact_contracts::record_run_state_advisory_tx(
+            &mut tx,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: "run_state_projection_v1".into(),
+                canonical_path: "run_state.json".into(),
+                raw_path: raw_run_state_path.to_string_lossy().into_owned(),
+                raw_status: "superseded_advisory".into(),
+                generation_id: "advisory-run-state".into(),
+                source_agent_execution_id: Some("agent-exec-review".into()),
+                source_stage_execution_id: Some(stage.id.to_string()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: domain::agent::AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "true".into(),
+                }],
+                false,
+            ),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage.clone()])
+            .await
+            .unwrap();
+
+        let rejections =
+            db::repos::workflow_conflicts::list_advisory_rejections_for_run(&pool, run_id)
+                .await
+                .unwrap();
+        assert_eq!(rejections.len(), 1);
+        let rejection = &rejections[0];
+        assert_eq!(rejection.stage_execution_id, Some(stage.id.to_string()));
+        assert_eq!(rejection.selected_next_state_id, "refine");
+        assert_eq!(
+            rejection.advisory_next_stage_hint.as_deref(),
+            Some("state_3_proposal_drafted")
+        );
+        assert_eq!(
+            rejection.advisory_next_action.as_deref(),
+            Some("revise_proposal")
+        );
+        assert_eq!(rejection.graph_membership_result, "absent_from_graph");
+        assert!(rejection
+            .advisory_hint_provenance
+            .iter()
+            .any(|hint| hint.advisory_path == "$.next_stage"
+                && hint.superseded_by_projection
+                && hint.source_agent_execution_id.as_deref() == Some("agent-exec-review")));
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected advisory hint must not block graph-authoritative advancement"
+        );
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_state
+                .as_deref(),
+            Some("refine")
+        );
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("legal graph transition should settle through cursor");
+        assert_eq!(cursor.current_state_id, "review");
+        assert_eq!(cursor.cursor_status, "graph_transition_selected");
+        assert_eq!(cursor.resume_policy, "continue_from_selected_transition");
+        assert_eq!(cursor.selected_next_state_id.as_deref(), Some("refine"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_blocks_conflicted_proposal_review_summary() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "aggregate transition truth conflict".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let summary_path = tmp.path().join("reviews/proposal/summary.json");
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &summary_path,
+            r#"{"pass":true,"blocker_count":1,"blocking_issues":[{"id":"B-1"}],"required_changes":["fix authority"],"decision":"pass"}"#,
+        )
+        .unwrap();
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_review_summary".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json".into(),
+        );
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![
+                    CompiledTransition {
+                        to: "approved".into(),
+                        condition: "proposal_review_summary.pass == true".into(),
+                    },
+                    CompiledTransition {
+                        to: "refine".into(),
+                        condition: "proposal_review_summary.pass == false".into(),
+                    },
+                ],
+                false,
+            ),
+        );
+        plan.states.insert(
+            "approved".into(),
+            compiled_state("approved", Vec::new(), true),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("conflicted aggregate truth should block graph advancement");
+        assert_eq!(
+            blocked.reason,
+            WorkflowConflictReason::AggregateTransitionTruthConflicted
+        );
+        assert_eq!(
+            blocked.status,
+            WorkflowConflictStatus::OperatorConfirmationRequired
+        );
+        assert!(blocked.candidate_transitions.iter().any(|candidate| {
+            candidate.result == CandidateTransitionResult::EvaluationError
+                && candidate
+                    .sanitized_diagnostic
+                    .as_deref()
+                    .is_some_and(|diagnostic| diagnostic.contains("pass=true"))
+        }));
+        let stored_run = db::repos::runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_run.status, RunStatus::Blocked);
+        assert_eq!(stored_run.current_state.as_deref(), Some("review"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_persists_terminal_unverifiable_conflict_history() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "terminal unverifiable workflow conflict".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "exists('unknown_artifact')".into(),
+                }],
+                false,
+            ),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal_unverifiable conflicts remain history, not current unresolved conflicts"
+        );
+        let history = db::repos::workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].reason,
+            WorkflowConflictReason::WorkflowConflictUnverifiable
+        );
+        assert_eq!(
+            history[0].status,
+            WorkflowConflictStatus::TerminalUnverifiable
+        );
+        assert!(history[0].terminal_failure_reason.is_some());
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("terminal unverifiable conflict should settle cursor");
+        assert_eq!(cursor.current_state_id, "review");
+        assert_eq!(cursor.cursor_status, "terminal_unverifiable");
+        assert_eq!(cursor.resume_policy, "terminal_failure");
+        assert_eq!(
+            cursor.conflict_id.as_deref(),
+            Some(history[0].conflict_id.as_str())
+        );
+        assert!(cursor.terminal_failure_reason.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_resolves_current_conflict_on_later_legal_transition() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P017".into(),
+            body: "workflow conflict resolution runtime wiring".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("proposal_reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let mut blocking_plan = test_plan();
+        blocking_plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "false".into(),
+                }],
+                false,
+            ),
+        );
+        blocking_plan
+            .states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &blocking_plan, &[stage.clone()])
+            .await
+            .unwrap();
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("blocking conflict should exist before legal transition");
+
+        let mut resolving_plan = blocking_plan;
+        resolving_plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![CompiledTransition {
+                    to: "refine".into(),
+                    condition: "true".into(),
+                }],
+                false,
+            ),
+        );
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &resolving_plan, &[stage])
+            .await
+            .unwrap();
+
+        assert!(
+            db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "legal graph advancement should resolve the current blocking conflict"
+        );
+        let history = db::repos::workflow_conflicts::list_conflict_history_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].conflict_id, blocked.conflict_id);
+        assert_eq!(history[0].status, WorkflowConflictStatus::Resolved);
+        assert_eq!(
+            history[0]
+                .resolution_record_json
+                .as_ref()
+                .and_then(|value| value.get("selected_next_state_id"))
+                .and_then(|value| value.as_str()),
+            Some("refine")
+        );
+        assert_eq!(
+            db::repos::runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_state
+                .as_deref(),
+            Some("refine")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_candidate_transition_evaluation_classifies_unknown_and_missing_inputs() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = test_run(RunId::new());
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_review_summary".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json".into(),
+        );
+
+        let unknown_exists = orchestrator
+            .evaluate_transition_candidate(
+                0,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "exists('unknown_artifact')".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            unknown_exists.result,
+            CandidateTransitionResult::InvalidExpression
+        );
+        assert_eq!(
+            unknown_exists.required_artifacts,
+            vec!["unknown_artifact".to_string()]
+        );
+
+        let unknown_field = orchestrator
+            .evaluate_transition_candidate(
+                1,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "unknown_artifact.pass == true".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            unknown_field.result,
+            CandidateTransitionResult::InvalidExpression
+        );
+
+        let declared_absent = orchestrator
+            .evaluate_transition_candidate(
+                2,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "exists('proposal_review_summary')".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            declared_absent.result,
+            CandidateTransitionResult::MissingInput
+        );
+        assert_eq!(
+            declared_absent.missing_artifacts,
+            vec!["proposal_review_summary".to_string()]
+        );
+
+        let summary_path = tmp.path().join("reviews/proposal/summary.json");
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        std::fs::write(&summary_path, r#"{"summary":"needs refinement"}"#).unwrap();
+        let missing_field = orchestrator
+            .evaluate_transition_candidate(
+                3,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "proposal_review_summary.pass == false".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(
+            missing_field.result,
+            CandidateTransitionResult::MissingInput
+        );
+        assert_eq!(
+            missing_field.missing_fields,
+            vec!["proposal_review_summary.pass".to_string()]
+        );
+
+        std::fs::write(&summary_path, r#"{"pass":false}"#).unwrap();
+        let matched = orchestrator
+            .evaluate_transition_candidate(
+                4,
+                "review",
+                &CompiledTransition {
+                    to: "refine".into(),
+                    condition: "proposal_review_summary.pass == false".into(),
+                },
+                &run,
+                &plan,
+            )
+            .await;
+        assert_eq!(matched.result, CandidateTransitionResult::Matched);
+        assert_eq!(
+            matched.source_artifact_ids,
+            vec!["proposal_review_summary".to_string()]
+        );
+    }
+}

@@ -5,33 +5,55 @@ import Observation
 final class ProviderSettingsStore {
     private let fileURL: URL
     @MainActor private(set) var settings: ProviderSettings
+    @MainActor private(set) var diagnosticsMessage: String?
 
     @MainActor
     init(fileURL: URL? = nil, initialSettings: ProviderSettings? = nil) {
         let resolvedURL = fileURL ?? Self.defaultFileURL()
         self.fileURL = resolvedURL
+        self.diagnosticsMessage = nil
 
         if let initialSettings {
             self.settings = Self.sanitized(initialSettings)
-            try? persist()
+            persistOrRecordFailure(
+                summary: "Failed to persist provider settings during initialization"
+            )
             return
         }
 
+        let fileExists = FileManager.default.fileExists(atPath: resolvedURL.path)
         if let loaded = try? Self.load(from: resolvedURL) {
-            self.settings = Self.sanitized(loaded)
+            let migrated = Self.migratedIfNeeded(loaded)
+            self.settings = Self.sanitized(migrated)
             if self.settings != loaded {
-                try? persist()
+                persistOrRecordFailure(
+                    summary: "Failed to persist normalized provider settings"
+                )
+            } else {
+                clearDiagnostics()
             }
         } else {
             self.settings = Self.sanitized(Self.seededDefault())
-            try? persist()
+            if fileExists {
+                recordFailure(
+                    summary: "Failed to load persisted provider settings; using defaults instead",
+                    error: ProviderSettingsStoreError.loadFailed(resolvedURL.path)
+                )
+                do {
+                    try persist()
+                } catch {
+                    recordFailure(summary: "Failed to persist fallback provider settings", error: error)
+                }
+                return
+            }
+            persistOrRecordFailure(summary: "Failed to create default provider settings store")
         }
     }
 
     @MainActor
     func replace(with settings: ProviderSettings) {
         self.settings = Self.sanitized(settings)
-        try? persist()
+        persistOrRecordFailure(summary: "Failed to save provider settings")
     }
 
     @MainActor
@@ -48,7 +70,7 @@ final class ProviderSettingsStore {
         if settings.preferredProviderIDsByFamily[provider.family.rawValue] == nil {
             settings.preferredProviderIDsByFamily[provider.family.rawValue] = provider.id
         }
-        try? persist()
+        persistOrRecordFailure(summary: "Failed to save provider settings")
     }
 
     @MainActor
@@ -57,15 +79,15 @@ final class ProviderSettingsStore {
         settings.configuredProviders.removeAll { $0.id == id }
         if settings.preferredProviderIDsByFamily[provider.family.rawValue] == id {
             settings.preferredProviderIDsByFamily[provider.family.rawValue] =
-                settings.configuredProviders.first(where: { $0.family == provider.family })?.id
+                settings.configuredProviders.first(where: { $0.family == provider.family && $0.isEnabled })?.id
         }
-        try? persist()
+        persistOrRecordFailure(summary: "Failed to save provider settings")
     }
 
     @MainActor
     func setPreferredProvider(id: UUID, for family: ProviderFamily) {
         settings.preferredProviderIDsByFamily[family.rawValue] = id
-        try? persist()
+        persistOrRecordFailure(summary: "Failed to save provider settings")
     }
 
     private func persist() throws {
@@ -78,16 +100,155 @@ final class ProviderSettingsStore {
     }
 
     private static func load(from fileURL: URL) throws -> ProviderSettings {
-        try JSONDecoder().decode(ProviderSettings.self, from: Data(contentsOf: fileURL))
+        let raw = try Data(contentsOf: fileURL)
+        let migrated: Data
+        do {
+            migrated = try migrateRawProviderSettings(raw)
+        } catch {
+            ForgeLogger.app.error("Provider settings raw migration failed for \(fileURL.path): \(error.localizedDescription)")
+            migrated = raw
+        }
+        return try JSONDecoder().decode(ProviderSettings.self, from: migrated)
+    }
+
+    @MainActor
+    private func persistOrRecordFailure(summary: String) {
+        do {
+            try persist()
+            clearDiagnostics()
+        } catch {
+            recordFailure(summary: summary, error: error)
+        }
+    }
+
+    @MainActor
+    private func recordFailure(summary: String, error: Error) {
+        let message = "\(summary): \(error.localizedDescription)"
+        diagnosticsMessage = message
+        ForgeLogger.app.error(message)
+    }
+
+    @MainActor
+    private func clearDiagnostics() {
+        diagnosticsMessage = nil
+    }
+
+    // MARK: - Raw Goose-era Migration (P033)
+
+    /// Pre-decode migration for local `provider-settings.json`.
+    /// Rewrites Goose-era `ProviderFamily` and `ProviderTransport` raw values before
+    /// `JSONDecoder` touches the payload (deleted enum cases cause decode failures).
+    static func migrateRawProviderSettings(_ data: Data) throws -> Data {
+        guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+        guard (json["migration_version"] as? Int ?? 0) < 1 else { return data }
+        migrateProviderSettingsFields(&json)
+        json["migration_version"] = 1
+        return try JSONSerialization.data(withJSONObject: json)
+    }
+
+    /// Pre-decode migration for imported `chainworks-settings.json` (ExportableSettingsPackage shape).
+    /// Rewrites the nested `providerSettings` dict and trims deleted-UUID placeholders.
+    static func migrateRawTransferPackage(_ data: Data) throws -> Data {
+        guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+        guard var nested = json["providerSettings"] as? [String: Any] else { return data }
+        guard (nested["migration_version"] as? Int ?? 0) < 1 else { return data }
+        let deletedIDs = gooseCodexUUIDs(from: nested)
+        migrateProviderSettingsFields(&nested)
+        nested["migration_version"] = 1
+        json["providerSettings"] = nested
+        if var placeholders = json["secretPlaceholders"] as? [String] {
+            placeholders.removeAll { key in deletedIDs.contains { key.contains($0) } }
+            json["secretPlaceholders"] = placeholders
+        }
+        return try JSONSerialization.data(withJSONObject: json)
+    }
+
+    /// Shared raw field rewriter — operates on a `ProviderSettings`-shaped dict.
+    private static func migrateProviderSettingsFields(_ json: inout [String: Any]) {
+        var providers = json["configuredProviders"] as? [[String: Any]] ?? []
+
+        providers = providers.compactMap { provider -> [String: Any]? in
+            var p = provider
+            guard let family = p["family"] as? String else { return p }
+
+            switch family {
+            case "codex":
+                return nil  // Goose-backed Codex deleted — no ACP continuation
+            case "claude":
+                p["family"] = "claudeACP"
+                p["transport"] = "cli"
+                p["endpoint"] = NSNull()
+                if (p["displayName"] as? String) == "Claude Goose" { p["displayName"] = "Claude ACP" }
+                p["capabilities"] = encodedCapabilitiesJSON(.default(for: .claudeACP))
+                p["adapterVersion"] = "acp-v1"
+                p["isEnabled"] = true
+            case "gemini":
+                p["family"] = "geminiACP"
+                p["transport"] = "cli"
+                p["endpoint"] = NSNull()
+                if (p["displayName"] as? String) == "Gemini Goose" { p["displayName"] = "Gemini ACP" }
+                p["capabilities"] = encodedCapabilitiesJSON(.default(for: .geminiACP))
+                p["adapterVersion"] = "acp-v1"
+                p["isEnabled"] = true
+            default:
+                if (p["transport"] as? String) == "goose_server" { p["transport"] = "cli" }
+            }
+            return p
+        }
+
+        json["configuredProviders"] = providers
+        if json["notificationOnProviderFailure"] == nil {
+            json["notificationOnProviderFailure"] = true
+        }
+        if json["runStartRequiresCleanPreflight"] == nil {
+            json["runStartRequiresCleanPreflight"] = true
+        }
+
+        if var preferred = json["preferredProviderIDsByFamily"] as? [String: Any] {
+            preferred.removeValue(forKey: "codex")
+            if let v = preferred.removeValue(forKey: "claude") { preferred["claudeACP"] = v }
+            if let v = preferred.removeValue(forKey: "gemini") { preferred["geminiACP"] = v }
+            json["preferredProviderIDsByFamily"] = preferred
+        } else {
+            json["preferredProviderIDsByFamily"] = [:]
+        }
+    }
+
+    /// Collects UUID strings from Goose-era Codex rows (for transfer placeholder cleanup).
+    private static func gooseCodexUUIDs(from providerSettingsJSON: [String: Any]) -> [String] {
+        guard let providers = providerSettingsJSON["configuredProviders"] as? [[String: Any]] else { return [] }
+        return providers.compactMap { p -> String? in
+            guard (p["family"] as? String) == "codex", let id = p["id"] as? String else { return nil }
+            return id
+        }
+    }
+
+    private static func encodedCapabilitiesJSON(_ capabilities: ProviderCapabilities) -> [String: Any] {
+        let encoder = JSONEncoder()
+        guard
+            let data = try? encoder.encode(capabilities),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return [:]
+        }
+        return object
     }
 
     private static func sanitized(_ settings: ProviderSettings) -> ProviderSettings {
         ProviderSettings(
-            configuredProviders: settings.configuredProviders.map(sanitized),
+            configuredProviders: settings.configuredProviders.map { sanitized($0) },
             preferredProviderIDsByFamily: settings.preferredProviderIDsByFamily,
             notificationOnProviderFailure: settings.notificationOnProviderFailure,
             runStartRequiresCleanPreflight: settings.runStartRequiresCleanPreflight
         )
+    }
+
+    private static func migratedIfNeeded(_ settings: ProviderSettings) -> ProviderSettings {
+        guard settings.configuredProviders.isEmpty,
+              settings.preferredProviderIDsByFamily.isEmpty else {
+            return settings
+        }
+        return seededDefault()
     }
 
     private static func sanitized(_ provider: ConfiguredProvider) -> ConfiguredProvider {
@@ -119,46 +280,32 @@ final class ProviderSettingsStore {
 
     private static func seededDefault() -> ProviderSettings {
         let environment = ProcessInfo.processInfo.environment
-        let seedsInMemory = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
-        let fixtureEndpoint = environment["CHAINWORKS_GOOSE_FIXTURE_MODE"] == nil ? nil : "http://fixture.local"
-        let gooseBaseURL = environment["CHAINWORKS_GOOSE_BASE_URL"] ?? fixtureEndpoint
-        var providers: [ConfiguredProvider] = seedsInMemory ? [
+        var providers: [ConfiguredProvider] = [
             ConfiguredProvider(
-                family: .codex,
-                displayName: "Codex Goose",
-                transport: .gooseServer,
-                endpoint: gooseBaseURL,
-                authMode: gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
-                defaultModel: "gpt-5-codex"
+                family: .codexACP,
+                displayName: "Codex ACP",
+                transport: .cli,
+                authMode: .apiKey,
+                defaultModel: "gpt-5"
             ),
             ConfiguredProvider(
-                family: .claude,
-                displayName: "Claude Goose",
-                transport: .gooseServer,
-                endpoint: gooseBaseURL,
-                authMode: gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
+                family: .claudeACP,
+                displayName: "Claude ACP",
+                transport: .cli,
+                authMode: .apiKey,
                 defaultModel: "sonnet"
             ),
             ConfiguredProvider(
-                family: .gemini,
-                displayName: gooseBaseURL == nil ? "Gemini CLI" : "Gemini Goose",
-                transport: gooseBaseURL == nil ? .cli : .gooseServer,
-                endpoint: gooseBaseURL,
-                authMode: gooseBaseURL == nil || gooseBaseURL == fixtureEndpoint ? .none : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey),
+                family: .geminiACP,
+                displayName: "Gemini ACP",
+                transport: .cli,
+                authMode: .apiKey,
                 defaultModel: "gemini-2.5-pro"
             ),
             ConfiguredProvider(
-                family: .codexACP,
-                displayName: "Codex ACP",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "gpt-5",
-                isEnabled: false
-            ),
-            ConfiguredProvider(
                 family: .auggie,
                 displayName: "Auggie CLI",
-                transport: .gooseServer,
+                transport: .cli,
                 authMode: .apiKey,
                 defaultModel: "auggie-default",
                 isEnabled: false
@@ -166,32 +313,7 @@ final class ProviderSettingsStore {
             ConfiguredProvider(
                 family: .junie,
                 displayName: "Junie CLI",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "junie-default",
-                isEnabled: false
-            )
-        ] : [
-            ConfiguredProvider(
-                family: .codexACP,
-                displayName: "Codex ACP",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "gpt-5",
-                isEnabled: false
-            ),
-            ConfiguredProvider(
-                family: .auggie,
-                displayName: "Auggie CLI",
-                transport: .gooseServer,
-                authMode: .apiKey,
-                defaultModel: "auggie-default",
-                isEnabled: false
-            ),
-            ConfiguredProvider(
-                family: .junie,
-                displayName: "Junie CLI",
-                transport: .gooseServer,
+                transport: .cli,
                 authMode: .apiKey,
                 defaultModel: "junie-default",
                 isEnabled: false
@@ -200,18 +322,12 @@ final class ProviderSettingsStore {
 
         if let liveProvider = environment["CHAINWORKS_LIVE_PROVIDER"],
            let family = ProviderFamily.from(runtimeIdentifier: liveProvider) {
-            let transport: ProviderTransport = gooseBaseURL == nil ? .cli : .gooseServer
-            let authMode: ProviderAuthMode = gooseBaseURL == nil || gooseBaseURL == fixtureEndpoint
-                ? .none
-                : (environment["CHAINWORKS_GOOSE_API_KEY"] == nil ? .none : .apiKey)
-            let endpoint = gooseBaseURL
             providers.removeAll { $0.family == family }
             providers.append(ConfiguredProvider(
                 family: family,
-                displayName: transport == .gooseServer ? "\(family.displayName) Goose" : "\(family.displayName) Seeded",
-                transport: transport,
-                endpoint: endpoint,
-                authMode: authMode,
+                displayName: "\(family.displayName) Seeded",
+                transport: .cli,
+                authMode: .none,
                 defaultModel: environment["CHAINWORKS_LIVE_MODEL"],
                 capabilities: .default(for: family)
             ))
@@ -225,5 +341,16 @@ final class ProviderSettingsStore {
             notificationOnProviderFailure: true,
             runStartRequiresCleanPreflight: true
         )
+    }
+}
+
+private enum ProviderSettingsStoreError: LocalizedError {
+    case loadFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .loadFailed(let path):
+            return "Persisted settings at \(path) could not be decoded"
+        }
     }
 }

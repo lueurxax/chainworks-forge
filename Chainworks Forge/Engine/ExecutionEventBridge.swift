@@ -29,6 +29,16 @@ final class ExecutionEventBridge: @unchecked Sendable {
     private var _hasFinalOutput: Bool = false
     private var _finishReason: String?
     private var _finishRaw: String?
+    private var _usageUpdateCount = 0
+    private var _latestUsageSnapshot: CodexUsageSnapshot?
+    private var _discoveryToolCallCount = 0
+    private var _promptSubmittedAt: Date?
+    private var _firstEditAt: Date?
+    private var _lastMeaningfulProgressAt: Date?
+    private var _lastToolName: String?
+    private var _lastMutatingToolName: String?
+    private var _accumulatedTextBytes = 0
+    private var _rawToolPayloadBytes = 0
 
     // MARK: - Public Accessors
 
@@ -56,6 +66,50 @@ final class ExecutionEventBridge: @unchecked Sendable {
         withLock { _finishRaw }
     }
 
+    func codexTelemetry(
+        runtimeHomeBytes: Int? = nil,
+        runawayReason: String? = nil
+    ) -> CodexReceiptTelemetry? {
+        withLock {
+            guard _usageUpdateCount > 0
+                || !_toolCalls.isEmpty
+                || _discoveryToolCallCount > 0
+                || _firstEditAt != nil
+                || _rawToolPayloadBytes > 0 else {
+                return nil
+            }
+            return CodexReceiptTelemetry(
+                inputTokens: _latestUsageSnapshot?.inputTokens,
+                cachedInputTokens: _latestUsageSnapshot?.cachedInputTokens,
+                outputTokens: _latestUsageSnapshot?.outputTokens,
+                modelContextWindow: _latestUsageSnapshot?.modelContextWindow,
+                usageUpdateCount: _usageUpdateCount,
+                toolCallCount: _toolCalls.count,
+                discoveryToolCallCount: _discoveryToolCallCount,
+                promptSubmittedAt: _promptSubmittedAt,
+                firstEditAt: _firstEditAt,
+                lastMeaningfulProgressAt: _lastMeaningfulProgressAt,
+                lastToolName: _lastToolName,
+                lastMutatingToolName: _lastMutatingToolName,
+                accumulatedTextBytes: _accumulatedTextBytes,
+                rawToolPayloadBytes: _rawToolPayloadBytes,
+                runtimeHomeBytes: runtimeHomeBytes,
+                runawayReason: runawayReason,
+                supervisionClassification: nil,
+                silenceDurationSeconds: nil,
+                automaticRetryConsumed: false,
+                mutationVerificationAttempted: false,
+                mutationSideEffectObserved: nil,
+                firstVerifiedMutatedPath: nil
+            )
+        }
+    }
+
+    var promptSubmittedAt: Date? { withLock { _promptSubmittedAt } }
+    var firstMutatingToolAt: Date? { withLock { _firstEditAt } }
+    var lastMeaningfulProgressAt: Date? { withLock { _lastMeaningfulProgressAt } }
+    var lastMutatingToolName: String? { withLock { _lastMutatingToolName } }
+
     // MARK: - Event Processing
 
     /// Process a stream of RuntimeStreamEvents and yield app-friendly ExecutionEvents.
@@ -64,6 +118,7 @@ final class ExecutionEventBridge: @unchecked Sendable {
         onEvent: @Sendable @escaping (ExecutionEvent) -> Void
     ) async throws -> ExecutionStreamResult {
         var finalContent: String?
+        var sawSessionClosed = false
 
         for try await event in stream {
             let appEvent = mapToAppEvent(event)
@@ -71,6 +126,10 @@ final class ExecutionEventBridge: @unchecked Sendable {
             onEvent(appEvent)
 
             switch event {
+            case .promptSubmitted:
+                withLock {
+                    _promptSubmittedAt = Date()
+                }
             case .finalOutput(let content):
                 finalContent = content
                 withLock {
@@ -84,10 +143,25 @@ final class ExecutionEventBridge: @unchecked Sendable {
             case .textChunk(let text):
                 withLock {
                     _accumulatedText += text
+                    _accumulatedTextBytes += text.lengthOfBytes(using: .utf8)
                 }
             case .toolCallStarted(let toolName, let raw):
                 let resolvedToolName = appEvent.toolName ?? toolName
                 withLock {
+                    _rawToolPayloadBytes += raw.lengthOfBytes(using: .utf8)
+                    _lastToolName = resolvedToolName
+                    if progressClass(for: resolvedToolName) != .weak {
+                        _lastMeaningfulProgressAt = Date()
+                    }
+                    if isDiscoveryToolName(resolvedToolName) {
+                        _discoveryToolCallCount += 1
+                    }
+                    if _firstEditAt == nil, isMutatingToolName(resolvedToolName) {
+                        _firstEditAt = Date()
+                    }
+                    if isMutatingToolName(resolvedToolName) {
+                        _lastMutatingToolName = resolvedToolName
+                    }
                     _toolCalls.append(ToolCallRecord(
                         toolName: resolvedToolName,
                         rawPayload: raw,
@@ -100,17 +174,35 @@ final class ExecutionEventBridge: @unchecked Sendable {
             case .toolCallFinished(let toolName, let raw):
                 let resolvedToolName = appEvent.toolName ?? toolName
                 withLock {
+                    _rawToolPayloadBytes += raw.lengthOfBytes(using: .utf8)
+                    _lastToolName = resolvedToolName
+                    if progressClass(for: resolvedToolName) != .weak {
+                        _lastMeaningfulProgressAt = Date()
+                    }
+                    if isMutatingToolName(resolvedToolName) {
+                        _lastMutatingToolName = resolvedToolName
+                    }
+                    let didSucceed = Self.toolCallSucceeded(from: raw)
                     let idx =
                         _toolCalls.lastIndex(where: { $0.toolName == resolvedToolName && $0.completedAt == nil })
                         ?? _toolCalls.lastIndex(where: { $0.completedAt == nil })
                     if let idx {
                         _toolCalls[idx].completedAt = Date()
-                        _toolCalls[idx].succeeded = true
+                        _toolCalls[idx].succeeded = didSucceed
                         _toolCalls[idx].responseRawPayload = raw
                     }
                 }
             case .error(let message):
                 throw ExecutionEventBridgeError.streamFailed(message: message)
+            case .sessionClosed:
+                sawSessionClosed = true
+            case .unknown(let type, let data):
+                if type == "usage_update" {
+                    withLock {
+                        _usageUpdateCount += 1
+                        _latestUsageSnapshot = CodexUsageSnapshot.parse(raw: data) ?? _latestUsageSnapshot
+                    }
+                }
             default:
                 break
             }
@@ -122,8 +214,18 @@ final class ExecutionEventBridge: @unchecked Sendable {
             toolCalls: toolCalls,
             succeeded: hasFinalOutput,
             finishReason: finishReason,
-            finishRaw: finishRaw
+            finishRaw: finishRaw,
+            sawSessionClosed: sawSessionClosed
         )
+    }
+
+    private static func toolCallSucceeded(from rawPayload: String) -> Bool {
+        guard let data = rawPayload.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = json["status"] as? String else {
+            return true
+        }
+        return status.caseInsensitiveCompare("failed") != .orderedSame
     }
 
     // MARK: - Private: Event Mapping
@@ -199,6 +301,16 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     private func record(_ event: ExecutionEvent) {
         withLock {
+            if event.type == .textChunk,
+               let lastEvent = _eventLog.last,
+               lastEvent.type == .textChunk {
+                _eventLog[_eventLog.count - 1] = ExecutionEvent(
+                    type: .textChunk,
+                    timestamp: lastEvent.timestamp,
+                    detail: lastEvent.detail + event.detail
+                )
+                return
+            }
             _eventLog.append(event)
         }
     }
@@ -213,6 +325,16 @@ final class ExecutionEventBridge: @unchecked Sendable {
             _hasFinalOutput = false
             _finishReason = nil
             _finishRaw = nil
+            _usageUpdateCount = 0
+            _latestUsageSnapshot = nil
+            _discoveryToolCallCount = 0
+            _promptSubmittedAt = nil
+            _firstEditAt = nil
+            _lastMeaningfulProgressAt = nil
+            _lastToolName = nil
+            _lastMutatingToolName = nil
+            _accumulatedTextBytes = 0
+            _rawToolPayloadBytes = 0
         }
     }
 
@@ -224,7 +346,13 @@ final class ExecutionEventBridge: @unchecked Sendable {
 
     private func resolveToolCallStartedName(toolName: String, raw: String) -> String {
         let metadata = parseToolPayloadMetadata(from: raw)
-        let resolved = preferredToolName(primary: toolName, fallback: metadata.toolName)
+        let fallbackFromCallID = metadata.callID.flatMap { callID in
+            withLock { _toolNamesByCallID[callID] }
+        }
+        let resolved = preferredToolName(
+            primary: toolName,
+            fallback: metadata.toolName ?? fallbackFromCallID
+        )
 
         if let callID = metadata.callID, isDisplayableToolName(resolved) {
             withLock {
@@ -312,6 +440,34 @@ final class ExecutionEventBridge: @unchecked Sendable {
         }
 
         return current as? String
+    }
+
+    private func isDiscoveryToolName(_ toolName: String) -> Bool {
+        let normalized = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "search"
+            || normalized == "read"
+            || normalized == "read_file"
+            || normalized == "read_workspace"
+            || normalized == "execute"
+            || normalized == "permission:read"
+            || normalized == "permission:execute"
+    }
+
+    func progressClass(for toolName: String) -> ACPProgressClass {
+        if isMutatingToolName(toolName) {
+            return .mutating
+        }
+        if isDiscoveryToolName(toolName) {
+            return .weak
+        }
+        return .strong
+    }
+
+    private func isMutatingToolName(_ toolName: String) -> Bool {
+        let normalized = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "edit"
+            || normalized == "apply_patch"
+            || normalized == "write"
     }
 }
 
@@ -417,4 +573,128 @@ struct ExecutionStreamResult: Sendable {
     let succeeded: Bool
     let finishReason: String?
     let finishRaw: String?
+    let sawSessionClosed: Bool
+}
+
+struct CodexReceiptTelemetry: Codable, Sendable, Equatable {
+    var inputTokens: Int?
+    var cachedInputTokens: Int?
+    var outputTokens: Int?
+    var modelContextWindow: Int?
+    var usageUpdateCount: Int
+    var toolCallCount: Int
+    var discoveryToolCallCount: Int
+    var promptSubmittedAt: Date?
+    var firstEditAt: Date?
+    var lastMeaningfulProgressAt: Date?
+    var lastToolName: String?
+    var lastMutatingToolName: String?
+    var accumulatedTextBytes: Int
+    var rawToolPayloadBytes: Int
+    var runtimeHomeBytes: Int?
+    var runawayReason: String?
+    var supervisionClassification: SupervisionClassification?
+    var silenceDurationSeconds: Double?
+    var automaticRetryConsumed: Bool
+    var mutationVerificationAttempted: Bool
+    var mutationSideEffectObserved: Bool?
+    var firstVerifiedMutatedPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case cachedInputTokens = "cached_input_tokens"
+        case outputTokens = "output_tokens"
+        case modelContextWindow = "model_context_window"
+        case usageUpdateCount = "usage_update_count"
+        case toolCallCount = "tool_call_count"
+        case discoveryToolCallCount = "discovery_tool_call_count"
+        case promptSubmittedAt = "prompt_submitted_at"
+        case firstEditAt = "first_edit_at"
+        case lastMeaningfulProgressAt = "last_meaningful_progress_at"
+        case lastToolName = "last_tool_name"
+        case lastMutatingToolName = "last_mutating_tool_name"
+        case accumulatedTextBytes = "accumulated_text_bytes"
+        case rawToolPayloadBytes = "raw_tool_payload_bytes"
+        case runtimeHomeBytes = "runtime_home_bytes"
+        case runawayReason = "runaway_reason"
+        case supervisionClassification = "supervision_classification"
+        case silenceDurationSeconds = "silence_duration_seconds"
+        case automaticRetryConsumed = "automatic_retry_consumed"
+        case mutationVerificationAttempted = "mutation_verification_attempted"
+        case mutationSideEffectObserved = "mutation_side_effect_observed"
+        case firstVerifiedMutatedPath = "first_verified_mutated_path"
+    }
+}
+
+enum ACPProgressClass: String, Sendable, Equatable {
+    case weak
+    case strong
+    case mutating
+}
+
+struct CodexUsageSnapshot: Codable, Sendable, Equatable {
+    let inputTokens: Int?
+    let cachedInputTokens: Int?
+    let outputTokens: Int?
+    let modelContextWindow: Int?
+
+    static func parse(raw: String) -> CodexUsageSnapshot? {
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return nil
+        }
+
+        let inputTokens = findInt(in: json, matching: ["input_tokens", "inputTokens", "token_count"])
+        let cachedInputTokens = findInt(in: json, matching: ["cached_input_tokens", "cachedInputTokens"])
+        let outputTokens = findInt(in: json, matching: ["output_tokens", "outputTokens"])
+        let modelContextWindow = findInt(in: json, matching: ["model_context_window", "modelContextWindow"])
+
+        guard inputTokens != nil || cachedInputTokens != nil || outputTokens != nil || modelContextWindow != nil else {
+            return nil
+        }
+
+        return CodexUsageSnapshot(
+            inputTokens: inputTokens,
+            cachedInputTokens: cachedInputTokens,
+            outputTokens: outputTokens,
+            modelContextWindow: modelContextWindow
+        )
+    }
+
+    private static func findInt(in value: Any, matching keys: [String]) -> Int? {
+        if let dict = value as? [String: Any] {
+            for key in keys {
+                if let candidate = dict[key] {
+                    if let intValue = int(from: candidate) {
+                        return intValue
+                    }
+                }
+            }
+            for nested in dict.values {
+                if let found = findInt(in: nested, matching: keys) {
+                    return found
+                }
+            }
+        } else if let array = value as? [Any] {
+            for nested in array {
+                if let found = findInt(in: nested, matching: keys) {
+                    return found
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func int(from value: Any) -> Int? {
+        if let intValue = value as? Int {
+            return intValue
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
 }

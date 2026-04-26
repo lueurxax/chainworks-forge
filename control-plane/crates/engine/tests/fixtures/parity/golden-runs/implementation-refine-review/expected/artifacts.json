@@ -1,0 +1,1 @@
+{"artifacts":[{"name":"implementation_patch","contract_id":"claude.output","stage_id":"implement","format":"json","report_kind":null},{"name":"review_notes","contract_id":"claude.output","stage_id":"review","format":"json","report_kind":"parity_summary"}]}

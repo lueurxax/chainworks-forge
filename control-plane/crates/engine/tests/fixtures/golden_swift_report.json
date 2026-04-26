@@ -1,0 +1,36 @@
+{
+  "description": "Golden snapshot of Swift-app-produced report for a minimal 2-stage workflow. Used by parity harness to assert daemon produces equivalent output shape.",
+  "workflow_id": "minimal_linear",
+  "stages": [
+    {
+      "stage_id": "stage_1_intake",
+      "label": "Intake",
+      "status": "completed",
+      "attempt_number": 1,
+      "has_artifacts": true
+    },
+    {
+      "stage_id": "stage_2_finalize",
+      "label": "Finalize",
+      "status": "completed",
+      "attempt_number": 1,
+      "has_artifacts": true
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "intake_brief",
+      "contract_id": "claude.output",
+      "stage_id": "stage_1_intake"
+    },
+    {
+      "name": "final_report",
+      "contract_id": "claude.output",
+      "stage_id": "stage_2_finalize"
+    }
+  ],
+  "run_status": "completed",
+  "total_stages": 2,
+  "completed_stages": 2,
+  "failed_stages": 0
+}

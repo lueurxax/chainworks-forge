@@ -1,0 +1,40 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "control-plane"
+path = "src/main.rs"
+
+[dependencies]
+domain = { path = "../domain" }
+db = { path = "../db" }
+acp = { path = "../acp" }
+engine = { path = "../engine" }
+graphql-server = { path = "../graphql-server" }
+mcp-server = { path = "../mcp-server" }
+auth = { path = "../auth" }
+sqlx = { workspace = true }
+axum = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+dirs = "5"
+sha2 = "0.10"
+anyhow = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+tokio = { workspace = true }
+fs2 = "0.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+filetime = "0.2"

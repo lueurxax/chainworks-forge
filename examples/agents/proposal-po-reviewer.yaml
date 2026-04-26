@@ -6,8 +6,8 @@ agent:
   business_mode: proposal_review
 
   backend:
-    runtime: goose
-    provider: claude_code
+    runtime: claude_agent
+    provider: claude_acp
     model: opus
     effort: high
 
@@ -22,7 +22,7 @@ agent:
     Produce both a concise executive summary and a machine-readable report.
 
   permissions:
-    goose_mode: chat
+    runtime_mode: chat
     access_profile: ro_review
     roots:
       - "{{ repo_root }}"

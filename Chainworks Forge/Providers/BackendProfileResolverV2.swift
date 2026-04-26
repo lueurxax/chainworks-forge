@@ -48,8 +48,8 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
 
     var effectiveRuntimeNamespace: String? {
         switch adapterFamily {
-        case nil, "", "goose":
-            return transport == ProviderTransport.gooseServer.rawValue ? "goose" : nil
+        case nil, "":
+            return nil
         case "claude_agent_acp":
             return "claude_agent"
         case "gemini_cli_acp":
@@ -65,8 +65,8 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
         }
     }
 
-    var usesGooseExecutionPath: Bool {
-        effectiveRuntimeNamespace == "goose"
+    var usesLegacyExecutionPath: Bool {
+        effectiveRuntimeNamespace == nil
     }
 
     // MARK: - Proposal 011 (REQ-010): Cross-family coherence check
@@ -96,6 +96,7 @@ struct ResolvedProviderBinding: Codable, Equatable, Sendable {
 enum BackendProfileResolverError: Error, LocalizedError {
     case unknownProviderFamily(String)
     case noConfiguredProvider(ProviderFamily)
+    case providerNotEnabled(family: ProviderFamily)
     case configuredProviderNotFound(UUID)
     case missingModel(agentID: String)
 
@@ -105,6 +106,8 @@ enum BackendProfileResolverError: Error, LocalizedError {
             return "Provider family '\(provider)' is not configured for Proposal 006"
         case .noConfiguredProvider(let family):
             return "No configured provider available for \(family.displayName)"
+        case .providerNotEnabled(let family):
+            return "Provider family \(family.displayName) is configured but not enabled. Enable it in Settings to use this runtime profile."
         case .configuredProviderNotFound(let id):
             return "Configured provider \(id.uuidString) could not be found"
         case .missingModel(let agentID):
@@ -138,6 +141,11 @@ struct BackendProfileResolverV2 {
             } else if let preferred = providerRegistry.preferredProvider(for: family) {
                 configuredProvider = preferred
             } else {
+                // Distinguish between "no providers at all" and "providers exist but all disabled"
+                let anyExistForFamily = providerRegistry.configuredProviders.contains { $0.family == family }
+                if anyExistForFamily {
+                    throw BackendProfileResolverError.providerNotEnabled(family: family)
+                }
                 throw BackendProfileResolverError.noConfiguredProvider(family)
             }
 
@@ -158,9 +166,9 @@ struct BackendProfileResolverV2 {
                 resolvedCapabilityClass = profile.capabilityClass
                 resolvedTransportKind = profile.transportKind
             } else {
-                // Default: legacy Goose runtime
+                // Default: legacy runtime (no explicit profile)
                 resolvedRuntimeProfileID = agent.runtimeProfileID
-                resolvedAdapterFamily = "goose"
+                resolvedAdapterFamily = "claude_agent_acp"
                 resolvedCapabilityClass = .legacyOperatorGrade
                 resolvedTransportKind = configuredProvider.transport.rawValue
             }

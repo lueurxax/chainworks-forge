@@ -1,0 +1,98 @@
+use anyhow::{bail, Result};
+use async_trait::async_trait;
+use tracing::info;
+
+use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
+use crate::transport::AcpSessionConfig;
+use crate::ExecutionRequest;
+
+const BINARY_ENV_VAR: &str = "CHAINWORKS_CLAUDE_ACP_BINARY";
+
+/// Adapter for the Claude Agent provider (`claude-agent-acp`).
+///
+/// Spawns the binary given by `CHAINWORKS_CLAUDE_ACP_BINARY` (defaulting to
+/// `claude-agent-acp` on PATH) and communicates with it using the ACP
+/// JSON-RPC 2.0 protocol over ndjson stdio.
+///
+/// Protocol: `initialize` → `session/new` → `session/prompt` (streaming)
+///   → `session/close` → graceful shutdown.
+///
+/// Artifact paths are discovered by diffing the workspace filesystem before
+/// and after the session.
+pub struct ClaudeAgentAdapter {
+    binary_path: String,
+    set_mode_after_session_new: bool,
+}
+
+impl ClaudeAgentAdapter {
+    /// Create a new adapter, resolving the binary from `CHAINWORKS_CLAUDE_ACP_BINARY`
+    /// or falling back to `claude-agent-acp` on PATH.
+    pub fn new() -> Self {
+        let binary_path =
+            std::env::var(BINARY_ENV_VAR).unwrap_or_else(|_| "claude-agent-acp".to_string());
+        Self {
+            binary_path,
+            set_mode_after_session_new: true,
+        }
+    }
+
+    /// Construct with an explicit binary path — for testing and runtime injection.
+    pub fn new_with_binary(path: impl Into<String>) -> Self {
+        Self {
+            binary_path: path.into(),
+            set_mode_after_session_new: false,
+        }
+    }
+}
+
+impl Default for ClaudeAgentAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AcpAdapter for ClaudeAgentAdapter {
+    fn provider_name(&self) -> &str {
+        "claude"
+    }
+
+    fn prepare_launch_spec(
+        &self,
+        req: &ExecutionRequest,
+        _resources: &mut LaunchResourceGuard,
+    ) -> Result<AcpLaunchSpec> {
+        if self.binary_path.is_empty() {
+            bail!(
+                "ClaudeAgentAdapter: binary path is empty — set {BINARY_ENV_VAR} \
+                 or ensure claude-agent-acp is on PATH"
+            );
+        }
+
+        info!(
+            provider = "claude",
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            agent_id = %req.agent_id,
+            binary = %self.binary_path,
+            "Spawning Claude ACP subprocess"
+        );
+
+        Ok(AcpLaunchSpec::new(&self.binary_path))
+    }
+
+    fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
+        let default_config = AcpSessionConfig::default();
+        let model_str = req
+            .model
+            .as_deref()
+            .unwrap_or(default_config.model)
+            .to_string();
+        let config = AcpSessionConfig {
+            model: &model_str,
+            set_mode_after_session_new: self.set_mode_after_session_new,
+            ..default_config
+        };
+        Ok(AcpSessionNewSpec::from_config(config))
+    }
+}

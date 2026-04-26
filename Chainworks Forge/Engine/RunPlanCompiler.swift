@@ -228,6 +228,10 @@ final class RunPlanCompiler {
                 )
             }
 
+            let requestedMCPServerIDs = agentDef.mode == "prepush_review"
+                ? backend.mcp.filter { $0 != "xcode" }
+                : backend.mcp
+
             bindings[agentID] = ResolvedAgent(
                 id: agentDef.id,
                 title: agentDef.title,
@@ -239,7 +243,8 @@ final class RunPlanCompiler {
                 maxTurns: backend.maxTurns,
                 temperature: backend.temperature,
                 permissionProfile: agentDef.permissionProfile,
-                mcpProfileID: agentDef.mcpProfile,
+                mcpProfileID: requestedMCPServerIDs.isEmpty ? nil : agentDef.backendProfile,
+                requestedMCPServerIDs: requestedMCPServerIDs,
                 skillRef: agentDef.skillRef,
                 skillRole: agentDef.skillRole,
                 resolvedSkill: resolvedSkill,
@@ -380,6 +385,9 @@ final class RunPlanCompiler {
 
         if trimmed == "approval.granted == true" {
             return .approvalGranted
+        }
+        if trimmed == "approval.rejected == true" {
+            return .approvalRejected
         }
 
         // exists('artifact_name')

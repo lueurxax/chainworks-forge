@@ -37,12 +37,8 @@ The UI test target (`Chainworks ForgeUITests/`) remains on XCTest.
 | `ArtifactValidationTests` | — | — |
 | `Chainworks_ForgeTests` | `.fast` | — |
 | `EndToEndTests` | `.integration` | Lane A |
-| `GooseAgentExecutorTests` | — | Lane B |
-| `GooseServerLiveIntegrationTests` | `.live` | — |
-| `GooseServerTransportTests` | — | Local mock |
-| `GooseSessionBridgeTests` | — | Lane B |
-| `GooseStreamEventMapperTests` | — | — |
-| `LiveGooseConnectionProofTests` | `.live` | — |
+| `RuntimeAgentExecutorTests` | — | Lane B |
+| `RuntimeSessionBridgeTests` | — | Lane B |
 | `LiveProposalWorkflowTests` | `.live` | — |
 | `OrchestratorTests` | `.fast` | Lane B |
 | `ProviderPlatformTests` | `.fast`, `.provider` | — |
@@ -57,7 +53,7 @@ The UI test target (`Chainworks ForgeUITests/`) remains on XCTest.
 | File | Role |
 |---|---|
 | `TestSupport.swift` | Assertion helpers, fixture loaders, async polling, `TestBundleMarker` |
-| `SharedMocks.swift` | `StubGooseTransport`, `ObservableGooseTransport`, `SharedStaticResultExecutor`, `SharedEventCollector` |
+| `SharedMocks.swift` | `StubRuntimeTransport`, `ObservableRuntimeTransport`, `SharedStaticResultExecutor`, `SharedEventCollector` |
 
 ## Framework Conventions
 
@@ -113,7 +109,7 @@ Suites currently using `.serialized`:
 
 The suite uses two explicit transport mock lanes.
 
-### Lane A: `StubGooseTransport`
+### Lane A: `StubRuntimeTransport`
 
 `Sendable` struct for tests that only need deterministic stimulus injection and do not assert on transport-side effects.
 
@@ -123,26 +119,25 @@ Used by:
 - `EndToEndTests`
 - other stream-only paths
 
-### Lane B: `ObservableGooseTransport`
+### Lane B: `ObservableRuntimeTransport`
 
 `actor` for tests that assert on request content, session lifecycle, and call counts.
 
 Used by:
 
-- `GooseAgentExecutorTests`
-- `GooseSessionBridgeTests`
+- `RuntimeAgentExecutorTests`
+- `RuntimeSessionBridgeTests`
 - `OrchestratorTests`
 
 ### Lane Assignment
 
 | Test file | Lane | Reason |
 |---|---|---|
-| `GooseAgentExecutorTests` | B | Asserts on execution policy and session closure |
-| `GooseSessionBridgeTests` | B | Asserts on session lifecycle |
+| `RuntimeAgentExecutorTests` | B | Asserts on execution policy and session closure |
+| `RuntimeSessionBridgeTests` | B | Asserts on session lifecycle |
 | `OrchestratorTests` | B | Asserts on request propagation and call counts |
 | `SimulatedAgentExecutorTests` | A | Stateless result injection |
 | `EndToEndTests` | A | Stateless result injection |
-| `GooseServerTransportTests` | Local mock | Uses local `MockURLProtocol` path |
 
 ## Shared Test Infrastructure
 
@@ -168,8 +163,8 @@ Other infrastructure:
 
 | Component | Type | Role |
 |---|---|---|
-| `StubGooseTransport` | `struct` | Lane A stimulus injection |
-| `ObservableGooseTransport` | `actor` | Lane B observable transport |
+| `StubRuntimeTransport` | `struct` | Lane A stimulus injection |
+| `ObservableRuntimeTransport` | `actor` | Lane B observable transport |
 | `SharedStaticResultExecutor` | `struct` | Static-result E2E injection |
 | `SharedEventCollector` | class | Shared event collection helper |
 
@@ -191,10 +186,6 @@ The migration consolidated several repetitive suites with `@Test(arguments:)`.
 
 Parameterizes approval and condition evaluation cases that used to be split across many near-identical methods.
 
-### `GooseStreamEventMapperTests`
-
-Parameterizes ignored-event JSON fixtures into a single mapping test.
-
 ### `ResumeManagerTests`
 
 Uses parameterized coverage for resume classification scenarios.
@@ -208,7 +199,7 @@ Tags are the source of truth for gate membership. Plans in `TestPlans/` exist as
 | `.fast` | Inner-loop engineering gate | `Chainworks_ForgeTests`, `OrchestratorTests`, `ProviderPlatformTests`, `ResumeManagerTests`, `ArtifactManagerTests` |
 | `.smoke` | UI-level smoke coverage (unit-side only) | — |
 | `.integration` | External provider connectivity | `EndToEndTests` |
-| `.live` | Running Goose server required | `GooseServerLiveIntegrationTests`, `LiveGooseConnectionProofTests`, `LiveProposalWorkflowTests` |
+| `.live` | Runtime-specific live proof required | `LiveProposalWorkflowTests` |
 | `.provider` | Provider-platform slice | `ProviderPlatformTests` |
 
 | Plan | Tag filter | Targets |
@@ -241,7 +232,6 @@ Residual gaps in the suite itself:
 |---|---|---|
 | `awaitCondition()` does not use `confirmation()` | Uses manual polling rather than Swift Testing confirmation primitives | Low |
 | Fixture loader hardening | Some loaders still force-unwrap bundle URLs | Low |
-| `GooseServerTransportTests` local mock | Uses local `MockURLProtocol: URLProtocol, @unchecked Sendable` instead of Lane A/B | Medium |
 | Residual `@unchecked Sendable` helpers | `SharedEventCollector` and `EventCollector` remain compiler-unverified | Medium |
 | `full` gate stability | Full suite has historically observed SwiftData/UI instability outside the active slice | High |
 | Raw `.xctestplan` proving quality | Some direct `xcodebuild -testPlan ...` invocations can return green `0`-test results against Swift Testing suites | High |

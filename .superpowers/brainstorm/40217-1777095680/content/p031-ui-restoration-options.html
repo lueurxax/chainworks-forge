@@ -1,0 +1,116 @@
+<h2>P031 UI Restoration Shape</h2>
+<p class="subtitle">All options keep workflow truth GraphQL-only. Old SwiftData views are used only as visual/layout donors, not as data or write paths.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">A. Read-only operator shell</div>
+        <div class="mockup-body">
+          <div style="display:flex; min-height:320px; gap:14px;">
+            <div class="mock-sidebar" style="width:190px;">
+              <strong>Navigation</strong><br><br>
+              Runs<br>
+              Ideas<br>
+              Approvals<br>
+              Agent Catalog<br>
+              Workflow Catalog<br>
+              Daemon
+            </div>
+            <div class="mock-content" style="flex:1;">
+              <strong>Run workspace</strong>
+              <div style="display:grid;grid-template-columns: 1.1fr 1fr;gap:12px;margin-top:12px;">
+                <div class="placeholder">Run list with idea titles</div>
+                <div class="placeholder">Run detail summary</div>
+              </div>
+              <div style="display:grid;grid-template-columns: 1fr 1fr;gap:12px;margin-top:12px;">
+                <div class="placeholder">Stage transition map</div>
+                <div class="placeholder">Artifact viewer: markdown/json</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. Restore the old shell as a thin read UI</h3>
+      <p>Bring back the app shape users expect: run, idea, approval, catalog, workflow, daemon surfaces. Each surface is backed by named GraphQL reads or an explicit unavailable state.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">B. Run-centric workspace first</div>
+        <div class="mockup-body">
+          <div style="display:flex; min-height:320px; gap:14px;">
+            <div class="mock-sidebar" style="width:230px;">
+              <strong>Runs only</strong><br><br>
+              P017 Control Plane<br>
+              P031 Thin UI<br>
+              P051 Xcode MCP<br>
+              P064 Sync<br>
+              P065 Retry
+            </div>
+            <div class="mock-content" style="flex:1;">
+              <strong>Selected run</strong>
+              <div class="placeholder" style="height:70px;">Run summary</div>
+              <div class="placeholder" style="height:110px;">Stage transition graph</div>
+              <div class="placeholder" style="height:110px;">Artifacts + reports</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. Prioritize runs and nested inspection</h3>
+      <p>Fastest path for dogfood: fix run identity, transitions, artifacts, reports. Ideas and catalogs come back as secondary panels or later tabs.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">C. Minimal graft</div>
+        <div class="mockup-body">
+          <div style="display:flex; min-height:320px; gap:14px;">
+            <div class="mock-sidebar" style="width:210px;">
+              <strong>Current P031</strong><br><br>
+              Runs<br>
+              External write paths
+            </div>
+            <div class="mock-content" style="flex:1;">
+              <strong>Add panels in place</strong>
+              <div class="placeholder">Stage list</div>
+              <div class="placeholder">Artifact metadata</div>
+              <div class="placeholder">Catalog links</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. Patch the current single-screen UI</h3>
+      <p>Least code movement, but preserves the cramped shell and does not really restore operator navigation.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>Recommendation: A</h4>
+    <ul>
+      <li>Matches the original product shape.</li>
+      <li>Lets dogfood validate all required P031 surfaces.</li>
+      <li>Keeps old UI writes out by routing every screen through GraphQL read stores.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Guardrails</h4>
+    <ul>
+      <li>No SwiftData, local recovery services, local artifact file scans, or MCP from governed UI.</li>
+      <li>Artifact markdown/json rendering needs server-owned payload readback; metadata-only rows stay visibly unavailable.</li>
+      <li>Any missing GraphQL field becomes an explicit disabled/deferred state, not a local fallback.</li>
+    </ul>
+  </div>
+</div>

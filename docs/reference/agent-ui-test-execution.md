@@ -142,7 +142,7 @@ That gate is where agents should collect:
 
 - bounded `1024×768` minimum-window screenshots
 - bounded accessibility proof for Differentiate Without Color, Increase Contrast, and Reduce Transparency
-- current-round runtime proof for secondary Appendix A surfaces such as Goose assistant, workflow map, and release gate
+- current-round runtime proof for secondary Appendix A surfaces such as workflow map and release gate
 
 ### 3. App-Launched Dogfood Proof
 
@@ -414,7 +414,7 @@ CHAINWORKS_P007_DOGFOOD_AUTORUN=1
 Important companion variables:
 
 - `CHAINWORKS_IN_MEMORY_STORE=1`
-- `CHAINWORKS_GOOSE_FIXTURE_MODE=full_mvp_success`
+- `CHAINWORKS_FIXTURE_MODE=full_mvp_success`
 - `CHAINWORKS_DELIVERY_PROOF_MODE=happy_path` or `non_happy_path`
 - `CHAINWORKS_UI_TEST_SEED_IDEA_TITLE=...`
 - `CHAINWORKS_UI_TEST_SEED_IDEA_BODY=...`
@@ -479,7 +479,7 @@ Minimal shape:
 ```bash
 CHAINWORKS_P007_DOGFOOD_AUTORUN=1 \
 CHAINWORKS_IN_MEMORY_STORE=1 \
-CHAINWORKS_GOOSE_FIXTURE_MODE=full_mvp_success \
+CHAINWORKS_FIXTURE_MODE=full_mvp_success \
 CHAINWORKS_DELIVERY_PROOF_MODE=happy_path \
 CHAINWORKS_UI_TEST_SEED_IDEA_TITLE="P007 Happy Proof" \
 CHAINWORKS_UI_TEST_SEED_IDEA_BODY="Remote app-launched happy-path proof." \
@@ -496,7 +496,7 @@ Minimal shape:
 ```bash
 CHAINWORKS_P007_DOGFOOD_AUTORUN=1 \
 CHAINWORKS_IN_MEMORY_STORE=1 \
-CHAINWORKS_GOOSE_FIXTURE_MODE=full_mvp_success \
+CHAINWORKS_FIXTURE_MODE=full_mvp_success \
 CHAINWORKS_DELIVERY_PROOF_MODE=non_happy_path \
 CHAINWORKS_UI_TEST_SEED_IDEA_TITLE="P007 Non-Happy Proof" \
 CHAINWORKS_UI_TEST_SEED_IDEA_BODY="Remote app-launched non-happy-path proof." \
@@ -514,7 +514,7 @@ Recommended remote shape:
 ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && \
 CHAINWORKS_P007_DOGFOOD_AUTORUN=1 \
 CHAINWORKS_IN_MEMORY_STORE=1 \
-CHAINWORKS_GOOSE_FIXTURE_MODE=full_mvp_success \
+CHAINWORKS_FIXTURE_MODE=full_mvp_success \
 CHAINWORKS_DELIVERY_PROOF_MODE=happy_path \
 CHAINWORKS_UI_TEST_SEED_IDEA_TITLE='P007 Happy Proof' \
 CHAINWORKS_UI_TEST_SEED_IDEA_BODY='Remote app-launched happy-path proof.' \
@@ -671,5 +671,4 @@ For Proposal 022-like proposal-loop slices, the final proof should include:
 - [test-gates.md](test-gates.md)
 - [test-suite-architecture.md](test-suite-architecture.md)
 - [operator-experience.md](operator-experience.md)
-- [goose-provider-remediation.md](goose-provider-remediation.md)
 - [live-workflow-map.md](live-workflow-map.md)

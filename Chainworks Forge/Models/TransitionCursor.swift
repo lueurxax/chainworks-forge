@@ -39,6 +39,9 @@ struct TransitionCursor: Codable, Sendable, Equatable {
 
     /// When this cursor was persisted.
     let updatedAt: Date
+
+    /// Terminal workflow-conflict reason surfaced when no same-run continuation is safe.
+    var terminalFailureReason: String? = nil
 }
 
 /// Describes the phase of the transition boundary.
@@ -47,6 +50,8 @@ struct TransitionCursor: Codable, Sendable, Equatable {
 /// status is tracked by `StageExecution.status` and is not duplicated here.
 ///
 /// Progression: `awaitingFirstState` → `transitionSettled` → `transitionStarted` → `terminal`
+/// Blocking workflow conflicts pause at `awaitingConflictResolution` until operator or
+/// lead mediation resolves the conflict.
 enum TransitionSettlementPhase: String, Codable, Sendable, Equatable {
     /// Run has been created but no state has begun execution yet.
     case awaitingFirstState = "awaiting_first_state"
@@ -58,6 +63,9 @@ enum TransitionSettlementPhase: String, Codable, Sendable, Equatable {
 
     /// The scheduled next state has begun execution (agent work has started).
     case transitionStarted = "transition_started"
+
+    /// A workflow conflict blocked legal graph advancement at the current state.
+    case awaitingConflictResolution = "await_conflict_resolution"
 
     /// The run has reached a terminal state (completed, failed, or cancelled).
     case terminal = "terminal"
@@ -84,15 +92,20 @@ extension TransitionCursor {
     /// Seed a cursor for a pre-P032 legacy run being resumed from a heuristic continuation.
     /// Records the resume target as the next scheduled state so we don't lose the
     /// heuristic computation by writing `.initial()`.
-    static func seededForResume(nextScheduledStateID: String) -> TransitionCursor {
+    static func seededForResume(
+        nextScheduledStateID: String,
+        nextScheduledIteration: Int? = nil,
+        nextScheduledAttemptNumber: Int? = nil,
+        scheduledStageExecutionID: UUID? = nil
+    ) -> TransitionCursor {
         TransitionCursor(
             sequenceNumber: 0,
             lastCompletedStateID: nil,
             lastCompletedStageExecutionID: nil,
             nextScheduledStateID: nextScheduledStateID,
-            nextScheduledIteration: nil,
-            nextScheduledAttemptNumber: nil,
-            scheduledStageExecutionID: nil,
+            nextScheduledIteration: nextScheduledIteration,
+            nextScheduledAttemptNumber: nextScheduledAttemptNumber,
+            scheduledStageExecutionID: scheduledStageExecutionID,
             settlementPhase: .transitionSettled,
             updatedAt: Date()
         )
@@ -135,10 +148,29 @@ extension TransitionCursor {
         )
     }
 
+    /// Cursor marking that transition authority blocked at a workflow conflict.
+    func markingWorkflowConflictBlocked(
+        currentStateID: String,
+        currentStageExecutionID: UUID?
+    ) -> TransitionCursor {
+        TransitionCursor(
+            sequenceNumber: sequenceNumber + 1,
+            lastCompletedStateID: currentStateID,
+            lastCompletedStageExecutionID: currentStageExecutionID,
+            nextScheduledStateID: nil,
+            nextScheduledIteration: nil,
+            nextScheduledAttemptNumber: nil,
+            scheduledStageExecutionID: nil,
+            settlementPhase: .awaitingConflictResolution,
+            updatedAt: Date()
+        )
+    }
+
     /// Cursor marking the run as terminal (completed, failed, or cancelled).
     func markingTerminal(
         lastCompletedStateID: String? = nil,
-        lastCompletedStageExecutionID: UUID? = nil
+        lastCompletedStageExecutionID: UUID? = nil,
+        terminalFailureReason: String? = nil
     ) -> TransitionCursor {
         TransitionCursor(
             sequenceNumber: sequenceNumber + 1,
@@ -149,7 +181,8 @@ extension TransitionCursor {
             nextScheduledAttemptNumber: nil,
             scheduledStageExecutionID: nil,
             settlementPhase: .terminal,
-            updatedAt: Date()
+            updatedAt: Date(),
+            terminalFailureReason: terminalFailureReason ?? self.terminalFailureReason
         )
     }
 }

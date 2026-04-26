@@ -1,0 +1,10 @@
+{
+  "schema_version": "operator-decisions.v1",
+  "decisions": [
+    {
+      "stage_id": "attempt_1",
+      "decision": "continue",
+      "at": "replay_start"
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+{
+  "review_pass_id": "rp-031-001",
+  "source_proposal_artifact": "/Users/user/Documents/Chainworks Forge/.chainworks/runs/8dd01a54-0791-43e0-b526-5ed92c95b34f/proposals/current/proposal.md",
+  "items": [
+    {
+      "id": "LIFT-R9-001",
+      "source_issue_id": "ARCH-R9-01",
+      "source_reviewer": "architect",
+      "severity": "blocking",
+      "current_score_impact": "Architect score 8; blocking issue prevents pass",
+      "title": "Reconcile P043 reference contract with GraphQL-only P031 correction",
+      "description": "Amend P043 reference and composed P031 gate language so command-completion refresh, command receipt display, and MCP command-control rules are explicitly outside P031-owned UI. Keep MCP documented for non-UI surfaces only.",
+      "estimated_lift": "Resolving removes the only blocker. Expected architect score lift: +0.5 to +1.0.",
+      "acceptance_criterion": "P043/P031 reference docs state P031 UI consumes GraphQL reads only. proposal-031 gate fails on UI MCP, UI GraphQL mutations, and UI command receipt state."
+    },
+    {
+      "id": "LIFT-R9-002",
+      "source_issue_id": "ARCH-R9-04",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "current_score_impact": "Converges with UX-R9-01, UI-02, PO-R9-04 across all four reviewers",
+      "title": "Define binary approval disabled-state contract",
+      "description": "Make approval decision behavior binary: hidden/read-only diagnostics only, or enabled through a named separately approved transport. No Swift inference of write availability. Replace disabled primary buttons with a distinct diagnostic-only UI element.",
+      "estimated_lift": "Expected architect: +0.2, UX: +0.5, UI: +0.3, PO: +0.1. Highest cross-panel impact.",
+      "acceptance_criterion": "Absent an approved transport, approval controls are disabled/hidden with server-provided diagnostic reasons. Gate proves controls cannot call MCP, GraphQL mutation, or local mutation."
+    },
+    {
+      "id": "LIFT-R9-003",
+      "source_issue_id": "ARCH-R9-02",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "current_score_impact": "Architect score 8",
+      "title": "Map new read-only metadata to concrete GraphQL schema fields",
+      "description": "Add a schema matrix for disabledReasonCode, payloadAvailabilityState, payloadUnavailableReasonCode, writePathState, diagnosticId, and serverDebugDetail: GraphQL type, enum cases, nullability, redaction, Swift presenter, and tests.",
+      "estimated_lift": "Expected architect score lift: +0.3. Also resolves UI-03 indirectly.",
+      "acceptance_criterion": "Approval, report, and disabled-state metadata fields are mapped to concrete GraphQL types with redaction tests."
+    },
+    {
+      "id": "LIFT-R9-004",
+      "source_issue_id": "ARCH-R9-03",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "current_score_impact": "Architect score 8",
+      "title": "Define P031-owned UI file/module boundary inventory",
+      "description": "Enumerate the exact Swift files/types in P031 scope, legacy-only files, generated GraphQL operation locations, forbidden import/call patterns, and explicit exclusions for non-workflow support.",
+      "estimated_lift": "Expected architect score lift: +0.2.",
+      "acceptance_criterion": "P031 gate has a maintained file/type allowlist. Static checks fail for governed surfaces importing MCP, GraphQL mutations, or local mutation services."
+    },
+    {
+      "id": "LIFT-R9-005",
+      "source_issue_id": "PO-R9-01",
+      "source_reviewer": "product_owner",
+      "severity": "non_blocking",
+      "current_score_impact": "Product owner score 8; condition for full approval",
+      "title": "Document operator write-path workflow before dogfood",
+      "description": "Map each removed P031 UI write control to its current alternative surface (MCP terminal, CLI, automation) or explicitly mark it temporarily unavailable with a follow-up reference.",
+      "estimated_lift": "Expected product owner score lift: +0.5. Resolves one of two PO approval conditions.",
+      "acceptance_criterion": "Pre-dogfood operator communication artifact maps 100% of removed controls. Zero dogfood-blocking escalations from undocumented write paths."
+    },
+    {
+      "id": "LIFT-R9-006",
+      "source_issue_id": "PO-R9-02",
+      "source_reviewer": "product_owner",
+      "severity": "non_blocking",
+      "current_score_impact": "Product owner score 8; condition for full approval",
+      "title": "Add user-outcome metric for operator workflow viability",
+      "description": "After each dogfood run, capture whether the participating operator completed the run workflow end-to-end without improvised workarounds.",
+      "estimated_lift": "Expected product owner score lift: +0.25. Resolves second PO approval condition.",
+      "acceptance_criterion": "Dogfood evidence includes per-run operator workflow-completion note from at least one operator."
+    },
+    {
+      "id": "LIFT-R9-007",
+      "source_issue_id": "UX-R9-01",
+      "source_reviewer": "ux_designer",
+      "severity": "non_blocking",
+      "current_score_impact": "UX score 8.5",
+      "title": "Replace disabled approval buttons with contextual diagnostic guidance",
+      "description": "Instead of a disabled standard button, use a distinct inline banner or terminal-styled text box with 'Execute via CLI' and copyable ID. Aligns operator mental model immediately.",
+      "estimated_lift": "Expected UX score lift: +0.5.",
+      "acceptance_criterion": "Approval controls when disabled use a diagnostic-specific UI element, not a disabled primary button."
+    },
+    {
+      "id": "LIFT-R9-008",
+      "source_issue_id": "UX-R9-02",
+      "source_reviewer": "ux_designer",
+      "severity": "non_blocking",
+      "current_score_impact": "UX score 8.5",
+      "title": "Add first-run onboarding banner for the read-only transition",
+      "description": "Display a dismissible banner on RunsHome during dogfood explaining that all control actions are managed via external tools.",
+      "estimated_lift": "Expected UX score lift: +0.25.",
+      "acceptance_criterion": "Dogfood mode shows a dismissible orientation banner on first thin-read launch."
+    },
+    {
+      "id": "LIFT-R9-009",
+      "source_issue_id": "UI-01",
+      "source_reviewer": "ui_designer",
+      "severity": "non_blocking",
+      "current_score_impact": "UI score 8",
+      "title": "Define Syncing pattern placement for detail views",
+      "description": "Standardize Syncing placement for RunDetailView and ArtifactsView (e.g., top trailing edge of navigation bar or fixed header slot).",
+      "estimated_lift": "Expected UI score lift: +0.5.",
+      "acceptance_criterion": "Syncing placement is specified for all non-list contexts with no layout shift."
+    },
+    {
+      "id": "LIFT-R9-010",
+      "source_issue_id": "UI-03",
+      "source_reviewer": "ui_designer",
+      "severity": "non_blocking",
+      "current_score_impact": "UI score 8",
+      "title": "Specify exact icon family for Report payload availability indicators",
+      "description": "Define SF Symbols or icon family for report payload states (e.g., doc.text.fill for available, doc for metadata-only) with stable width and density rules.",
+      "estimated_lift": "Expected UI score lift: +0.25.",
+      "acceptance_criterion": "Reports list payload indicator uses named SF Symbols with defined stable width."
+    },
+    {
+      "id": "LIFT-R9-011",
+      "source_issue_id": "ARCH-R9-05",
+      "source_reviewer": "architect",
+      "severity": "non_blocking",
+      "current_score_impact": "Architect score 8",
+      "title": "Promote full r9 contract to checked-in proposal or add governing addendum",
+      "description": "Synchronize r9 into docs/proposals/ or add a short addendum marking the run-local artifact as governing with Phase 0 obligations copied.",
+      "estimated_lift": "Expected architect score lift: +0.1.",
+      "acceptance_criterion": "Implementation tickets link one governing artifact. Checked-in proposal includes r9 no-UI-write guard strategy."
+    },
+    {
+      "id": "LIFT-R9-012",
+      "source_issue_id": "PO-R9-03",
+      "source_reviewer": "product_owner",
+      "severity": "non_blocking",
+      "current_score_impact": "Product owner score 8",
+      "title": "Add priority tiers and timeline expectations for follow-up proposals",
+      "description": "Each follow-up should have a priority tier and expected start timeframe relative to P031 completion. P031-FOLLOWUP-APPROVAL-WRITE-PATH should be the immediate next proposal.",
+      "estimated_lift": "Expected product owner score lift: +0.1.",
+      "acceptance_criterion": "Each follow-up has priority tier and expected start timeframe."
+    }
+  ]
+}

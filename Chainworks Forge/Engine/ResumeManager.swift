@@ -135,6 +135,14 @@ final class ResumeManager {
     // MARK: - Single Run Classification
 
     private func classifyRun(_ run: Run, compiler: RunPlanCompiler) -> ResumeAction {
+        // Check 0 (P033): Reject Goose-bound runs — legacy runtime no longer supported.
+        if isGooseBoundRun(run) {
+            return .cannotResume(
+                run,
+                reason: "This run was created with a runtime that is no longer supported. Create a new run to continue."
+            )
+        }
+
         // Check 1: Compiler version (ARCH-029)
         guard run.planCompilerVersion == RunPlan.currentCompilerVersion else {
             return .cannotResume(
@@ -164,6 +172,14 @@ final class ResumeManager {
             run.driftDetails = driftReason
         } else if run.driftDetails?.contains("hash mismatch") == true {
             run.driftDetails = nil
+        }
+
+        if run.transitionCursor?.settlementPhase == .awaitingConflictResolution,
+           let conflict = run.currentWorkflowConflictRecord {
+            return .needsDecision(
+                run,
+                reason: "Workflow conflict requires resolution before resume: \(conflict.reason.rawValue)"
+            )
         }
 
         // Check 4: Side-effect stage detection (e.g., git push, release)
@@ -216,7 +232,9 @@ final class ResumeManager {
                         driftReasons.append("Workflow source has changed (hash mismatch)")
                     }
                 } catch {
-                    // Can't read source — don't flag as drift, could be benign
+                    let message = "Workflow source could not be read during drift detection: \(error.localizedDescription)"
+                    ForgeLogger.recovery.error("\(message) [run=\(run.id)]")
+                    driftReasons.append(message)
                 }
             }
         }
@@ -224,7 +242,7 @@ final class ResumeManager {
         // Check catalog source drift
         if !run.catalogSourcePath.isEmpty {
             let sourceURL = URL(fileURLWithPath: run.catalogSourcePath)
-            if FileManager.default.fileExists(atPath: sourceURL.path) {
+            if SecurityScopedAccess.fileExists(at: sourceURL) {
                 do {
                     let currentCatalog = try YAMLParser.loadAgentCatalog(from: sourceURL)
                     let (_, currentHash) = try DefinitionHasher.hash(currentCatalog)
@@ -232,7 +250,9 @@ final class ResumeManager {
                         driftReasons.append("Agent catalog source has changed (hash mismatch)")
                     }
                 } catch {
-                    // Can't read source — don't flag as drift
+                    let message = "Agent catalog source could not be read during drift detection: \(error.localizedDescription)"
+                    ForgeLogger.recovery.error("\(message) [run=\(run.id)]")
+                    driftReasons.append(message)
                 }
             }
         }
@@ -321,6 +341,18 @@ final class ResumeManager {
             .map(\.stageID)
 
         return runningStageIDs.contains { isSideEffectState($0, plan: plan) }
+    }
+
+    // MARK: - Goose-era Detection (P033)
+
+    /// Returns `true` if any agent execution in the run carries a Goose adapter family.
+    /// Goose-bound runs cannot be resumed: the Goose runtime has been removed.
+    private func isGooseBoundRun(_ run: Run) -> Bool {
+        run.stageExecutions.contains { stage in
+            stage.agentExecutions.contains { agentExec in
+                agentExec.actualAdapterFamily == "goose"
+            }
+        }
     }
 
     private func mergedInterruptionReason(existing: String?) -> String {

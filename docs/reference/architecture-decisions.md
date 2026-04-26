@@ -91,10 +91,30 @@ This document records the key architecture decisions made during the foundation 
 
 **Consequence:** Same object always produces the same JSON bytes and the same SHA-256 hash. Verified by tests that encode the same object 100 times.
 
-## Idea does not carry workflowID
+## ARCH-031: Thin GraphQL-Only UI Rewrite
 
-**Context:** The schema allows many runs per idea, and each run must capture the exact workflow+catalog revision it was started with.
+**Context:** The macOS operator app traditionally read from SwiftData and issued commands through multiple paths (MCP, local services). This created ambiguity about the source of truth and allowed the UI to become a second control plane.
 
-**Decision:** `Idea` has no `workflowID` field. Workflow identity lives on `Run` through the provenance snapshot.
+**Decision:** The macOS UI is narrowed to a thin, GraphQL-only read client.
+1. Governed SwiftUI surfaces render workflow truth from server-owned GraphQL projections only.
+2. The UI is read-only: no MCP writes, no GraphQL mutations, no local mutation fallback.
+3. Every removed write control (Start, Cancel, Retry, Resolve Approval) is replaced with diagnostic guidance and identifiers for external CLI/MCP workflows.
+4. UI state is limited to presentation, server-derived caches, read-refresh state, and freshness handling.
 
-**Consequence:** Reruns are unambiguous. Resume is safe even when YAML changes between runs. Each run independently records what it was started with.
+**Consequence:** Single authoritative read plane (GraphQL). Commands move outside the macOS UI to validated external workflows. Static guards and a machine-readable UI inventory enforce the read-only boundary.
+
+## ARCH-037: Owner-aware execution identity
+
+**Context:** Agent executions traditionally assumed stage-ownership. Proposal 017 requires lead-mediated conflicts to own agent executions without creating synthetic stages.
+
+**Decision:** Migrate `AgentExecution` to a general owner model with `ownerKind` and `ownerID`. Support `stage_execution` and `lead_conflict_mediation` owners.
+
+**Consequence:** All persistence, quota, retry, artifact, and cost paths must key off durable owner identity. `stageExecutionID` becomes nullable. This enables mediation-owned executions to reuse the same infrastructure as stage-owned executions.
+
+## ARCH-038: Implementation Handoff Status
+
+**Context:** Runs entering implementation (Phase A/B) need to track engine-owned handoff truth separately from simple stage status.
+
+**Decision:** Use `ImplementationHandoffStatus` to track engine-owned handoff truth (`ready`, `blocked_before_code`, `running`).
+
+**Consequence:** Handoff remains engine-owned and deterministic, independent of advisory agent hints.

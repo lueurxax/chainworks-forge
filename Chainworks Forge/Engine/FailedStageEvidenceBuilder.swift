@@ -7,7 +7,7 @@ import Foundation
 ///
 /// Key principle (§6.2): Validation must never be the point where all
 /// downstream evidence disappears.
-struct FailedStageEvidenceBuilder {
+nonisolated struct FailedStageEvidenceBuilder {
 
     /// Build a complete evidence packet for a failed stage.
     /// This is the canonical reference for recovery UI, reports, and export.
@@ -35,6 +35,9 @@ struct FailedStageEvidenceBuilder {
         if let vf = validationFailure {
             failureSummary = vf.failureSummary
         } else if let agent = failedAgent,
+                  let supervision = agent.supervisionClassification {
+            failureSummary = supervision.defaultSummary
+        } else if let agent = failedAgent,
                   let envelope = decodeOutcomeEnvelope(from: agent),
                   let rawErrorMessage = envelope.rawErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !rawErrorMessage.isEmpty {
@@ -55,6 +58,8 @@ struct FailedStageEvidenceBuilder {
             }
         )
 
+        let failedAgentEnvelope = failedAgent.flatMap(decodeOutcomeEnvelope(from:))
+
         return FailedStageEvidencePacket(
             id: UUID(),
             timestamp: Date(),
@@ -65,6 +70,10 @@ struct FailedStageEvidenceBuilder {
             failedAgentTitle: failedAgent?.agentTitle,
             failureSummary: failureSummary,
             failureClass: validationFailure?.failureClass ?? .agentReportedFailure,
+            supervisionClassification: failedAgent?.supervisionClassification,
+            canonicalOutcome: failedAgent?.canonicalOutcome,
+            transportErrorKind: failedAgent?.transportErrorKind ?? failedAgentEnvelope?.transportErrorKind,
+            outputPresence: failedAgent?.outputPresence ?? failedAgentEnvelope?.outputPresence,
             rawOutputsExist: rawOutputsExist,
             receiptExists: receiptExists,
             transcriptExists: transcriptExists,
@@ -101,6 +110,10 @@ struct FailedStageEvidencePacket: Codable, Sendable, Identifiable {
     // Failure description
     let failureSummary: String
     let failureClass: ValidationFailureClass
+    let supervisionClassification: SupervisionClassification?
+    let canonicalOutcome: AgentCanonicalOutcome?
+    let transportErrorKind: TransportErrorKind?
+    let outputPresence: OutputPresence?
 
     // Evidence availability
     let rawOutputsExist: Bool

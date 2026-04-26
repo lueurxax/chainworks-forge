@@ -163,6 +163,78 @@ struct RecoveryCoordinatorTests {
         #expect(recoveryContext.suggestedAction == .cloneRunCurrentConfig)
     }
 
+    @Test("Implementation started recovery prefers stage retry when only lead orchestrator failed before code writer starts")
+    func implementationStartedRecoveryPrefersStageRetryOverLeadRetry() throws {
+        let context = try makeRecoveryContext()
+        let idea = Idea(title: "Blocked Implementation", body: "Body", status: .active)
+        context.insert(idea)
+
+        let run = makeRun(status: .blocked)
+        run.idea = idea
+        idea.runs.append(run)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(),
+            status: .blocked,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        stage.run = run
+        run.stageExecutions.append(stage)
+        context.insert(stage)
+
+        let agent = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "freeze_proposal_and_provision_worktree",
+            startedAt: Date(),
+            status: .failed,
+            provider: "claude_code",
+            effort: "high"
+        )
+        agent.stageExecution = stage
+        agent.supervisionClassification = .idleHangBeforeFirstProgress
+        stage.agentExecutions.append(agent)
+        context.insert(agent)
+
+        let snapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(),
+            runID: run.id,
+            recommendedAction: RecoveryActionDetail(
+                action: .retryFailedAgent,
+                stageID: stage.stageID,
+                agentID: agent.agentID,
+                explanation: "Retry only the failed agent.",
+                staysInSameRun: true,
+                reusesSiblingOutputs: true,
+                reExecutesWholeStage: false
+            ),
+            availableActions: [
+                RecoveryActionDetail(
+                    action: .retryFailedStage,
+                    stageID: stage.stageID,
+                    agentID: nil,
+                    explanation: "Retry the entire implementation_started stage.",
+                    staysInSameRun: true,
+                    reusesSiblingOutputs: false,
+                    reExecutesWholeStage: true
+                )
+            ],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        stage.recoverySnapshotJSON = try JSONEncoder().encode(snapshot)
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let recoveryContext = coordinator.recoveryContext(for: run)
+
+        #expect(recoveryContext.suggestedAction == .retryStage(stageID: stage.stageID))
+    }
+
     @Test("Retry agent targets latest failed attempt in repeated stage lineage")
     func retryAgentTargetsLatestFailedAttemptInRepeatedStageLineage() throws {
         let context = try makeRecoveryContext()
@@ -237,6 +309,267 @@ struct RecoveryCoordinatorTests {
         let retryAttempts = failedStage.agentExecutions.filter { $0.agentID == "proposal_writer" && $0.status == .pending }
         #expect(retryAttempts.count == 1)
         #expect(retryAttempts.first?.supersedesAgentExecutionID == failedAgent.id)
+    }
+
+    @Test("Stage retry coordinator scopes automatic retry lineage to the failed task packet")
+    func stageRetryCoordinatorScopesRetryLineageToTaskPacket() throws {
+        let context = try makeRecoveryContext()
+        let run = makeRun(status: .blocked)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        run.stageExecutions.append(stage)
+        context.insert(stage)
+
+        let siblingTaskOne = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "task_a",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        siblingTaskOne.agentAttemptNumber = 1
+        siblingTaskOne.stageExecution = stage
+        stage.agentExecutions.append(siblingTaskOne)
+        context.insert(siblingTaskOne)
+
+        let siblingTaskTwo = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "task_a",
+            startedAt: Date(timeIntervalSince1970: 102),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        siblingTaskTwo.agentAttemptNumber = 2
+        siblingTaskTwo.stageExecution = stage
+        stage.agentExecutions.append(siblingTaskTwo)
+        context.insert(siblingTaskTwo)
+
+        let targetCompleted = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "task_b",
+            startedAt: Date(timeIntervalSince1970: 103),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        targetCompleted.agentAttemptNumber = 1
+        targetCompleted.stageExecution = stage
+        stage.agentExecutions.append(targetCompleted)
+        context.insert(targetCompleted)
+
+        let failedTarget = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "task_b",
+            startedAt: Date(timeIntervalSince1970: 104),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedTarget.agentAttemptNumber = 2
+        failedTarget.stageExecution = stage
+        stage.agentExecutions.append(failedTarget)
+        context.insert(failedTarget)
+
+        let retryCoordinator = StageRetryCoordinator(modelContext: context)
+        let retryExec = try retryCoordinator.retryFailedAgent(run: run, stage: stage, failedAgent: failedTarget, retryReason: "automatic_watchdog_retry")
+
+        #expect(retryExec.taskName == "task_b")
+        #expect(retryExec.agentAttemptNumber == 3)
+        #expect(retryExec.supersedesAgentExecutionID == failedTarget.id)
+    }
+
+    @Test("Retry stage targets the latest failed stage attempt for a repeated stage lineage")
+    func retryStageTargetsLatestFailedStageAttempt() throws {
+        let context = try makeRecoveryContext()
+        let run = makeRun(status: .failed)
+        context.insert(run)
+
+        let earlierStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        earlierStage.run = run
+        context.insert(earlierStage)
+
+        let latestStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        latestStage.run = run
+        context.insert(latestStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: "state_8_implementation_continued")
+
+        let retryStage = try #require(
+            run.stageExecutions
+                .filter { $0.stageID == "state_8_implementation_continued" }
+                .max { lhs, rhs in lhs.attemptNumber < rhs.attemptNumber }
+        )
+        #expect(retryStage.id != earlierStage.id)
+        #expect(retryStage.id != latestStage.id)
+        #expect(retryStage.attemptNumber == 3)
+        #expect(retryStage.status == .ready)
+    }
+
+    @Test("Retry stage rebinds continuation cursor and supersedes stale running attempts in the same state iteration")
+    func retryStageRebindsCursorAndSupersedesStaleRunningAttempt() throws {
+        let context = try makeRecoveryContext()
+        let run = makeRun(status: .blocked)
+        context.insert(run)
+
+        let staleBlockedStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .blocked,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        staleBlockedStage.run = run
+        context.insert(staleBlockedStage)
+
+        let staleRunningStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .running,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        staleRunningStage.run = run
+        context.insert(staleRunningStage)
+
+        let latestBlockedStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 102),
+            status: .blocked,
+            iteration: 7,
+            attemptNumber: 2
+        )
+        latestBlockedStage.run = run
+        context.insert(latestBlockedStage)
+
+        let staleRunningAgent = AgentExecution(
+            agentID: "lead_orchestrator",
+            agentTitle: "Lead / Orchestrator",
+            taskName: "freeze_proposal_and_provision_worktree",
+            startedAt: Date(timeIntervalSince1970: 103),
+            status: .running,
+            provider: "claude_code",
+            effort: "high"
+        )
+        staleRunningAgent.stageExecution = staleRunningStage
+        staleRunningStage.agentExecutions.append(staleRunningAgent)
+        context.insert(staleRunningAgent)
+
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 12,
+                lastCompletedStateID: "state_6_implementation_approval",
+                lastCompletedStageExecutionID: UUID(),
+                nextScheduledStateID: "state_7_implementation_started",
+                nextScheduledIteration: 7,
+                nextScheduledAttemptNumber: 2,
+                scheduledStageExecutionID: staleRunningStage.id,
+                settlementPhase: .transitionStarted,
+                updatedAt: Date(timeIntervalSince1970: 104)
+            )
+        )
+
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: "state_7_implementation_started")
+
+        let retriedStages = run.stageExecutions.filter { stage in
+            stage.stageID == "state_7_implementation_started"
+                && stage.iteration == 7
+                && stage.attemptNumber == 3
+        }
+        let newStage = try #require(retriedStages.first)
+
+        #expect(newStage.status == .ready)
+        #expect(run.transitionCursor?.nextScheduledStateID == "state_7_implementation_started")
+        #expect(run.transitionCursor?.nextScheduledIteration == 7)
+        #expect(run.transitionCursor?.nextScheduledAttemptNumber == 3)
+        #expect(run.transitionCursor?.scheduledStageExecutionID == newStage.id)
+        #expect(run.transitionCursor?.settlementPhase == .transitionSettled)
+        #expect(staleRunningStage.status != .running)
+        #expect(staleRunningAgent.status != .running)
+        #expect(latestBlockedStage.status == .blocked)
+    }
+
+    @Test("Stage retry coordinator snapshot explains exhausted automatic watchdog retries")
+    func stageRetryCoordinatorSnapshotExplainsExhaustedWatchdogRetries() throws {
+        let context = try makeRecoveryContext()
+        let run = makeRun(status: .blocked)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        run.stageExecutions.append(stage)
+        context.insert(stage)
+
+        let failedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedAgent.retryReason = "automatic_watchdog_retry"
+        failedAgent.agentAttemptNumber = 2
+        failedAgent.supervisionClassification = .idleHangAfterFirstEdit
+        failedAgent.stageExecution = stage
+        stage.agentExecutions.append(failedAgent)
+        context.insert(failedAgent)
+
+        let snapshot = StageRetryCoordinator(modelContext: context).narrowestRecoveryAction(
+            for: run,
+            failedStage: stage,
+            failedAgent: failedAgent,
+            validationFailure: nil
+        )
+
+        #expect(snapshot.recommendedAction?.action == .retryFailedAgent)
+        #expect(snapshot.recommendedAction?.agentID == failedAgent.agentID)
+        #expect(snapshot.recommendedAction?.explanation.localizedCaseInsensitiveContains("automatic watchdog retry") == true)
+        #expect(snapshot.recommendedAction?.explanation.localizedCaseInsensitiveContains("first edit") == true)
     }
 
     @Test("Interrupted transition prefers resume action over invalid retry stage")
@@ -374,6 +707,166 @@ struct RecoveryCoordinatorTests {
         #expect(actions.contains(.resumeInterrupted(stageID: "state_7_implementation_started")))
         #expect(recoveryContext.suggestedAction == .resumeInterrupted(stageID: "state_7_implementation_started"))
     }
+
+    @Test("Exhausted watchdog retry truth beats stale interrupted continuation cursor")
+    func exhaustedWatchdogRetryBeatsInterruptedContinuationCursor() throws {
+        let context = try makeRecoveryContext()
+        let idea = Idea(title: "Watchdog Idea", body: "Body", status: .active)
+        context.insert(idea)
+
+        let run = makeRun(status: .blocked)
+        run.idea = idea
+        idea.runs.append(run)
+        context.insert(run)
+
+        let failedStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        run.stageExecutions.append(failedStage)
+        context.insert(failedStage)
+
+        let failedRetry = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 210),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedRetry.completedAt = Date(timeIntervalSince1970: 240)
+        failedRetry.retryReason = "automatic_watchdog_retry"
+        failedRetry.agentAttemptNumber = 2
+        failedRetry.canonicalOutcome = .failedBeforeOutput
+        failedRetry.supervisionClassification = .idleHangAfterFirstEdit
+        failedRetry.stageExecution = failedStage
+        failedStage.agentExecutions.append(failedRetry)
+        context.insert(failedRetry)
+
+        let snapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(),
+            runID: run.id,
+            recommendedAction: RecoveryActionDetail(
+                action: .retryFailedAgent,
+                stageID: failedStage.stageID,
+                agentID: failedRetry.agentID,
+                explanation: "Automatic watchdog retry already consumed; retry the failed code writer explicitly.",
+                staysInSameRun: true,
+                reusesSiblingOutputs: true,
+                reExecutesWholeStage: false
+            ),
+            availableActions: [],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        failedStage.recoverySnapshotJSON = try JSONEncoder().encode(snapshot)
+
+        let staleContinuation = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed",
+            startedAt: Date(timeIntervalSince1970: 250),
+            status: .ready,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        staleContinuation.run = run
+        run.stageExecutions.append(staleContinuation)
+        context.insert(staleContinuation)
+
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 4,
+                lastCompletedStateID: failedStage.stageID,
+                lastCompletedStageExecutionID: failedStage.id,
+                nextScheduledStateID: staleContinuation.stageID,
+                nextScheduledIteration: staleContinuation.iteration,
+                nextScheduledAttemptNumber: staleContinuation.attemptNumber,
+                scheduledStageExecutionID: staleContinuation.id,
+                settlementPhase: .transitionSettled,
+                updatedAt: Date()
+            )
+        )
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        let actions = coordinator.availableActions(for: run)
+        let recoveryContext = coordinator.recoveryContext(for: run)
+
+        #expect(actions.first == .retryAgent(stageID: failedStage.stageID, agentID: failedRetry.agentID))
+        #expect(!actions.contains(.resumeInterrupted(stageID: staleContinuation.stageID)))
+        #expect(recoveryContext.suggestedAction == .retryAgent(stageID: failedStage.stageID, agentID: failedRetry.agentID))
+        #expect(recoveryContext.reason.localizedCaseInsensitiveContains("first edit"))
+        #expect(recoveryContext.failureClass == SupervisionClassification.idleHangAfterFirstEdit.rawValue)
+    }
+
+    @Test("Evidence packet prefers exhausted watchdog retry stage over a later generic blocked stage")
+    func evidencePacketPrefersExhaustedWatchdogStage() throws {
+        let context = try makeRecoveryContext()
+        let run = makeRun(status: .blocked)
+        context.insert(run)
+
+        let watchdogStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        watchdogStage.run = run
+        context.insert(watchdogStage)
+
+        let watchdogAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        watchdogAgent.completedAt = Date(timeIntervalSince1970: 120)
+        watchdogAgent.supervisionClassification = .idleHangAfterFirstEdit
+        watchdogAgent.retryReason = "automatic_watchdog_retry"
+        watchdogAgent.stageExecution = watchdogStage
+        context.insert(watchdogAgent)
+
+        let laterStage = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        laterStage.run = run
+        context.insert(laterStage)
+
+        let laterAgent = AgentExecution(
+            agentID: "reviewer",
+            agentTitle: "Reviewer",
+            taskName: "review",
+            startedAt: Date(timeIntervalSince1970: 201),
+            status: .failed,
+            provider: "claude",
+            effort: "high"
+        )
+        laterAgent.completedAt = Date(timeIntervalSince1970: 220)
+        laterAgent.logSnippet = "generic blocked stage"
+        laterAgent.stageExecution = laterStage
+        context.insert(laterAgent)
+        try context.save()
+
+        let packet = try #require(RecoveryCoordinator(modelContext: context).buildEvidencePacket(for: run))
+        #expect(packet.stageID == watchdogStage.stageID)
+        #expect(packet.supervisionClassification == .idleHangAfterFirstEdit)
+    }
 }
 
 private func makeRecoveryContext() throws -> ModelContext {
@@ -435,7 +928,7 @@ private func makeRecoveryCatalog() -> AgentCatalog {
         schemaVersion: 1,
         app: AppConfig(
             name: "test",
-            runtime: "goose",
+            runtime: "claude_agent",
             transport: "http",
             description: "test",
             ideaInputMode: "text",

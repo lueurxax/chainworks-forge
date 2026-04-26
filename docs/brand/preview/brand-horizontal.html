@@ -1,0 +1,75 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Horizontal logo</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{
+    font-family:var(--font-text);color:var(--label);
+    -webkit-font-smoothing:antialiased;
+    padding:24px;box-sizing:border-box;
+  }
+  .stack{display:flex;flex-direction:column;gap:18px;}
+  .lbl{
+    font:var(--t-caption2);
+    letter-spacing:0.05em;
+    color:var(--label-tertiary);
+    text-transform:uppercase;
+    font-weight:600;
+  }
+  .meta{
+    font:var(--t-caption1);
+    color:var(--label-secondary);
+    margin-top:2px;
+  }
+
+  /* Primary lockup — full hero panel.
+     The image is its own background; we don't wrap it in another dark card. */
+  .hero{
+    border-radius:14px;
+    overflow:hidden;
+    box-shadow:
+      0 1px 2px rgba(4,8,13,0.10),
+      0 12px 32px rgba(4,8,13,0.18);
+    line-height:0;
+  }
+  .hero img{
+    width:100%;
+    height:auto;
+    display:block;
+  }
+
+  /* Light surface — flat two-color lockup */
+  .card-light{
+    background:#FFFFFF;
+    border-radius:14px;
+    padding:28px 36px;
+    display:flex;align-items:center;
+    box-shadow:
+      0 1px 2px rgba(4,8,13,0.04),
+      0 6px 20px rgba(4,8,13,0.06);
+  }
+  .card-light img{ height:60px;display:block; }
+</style></head>
+<body>
+
+<div class="stack">
+
+  <div>
+    <div class="lbl">Primary lockup · On dark</div>
+    <div class="meta">Hero panel — README header, landing hero, marketing surfaces. Use as-is, no further chrome.</div>
+  </div>
+  <div class="hero">
+    <img src="../assets/brand-hero-panel.png" alt="Chainworks Forge"/>
+  </div>
+
+  <div>
+    <div class="lbl">Primary lockup · On light</div>
+    <div class="meta">Documents, light app surfaces, print. Use as-is, no further chrome.</div>
+  </div>
+  <div class="hero">
+    <img src="../assets/brand-hero-panel-light.png" alt="Chainworks Forge"/>
+  </div>
+
+</div>
+
+</body></html>

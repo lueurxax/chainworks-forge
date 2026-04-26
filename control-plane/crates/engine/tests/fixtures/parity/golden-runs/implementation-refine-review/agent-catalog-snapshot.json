@@ -1,0 +1,13 @@
+{
+  "schema_version": "agent-catalog-snapshot.v1",
+  "agents": [
+    {
+      "id": "fixture_agent",
+      "provider": "claude"
+    }
+  ],
+  "artifact_templates": {
+    "implementation_patch": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/implementation_patch.json",
+    "review_notes": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/review_notes.json"
+  }
+}

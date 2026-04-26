@@ -3,8 +3,8 @@ import Foundation
 // MARK: - RuntimeTransportProtocol (Proposal 026 — ACP-shaped canonical runtime transport)
 
 /// Canonical runtime transport contract. ACP-shaped vocabulary for session lifecycle,
-/// prompt submission, and stream events. All runtime adapters (Goose, Claude Agent ACP,
-/// Gemini CLI ACP) implement this protocol.
+/// prompt submission, and stream events. All runtime adapters (Claude Agent ACP,
+/// Gemini CLI ACP, Codex ACP) implement this protocol.
 protocol RuntimeTransportProtocol: Sendable {
     /// Transport-owned runtime namespace used to resolve session-scoped MCP mappings.
     /// Keeps MCP policy independent from frozen provider bindings in fixture/proof flows.
@@ -168,6 +168,31 @@ struct RuntimeSessionResponse: Codable, Sendable {
 
 struct RuntimeSessionRuntimeState: Codable, Sendable {
     let enabledExtensions: [String]
+    let runtimeHomePath: String?
+    let providerDiagnostics: [RuntimeProviderDiagnostic]
+
+    init(
+        enabledExtensions: [String],
+        runtimeHomePath: String? = nil,
+        providerDiagnostics: [RuntimeProviderDiagnostic] = []
+    ) {
+        self.enabledExtensions = enabledExtensions
+        self.runtimeHomePath = runtimeHomePath
+        self.providerDiagnostics = providerDiagnostics
+    }
+}
+
+enum RuntimeProviderDiagnosticSeverity: String, Codable, Sendable, Equatable {
+    case info
+    case warning
+    case error
+}
+
+struct RuntimeProviderDiagnostic: Codable, Sendable, Equatable {
+    let source: String
+    let severity: RuntimeProviderDiagnosticSeverity
+    let message: String
+    let normalizedReason: String?
 }
 
 // MARK: - RuntimeExecutionPolicy
@@ -243,9 +268,9 @@ enum RuntimeStreamEvent: Sendable {
 // MARK: - RuntimeExtensionRegistryProvider (Proposal 026 Phase 2)
 
 /// Abstracts MCP / extension registry access so core runtime code
-/// does not depend on the concrete Goose config reader.
+/// does not depend on a concrete config reader.
 protocol RuntimeExtensionRegistryProvider: Sendable {
-    func registrySnapshot() throws -> GooseExtensionRegistrySnapshot
+    func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot
 }
 
 // MARK: - RuntimeTransportError
@@ -282,6 +307,18 @@ enum RuntimeTransportError: Error, LocalizedError {
 /// Transports are cached by adapter family — max one instance per family per run.
 protocol RuntimeTransportFactory: Sendable {
     func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol
+}
+
+/// Optional lifecycle hook for factories that cache live runtime transports and need
+/// explicit app-termination cleanup beyond normal per-session settlement.
+protocol RuntimeTransportFactoryTerminationControlling: Sendable {
+    func terminateActiveTransportsForAppShutdown()
+}
+
+/// Optional lifecycle hook for transports that own live runtime sessions/processes and
+/// need immediate teardown during app termination.
+protocol RuntimeTransportTerminationControlling: Sendable {
+    func terminateActiveSessionsForAppShutdown()
 }
 
 /// Trivial factory wrapping a single transport — backward compatibility for tests

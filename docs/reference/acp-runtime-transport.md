@@ -1,6 +1,6 @@
 # ACP Runtime Transport
 
-Stable reference for the ACP-shaped runtime transport layer in Chainworks Forge, including runtime selection, adapter families, persisted runtime truth, and Goose's current role as a compatibility adapter inside the transport stack.
+Stable reference for the ACP-only runtime transport layer in Chainworks Forge, including runtime selection, adapter families, and persisted runtime truth.
 
 ## Purpose
 
@@ -8,11 +8,11 @@ Runtime execution should be transport-neutral at the control-plane level.
 
 The app must be able to:
 
-- compile runs without binding core orchestration to Goose endpoint semantics,
+- compile runs without binding orchestration to provider-specific endpoint semantics,
 - select a runtime through catalog/runtime-profile truth,
 - persist transport-neutral execution truth,
 - support multiple ACP-capable runtimes,
-- and keep Goose available as an adapter without letting it define the core model.
+- and keep the control plane independent from any one adapter family.
 
 ## Scope
 
@@ -23,7 +23,6 @@ This reference covers:
 - catalog-owned runtime profiles,
 - backend-profile to runtime-profile binding,
 - ACP adapter families,
-- Goose compatibility adapter role,
 - runtime-profile and backend-profile interaction,
 - persisted transport-neutral run truth,
 - and operator-facing consequences of runtime selection.
@@ -41,11 +40,10 @@ It does not define:
 - [provider-platform.md](provider-platform.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
 - [live-provider-execution-slice.md](live-provider-execution-slice.md)
-- [goose-server-transport.md](goose-server-transport.md)
 
 ## Canonical transport contract
 
-Core execution now depends on `RuntimeTransportProtocol`, not on Goose-specific REST or SSE semantics.
+Core execution depends on `RuntimeTransportProtocol` as the stable ACP runtime boundary.
 
 The transport contract owns:
 
@@ -100,8 +98,11 @@ Current repo-backed runtime profiles are:
 |---|---|---|---|---|
 | `claude_agent_acp` | `claude_agent_acp` | `operator_grade` | `acp_stdio` | `acp_native` |
 | `gemini_cli_acp` | `gemini_cli_acp` | `control_capable` | `acp_stdio` | `acp_native` |
+| `codex_acp` | `codex_acp` | `operator_grade` | `acp_stdio` | `acp_native` |
+| `auggie_cli_acp` | `auggie_cli_acp` | `control_capable` | `acp_stdio` | `acp_native` |
+| `junie_cli_acp` | `junie_cli_acp` | `control_capable` | `acp_stdio` | `acp_native` |
 
-The catalog currently does not ship second-wave runtime profiles such as Codex ACP, Auggie CLI ACP, or Junie CLI ACP.
+`RuntimeProfile.requires` is a normative capability map — it gates launch, startup preflight, and MCP-policy reconciliation. Profiles that are known but missing required capabilities block run execution via the deterministic readiness contract. Disabled, configured, and unavailable states remain distinct in operator-facing surfaces (not collapsed into a single message path).
 
 ## Backend-profile ownership
 
@@ -113,7 +114,7 @@ Agents continue to select only `backend_profile`.
 - model,
 - effort,
 - structured-output intent,
-- and optional `runtime_profile`.
+- and backend-owned required MCP.
 
 This keeps runtime selection attached to the same binding lane that already owns provider/model intent.
 
@@ -121,7 +122,8 @@ In the current catalog:
 
 - Claude-backed operator and writer profiles bind to `claude_agent_acp`
 - Gemini review profiles bind to `gemini_cli_acp`
-- backend profiles without `runtime_profile` continue to execute through the Goose compatibility path
+- Codex-backed implementation and authoring profiles bind to `codex_acp`
+- Auggie and Junie remain ACP-only families where configured
 
 The current resolver path is:
 
@@ -135,41 +137,43 @@ backend_profile
 
 ## Implemented transport families
 
-### Goose compatibility adapter
-
-Goose remains implemented and supported through adapter seams:
-
-- `GooseServerTransport`
-- `GooseTransport` legacy compatibility path where still applicable
-- `FixtureGooseTransport` for deterministic testing
-
-Goose is part of the transport layer, not the canonical control-plane model.
-
 ### ACP-native adapters
 
-The currently implemented ACP-native adapters are:
+The currently implemented ACP-native adapters are normalized into canonical 
+provider families (`claude`, `gemini`, `codex`, `auggie`, `junie`) for 
+consistent capacity management and backpressure:
 
-- `ClaudeAgentACPTransport`
-- `GeminiCLIACPTransport`
+- `ClaudeAgentACPTransport` (canonical: `claude`)
+- `GeminiCLIACPTransport` (canonical: `gemini`)
+- `CodexACPTransport` (canonical: `codex`)
+- `AuggieCLIACPTransport` (canonical: `auggie`)
+- `JunieCLIACPTransport` (canonical: `junie`)
 
 Shared ACP plumbing lives in:
 
 - `ACPSubprocessManager`
 - `ACPStreamEventMapper`
 
+#### Bounded Discovery and DiscoveryFilesystem
+
+Broad filesystem discovery is not part of the pre-`initialize` path. Instead of implicit inference from the entire repository or worktree, the system uses a bounded discovery model:
+
+- **DiscoveryFilesystem Ownership**: Shared discovery value-types and filesystem logic live in `domain::discovery`, while policy construction remains engine-owned.
+- **Bounded Discovery**: Discovery is restricted to the run meta-root and explicitly declared expected output paths.
+- **Pre-Prompt Metadata**: Metadata capture is now a per-execution, per-prompt-turn step for both fresh and reused sessions.
+- **Settlement Pipeline**: An engine-owned pipeline settles discovered artifacts based on typed expected outputs and discovery decisions.
+
 ## Current factory behavior
 
-`DefaultRuntimeTransportFactory` currently has three effective paths:
+`DefaultRuntimeTransportFactory` now resolves only ACP families:
 
-1. `adapterFamily == "goose"` or missing runtime profile -> shared Goose transport
-2. `adapterFamily == "claude_agent_acp"` -> `ClaudeAgentACPTransport`
-3. `adapterFamily == "gemini_cli_acp"` -> `GeminiCLIACPTransport`
+1. `adapterFamily == "claude_agent_acp"` -> `ClaudeAgentACPTransport`
+2. `adapterFamily == "gemini_cli_acp"` -> `GeminiCLIACPTransport`
+3. `adapterFamily == "codex_acp"` -> `CodexACPTransport`
+4. `adapterFamily == "auggie_cli_acp"` -> `AuggieCLIACPTransport`
+5. `adapterFamily == "junie_cli_acp"` -> `JunieCLIACPTransport`
 
-Important current limitation:
-
-- unknown non-Goose adapter families still fall back to Goose when Goose is configured
-
-That fallback is the current implementation truth and should be treated as a compatibility behavior, not as a future-safe rollout contract.
+Unknown families fail closed.
 
 ## Persisted runtime truth
 
@@ -192,21 +196,6 @@ Concrete persisted execution truth includes:
 - `ResolvedProviderBinding.capabilityClass`
 - `AgentExecution.runtimeProfileID`
 - `AgentExecution.actualAdapterFamily`
-
-## Goose's current role
-
-Goose still matters, but its role is narrower than before:
-
-- local managed runtime continuity,
-- compatibility path for existing provider workflows,
-- one adapter family within a broader transport system,
-- runtime-specific MCP realization where relevant.
-
-What Goose no longer owns:
-
-- the canonical transport vocabulary,
-- the control-plane execution model,
-- or the only supported live runtime shape.
 
 ## ACP operator impact
 
@@ -233,29 +222,26 @@ This is how ACP support became part of the system without rewriting the operator
 
 ## Current invariants
 
-The implemented first-wave ACP baseline currently guarantees:
+The implemented ACP baseline currently guarantees:
 
-1. core execution code depends on `RuntimeTransportProtocol`, not Goose endpoint semantics,
-2. Goose remains the default continuity path for backend profiles without explicit runtime profiles,
-3. runtime profile choice is frozen into run-start binding truth,
-4. operator/report/recovery surfaces read persisted Forge truth rather than adapter-local heuristics,
-5. Claude Agent ACP and Gemini CLI ACP are the only first-wave ACP adapters currently supported in repo-owned catalog data.
-
-The implementation does **not** currently guarantee:
-
-- fail-closed rejection for every unknown adapter family,
-- second-wave ACP provider support,
-- or Goose removal as the default compatibility path.
+1. core execution code depends on `RuntimeTransportProtocol` as the canonical ACP transport boundary,
+2. runtime profile choice is frozen into run-start binding truth,
+3. operator/report/recovery surfaces read persisted Forge truth rather than adapter-local heuristics,
+4. unknown adapter families fail closed,
+5. repo-owned catalog data can target Claude, Gemini, Codex, Auggie, and Junie ACP families.
 
 ## Current implementation owners
 
 - `Chainworks Forge/Engine/RuntimeTransport.swift`
 - `Chainworks Forge/Providers/BackendProfileResolverV2.swift`
 - `Chainworks Forge/Engine/ExecutionService.swift`
-- `Chainworks Forge/Engine/GooseSessionBridge.swift`
-- `Chainworks Forge/Engine/GooseAdapter/GooseServerTransport.swift`
+- `Chainworks Forge/Engine/RuntimeSessionBridge.swift`
+- `Chainworks Forge/Engine/RuntimeAgentExecutor.swift`
 - `Chainworks Forge/Engine/ACPAdapters/ClaudeAgentACPTransport.swift`
 - `Chainworks Forge/Engine/ACPAdapters/GeminiCLIACPTransport.swift`
+- `Chainworks Forge/Engine/ACPAdapters/CodexACPTransport.swift`
+- `Chainworks Forge/Engine/ACPAdapters/AuggieCLIACPTransport.swift`
+- `Chainworks Forge/Engine/ACPAdapters/JunieCLIACPTransport.swift`
 - `Chainworks Forge/Engine/ACPAdapters/ACPSubprocessManager.swift`
 - `Chainworks Forge/Engine/ACPAdapters/ACPStreamEventMapper.swift`
 - `Chainworks Forge/Models/AgentExecution.swift`

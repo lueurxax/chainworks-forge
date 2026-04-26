@@ -727,6 +727,29 @@ struct AgentSessionTests {
         #expect(json != nil)
     }
 
+    @Test("SessionLineageReportBridge surfaces fetch failures in the envelope")
+    func reportBridgeSurfacesFetchFailure() throws {
+        enum TestError: LocalizedError {
+            case fetchFailed
+
+            var errorDescription: String? {
+                "fixture fetch failed"
+            }
+        }
+
+        let runID = UUID()
+        let envelope = SessionLineageReportBridge.generateEnvelope(
+            for: runID,
+            fetchLineages: {
+                throw TestError.fetchFailed
+            }
+        )
+
+        #expect(envelope.reports.isEmpty)
+        let errorMessage = try #require(envelope.errorMessage)
+        #expect(errorMessage.contains("fixture fetch failed"))
+    }
+
     // MARK: - Receipt Fields (REQ-006)
 
     @Test("SessionReuseReceiptFields builds from AgentExecution")

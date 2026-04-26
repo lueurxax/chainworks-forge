@@ -11,9 +11,15 @@ xcuserdata/
 build/
 DerivedData/
 DerivedDataCodex/
+.xcode-cloud/
+
+# Generated documentation/export bundles
+/docs.zip
 
 # Swift Package Manager
 .build/
+control-plane/target/
+control-plane/control-plane/
 
 # Temporary editor files
 *.swp
@@ -21,3 +27,18 @@ DerivedDataCodex/
 
 # Local tool state
 .claude/
+.chainworks/
+traces/
+.forge-codex-acp/
+control-plane/chainworks-control-plane.db
+control-plane/chainworks-control-plane.db-*
+control-plane/crates/daemon/principals.json
+
+# Local SQLite runtime databases at repository root.
+/*.db
+/*.db-shm
+/*.db-wal
+/chainworks-control-plane.db.backup-*.sqlite
+
+# P042 §10.5 release-host credentials (checked via example template only).
+scripts/packaging.env

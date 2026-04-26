@@ -9,34 +9,22 @@ import AppKit
 @MainActor
 @Suite("ProviderPlatform", .tags(.fast, .provider))
 struct ProviderPlatformTests {
+    private struct RawBookmarkRecord: Codable {
+        let path: String
+        let kind: SecurityScopedBookmarkKind
+        let bookmarkData: Data
+    }
+
+    private struct ThrowingExtensionRegistryProvider: RuntimeExtensionRegistryProvider {
+        let error: Error
+
+        func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot {
+            throw error
+        }
+    }
+
     private static var retainedObjects: [AnyObject] = []
     private static var retainedRegistries: [ProviderRegistry] = []
-
-    final class TestGooseHandle: GooseServerProcessHandle {
-        var isRunning: Bool = true
-
-        func terminate() {
-            isRunning = false
-        }
-    }
-
-    final class TestLifecycleGooseController: ManagedGooseServerControlling {
-        var stopCallCount = 0
-        var sleepCallCount = 0
-        var wakeCallCount = 0
-
-        func stopManagedServer() {
-            stopCallCount += 1
-        }
-
-        func prepareForSystemSleep() {
-            sleepCallCount += 1
-        }
-
-        func reconcileAfterSystemWake() async {
-            wakeCallCount += 1
-        }
-    }
 
     private func makeTestSecretStore(_ serviceName: String) -> KeychainSecretStore {
         KeychainSecretStore(serviceName: serviceName, useInMemoryStore: true)
@@ -95,7 +83,7 @@ struct ProviderPlatformTests {
       execution:
         single_active_run_per_idea: true
       required_providers:
-        - codex
+        - codexACP
     variables: {}
     states:
       state_1_write:
@@ -109,13 +97,13 @@ struct ProviderPlatformTests {
     schema_version: 1
     app:
       name: Chainworks
-      runtime: goose
+      runtime: claude_agent
       transport: rest_sse
     agents:
       code_writer:
         title: Code Writer
         mode: tool_use
-        provider: codex
+        provider: codexACP
         model: codex
         effort: high
         max_turns: 5
@@ -126,14 +114,8 @@ struct ProviderPlatformTests {
         outputs: [output]
     """
 
-    private func makeAdapters(
-        gooseProbe: @escaping @Sendable (URL) async -> GooseServerReachability = { _ in .reachable(statusCode: 200) }
-    ) -> [ProviderFamily: any ProviderAdapter] {
-        [
-            .codex: CodexProviderAdapter(gooseProbe: gooseProbe),
-            .claude: ClaudeProviderAdapter(gooseProbe: gooseProbe),
-            .gemini: GeminiProviderAdapter(gooseProbe: gooseProbe)
-        ]
+    private func makeAdapters() -> [ProviderFamily: any ProviderAdapter] {
+        ProviderAdapterFactory.makeAdapters()
     }
 
     private func unzipArchive(_ archiveURL: URL, to destinationURL: URL) throws {
@@ -307,35 +289,39 @@ struct ProviderPlatformTests {
         #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
     }
 
-    @Test("Fixture live runtime is ready even when managed Goose server is idle")
-    mutating func fixtureLiveRuntimeIsReadyWhenServerManagerIsIdle() throws {
+    @Test("Workflow YAML remains readable through security-scoped access")
+    mutating func workflowYAMLRemainsReadableThroughSecurityScopedAccess() throws {
+        clearSecurityScopedBookmarks()
+
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            clearSecurityScopedBookmarks()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let (workflowURL, _) = try makeCanonicalYAMLCopies(in: tempDirectory)
+        SecurityScopedAccess.remember(url: workflowURL, kind: .workflowSource)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+
+        #expect(workflow.workflow.id.isEmpty == false)
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().contains(workflowURL.standardizedFileURL.path))
+    }
+
+    @Test("Fixture live runtime is ready")
+    mutating func fixtureLiveRuntimeIsReady() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let (_, context) = try makeTestModelContainer()
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-        let gooseServerManager = GooseServerManager(appConfigurationStore: store)
         let configuration = LiveRuntimeConfiguration(
-            baseURL: URL(string: "http://fixture.local")!,
-            apiKey: nil,
             override: LiveExecutionOverride(
                 enabled: true,
-                provider: "claude_code",
+                provider: "claude_acp",
                 model: "fixture-model",
                 effort: "high"
             ),
-            transportMode: .fixtureFullMVPSuccess,
-            transportAPI: .bespoke
+            transportMode: .fixtureFullMVPSuccess
         )
 
         let service = ExecutionService(
@@ -343,8 +329,7 @@ struct ProviderPlatformTests {
             executor: SimulatedAgentExecutor(simulatedDelay: 0),
             catalog: nil,
             stewardConfig: nil,
-            liveRuntimeConfiguration: configuration,
-            gooseServerManager: gooseServerManager
+            liveRuntimeConfiguration: configuration
         )
 
         #expect(service.supportsLiveExecution)
@@ -357,302 +342,48 @@ struct ProviderPlatformTests {
         }
     }
 
-    @Test("Managed Goose server launches on bootstrap when autostart is enabled")
-    mutating func managedGooseServerLaunchesOnBootstrap() async throws {
+    @Test("ACP-backed live runtime is ready when providers are configured")
+    mutating func acpBackedLiveRuntimeIsReadyWhenProvidersAreConfigured() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                gooseServerAutostart: true,
-                gooseServerBinaryPath: "/bin/sh",
-                gooseServerSecretKey: "dev-secret",
-                activeConfigurationSource: .persistedSettings
+        let (_, context) = try makeTestModelContainer()
+        let provider = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gpt-5.4"
+        )
+        let settingsStore = ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [provider],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: provider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
             )
-        ))
+        )
+        let registry = retain(ProviderRegistry(settingsStore: settingsStore))
+        let catalog = try YAMLParser.loadAgentCatalog(from: testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml"))
 
-        var launchPlan: GooseManagedServerLaunchPlan?
-        var launchCount = 0
-        var probeCount = 0
-        let manager = GooseServerManager(
-            appConfigurationStore: store,
-            probe: { _ in
-                probeCount += 1
-                return probeCount >= 2 ? .reachable(statusCode: 200) : .unreachable(reason: "Connection refused")
-            },
-            launcher: { plan in
-                launchPlan = plan
-                launchCount += 1
-                return TestGooseHandle()
-            }
+        let service = ExecutionService(
+            modelContext: context,
+            executor: SimulatedAgentExecutor(simulatedDelay: 0),
+            catalog: catalog,
+            stewardConfig: nil,
+            liveRuntimeConfiguration: nil,
+            providerRegistry: registry
         )
 
-        await manager.bootstrap()
-
-        #expect(manager.launchState == .running)
-        #expect(launchCount == 1)
-        #expect(launchPlan?.arguments == ["agent"])
-        #expect(launchPlan?.environment["GOOSE_PORT"] == "51200")
-        #expect(launchPlan?.environment["GOOSE_HOST"] == "127.0.0.1")
-        #expect(launchPlan?.environment["GOOSE_TLS"] == "true")
-        #expect(launchPlan?.environment["PATH"]?.contains("/opt/homebrew/bin") == true)
-        #expect(launchPlan?.environment["NODE_OPTIONS"]?.contains("--max-old-space-size=4096") == true)
-    }
-
-    @Test("Managed Goose server does not auto-launch when autostart is disabled")
-    mutating func managedGooseServerDoesNotAutolaunchWhenDisabled() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                gooseServerAutostart: false,
-                gooseServerBinaryPath: "/bin/sh",
-                gooseServerSecretKey: "dev-secret",
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-
-        var launchCount = 0
-        let manager = GooseServerManager(
-            appConfigurationStore: store,
-            probe: { _ in .reachable(statusCode: 200) },
-            launcher: { _ in
-                launchCount += 1
-                return TestGooseHandle()
-            }
-        )
-
-        await manager.bootstrap()
-
-        #expect(manager.launchState == .external)
-        #expect(launchCount == 0)
-        #expect(manager.liveRuntimeConfiguration?.baseURL.absoluteString == "https://127.0.0.1:51200")
-    }
-
-    @Test("Managed Goose server adopts reachable managed process so shutdown can terminate it")
-    mutating func managedGooseServerAdoptsReachableProcessForShutdown() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                gooseServerAutostart: true,
-                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
-                gooseServerSecretKey: "dev-secret",
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-
-        let adoptedHandle = TestGooseHandle()
-        let manager = GooseServerManager(
-            appConfigurationStore: store,
-            probe: { _ in .reachable(statusCode: 200) },
-            launcher: { _ in
-                Issue.record("Launcher should not run when reachable managed server already exists")
-                return TestGooseHandle()
-            },
-            managedProcessPIDResolver: { _ in 4242 },
-            adoptedHandleFactory: { pid in
-                #expect(pid == 4242)
-                return adoptedHandle
-            }
-        )
-
-        await manager.bootstrap()
-        #expect(manager.launchState == .running)
-        #expect(adoptedHandle.isRunning)
-
-        manager.stopManagedServer()
-        #expect(!adoptedHandle.isRunning)
-    }
-
-    @Test("Managed Goose server stops adopted process when app termination notification arrives")
-    mutating func managedGooseServerStopsAdoptedProcessOnAppTerminationNotification() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                gooseServerAutostart: true,
-                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
-                gooseServerSecretKey: "dev-secret",
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-
-        let adoptedHandle = TestGooseHandle()
-        let manager = GooseServerManager(
-            appConfigurationStore: store,
-            probe: { _ in .reachable(statusCode: 200) },
-            launcher: { _ in
-                Issue.record("Launcher should not run when reachable managed server already exists")
-                return TestGooseHandle()
-            },
-            managedProcessPIDResolver: { _ in 7777 },
-            adoptedHandleFactory: { pid in
-                #expect(pid == 7777)
-                return adoptedHandle
-            }
-        )
-
-        await manager.bootstrap()
-        #expect(adoptedHandle.isRunning)
-
-#if os(macOS)
-        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
-#endif
-
-        #expect(!adoptedHandle.isRunning)
-    }
-
-    @Test("Managed Goose server clears adopted handle for sleep and reconciles on wake")
-    mutating func managedGooseServerClearsHandleForSleepAndReconcilesOnWake() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-        let stubBinary = tempDirectory.appendingPathComponent("goosed-stub")
-        try "#!/bin/sh\nsleep 60\n".write(to: stubBinary, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubBinary.path)
-
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                gooseServerAutostart: true,
-                gooseServerBinaryPath: stubBinary.path,
-                gooseServerSecretKey: "dev-secret",
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-
-        let adoptedHandle = TestGooseHandle()
-        var probeCount = 0
-        var launchCount = 0
-        let manager = GooseServerManager(
-            appConfigurationStore: store,
-            probe: { _ in
-                probeCount += 1
-                switch probeCount {
-                case 1:
-                    return .reachable(statusCode: 200)
-                case 2:
-                    return .unreachable(reason: "Connection refused after wake")
-                default:
-                    return .reachable(statusCode: 200)
-                }
-            },
-            launcher: { _ in
-                launchCount += 1
-                return TestGooseHandle()
-            },
-            managedProcessPIDResolver: { _ in 5151 },
-            adoptedHandleFactory: { _ in adoptedHandle }
-        )
-
-        await manager.bootstrap()
-        #expect(manager.launchState == .running)
-        #expect(adoptedHandle.isRunning)
-
-        manager.prepareForSystemSleep()
-        #expect(manager.launchState == .idle)
-        #expect(adoptedHandle.isRunning)
-
-        await manager.reconcileAfterSystemWake()
-        #expect(manager.launchState == .running)
-        #expect(launchCount == 1)
-    }
-
-    @Test("Managed Goose server wake refresh uses status-only path when autostart is disabled")
-    mutating func managedGooseServerWakeRefreshUsesStatusOnlyPathWhenAutostartDisabled() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let store = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                gooseServerAutostart: false,
-                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
-                gooseServerSecretKey: "dev-secret",
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-
-        var launchCount = 0
-        var probeCount = 0
-        let manager = GooseServerManager(
-            appConfigurationStore: store,
-            probe: { _ in
-                probeCount += 1
-                return .reachable(statusCode: 200)
-            },
-            launcher: { _ in
-                launchCount += 1
-                return TestGooseHandle()
-            }
-        )
-
-        await manager.bootstrap()
-        #expect(manager.launchState == .external)
-
-        manager.prepareForSystemSleep()
-        #expect(manager.launchState == .idle)
-
-        await manager.reconcileAfterSystemWake()
-        #expect(manager.launchState == .external)
-        #expect(launchCount == 0)
-        #expect(probeCount >= 2)
-    }
-
-    @Test("App termination coordinator forwards sleep and wake lifecycle notifications")
-    mutating func appTerminationCoordinatorForwardsSleepAndWakeLifecycleNotifications() async throws {
-        #if os(macOS)
-        let controller = TestLifecycleGooseController()
-        let workspaceCenter = NotificationCenter()
-        let coordinator = AppTerminationCoordinator(workspaceNotificationCenter: workspaceCenter)
-        coordinator.gooseServerManager = controller
-
-        workspaceCenter.post(name: NSWorkspace.willSleepNotification, object: nil)
-        #expect(controller.sleepCallCount == 1)
-
-        workspaceCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
-        try? await Task.sleep(for: .milliseconds(50))
-        #expect(controller.wakeCallCount == 1)
-        #else
-        Issue.record("macOS-only lifecycle notification test")
-        #endif
+        #expect(service.supportsLiveExecution)
+        switch service.liveRuntimeReadiness {
+        case .ready(let summary, let source):
+            #expect(summary.contains("ACP"))
+            #expect(source == "Agent catalog")
+        case .unavailable(let reason, let recovery):
+            Issue.record("ACP runtime should be ready, got unavailable: \(reason) / \(recovery)")
+        }
     }
 
     @Test("Backend profile resolver resolves preferred provider and overrides")
@@ -661,14 +392,14 @@ struct ProviderPlatformTests {
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let claude = ConfiguredProvider(
-            family: .claude,
+            family: .claudeACP,
             displayName: "Claude CLI",
             transport: .cli,
             authMode: .none,
             defaultModel: "sonnet"
         )
         let alternateClaude = ConfiguredProvider(
-            family: .claude,
+            family: .claudeACP,
             displayName: "Claude HTTP",
             transport: .httpAPI,
             endpoint: "http://localhost:8080",
@@ -677,7 +408,7 @@ struct ProviderPlatformTests {
         )
         let settings = ProviderSettings(
             configuredProviders: [claude, alternateClaude],
-            preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: claude.id],
+            preferredProviderIDsByFamily: [ProviderFamily.claudeACP.rawValue: claude.id],
             notificationOnProviderFailure: true,
             runStartRequiresCleanPreflight: true
         )
@@ -707,7 +438,7 @@ struct ProviderPlatformTests {
         #expect(binding?.configuredProviderID == alternateClaude.id)
         #expect(binding?.model == "claude-custom")
         #expect(binding?.effort == "high")
-        #expect(binding?.providerIdentifier == "claude_code")
+        #expect(binding?.providerIdentifier == "claude_acp")
     }
 
     @Test("Backend profile resolver supports mixed providers across agents")
@@ -716,14 +447,14 @@ struct ProviderPlatformTests {
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let codex = ConfiguredProvider(
-            family: .codex,
+            family: .codexACP,
             displayName: "Codex CLI",
             transport: .cli,
             authMode: .none,
             defaultModel: "gpt-5-codex"
         )
         let gemini = ConfiguredProvider(
-            family: .gemini,
+            family: .geminiACP,
             displayName: "Gemini API",
             transport: .httpAPI,
             endpoint: "https://generativelanguage.googleapis.com",
@@ -735,8 +466,8 @@ struct ProviderPlatformTests {
             initialSettings: ProviderSettings(
                 configuredProviders: [codex, gemini],
                 preferredProviderIDsByFamily: [
-                    ProviderFamily.codex.rawValue: codex.id,
-                    ProviderFamily.gemini.rawValue: gemini.id
+                    ProviderFamily.codexACP.rawValue: codex.id,
+                    ProviderFamily.geminiACP.rawValue: gemini.id
                 ],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
@@ -753,8 +484,8 @@ struct ProviderPlatformTests {
             startOptions: .empty
         )
 
-        #expect(bindings?["proposal_writer"]?.providerIdentifier == "codex")
-        #expect(bindings?["proposal_reviewer"]?.providerIdentifier == "gemini")
+        #expect(bindings?["proposal_writer"]?.providerIdentifier == "codex_acp")
+        #expect(bindings?["proposal_reviewer"]?.providerIdentifier == "gemini_acp")
     }
 
     @Test("Backend profile resolver prefers backend profile model over configured provider default")
@@ -763,9 +494,9 @@ struct ProviderPlatformTests {
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let claude = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
+            family: .claudeACP,
+            displayName: "Claude ACP",
+            transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,
             defaultModel: "sonnet"
@@ -774,7 +505,7 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [claude],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: claude.id],
+                preferredProviderIDsByFamily: [ProviderFamily.claudeACP.rawValue: claude.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
@@ -830,249 +561,6 @@ struct ProviderPlatformTests {
         #expect(provenance.configuredProviderDefaultModel == "sonnet")
     }
 
-    @Test("Provider troubleshooting reports Goose-first guidance for Codex")
-    mutating func providerTroubleshootingReportsGooseFirstGuidanceForCodex() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appConfiguration = AppConfiguration(
-            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-            activeConfigurationSource: .persistedSettings
-        )
-        let appStore = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: appConfiguration
-        ))
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-first"),
-            adapters: makeAdapters()
-        ))
-
-        await registry.refreshDiagnostics(appConfiguration: appStore.configuration)
-        let report = try #require(registry.troubleshootingReport(for: provider.id))
-
-        #expect(report.status == .healthy)
-        #expect(report.gooseFirstGuidance != nil)
-        #expect(report.evidence.contains { $0.label == "Endpoint" })
-        #expect(report.evidence.contains { $0.label == "Goose server reachability" && $0.value.contains("Reachable via") })
-    }
-
-    @Test("Goose handshake probe starts configured_unverified then verifies")
-    mutating func gooseHandshakeProbeStartsConfiguredUnverifiedThenVerifies() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appStore = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-        let provider = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "sonnet"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-journey"),
-            adapters: makeAdapters()
-        ))
-
-        let probe = GooseProviderHandshakeProbe(
-            providerRegistry: registry,
-            appConfigurationStore: appStore
-        )
-        let initial = try #require(probe.configuredSnapshot(for: provider.id, origin: .providerSettings))
-        #expect(initial.journeyState == .configuredUnverified)
-
-        let verified = try #require(await probe.probe(providerID: provider.id, origin: .providerSettings))
-        #expect(verified.journeyState == .verified)
-        #expect(verified.report?.status == .healthy)
-    }
-
-    @Test("Goose handshake probe maps blocked troubleshooting to failing")
-    mutating func gooseHandshakeProbeMapsBlockedTroubleshootingToFailing() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appStore = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-journey-blocked"),
-            adapters: makeAdapters(gooseProbe: { _ in
-                .unreachable(reason: "Could not connect to the server.")
-            })
-        ))
-
-        let probe = GooseProviderHandshakeProbe(
-            providerRegistry: registry,
-            appConfigurationStore: appStore
-        )
-        let failing = try #require(await probe.probe(providerID: provider.id, origin: .firstRunWizard))
-        #expect(failing.journeyState == .failing)
-        #expect(failing.report?.failureLayer == .gooseReachability)
-    }
-
-    @Test("Provider troubleshooting blocks Goose-backed provider without endpoint")
-    mutating func providerTroubleshootingBlocksMissingGooseEndpoint() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appConfiguration = AppConfiguration(
-            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-            activeConfigurationSource: .persistedSettings
-        )
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
-            endpoint: nil,
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-endpoint")
-        ))
-
-        let service = ProviderTroubleshootingService()
-        let report = await service.report(
-            for: provider,
-            providerRegistry: registry,
-            appConfiguration: appConfiguration
-        )
-
-        #expect(report.status == .blocked)
-        #expect(report.failureLayer == .gooseEndpoint)
-        #expect(report.evidence.contains { $0.label == "Endpoint" && $0.state == .blocked })
-    }
-
-    @Test("Provider troubleshooting blocks Codex CLI fallback when executable is missing")
-    mutating func providerTroubleshootingBlocksMissingCLIExecutable() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appConfiguration = AppConfiguration(
-            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-            activeConfigurationSource: .persistedSettings
-        )
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex CLI",
-            transport: .cli,
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.missing-cli")
-        ))
-
-        let service = ProviderTroubleshootingService(whichExecutable: { _ in nil })
-        let report = await service.report(
-            for: provider,
-            providerRegistry: registry,
-            appConfiguration: appConfiguration
-        )
-
-        #expect(report.status == .blocked)
-        #expect(report.failureLayer == .cliExecutable)
-        #expect(report.remediation.contains { $0.contains("Goose Server transport") })
-    }
-
     @Test("Provider registry caches troubleshooting reports after refresh")
     mutating func providerRegistryCachesTroubleshootingReports() async throws {
         let tempDirectory = try makeTempDirectory()
@@ -1087,9 +575,9 @@ struct ProviderPlatformTests {
             activeConfigurationSource: .persistedSettings
         )
         let provider = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
+            family: .claudeACP,
+            displayName: "Claude ACP",
+            transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .apiKey,
             defaultModel: "opus"
@@ -1100,7 +588,7 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: provider.id],
+                preferredProviderIDsByFamily: [ProviderFamily.claudeACP.rawValue: provider.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
@@ -1114,205 +602,9 @@ struct ProviderPlatformTests {
         await registry.refreshDiagnostics(appConfiguration: appConfiguration)
 
         let report = try #require(registry.troubleshootingReport(for: provider.id))
-        #expect(report.displayName == "Claude Goose")
+        #expect(report.displayName == "Claude ACP")
         #expect(registry.lastRefreshedAt != nil)
-        #expect(report.evidence.contains { $0.label == "Goose server reachability" && $0.state == .info })
-    }
-
-    @Test("Goose-backed provider health marks server as unavailable when status probe fails")
-    mutating func gooseBackedProviderHealthMarksServerUnavailableWhenProbeFails() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-unreachable"),
-            adapters: makeAdapters(gooseProbe: { _ in
-                .unreachable(reason: "Could not connect to the server.")
-            })
-        ))
-
-        await registry.refreshHealth()
-
-        let snapshot = try #require(registry.healthSnapshot(for: provider.id))
-        #expect(snapshot.status == .unavailable)
-        #expect(snapshot.summary.contains("Goose server is unreachable"))
-        #expect(snapshot.blockingIssues.contains { $0.contains("Could not connect to the server.") })
-    }
-
-    @Test("Provider troubleshooting reports unreachable Goose server explicitly")
-    mutating func providerTroubleshootingReportsUnreachableGooseServerExplicitly() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appConfiguration = AppConfiguration(
-            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-            agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-            activeConfigurationSource: .persistedSettings
-        )
-        let provider = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "opus"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-report"),
-            adapters: makeAdapters(gooseProbe: { _ in
-                .unreachable(reason: "Could not connect to the server.")
-            })
-        ))
-
-        await registry.refreshDiagnostics(appConfiguration: appConfiguration)
-
-        let report = try #require(registry.troubleshootingReport(for: provider.id))
-        #expect(report.status == .blocked)
-        #expect(report.failureLayer == .gooseReachability)
-        #expect(report.headline.contains("cannot reach Goose server"))
-        #expect(report.evidence.contains {
-            $0.label == "Goose server reachability"
-                && $0.state == .blocked
-                && $0.value.contains("Could not connect to the server.")
-        })
-    }
-
-    @Test("Goose assistant probe transitions to verified after clean diagnostics")
-    mutating func gooseAssistantProbeTransitionsToVerified() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appStore = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-assistant-verified"),
-            adapters: makeAdapters()
-        ))
-
-        let probe = GooseProviderHandshakeProbe(
-            providerRegistry: registry,
-            appConfigurationStore: appStore
-        )
-
-        let configured = try #require(probe.configuredSnapshot(for: provider.id, origin: .providerSettings))
-        #expect(configured.journeyState == .configuredUnverified)
-        #expect(configured.handshakeSteps.map(\.label).contains("Transport"))
-        #expect(configured.handshakeSteps.map(\.label).contains("Handshake Probe"))
-        #expect(configured.transport == .gooseServer)
-        #expect(configured.providerIdentifier == "codex")
-
-        let verified = try #require(await probe.probe(providerID: provider.id, origin: .providerSettings))
-        #expect(verified.journeyState == .verified)
-        #expect(verified.report?.status == .healthy)
-        #expect(verified.handshakeSteps.contains { $0.label == "Handshake Probe" && $0.state == .passed })
-        #expect(verified.availableModels.contains("gpt-5-codex"))
-    }
-
-    @Test("Goose assistant probe transitions to failing when Goose endpoint is invalid")
-    mutating func gooseAssistantProbeTransitionsToFailing() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let appStore = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-                worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-                workflowSourcePath: tempDirectory.appendingPathComponent("workflow.yaml").path,
-                agentCatalogSourcePath: tempDirectory.appendingPathComponent("agents.yaml").path,
-                supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-                activeConfigurationSource: .persistedSettings
-            )
-        ))
-        let provider = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
-            endpoint: nil,
-            authMode: .none,
-            defaultModel: "sonnet"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-assistant-failing")
-        ))
-
-        let probe = GooseProviderHandshakeProbe(
-            providerRegistry: registry,
-            appConfigurationStore: appStore
-        )
-
-        let failing = try #require(await probe.probe(providerID: provider.id, origin: .firstRunWizard))
-        #expect(failing.journeyState == .failing)
-        #expect(failing.report?.failureLayer == .gooseEndpoint)
-        #expect(failing.handshakeSteps.contains { $0.label == "Endpoint" && $0.state == .failed })
+        #expect(report.evidence.contains { $0.label == "Configured transport" })
     }
 
     @Test("Settings transfer exports schema version")
@@ -1337,7 +629,7 @@ struct ProviderPlatformTests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .codex,
+                        family: .codexACP,
                         displayName: "Codex CLI",
                         transport: .cli,
                         authMode: .none,
@@ -1380,7 +672,7 @@ struct ProviderPlatformTests {
             activeConfigurationSource: .persistedSettings
         )
         let initialProvider = ConfiguredProvider(
-            family: .codex,
+            family: .codexACP,
             displayName: "Initial Codex",
             transport: .cli,
             authMode: .none,
@@ -1395,14 +687,14 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [initialProvider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: initialProvider.id],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: initialProvider.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
         ))
 
         let importProvider = ConfiguredProvider(
-            family: .gemini,
+            family: .geminiACP,
             displayName: "Imported Gemini",
             transport: .httpAPI,
             endpoint: "https://generativelanguage.googleapis.com",
@@ -1421,7 +713,7 @@ struct ProviderPlatformTests {
             ),
             providerSettings: ProviderSettings(
                 configuredProviders: [importProvider],
-                preferredProviderIDsByFamily: [ProviderFamily.gemini.rawValue: importProvider.id],
+                preferredProviderIDsByFamily: [ProviderFamily.geminiACP.rawValue: importProvider.id],
                 notificationOnProviderFailure: false,
                 runStartRequiresCleanPreflight: false
             ),
@@ -1446,6 +738,127 @@ struct ProviderPlatformTests {
         }
         #expect(appStore.configuration == initialConfiguration)
         #expect(providerStore.settings.configuredProviders.map(\.displayName) == ["Initial Codex"])
+    }
+
+    @Test("Settings import surfaces bookmark persistence warnings")
+    mutating func settingsImportSurfacesBookmarkPersistenceWarnings() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            SecurityScopedAccess.resetForTesting()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: AppConfiguration.seededDefault()
+        ))
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: .empty
+        ))
+
+        let importedProvider = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Imported Codex",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gpt-5"
+        )
+        let package = ExportableSettingsPackage(
+            transferSchemaVersion: SettingsTransferService.currentSchemaVersion,
+            appConfiguration: AppConfiguration(
+                runStorageBasePath: "/imported/runs",
+                worktreeBasePath: nil,
+                workflowSourcePath: "/imported/workflow.yaml",
+                agentCatalogSourcePath: "/imported/agents.yaml",
+                supportBundleExportPath: nil,
+                activeConfigurationSource: .persistedSettings
+            ),
+            providerSettings: ProviderSettings(
+                configuredProviders: [importedProvider],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: importedProvider.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            ),
+            exportedAt: Date(),
+            appVersion: "dev",
+            secretPlaceholders: []
+        )
+
+        let packageURL = tempDirectory.appendingPathComponent("chainworks-settings.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(package).write(to: packageURL, options: .atomic)
+
+        SecurityScopedAccess.installBookmarkDataProviderForTesting { _ in
+            struct BookmarkFailure: LocalizedError {
+                var errorDescription: String? { "bookmark fixture failed" }
+            }
+            throw BookmarkFailure()
+        }
+
+        let service = SettingsTransferService(
+            appConfigurationStore: appStore,
+            providerSettingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.import-warning")
+        )
+
+        let warnings = try service.importSettings(from: packageURL)
+
+        #expect(warnings.count == 1)
+        #expect(warnings[0].contains("could not be bookmarked"))
+        #expect(appStore.configuration.runStorageBasePath == "/imported/runs")
+        #expect(providerStore.settings.configuredProviders.map(\.displayName) == ["Imported Codex"])
+    }
+
+    @Test("Security-scoped access reports bookmark creation failure")
+    mutating func securityScopedAccessReportsBookmarkCreationFailure() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            SecurityScopedAccess.resetForTesting()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let targetURL = tempDirectory.appendingPathComponent("workflow.yaml")
+        try "schema_version: 1\n".write(to: targetURL, atomically: true, encoding: .utf8)
+
+        SecurityScopedAccess.installBookmarkDataProviderForTesting { _ in
+            struct BookmarkFailure: LocalizedError {
+                var errorDescription: String? { "bookmark fixture failed" }
+            }
+            throw BookmarkFailure()
+        }
+
+        let saved = SecurityScopedAccess.remember(url: targetURL, kind: .workflowSource)
+
+        #expect(saved == false)
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
+    }
+
+    @Test("Security-scoped access prunes stale temporary bookmarks without resolving them")
+    mutating func securityScopedAccessPrunesStaleTemporaryBookmarks() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer {
+            SecurityScopedAccess.resetForTesting()
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        let targetURL = tempDirectory
+            .appendingPathComponent("examples/workflows", isDirectory: true)
+            .appendingPathComponent("proposal-to-release.yaml")
+        let encoded = try JSONEncoder().encode([
+            RawBookmarkRecord(
+                path: targetURL.standardizedFileURL.path,
+                kind: .workflowSource,
+                bookmarkData: Data("stale".utf8)
+            )
+        ])
+        SecurityScopedAccess.setRawBookmarkStoreDataForTesting(encoded)
+
+        let exists = SecurityScopedAccess.fileExists(at: targetURL)
+
+        #expect(exists == false)
+        #expect(SecurityScopedAccess.bookmarkedPathsForTesting().isEmpty)
     }
 
     @Test("Preflight fails when required provider family is missing")
@@ -1504,7 +917,7 @@ struct ProviderPlatformTests {
             initialConfiguration: configuration
         ))
         let provider = ConfiguredProvider(
-            family: .gemini,
+            family: .geminiACP,
             displayName: "Gemini API",
             transport: .httpAPI,
             endpoint: "https://generativelanguage.googleapis.com",
@@ -1515,7 +928,7 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.gemini.rawValue: provider.id],
+                preferredProviderIDsByFamily: [ProviderFamily.geminiACP.rawValue: provider.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
@@ -1534,65 +947,6 @@ struct ProviderPlatformTests {
 
         #expect(report.status == .fail)
         #expect(report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("API key is missing") })
-    }
-
-    @Test("Preflight fails when Goose server is unreachable")
-    mutating func preflightFailsWhenGooseServerIsUnreachable() async throws {
-        let tempDirectory = try makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
-        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
-        let configuration = AppConfiguration(
-            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
-            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
-            workflowSourcePath: canonicalCopies.workflowURL.path,
-            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
-            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
-            activeConfigurationSource: .persistedSettings
-        )
-
-        let appStore = retain(AppConfigurationStore(
-            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
-            initialConfiguration: configuration
-        ))
-        let provider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
-            authMode: .none,
-            defaultModel: "gpt-5-codex"
-        )
-        let providerStore = retain(ProviderSettingsStore(
-            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
-            initialSettings: ProviderSettings(
-                configuredProviders: [provider],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: provider.id],
-                notificationOnProviderFailure: true,
-                runStartRequiresCleanPreflight: true
-            )
-        ))
-        let registry = retain(ProviderRegistry(
-            settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.goose-preflight"),
-            adapters: makeAdapters(gooseProbe: { _ in
-                .unreachable(reason: "Could not connect to the server.")
-            })
-        ))
-        let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
-
-        let report = await preflight.runReport(
-            workflowURL: URL(fileURLWithPath: configuration.workflowSourcePath),
-            catalogURL: URL(fileURLWithPath: configuration.agentCatalogSourcePath),
-            plan: makePlan(provider: "codex")
-        )
-
-        #expect(report.status == .fail)
-        #expect(report.checks.contains {
-            $0.title == "Codex Goose Reachability"
-                && $0.status == .fail
-                && $0.message.contains("Could not connect to the server.")
-        })
     }
 
     @Test("Preflight fails when override selects unavailable model")
@@ -1615,7 +969,7 @@ struct ProviderPlatformTests {
             initialConfiguration: configuration
         ))
         let claude = ConfiguredProvider(
-            family: .claude,
+            family: .claudeACP,
             displayName: "Claude CLI",
             transport: .cli,
             authMode: .none,
@@ -1625,7 +979,7 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [claude],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: claude.id],
+                preferredProviderIDsByFamily: [ProviderFamily.claudeACP.rawValue: claude.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
@@ -1674,9 +1028,9 @@ struct ProviderPlatformTests {
             initialConfiguration: configuration
         ))
         let gemini = ConfiguredProvider(
-            family: .gemini,
+            family: .geminiACP,
             displayName: "Gemini",
-            transport: .gooseServer,
+            transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,
             defaultModel: "gemini-2.5-pro"
@@ -1685,7 +1039,7 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [gemini],
-                preferredProviderIDsByFamily: [ProviderFamily.gemini.rawValue: gemini.id],
+                preferredProviderIDsByFamily: [ProviderFamily.geminiACP.rawValue: gemini.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
@@ -1730,24 +1084,25 @@ struct ProviderPlatformTests {
             initialConfiguration: configuration
         ))
         let codex = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex API",
-            transport: .httpAPI,
-            endpoint: "https://codex.test.local",
-            authMode: .none
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gpt-5"
         )
         let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [codex],
-                preferredProviderIDsByFamily: [ProviderFamily.codex.rawValue: codex.id],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: codex.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
         ))
         let registry = retain(ProviderRegistry(
             settingsStore: providerStore,
-            secretStore: makeTestSecretStore("com.chainworks.tests.model-case-insensitive")
+            secretStore: makeTestSecretStore("com.chainworks.tests.model-case-insensitive"),
+            adapters: makeAdapters()
         ))
         let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
 
@@ -1756,8 +1111,8 @@ struct ProviderPlatformTests {
             title: "Proposal Reviewer / Architect",
             mode: "tool_use",
             backendProfileID: "codex_architect_high",
-            provider: "codex",
-            model: "GPT-5.4",
+            provider: "codex_acp",
+            model: "GPT-5",
             effort: "high",
             maxTurns: 8,
             temperature: 0.0,
@@ -1793,7 +1148,201 @@ struct ProviderPlatformTests {
             plan: plan
         )
 
-        #expect(!report.blockingIssues.contains { $0.contains("Model GPT-5.4 is not available") })
+        let modelBlockingIssues = report.blockingIssues.filter { $0.contains("Model GPT-5 is not available") }
+        #expect(modelBlockingIssues.isEmpty, "GPT-5 should be case-insensitively matched to gpt-5. Blocking issues: \(report.blockingIssues)")
+    }
+
+    @Test("Preflight does not block codex ACP bindings on legacy provider health or missing codex MCP mappings")
+    mutating func preflightAllowsCodexACPBindingsWithoutLegacyCredentialRequirement() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
+        let configuration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: configuration
+        ))
+        let codex = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .apiKey,
+            defaultModel: "gpt-5-codex"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [codex],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: codex.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.codex-acp-preflight"),
+            adapters: makeAdapters()
+        ))
+        let preflight = PreflightService(appConfigurationStore: appStore, providerRegistry: registry)
+
+        let agent = ResolvedAgent(
+            id: "code_writer",
+            title: "Code Writer",
+            mode: "tool_use",
+            backendProfileID: "codex_writer_high",
+            provider: "codex_acp",
+            model: "GPT-5",
+            effort: "high",
+            maxTurns: 18,
+            temperature: 0.12,
+            permissionProfile: "IMPLEMENT_WRITE",
+            mcpProfileID: "code_build_rich",
+            skillRef: "implementation_writer_core",
+            skillRole: nil,
+            prompt: "Implement the approved proposal.",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: [],
+            outputs: ["implementation_summary"],
+            worktreeWriteEnabled: true,
+            runtimeProfileID: "codex_acp"
+        )
+
+        let plan = RunPlan(
+            workflowID: "codex_acp_preflight",
+            workflowTitle: "Codex ACP Preflight",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let report = await preflight.runReport(
+            workflowURL: URL(fileURLWithPath: configuration.workflowSourcePath),
+            catalogURL: URL(fileURLWithPath: configuration.agentCatalogSourcePath),
+            plan: plan
+        )
+
+        #expect(!report.blockingIssues.contains { $0.contains("runtime mapping for 'codex'") })
+        #expect(!report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("API key is missing") })
+        #expect(!report.blockingIssues.contains { $0.localizedCaseInsensitiveContains("provider requires attention") })
+    }
+
+    @Test("Simulated preflight skips runtime MCP validation when registry is unavailable")
+    mutating func simulatedPreflightSkipsRuntimeMCPValidationWhenRegistryUnavailable() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let canonicalCopies = try makeCanonicalYAMLCopies(in: tempDirectory)
+        let configuration = AppConfiguration(
+            runStorageBasePath: tempDirectory.appendingPathComponent("runs").path,
+            worktreeBasePath: tempDirectory.appendingPathComponent("worktrees").path,
+            workflowSourcePath: canonicalCopies.workflowURL.path,
+            agentCatalogSourcePath: canonicalCopies.catalogURL.path,
+            supportBundleExportPath: tempDirectory.appendingPathComponent("exports").path,
+            activeConfigurationSource: .persistedSettings
+        )
+
+        let appStore = retain(AppConfigurationStore(
+            fileURL: tempDirectory.appendingPathComponent("app-config.json"),
+            initialConfiguration: configuration
+        ))
+        let codex = ConfiguredProvider(
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
+            endpoint: "https://127.0.0.1:51200",
+            authMode: .none,
+            defaultModel: "gpt-5"
+        )
+        let providerStore = retain(ProviderSettingsStore(
+            fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
+            initialSettings: ProviderSettings(
+                configuredProviders: [codex],
+                preferredProviderIDsByFamily: [ProviderFamily.codexACP.rawValue: codex.id],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+        let registry = retain(ProviderRegistry(
+            settingsStore: providerStore,
+            secretStore: makeTestSecretStore("com.chainworks.tests.simulated-mcp-skip"),
+            adapters: makeAdapters()
+        ))
+        let preflight = PreflightService(
+            appConfigurationStore: appStore,
+            providerRegistry: registry,
+            extensionRegistryProvider: ThrowingExtensionRegistryProvider(error: CocoaError(.fileNoSuchFile))
+        )
+
+        let agent = ResolvedAgent(
+            id: "proposal_reviewer_architect",
+            title: "Proposal Reviewer / Architect",
+            mode: "tool_use",
+            backendProfileID: "codex_architect_high",
+            provider: "codex",
+            model: "GPT-5.4",
+            effort: "high",
+            maxTurns: 8,
+            temperature: 0,
+            permissionProfile: "read_only",
+            mcpProfileID: "codex_architect_high",
+            requestedMCPServerIDs: ["context7", "xcode"],
+            skillRef: "skill",
+            skillRole: nil,
+            prompt: "Review the proposal as an architect",
+            outputContract: nil,
+            requiresHumanApproval: false,
+            inputs: ["proposal_current"],
+            outputs: ["proposal_review_architect"],
+            runtimeProfileID: "codex_acp"
+        )
+
+        let plan = RunPlan(
+            workflowID: "simulated_mcp_skip",
+            workflowTitle: "Simulated MCP Skip",
+            states: [:],
+            initialStateID: "state_1",
+            agentBindings: [agent.id: agent],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "workflow-hash",
+            catalogSnapshotHash: "catalog-hash",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let report = await preflight.runReport(
+            workflowURL: URL(fileURLWithPath: configuration.workflowSourcePath),
+            catalogURL: URL(fileURLWithPath: configuration.agentCatalogSourcePath),
+            plan: plan,
+            requiresRuntimeMCPValidation: false
+        )
+
+        #expect(report.status != .fail)
+        #expect(!report.blockingIssues.contains { $0.contains("Runtime extension registry is unavailable") })
+        #expect(report.warnings.contains { $0.contains("skipped for simulated execution mode") })
+        let mcpCheck = try #require(report.checks.first { $0.title == "Backend MCP — proposal_reviewer_architect" })
+        #expect(mcpCheck.status == .warn)
     }
 
     @Test("Sample run launcher creates frozen provider binding snapshot")
@@ -1822,25 +1371,25 @@ struct ProviderPlatformTests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .codex,
-                        displayName: "Codex Goose",
-                        transport: .gooseServer,
+                        family: .codexACP,
+                        displayName: "Codex ACP",
+                        transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
                         defaultModel: "gpt-5.4"
                     ),
                     ConfiguredProvider(
-                        family: .claude,
-                        displayName: "Claude Goose",
-                        transport: .gooseServer,
+                        family: .claudeACP,
+                        displayName: "Claude ACP",
+                        transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
                         defaultModel: "opus"
                     ),
                     ConfiguredProvider(
-                        family: .gemini,
-                        displayName: "Gemini Goose",
-                        transport: .gooseServer,
+                        family: .geminiACP,
+                        displayName: "Gemini ACP",
+                        transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
                         defaultModel: "gemini-2.5-pro"
@@ -1944,7 +1493,7 @@ struct ProviderPlatformTests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .claude,
+                        family: .claudeACP,
                         displayName: "Claude CLI",
                         transport: .cli,
                         authMode: .none,
@@ -1978,35 +1527,31 @@ struct ProviderPlatformTests {
         #expect(contents.contains { $0.hasSuffix("artifacts/proposal.md") })
     }
 
-    @Test("Provider draft resets generated model when switching from Codex to Claude")
-    mutating func providerDraftResetsGeneratedModelWhenSwitchingFamilies() {
-        var draft = ProviderDraft()
-        let configuration = AppConfiguration.seededDefault()
+    @Test("Provider defaults reset generated model when switching from Codex to Claude")
+    mutating func providerDefaultsResetGeneratedModelWhenSwitchingFamilies() {
+        let transport = ProviderTransport.cli
 
-        draft.applyFamilyDefaults(.codex, configuration: configuration)
-        #expect(draft.displayName == "Codex Goose")
-        #expect(draft.defaultModel == "gpt-5-codex")
-
-        draft.applyFamilyDefaults(.claude, configuration: configuration)
-
-        #expect(draft.family == .claude)
-        #expect(draft.displayName == "Claude Goose")
-        #expect(draft.defaultModel == "sonnet")
+        #expect(ProviderDefaults.generatedDisplayName(for: .codexACP, transport: transport) == "Codex ACP CLI")
+        #expect(ProviderDefaults.defaultModel(for: .codexACP) == "gpt-5")
+        #expect(ProviderDefaults.generatedDisplayName(for: .claudeACP, transport: transport) == "Claude ACP CLI")
+        #expect(ProviderDefaults.defaultModel(for: .claudeACP) == "sonnet")
     }
 
-    @Test("Provider draft normalizes cross-family model before save")
-    mutating func providerDraftNormalizesCrossFamilyModelBeforeSave() {
-        var draft = ProviderDraft()
-        draft.family = .claude
-        draft.displayName = "Claude Goose"
-        draft.transport = .gooseServer
-        draft.defaultModel = "gpt-5-codex"
+    @Test("Provider model defaults normalize cross-family values before save")
+    mutating func providerModelDefaultsNormalizeCrossFamilyValuesBeforeSave() {
+        let normalized = ProviderDefaults.canonicalModel(
+            "gpt-5-codex",
+            for: .claudeACP,
+            transport: .cli
+        )
+        let savedModel: String
+        if let normalized, ProviderDefaults.model(normalized, isCompatibleWith: .claudeACP) {
+            savedModel = normalized
+        } else {
+            savedModel = ProviderDefaults.defaultModel(for: .claudeACP)
+        }
 
-        draft.normalizeForSave()
-        let provider = draft.makeProvider()
-
-        #expect(provider.family == .claude)
-        #expect(provider.defaultModel == "sonnet")
+        #expect(savedModel == "sonnet")
     }
 
     @Test("Provider settings store sanitizes stale cross-family provider defaults")
@@ -2015,9 +1560,9 @@ struct ProviderPlatformTests {
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let staleClaude = ConfiguredProvider(
-            family: .claude,
-            displayName: "Codex Goose",
-            transport: .gooseServer,
+            family: .claudeACP,
+            displayName: "Codex ACP CLI",
+            transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,
             defaultModel: "gpt-5-codex"
@@ -2027,27 +1572,27 @@ struct ProviderPlatformTests {
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
             initialSettings: ProviderSettings(
                 configuredProviders: [staleClaude],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: staleClaude.id],
+                preferredProviderIDsByFamily: [ProviderFamily.claudeACP.rawValue: staleClaude.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
         ))
 
         let sanitized = try #require(store.settings.configuredProviders.first)
-        #expect(sanitized.family == .claude)
+        #expect(sanitized.family == .claudeACP)
         #expect(sanitized.defaultModel == "sonnet")
-        #expect(sanitized.displayName == "Claude Goose")
+        #expect(sanitized.displayName == "Claude ACP CLI")
     }
 
-    @Test("Provider settings store canonicalizes legacy Claude Goose model identifiers")
-    mutating func providerSettingsStoreCanonicalizesLegacyClaudeGooseModelIdentifiers() throws {
+    @Test("Provider settings store canonicalizes legacy Claude ACP model identifiers")
+    mutating func providerSettingsStoreCanonicalizesLegacyClaudeACPModelIdentifiers() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
         let legacyClaude = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
+            family: .claudeACP,
+            displayName: "Claude ACP",
+            transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,
             defaultModel: "claude-opus-4.6"
@@ -2058,7 +1603,7 @@ struct ProviderPlatformTests {
             fileURL: fileURL,
             initialSettings: ProviderSettings(
                 configuredProviders: [legacyClaude],
-                preferredProviderIDsByFamily: [ProviderFamily.claude.rawValue: legacyClaude.id],
+                preferredProviderIDsByFamily: [ProviderFamily.claudeACP.rawValue: legacyClaude.id],
                 notificationOnProviderFailure: true,
                 runStartRequiresCleanPreflight: true
             )
@@ -2070,5 +1615,73 @@ struct ProviderPlatformTests {
         let persisted = try JSONDecoder().decode(ProviderSettings.self, from: Data(contentsOf: fileURL))
         let persistedClaude = try #require(persisted.configuredProviders.first)
         #expect(persistedClaude.defaultModel == "opus")
+    }
+
+    @Test("Provider settings store surfaces malformed persisted settings load failures")
+    mutating func providerSettingsStoreSurfacesMalformedPersistedSettingsLoadFailures() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let fileURL = tempDirectory.appendingPathComponent("provider-settings.json")
+        try "{not-json".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let store = retain(ProviderSettingsStore(fileURL: fileURL))
+
+        let message = try #require(store.diagnosticsMessage)
+        #expect(message.contains("Failed to load persisted provider settings"))
+        #expect(store.settings.configuredProviders.isEmpty == false)
+    }
+
+    @Test("Provider settings store surfaces persistence failures")
+    mutating func providerSettingsStoreSurfacesPersistenceFailures() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let fileURL = tempDirectory.appendingPathComponent("provider-settings.json", isDirectory: true)
+        try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+
+        let store = retain(ProviderSettingsStore(
+            fileURL: fileURL,
+            initialSettings: ProviderSettings(
+                configuredProviders: [],
+                preferredProviderIDsByFamily: [:],
+                notificationOnProviderFailure: true,
+                runStartRequiresCleanPreflight: true
+            )
+        ))
+
+        let message = try #require(store.diagnosticsMessage)
+        #expect(message.contains("Failed to persist provider settings during initialization"))
+    }
+
+    @Test("Gemini ACP health check uses the gemini CLI executable")
+    mutating func geminiACPHealthCheckUsesGeminiExecutable() async throws {
+        guard ProcessSupport.which("gemini") != nil else {
+            Issue.record("gemini is not installed on this machine; skipping environment-dependent Gemini ACP health check")
+            return
+        }
+
+        let provider = ConfiguredProvider(
+            family: .geminiACP,
+            displayName: "Gemini ACP",
+            transport: .cli,
+            authMode: .none,
+            defaultModel: "gemini-2.5-pro"
+        )
+
+        let snapshot = await GeminiACPProviderAdapter().verify(
+            provider: provider,
+            secretStore: makeTestSecretStore("com.chainworks.tests.gemini-acp-health")
+        )
+
+        #expect(!snapshot.blockingIssues.contains { $0.contains("gemini-cli-acp") })
+        #expect(!snapshot.blockingIssues.contains { $0.contains("Executable 'gemini' is not available on PATH") })
+    }
+
+    @Test("Provider family resolver accepts canonical ACP family raw values")
+    func providerFamilyResolverAcceptsCanonicalACPValues() {
+        #expect(ProviderFamily.from(runtimeIdentifier: ProviderFamily.codexACP.rawValue) == .codexACP)
+        #expect(ProviderFamily.from(runtimeIdentifier: ProviderFamily.claudeACP.rawValue) == .claudeACP)
+        #expect(ProviderFamily.from(runtimeIdentifier: ProviderFamily.geminiACP.rawValue) == .geminiACP)
     }
 }

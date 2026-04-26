@@ -1,59 +1,64 @@
 # Per-Agent MCP Policy and Runtime Validation
 
-Stable reference for how Chainworks Forge resolves per-agent MCP intent, validates that intent against the selected runtime, persists requested/predicted/actual truth, and exposes the results in operator-facing surfaces.
+Stable reference for the Rust control-plane MCP owner chain.
+
+This document describes how per-agent MCP intent is compiled, resolved against the machine-local registry, persisted on executions, and exposed northbound.
 
 ## Purpose
 
-MCP access is runtime policy, not an untracked side effect.
+MCP access is explicit execution truth, not an adapter side effect.
 
-For any execution, the system must be able to explain:
+For any execution, the system must be able to answer:
 
-- which per-agent MCP profile was requested,
-- which runtime servers/extensions were predicted,
-- which ones actually became effective,
-- which ones were denied or unavailable,
-- and where that truth appears in reports and comparison.
+- which backend profile owned the MCP request
+- which MCP server IDs were requested
+- which runtime entries were predicted to become active
+- which ones actually became active
+- which ones were denied
+- and which northbound readers expose that truth
 
 ## Scope
 
 This reference covers:
 
-- catalog-owned `mcp_profile`,
-- `mcp_policy`, `mcp_server_registry`, and `mcp_profiles`,
-- preflight and runtime validation,
-- runtime-specific MCP realization,
-- requested / predicted / actual / denied truth,
-- and MCP telemetry in reports and comparisons.
+- `AgentEntry.backend_profile`
+- `backend_profile.mcp`
+- compilation into `ResolvedAgent`
+- executor-time resolution against the machine-local MCP registry
+- requested / predicted / actual / denied persistence on `AgentExecution`
+- northbound report and GraphQL readers
 
 It does not define:
 
-- provider credential setup,
-- generic runtime transport selection,
-- or external MCP server authoring outside the catalog/runtime contract.
-
-## Related docs
-
-- [provider-platform.md](provider-platform.md)
-- [runtime-contract.md](runtime-contract.md)
-- [acp-runtime-transport.md](acp-runtime-transport.md)
-- [operator-experience.md](operator-experience.md)
-- [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md)
+- provider credentials
+- generic transport selection outside MCP
+- external MCP server authoring
+- or export-only naming for evidence packs
 
 ## Canonical ownership
 
-The canonical MCP ownership model is:
+The canonical Rust owner chain is:
 
-- `AgentCatalog.mcpPolicy` defines system-wide policy defaults,
-- `mcp_server_registry` defines named runtime-relevant MCP servers,
-- `mcp_profiles` define reusable policy bundles,
-- `agent.mcp_profile` selects the effective runtime intent for an agent.
+```text
+AgentEntry.backend_profile
+  -> backend_profile.mcp
+  -> ResolvedAgent.backend_profile_id
+  -> ResolvedAgent.requested_mcp_server_ids
+  -> executor MCP resolver
+  -> AgentExecution MCP provenance fields
+  -> GraphQL / MCP northbound readers
+```
 
-Permission profiles do not own modern MCP truth.
-They may still provide legacy ceiling context, but runtime authority lives on the catalog MCP model above.
+Key rules:
+
+- `backend_profile.mcp` is the only requested-intent owner for this slice.
+- `required_tools` does not own MCP intent.
+- legacy `mcp_profile` wording is not canonical for the Rust control-plane implementation.
+- executable command/args/env definitions come from the machine-local MCP registry, not from the workflow catalog.
 
 ## Resolution model
 
-The system tracks four distinct truth layers:
+The system tracks four distinct layers:
 
 1. `requested`
 2. `predicted`
@@ -64,137 +69,108 @@ These layers must not be collapsed.
 
 ### Requested
 
-What the selected `mcp_profile` asks for.
+What the compiled agent binding asked for via `ResolvedAgent.requested_mcp_server_ids`.
 
 ### Predicted
 
-What the app expects to become active after applying catalog policy plus runtime mapping.
+What the executor expects to be realizable before ACP session startup after resolving against the local MCP registry and runtime binding.
 
 ### Actual
 
-What the runtime actually settled on for the execution.
+What the runtime session actually settled on.
 
 ### Denied
 
-What policy or runtime constraints blocked from the requested set.
+What was missing, disabled, unsupported, or blocked by runtime-specific rules.
 
 ## Resolution pipeline
 
-The implemented path is:
+The implemented Rust path is:
 
 ```text
-AgentCatalog
-  -> YAML validation
-  -> RunPlanCompiler / ResolvedAgent
-  -> MCPPolicyResolver
-  -> GooseSessionBridge or ACP-native runtime path
+workflow compiler
+  -> ResolvedAgent
+  -> executor-side MCP resolver
+  -> ACP transport session/new
   -> AgentExecution settlement
-  -> RunReportBuilder / RunComparisonService / operator shell
+  -> report / GraphQL readers
 ```
 
-### Validation
+### Compiler ownership
 
-Before execution, the catalog validator checks:
+The workflow compiler is responsible for freezing MCP request intent into the run plan:
 
-- missing MCP profile references,
-- unknown server registry references,
-- unsupported fallback policy values,
-- conflicting required/optional declarations,
-- legacy permission-profile MCP drift.
+- `ResolvedAgent.backend_profile_id`
+- `ResolvedAgent.requested_mcp_server_ids`
+
+That compiler output is the only MCP request intent the executor should consume.
 
 ### Runtime realization
 
-Runtime realization depends on adapter family:
+Runtime realization resolves executable server definitions from the machine-local MCP registry:
 
-- Goose-backed runtimes reconcile against Goose extension IDs,
-- ACP-native runtimes keep Forge truth but realize MCP through ACP-native semantics,
-- portability-sensitive paths must not hardcode workstation-specific absolute paths.
+- canonical path: `~/.config/mcp/config.yaml`
+- explicit override: `CHAINWORKS_CODEX_CONFIG_PATH`
+- one-time legacy migration source when canonical file is absent: `~/.config/goose/config.yaml`
 
-The runtime layer may vary, but the persisted Forge truth model remains the same.
+Runtime/provider binding decides whether a requested entry is valid for the selected session family, including `stdio` versus `platform` filtering.
 
-## Persistence and reporting
+## Persistence
 
-The MCP slice is durable only if post-run truth stays inspectable.
+The durable MCP truth lives on `AgentExecution`.
 
-Current persisted lanes include:
+Current persisted fields for this slice are expected to carry:
 
-- frozen MCP policy data in the run snapshot,
-- `AgentExecution` MCP fields,
-- report payload MCP sections,
-- comparison payload MCP sections,
-- aggregate telemetry.
+- requested MCP extension IDs
+- predicted effective extension IDs
+- predicted runtime IDs
+- actual effective extension IDs
+- actual runtime IDs
+- denied extension IDs
+- MCP session startup latency
 
-### Reported telemetry
+These rows are the source of truth for northbound readers.
 
-Current report telemetry includes:
+## Northbound readers
 
-- executions with MCP profile,
-- zero-MCP executions,
-- requested extension count,
-- predicted extension count,
-- actual extension count,
-- denied extension count,
-- prompt/context delta attributable to MCP,
-- blocked runs caused by MCP preflight,
-- per-server usage summary when available.
+Northbound readers must consume persisted execution truth rather than reconstructing MCP state from raw transport payloads.
 
-## Operator-visible surfaces
+### MCP reports
 
-MCP truth is part of the existing shell-owned explanation path.
+`reports.get` and `report://{run_id}` should expose:
 
-### Run reports
+- requested
+- predicted
+- actual
+- denied
 
-Reports expose:
+for each execution that persisted MCP truth.
 
-- requested MCP set,
-- predicted set,
-- actual set,
-- denied set,
-- MCP telemetry and drift summaries.
+### GraphQL
 
-### Comparison
+GraphQL should expose:
 
-Comparison can explain why two runs differ at the MCP/runtime layer rather than reducing the difference to generic provider drift.
+- run-owned summaries at the run layer
+- execution-owned MCP truth at an execution reader
+- artifact-owned validation failure payloads at the artifact layer
 
-### Artifact inspection and diagnostics
+The stage summary reader may expose coarse booleans, but it is not the owner for full execution MCP payloads.
 
-Execution receipts and diagnostics preserve enough MCP truth to explain runtime variance after the fact.
+## Integration with adjacent slices
 
-### Preflight and readiness
+This slice depends on and composes with:
 
-Start-time preflight remains the early warning surface when the runtime cannot honor the requested MCP profile safely.
+- [workflow-execution-engine.md](workflow-execution-engine.md)
+- [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md)
+- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
+- [acp-runtime-transport.md](acp-runtime-transport.md)
 
-## Integration with the app
+## Current implementation anchors
 
-This capability is integrated into four existing system layers:
-
-1. catalog validation and preflight,
-2. runtime packet/session preparation,
-3. execution settlement and telemetry persistence,
-4. operator-facing reports, comparison, and diagnostics.
-
-That means MCP policy is not a background adapter detail. It is part of the product's execution truth.
-
-## Current implementation owners
-
-- `Chainworks Forge/DSL/AgentCatalog.swift`
-- `Chainworks Forge/DSL/YAMLValidator.swift`
-- `Chainworks Forge/Engine/MCPPolicyRuntime.swift`
-- `Chainworks Forge/Engine/GooseSessionBridge.swift`
-- `Chainworks Forge/Engine/GooseAdapter/GooseServerTransport.swift`
-- `Chainworks Forge/Engine/RunReportBuilder.swift`
-- `Chainworks Forge/Engine/RunComparisonService.swift`
-- `Chainworks Forge/Models/AgentExecution.swift`
-- `Chainworks Forge/Views/RunReportView.swift`
-- `Chainworks Forge/Views/RunComparisonView.swift`
-- `Chainworks Forge/Views/ProviderTroubleshootingPanel.swift`
-
-## Verification baseline
-
-Current stable verification for this slice is:
-
-- dedicated MCP capability regression coverage on the current tree
-- current focused verification summary `36/36` passed
-- capability verification still re-proves the portability-sensitive MCP assertions
-- same-tree approved-host `full` green basis:
-  - `full-20260408-101540.xcresult`
+- `control-plane/crates/workflow/src/compiler.rs`
+- `control-plane/crates/workflow/src/plan.rs`
+- `control-plane/crates/engine/src/executor.rs`
+- `control-plane/crates/mcp-server/src/server.rs`
+- `control-plane/crates/mcp-server/src/tools/reports.rs`
+- `control-plane/crates/graphql-server/src/types/stage.rs`
+- `control-plane/crates/graphql-server/src/types/artifact.rs`

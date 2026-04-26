@@ -486,6 +486,74 @@ struct ResumeManagerTests {
         }
     }
 
+    @Test("Classify run surfaces unreadable source drift diagnostics")
+    func classifyRunWithUnreadableSourcesSurfacesDiagnostics() async throws {
+        let sourceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeUnreadable-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let workflowURL = sourceRoot.appendingPathComponent("workflow.yaml")
+        let catalogURL = sourceRoot.appendingPathComponent("agents.yaml")
+        let workflowFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
+        let catalogFixtureURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
+        try FileManager.default.copyItem(at: workflowFixtureURL, to: workflowURL)
+        _ = try writePortableCatalogCopy(from: catalogFixtureURL, to: catalogURL)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: catalogURL.path
+        )
+
+        let idea = Idea(title: "Unreadable Drift", body: "Unreadable source should be visible")
+        context.insert(idea)
+
+        let runID = UUID()
+        let workspaceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResumeUnreadableWorkspace-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: workspaceRoot,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: context).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: workflowURL.path,
+            catalogSourcePath: catalogURL.path
+        )
+        idea.workspaceRootPath = sourceRoot.path
+        run.frozenWorkspaceRootPath = sourceRoot.path
+        run.status = .running
+        try context.save()
+
+        try FileManager.default.removeItem(at: workflowURL)
+        try FileManager.default.createDirectory(at: workflowURL, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+
+        let manager = ResumeManager(modelContext: context)
+        let actions = try manager.classifyInterruptedRuns(compiler: compiler)
+
+        #expect(actions.count == 1)
+        if case .resume(let resumedRun, _, _) = actions[0] {
+            let driftDetails = try #require(resumedRun.driftDetails)
+            #expect(driftDetails.contains("Workflow source could not be read during drift detection"))
+            #expect(driftDetails.contains("Agent catalog source could not be read during drift detection"))
+        } else {
+            Issue.record("Expected .resume with drift diagnostics, got \(actions[0])")
+        }
+    }
+
     @Test("Run creation persists frozen workflow and catalog snapshot artifacts")
     func runCreationPersistsFrozenSnapshotArtifacts() throws {
         let sourceRoot = FileManager.default.temporaryDirectory
@@ -633,6 +701,112 @@ struct ResumeManagerTests {
         #expect(remainingRuns.count == 1)
         #expect(remainingRuns.first?.id == blockedRun.id)
         #expect(FileManager.default.fileExists(atPath: blockedRoot.path))
+    }
+
+    @Test("Run repository cleanup deletes terminal runs with approvals without detached fault crashes")
+    func runRepositoryCleanupDeletesTerminalRunsWithApprovals() throws {
+        let idea = Idea(title: "Cleanup approvals", body: "terminal run with approvals")
+        context.insert(idea)
+
+        let run = Run(
+            workflowID: "wf-terminal",
+            workflowTitle: "WF Terminal",
+            workflowSnapshotHash: "wf-terminal-hash",
+            catalogSnapshotHash: "cat-terminal-hash",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("RunCleanupApproval-\(UUID().uuidString)", isDirectory: true).path,
+            artifactRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("RunCleanupApprovalArtifacts-\(UUID().uuidString)", isDirectory: true).path
+        )
+        run.idea = idea
+        run.status = .completed
+
+        let approval = Approval(stageID: "approval_gate", requestedAt: Date(timeIntervalSince1970: 10), decision: .granted)
+        approval.run = run
+        run.approvals.append(approval)
+
+        context.insert(run)
+        context.insert(approval)
+        try context.save()
+
+        let repository = RunRepository(context: context)
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+        let remainingRuns = try context.fetch(FetchDescriptor<Run>())
+        let remainingApprovals = try context.fetch(FetchDescriptor<Approval>())
+
+        #expect(cleanupPlan.deletedRunCount == 1)
+        #expect(cleanupPlan.deletedRunIDs == [run.id])
+        #expect(remainingRuns.isEmpty)
+        #expect(remainingApprovals.isEmpty)
+    }
+
+    @Test("Run repository cleanup deletes terminal runs with stage executions without detached fault crashes")
+    func runRepositoryCleanupDeletesTerminalRunsWithStageExecutions() throws {
+        let idea = Idea(title: "Cleanup stages", body: "terminal run with stages")
+        context.insert(idea)
+
+        let run = Run(
+            workflowID: "wf-terminal-stage",
+            workflowTitle: "WF Terminal Stage",
+            workflowSnapshotHash: "wf-terminal-stage-hash",
+            catalogSnapshotHash: "cat-terminal-stage-hash",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8),
+            workspaceRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("RunCleanupStage-\(UUID().uuidString)", isDirectory: true).path,
+            artifactRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("RunCleanupStageArtifacts-\(UUID().uuidString)", isDirectory: true).path
+        )
+        run.idea = idea
+        run.status = .failed
+
+        let stage = StageExecution(
+            stageID: "implementation",
+            label: "Implementation",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.completedAt = Date(timeIntervalSince1970: 30)
+        stage.run = run
+        run.stageExecutions.append(stage)
+
+        let agent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "implement",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        agent.completedAt = Date(timeIntervalSince1970: 29)
+        agent.stageExecution = stage
+        stage.agentExecutions.append(agent)
+
+        context.insert(run)
+        context.insert(stage)
+        context.insert(agent)
+        try context.save()
+
+        let repository = RunRepository(context: context)
+        let cleanupPlan = try repository.prepareTerminalRunCleanup()
+        let remainingRuns = try context.fetch(FetchDescriptor<Run>())
+        let remainingStages = try context.fetch(FetchDescriptor<StageExecution>())
+        let remainingAgents = try context.fetch(FetchDescriptor<AgentExecution>())
+
+        #expect(cleanupPlan.deletedRunCount == 1)
+        #expect(cleanupPlan.deletedRunIDs == [run.id])
+        #expect(remainingRuns.isEmpty)
+        #expect(remainingStages.isEmpty)
+        #expect(remainingAgents.isEmpty)
     }
 
     @Test("Run repository cleanup migrates referenced attachment into idea workspace")
@@ -934,7 +1108,7 @@ struct ResumeManagerTests {
         let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
         let service = ExecutionService(modelContext: context, executor: executor)
 
-        try service.resumeRun(run: run, compiler: compiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
 
         await awaitCondition("Recovery-created ready run should attach and transition to running", timeout: 3.0) {
             service.orchestrator(for: run.id) != nil && run.status == .running
@@ -942,6 +1116,38 @@ struct ResumeManagerTests {
 
         #expect(service.orchestrator(for: run.id) != nil)
         #expect(run.status == .running)
+
+        await cancelAndAwaitSettled(service, runID: run.id)
+    }
+
+    @Test("ExecutionService resume uses frozen snapshot catalog when live catalog is unavailable")
+    func executionServiceResumeUsesFrozenSnapshotCatalogWhenLiveCatalogUnavailable() async throws {
+        let (run, plan, _) = try makeRunFromPlan()
+        run.status = .failed
+
+        let failedStage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .failed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: plan.initialStateID)
+
+        let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
+        let service = ExecutionService(modelContext: context, executor: executor, catalog: nil)
+
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
+
+        let orchestrator = try #require(service.orchestrator(for: run.id))
+        let orchestratorCatalog = try #require(orchestrator.catalog)
+        #expect(orchestratorCatalog.backendProfiles.isEmpty == false)
+        #expect(orchestratorCatalog.agents.isEmpty == false)
 
         await cancelAndAwaitSettled(service, runID: run.id)
     }
@@ -985,7 +1191,7 @@ struct ResumeManagerTests {
         let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
         let service = ExecutionService(modelContext: context, executor: executor)
 
-        try service.resumeRun(run: run, compiler: compiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
 
         await awaitCondition("Recovery-created running run should attach an orchestrator", timeout: 3.0) {
             service.orchestrator(for: run.id) != nil && run.status == .running
@@ -993,6 +1199,53 @@ struct ResumeManagerTests {
 
         #expect(service.orchestrator(for: run.id) != nil)
         #expect(run.status == .running)
+
+        await cancelAndAwaitSettled(service, runID: run.id)
+    }
+
+    @Test("ExecutionService resume immediately persists running status and refreshes latest summary")
+    func executionServiceResumeImmediatelyPersistsRunningStatusAndSummary() async throws {
+        let (run, plan, workspace) = try makeRunFromPlan()
+        run.status = .blocked
+        run.completedAt = Date(timeIntervalSince1970: 400)
+        run.driftDetails = "Execution stalled after the last session closed before the workflow could transition."
+
+        let blockedStage = StageExecution(
+            stageID: plan.initialStateID,
+            label: try #require(plan.states[plan.initialStateID]?.label),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+        try context.save()
+
+        let coordinator = RecoveryCoordinator(modelContext: context)
+        _ = try coordinator.retryStage(run: run, stageID: plan.initialStateID)
+
+        let executor = SimulatedAgentExecutor(simulatedDelay: 1.0)
+        let service = ExecutionService(modelContext: context, executor: executor)
+
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
+
+        #expect(run.status == .running)
+        #expect(run.completedAt == nil)
+
+        let latestSummaryURL = workspace.artifactRoot
+            .appendingPathComponent("reports", isDirectory: true)
+            .appendingPathComponent("run_summary_latest.json")
+
+        await awaitCondition("Latest summary should be refreshed to running", timeout: 3.0) {
+            guard FileManager.default.fileExists(atPath: latestSummaryURL.path),
+                  let data = try? Data(contentsOf: latestSummaryURL),
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+
+            return payload["status"] as? String == RunStatus.running.rawValue
+                && payload["blockedReason"] as? String == nil
+        }
 
         await cancelAndAwaitSettled(service, runID: run.id)
     }
@@ -1044,7 +1297,7 @@ struct ResumeManagerTests {
             catalog: catalog
         )
 
-        try service.resumeRun(run: run, compiler: compiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
 
         await awaitCondition("Recovery-created running run should complete without creating a new stage iteration", timeout: 3.0) {
             run.status == .completed
@@ -1096,11 +1349,18 @@ struct ResumeManagerTests {
         )
         failedAgent.stageExecution = stage
         failedAgent.logSnippet = "Required outputs missing: output_1"
+        failedAgent.supervisionClassification = .idleHangAfterFirstEdit
+        failedAgent.transportErrorKind = .stream
         context.insert(failedAgent)
         try context.save()
 
-        let coordinator = RecoveryCoordinator(modelContext: context)
-        _ = try coordinator.retryAgent(run: run, stageID: plan.initialStateID, agentID: "test_agent")
+        let retryCoordinator = StageRetryCoordinator(modelContext: context)
+        _ = try retryCoordinator.retryFailedAgent(
+            run: run,
+            stage: stage,
+            failedAgent: failedAgent,
+            retryReason: "automatic_watchdog_retry"
+        )
 
         let retryExec = try #require(
             stage.agentExecutions
@@ -1126,7 +1386,7 @@ struct ResumeManagerTests {
             catalog: catalog
         )
 
-        try service.resumeRun(run: run, compiler: compiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
 
         await awaitCondition("Late output should complete the run without rerunning the retry attempt", timeout: 3.0) {
             run.status == .completed
@@ -1140,6 +1400,10 @@ struct ResumeManagerTests {
         #expect(stage.agentExecutions.count == 2)
         #expect(failedAgent.status == .completed)
         #expect(retryExec.status == .completed)
+        #expect(failedAgent.supervisionClassification == .idleHangAfterFirstEdit)
+        #expect(failedAgent.canonicalOutcome == .completedWithTransportError)
+        #expect(retryExec.retryReason == "automatic_watchdog_retry")
+        #expect(retryExec.transportErrorKind == .stream)
         #expect(
             failedAgent.artifacts.contains { $0.name == "output_1" }
         )
@@ -1171,7 +1435,7 @@ struct ResumeManagerTests {
             catalog: catalog
         )
 
-        try service.resumeRun(run: run, compiler: compiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: compiler, source: .runsHomeManualResume)
 
         await awaitCondition("Recovery-created ready stage retry should complete without extra stage creation", timeout: 3.0) {
             run.status == .completed
@@ -1215,7 +1479,7 @@ struct ResumeManagerTests {
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
 
-        let idea = Idea(title: "Live Workflow", body: "Validate Goose-backed executor routing")
+        let idea = Idea(title: "Live Workflow", body: "Validate runtime-backed executor routing")
         context.insert(idea)
 
         let runID = UUID()
@@ -1245,16 +1509,13 @@ struct ResumeManagerTests {
             executor: SimulatedAgentExecutor(),
             catalog: catalog,
             liveRuntimeConfiguration: LiveRuntimeConfiguration(
-                baseURL: URL(string: "http://localhost:9999")!,
-                apiKey: nil,
                 override: LiveExecutionOverride(
                     enabled: true,
-                    provider: "claude_code",
+                    provider: "claude_acp",
                     model: "default",
                     effort: "high"
                 ),
-                transportMode: .network,
-                transportAPI: .gooseServer
+                transportMode: .fixtureFullMVPSuccess
             )
         )
 
@@ -1519,6 +1780,7 @@ struct ResumeManagerTests {
             hasPendingApproval: false,
             hasRunningAgents: false,
             stalledStageStatus: nil,
+            stalledStageStartedAt: nil,
             latestLiveEvent: ExecutionEvent(
                 type: .sessionClosed,
                 timestamp: Date().addingTimeInterval(-5),
@@ -1549,6 +1811,7 @@ struct ResumeManagerTests {
             hasPendingApproval: false,
             hasRunningAgents: false,
             stalledStageStatus: .completed,
+            stalledStageStartedAt: nil,
             latestLiveEvent: ExecutionEvent(
                 type: .sessionClosed,
                 timestamp: Date().addingTimeInterval(-31),
@@ -1560,8 +1823,264 @@ struct ResumeManagerTests {
         #expect(shouldReconcile == false)
     }
 
-    @Test("ExecutionService starts ACP-backed live workflow without Goose runtime config")
-    func executionServiceStartsACPBackedLiveWorkflowWithoutGooseRuntimeConfig() async throws {
+    @Test("ExecutionService does not reconcile immediately after all fan-out reviewers settle")
+    func executionServiceDoesNotReconcileFreshPostFanoutSettlement() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: Date().addingTimeInterval(-240),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-31),
+                detail: "Session closed"
+            ),
+            now: Date()
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService reconciles stalled run after extended post-fanout settlement grace window")
+    func executionServiceReconcilesExpiredPostFanoutSettlement() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: Date().addingTimeInterval(-480),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: Date().addingTimeInterval(-301),
+                detail: "Session closed"
+            ),
+            now: Date()
+        )
+
+        #expect(shouldReconcile == true)
+    }
+
+    @Test("ExecutionService does not reconcile freshly started downstream stage before first agent work")
+    func executionServiceDoesNotReconcileFreshStartedDownstreamStageBeforeFirstAgentWork() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 2,
+                lastCompletedStateID: "state_5_proposal_refined",
+                lastCompletedStageExecutionID: UUID(),
+                nextScheduledStateID: "state_4_proposal_reviewed",
+                nextScheduledIteration: 9,
+                nextScheduledAttemptNumber: 1,
+                scheduledStageExecutionID: nil,
+                settlementPhase: .transitionStarted,
+                updatedAt: now.addingTimeInterval(-31)
+            )
+        )
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: false,
+            hasStartedStageWithoutAgentWork: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-31),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-31),
+                detail: "Upstream writer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService reconciles truly stale started downstream stage after extended grace")
+    func executionServiceReconcilesTrulyStaleStartedDownstreamStageAfterExtendedGrace() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        run.persistTransitionCursor(
+            TransitionCursor(
+                sequenceNumber: 2,
+                lastCompletedStateID: "state_5_proposal_refined",
+                lastCompletedStageExecutionID: UUID(),
+                nextScheduledStateID: "state_4_proposal_reviewed",
+                nextScheduledIteration: 9,
+                nextScheduledAttemptNumber: 1,
+                scheduledStageExecutionID: nil,
+                settlementPhase: .transitionStarted,
+                updatedAt: now.addingTimeInterval(-301)
+            )
+        )
+
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            hasSettledParallelFanout: false,
+            hasStartedStageWithoutAgentWork: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-301),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-301),
+                detail: "Upstream writer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == true)
+    }
+
+    @Test("ExecutionService does not reconcile newly started stage from previous stage session close")
+    func executionServiceDoesNotReconcileNewlyStartedStageFromPreviousSessionClose() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: false,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-2),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-45),
+                detail: "Previous stage session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService does not reconcile while parallel stage still has running agents inside extended grace")
+    func executionServiceDoesNotReconcileWhileParallelStageAgentsAreStillRunning() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-177),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-177),
+                detail: "One reviewer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == false)
+    }
+
+    @Test("ExecutionService reconciles truly stale running-agent stage after extended grace expires")
+    func executionServiceReconcilesTrulyStaleRunningAgentStageAfterExtendedGrace() {
+        let run = Run(
+            workflowID: "test",
+            workflowTitle: "Test",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "wf.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data()
+        )
+        run.status = .running
+
+        let now = Date()
+        let shouldReconcile = ExecutionService.shouldReconcileStalledRun(
+            run: run,
+            hasPendingApproval: false,
+            hasRunningAgents: true,
+            stalledStageStatus: .running,
+            stalledStageStartedAt: now.addingTimeInterval(-301),
+            latestLiveEvent: ExecutionEvent(
+                type: .sessionClosed,
+                timestamp: now.addingTimeInterval(-301),
+                detail: "One reviewer session closed"
+            ),
+            now: now
+        )
+
+        #expect(shouldReconcile == true)
+    }
+
+    @Test("ExecutionService starts ACP-backed live workflow without legacy runtime config")
+    func executionServiceStartsACPBackedLiveWorkflowWithoutLegacyRuntimeConfig() async throws {
         let workflow = try loadLiveWorkflow()
         let catalog = try loadCanonicalCatalog()
         let plan = try compiler.previewCompile(workflow: workflow, catalog: catalog)
@@ -1760,7 +2279,7 @@ struct ResumeManagerTests {
             catalog: catalog
         )
 
-        try service.resumeRun(run: run, compiler: localCompiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: localCompiler, source: .runsHomeManualResume)
 
         // Wait for approval restoration using awaitCondition instead of pollUntil
         await awaitCondition("Waiting approval should be restored", timeout: 3.0) {
@@ -1932,7 +2451,7 @@ struct ResumeManagerTests {
             catalog: catalog
         )
 
-        try service.resumeRun(run: run, compiler: localCompiler)
+        try service.resumeRunFromOperatorRecovery(run: run, compiler: localCompiler, source: .runsHomeManualResume)
         await awaitCondition("Pending approval should be restored", timeout: 3.0) {
             service.pendingApprovalCount == 1
         }
@@ -2152,5 +2671,321 @@ struct ResumeManagerTests {
             })
         )
         #expect(fetchedApproval.decidedAt != nil)
+    }
+
+    @Test("ExecutionService rebuild prunes stale in-memory approval requests after gate already settled")
+    func executionServiceRebuildPrunesStalePendingApprovalRequestsAfterSettlement() throws {
+        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
+        let config = ModelConfiguration("ExecutionServicePruneStaleApprovals-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let localContainer = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(localContainer)
+        let localContext = localContainer.mainContext
+        let localCompiler = RunPlanCompiler(modelContext: localContext)
+
+        let workflow = WorkflowDefinition(
+            schemaVersion: 1,
+            workflow: WorkflowMeta(
+                id: "approval_prune",
+                name: "Approval Prune",
+                usesAgentCatalog: nil,
+                description: "Stale approval pruning test",
+                ideaInput: nil,
+                execution: ExecutionConfig(singleActiveRunPerIdea: true, resumePolicy: "automatic_on_launch"),
+                requiredProviders: []
+            ),
+            variables: nil,
+            failurePolicy: nil,
+            scoring: nil,
+            initialState: "state_1",
+            states: [
+                "state_1": WorkflowState(
+                    label: "Approval Gate",
+                    type: "start",
+                    owner: "test_agent",
+                    approval: "required",
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: []
+                )
+            ]
+        )
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Approval prune test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: "Test Skill", description: "Test")],
+            contracts: [:],
+            backendProfiles: [
+                "test_profile": BackendProfile(
+                    provider: "claude_code",
+                    model: "test-model",
+                    effort: "high",
+                    temperature: 0,
+                    maxTurns: 4,
+                    structuredOutput: "none"
+                )
+            ],
+            permissionProfiles: [
+                "TEST": PermissionProfile(
+                    filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                    git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                    shell: ShellPermissions(allow: nil, deny: nil),
+                    network: NetworkPermissions(allow: nil),
+                    mcp: MCPPermissions(allow: nil)
+                )
+            ],
+            agents: [
+                AgentDefinition(
+                    id: "test_agent",
+                    title: "Test Agent",
+                    mode: "tool_use",
+                    backendProfile: "test_profile",
+                    permissionProfile: "TEST",
+                    skillRef: "test_skill",
+                    skillRole: nil,
+                    worktreePolicy: nil,
+                    requiredTools: nil,
+                    inputs: [],
+                    outputs: [],
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    prompt: "Wait for approval",
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
+                )
+            ]
+        )
+
+        let plan = try localCompiler.previewCompile(workflow: workflow, catalog: catalog)
+        let idea = Idea(title: "Prune stale approvals", body: "Ensure rebuild drops stale in-memory requests")
+        localContext.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PruneStaleApprovals-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: localContext).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+        run.status = .waitingApproval
+
+        let stageExec = StageExecution(
+            stageID: "state_1",
+            label: "Approval Gate",
+            status: .waitingApproval,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stageExec.run = run
+        localContext.insert(stageExec)
+
+        let approval = Approval(stageID: "state_1", decision: .requested)
+        approval.run = run
+        localContext.insert(approval)
+        try localContext.save()
+
+        let service = ExecutionService(
+            modelContext: localContext,
+            executor: SimulatedAgentExecutor(),
+            catalog: catalog
+        )
+
+        #expect(service.pendingApprovalCount == 1)
+
+        approval.decision = .granted
+        approval.decidedAt = Date()
+        stageExec.status = .completed
+        stageExec.completedAt = Date()
+        run.status = .blocked
+        try localContext.save()
+
+        service.rebuildPersistedPendingApprovals()
+
+        #expect(service.pendingApprovalCount == 0)
+    }
+
+    @Test("ExecutionService resolveApproval ignores stale request when run still says waitingApproval but gate is already granted")
+    func executionServiceResolveApprovalIgnoresStaleRequestForAlreadyGrantedGate() throws {
+        let schema = Schema([Idea.self, Run.self, StageExecution.self, AgentExecution.self, Approval.self, Artifact.self])
+        let config = ModelConfiguration("ExecutionServiceIgnoreStaleApproval-\(UUID().uuidString)", schema: schema, isStoredInMemoryOnly: true)
+        let localContainer = try ModelContainer(for: schema, configurations: [config])
+        TestModelContainerRetainer.retain(localContainer)
+        let localContext = localContainer.mainContext
+        let localCompiler = RunPlanCompiler(modelContext: localContext)
+
+        let workflow = WorkflowDefinition(
+            schemaVersion: 1,
+            workflow: WorkflowMeta(
+                id: "approval_prune",
+                name: "Approval Prune",
+                usesAgentCatalog: nil,
+                description: "Ignore stale approval test",
+                ideaInput: nil,
+                execution: ExecutionConfig(singleActiveRunPerIdea: true, resumePolicy: "automatic_on_launch"),
+                requiredProviders: []
+            ),
+            variables: nil,
+            failurePolicy: nil,
+            scoring: nil,
+            initialState: "state_1",
+            states: [
+                "state_1": WorkflowState(
+                    label: "Approval Gate",
+                    type: "start",
+                    owner: "test_agent",
+                    approval: "required",
+                    run: nil,
+                    runAfterApproval: nil,
+                    loop: nil,
+                    transitions: []
+                )
+            ]
+        )
+        let catalog = AgentCatalog(
+            schemaVersion: 1,
+            app: AppConfig(
+                name: "Chainworks Forge",
+                runtime: "local",
+                transport: "http_sse",
+                description: "Ignore stale approval test catalog",
+                ideaInputMode: "text",
+                singleActiveRunPerIdea: true,
+                runResumePolicy: "automatic_on_launch",
+                requiredProviders: []
+            ),
+            paths: [:],
+            artifacts: [:],
+            skills: ["test_skill": SkillRef(type: "inline_skill", path: nil, name: "Test Skill", description: "Test")],
+            contracts: [:],
+            backendProfiles: [
+                "test_profile": BackendProfile(
+                    provider: "claude_code",
+                    model: "test-model",
+                    effort: "high",
+                    temperature: 0,
+                    maxTurns: 4,
+                    structuredOutput: "none"
+                )
+            ],
+            permissionProfiles: [
+                "TEST": PermissionProfile(
+                    filesystem: FilesystemPermissions(read: nil, write: nil, deny: nil),
+                    git: GitPermissions(status: nil, diff: nil, checkout: nil, commit: nil, push: nil),
+                    shell: ShellPermissions(allow: nil, deny: nil),
+                    network: NetworkPermissions(allow: nil),
+                    mcp: MCPPermissions(allow: nil)
+                )
+            ],
+            agents: [
+                AgentDefinition(
+                    id: "test_agent",
+                    title: "Test Agent",
+                    mode: "tool_use",
+                    backendProfile: "test_profile",
+                    permissionProfile: "TEST",
+                    skillRef: "test_skill",
+                    skillRole: nil,
+                    worktreePolicy: nil,
+                    requiredTools: nil,
+                    inputs: [],
+                    outputs: [],
+                    outputContract: nil,
+                    requiresHumanApproval: false,
+                    prompt: "Wait for approval",
+                    notes: nil,
+                    sessionReuseScope: nil,
+                    sessionFamilyID: nil
+                )
+            ]
+        )
+
+        let plan = try localCompiler.previewCompile(workflow: workflow, catalog: catalog)
+        let idea = Idea(title: "Ignore stale approvals", body: "Do not replay settled approval gates")
+        localContext.insert(idea)
+
+        let runID = UUID()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("IgnoreStaleApproval-\(runID.uuidString)", isDirectory: true)
+        let artifactRoot = tempDir.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let workspace = RunWorkspace(
+            runID: runID,
+            workspaceRoot: tempDir,
+            artifactRoot: artifactRoot,
+            worktreeRoot: nil
+        )
+
+        let run = try RunRepository(context: localContext).createRunFromPlan(
+            for: idea,
+            plan: plan,
+            workspace: workspace,
+            workflowSourcePath: repositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml").path,
+            catalogSourcePath: repositoryRootURL().appendingPathComponent("examples/agents/agents.yaml").path
+        )
+        run.status = .waitingApproval
+
+        let stageExec = StageExecution(
+            stageID: "state_1",
+            label: "Approval Gate",
+            status: .waitingApproval,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stageExec.run = run
+        localContext.insert(stageExec)
+
+        let approval = Approval(stageID: "state_1", decision: .requested)
+        approval.run = run
+        localContext.insert(approval)
+        try localContext.save()
+
+        let executor = SimulatedAgentExecutor()
+        let service = ExecutionService(
+            modelContext: localContext,
+            executor: executor,
+            catalog: catalog
+        )
+        let requestID = try #require(service.pendingApprovals.keys.first)
+
+        approval.decision = .granted
+        approval.decidedAt = Date()
+        stageExec.status = .completed
+        stageExec.completedAt = Date()
+        run.status = .waitingApproval
+        try localContext.save()
+
+        service.resolveApproval(approvalID: requestID, granted: true, comment: "stale request should be ignored")
+
+        #expect(service.pendingApprovalCount == 0)
+        #expect(service.orchestrator(for: run.id) == nil)
+        #expect(executor.executedTasks.isEmpty)
+        #expect(run.approvals.filter { $0.stageID == "state_1" && $0.decision == .requested }.isEmpty)
+        #expect(run.approvals.filter { $0.stageID == "state_1" && $0.decision == .granted }.count == 1)
     }
 }

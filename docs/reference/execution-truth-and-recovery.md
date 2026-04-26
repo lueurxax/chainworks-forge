@@ -1,6 +1,6 @@
 # Execution Truth and Recovery
 
-Stable reference for the implemented execution-truth, settlement, and recovery slice that was previously tracked by Proposal 016.
+Stable reference for the execution-truth, settlement, and recovery contract.
 
 ## Purpose
 
@@ -13,8 +13,6 @@ This document is the stable contract for:
 - approval restoration and resume behavior,
 - frozen-vs-runtime binding truth in reports,
 - and recovery/report readers that must prefer persisted truth over heuristic reconstruction.
-
-For implementation/proof status, use [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md).
 
 ## Scope
 
@@ -58,7 +56,7 @@ These values live in [`Chainworks Forge/Models/ExecutionTruth.swift`](<../../Cha
 Transport finish markers such as `stop` or `session_closed` describe how streaming ended.
 They do not by themselves prove successful completion.
 
-Current classification rules in `GooseAgentExecutor` therefore require more than a neutral finish marker:
+Current classification rules in `RuntimeAgentExecutor` therefore require more than a neutral finish marker:
 
 - durable output plus later transport failure becomes `completed_with_transport_error`,
 - timeout before output becomes `timed_out_before_output`,
@@ -71,6 +69,7 @@ Current classification rules in `GooseAgentExecutor` therefore require more than
 The primary persisted execution-truth columns on `AgentExecution` are:
 
 - `canonicalOutcome`
+- `supervisionClassification`
 - `transportErrorKind`
 - `providerStopReason`
 - `outputPresence`
@@ -88,6 +87,105 @@ Readers must use this precedence:
 3. coarse legacy fields like `AgentStatus` only when canonical columns are absent.
 
 Raw receipts or transcripts must never silently override canonical persisted outcome truth.
+
+### Watchdog-specific truth refines, but does not replace, canonical outcome
+
+`supervisionClassification` is the durable refinement field for watchdog-specific execution truth.
+
+The stable contract is:
+
+- `canonicalOutcome` remains the terminal execution state,
+- `supervisionClassification` carries watchdog-specific or integrity-specific refinement such as:
+  - `idleHangBeforeFirstProgress`
+  - `idleHangAfterProgress`
+  - `idleHangReadLoop`
+  - `idleHangAfterFirstEdit`
+  - `mutationSideEffectMissing`
+- `transportErrorKind` and `providerStopReason` remain orthogonal transport/provider evidence,
+- `outcomeEnvelopeJSON` and receipts explain the settled truth but do not redefine it.
+
+Readers must therefore interpret agent-level execution truth in this order:
+
+1. `canonicalOutcome` for terminal state,
+2. `supervisionClassification` for watchdog-specific refinement,
+3. `transportErrorKind` and `providerStopReason` for transport/provider context,
+4. evidence payloads only as supporting detail.
+
+### Rust ACP runtime facts are durable execution truth
+
+The Rust control plane persists provider-independent runtime facts for every ACP-backed
+agent execution that reaches the engine-owned execution path. These facts are not log
+parsing and are not reconstructed from transcripts during readback.
+
+#### AgentExecution Owner Model
+
+To support lead-mediated conflicts without synthetic stage states, `AgentExecution` 
+uses a general owner model (ARCH-037). 
+- **owner_kind**: `stage_execution` or `lead_conflict_mediation`.
+- **owner_id**: References either `stage_execution_id` or `mediation_record_id`.
+- **stage_execution_id**: Becomes nullable; required for `stage_execution` owners 
+  and null for `lead_conflict_mediation`.
+
+This allows mediation-owned executions to reuse the same retry, quota, 
+artifact, and cost infrastructure as stage-owned executions.
+
+`agent_execution_runtime_facts` is the durable execution-facts row keyed by 
+`agent_execution_id`. It records:
+
+- `failure_kind` as a stable `AgentFailureKind`,
+- `failure_kind_raw_debug` for future or provider-specific raw values,
+- `failure_message_redacted` and its redaction version,
+- `retry_after` and `operator_action_hint`,
+- provider process / transport diagnostics such as exit status, transport code, and
+  supervision classification,
+- `output_settlement`,
+- required-output validity and late-output counters,
+- session reuse reason,
+- `quota_ledger_id`,
+- creation and update timestamps.
+
+`agent_execution_discovery_diagnostics` is a related durable table that owns detailed discovery pipeline execution decisions (exact paths, provider envelopes, meta-root bounding). `agent_execution_runtime_facts` projects those decisions into scalar `output_settlement` truth but does not store the full payload.
+
+Current `AgentFailureKind` values include:
+
+- `provider_quota`
+- `provider_permission_required`
+- `provider_permission_rejected`
+- `provider_timeout`
+- `provider_internal_error`
+- `transport_epipe`
+- `transport_protocol_error`
+- `transport_closed`
+- `mcp_startup_timeout`
+- `mcp_permission_modal_stall`
+- `xcode_host_environment_error`
+- `missing_required_outputs`
+- `invalid_output_contract`
+- `cancelled_by_operator`
+- `superseded_by_retry`
+- `host_interruption`
+- `unknown`
+
+Rules:
+
+- unknown stored failure kinds map to public `unknown` while preserving the raw value
+  in operator-only debug readback,
+- non-operator GraphQL/MCP readers must receive `null` or omitted raw debug detail,
+- `quota_ledger_id` references the durable provider-quota retry ledger,
+- runtime facts are the preferred source for recovery action hints and report summaries,
+- output-settlement truth stays separate from failure-kind truth.
+
+`AgentOutputSettlement` captures what happened to declared outputs independently of
+why the provider finished:
+
+- `none`
+- `valid_outputs_from_completed_execution`
+- `valid_outputs_from_failed_execution`
+- `missing_required_outputs`
+- `invalid_required_outputs`
+- `ignored_late_outputs`
+
+`ignored_late_outputs` is settlement truth, not an `AgentFailureKind`.
 
 ## Stage Truth and Recovery Evidence
 
@@ -111,6 +209,53 @@ The important contract is ownership, not file shape:
 - recovery recommendations belong to the stage record,
 - reports and recovery surfaces read the stage record first instead of inferring truth from loose artifact scans.
 
+`recoverySnapshotJSON` is stage-owned next-action truth, not agent-level execution truth.
+It may narrow the operator action after a watchdog failure or exhausted retry, but it must not override the settled `AgentExecution` truth described above.
+
+### Workflow Conflict Recovery
+
+When declarative graph authority fails to select a valid next state, the run 
+blocks with a `WorkflowConflictRecord`.
+
+**Conflict Classification:**
+- `unresolved`: Initial state requiring attention.
+- `lead_mediation_pending`: Escalated to a system lead for same-run resolution.
+- `operator_confirmation_required`: Lead produced a resolution that requires 
+  manual approval.
+- `resolved`: Successfully settled back into graph authority.
+- `superseded`: A newer conflict fingerprint arrived before resolution.
+- `terminal_unverifiable`: Irrecoverable conflict requiring manual resolution 
+  (e.g., clone or manual edit).
+
+**Advisory Rejection Truth:**
+If the graph advances legally despite agent hints that would have caused a 
+conflict, the runtime persists a `WorkflowAdvisoryRejectionRecord`. These are 
+not blocking and appear in run reports and history as non-critical evidence of 
+graph authority.
+
+### Transition Cursor Authority
+
+Transition completion and cursor update are one atomic settlement unit. 
+The run-level transition cursor is the authoritative continuation signal:
+
+- `currentStageID` resolution is cursor-first.
+- If a blocking `WorkflowConflictRecord` is current, the cursor remains anchored 
+  at the current state with `resume_policy=await_conflict_resolution`.
+- Transition settlement cannot be inferred from partial stage snapshots alone.
+
+### Implementation Handoff Status
+
+Runs entering implementation use `ImplementationHandoffStatus` to
+track engine-owned handoff truth (ARCH-038):
+- **Engine-Owned Handoff**: The engine owns the deterministic `approved_proposal`
+  snapshot and handoff artifacts.
+- **Durable Readback**: `code_writer_start_status` remains `not_queued` until an
+  execution is actually claimed. `implementation_handoff_status` distinguishes
+  between `ready`, `blocked_before_code`, and `running`.
+- **Failure Handling**: Implementation-entry planning timeouts block with
+  `implementation_handoff_unavailable` without losing the deterministic approved
+  proposal. Retry resumes from the handoff/planning boundary.
+
 ### Recovery uses the narrowest valid next action
 
 `StageRetryCoordinator` persists and rebuilds `RecoveryActionSnapshot` values that describe the narrowest valid next step:
@@ -123,7 +268,78 @@ The important contract is ownership, not file shape:
 
 `RunReportBuilder` and `RecoveryCoordinator` consume these snapshots directly when present and synthesize them from stage evidence only as a fallback.
 
+### Provider quota recovery uses a durable ledger
+
+Provider quota failures are classified as `provider_quota`, may persist `retry_after`,
+and are linked to `agent_retry_budget_ledger` through
+`agent_execution_runtime_facts.quota_ledger_id`.
+
+The retry ledger is idempotent per execution and records whether a retry waited for
+the provider reset window or explicitly consumed normal retry budget early. Stage
+retry handling must consult this ledger before resetting execution state so operators
+cannot accidentally hide quota exhaustion as an ordinary retry.
+
+Recovery snapshots should prefer runtime facts when selecting the next action:
+
+- `provider_quota` -> wait for `retry_after` or explicitly consume budget,
+- `provider_permission_required` -> provider authorization,
+- `mcp_permission_modal_stall` -> Xcode/MCP authorization,
+- `missing_required_outputs` -> inspect outputs then retry,
+- `invalid_required_outputs` -> inspect contract then retry,
+- `valid_outputs_from_failed_execution` -> accept degraded outputs or retry,
+- `host_interruption` -> automated jittered retry under capacity caps.
+
+### Host Interruption
+
+`host_interruption` is a neutral or cautionary failure kind, not a critical provider
+failure. It is detected by comparing monotonic and wall-clock timestamps or via macOS
+system hooks.
+
+Rules:
+- Only executions running across the detected epoch are eligible for host interruption
+  classification.
+- Host-interrupted executions terminate ACP sessions and provider process groups
+  before retry.
+- Retries are exempt from provider quota retry budget but still count against
+  active execution capacity.
+- Late or partial outputs from superseded host-interrupted attempts are skipped
+  unless existing settlement rules allow promotion.
+
+### Startup Recovery
+
+Startup recovery repair is the first phase of daemon execution. It reconciles
+stale running work from a previous process crash or hard shutdown.
+
+Rules:
+- **Capacity-Aware Requeue**: Recovered work is requeued through the same capacity
+  gates as ordinary work. It does not bypass global, provider, or per-run caps.
+- **Durable Readback**: Startup recovery progress is persisted in the
+  `startup_recovery_readbacks` table and exposed via GraphQL/MCP so operators
+  can see the recovery backlog during initialization.
+- **Stale Repair**: A terminal, skipped, or superseded stage must not own a
+  running agent execution after startup repair completes.
+- **Idempotency**: Repeated startup repair cycles converge to the same truth
+  without duplicating work items.
+
 ## Resume and Approval Restore
+
+### Atomic transition settlement and cursor authority
+
+Transition completion and cursor update are one settlement unit in the execution-persistence flow. Recovery never infers continuation from partial stage snapshots alone.
+
+The run-level transition cursor is the authoritative continuation signal:
+
+- `currentStageID` resolution is cursor-first — if cursor metadata is present, projection and UI-facing stage state follow it; `stageExecutions` order is a compatibility fallback only.
+- Interrupted transition paths keep intermediate marker state so the system can surface exact interruption and continue deterministically.
+- Workflow-map projection and report/recovery builders derive continuation from cursor data before stage aggregate views.
+
+Invariants:
+
+1. no UI-facing stage claims resumable state without matching cursor continuity,
+2. repeated projection/recovery cycles converge to the same cursor-derived stage,
+3. resumed runs never lose transition intent when partial transition state is present.
+
+Implementation owners: `Run` cursor metadata and derived-stage helpers, `WorkflowMapProjectionService`, `RunReportBuilder`, `RecoveryCoordinator`.
 
 ### Resume is fail-closed
 
@@ -147,7 +363,7 @@ That classification already considers:
 Approval-bound runs are allowed to restore visible pending approval context after relaunch.
 The contract is:
 
-- approval gates restore the same operator decision point when the persisted state still supports it,
+- approval gates restore the same operator decision point (read-only/diagnostic in P031) when the persisted state still supports it,
 - drift can be surfaced as context without silently discarding the approval state,
 - recovery or report readers must not invent a new approval truth that was not persisted.
 
@@ -177,9 +393,10 @@ The narrower binding contract is documented in [provider-binding-truth.md](provi
 Current report/recovery readers should prefer:
 
 1. `AgentExecution` execution-truth columns,
-2. `StageExecution` failure and recovery payloads,
-3. run-level trust / provenance metadata,
-4. coarse legacy statuses only as compatibility fallback.
+2. Rust `agent_execution_runtime_facts` when present,
+3. `StageExecution` failure and recovery payloads,
+4. run-level trust / provenance metadata,
+5. coarse legacy statuses only as compatibility fallback.
 
 This keeps report timelines, failed-step summaries, retry hints, and resume guidance tied to persisted truth rather than heuristic rescans of historical artifacts.
 
@@ -189,13 +406,14 @@ This slice is currently proved primarily through current-head non-UI test suites
 
 High-signal proof owners include:
 
-- `GooseAgentExecutorTests` for transport-outcome classification and limit exhaustion,
+- `RuntimeAgentExecutorTests` for transport-outcome classification and limit exhaustion,
 - `OrchestratorTests` for persistence of canonical outcome, provider/model truth, and validation-after-output settlement,
 - `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 - `RecoveryCoordinatorTests` for narrow recovery action ownership,
-- `Proposal013Tests` for failed-stage evidence and report/recovery fallback behavior.
-
-For the consolidated proof story, use [../evidence/execution-truth-and-recovery-proof.md](../evidence/execution-truth-and-recovery-proof.md).
+- failed-stage evidence and report/recovery fallback suites,
+- `./scripts/test-gate.sh proposal-058` for Rust ACP runtime facts, claim/start ownership,
+  source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
+  retry ledger behavior.
 
 ## Adjacent References
 

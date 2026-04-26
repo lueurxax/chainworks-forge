@@ -6,7 +6,24 @@ The Workflow Execution Engine compiles YAML workflow definitions and agent catal
 into executable run plans, then drives them through a state machine to completion.
 It handles sequential and parallel agent execution, human approval gates, bounded
 loops, artifact persistence, transition evaluation, and safe resume after app
-interruption. All engine code lives under `Chainworks Forge/Engine/`.
+interruption.
+
+All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
+`control-plane/crates/engine/` (Rust daemon).
+
+**P031 Thin UI Boundary:**
+Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's
+state via GraphQL projections. While the Swift engine remains implemented for
+parity, the governed UI is prohibited from calling mutation paths in
+`ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and
+Approval actions move to external CLI/MCP workflows.
+
+**Rust Daemon Implementation:**
+The Rust control-plane daemon implements the same state machine and transition
+semantics while adding robust capacity-aware scheduling, scheduler fairness,
+executor backpressure, and host interruption recovery to handle concurrent runs
+on a single host. See [rust-control-plane.md](rust-control-plane.md) for details
+on the daemon's scheduler, write serialization, and recovery logic.
 
 Related stable docs:
 
@@ -76,7 +93,7 @@ on a `Run` record and re-runs `previewCompile`. Rejects compiler version mismatc
 `RunPlanCompiler` also owns the compile-time resolution that turns catalog declarations into runtime-authoritative agent bindings:
 
 - `skill_ref` / `skill_role` -> frozen `ResolvedSkill`
-- `mcp_profile` -> frozen MCP intent on the resolved agent
+- `AgentEntry.backend_profile` / `backend_profile.mcp` -> `ResolvedAgent.backend_profile_id` plus frozen `ResolvedAgent.requested_mcp_server_ids`
 - `backend_profile` / `runtime_profile` -> transport-ready provider binding truth
 
 ### Workflow Orchestrator (`WorkflowOrchestrator.swift`)
@@ -104,8 +121,9 @@ executor, then persists outputs through `ArtifactManager`.
 
 **Approval flow**: When a state has `approval: required`, the orchestrator pauses,
 creates an `Approval` record, and publishes an `ApprovalRequest`. On resolution:
-granted resumes execution (including any `runAfterApproval` block); rejected cancels
-the run.
+granted resumes execution (including any `runAfterApproval` block); rejected typically
+cancels the run, but some workflows define explicit loopback transitions for
+`approval.rejected == true` (e.g., looping back to proposal refinement).
 
 **Cancellation**: Sets `isCancelled`, updates run status, stops the loop.
 
@@ -118,8 +136,7 @@ protocol AgentExecutor: Sendable {
 }
 ```
 
-Executors return `[String: Data]` (in-memory), never file URLs. The
-`ArtifactManager` is the sole disk writer (ARCH-030).
+Executors return `[String: Data]` (in-memory) or write to disk via the discovery settlement pipeline. The `ArtifactManager` is the primary disk writer for in-memory results and the metadata authority for all artifacts (ARCH-030).
 
 The executor path consumes:
 
@@ -140,20 +157,20 @@ Deterministic mock. Generates structurally valid outputs via
 `OutputContractTemplates`. Supports injectable failures (`failingAgentIDs`) and
 configurable delay. Thread-safe task tracking for test assertions.
 
-#### GooseAgentExecutor (`GooseAgentExecutor.swift`)
+#### RuntimeAgentExecutor (`RuntimeAgentExecutor.swift`)
 
-Live executor using a Goose backend. Accepts `any GooseTransportProtocol` (bespoke
-or `GooseServerTransport`). Per-execution flow:
+Live executor using the selected ACP runtime transport. Per-execution flow:
 
 1. Validate workspace boundaries.
-2. Create an isolated session via `GooseSessionBridge`.
-3. Stream execution events through `ExecutionEventBridge`.
-4. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-5. Read declared output files from the workspace artifact directory.
-6. Validate required outputs -- missing outputs fail the stage.
+2. Capture pre-prompt metadata for the per-execution baseline.
+3. Create an isolated session via `RuntimeSessionBridge`.
+4. Stream execution events through `ExecutionEventBridge`.
+5. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
+6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
+7. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
-before the SSE connection dropped.
+before the transport closed, governed by the discovery settlement policy.
 
 ### Artifact Manager (`ArtifactManager.swift`)
 
@@ -176,7 +193,6 @@ Nonisolated, `Sendable` disk I/O layer.
 - Path layout: `{artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}`
 - Path traversal guard: rejects any resolved path outside `workspaceRoot`.
 - Atomic writes with SHA-256 checksums.
-
 ### Transition Evaluator (`TransitionEvaluator.swift`)
 
 Stateless evaluator for transition `when` clauses (ARCH-031). Supports only
@@ -187,15 +203,126 @@ canonical patterns:
 | Always | `when: 'true'` |
 | Artifact exists | `when: exists('proposal_review_summary')` |
 | Approval granted | `when: approval.granted == true` |
+| Approval rejected | `when: approval.rejected == true` |
 | Comparison | `when: review.score >= vars.min_score` |
 | Connectives | `expr and expr`, `expr or expr` |
 
 Value resolution supports `vars.*` (runtime variables), `artifact.field` (artifact
 metadata), and literals (int, double, bool, quoted string). Comparison operators:
-`==`, `>`, `>=`. Unrecognized expressions fail closed (return false).
+`==`, `>`, `>=`, `!=`. Unrecognized expressions fail closed (return false).
 
-### Resume Manager (`ResumeManager.swift`)
+### Transition Authority Resolver (`WorkflowOrchestrator.swift`)
 
+The Transition Authority Resolver (ARCH-032) enforces the compiled workflow graph
+as the sole authority for stage progression.
+
+**Authority Rules:**
+- The compiled workflow graph is the only authority for legal next state selection.
+- Agent-authored `next_stage`, `next_action`, `run_state.json`, and narrative
+  transition hints are treated as **advisory evidence only**.
+- A legal declarative transition always takes precedence over a conflicting
+  advisory hint.
+- An advisory `next_stage` absent from the graph never creates a synthetic state.
+- Multiple matched declarative transitions without a tie-break result in a
+  blocking conflict.
+- Unknown catalog artifact references (`exists(unknown_artifact)`) never evaluate
+  to true; they are classified as `invalid_expression` (undeclared) or
+  `missing_input` (declared but absent).
+
+### Aggregate Artifact Field Authority
+
+To ensure deterministic evaluation, aggregate artifact fields are classified by
+authority (ARCH-035). For example, in `proposal_review_summary_v1`:
+
+- **Transition Authoritative**: `pass`, `blocker_count`, `blocking_issues`,
+  `required_changes`. These drive graph transitions.
+- **Advisory Only**: `next_action`, `next_stage`. These are recorded as
+  advisory evidence but cannot select a graph transition alone.
+- **Contradiction Bearing**: `decision`. Used to detect internal aggregate
+  inconsistency.
+
+### Candidate Transition Evaluation
+
+Every transition evaluation produces a `CandidateTransitionEvaluation` record
+detailing why a transition matched or failed (ARCH-033).
+
+Results include:
+- `matched`
+- `not_matched`
+- `missing_input` (declared artifact absent)
+- `invalid_expression` (undeclared artifact or invalid field)
+- `evaluation_error`
+
+### Transition Input Dependency Classification
+
+Fail-closed behavior applies to all transition inputs (ARCH-036):
+- If a referenced artifact is not declared by the workflow/catalog contract,
+  it is `invalid_expression`.
+- If declared but absent, it is `missing_input`.
+- `exists(unknown_artifact)` never returns true in graph-authoritative evaluation.
+
+#### Workflow Conflict and Advisory Rejection
+
+If graph authority cannot determine a single valid next state, the engine persists
+a `WorkflowConflictRecord`:
+- `no_declarative_transition_matched`
+- `multiple_declarative_transitions_matched_without_tie_break`
+- `required_artifact_or_field_missing_for_transition`
+- `aggregate_transition_truth_conflicted`
+- `workflow_conflict_unverifiable`
+- `implementation_handoff_unavailable`
+
+If the graph advances legally despite a conflicting agent hint, the hint is
+persisted as a `WorkflowAdvisoryRejectionRecord` for historical truth.
+
+#### Lead Conflict Mediation
+
+The engine provides automated conflict resolution through **Lead Conflict Mediation**.
+Eligible conflicts are routed to a system lead for same-run resolution before
+falling back to manual intervention.
+
+**Mediation Lifecycle:**
+1. **Detection**: A blocking conflict is detected and persisted.
+2. **Escalation**: If mediation is enabled and a system lead is resolvable via
+   `PhaseBLeadResolver`, the engine creates a `LeadConflictMediationRecord`.
+3. **Execution**: The system lead is invoked with the conflict context. The
+   execution is owned by the mediation record (`owner_kind: lead_conflict_mediation`).
+4. **Settlement**: Lead output must satisfy the lead agent's
+   `LeadResolutionContract`; malformed or absent output moves the mediation and
+   conflict to `terminal_unverifiable`.
+5. **Confirmation**: If the resolution requires operator sign-off, a
+   `lead_mediation_confirmation` is created in the separate mediation confirmation
+   store and appears in the mixed `approvals.list` inbox.
+6. **Resolution**: Once confirmed or auto-settled, the mediation outcome resolves
+    the conflict, enabling the orchestrator to advance the transition cursor.
+
+**Phase B Lead Resolver:**
+During Phase B, lead resolution uses a **versioned JSON compatibility map** (`docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`) as the sole machine-authoritative source for lead selection. This map defines exact matches between workflow/catalog pairs and their designated system lead. Fail-closed rules apply if no match or multiple matches exist.
+
+**Validation and Preflight**:
+Mandatory static validation and runtime preflight ensure exactly-one lead
+resolution and `LeadResolutionContract` coverage. Failure to resolve a valid
+lead results in a `terminal_unverifiable` conflict.
+
+**Observability**:
+P017 records workflow-conflict rollout metrics in durable
+`workflow_conflict_metric_events` rows. Phase C adds
+`phase_c_validation_outcome_total` for lead validation outcomes
+(`static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`), while
+conflict resolution records `workflow_conflict_time_to_resolution_seconds`,
+`conflict_reason_to_action_outcome_total`, and
+`recovery_action_chosen_total`.
+
+#### Status-based implementation handoff transitions
+
+
+The implementation completeness and handoff contract uses status-based
+transitions for the implementation loop. The `code_writer` exits the implementation
+loop when the self-assessment status is `complete`, `handoff_required`, or `blocked`.
+
+---
+
+## Resume Manager (`ResumeManager.swift`)
 Classifies interrupted runs at app launch (ARCH-029). Three outcomes per run:
 
 - **`.resume`** -- plan rebuilt successfully, no drift, no mid-side-effect
@@ -205,28 +332,11 @@ Classifies interrupted runs at app launch (ARCH-029). Three outcomes per run:
 - **`.cannotResume`** -- compiler version mismatch or snapshot corruption. Marked
   failed.
 
-Side-effect detection uses permission profiles (`RELEASE_GIT`, `RELEASE_PUBLISH`),
-the `requiresHumanApproval` flag, and stage-name heuristics (commit, push, release,
-publish, deploy).
+### Transition Cursor Authority
 
-### Execution Service (`ExecutionService.swift`)
-
-App-scoped `@MainActor @Observable` singleton (ARCH-022). Manages the collection
-of active orchestrators (ARCH-028 -- not a per-run singleton).
-
-Responsibilities:
-
-- **Start run** -- creates an orchestrator, wires approval and completion callbacks,
-  selects the appropriate executor (simulated vs. live).
-- **Resume interrupted runs** -- delegates to `ResumeManager`, then starts
-  orchestrators for resumable runs; marks others blocked or failed.
-- **Approval resolution** -- routes approval decisions to the correct orchestrator.
-- **Cancellation** -- cancels the orchestrator and cleans up state.
-- **Executor selection** -- for live workflows (`proposal_loop_live`), selects a
-  `GooseAgentExecutor` backed by the selected `RuntimeTransportProtocol`
-  implementation (Goose compatibility or ACP-native adapter) and optional
-  provider/model override.
-- **Post-run hooks** -- triggers Steward analysis and emits run reports on completion.
+Transition completion and cursor update are one atomic settlement unit (ARCH-034).
+The run-level transition cursor is the authoritative continuation signal,
+anchoring the run at the current state when a blocking conflict exists.
 
 ---
 
@@ -245,6 +355,9 @@ Responsibilities:
 | ARCH-029 | Resume safety: compiler version check, drift detection, side-effect stage detection. |
 | ARCH-030 | Executors return `[String: Data]`. `ArtifactManager` is the sole disk writer. |
 | ARCH-031 | Transition conditions use only the canonical pattern set; unrecognized expressions fail closed. |
+| ARCH-032 | Workflow Authority: The compiled graph is the sole authority; agent hints are advisory only. |
+| ARCH-033 | Conflict Truth: Blocking graph outcomes must persist as typed `WorkflowConflictRecord`. |
+| ARCH-034 | Cursor Authority: Transition settlement and cursor update are atomic; cursor anchors on conflicts. |
 
 ---
 
@@ -276,7 +389,7 @@ Responsibilities:
       │        │                                 │
       │        v                                 │
       │  ┌─────────────┐                         │
-      │  │AgentExecutor│  (Simulated or Goose)   │
+      │  │AgentExecutor│  (Simulated or ACP)     │
       │  └─────┬───────┘                         │
       │        │ AgentResult ([String: Data])     │
       │        v                                 │
@@ -301,7 +414,7 @@ Responsibilities:
 | `Engine/WorkflowOrchestrator.swift` | Per-run state machine driver |
 | `Engine/AgentExecutor.swift` | Executor protocol, ExecutionContext, AgentResult |
 | `Engine/SimulatedAgentExecutor.swift` | Deterministic mock executor |
-| `Engine/GooseAgentExecutor.swift` | Live executor via Goose backend |
+| `Engine/RuntimeAgentExecutor.swift` | Live executor via ACP runtime transport |
 | `Engine/ArtifactManager.swift` | SwiftData metadata bridge for artifacts |
 | `Engine/ArtifactStorage.swift` | Nonisolated disk I/O with path guards |
 | `Engine/TransitionEvaluator.swift` | Stateless transition condition evaluator |

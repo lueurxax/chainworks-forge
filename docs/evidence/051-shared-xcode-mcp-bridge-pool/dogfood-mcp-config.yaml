@@ -1,0 +1,12 @@
+mcp:
+  xcode:
+    type: xcode_broker
+    runtime_id: xcode
+    xcode_pid_selector: pid:36971
+  context7:
+    runtime_id: context7
+    command: npx
+    args:
+      - -y
+      - "@upstash/context7-mcp"
+    env: {}

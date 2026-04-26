@@ -1,6 +1,6 @@
 # UI Quality and Visual Polish
 
-Stable reference for the implemented UI quality, readability, accessibility, and bounded design-system hardening slice that was previously tracked by Proposal 012.
+Stable reference for the UI quality, readability, accessibility, and bounded design-system hardening slice.
 
 ## Purpose
 
@@ -63,7 +63,7 @@ Implemented hierarchy/state work includes:
 - structured provider settings rather than one undifferentiated settings wall,
 - pilot readiness summary treatment,
 - step-oriented first-run setup presentation,
-- visible journey/probing feedback in Goose remediation,
+- visible journey/probing feedback in provider diagnostics and setup,
 - surface-local loading, success, and retry copy for bounded async actions.
 
 ### Shared status semantics
@@ -133,12 +133,12 @@ These surfaces now define the stable proof-owning UI quality baseline:
 | `FirstRunSetupWizard` | Preview + interaction/runtime proof | steps, validation, launch feedback |
 | `ArchivedIdeasView` | Preview | empty-state/readability consistency |
 | `DeliveryPreflightReportView` | Preview + adopter-slice accessibility proof | positive and negative status rendering |
-| `GooseProviderConnectionAssistantView` | Preview + runtime proof | guided remediation journey and probing feedback |
 | `ApprovalGateView` | Interaction/runtime proof | keyboard-only confirm/dismiss ownership |
 | `ReleaseGateView` | Preview + runtime proof | artifact semantics and decision affordances |
 | `RecoverySheet` | Interaction/runtime proof | recovery action discoverability and dismissal |
 | `RunStartOverridesView` | Preview | bounded secondary-surface consistency |
 | `WorkflowMapView` | Preview + runtime proof | stage-card affordance, status badges, topology readability |
+| `ImplementationSelfAssessmentPanel` | Preview + interaction/runtime proof | 2x2 metric grid, status-mapped icons, detail disclosure groups, accessibility summary |
 
 ## Minimum-window contract
 
@@ -202,5 +202,4 @@ Use:
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) for the implemented brand/token adoption layer,
 - [provider-platform.md](provider-platform.md) for provider/settings/readiness semantics,
 - [live-workflow-map.md](live-workflow-map.md) for topology truth in run detail,
-- [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) for brand-system authority,
-- [../evidence/ui-quality-and-polish-proof.md](../evidence/ui-quality-and-polish-proof.md) for current implementation/proof status.
+- [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) for brand-system authority.

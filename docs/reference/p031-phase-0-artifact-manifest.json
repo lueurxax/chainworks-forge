@@ -1,0 +1,97 @@
+{
+  "schema_version": "p031-phase-0-artifact-manifest-v1",
+  "status": "phase0d_runtime_evidence_attached_phase3_dogfood_signoff_pending",
+  "entries": [
+    {
+      "id": "governing_contract",
+      "path": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 1"
+    },
+    {
+      "id": "p043_reconciliation_evidence",
+      "path": "docs/reference/query-projections-and-client-consumption-contract.md",
+      "owner_role": "Rust control-plane owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 1"
+    },
+    {
+      "id": "p031_gate_evidence",
+      "path": "scripts/test-gate.sh",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 1"
+    },
+    {
+      "id": "ui_inventory",
+      "path": "docs/reference/p031-thin-ui-inventory.json",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 1"
+    },
+    {
+      "id": "schema_decision_record",
+      "path": "docs/reference/p031-schema-decision-record.json",
+      "owner_role": "Rust control-plane owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 1"
+    },
+    {
+      "id": "operator_write_path_guide",
+      "path": "docs/reference/p031-operator-write-path-guide.json",
+      "owner_role": "P031 release owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "degraded_state_evidence",
+      "path": "docs/evidence/p031-degraded-state-evidence.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "ready_with_scripted_drill_or_waiver_pending",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "degraded_state_sanitized_screenshot",
+      "path": "docs/evidence/p031-runtime/p031-runtime-ui-chainworks-restored-db-degraded-sanitized-2026-04-24.png",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready_release_screenshot",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "freshness_baseline",
+      "path": "docs/evidence/p031-freshness-baseline.md",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready_with_dogfood_confirmation_pending",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "report_payload_priority_decision",
+      "path": "docs/evidence/p031-report-payload-priority-decision.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "report_payload_live_evidence",
+      "path": "docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready_runtime_evidence",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "ux_accessibility_signoff",
+      "path": "docs/evidence/p031-ux-accessibility-signoff.md",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "validated_with_assistive_access_limitation",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "dogfood_signoff_template",
+      "path": "docs/evidence/p031-dogfood-signoff.md",
+      "owner_role": "P031 release owner",
+      "validation_status": "ready_template_with_runtime_prereqs_attached",
+      "blocking_phase": "Phase 3"
+    }
+  ]
+}

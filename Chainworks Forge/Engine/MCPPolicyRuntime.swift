@@ -34,7 +34,7 @@ struct MCPPolicyResolutionReport: Codable, Equatable, Sendable {
     )
 }
 
-struct GooseExtensionDefinition: Codable, Equatable, Sendable {
+struct RuntimeExtensionDefinition: Codable, Equatable, Sendable {
     let enabled: Bool?
     let type: String?
     let name: String
@@ -92,7 +92,7 @@ struct GooseExtensionDefinition: Codable, Equatable, Sendable {
     }
 
     /// Initialise from a raw YAML dictionary (as returned by `Yams.load`).
-    /// Used by `GooseExtensionRegistryReader.snapshot()` to avoid
+    /// Used by extension registry reader `snapshot()` to avoid
     /// `Decodable` conformance actor-isolation issues in nonisolated contexts.
     nonisolated fileprivate init?(rawYAML dict: [String: Any]) {
         guard let name = dict["name"] as? String else { return nil }
@@ -111,60 +111,82 @@ struct GooseExtensionDefinition: Codable, Equatable, Sendable {
     }
 }
 
-struct GooseExtensionRegistrySnapshot: Equatable, Sendable {
+struct RuntimeExtensionRegistrySnapshot: Equatable, Sendable {
     let configURL: URL
     let installedExtensionIDs: [String]
     let enabledExtensionIDs: [String]
-    let configsByRuntimeID: [String: GooseExtensionDefinition]
+    let configsByRuntimeID: [String: RuntimeExtensionDefinition]
 }
 
-struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
-    static let environmentConfigPathKey = "CHAINWORKS_GOOSE_CONFIG_PATH"
-    let configURL: URL
+private enum RuntimeExtensionRegistryConfigResolver {
+    nonisolated static func fixtureURLIfPresent() -> URL? {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let candidate = repoRoot.appendingPathComponent("examples/mcp/mcp-config-fixture.yaml")
+        return FileManager.default.isReadableFile(atPath: candidate.path) ? candidate : nil
+    }
 
-    nonisolated init(configURL: URL? = nil) {
-        if let configURL {
-            self.configURL = configURL
-            return
-        }
-
+    nonisolated static func defaultConfigURL(
+        primaryEnvironmentKey: String,
+        secondaryEnvironmentKey: String? = nil,
+        defaultPath: String
+    ) -> URL {
         let environment = ProcessInfo.processInfo.environment
         let isTestHost = environment["XCTestConfigurationFilePath"] != nil
         let usesInMemoryStore = environment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
-        if isTestHost || usesInMemoryStore {
-            // Nonisolated fixture URL resolution. Navigates 3 levels up from this
-            // source file to the repo root (Engine -> app target -> project -> repo).
-            let fixtureURL = URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("examples/goose/goose-config-fixture.yaml")
-            if FileManager.default.isReadableFile(atPath: fixtureURL.path) {
-                self.configURL = fixtureURL
-                return
-            }
+        if (isTestHost || usesInMemoryStore), let fixtureURL = fixtureURLIfPresent() {
+            return fixtureURL
         }
 
-        if let environmentPath = ProcessInfo.processInfo.environment["CHAINWORKS_GOOSE_CONFIG_PATH"]?
+        if let explicitPath = environment[primaryEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !environmentPath.isEmpty {
-            self.configURL = URL(fileURLWithPath: environmentPath)
-            return
+           !explicitPath.isEmpty {
+            return URL(fileURLWithPath: explicitPath)
         }
 
-        self.configURL = FileManager.default.homeDirectoryForCurrentUser
+        if let secondaryEnvironmentKey,
+           let fallbackPath = environment[secondaryEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !fallbackPath.isEmpty {
+            return URL(fileURLWithPath: fallbackPath)
+        }
+
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(defaultPath)
+    }
+
+    nonisolated static func sharedLegacyConfigURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/goose/config.yaml")
     }
 
-    nonisolated func snapshot() throws -> GooseExtensionRegistrySnapshot {
+    nonisolated static func migrateLegacyRegistryIfNeeded(
+        canonicalURL: URL,
+        legacyURL: URL
+    ) throws {
+        let fileManager = FileManager.default
+        guard !fileManager.isReadableFile(atPath: canonicalURL.path),
+              fileManager.isReadableFile(atPath: legacyURL.path) else {
+            return
+        }
+
+        try fileManager.createDirectory(
+            at: canonicalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fileManager.copyItem(at: legacyURL, to: canonicalURL)
+    }
+
+    nonisolated static func loadSnapshot(configURL: URL) throws -> RuntimeExtensionRegistrySnapshot {
         let contents = try String(contentsOf: configURL, encoding: .utf8)
-        // Use raw YAML load to avoid @MainActor-inferred Decodable conformance issues.
-        let extensions: [String: GooseExtensionDefinition]
+        let extensions: [String: RuntimeExtensionDefinition]
         if let root = try Yams.load(yaml: contents) as? [String: Any],
            let rawExtensions = root["extensions"] as? [String: Any] {
-            extensions = rawExtensions.compactMapValues { value -> GooseExtensionDefinition? in
+            extensions = rawExtensions.compactMapValues { value -> RuntimeExtensionDefinition? in
                 guard let dict = value as? [String: Any] else { return nil }
-                return GooseExtensionDefinition(rawYAML: dict)
+                return RuntimeExtensionDefinition(rawYAML: dict)
             }
         } else {
             extensions = [:]
@@ -173,16 +195,51 @@ struct GooseExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable 
         let enabled = extensions
             .compactMap { key, value in value.enabled == true ? key : nil }
             .sorted()
-        return GooseExtensionRegistrySnapshot(
+        return RuntimeExtensionRegistrySnapshot(
             configURL: configURL,
             installedExtensionIDs: installed,
             enabledExtensionIDs: enabled,
             configsByRuntimeID: extensions
         )
     }
+}
+
+// MARK: - RuntimeExtensionRegistryReader
+
+/// Shared local MCP registry reader for ACP runtimes.
+/// Canonical ownership is `~/.config/mcp/config.yaml`.
+/// If an older shared registry exists only at `~/.config/goose/config.yaml`,
+/// it is migrated once into the canonical ACP path and then read from there.
+struct CodexExtensionRegistryReader: RuntimeExtensionRegistryProvider, Sendable {
+    static let environmentConfigPathKey = "CHAINWORKS_CODEX_CONFIG_PATH"
+    let configURL: URL
+
+    nonisolated init(configURL: URL? = nil, legacyConfigURL: URL? = nil) {
+        let envKey = "CHAINWORKS_CODEX_CONFIG_PATH"
+        let preferred = configURL ?? RuntimeExtensionRegistryConfigResolver.defaultConfigURL(
+            primaryEnvironmentKey: envKey,
+            defaultPath: ".config/mcp/config.yaml"
+        )
+        let environment = ProcessInfo.processInfo.environment
+        let hasExplicitOverride = environment[envKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        if !hasExplicitOverride || configURL != nil {
+            let legacy = legacyConfigURL ?? RuntimeExtensionRegistryConfigResolver.sharedLegacyConfigURL()
+            try? RuntimeExtensionRegistryConfigResolver.migrateLegacyRegistryIfNeeded(
+                canonicalURL: preferred,
+                legacyURL: legacy
+            )
+        }
+        self.configURL = preferred
+    }
+
+    nonisolated func snapshot() throws -> RuntimeExtensionRegistrySnapshot {
+        try RuntimeExtensionRegistryConfigResolver.loadSnapshot(configURL: configURL)
+    }
 
     /// RuntimeExtensionRegistryProvider conformance.
-    nonisolated func registrySnapshot() throws -> GooseExtensionRegistrySnapshot {
+    nonisolated func registrySnapshot() throws -> RuntimeExtensionRegistrySnapshot {
         try snapshot()
     }
 }
@@ -192,60 +249,36 @@ struct MCPPolicyResolver: Sendable {
         agent: ResolvedAgent,
         catalog: AgentCatalog,
         providerBinding: ResolvedProviderBinding?,
-        gooseRegistry: GooseExtensionRegistrySnapshot?,
+        runtimeRegistry: RuntimeExtensionRegistrySnapshot?,
         runtimeNamespaceOverride: String? = nil
     ) -> MCPPolicyResolutionReport {
-        let defaultProfile = catalog.mcpPolicy.defaultProfile
-        let profileID = (agent.mcpProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? agent.mcpProfileID!
-            : defaultProfile
+        let requestedServers = Array(Set(agent.requestedMCPServerIDs)).sorted()
+        let profileID = agent.backendProfileID ?? "none"
 
-        if profileID == "none" {
+        if requestedServers.isEmpty {
             return .none
         }
-
-        guard let profile = catalog.mcpProfiles[profileID] else {
-            return MCPPolicyResolutionReport(
-                profileID: profileID,
-                requiredExtensions: [],
-                optionalExtensions: [],
-                requestedExtensions: [],
-                requiredRuntimeExtensionIDs: [],
-                optionalRuntimeExtensionIDs: [],
-                predictedEffectiveExtensions: [],
-                predictedEffectiveRuntimeExtensionIDs: [],
-                deniedExtensions: [],
-                warnings: [],
-                blockingIssues: ["Agent '\(agent.id)' references unknown MCP profile '\(profileID)'."]
-            )
-        }
-
-        let fallback = MCPFallbackPolicy(rawValue: profile.fallbackPolicy) ?? .failIfRequiredMissing
         let runtimeNamespace = runtimeNamespaceOverride ?? runtimeNamespace(for: providerBinding)
 
         var requiredRuntimeIDs: [String] = []
-        var optionalRuntimeIDs: [String] = []
         var effectiveExtensions: [String] = []
         var effectiveRuntimeIDs: [String] = []
         var deniedExtensions: [String] = []
-        var warnings: [String] = []
+        let warnings: [String] = []
         var blockingIssues: [String] = []
 
-        if !profile.allRequestedExtensions.isEmpty {
-            if runtimeNamespace == nil {
-                blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
-            }
-            if runtimeNamespace == "goose", gooseRegistry == nil {
-                blockingIssues.append("Goose extension registry is unavailable; cannot validate MCP profile '\(profileID)' for agent '\(agent.id)'.")
-            }
+        if runtimeNamespace == nil {
+            blockingIssues.append("Provider runtime cannot reconcile session-scoped MCP extensions for agent '\(agent.id)'.")
+        }
+        if runtimeRegistry == nil {
+            blockingIssues.append("Runtime extension registry is unavailable; cannot validate backend MCP requirements for agent '\(agent.id)'.")
         }
 
-        for serverID in profile.requiredExtensions {
+        for serverID in requestedServers {
             switch resolveServer(
                 serverID: serverID,
                 runtimeNamespace: runtimeNamespace,
-                registry: catalog.mcpServerRegistry,
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             ) {
             case .available(let runtimeID):
                 requiredRuntimeIDs.append(runtimeID)
@@ -253,38 +286,17 @@ struct MCPPolicyResolver: Sendable {
                 effectiveRuntimeIDs.append(runtimeID)
             case .missing(let message):
                 deniedExtensions.append(serverID)
-                if fallback == .failIfRequiredMissing {
-                    blockingIssues.append(message)
-                } else {
-                    warnings.append(message)
-                }
-            }
-        }
-
-        for serverID in profile.optionalExtensions {
-            switch resolveServer(
-                serverID: serverID,
-                runtimeNamespace: runtimeNamespace,
-                registry: catalog.mcpServerRegistry,
-                gooseRegistry: gooseRegistry
-            ) {
-            case .available(let runtimeID):
-                optionalRuntimeIDs.append(runtimeID)
-                effectiveExtensions.append(serverID)
-                effectiveRuntimeIDs.append(runtimeID)
-            case .missing(let message):
-                deniedExtensions.append(serverID)
-                warnings.append(message)
+                blockingIssues.append(message)
             }
         }
 
         return MCPPolicyResolutionReport(
             profileID: profileID,
-            requiredExtensions: profile.requiredExtensions,
-            optionalExtensions: profile.optionalExtensions,
-            requestedExtensions: profile.allRequestedExtensions,
+            requiredExtensions: requestedServers,
+            optionalExtensions: [],
+            requestedExtensions: requestedServers,
             requiredRuntimeExtensionIDs: Array(Set(requiredRuntimeIDs)).sorted(),
-            optionalRuntimeExtensionIDs: Array(Set(optionalRuntimeIDs)).sorted(),
+            optionalRuntimeExtensionIDs: [],
             predictedEffectiveExtensions: Array(Set(effectiveExtensions)).sorted(),
             predictedEffectiveRuntimeExtensionIDs: Array(Set(effectiveRuntimeIDs)).sorted(),
             deniedExtensions: Array(Set(deniedExtensions)).sorted(),
@@ -300,27 +312,25 @@ struct MCPPolicyResolver: Sendable {
     private func resolveServer(
         serverID: String,
         runtimeNamespace: String?,
-        registry: [String: MCPServerRegistryEntry],
-        gooseRegistry: GooseExtensionRegistrySnapshot?
+        runtimeRegistry: RuntimeExtensionRegistrySnapshot?
     ) -> MCPServerResolution {
-        guard let entry = registry[serverID] else {
-            return .missing("MCP server '\(serverID)' is not declared in mcp_server_registry.")
-        }
         guard let runtimeNamespace else {
             return .missing("MCP server '\(serverID)' requires a runtime with session-scoped MCP reconciliation support.")
         }
-        guard let runtimeID = entry.runtimeIDs[runtimeNamespace], !runtimeID.isEmpty else {
-            return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
-        }
-        if runtimeNamespace == "goose" {
-            guard let gooseRegistry else {
-                return .missing("MCP server '\(serverID)' cannot be validated because Goose extension registry is unavailable.")
+        if let runtimeRegistry {
+            guard let definition = runtimeRegistry.configsByRuntimeID[serverID] else {
+                return .missing("MCP server '\(serverID)' is not installed in the runtime registry.")
             }
-            guard gooseRegistry.configsByRuntimeID[runtimeID] != nil else {
-                return .missing("MCP server '\(serverID)' maps to runtime extension '\(runtimeID)', but that extension is not installed in Goose.")
+            if definition.enabled == false {
+                return .missing("MCP server '\(serverID)' is installed in the runtime registry but disabled.")
+            }
+
+            let normalizedType = definition.type?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "stdio"
+            if normalizedType == "platform", runtimeNamespace != "codex" {
+                return .missing("MCP server '\(serverID)' has no runtime mapping for '\(runtimeNamespace)'.")
             }
         }
-        return .available(runtimeID: runtimeID)
+        return .available(runtimeID: serverID)
     }
 }
 

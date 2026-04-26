@@ -131,12 +131,19 @@ Top-level structure parsed from `workflow.yaml`. Describes an explicit state mac
 WorkflowDefinition
 ├── schemaVersion: Int
 ├── workflow: WorkflowMeta
+├── discovery: DiscoveryConfig?
 ├── variables: [String: AnyCodableValue]?
 ├── failurePolicy: FailurePolicy?
 ├── scoring: ScoringConfig?
 ├── initialState: String
 └── states: [String: WorkflowState]
 ```
+
+#### `DiscoveryConfig`
+
+| Field | YAML Key | Type | Notes |
+|---|---|---|---|
+| `legacyBroadDiscoveryPolicy` | `legacy_broad_discovery_policy` | `String?` | `disabled` (default) or `workflow_opt_in` |
 
 #### `WorkflowState`
 
@@ -165,6 +172,11 @@ Defines which agents execute within a state:
 - `task: String` — task description
 - `inputs: [String]?` — input artifact references
 - `outputs: [String]?` — output artifact references
+- `output_policies: [String: OutputPolicyDefinition]?` — per-output settlement and reuse policies (P057/P058)
+
+#### `OutputPolicyDefinition`
+
+- `reuse_policy: String?` — `must_produce` or `allow_unchanged_existing`
 
 #### `Transition`
 

@@ -36,7 +36,7 @@ Goose still matters as legacy and compatibility infrastructure, but it is no lon
 - captures ideas as units of engineering work
 - executes YAML-defined workflows instead of hardcoded chat flows
 - binds specialized agents to providers, models, permissions, and output contracts
-- preserves run state, stage history, approvals, and artifact metadata in SwiftData
+- preserves run state, stage history, approvals, and artifact metadata in the backend (read by the UI via GraphQL projections)
 - stores generated artifacts on disk instead of hiding execution inside chat history
 - supports recovery, comparison, reporting, and approval-driven continuation
 - keeps repo-backed delivery and release work behind explicit gates
@@ -48,6 +48,7 @@ In practice, Chainworks Forge sits between ad hoc AI chats and heavyweight orche
 The current direction is:
 
 - ACP-first runtime transport
+- thin GraphQL-only operator UI over server-owned projections
 - frozen run truth and operator-visible recovery
 - backend-specific agent tuning through catalog-defined workflows
 - local-first execution with explicit provider/runtime diagnostics
@@ -70,11 +71,11 @@ It assumes that workflow truth, artifacts, approvals, and recovery matter more t
 
 ## Current Product Shape
 
-Today the app exposes these top-level operator surfaces:
+Today the app exposes these top-level operator surfaces through the thin GraphQL read boundary:
 
-- `Runs Home` for active, blocked, running, and completed runs
-- `Ideas` for starting and managing work
-- `Approvals` for pending human decisions
+- `Runs Home` for active, blocked, running, and completed runs (GraphQL-only)
+- `Ideas` for capturing and managing work (Create Idea is outside the governed thin UI write path)
+- `Approvals` for pending human decisions (diagnostic-only until a separate write transport is approved)
 - `Agent Catalog` for inspecting the resolved agent catalog
 - `Workflow Inspector` for YAML workflow inspection and validation
 - `Pilot Readiness` for readiness and sign-off support
@@ -90,21 +91,27 @@ The current MVP provider set is:
 
 The repository is past the scaffold stage. The implemented system now includes:
 
+- lead-mediated workflow conflict resolution and mandatory lead validation (Proposal 017 Phase B/C)
+- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
+- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017 Phase A)
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
+- local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
+- implementation completeness and handoff contract with structured status and verification truth
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
 
 Active proposal work is currently concentrated in:
 
-- [`docs/proposals/015-skill-resolution-and-runtime-injection.md`](docs/proposals/015-skill-resolution-and-runtime-injection.md)
+- [`docs/proposals/032-polish-stabilization-and-productization-backlog.md`](docs/proposals/032-polish-stabilization-and-productization-backlog.md)
+- [`docs/proposals/036-ux-consolidation-and-navigation-simplification.md`](docs/proposals/036-ux-consolidation-and-navigation-simplification.md)
 - [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
-The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
+The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). New UI proposals should build on that reference rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
 
 ## Implemented Today
 
@@ -119,9 +126,11 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - `ExecutionService`
   - `WorkflowOrchestrator`
   - `ResumeManager`
+  - Capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon)
 - artifact persistence and retrieval:
   - `ArtifactStorage`
   - `ArtifactManager`
+  - `bounded artifact discovery and settlement optimization`
   - report/export surfaces
 - provider platform slices:
   - provider settings
@@ -129,6 +138,10 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - ACP-oriented runtime dispatch and provider bindings
   - Goose compatibility diagnostics and remediation
   - frozen provider/model provenance truth
+- local daemon lifecycle slice:
+  - typed health/readiness and `daemonStatus` readback
+  - packaged app/helper supervision with PID lock and crash budget
+  - SQLite migration preflight, failed-serve status, diagnostics export, and packaged daemon proof lanes
 - repo-backed delivery slice:
   - worktree provisioning
   - delivery configuration freezing
@@ -215,6 +228,7 @@ Most common gates:
 
 - `./scripts/test-gate.sh build` — compile-only sanity check
 - `./scripts/test-gate.sh fast` — default inner-loop runtime/unit gate
+- Focused implementation completeness and handoff proof gate — see `docs/reference/test-gates.md`
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"` — remote-only UI smoke gate
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-022"` — remote-only Proposal 022 proof gate
 - `ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh full"` — remote-only full sign-off gate
@@ -233,12 +247,12 @@ Start here:
 - [`docs/reference/current-system-baseline.md`](docs/reference/current-system-baseline.md) — current-head subsystem map and baseline
 - [`docs/ps/chainworks-forge-mvp.md`](docs/ps/chainworks-forge-mvp.md) — MVP scope and requirements
 - [`docs/research/chainworks_core_idea.md`](docs/research/chainworks_core_idea.md) — product vision and positioning
-- [`docs/proposals/026-acp-first-runtime-transport-and-goose-decoupling.md`](docs/proposals/026-acp-first-runtime-transport-and-goose-decoupling.md) — additive ACP runtime rollout
-- [`docs/proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md`](docs/proposals/030-remove-goose-from-canonical-transport-and-simplify-runtime.md) — target architecture after Goose stops being canonical
+- [`docs/reference/acp-runtime-transport.md`](docs/reference/acp-runtime-transport.md) — ACP runtime transport and adapter-family contract
 
 Implemented-system references:
 
 - [`docs/reference/workflow-execution-engine.md`](docs/reference/workflow-execution-engine.md)
+- [`docs/reference/artifact-discovery-and-settlement-optimization.md`](docs/reference/artifact-discovery-and-settlement-optimization.md)
 - [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
 - [`docs/reference/execution-truth-and-recovery.md`](docs/reference/execution-truth-and-recovery.md)
 - [`docs/reference/output-contracts-failure-evidence-and-recovery.md`](docs/reference/output-contracts-failure-evidence-and-recovery.md)
@@ -257,7 +271,6 @@ Examples:
 
 - [`examples/README.md`](examples/README.md)
 - [`examples/agents/agents.yaml`](examples/agents/agents.yaml)
-- [`examples/agents/agents_with_gemini.yaml`](examples/agents/agents_with_gemini.yaml)
 - [`examples/workflows/workflow.yaml`](examples/workflows/workflow.yaml)
 - [`examples/workflows/proposal-loop-live.yaml`](examples/workflows/proposal-loop-live.yaml)
 - [`examples/workflows/full-mvp-live.yaml`](examples/workflows/full-mvp-live.yaml)

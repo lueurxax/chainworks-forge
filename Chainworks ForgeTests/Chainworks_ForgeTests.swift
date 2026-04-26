@@ -35,7 +35,7 @@ private let dummyWorkflow = WorkflowDefinition(
 private let dummyCatalog = AgentCatalog(
     schemaVersion: 1,
     app: AppConfig(
-        name: "test", runtime: "goose", transport: "http",
+        name: "test", runtime: "claude_agent", transport: "http",
         description: "test", ideaInputMode: "text",
         singleActiveRunPerIdea: true, runResumePolicy: "automatic_on_launch",
         requiredProviders: []
@@ -105,7 +105,7 @@ private func makeCatalog(
     AgentCatalog(
         schemaVersion: 1,
         app: AppConfig(
-            name: "test", runtime: "goose", transport: "http",
+            name: "test", runtime: "claude_agent", transport: "http",
             description: "test", ideaInputMode: "text",
             singleActiveRunPerIdea: true, runResumePolicy: "automatic_on_launch",
             requiredProviders: []
@@ -179,6 +179,49 @@ struct IdeaTests {
         #expect(idea.title == "Test Idea")
         #expect(idea.status == .draft)
         #expect(idea.runs.isEmpty)
+    }
+
+    @MainActor
+    @Test("Idea detail prefers the latest active run over a stale previously selected run")
+    func preferredDetailRunPrefersLatestActiveRun() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test Idea", body: "Test body")
+        context.insert(idea)
+
+        let olderRun = try makeRun(in: context, for: idea)
+        olderRun.startedAt = Date(timeIntervalSince1970: 100)
+        olderRun.status = .running
+
+        let newerRun = Run(
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            workflowID: olderRun.workflowID,
+            workflowTitle: olderRun.workflowTitle,
+            workflowSnapshotHash: olderRun.workflowSnapshotHash,
+            catalogSnapshotHash: olderRun.catalogSnapshotHash,
+            workflowSourcePath: olderRun.workflowSourcePath,
+            catalogSourcePath: olderRun.catalogSourcePath,
+            workflowSnapshotJSON: olderRun.workflowSnapshotJSON,
+            catalogSnapshotJSON: olderRun.catalogSnapshotJSON,
+            workspaceRoot: olderRun.workspaceRoot,
+            artifactRoot: olderRun.artifactRoot,
+            planCompilerVersion: olderRun.planCompilerVersion
+        )
+        newerRun.idea = idea
+        idea.runs.append(newerRun)
+        context.insert(newerRun)
+        try context.save()
+
+        let preferred = idea.preferredDetailRun(selectedRun: olderRun)
+        #expect(preferred?.id == newerRun.id)
+    }
+}
+
+@Suite("App Performance Contracts", .tags(.fast))
+struct AppPerformanceContractTests {
+    @Test("Window restoration stays disabled for the production app path")
+    func windowRestorationStaysDisabled() {
+        #expect(Chainworks_ForgeApp.shouldDisableWindowRestoration)
     }
 }
 
@@ -515,6 +558,35 @@ struct RunTests {
         )
         latestBlockedStage.run = run
         context.insert(latestBlockedStage)
+
+        #expect(run.presentationStatus == .blocked)
+        #expect(run.presentationStatusLabel == "blocked")
+    }
+
+    @Test func presentationStatusPrefersStoredBlockedStatusWhenLatestRunningStageHasNoLiveOwner() throws {
+        let context = try makeContext()
+        let idea = Idea(title: "Test", body: "Body")
+        context.insert(idea)
+        let run = try makeRun(in: context, for: idea)
+        run.status = .blocked
+
+        let staleBlockedStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked
+        )
+        staleBlockedStage.run = run
+        context.insert(staleBlockedStage)
+
+        let retryRunningStage = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 30),
+            status: .running
+        )
+        retryRunningStage.run = run
+        context.insert(retryRunningStage)
 
         #expect(run.presentationStatus == .blocked)
         #expect(run.presentationStatusLabel == "blocked")
@@ -858,14 +930,12 @@ struct YAMLParserTests {
             .deletingLastPathComponent()
         let url = repoRoot.appendingPathComponent("examples/agents/agents_mcp_profiles_v2.yaml")
         let catalog = try YAMLParser.loadAgentCatalog(from: url)
-        #expect(catalog.mcpPolicy.defaultProfile == "none")
-        #expect(catalog.mcpServerRegistry["xcode"]?.runtimeIDs["goose"] == "xcode")
-        #expect(catalog.mcpProfiles["code_build_rich"] != nil)
+        #expect(catalog.backendProfiles["codex_builder_high"]?.mcp == ["context7", "xcode"])
         let codeWriter = try #require(catalog.agents.first(where: { $0.id == "code_writer" }))
-        #expect(codeWriter.mcpProfile == "code_build_rich")
+        #expect(codeWriter.mcpProfile == nil)
     }
 
-    @Test func reviewVisualProfileDoesNotOptIntoAutovisualiser() throws {
+    @Test func reviewVisualBackendsRequireOnlyXcode() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -876,9 +946,8 @@ struct YAMLParserTests {
 
         for url in catalogURLs {
             let catalog = try YAMLParser.loadAgentCatalog(from: url)
-            let reviewVisual = try #require(catalog.mcpProfiles["review_visual"])
-            #expect(reviewVisual.requiredExtensions == ["xcode"])
-            #expect(reviewVisual.optionalExtensions.isEmpty)
+            #expect(catalog.backendProfiles["gemini_review_pro"]?.mcp == ["xcode"])
+            #expect(catalog.backendProfiles["claude_product_high"]?.mcp == ["xcode"])
         }
     }
 
@@ -897,11 +966,11 @@ struct YAMLParserTests {
             #expect(catalog.runtimeProfiles["claude_agent_acp"] != nil)
             #expect(catalog.runtimeProfiles["gemini_cli_acp"] != nil)
 
-            for (id, profile) in catalog.backendProfiles where profile.provider == "claude_code" {
+            for (id, profile) in catalog.backendProfiles where ProviderFamily.from(runtimeIdentifier: profile.provider) == .claudeACP {
                 #expect(profile.runtimeProfile == "claude_agent_acp", "Expected \(id) to use claude_agent_acp in \(url.lastPathComponent)")
             }
 
-            for (id, profile) in catalog.backendProfiles where profile.provider == "gemini" {
+            for (id, profile) in catalog.backendProfiles where ProviderFamily.from(runtimeIdentifier: profile.provider) == .geminiACP {
                 #expect(profile.runtimeProfile == "gemini_cli_acp", "Expected \(id) to use gemini_cli_acp in \(url.lastPathComponent)")
             }
 
@@ -921,6 +990,64 @@ struct YAMLParserTests {
         )
         #expect(workflow.states.count == 12)
         #expect(workflow.initialState == "state_1_idea_received")
+        #expect(workflow.discovery?.legacyBroadDiscoveryPolicy == nil)
+    }
+
+    @Test func parseWorkflowLegacyBroadDiscoveryPolicy() throws {
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("workflow-discovery-\(UUID()).yaml")
+        let yaml = """
+        schema_version: 1
+        workflow:
+          id: wf-discovery
+          name: Discovery Workflow
+          description: test
+          execution:
+            single_active_run_per_idea: true
+            resume_policy: automatic_on_launch
+          required_providers: []
+        discovery:
+          legacy_broad_discovery_policy: workflow_opt_in
+        initial_state: start
+        states:
+          start:
+            label: Start
+            type: start
+            owner: lead_orchestrator
+        """
+        try yaml.write(to: tmpURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        let workflow = try YAMLParser.loadWorkflow(from: tmpURL)
+        #expect(workflow.discovery?.legacyBroadDiscoveryPolicy == .workflowOptIn)
+    }
+
+    @Test func invalidWorkflowLegacyBroadDiscoveryPolicyThrows() throws {
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("workflow-discovery-invalid-\(UUID()).yaml")
+        let yaml = """
+        schema_version: 1
+        workflow:
+          id: wf-discovery
+          name: Discovery Workflow
+          description: test
+          execution:
+            single_active_run_per_idea: true
+            resume_policy: automatic_on_launch
+          required_providers: []
+        discovery:
+          legacy_broad_discovery_policy: always
+        initial_state: start
+        states:
+          start:
+            label: Start
+            type: start
+            owner: lead_orchestrator
+        """
+        try yaml.write(to: tmpURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        #expect(throws: YAMLParserError.self) {
+            _ = try YAMLParser.loadWorkflow(from: tmpURL)
+        }
     }
 
     @Test func parseCompactWorkflow() throws {
@@ -928,8 +1055,8 @@ struct YAMLParserTests {
             from: fixtureURL("proposal-to-release.yaml")
         )
         #expect(compact.workflow.stages.count == 10)
-        #expect(compact.workflow.requiredProviders.contains("codex"))
-        #expect(compact.workflow.requiredProviders.contains("claude_code"))
+        #expect(compact.workflow.requiredProviders.contains("codex_acp"))
+        #expect(compact.workflow.requiredProviders.contains("claude_acp"))
     }
 
     @Test func parseAgentDefinitions() throws {
@@ -958,8 +1085,8 @@ struct YAMLParserTests {
         let catalog = try YAMLParser.loadAgentCatalog(
             from: fixtureURL("agents.yaml")
         )
-        #expect(catalog.backendProfiles["claude_orchestrator_high"]?.provider == "claude_code")
-        #expect(catalog.backendProfiles["codex_builder_high"]?.provider == "codex")
+        #expect(ProviderFamily.from(runtimeIdentifier: catalog.backendProfiles["claude_orchestrator_high"]?.provider ?? "") == .claudeACP)
+        #expect(ProviderFamily.from(runtimeIdentifier: catalog.backendProfiles["codex_builder_high"]?.provider ?? "") == .codexACP)
     }
 
     @Test func exampleCatalogKeepsProposalWriterOnCurrentWriterProfile() throws {
@@ -998,6 +1125,29 @@ struct YAMLParserTests {
         let url = URL(fileURLWithPath: "/nonexistent/\(UUID()).yaml")
         #expect(throws: YAMLParserError.self) {
             _ = try YAMLParser.loadAgentCatalog(from: url)
+        }
+    }
+
+    @Test func unreadablePathPreservesReadFailureReason() throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("yaml-unreadable-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        #expect(throws: YAMLParserError.self) {
+            _ = try YAMLParser.loadAgentCatalog(from: tempDirectory)
+        }
+
+        do {
+            _ = try YAMLParser.loadAgentCatalog(from: tempDirectory)
+            Issue.record("Expected YAMLParser to fail for a directory URL")
+        } catch let error as YAMLParserError {
+            switch error {
+            case .fileReadFailed(let path, _):
+                #expect(path == tempDirectory.path)
+            default:
+                Issue.record("Expected fileReadFailed, got \(error)")
+            }
         }
     }
 
@@ -1081,8 +1231,8 @@ struct YAMLParserTests {
 
     @Test func testCompactRequiredProvidersParsed() throws {
         let compact = try YAMLParser.loadCompactWorkflow(from: fixtureURL("proposal-to-release.yaml"))
-        #expect(compact.workflow.requiredProviders.contains("codex"))
-        #expect(compact.workflow.requiredProviders.contains("claude_code"))
+        #expect(compact.workflow.requiredProviders.contains("codex_acp"))
+        #expect(compact.workflow.requiredProviders.contains("claude_acp"))
         #expect(compact.workflow.requiredProviders.count == 2)
     }
 
@@ -1297,7 +1447,7 @@ struct YAMLValidatorTests {
         #expect(issues.filter { $0.severity == .error }.isEmpty)
     }
 
-    @Test func brokenMCPProfileRef() {
+    @Test func legacyMCPProfileReferenceEmitsWarning() {
         let catalog = makeCatalog(
             skills: ["sk1": dummySkillRef],
             backendProfiles: ["bp1": dummyBackendProfile],
@@ -1306,7 +1456,16 @@ struct YAMLValidatorTests {
         )
 
         let issues = YAMLValidator.validateMCPRefs(catalog)
-        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("non-existent MCP profile") }))
+        #expect(issues.contains(where: { $0.severity == .warning && $0.message.contains("legacy mcp_profile") }))
+    }
+
+    @Test func canonicalCatalogDoesNotEmitLegacyPermissionProfileMCPWarnings() throws {
+        let repoRoot = testRepositoryRootURL()
+        let workflow = try YAMLParser.loadWorkflow(from: repoRoot.appendingPathComponent("examples/workflows/workflow.yaml"))
+        let catalog = try YAMLParser.loadAgentCatalog(from: repoRoot.appendingPathComponent("examples/agents/agents.yaml"))
+
+        let issues = YAMLValidator.validateAll(workflow: workflow, catalog: catalog)
+        #expect(issues.contains(where: { $0.message.contains("legacy MCP allowance") }) == false)
     }
 
     @Test func brokenArtifactRef() {
@@ -1392,6 +1551,32 @@ struct YAMLValidatorTests {
         )
         let issues = YAMLValidator.validateRunBlockSemantics(wf)
         #expect(issues.contains(where: { $0.message.contains("dup_agent") && $0.message.contains("both parallel and then") }))
+    }
+
+    @Test func outputPoliciesMustReferenceDeclaredOutputs() {
+        let wf = makeWorkflow(
+            initialState: "s1",
+            states: ["s1": WorkflowState(label: "S1", type: "start", owner: "o", approval: nil,
+                                          run: RunBlock(
+                                              sequence: [
+                                                  AgentTask(
+                                                      agent: "writer",
+                                                      task: "write",
+                                                      inputs: nil,
+                                                      outputs: ["proposal_review"],
+                                                      outputPolicies: [
+                                                          "stale_review": OutputPolicyDefinition(reusePolicy: .allowUnchangedExisting)
+                                                      ]
+                                                  )
+                                              ],
+                                              parallel: nil,
+                                              then: nil
+                                          ),
+                                          runAfterApproval: nil, loop: nil, transitions: nil)]
+        )
+
+        let issues = YAMLValidator.validateRunBlockSemantics(wf)
+        #expect(issues.contains(where: { $0.severity == .error && $0.message.contains("output_policies key 'stale_review'") }))
     }
 }
 

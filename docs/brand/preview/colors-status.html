@@ -1,0 +1,54 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Status palette</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{font-family:var(--font-text);color:var(--label);-webkit-font-smoothing:antialiased;height:200px;overflow:hidden;}
+  .card{padding:20px 24px;height:100%;box-sizing:border-box;}
+  .lbl{font:var(--t-caption2);letter-spacing:var(--tracking-wide);color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .row{display:flex;gap:12px;align-items:center;}
+  .row.tight{gap:6px;}
+  .stack{display:flex;flex-direction:column;gap:12px;}
+  .swatch{width:64px;height:64px;border-radius:14px;box-shadow:inset 0 0 0 0.5px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);}
+  .sw-md{width:48px;height:48px;border-radius:10px;box-shadow:inset 0 0 0 0.5px rgba(0,0,0,0.08);}
+  .sw-sm{width:32px;height:32px;border-radius:8px;box-shadow:inset 0 0 0 0.5px rgba(0,0,0,0.08);}
+  .meta{display:flex;flex-direction:column;gap:2px;}
+  .meta .name{font:var(--t-caption1);font-weight:600;color:var(--label);}
+  .meta .val{font-family:var(--font-mono);font-size:10.5px;color:var(--label-secondary);}
+  .capsule{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;font:var(--t-caption1);font-weight:600;border-radius:999px;background:color-mix(in srgb, currentColor 14%, transparent);}
+  .capsule.sm{padding:2px 7px;font-size:10px;}
+  .ico{width:14px;height:14px;display:inline-block;}
+  hr{border:0;border-top:0.5px solid var(--separator);margin:0;}
+</style></head>
+<body><div class="card">
+<div class="stack">
+  <div class="lbl">Run & approval state · Apple system colors</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px 18px;">
+    <div class="row tight">
+      <div class="sw-sm" style="background:#0A84FF;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Running</span><span class="val">#0A84FF</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#FFD60A;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Awaiting approval</span><span class="val">#FFD60A</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#34C759;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Completed</span><span class="val">#34C759</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#FF3B30;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Failed</span><span class="val">#FF3B30</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#FF9F0A;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Blocked</span><span class="val">#FF9F0A</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#8E8E93;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Pending</span><span class="val">#8E8E93</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#C7C7CC;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Cancelled</span><span class="val">#C7C7CC</span></div>
+    </div><div class="row tight">
+      <div class="sw-sm" style="background:#8E8E93;width:22px;height:22px;border-radius:6px;"></div>
+      <div class="meta"><span class="name">Cancelling</span><span class="val">#8E8E93</span></div>
+    </div>
+  </div>
+</div>
+</div></body></html>

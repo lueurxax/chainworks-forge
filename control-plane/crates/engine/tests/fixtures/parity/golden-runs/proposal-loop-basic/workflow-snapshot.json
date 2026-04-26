@@ -1,0 +1,28 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "proposal-loop-basic",
+  "title": "Proposal Loop Basic",
+  "initial_state": "draft",
+  "states": [
+    {
+      "stage_id": "draft",
+      "label": "Draft",
+      "owner": "fixture_agent",
+      "outputs": [
+        "draft_brief"
+      ],
+      "next_stage": "review",
+      "terminal": false
+    },
+    {
+      "stage_id": "review",
+      "label": "Review",
+      "owner": "fixture_agent",
+      "outputs": [
+        "proposal_review"
+      ],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

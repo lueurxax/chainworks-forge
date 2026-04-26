@@ -1,0 +1,81 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Brand hero</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{
+    font-family:var(--font-text);color:var(--label);
+    -webkit-font-smoothing:antialiased;
+    padding:20px 24px;box-sizing:border-box;
+  }
+  .stack{display:flex;flex-direction:column;gap:14px;}
+  .lbl{
+    font:var(--t-caption2);
+    letter-spacing:0.05em;
+    color:var(--label-tertiary);
+    text-transform:uppercase;
+    font-weight:600;
+  }
+  .meta{
+    font:var(--t-caption1);
+    color:var(--label-secondary);
+  }
+  .hero{
+    border-radius:14px;
+    overflow:hidden;
+    box-shadow:
+      0 1px 2px rgba(4,8,13,0.10),
+      0 12px 32px rgba(4,8,13,0.18);
+    line-height:0;
+  }
+  .hero img{ width:100%;height:auto;display:block; }
+
+  .specs{
+    display:grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap:10px;
+    padding:14px 18px;
+    background:var(--bg-elevated);
+    border-radius:10px;
+    box-shadow:inset 0 0 0 0.5px rgba(0,0,0,0.06);
+  }
+  .spec{display:flex;flex-direction:column;gap:2px;}
+  .spec .k{font:var(--t-caption2);color:var(--label-tertiary);text-transform:uppercase;font-weight:600;letter-spacing:0.05em;}
+  .spec .v{font-family:var(--font-mono);font-size:11.5px;color:var(--label);}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:6px;box-shadow:inset 0 0 0 0.5px rgba(0,0,0,0.18);}
+</style></head>
+<body>
+
+<div class="stack">
+
+  <div>
+    <div class="lbl">Brand hero · primary marketing artwork</div>
+    <div class="meta">README header, landing page, deck title slide. The single image is its own canvas — never crop, recolour, or reframe.</div>
+  </div>
+
+  <div class="hero">
+    <img src="../assets/brand-hero.png" alt="Chainworks Forge"/>
+  </div>
+
+  <div class="specs">
+    <div class="spec">
+      <div class="k">Background</div>
+      <div class="v"><span class="swatch" style="background:#0E1623;"></span>#0E1623</div>
+    </div>
+    <div class="spec">
+      <div class="k">Bird</div>
+      <div class="v"><span class="swatch" style="background:#FAFBFD;"></span>#FAFBFD</div>
+    </div>
+    <div class="spec">
+      <div class="k">Orbit</div>
+      <div class="v"><span class="swatch" style="background:#A3AFC0;"></span>#A3AFC0</div>
+    </div>
+    <div class="spec">
+      <div class="k">Beak accent</div>
+      <div class="v"><span class="swatch" style="background:#F59A2B;"></span>#F59A2B</div>
+    </div>
+  </div>
+
+</div>
+
+</body></html>

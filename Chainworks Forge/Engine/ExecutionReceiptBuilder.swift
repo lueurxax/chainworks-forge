@@ -30,15 +30,20 @@ struct ExecutionReceiptBuilder: Sendable {
         provider: String,
         model: String,
         effort: String,
+        supervision: ExecutionSupervisionReceipt? = nil,
+        codexTelemetry: CodexReceiptTelemetry? = nil,
         sessionReuseDisposition: String? = nil,
         sessionReuseScope: String? = nil,
-        sessionFamilyID: String? = nil
+        sessionFamilyID: String? = nil,
+        agentAttemptNumber: Int? = nil,
+        retryReason: String? = nil,
+        supersedesAgentExecutionID: UUID? = nil
     ) -> [String: Data] {
         var artifacts: [String: Data] = [:]
 
         // 1. Structured receipt (JSON) — Proposal 018: includes session provenance
         let receipt = ExecutionReceipt(
-            receiptVersion: "1.1",
+            receiptVersion: "1.2",
             agentID: agentID,
             sessionID: sessionID,
             stageID: stageID,
@@ -62,6 +67,11 @@ struct ExecutionReceiptBuilder: Sendable {
                 )
             },
             eventCount: events.count,
+            supervision: supervision,
+            codexTelemetry: codexTelemetry,
+            agentAttemptNumber: agentAttemptNumber,
+            retryReason: retryReason,
+            supersedesAgentExecutionID: supersedesAgentExecutionID,
             sessionReuseDisposition: sessionReuseDisposition,
             sessionReuseScope: sessionReuseScope,
             sessionFamilyID: sessionFamilyID
@@ -176,6 +186,11 @@ struct ExecutionReceipt: Codable, Sendable {
     let toolCallCount: Int
     let toolCalls: [ReceiptToolCall]
     let eventCount: Int
+    let supervision: ExecutionSupervisionReceipt?
+    let codexTelemetry: CodexReceiptTelemetry?
+    let agentAttemptNumber: Int?
+    let retryReason: String?
+    let supersedesAgentExecutionID: UUID?
     // Proposal 018: Session provenance fields for receipt consumers (REQ-006, PROD-001)
     let sessionReuseDisposition: String?
     let sessionReuseScope: String?
@@ -197,9 +212,40 @@ struct ExecutionReceipt: Codable, Sendable {
         case toolCallCount = "tool_call_count"
         case toolCalls = "tool_calls"
         case eventCount = "event_count"
+        case supervision
+        case codexTelemetry = "codex_telemetry"
+        case agentAttemptNumber = "agent_attempt_number"
+        case retryReason = "retry_reason"
+        case supersedesAgentExecutionID = "supersedes_agent_execution_id"
         case sessionReuseDisposition = "session_reuse_disposition"
         case sessionReuseScope = "session_reuse_scope"
         case sessionFamilyID = "session_family_id"
+    }
+}
+
+struct ExecutionSupervisionReceipt: Codable, Sendable, Equatable {
+    let classification: SupervisionClassification?
+    let promptSubmittedAt: Date?
+    let lastMeaningfulProgressAt: Date?
+    let firstMutatingToolAt: Date?
+    let lastMutatingToolName: String?
+    let silenceDurationSeconds: Double?
+    let automaticRetryConsumed: Bool
+    let mutationVerificationAttempted: Bool
+    let mutationSideEffectObserved: Bool?
+    let firstVerifiedMutatedPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case classification
+        case promptSubmittedAt = "prompt_submitted_at"
+        case lastMeaningfulProgressAt = "last_meaningful_progress_at"
+        case firstMutatingToolAt = "first_mutating_tool_at"
+        case lastMutatingToolName = "last_mutating_tool_name"
+        case silenceDurationSeconds = "silence_duration_seconds"
+        case automaticRetryConsumed = "automatic_retry_consumed"
+        case mutationVerificationAttempted = "mutation_verification_attempted"
+        case mutationSideEffectObserved = "mutation_side_effect_observed"
+        case firstVerifiedMutatedPath = "first_verified_mutated_path"
     }
 }
 

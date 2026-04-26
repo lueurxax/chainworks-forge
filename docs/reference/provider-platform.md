@@ -1,6 +1,6 @@
 # Provider Platform
 
-Stable reference for the multi-provider, settings, diagnostics, and pilot-readiness baseline that was previously tracked as Proposal 006.
+Stable reference for the multi-provider, settings, diagnostics, and pilot-readiness baseline.
 
 ## Purpose
 
@@ -17,9 +17,8 @@ The app must be able to:
 
 This document records that implemented baseline as a reference contract.
 
-Related stable doc:
+Related stable docs:
 
-- [goose-provider-remediation.md](goose-provider-remediation.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
 - [project-workspace-contract.md](project-workspace-contract.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
@@ -27,17 +26,37 @@ Related stable doc:
 
 ## Supported MVP provider families
 
-The current MVP provider set is:
+The current MVP provider set is normalized into five canonical families for 
+consistent capacity management and scheduling:
 
-1. `codex`
-2. `claude_code`
-3. `gemini`
+1. `claude` (aliases: `claude_acp`, `claude_agent`, `claude_agent_acp`)
+2. `gemini` (aliases: `gemini_acp`, `gemini_cli`, `gemini_cli_acp`)
+3. `codex` (aliases: `codex_acp`, `codex_cli`, `codex_cli_acp`, `openai_codex`)
+4. `auggie` (aliases: `auggie_acp`)
+5. `junie` (aliases: `junie_acp`)
+
+### Capacity Caps
+
+The control-plane daemon enforces default active-execution caps per provider family to 
+prevent saturation and ensure scheduling fairness:
+
+| Family | Default Cap |
+|---|---|
+| `claude` | 8 |
+| `gemini` | 4 |
+| `codex` | 10 |
+| `auggie` | 1 |
+| `junie` | 1 |
+
+System-wide, the daemon enforces a global cap of **20 active agent executions** and 
+a per-run cap of **4 active agent executions**. Surplus work remains queued 
+(backpressured) rather than failing.
 
 The operator should reason about provider family, configured installation/account, model, effort, capabilities, and current health without needing to care about transport internals.
 
 Runtime transport selection and per-agent MCP policy are adjacent contracts, but they are not owned here:
 
-- transport-family and ACP/Goose adapter truth live in [acp-runtime-transport.md](acp-runtime-transport.md),
+- transport-family and ACP adapter truth live in [acp-runtime-transport.md](acp-runtime-transport.md),
 - per-agent MCP policy and requested/predicted/actual runtime truth live in [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md).
 
 ## Core components
@@ -179,7 +198,7 @@ Overrides apply to the current run only and never mutate YAML/catalog definition
 
 ## Preflight and diagnostics
 
-The operator should learn about problems before hitting `Start Run`.
+The operator should learn about problems before issuing a run command externally. In P031, the macOS UI provides diagnostic preflight readback but does not host the `Start Run` action.
 
 Preflight categories:
 
@@ -197,15 +216,14 @@ Preflight categories:
 - warnings,
 - blocking issues.
 
-Run-start gate semantics:
-
-- `pass` -> start enabled
-- `warn` -> start allowed only with explicit confirmation
-- `fail` -> start disabled
+**Diagnostic Gate Semantics (UI Read-only):**
+- `pass` -> diagnostic green
+- `warn` -> diagnostic amber; external start advised only with caution
+- `fail` -> diagnostic red; external start likely to fail
 
 Preflight reads from persisted configuration stores, not ad hoc path state.
 
-For Goose-backed providers, preflight also consumes the remediation/verification truth described in [goose-provider-remediation.md](goose-provider-remediation.md).
+Preflight consumes ACP-era adapter health, persisted provider configuration, and runtime compatibility truth directly from the provider platform and runtime layers.
 
 ## Usage receipts
 
@@ -251,7 +269,6 @@ The provider-platform baseline includes:
 - `ProviderSettingsView`
 - `PreflightReportView`
 - `PilotReadinessView`
-- `GooseProviderConnectionAssistant`
 - `ProviderSetupEvidencePanel`
 
 Those surfaces cover:
@@ -259,29 +276,15 @@ Those surfaces cover:
 - workspace/YAML selection,
 - provider configuration,
 - provider verification,
-- Goose-backed remediation for `codex` and `claude_code`,
-- sample-run bootstrap,
+- ACP runtime readiness and provider diagnostics,
+- sample-run bootstrap (Diagnostic-only),
 - current provider/YAML/workspace health,
 - configuration source,
 - last successful run,
 - blocked runs,
-- pending approvals.
+- pending approvals (Diagnostic-only).
 
 The goal is to make the system operable on a fresh machine, not just understandable to someone already living in the codebase.
-
-## Goose-backed remediation
-
-For `codex` and `claude_code`, the primary operator path is Goose-backed.
-
-That remediation slice is stable and implemented:
-
-- unhealthy provider rows and first-run setup can hand off into `GooseProviderConnectionAssistant`,
-- verification follows a stepwise Goose handshake rather than a generic "try again" loop,
-- `ProviderSetupEvidencePanel` exposes endpoint/provider/model/probe facts,
-- `PilotReadinessView` and run-start preflight consume the same derived truth.
-
-This avoids a split reality where runtime depends on Goose but operator setup validates something else.
-
 ## Boundaries
 
 This reference intentionally stops at provider/platform readiness.

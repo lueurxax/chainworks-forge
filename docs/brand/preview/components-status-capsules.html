@@ -1,0 +1,165 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Status capsules</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{
+    font-family:var(--font-text);color:var(--label);
+    -webkit-font-smoothing:antialiased;
+    padding:20px 24px;box-sizing:border-box;
+  }
+  .stack{display:flex;flex-direction:column;gap:14px;}
+  .lbl{
+    font:var(--t-caption2);letter-spacing:0.05em;
+    color:var(--label-tertiary);text-transform:uppercase;font-weight:600;
+  }
+  .meta{font:var(--t-caption1);color:var(--label-secondary);margin-top:2px;}
+
+  /* —— Cinematic dark stage (hero panel aesthetic) —————————— */
+  .stage-dark{
+    position:relative;
+    border-radius:14px;overflow:hidden;
+    padding:28px 32px;
+    background:
+      radial-gradient(120% 80% at 50% 50%, #1A2433 0%, #0E1623 55%, #04080D 100%);
+    box-shadow:
+      0 1px 2px rgba(4,8,13,0.20),
+      0 14px 36px rgba(4,8,13,0.32);
+  }
+  .stage-dark::after{
+    content:"";position:absolute;inset:0;
+    background:radial-gradient(60% 40% at 30% 35%, rgba(255,255,255,0.05), transparent 70%);
+    pointer-events:none;
+  }
+  .stage-dark .eyebrow{
+    font:var(--t-caption2);letter-spacing:0.18em;
+    color:rgba(235,235,245,0.55);text-transform:uppercase;font-weight:600;
+    margin-bottom:18px;
+  }
+
+  /* —— Diffuse light stage (translucency demo) —————————— */
+  .stage-light{
+    position:relative;
+    border-radius:14px;overflow:hidden;
+    padding:28px 32px;
+    background:
+      radial-gradient(70% 110% at 12% 18%,  #FFD8A8 0%, transparent 55%),
+      radial-gradient(60% 100% at 88% 24%,  #B7D4FF 0%, transparent 55%),
+      radial-gradient(60% 100% at 30% 92%,  #C9F0D8 0%, transparent 55%),
+      radial-gradient(70% 110% at 78% 88%,  #F4C7E2 0%, transparent 55%),
+      linear-gradient(180deg, #F2F2F7 0%, #E9E9F0 100%);
+    box-shadow:
+      0 1px 2px rgba(4,8,13,0.06),
+      0 12px 28px rgba(4,8,13,0.10);
+  }
+  .stage-light .eyebrow{
+    font:var(--t-caption2);letter-spacing:0.18em;
+    color:var(--label-tertiary);text-transform:uppercase;font-weight:600;
+    margin-bottom:18px;
+  }
+
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+  .row + .row{margin-top:14px;}
+
+  /* —— Liquid Glass capsule —————————————— */
+  .glass{
+    position:relative;
+    display:inline-flex;align-items:center;gap:6px;
+    padding:4px 11px 4px 9px;
+    font:var(--t-caption1);font-weight:600;font-size:11.5px;
+    border-radius:999px;
+    color: var(--c, #0A84FF);
+    background:
+      linear-gradient(180deg,
+        color-mix(in srgb, var(--c) 28%, rgba(255,255,255,0.55)) 0%,
+        color-mix(in srgb, var(--c) 16%, rgba(255,255,255,0.30)) 100%);
+    backdrop-filter: blur(14px) saturate(180%);
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+    box-shadow:
+      0 1px 2px rgba(15,20,30,0.12),
+      0 4px 12px color-mix(in srgb, var(--c) 22%, transparent),
+      inset 0 1px 0 rgba(255,255,255,0.85),
+      inset 0 -0.5px 0 color-mix(in srgb, var(--c) 30%, transparent),
+      inset 0 0 0 0.5px color-mix(in srgb, var(--c) 35%, rgba(255,255,255,0.6));
+    text-shadow: 0 0.5px 0 rgba(255,255,255,0.4);
+    isolation:isolate;
+  }
+  .glass::before{
+    content:"";position:absolute;inset:0.5px 0.5px auto 0.5px;height:42%;
+    border-radius:999px;
+    background:linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0));
+    pointer-events:none;
+  }
+  .glass .dot{
+    width:6px;height:6px;border-radius:999px;
+    background: var(--c);
+    box-shadow:
+      0 0 0 0.5px rgba(0,0,0,0.06),
+      0 0 6px color-mix(in srgb, var(--c) 70%, transparent),
+      inset 0 0.5px 0 rgba(255,255,255,0.6);
+  }
+  .glass.running .dot{ animation:pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse{
+    0%,100%{ box-shadow:0 0 0 0.5px rgba(0,0,0,0.06), 0 0 4px color-mix(in srgb, var(--c) 60%, transparent), inset 0 0.5px 0 rgba(255,255,255,0.6); }
+    50%   { box-shadow:0 0 0 0.5px rgba(0,0,0,0.06), 0 0 10px color-mix(in srgb, var(--c) 90%, transparent), 0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent), inset 0 0.5px 0 rgba(255,255,255,0.6); }
+  }
+  .glass.sm{ padding:3px 9px 3px 8px; font-size:10.5px; gap:5px; }
+  .glass.sm .dot{ width:5px;height:5px; }
+  .glass.neutral{
+    --c:#6E6E73;
+    color:#3A3A3C;
+    background:linear-gradient(180deg, rgba(255,255,255,0.65), rgba(255,255,255,0.30));
+  }
+
+  /* On the dark stage, neutral chips invert their text colour */
+  .stage-dark .glass.neutral{
+    color:rgba(235,235,245,0.85);
+    background:linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.06));
+    box-shadow:
+      0 1px 2px rgba(0,0,0,0.30),
+      inset 0 1px 0 rgba(255,255,255,0.18),
+      inset 0 0 0 0.5px rgba(255,255,255,0.14);
+    text-shadow:none;
+  }
+</style></head>
+<body>
+
+<div class="stack">
+  <div>
+    <div class="lbl">StatusCapsule · Liquid Glass</div>
+    <div class="meta">Run state, agent state, gate state. The whole vocabulary.</div>
+  </div>
+
+  <div class="stage-dark">
+    <div class="eyebrow">On dark surface</div>
+    <div class="row">
+      <span class="glass running" style="--c:#0A84FF;"><span class="dot"></span>Running</span>
+      <span class="glass" style="--c:#C8920A;"><span class="dot"></span>Awaiting approval</span>
+      <span class="glass" style="--c:#1C8A3D;"><span class="dot"></span>Completed</span>
+      <span class="glass" style="--c:#D70015;"><span class="dot"></span>Failed</span>
+      <span class="glass" style="--c:#C25A00;"><span class="dot"></span>Blocked</span>
+      <span class="glass neutral"><span class="dot"></span>Cancelled</span>
+    </div>
+    <div class="row" style="gap:6px;">
+      <span class="glass sm neutral">Pending</span>
+      <span class="glass sm neutral">Ready</span>
+      <span class="glass sm neutral">Cancelling</span>
+      <span class="glass sm" style="--c:#0A84FF;"><span class="dot"></span>Frozen</span>
+      <span class="glass sm" style="--c:#1C8A3D;"><span class="dot"></span>Recovered</span>
+    </div>
+  </div>
+
+  <div class="stage-light">
+    <div class="eyebrow">On light surface</div>
+    <div class="row">
+      <span class="glass running" style="--c:#0A84FF;"><span class="dot"></span>Running</span>
+      <span class="glass" style="--c:#C8920A;"><span class="dot"></span>Awaiting approval</span>
+      <span class="glass" style="--c:#1C8A3D;"><span class="dot"></span>Completed</span>
+      <span class="glass" style="--c:#D70015;"><span class="dot"></span>Failed</span>
+      <span class="glass" style="--c:#C25A00;"><span class="dot"></span>Blocked</span>
+      <span class="glass neutral"><span class="dot"></span>Cancelled</span>
+    </div>
+  </div>
+</div>
+
+</body></html>

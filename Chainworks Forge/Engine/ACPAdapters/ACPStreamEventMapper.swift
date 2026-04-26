@@ -25,7 +25,7 @@ import Foundation
 /// - `user_message_chunk`       -> nil (ignored — Forge owns prompt truth)
 /// - Stream end / final result  -> `.finish(reason:, totalTokens:, raw:)`
 /// - Error                      -> `.error(message:)`
-enum ACPStreamEventMapper {
+nonisolated enum ACPStreamEventMapper {
 
     // MARK: - Public API
 
@@ -49,30 +49,12 @@ enum ACPStreamEventMapper {
 
         switch type {
         case "agent_message_chunk":
-            // content may be String or structured. Try String first, fall back to nested text.
-            if let rawContent = payload["content"], !(rawContent is String) {
-                ForgeLogger.bridge.info("agent_message_chunk content is NOT String, actual: \(Swift.type(of: rawContent)), value: \(String(describing: rawContent).prefix(200))")
-            }
-            let content: String
-            if let str = payload["content"] as? String {
-                content = str
-            } else if let dict = payload["content"] as? [String: Any], let text = dict["text"] as? String {
-                content = text
-            } else {
-                content = ""
-            }
+            let content = extractChunkText(from: payload["content"], logPrefix: "agent_message_chunk")
             guard !content.isEmpty else { return nil }
             return .textChunk(text: content)
 
         case "agent_thought_chunk":
-            let content: String
-            if let str = payload["content"] as? String {
-                content = str
-            } else if let dict = payload["content"] as? [String: Any], let text = dict["text"] as? String {
-                content = text
-            } else {
-                content = ""
-            }
+            let content = extractChunkText(from: payload["content"], logPrefix: "agent_thought_chunk")
             guard !content.isEmpty else { return nil }
             return .textChunk(text: "[thinking] \(content)")
 
@@ -119,18 +101,27 @@ enum ACPStreamEventMapper {
         case "session/request_permission":
             let toolName = extractPermissionToolName(from: params)
             let raw = serializeToJSON(params ?? [:]) ?? "{}"
-            // Forge auto-grants ACP permissions immediately inside the transport adapter,
-            // so the canonical live contract must show a full request/resolution lifecycle
-            // instead of a dangling "started" event that never finishes.
-            return [
-                .toolCallStarted(toolName: "permission:\(toolName)", raw: raw),
-                .toolCallFinished(toolName: "permission:\(toolName)", raw: raw)
-            ]
+            // Permission requests are only started here. Completion must be inferred from
+            // subsequent provider progress, otherwise the UI falsely claims permission
+            // succeeded even when the provider rejected or failed to deserialize the response.
+            return [.toolCallStarted(toolName: "permission:\(toolName)", raw: raw)]
 
         case "session/error":
-            let message = params?["message"] as? String
-                ?? params?["error"] as? String
-                ?? "Unknown ACP session error"
+            let message: String
+            if let params,
+               let nestedError = params["error"] as? [String: Any] {
+                message = ACPProtocolSupport.formatJSONRPCError(
+                    nestedError,
+                    fallback: "Unknown ACP session error"
+                )
+            } else if let params {
+                message = ACPProtocolSupport.formatJSONRPCError(
+                    params,
+                    fallback: "Unknown ACP session error"
+                )
+            } else {
+                message = "Unknown ACP session error"
+            }
             return [.error(message: message)]
 
         default:
@@ -140,6 +131,10 @@ enum ACPStreamEventMapper {
 
     static func mapNotification(method: String, params: [String: Any]?) -> RuntimeStreamEvent? {
         mapNotificationEvents(method: method, params: params).first
+    }
+
+    static func extractPermissionToolNameForDiagnostics(from params: [String: Any]?) -> String {
+        extractPermissionToolName(from: params)
     }
 
     // MARK: - Result Mapping
@@ -181,14 +176,14 @@ enum ACPStreamEventMapper {
         }
     }
 
-    /// Map a `tool_call_update` event. Observed statuses: `completed`, `in_progress`.
+    /// Map a `tool_call_update` event. Observed statuses: `completed`, `failed`, `in_progress`.
     private static func mapToolCallUpdate(_ json: [String: Any]) -> RuntimeStreamEvent {
         let toolName = extractToolName(from: json)
         let raw = serializeToJSON(json) ?? "{}"
 
         let status = json["status"] as? String ?? "in_progress"
         switch status {
-        case "completed":
+        case "completed", "failed":
             return .toolCallFinished(toolName: toolName, raw: raw)
         default:
             // in_progress updates — treat as refinements (started)
@@ -226,6 +221,48 @@ enum ACPStreamEventMapper {
             return name
         }
         return "unknown"
+    }
+
+    private static func extractChunkText(from rawContent: Any?, logPrefix: String) -> String {
+        guard let rawContent else { return "" }
+
+        if let str = rawContent as? String {
+            return str
+        }
+
+        if let dict = rawContent as? [String: Any] {
+            if let text = dict["text"] as? String {
+                return text
+            }
+
+            if let content = dict["content"] {
+                let nested = extractChunkText(from: content, logPrefix: logPrefix)
+                if !nested.isEmpty { return nested }
+            }
+
+            if let parts = dict["parts"] as? [Any] {
+                let joined = parts
+                    .map { extractChunkText(from: $0, logPrefix: logPrefix) }
+                    .joined()
+                if !joined.isEmpty { return joined }
+            }
+
+            if let items = dict["items"] as? [Any] {
+                let joined = items
+                    .map { extractChunkText(from: $0, logPrefix: logPrefix) }
+                    .joined()
+                if !joined.isEmpty { return joined }
+            }
+        }
+
+        if let array = rawContent as? [Any] {
+            return array
+                .map { extractChunkText(from: $0, logPrefix: logPrefix) }
+                .joined()
+        }
+
+        ForgeLogger.bridge.info("\(logPrefix) content is NOT String, actual: \(Swift.type(of: rawContent)), value: \(String(describing: rawContent).prefix(200))")
+        return ""
     }
 
     /// Extract tool name from a `session/request_permission` payload.

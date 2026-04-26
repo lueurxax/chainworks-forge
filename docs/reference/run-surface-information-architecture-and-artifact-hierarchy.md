@@ -1,6 +1,6 @@
 # Run Surface Information Architecture and Artifact Hierarchy
 
-Stable reference for the implemented run-surface information architecture and artifact-hierarchy slice that was previously tracked by Proposal 024.
+Stable reference for the run-surface information architecture and artifact-hierarchy slice.
 
 ## Purpose
 
@@ -13,8 +13,6 @@ This document is the stable contract for:
 - the focused timeline inspector as a subordinate workflow-map surface,
 - the shared canonical artifact hierarchy used for run browsing,
 - and the continuity rule that demoted metadata must not orphan report, export, delivery, or recovery paths.
-
-For implementation/proof status, use [../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md).
 
 ## Scope
 
@@ -78,7 +76,7 @@ The implemented `Runs Home` pane contract is:
 
 `Artifacts` owns the canonical hierarchy browser plus promoted artifacts.
 
-`Diagnostics` owns lower-frequency receipts, anomalies, recovery evidence, and other deep technical inspection paths.
+`Diagnostics` owns lower-frequency receipts, anomalies, recovery evidence, discovery settlement logs, and other deep technical inspection paths.
 
 ### `Idea` owns the operation-first pane set
 
@@ -212,9 +210,7 @@ This slice is proved by a mix of focused local verification and approved-host UI
 3. green approved-host targeted UI proof for the surviving export hub and focused timeline owner path,
 4. green approved-host `proposal-024` gate.
 
-The gate keeps the historical proposal label for reproducibility, but the slice itself is now stable implemented documentation rather than an active proposal.
-
-For the consolidated proof story, use [../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md](../evidence/run-surface-information-architecture-and-artifact-hierarchy-proof.md).
+The gate keeps its original label for reproducibility.
 
 ## Adjacent References
 

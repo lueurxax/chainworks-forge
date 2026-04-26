@@ -13,13 +13,7 @@ import SwiftData
     var effort: String
     var costCents: Int64?
     var logSnippet: String?
-    var gooseSessionID: String?
-
-    /// Canonical accessor (Proposal 026 — core code uses this name instead of gooseSessionID).
-    var runtimeSessionID: String? {
-        get { gooseSessionID }
-        set { gooseSessionID = newValue }
-    }
+    @Attribute(originalName: "gooseSessionID") var runtimeSessionID: String?
 
     // Proposal 004: Live provider fields (Section 11.1)
     var providerSessionID: String?
@@ -57,6 +51,7 @@ import SwiftData
     var outputEnvelopesJSON: Data?            // Serialized [StructuredOutputEnvelope]
     var compactionMetadataJSON: Data?         // Serialized CompactionMetadata (if output was compacted)
     var canonicalOutcome: AgentCanonicalOutcome?
+    var supervisionClassification: SupervisionClassification?
     var transportErrorKind: TransportErrorKind?
     var providerStopReason: String?
     var outputPresence: OutputPresence?
@@ -70,10 +65,11 @@ import SwiftData
     var deniedMCPExtensionsJSON: Data?
     var mcpSessionStartupLatencyMilliseconds: Int?
     var mcpServerTelemetryJSON: Data?
+    var actualXcodeRuntimeObservationJSON: Data?
 
     /// Proposal 026: Actual runtime profile used for this execution attempt.
     var runtimeProfileID: String?
-    /// Proposal 026: Actual adapter family (e.g. "goose", "claude_agent_acp", "gemini_cli_acp").
+    /// Proposal 026: Actual adapter family (e.g. "claude_agent_acp", "gemini_cli_acp", "codex_acp").
     var actualAdapterFamily: String?
     /// Proposal 026: Actual capability class of the runtime used.
     var actualCapabilityClass: String?

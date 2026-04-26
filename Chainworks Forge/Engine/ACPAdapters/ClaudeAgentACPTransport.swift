@@ -2,6 +2,17 @@ import Foundation
 
 // MARK: - ClaudeAgentACPTransport (Proposal 026, Phase 3 — Step 3.6)
 
+enum ClaudeWorkspaceSettingsRepairReason: String, Sendable {
+    case emptyFile
+    case invalidJSON
+}
+
+struct ClaudeWorkspaceSettingsRepair: Sendable {
+    let settingsURL: URL
+    let backupURL: URL
+    let reason: ClaudeWorkspaceSettingsRepairReason
+}
+
 /// ACP transport adapter for Claude Agent (`claude-agent-acp` subprocess).
 /// Communicates via subprocess stdin/stdout using ACP JSON-RPC protocol over ndjson framing.
 ///
@@ -17,7 +28,7 @@ import Foundation
 ///
 /// Mode catalog: `auto`, `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`
 /// Model catalog: `default`, `sonnet`, `haiku`
-final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
+nonisolated final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
 
     // MARK: - Configuration
 
@@ -30,6 +41,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     private var activeSessions: [String: ACPSubprocessManager] = [:]
     private var requestCounters: [String: Int] = [:]
     private var sessionSystemPrompts: [String: String] = [:]
+    private var sessionEnabledExtensions: [String: [String]] = [:]
     private let lock = NSLock()
 
     // MARK: - Init
@@ -43,6 +55,11 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     func createSession(request: RuntimeSessionRequest) async throws -> RuntimeSessionResponse {
         ForgeLogger.claudeACP.debug("createSession called, executablePath=\(executablePath), workingDir=\(request.workingDirectory ?? "nil")")
         let startTime = Date()
+        if let repair = try Self.sanitizeWorkspaceSettingsIfNeeded(workingDirectory: request.workingDirectory) {
+            ForgeLogger.claudeACP.info(
+                "Repaired malformed workspace Claude settings at \(repair.settingsURL.path) with backup \(repair.backupURL.lastPathComponent) [reason=\(repair.reason.rawValue)]"
+            )
+        }
         let subprocess = ACPSubprocessManager(
             executablePath: executablePath,
             arguments: [],
@@ -51,6 +68,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         )
 
         try subprocess.launch()
+        self.startStderrLogging(for: subprocess, prefix: "ClaudeAgentACP")
 
         // Step 1: Send `initialize` JSON-RPC request
         let initializeRequest = makeJSONRPCRequest(
@@ -87,7 +105,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         if let model = request.model {
             sessionParams["model"] = Self.mapModelForACPCatalog(model)
         }
-        // Note: requestedExtensions from Forge are Goose extension IDs — not applicable for ACP.
+        // Note: requestedExtensions from Forge are legacy extension IDs — not applicable for ACP.
         // Claude Agent ACP handles MCP through its own config; client-provided MCP servers
         // can be passed via mcpServers array if needed in the future.
         // Map execution policy to ACP mode.
@@ -128,13 +146,13 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         }
 
         // Register the active session and store systemPrompt for later prepending
-        lock.lock()
-        activeSessions[sessionId] = subprocess
-        requestCounters[sessionId] = 2 // initialize=1, session/new=2
-        if !request.systemPrompt.isEmpty {
-            sessionSystemPrompts[sessionId] = request.systemPrompt
+        withLock {
+            activeSessions[sessionId] = subprocess
+            requestCounters[sessionId] = 2 // initialize=1, session/new=2
+            if !request.systemPrompt.isEmpty {
+                sessionSystemPrompts[sessionId] = request.systemPrompt
+            }
         }
-        lock.unlock()
 
         let startupLatency = Int(Date().timeIntervalSince(startTime) * 1000)
 
@@ -142,6 +160,10 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         var enabledExtensions: [String]?
         if let extensions = sessionResult["enabledExtensions"] as? [String] {
             enabledExtensions = extensions
+        }
+
+        withLock {
+            sessionEnabledExtensions[sessionId] = enabledExtensions ?? []
         }
 
         return RuntimeSessionResponse(
@@ -168,25 +190,25 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                     return
                 }
 
-                self.lock.lock()
-                let subprocess = self.activeSessions[sessionID]
-                self.lock.unlock()
+                let subprocess = self.withLock {
+                    self.activeSessions[sessionID]
+                }
 
                 guard let subprocess else {
                     continuation.finish(throwing: RuntimeTransportError.streamingFailed(reason: "No active session for ID: \(sessionID)"))
                     return
                 }
 
-                // Synthesize session lifecycle events (matches GooseServerTransport behavior)
+                // Synthesize session lifecycle events (matches RuntimeTransportProtocol pattern)
                 continuation.yield(.sessionStarted(raw: #"{"session_id":"\#(sessionID)"}"#))
 
                 do {
                     // ACP session/prompt expects prompt as an array of content items:
                     // [{"type": "text", "text": "..."}]
-                    // LOCKED-003: System prompt is embedded in the prompt content (same as GooseServerTransport).
-                    self.lock.lock()
-                    let systemPrompt = self.sessionSystemPrompts[sessionID]
-                    self.lock.unlock()
+                    // LOCKED-003: System prompt is embedded in the prompt content (same as other transports).
+                    let systemPrompt = self.withLock {
+                        self.sessionSystemPrompts[sessionID]
+                    }
 
                     var fullContent = ""
                     if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -255,7 +277,10 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                                 let finishEvent = ACPStreamEventMapper.mapPromptResult(result)
                                 continuation.yield(finishEvent)
                             } else if let error = json["error"] as? [String: Any] {
-                                let message = error["message"] as? String ?? "Unknown ACP error"
+                                let message = ACPProtocolSupport.formatJSONRPCError(
+                                    error,
+                                    fallback: "Unknown ACP error"
+                                )
                                 continuation.yield(.error(message: message))
                             }
                             continuation.yield(.sessionClosed(raw: #"{"session_id":"\#(sessionID)"}"#))
@@ -277,6 +302,7 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
                             if method == "session/request_permission" {
                                 self.autoGrantPermission(
                                     subprocess: subprocess,
+                                    requestID: json["id"],
                                     params: params,
                                     sessionID: sessionID
                                 )
@@ -305,11 +331,13 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     }
 
     func closeSession(sessionID: String) async throws {
-        lock.lock()
-        let subprocess = activeSessions.removeValue(forKey: sessionID)
-        requestCounters.removeValue(forKey: sessionID)
-        sessionSystemPrompts.removeValue(forKey: sessionID)
-        lock.unlock()
+        let subprocess = withLock {
+            let subprocess = activeSessions.removeValue(forKey: sessionID)
+            requestCounters.removeValue(forKey: sessionID)
+            sessionSystemPrompts.removeValue(forKey: sessionID)
+            sessionEnabledExtensions.removeValue(forKey: sessionID)
+            return subprocess
+        }
 
         guard let subprocess else {
             throw RuntimeTransportError.sessionCloseFailed(reason: "No active session for ID: \(sessionID)")
@@ -326,6 +354,20 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
         // Brief wait for clean shutdown, then terminate
         try? await Task.sleep(for: .milliseconds(200))
         subprocess.terminate()
+    }
+
+    func readSessionRuntimeState(sessionID: String) async throws -> RuntimeSessionRuntimeState? {
+        let (subprocess, enabledExtensions) = withLock {
+            (
+                activeSessions[sessionID],
+                sessionEnabledExtensions[sessionID] ?? []
+            )
+        }
+
+        guard subprocess != nil else {
+            throw RuntimeTransportError.streamingFailed(reason: "No active session for ID: \(sessionID)")
+        }
+        return RuntimeSessionRuntimeState(enabledExtensions: enabledExtensions)
     }
 
     // MARK: - Private: Model Mapping
@@ -367,18 +409,56 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
 
     private func nextRequestID(for sessionID: String?) -> Int {
         let key = sessionID ?? "__global__"
-        lock.lock()
-        let current = (requestCounters[key] ?? 0) + 1
-        requestCounters[key] = current
-        lock.unlock()
-        return current
+        return withLock {
+            let current = (requestCounters[key] ?? 0) + 1
+            requestCounters[key] = current
+            return current
+        }
     }
 
     private func currentRequestID(for sessionID: String) -> Int {
-        lock.lock()
-        let current = requestCounters[sessionID] ?? 0
-        lock.unlock()
-        return current
+        return withLock {
+            requestCounters[sessionID] ?? 0
+        }
+    }
+
+    static func sanitizeWorkspaceSettingsIfNeeded(
+        workingDirectory: String?,
+        fileManager: FileManager = .default
+    ) throws -> ClaudeWorkspaceSettingsRepair? {
+        guard let workingDirectory, !workingDirectory.isEmpty else { return nil }
+
+        let settingsURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent("settings.json", isDirectory: false)
+
+        guard fileManager.fileExists(atPath: settingsURL.path) else { return nil }
+
+        let data = try Data(contentsOf: settingsURL)
+        let reason: ClaudeWorkspaceSettingsRepairReason?
+        if data.isEmpty {
+            reason = .emptyFile
+        } else if !isValidClaudeWorkspaceSettingsJSON(data) {
+            reason = .invalidJSON
+        } else {
+            reason = nil
+        }
+
+        guard let reason else { return nil }
+
+        let backupURL = settingsURL.deletingLastPathComponent().appendingPathComponent(
+            "settings.json.invalid-\(Self.repairTimestampString()).bak",
+            isDirectory: false
+        )
+        try data.write(to: backupURL, options: .atomic)
+        let replacementData = Data("{}\n".utf8)
+        try replacementData.write(to: settingsURL, options: .atomic)
+
+        return ClaudeWorkspaceSettingsRepair(
+            settingsURL: settingsURL,
+            backupURL: backupURL,
+            reason: reason
+        )
     }
 
     // MARK: - Private: Read Next JSON-RPC Result
@@ -417,24 +497,74 @@ final class ClaudeAgentACPTransport: RuntimeTransportProtocol, @unchecked Sendab
     /// For now, Forge auto-grants with `allow_once` based on the execution policy.
     private func autoGrantPermission(
         subprocess: ACPSubprocessManager,
+        requestID: Any?,
         params: [String: Any]?,
         sessionID: String
     ) {
-        guard let params,
-              let requestId = params["id"] as? String ?? params["requestId"] as? String else {
+        guard let response = ACPProtocolSupport.permissionSelectionResponse(
+            requestID: requestID,
+            params: params
+        ) else {
+            ForgeLogger.claudeACP.error("Failed to auto-grant permission for session \(sessionID)")
             return
         }
-
-        let response: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "session/permission_response",
-            "params": [
-                "sessionId": sessionID,
-                "requestId": requestId,
-                "response": "allow_once"
-            ] as [String: Any]
-        ]
-
         try? subprocess.sendJSON(response)
+    }
+
+    private func startStderrLogging(for subprocess: ACPSubprocessManager, prefix: String) {
+        Task.detached {
+            do {
+                for try await line in subprocess.readStderrLines() {
+                    if line.localizedCaseInsensitiveContains("error")
+                        || line.localizedCaseInsensitiveContains("failed")
+                        || line.localizedCaseInsensitiveContains("panic") {
+                        ForgeLogger.claudeACP.error("\(prefix) stderr: \(line)")
+                    } else {
+                        ForgeLogger.claudeACP.info("\(prefix) stderr: \(line)")
+                    }
+                }
+            } catch {
+                ForgeLogger.claudeACP.error("\(prefix) stderr reader failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+}
+
+private extension ClaudeAgentACPTransport {
+    static func isValidClaudeWorkspaceSettingsJSON(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            return false
+        }
+        return object is [String: Any]
+    }
+
+    static func repairTimestampString(now: Date = Date()) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: now)
+            .replacingOccurrences(of: ":", with: "-")
+    }
+}
+
+extension ClaudeAgentACPTransport: RuntimeTransportTerminationControlling {
+    func terminateActiveSessionsForAppShutdown() {
+        let subprocesses = withLock {
+            let subprocesses = Array(activeSessions.values)
+            activeSessions.removeAll()
+            requestCounters.removeAll()
+            sessionSystemPrompts.removeAll()
+            sessionEnabledExtensions.removeAll()
+            return subprocesses
+        }
+
+        for subprocess in subprocesses {
+            subprocess.terminate()
+        }
     }
 }

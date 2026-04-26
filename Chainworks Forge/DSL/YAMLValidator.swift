@@ -140,72 +140,36 @@ struct YAMLValidator: Sendable {
 
     static func validateMCPRefs(_ catalog: AgentCatalog) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
-        let registryIDs = Set(catalog.mcpServerRegistry.keys)
-        let profileIDs = Set(catalog.mcpProfiles.keys)
-        let defaultProfile = catalog.mcpPolicy.defaultProfile
-
-        if defaultProfile != "none" && !profileIDs.contains(defaultProfile) {
-            issues.append(ValidationIssue(
-                severity: .error,
-                message: "mcp_policy.default_profile '\(defaultProfile)' does not exist in mcp_profiles",
-                location: "mcp_policy.default_profile"
-            ))
+        for (backendProfileID, profile) in catalog.backendProfiles {
+            let duplicates = Dictionary(grouping: profile.mcp, by: \.self)
+                .filter { $0.value.count > 1 }
+                .keys
+                .sorted()
+            if !duplicates.isEmpty {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "Backend profile '\(backendProfileID)' declares duplicate MCP servers: \(duplicates.joined(separator: ", "))",
+                    location: "backend_profiles.\(backendProfileID).mcp"
+                ))
+            }
         }
 
         for agent in catalog.agents {
-            guard let profileID = agent.mcpProfile, !profileID.isEmpty else { continue }
-            if profileID != "none" && !profileIDs.contains(profileID) {
-                issues.append(ValidationIssue(
-                    severity: .error,
-                    message: "Agent '\(agent.id)' references non-existent MCP profile '\(profileID)'",
-                    location: "agents.\(agent.id).mcp_profile"
-                ))
-            }
+            guard let legacyProfileID = agent.mcpProfile?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !legacyProfileID.isEmpty else { continue }
+            issues.append(ValidationIssue(
+                severity: .warning,
+                message: "Agent '\(agent.id)' still declares legacy mcp_profile '\(legacyProfileID)'. Canonical MCP ownership is backend_profile.mcp.",
+                location: "agents.\(agent.id).mcp_profile"
+            ))
         }
 
-        for (profileID, profile) in catalog.mcpProfiles {
-            let fallback = MCPFallbackPolicy(rawValue: profile.fallbackPolicy)
-            if fallback == nil {
-                issues.append(ValidationIssue(
-                    severity: .error,
-                    message: "MCP profile '\(profileID)' has unsupported fallback_policy '\(profile.fallbackPolicy)'",
-                    location: "mcp_profiles.\(profileID).fallback_policy"
-                ))
-            }
-
-            let overlap = Set(profile.requiredExtensions).intersection(profile.optionalExtensions)
-            if !overlap.isEmpty {
-                issues.append(ValidationIssue(
-                    severity: .error,
-                    message: "MCP profile '\(profileID)' declares the same extension as required and optional: \(overlap.sorted().joined(separator: ", "))",
-                    location: "mcp_profiles.\(profileID)"
-                ))
-            }
-
-            for serverID in profile.allRequestedExtensions where !registryIDs.contains(serverID) {
-                issues.append(ValidationIssue(
-                    severity: .error,
-                    message: "MCP profile '\(profileID)' references unknown server '\(serverID)'",
-                    location: "mcp_profiles.\(profileID)"
-                ))
-            }
-        }
-
-        for (serverID, entry) in catalog.mcpServerRegistry {
-            if entry.runtimeIDs.isEmpty {
-                issues.append(ValidationIssue(
-                    severity: .error,
-                    message: "MCP server '\(serverID)' must declare at least one runtime_ids mapping",
-                    location: "mcp_server_registry.\(serverID).runtime_ids"
-                ))
-            }
-        }
-
+        let declaredServerIDs = Set(catalog.backendProfiles.values.flatMap(\.mcp))
         for (profileID, permissionProfile) in catalog.permissionProfiles {
-            for legacyName in permissionProfile.mcp.legacyAllow ?? [] where !registryIDs.contains(legacyName) {
+            for legacyName in permissionProfile.mcp.legacyAllow ?? [] where !declaredServerIDs.contains(legacyName) {
                 issues.append(ValidationIssue(
                     severity: .warning,
-                    message: "Permission profile '\(profileID)' contains legacy MCP allowance '\(legacyName)' that does not map to mcp_server_registry. Treat it as non-runtime metadata or add an explicit registry mapping.",
+                    message: "Permission profile '\(profileID)' contains legacy MCP allowance '\(legacyName)' that is not requested by any backend_profile.mcp entry. Treat it as non-runtime metadata or remove it.",
                     location: "permission_profiles.\(profileID).mcp"
                 ))
             }
@@ -468,9 +432,16 @@ struct YAMLValidator: Sendable {
 
         if let seq = block.sequence, seq.isEmpty {
             issues.append(ValidationIssue(severity: .warning, message: "Empty sequence block", location: "states.\(stateID).\(blockName).sequence"))
+        } else if let seq = block.sequence {
+            issues += validateOutputPolicies(seq, stateID: stateID, blockName: blockName, phaseName: "sequence")
         }
         if let par = block.parallel, par.isEmpty {
             issues.append(ValidationIssue(severity: .error, message: "Empty parallel block in fanout", location: "states.\(stateID).\(blockName).parallel"))
+        } else if let par = block.parallel {
+            issues += validateOutputPolicies(par, stateID: stateID, blockName: blockName, phaseName: "parallel")
+        }
+        if let then = block.then {
+            issues += validateOutputPolicies(then, stateID: stateID, blockName: blockName, phaseName: "then")
         }
 
         // Duplicate agent in then: agent appears in both parallel and then
@@ -483,6 +454,22 @@ struct YAMLValidator: Sendable {
             }
         }
 
+        return issues
+    }
+
+    private static func validateOutputPolicies(_ tasks: [AgentTask], stateID: String, blockName: String, phaseName: String) -> [ValidationIssue] {
+        var issues: [ValidationIssue] = []
+        for task in tasks {
+            guard let outputPolicies = task.outputPolicies, !outputPolicies.isEmpty else { continue }
+            let outputs = Set(task.outputs ?? [])
+            for policyOutput in outputPolicies.keys where !outputs.contains(policyOutput) {
+                issues.append(ValidationIssue(
+                    severity: .error,
+                    message: "output_policies key '\(policyOutput)' does not match any declared task output",
+                    location: "states.\(stateID).\(blockName).\(phaseName).\(task.task).output_policies"
+                ))
+            }
+        }
         return issues
     }
 }

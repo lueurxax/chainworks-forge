@@ -1,6 +1,6 @@
 # Proposal-Loop Feedback Fidelity and Rereview
 
-Stable reference for the implemented proposal-loop feedback-fidelity, score-lift backlog, writer-coverage, and targeted-rereview slice that was previously tracked by Proposal 022.
+Stable reference for the proposal-loop feedback-fidelity, score-lift backlog, writer-coverage, and targeted-rereview slice.
 
 ## Purpose
 
@@ -14,8 +14,6 @@ This document is the stable contract for:
 - persisted factual grounding and targeted-rereview planning,
 - proposal-growth discipline tied to actual score lift,
 - and shell-owned reporting, comparison, and artifact-inspection surfaces for proposal-loop progress.
-
-For implementation and proof status, use [../evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md](../evidence/proposal-loop-feedback-fidelity-and-rereview-proof.md).
 
 ## Scope
 

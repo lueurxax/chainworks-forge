@@ -183,6 +183,8 @@ struct RunRepository {
         let paths = runs.flatMap(Self.cleanupPaths(for:))
         let deletedRunIDs = runs.map(\.id)
 
+        materializeCleanupFaults(for: runs)
+
         for run in runs {
             context.delete(run)
         }
@@ -201,6 +203,90 @@ struct RunRepository {
         )
     }
 
+    private func materializeCleanupFaults(for runs: [Run]) {
+        for run in runs {
+            for stage in run.stageExecutions {
+                _ = stage.stageID
+                _ = stage.label
+                _ = stage.startedAt
+                _ = stage.completedAt
+                _ = stage.status
+                _ = stage.iteration
+                _ = stage.attemptNumber
+                _ = stage.lineageID
+                _ = stage.settlementKind
+                _ = stage.settledAt
+                _ = stage.activeOwnerToken
+                _ = stage.retryMode
+                _ = stage.triggerReason
+                _ = stage.supersedesAttemptNumber
+                _ = stage.validationFailureJSON
+                _ = stage.evidencePacketJSON
+                _ = stage.recoverySnapshotJSON
+
+                for agent in stage.agentExecutions {
+                    _ = agent.agentID
+                    _ = agent.agentTitle
+                    _ = agent.taskName
+                    _ = agent.startedAt
+                    _ = agent.completedAt
+                    _ = agent.status
+                    _ = agent.provider
+                    _ = agent.effort
+                    _ = agent.costCents
+                    _ = agent.logSnippet
+                    _ = agent.runtimeSessionID
+                    _ = agent.providerSessionID
+                    _ = agent.providerRequestID
+                    _ = agent.transcriptArtifactPath
+                    _ = agent.resolvedBackendProfileID
+                    _ = agent.providerReceiptJSON
+                    _ = agent.resolvedModel
+                    _ = agent.adapterVersion
+                    _ = agent.retryReason
+                    _ = agent.agentAttemptNumber
+                    _ = agent.supersedesAgentExecutionID
+                    _ = agent.validationFailureJSON
+                    _ = agent.outputEnvelopesJSON
+                    _ = agent.compactionMetadataJSON
+                    _ = agent.canonicalOutcome
+                    _ = agent.supervisionClassification
+                    _ = agent.transportErrorKind
+                    _ = agent.providerStopReason
+                    _ = agent.outputPresence
+                    _ = agent.settledAt
+                    _ = agent.runtimeProvider
+                    _ = agent.runtimeModel
+                    _ = agent.outcomeEnvelopeJSON
+                    _ = agent.runtimeProfileID
+                    _ = agent.actualAdapterFamily
+                    _ = agent.actualCapabilityClass
+                    _ = agent.repoRevisionBefore
+                    _ = agent.repoRevisionAfter
+                    _ = agent.sessionLineageID
+                    _ = agent.sessionGenerationID
+                    _ = agent.rehydratedFromCheckpointArtifactID
+                    _ = agent.invocationOwnerKey
+                    _ = agent.sessionReuseScope
+                    _ = agent.sessionFamilyID
+                    _ = agent.sessionReuseDisposition
+                    _ = agent.sessionResetReason
+                    _ = agent.inputPayloadBytes
+                    _ = agent.handoffMode
+                    _ = agent.modelTierUsed
+                }
+            }
+
+            for approval in run.approvals {
+                _ = approval.decision
+                _ = approval.stageID
+                _ = approval.requestedAt
+                _ = approval.decidedAt
+                _ = approval.comment
+            }
+        }
+    }
+
     nonisolated static func removeFilesystemRoots(_ plan: RunCleanupPlan) async -> Int {
         guard !plan.filesystemPaths.isEmpty else { return 0 }
 
@@ -214,7 +300,7 @@ struct RunRepository {
                     try fileManager.removeItem(atPath: path)
                     removedCount += 1
                 } catch {
-                    await ForgeLogger.app.error("Run cleanup failed to remove path \(path): \(error.localizedDescription)")
+                    ForgeLogger.app.error("Run cleanup failed to remove path \(path): \(error.localizedDescription)")
                 }
             }
 

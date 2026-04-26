@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Mono — paths, IDs, artifacts</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{font-family:var(--font-text);color:var(--label);-webkit-font-smoothing:antialiased;height:140px;overflow:hidden;}
+  .card{padding:20px 24px;height:100%;box-sizing:border-box;}
+  .lbl{font:var(--t-caption2);letter-spacing:var(--tracking-wide);color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .row{display:flex;gap:12px;align-items:center;}
+  .row.tight{gap:6px;}
+  .stack{display:flex;flex-direction:column;gap:12px;}
+  .meta{display:flex;flex-direction:column;gap:2px;}
+  .meta .name{font:var(--t-caption1);font-weight:600;color:var(--label);}
+  .meta .val{font-family:var(--font-mono);font-size:10.5px;color:var(--label-secondary);}
+  .capsule{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;font:var(--t-caption1);font-weight:600;border-radius:999px;}
+</style></head>
+<body><div class="card">
+<div class="stack" style="gap:6px;font-family:var(--font-mono);font-size:12px;line-height:16px;color:var(--label);">
+  <div>~/Library/.../runs/2026-04-26T12:18:33Z/</div>
+  <div>RunPlanCompiler.compile(workflow:catalog:)</div>
+  <div>artifact://review-report/sha256:8f3a…b9</div>
+  <div style="color:var(--label-secondary);">// frozen run snapshot · stage 4/7</div>
+</div>
+</div></body></html>

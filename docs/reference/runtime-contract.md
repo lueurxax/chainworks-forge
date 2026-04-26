@@ -30,7 +30,7 @@ Recommended status sets:
 - **Approval**: `pending`, `requested`, `granted`, `rejected`, `expired`
 - **Side effect**: `pending`, `armed`, `running`, `completed`, `failed`, `blocked`
 
-These states should be visible in SwiftData metadata and in the UI.
+These states should be visible in SwiftData metadata and in the UI (read-only from GraphQL projections in P031).
 
 ## 3. Artifact model
 
@@ -90,7 +90,16 @@ Minimum MVP policy:
 - no two write-capable agents may write to the same worktree concurrently in MVP
 - release side effects stay outside general write-capable agents
 
-## 6. Resume and retry policy
+## 6. Bounded Artifact Discovery
+
+The system uses a bounded discovery model to minimize startup latency and ensure artifact integrity.
+
+- **Meta-root Bounding**: Discovery is restricted to the run-owned meta-root.
+- **Exact-path Reads**: Declared expected outputs are read only from their exact paths.
+- **Pre-Prompt Metadata**: Metadata is captured per-execution to ensure freshness.
+- **Engine-owned Settlement**: The engine discovery pipeline settles artifacts based on typed expected outputs and discovery decisions.
+
+## 7. Resume and retry policy
 
 - safe local stages may auto-resume
 - approval stages return to `waiting_approval`
@@ -98,9 +107,9 @@ Minimum MVP policy:
 - retries are bounded by stage/workflow policy
 - each retry creates a new stage attempt and new artifacts
 
-## 7. Provider boundary
+## 8. Provider boundary
 
 MVP provider boundary:
 
-- required now: `codex`, `claude_code`, `gemini`
+- required now: `codex_acp`, `claude_acp`, `gemini_acp`, with optional `auggie` and `junie` families when configured
 - post-MVP via provider adapter extension: additional backends beyond the MVP provider set

@@ -1,6 +1,6 @@
 # Operator Experience
 
-Stable reference for the operator-facing baseline that was previously tracked as `P005-OPS`.
+Stable reference for the operator-facing baseline.
 
 ## Purpose
 
@@ -20,25 +20,26 @@ Related stable docs:
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
+- [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 
 ## Scope
 
-This reference covers the read-only and repo-agnostic operator layer:
+This reference covers the **read-only** and repo-agnostic operator layer (per P031-r18):
 
-- `RunsHomeView` as the primary landing surface
+- `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
-- immutable run reports plus mutable latest summaries
-- safe recovery actions for non-destructive run states
-- deterministic run comparison
+- immutable run reports plus mutable latest summaries (metadata inspection only)
+- diagnostic-only guidance for approvals and recovery
+- deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does not define repo-backed write/release recovery. That boundary belongs to [full-mvp-delivery.md](full-mvp-delivery.md).
+It does **NOT** define in-app write/recovery. Every write control (Start, Cancel, Retry, Resolve Approval) is removed or replaced with diagnostic guidance for external workflows.
 
 ## Runs Home
 
-`RunsHomeView` is the operator landing surface.
+`RunsHomeView` is the operator landing surface. It consumes workflow truth exclusively through GraphQL projections.
 
 Runs are grouped into:
 
@@ -57,17 +58,43 @@ Each row shows:
 - total cost,
 - last progress timestamp,
 - attention level,
-- runtime provenance.
+- queued agent count (when > 0),
+- runtime provenance,
+- **Freshness state** (Live, Refreshing, Stale, etc.).
 
-Contextual actions are status-aware:
+**Actions are diagnostic-only:**
+- `Open` is available for drill-down.
+- Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
 
-- `Open` is always available
-- `Open gate` appears only for approval-blocked runs
-- `Recover` appears only for blocked or failed runs
-- `Compare` appears only when a compatible target exists
-- `View report` appears only when report artifacts exist
+## Scheduler Health and Backpressure
 
-The operator shell must not promise an action that cannot actually run from the current row.
+Backpressure is treated as normal scheduling state, not failure. When the system
+reaches capacity (global, provider, or run-local), work remains queued and is
+visible as "Queued" or "Waiting for provider slot".
+
+Surfaces for backpressure visibility:
+- **Sidebar Badge**: Shows queued agent count next to the run status.
+- **Run Detail**: Displays active agents, queued agents, oldest queued age, and
+  top backpressure reason.
+- **Stage Detail**: Includes a "Backpressured Agents" disclosure showing pending
+  agents by provider and reason.
+- **Scheduler Health**: A dedicated section in PilotReadinessView showing system-wide
+  capacity, write pressure, and command latency.
+- **Sustained Backpressure Alerts**: Notifications trigger when work remains queued
+  longer than the configured threshold (default 5 minutes).
+
+### Workflow Conflict Details
+
+When a run blocks due to a workflow conflict, a dedicated **Conflict Details** 
+GroupBox appears immediately after the Blocker Summary. It provides:
+
+- **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step") 
+  plus status capsule.
+- **Current State**: The authoritative graph state where the run is anchored.
+- **Lead & Mediation**: The system lead agent assigned to the conflict and 
+  active mediation progress.
+- **Advisory Suggestion**: Redacted summary of the rejected agent hint.
+- **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
 
 If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
 
@@ -78,8 +105,10 @@ Operator surfaces must expose runtime trust instead of hiding it behind generic 
 The current trust states are:
 
 - `Fixture / verified baseline`
-- `Goose server / trust pending`
-- `Goose server / verified`
+- `Legacy / unverified`
+- `Legacy / verified`
+- `Runtime / unverified`
+- `Runtime / verified`
 
 That provenance appears in:
 
@@ -121,23 +150,31 @@ Report content includes:
 - recovery notes,
 - deterministic outcome.
 
-## Recovery
+### Recovery
 
-The implemented recovery toolkit covers non-destructive paths for the current baseline:
+The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
+Diagnostic guidance is provided for:
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
-4. `Clone Run (Frozen Snapshot)`
-5. `Clone Run (Current Config)`
+4. `Clone Run`
 
-`RecoverySheet` shows:
+**Workflow Conflict Actions (Read-Only):**
+- **Mediation Progress**: View sanitized live status updates (queued, 
+  running, validating) while mediation is active.
+- **Diagnostic Details**: For terminal conflicts, provides `run_id` and conflict 
+  identifiers for use in external resolution workflows.
+- **Manual Resolution Guidance**: In-app actions like `Clone Run` or `Open editable 
+  recovery artifact` are replaced with diagnostic identifiers and suggested 
+  external commands.
 
-- blocked reason,
-- most recent stage,
-- trust/provenance summary,
-- suggested safe next action,
-- only the actions allowed for the current run type.
+`RecoverySheet` and diagnostic banners show:
+
+- `run_id`, `stage_id`, or `approval_id` for copy-paste,
+- suggested CLI / MCP command strings,
+- `writePathState`: `read_only_diagnostic`,
+- `disabledReasonCode`: `WRITE_PATH_NOT_AVAILABLE`.
 
 Out of scope here:
 
@@ -145,7 +182,7 @@ Out of scope here:
 - git/release/publish recovery,
 - repo-backed side-effect re-entry.
 
-Those remain Proposal 007 territory.
+Those remain in the repo-backed delivery slice. See [full-mvp-delivery.md](full-mvp-delivery.md).
 
 ## Workflow map in run detail
 
@@ -212,6 +249,10 @@ Displayed provenance includes:
 - attempt,
 - runtime trust level.
 
+### Bounded Startup Latency
+
+The system enforces bounded artifact discovery to prevent broad local filesystem scanning from delaying ACP session initialization. Operators should notice significantly faster startup times in large workspaces compared to legacy implicit discovery models. Discovery diagnostics are available in the `Diagnostics` pane for technical inspection of settlement decisions.
+
 ## Notifications and presence
 
 The notification layer is intentionally conservative.
@@ -239,4 +280,4 @@ Later proposals and features may build on this operator spine, but should not re
 - recovery stays policy-bounded,
 - comparison stays deterministic.
 
-Repo-backed delivery work in Proposal 007 extends this operator shell rather than replacing it.
+The repo-backed delivery slice ([full-mvp-delivery.md](full-mvp-delivery.md)) extends this operator shell rather than replacing it.

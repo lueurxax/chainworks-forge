@@ -134,7 +134,7 @@ struct FullMVPWorkflowTests {
             providerIdentifier: "claude_code",
             model: "sonnet",
             effort: "high",
-            transport: "goose_server",
+            transport: "acp_http",
             adapterVersion: "v1"
         )
 
@@ -146,27 +146,29 @@ struct FullMVPWorkflowTests {
         #expect(adjusted.agentBindings["code_writer"]?.worktreeWriteEnabled == true)
     }
 
-    // MARK: - §13.1 Workflow: Implementation loop stops when seemingly_complete
+    // MARK: - §13.1 Workflow: Implementation loop follows v2 assessment status
 
-    @Test("Implementation continued loop transitions on seemingly_complete")
-    func implementationLoopStopsWhenSeeminglyComplete() throws {
+    @Test("Implementation continued loop transitions on v2 self-assessment status")
+    func implementationLoopFollowsV2SelfAssessmentStatus() throws {
         let workflow = try loadTestFullMVPLiveWorkflow()
 
-        // state_8 should have transitions conditional on seemingly_complete
         let state8 = workflow.states["state_8_implementation_continued"]
         #expect(state8 != nil, "state_8 must exist")
 
         let transitions = state8?.transitions ?? []
         #expect(transitions.count >= 2, "state_8 must have at least 2 transitions")
 
-        // One transition goes to state_9 when seemingly_complete == true
         let toReview = transitions.first { $0.to == "state_9_implementation_reviewed" }
         #expect(toReview != nil, "Must have transition to state_9")
-        #expect(toReview?.when.contains("seemingly_complete") == true)
+        #expect(toReview?.when.contains("implementation_self_assessment_v2.status") == true)
+        #expect(toReview?.when.contains("'handoff_required'") == true)
+        #expect(toReview?.when.contains("'blocked'") == true)
 
-        // One transition loops back when seemingly_complete == false
         let loopBack = transitions.first { $0.to == "state_8_implementation_continued" }
         #expect(loopBack != nil, "Must have loop-back transition")
+        #expect(loopBack?.when.contains("implementation_self_assessment_v2.status") == true)
+        #expect(loopBack?.when.contains("'needs_code_fixes'") == true)
+        #expect(loopBack?.when.contains("'invalid'") == true)
 
         // Loop config should exist with budget
         let loop = state8?.loop
@@ -296,6 +298,7 @@ struct FullMVPWorkflowTests {
         let context = TransitionEvaluator.EvaluationContext(
             producedArtifactNames: ["proposal_review_summary"],
             approvalGranted: false,
+            approvalRejected: false,
             variables: plan.variables,
             artifactFields: [
                 "proposal_review_summary": [
@@ -684,10 +687,10 @@ struct FullMVPIntegrationTests {
         #expect(resumedConfig.targetBranch == "dogfood/resume-test")
     }
 
-    // MARK: - testRejectManualReleaseCancelsRunWithoutSideEffects
+    // MARK: - Manual release rejection side effects
 
     @Test("Rejecting manual release produces no release side effects")
-    func rejectManualReleaseCancelsWithoutSideEffects() throws {
+    func rejectManualReleaseHasNoReleaseSideEffects() throws {
         let workflow = try loadTestFullMVPLiveWorkflow()
 
         // Verify state_11 has transitions — but no side effects occur without approval
@@ -701,8 +704,7 @@ struct FullMVPIntegrationTests {
         #expect(runAfter != nil, "run_after_approval block must exist")
 
         // The presence of run_after_approval means side effects are gated
-        // If approval is rejected, the orchestrator transitions based on approval.granted == false
-        // which would not match state_11's transition (which requires exists('git_push_receipt'))
+        // If approval is rejected, run_after_approval is skipped, so no release receipt exists.
     }
 
     // MARK: - testDeliveryPreflightService
@@ -880,7 +882,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureACPTransport(scenario: .fullMVPSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
@@ -950,6 +952,7 @@ struct FullMVPIntegrationTests {
         transitionContext = TransitionEvaluator.EvaluationContext(
             producedArtifactNames: Set(artifacts.map(\.name)),
             approvalGranted: false,
+            approvalRejected: false,
             variables: plan.variables,
             artifactFields: debugArtifactFields
         )
@@ -1046,7 +1049,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureACPTransport(scenario: .fullMVPSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,
@@ -1158,7 +1161,7 @@ struct FullMVPIntegrationTests {
             )
         )
 
-        let executor = RuntimeAgentExecutor(transport: FixtureGooseTransport(scenario: .fullMVPRefineThenSuccess))
+        let executor = RuntimeAgentExecutor(transport: FixtureACPTransport(scenario: .fullMVPRefineThenSuccess))
         let orchestrator = WorkflowOrchestrator(
             run: run,
             plan: plan,

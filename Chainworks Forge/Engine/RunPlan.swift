@@ -140,6 +140,8 @@ enum TransitionCondition: Sendable {
     case artifactExists(String)
     /// when: approval.granted == true
     case approvalGranted
+    /// when: approval.rejected == true
+    case approvalRejected
     /// when: <complex expression> — evaluated at runtime
     case expression(String)
 }
@@ -159,6 +161,7 @@ struct ResolvedAgent: Sendable {
     let temperature: Double
     let permissionProfile: String
     let mcpProfileID: String?
+    let requestedMCPServerIDs: [String]
     let skillRef: String
     let skillRole: String?
     let resolvedSkill: ResolvedSkill?
@@ -189,6 +192,7 @@ struct ResolvedAgent: Sendable {
         temperature: Double,
         permissionProfile: String,
         mcpProfileID: String? = nil,
+        requestedMCPServerIDs: [String] = [],
         skillRef: String,
         skillRole: String?,
         resolvedSkill: ResolvedSkill? = nil,
@@ -213,6 +217,7 @@ struct ResolvedAgent: Sendable {
         self.temperature = temperature
         self.permissionProfile = permissionProfile
         self.mcpProfileID = mcpProfileID
+        self.requestedMCPServerIDs = Array(Set(requestedMCPServerIDs)).sorted()
         self.skillRef = skillRef
         self.skillRole = skillRole
         self.resolvedSkill = resolvedSkill

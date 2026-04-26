@@ -1,0 +1,131 @@
+{
+  "schema_version": "behavioral-diff-report.v1",
+  "report_id": "projection-readback-surface-regeneration",
+  "mode": "fixture_regeneration",
+  "proof_mode": "fixture_lifecycle",
+  "run_fixture_id": "projection-readback-surface",
+  "fixture_revision": 1,
+  "client_snapshot_ref": "/Users/user/Documents/Chainworks Forge/control-plane/crates/engine/tests/fixtures/parity/golden-runs/projection-readback-surface/fixture.json",
+  "server_replay_ref": null,
+  "regeneration": {
+    "author": "p041-initial-fixture-lifecycle",
+    "reason": "Initial checked-in P041 V1 fixture capture baseline",
+    "previous_fixture_dir": null,
+    "initial_capture_without_prior": true
+  },
+  "comparison_surface": [
+    "canonical_state",
+    "projections",
+    "artifacts",
+    "reports",
+    "operator_summary"
+  ],
+  "surface_comparisons": [
+    {
+      "surface": "canonical_state",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "run_status": "completed",
+        "stages": [
+          {
+            "stage_id": "readback_source",
+            "label": "Readback Source",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "readback_report",
+            "label": "Readback Report",
+            "status": "completed",
+            "attempt_number": 1
+          }
+        ]
+      }
+    },
+    {
+      "surface": "projections",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "run_status": "completed",
+        "stages": [
+          {
+            "stage_id": "readback_source",
+            "label": "Readback Source",
+            "status": "completed",
+            "attempt_number": 1
+          },
+          {
+            "stage_id": "readback_report",
+            "label": "Readback Report",
+            "status": "completed",
+            "attempt_number": 1
+          }
+        ],
+        "readback_surfaces": [
+          "run_projection",
+          "stage_projection",
+          "artifact_index",
+          "graphql_readback",
+          "mcp_report_readback"
+        ]
+      }
+    },
+    {
+      "surface": "artifacts",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "artifacts": [
+          {
+            "name": "artifact_index_source",
+            "contract_id": "artifact.index",
+            "stage_id": "readback_source",
+            "format": "json",
+            "report_kind": null
+          },
+          {
+            "name": "graphql_mcp_readback",
+            "contract_id": "readback.parity",
+            "stage_id": "readback_report",
+            "format": "json",
+            "report_kind": "parity_summary"
+          }
+        ]
+      }
+    },
+    {
+      "surface": "reports",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "schema_version": "expected-reports.v1",
+        "reports": [
+          {
+            "kind": "parity_summary",
+            "version": 1,
+            "fixture_id": "projection-readback-surface"
+          }
+        ]
+      }
+    },
+    {
+      "surface": "operator_summary",
+      "status": "initial_capture",
+      "old": null,
+      "new": {
+        "status": "ready",
+        "summary": "Projection/GraphQL/MCP readback parity is ready."
+      }
+    }
+  ],
+  "divergences": [],
+  "summary": {
+    "blocking_count": 0,
+    "warning_count": 0,
+    "info_count": 0,
+    "operator_message": "Fixture regeneration diff recorded."
+  },
+  "verdict": "ready"
+}

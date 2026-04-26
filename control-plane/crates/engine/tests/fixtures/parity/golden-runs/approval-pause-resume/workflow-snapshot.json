@@ -1,0 +1,34 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "approval-pause-resume",
+  "title": "Approval Pause Resume",
+  "initial_state": "prepare",
+  "states": [
+    {
+      "stage_id": "prepare",
+      "label": "Prepare",
+      "owner": "fixture_agent",
+      "outputs": [],
+      "next_stage": "manual_approval",
+      "terminal": false
+    },
+    {
+      "stage_id": "manual_approval",
+      "label": "Manual Approval",
+      "owner": "fixture_agent",
+      "outputs": [
+        "approval_packet"
+      ],
+      "next_stage": "resume",
+      "terminal": false
+    },
+    {
+      "stage_id": "resume",
+      "label": "Resume",
+      "owner": "fixture_agent",
+      "outputs": [],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

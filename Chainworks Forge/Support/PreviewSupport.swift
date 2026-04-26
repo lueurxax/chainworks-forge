@@ -33,12 +33,6 @@ enum PreviewSupport {
                 workflowSourcePath: repoExampleURL("workflows/workflow.yaml").path,
                 agentCatalogSourcePath: repoExampleURL("agents/agents.yaml").path,
                 supportBundleExportPath: previewApplicationSupportURL("exports").path,
-                gooseServerHost: "127.0.0.1",
-                gooseServerPort: 51200,
-                gooseServerTLS: true,
-                gooseServerAutostart: true,
-                gooseServerBinaryPath: "/Applications/Goose.app/Contents/Resources/bin/goosed",
-                gooseServerSecretKey: "preview-secret",
                 activeConfigurationSource: .persistedSettings
             )
         )
@@ -47,26 +41,23 @@ enum PreviewSupport {
     @MainActor
     static func makeProviderSettingsStore() -> ProviderSettingsStore {
         let claudeProvider = ConfiguredProvider(
-            family: .claude,
-            displayName: "Claude Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
+            family: .claudeACP,
+            displayName: "Claude ACP",
+            transport: .cli,
             authMode: .apiKey,
             defaultModel: "opus"
         )
         let codexProvider = ConfiguredProvider(
-            family: .codex,
-            displayName: "Codex via Goose",
-            transport: .gooseServer,
-            endpoint: "https://127.0.0.1:51200",
+            family: .codexACP,
+            displayName: "Codex ACP",
+            transport: .cli,
             authMode: .apiKey,
-            defaultModel: "gpt-5-codex"
+            defaultModel: "gpt-5"
         )
         let geminiProvider = ConfiguredProvider(
-            family: .gemini,
-            displayName: "Gemini HTTP",
-            transport: .httpAPI,
-            endpoint: "https://127.0.0.1:51200",
+            family: .geminiACP,
+            displayName: "Gemini ACP",
+            transport: .cli,
             authMode: .none,
             defaultModel: "gemini-2.5-pro"
         )
@@ -100,11 +91,8 @@ enum PreviewSupport {
         liveConfigured: Bool = true
     ) -> ExecutionService {
         let runtimeConfiguration = liveConfigured ? LiveRuntimeConfiguration(
-            baseURL: URL(string: "https://127.0.0.1:51200")!,
-            apiKey: "preview-secret",
             override: nil,
-            transportMode: .network,
-            transportAPI: .gooseServer
+            transportMode: .fixtureProposalLoopSuccess
         ) : nil
 
         return ExecutionService(
@@ -127,7 +115,7 @@ enum PreviewSupport {
 
         let activeIdea = Idea(
             title: "Provider troubleshooting",
-            body: "Show why Codex and Claude fail in-app even when Goose is reachable.",
+            body: "Show why Codex and Claude fail in-app even when the runtime is reachable.",
             attachmentPath: previewDocumentsURL("specs/provider-troubleshooting.md").path,
             status: .active
         )
@@ -453,7 +441,11 @@ enum PreviewSupport {
         context.insert(run)
 
         seedWorkflowMapStages(into: run)
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            ForgeLogger.app.error("Failed to persist preview workflow-map run seed: \(error.localizedDescription)")
+        }
     }
 
     @MainActor

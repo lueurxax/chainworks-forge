@@ -42,11 +42,8 @@ struct Proposal022Tests {
             catalog: try loadExampleCatalog(),
             stewardConfig: try loadExampleStewardConfig(),
             liveRuntimeConfiguration: LiveRuntimeConfiguration(
-                baseURL: URL(string: "https://127.0.0.1:51200")!,
-                apiKey: "proposal-022-proof",
                 override: nil,
-                transportMode: .fixtureProposal022FeedbackCycle,
-                transportAPI: .gooseServer
+                transportMode: .fixtureProposal022FeedbackCycle
             ),
             notificationService: NotificationService()
         )
@@ -54,7 +51,7 @@ struct Proposal022Tests {
 
     @Test("Proposal 022 fixture cycle emits backlog, coverage, fact digest, and targeted rerun plan artifacts")
     func proposal022FixtureCycleEmitsCanonicalArtifacts() async throws {
-        let transport = FixtureGooseTransport(scenario: .proposal022FeedbackCycle)
+        let transport = FixtureACPTransport(scenario: .proposal022FeedbackCycle)
         let workspace = FileManager.default.temporaryDirectory
             .appendingPathComponent("Proposal022Fixture-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)

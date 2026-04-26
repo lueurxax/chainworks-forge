@@ -1,13 +1,14 @@
 import SwiftUI
 import Foundation
 import AppKit
+import SwiftData
 
-enum ArtifactRenderProvenance: Equatable {
+nonisolated enum ArtifactRenderProvenance: Equatable {
     case artifactBacked
     case explicit
 }
 
-struct ArtifactRenderContext: Equatable {
+nonisolated struct ArtifactRenderContext: Equatable {
     let format: ArtifactFormat
     let artifactName: String?
     let localRoots: [URL]
@@ -62,7 +63,7 @@ struct ArtifactRenderContext: Equatable {
     }
 }
 
-enum MarkdownImageSourcePolicy {
+nonisolated enum MarkdownImageSourcePolicy {
     case v1
 
     private static let allowedRenderableExtensions: Set<String> = [
@@ -196,7 +197,7 @@ enum MarkdownDocumentBlock: Equatable {
     }
 }
 
-enum MarkdownDocumentParser {
+nonisolated enum MarkdownDocumentParser {
     private static let imagePattern = try! NSRegularExpression(
         pattern: #"^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$"#,
         options: []
@@ -594,22 +595,47 @@ struct JSONTreeNode: Equatable {
 struct ArtifactContentRenderer: View {
     let content: String
     let context: ArtifactRenderContext
+    private let preparedPreview: ArtifactPreparedPreview?
+
+    init(content: String, context: ArtifactRenderContext) {
+        self.content = content
+        self.context = context
+        self.preparedPreview = nil
+    }
+
+    init(preparedPreview: ArtifactPreparedPreview, context: ArtifactRenderContext) {
+        self.content = preparedPreview.content
+        self.context = context
+        self.preparedPreview = preparedPreview
+    }
 
     var body: some View {
-        switch ArtifactPresentationIntent.resolve(content: content, context: context) {
-        case .markdownDocument:
-            MarkdownDocumentView(content: content, localRoots: context.localRoots)
-        case .jsonTree:
-            JSONTreeDocumentView(rawJSON: content)
-        case .diff:
-            DiffArtifactView(content: content)
-        case .plainText(let monospaced):
-            PlainTextArtifactView(content: content, monospaced: monospaced)
+        let prepared = preparedPreview ?? {
+            let intent = ArtifactPresentationIntent.resolve(content: content, context: context)
+            return ArtifactPreviewPolicy.prepare(content: content, intent: intent)
+        }()
+
+        VStack(alignment: .leading, spacing: 12) {
+            if let previewNotice = prepared.previewNotice {
+                ArtifactPreviewNoticeView(notice: previewNotice)
+            }
+
+            switch prepared.intent {
+            case .markdownDocument:
+                MarkdownDocumentView(content: prepared.content, localRoots: context.localRoots)
+            case .jsonTree:
+                JSONTreeDocumentView(rawJSON: prepared.content)
+            case .diff:
+                DiffArtifactView(content: prepared.content)
+            case .plainText(let monospaced):
+                PlainTextArtifactView(content: prepared.content, monospaced: monospaced)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-enum ArtifactPresentationIntent: Equatable {
+nonisolated enum ArtifactPresentationIntent: Equatable, Sendable {
     case markdownDocument
     case jsonTree(rescuedFrom: ArtifactFormat?)
     case diff
@@ -624,7 +650,16 @@ enum ArtifactPresentationIntent: Equatable {
         case .markdown:
             return .markdownDocument
         case .json:
-            return .jsonTree(rescuedFrom: nil)
+            if StructuredPayloadProbe.isTopLevelJSONObjectOrArray(content) {
+                return .jsonTree(rescuedFrom: nil)
+            }
+            if StructuredPayloadProbe.looksLikeDiff(content) {
+                return .diff
+            }
+            if StructuredPayloadProbe.looksLikeMarkdown(content) {
+                return .markdownDocument
+            }
+            return .plainText(monospaced: true)
         case .diff:
             return .diff
         case .report:
@@ -639,14 +674,150 @@ enum ArtifactPresentationIntent: Equatable {
     }
 }
 
-enum StructuredPayloadProbe {
-    static func isTopLevelJSONObjectOrArray(_ content: String) -> Bool {
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first, first == "{" || first == "[" else {
+nonisolated struct ArtifactPreparedPreview: Equatable, Sendable {
+    let content: String
+    let intent: ArtifactPresentationIntent
+    let previewNotice: ArtifactPreviewNotice?
+}
+
+nonisolated struct ArtifactPreviewNotice: Equatable, Sendable {
+    let visibleCharacterCount: Int
+    let totalCharacterCount: Int
+    let visibleLineCount: Int
+    let totalLineCount: Int
+    let renderedAsRawText: Bool
+
+    var message: String {
+        let lineSummary = "\(visibleLineCount.formatted())/\(totalLineCount.formatted()) lines"
+        let characterSummary = "\(visibleCharacterCount.formatted())/\(totalCharacterCount.formatted()) characters"
+        if renderedAsRawText {
+            return "Large artifact preview is capped and shown as raw text: \(lineSummary), \(characterSummary)."
+        }
+        return "Large artifact preview is capped: \(lineSummary), \(characterSummary)."
+    }
+}
+
+nonisolated enum ArtifactPreviewPolicy {
+    static let maxRenderedCharacters = 120_000
+    static let maxRenderedLines = 2_000
+    static let maxJSONTreeCharacters = 80_000
+
+    static func prepare(content: String, intent: ArtifactPresentationIntent) -> ArtifactPreparedPreview {
+        let forceRawText = shouldRenderAsRawText(content: content, intent: intent)
+        let truncated = cappedPrefix(content)
+
+        guard let truncated else {
+            if forceRawText {
+                return ArtifactPreparedPreview(
+                    content: content,
+                    intent: .plainText(monospaced: true),
+                    previewNotice: nil
+                )
+            }
+            return ArtifactPreparedPreview(content: content, intent: intent, previewNotice: nil)
+        }
+
+        return ArtifactPreparedPreview(
+            content: truncated.content,
+            intent: forceRawText ? .plainText(monospaced: true) : intent,
+            previewNotice: ArtifactPreviewNotice(
+                visibleCharacterCount: truncated.visibleCharacterCount,
+                totalCharacterCount: truncated.totalCharacterCount,
+                visibleLineCount: truncated.visibleLineCount,
+                totalLineCount: truncated.totalLineCount,
+                renderedAsRawText: forceRawText
+            )
+        )
+    }
+
+    private static func shouldRenderAsRawText(content: String, intent: ArtifactPresentationIntent) -> Bool {
+        switch intent {
+        case .jsonTree:
+            return content.count > maxJSONTreeCharacters || lineCount(content) > maxRenderedLines
+        case .markdownDocument, .diff, .plainText:
             return false
         }
-        if first == "{", trimmed.last != "}" { return false }
-        if first == "[", trimmed.last != "]" { return false }
+    }
+
+    private static func cappedPrefix(_ content: String) -> (
+        content: String,
+        visibleCharacterCount: Int,
+        totalCharacterCount: Int,
+        visibleLineCount: Int,
+        totalLineCount: Int
+    )? {
+        var cursor = content.startIndex
+        var visibleCharacters = 0
+        var visibleLines = content.isEmpty ? 0 : 1
+
+        while cursor < content.endIndex {
+            if visibleCharacters >= maxRenderedCharacters || visibleLines > maxRenderedLines {
+                break
+            }
+
+            let character = content[cursor]
+            if character.isNewline, visibleLines == maxRenderedLines {
+                break
+            }
+
+            visibleCharacters += 1
+            if character.isNewline {
+                visibleLines += 1
+            }
+            content.formIndex(after: &cursor)
+        }
+
+        guard cursor < content.endIndex else { return nil }
+
+        return (
+            content: String(content[..<cursor]),
+            visibleCharacterCount: visibleCharacters,
+            totalCharacterCount: content.count,
+            visibleLineCount: visibleLines,
+            totalLineCount: lineCount(content)
+        )
+    }
+
+    private static func lineCount(_ content: String) -> Int {
+        guard !content.isEmpty else { return 0 }
+        return content.reduce(into: 1) { count, character in
+            if character.isNewline {
+                count += 1
+            }
+        }
+    }
+}
+
+private struct ArtifactPreviewNoticeView: View {
+    let notice: ArtifactPreviewNotice
+
+    var body: some View {
+        Label(notice.message, systemImage: "scissors")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.secondary.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .textSelection(.enabled)
+    }
+}
+
+nonisolated enum StructuredPayloadProbe {
+    nonisolated private static let maxSynchronousJSONParseBytes = 80_000
+    nonisolated private static let maxProbeCharacters = 16_000
+
+    static func isTopLevelJSONObjectOrArray(_ content: String) -> Bool {
+        guard let first = firstNonWhitespace(in: content), first == "{" || first == "[" else {
+            return false
+        }
+        guard let last = lastNonWhitespace(in: content) else { return false }
+        if first == "{", last != "}" { return false }
+        if first == "[", last != "]" { return false }
+
+        if content.utf8.count > maxSynchronousJSONParseBytes {
+            return true
+        }
 
         guard let data = content.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data)
@@ -655,6 +826,63 @@ enum StructuredPayloadProbe {
         }
 
         return object is [String: Any] || object is [Any]
+    }
+
+    static func looksLikeMarkdown(_ content: String) -> Bool {
+        let normalized = sampledPrefix(content).replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
+        var evidenceCount = 0
+
+        for line in lines.prefix(40) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            if trimmed.hasPrefix("# ") || trimmed.hasPrefix("## ") || trimmed.hasPrefix("### ") {
+                return true
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("> ") {
+                return true
+            }
+            if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                evidenceCount += 1
+            }
+            if trimmed.contains("](") || trimmed.contains("**") || trimmed.contains("`") {
+                evidenceCount += 1
+            }
+            if trimmed.contains("|"), trimmed.filter({ $0 == "|" }).count >= 2 {
+                evidenceCount += 1
+            }
+            if evidenceCount >= 2 {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    static func looksLikeDiff(_ content: String) -> Bool {
+        let lines = sampledPrefix(content).replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .prefix(40)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return lines.contains { line in
+            line.hasPrefix("diff --git ")
+                || line.hasPrefix("@@ ")
+                || line.hasPrefix("+++ ")
+                || line.hasPrefix("--- ")
+        }
+    }
+
+    private static func sampledPrefix(_ content: String) -> String {
+        guard content.count > maxProbeCharacters else { return content }
+        return String(content.prefix(maxProbeCharacters))
+    }
+
+    private static func firstNonWhitespace(in content: String) -> Character? {
+        content.first { !$0.isWhitespace }
+    }
+
+    private static func lastNonWhitespace(in content: String) -> Character? {
+        content.reversed().first { !$0.isWhitespace }
     }
 }
 
@@ -1031,19 +1259,39 @@ private struct MarkdownDocumentTextView: NSViewRepresentable {
             .foregroundColor: NSColor.linkColor,
             .underlineStyle: NSUnderlineStyle.single.rawValue
         ]
-        textView.textStorage?.setAttributedString(attributedString)
+        textView.applyAttributedStringIfNeeded(attributedString)
         return textView
     }
 
     func updateNSView(_ nsView: MarkdownIntrinsicTextView, context: Context) {
         nsView.drawsBackground = backgroundColor.alphaComponent > 0.001
         nsView.backgroundColor = backgroundColor
-        nsView.textStorage?.setAttributedString(attributedString)
-        nsView.invalidateIntrinsicContentSize()
+        if nsView.applyAttributedStringIfNeeded(attributedString) {
+            nsView.scheduleIntrinsicSizeInvalidation()
+        }
+    }
+}
+
+enum MarkdownTextViewUpdatePolicy {
+    static func needsAttributedStringUpdate(current: NSAttributedString?, incoming: NSAttributedString) -> Bool {
+        guard let current else { return true }
+        return current.isEqual(to: incoming) == false
+    }
+
+    static func shouldInvalidateLayout(
+        previousWidth: CGFloat?,
+        newWidth: CGFloat,
+        tolerance: CGFloat = 0.5
+    ) -> Bool {
+        guard let previousWidth else { return true }
+        return abs(previousWidth - newWidth) > tolerance
     }
 }
 
 private final class MarkdownIntrinsicTextView: NSTextView {
+    private var lastMeasuredWidth: CGFloat?
+    private var intrinsicInvalidationScheduled = false
+
     override var intrinsicContentSize: NSSize {
         guard let textContainer, let layoutManager else {
             return NSSize(width: NSView.noIntrinsicMetric, height: 0)
@@ -1059,7 +1307,30 @@ private final class MarkdownIntrinsicTextView: NSTextView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         textContainer?.containerSize = NSSize(width: max(newSize.width, 1), height: CGFloat.greatestFiniteMagnitude)
-        invalidateIntrinsicContentSize()
+        if MarkdownTextViewUpdatePolicy.shouldInvalidateLayout(previousWidth: lastMeasuredWidth, newWidth: newSize.width) {
+            lastMeasuredWidth = newSize.width
+            scheduleIntrinsicSizeInvalidation()
+        }
+    }
+
+    @discardableResult
+    func applyAttributedStringIfNeeded(_ attributedString: NSAttributedString) -> Bool {
+        let current = textStorage?.copy() as? NSAttributedString
+        guard MarkdownTextViewUpdatePolicy.needsAttributedStringUpdate(current: current, incoming: attributedString) else {
+            return false
+        }
+        textStorage?.setAttributedString(attributedString)
+        return true
+    }
+
+    func scheduleIntrinsicSizeInvalidation() {
+        guard intrinsicInvalidationScheduled == false else { return }
+        intrinsicInvalidationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.intrinsicInvalidationScheduled = false
+            self.invalidateIntrinsicContentSize()
+        }
     }
 }
 
@@ -1270,5 +1541,97 @@ struct DiffArtifactView: View {
         if line.hasPrefix("+") { return .green.opacity(0.1) }
         if line.hasPrefix("-") { return .red.opacity(0.1) }
         return .clear
+    }
+}
+
+struct WorkflowRunArtifactSnapshot {
+    let latestArtifacts: [Artifact]
+    let approvalContextArtifacts: [Artifact]
+    let latestDebugArtifacts: [Artifact]
+
+    init(artifacts: [Artifact]) {
+        let visibleArtifacts = artifacts.filter { $0.reportKind != "immutable_history" }
+        self.latestArtifacts = visibleArtifacts.sorted { lhs, rhs in
+            if lhs.name == "final_feature_report" && rhs.name != "final_feature_report" {
+                return true
+            }
+            if rhs.name == "final_feature_report" && lhs.name != "final_feature_report" {
+                return false
+            }
+            return lhs.createdAt > rhs.createdAt
+        }
+
+        self.approvalContextArtifacts = visibleArtifacts
+            .filter { artifact in
+                artifact.name == "proposal_review_summary" || artifact.name == "proposal_current"
+            }
+            .sorted { lhs, rhs in
+                Self.approvalContextRank(lhs.name) < Self.approvalContextRank(rhs.name)
+            }
+
+        self.latestDebugArtifacts = visibleArtifacts
+            .filter { artifact in
+                artifact.name.contains("transcript") || artifact.name.contains("receipt")
+            }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    private static func approvalContextRank(_ name: String) -> Int {
+        switch name {
+        case "proposal_review_summary":
+            return 0
+        case "proposal_current":
+            return 1
+        default:
+            return 2
+        }
+    }
+}
+
+enum ArtifactInspectorSkillTruthFormatter {
+    static func compactSummary(_ summary: String) -> String? {
+        let compacted = summary
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !compacted.isEmpty else { return nil }
+        let maxLength = 221
+        guard compacted.count > maxLength else { return compacted }
+        return String(compacted.prefix(maxLength - 1)) + "…"
+    }
+}
+
+enum ArtifactInspectorTraceabilityResolver {
+    static func downstreamConsumers(
+        artifact: Artifact,
+        run: Run,
+        modelContext: ModelContext
+    ) -> [AgentExecution] {
+        let runID = run.id
+        let descriptor = FetchDescriptor<StageExecution>()
+        guard let stages = try? modelContext.fetch(descriptor) else { return [] }
+
+        return stages
+            .filter { $0.run?.id == runID }
+            .flatMap { stage in stage.agentExecutions }
+            .filter { execution in
+                guard let data = execution.inputBindingsJSON,
+                      let bindings = try? JSONDecoder().decode([InputBinding].self, from: data)
+                else { return false }
+                return bindings.contains { binding in
+                    binding.artifactName == artifact.name && binding.producingAgentID == artifact.agentID
+                }
+            }
+    }
+}
+
+enum RunReportSupersedence {
+    static func notice(for artifact: Artifact, run: Run) -> String? {
+        guard artifact.reportKind == "immutable_history",
+              let reportVersion = artifact.reportVersion,
+              reportVersion < run.latestReportVersion
+        else { return nil }
+
+        return "This immutable run report was superseded after the run continued to version \(run.latestReportVersion)."
     }
 }

@@ -8,10 +8,15 @@ enum PersistedRunGraph {
             return run.stageExecutions
         }
 
-        let descriptor = FetchDescriptor<StageExecution>()
+        let runID = run.id
+        let descriptor = FetchDescriptor<StageExecution>(
+            predicate: #Predicate<StageExecution> { stage in
+                stage.run?.id == runID
+            }
+        )
 
         if let fetched = try? modelContext.fetch(descriptor) {
-            return fetched.filter { $0.run?.id == run.id }
+            return fetched
         }
 
         return run.stageExecutions
@@ -22,10 +27,15 @@ enum PersistedRunGraph {
             return run.approvals
         }
 
-        let descriptor = FetchDescriptor<Approval>()
+        let runID = run.id
+        let descriptor = FetchDescriptor<Approval>(
+            predicate: #Predicate<Approval> { approval in
+                approval.run?.id == runID
+            }
+        )
 
         if let fetched = try? modelContext.fetch(descriptor) {
-            return fetched.filter { $0.run?.id == run.id }
+            return fetched
         }
 
         return run.approvals

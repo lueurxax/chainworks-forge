@@ -1,0 +1,6 @@
+interface:
+  display_name: "Proposal Implementation Audit"
+  short_description: "Proposal-vs-implementation conformance + routed specialist audit"
+  default_prompt: "Use $proposal-implementation-audit in auto mode for <proposal-path>. Reuse prior proposal-review reviewer selection when valid, audit the current implementation against the proposal, write one versioned implementation audit report beside the proposal, and summarize conformance, readiness, selected reviewers, and blockers."
+policy:
+  allow_implicit_invocation: false

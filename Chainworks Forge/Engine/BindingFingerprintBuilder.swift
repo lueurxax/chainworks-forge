@@ -45,7 +45,7 @@ struct BindingFingerprintBuilder {
 
         // Permission profile (§6.1)
         components.append(agent.permissionProfile)
-        components.append(agent.mcpProfileID ?? "none")
+        components.append(agent.requestedMCPServerIDs.sorted().joined(separator: ","))
 
         // Workspace isolation (§6.1)
         components.append(workingDirectory)

@@ -36,11 +36,11 @@ import SwiftData
     var stack: String?
     var experimentCohortID: UUID?
 
-    // P005-OPS §6.5: Report and runtime trust additions
+    // P005-OPS §6.5 / Proposal 033 §6: runtime trust additions
     var latestSummaryArtifactID: UUID?
     var latestImmutableReportArtifactID: UUID?
     var latestReportVersion: Int = 0
-    var runtimeTrustLevel: String?    // "fixture_verified" | "server_unverified" | "server_verified"
+    var runtimeTrustLevel: String?    // "fixture_verified" | legacy "server_*" | ACP-era "runtime_*"
     var providerBindingSnapshotJSON: Data?
     var startOptionsJSON: Data?
 
@@ -91,6 +91,13 @@ import SwiftData
     // Serialized TransitionCursor — the single canonical continuation truth for resume,
     // recovery, and report surfaces. Nil for pre-P032 runs (fallback to heuristic path).
     var transitionCursorJSON: Data?
+    // Proposal 017 Phase A bridge: temporary JSON storage for workflow conflict
+    // truth until Swift moves to first-class conflict persistence.
+    var workflowConflictRecordsJSONV1: Data?
+    // Proposal 054: Canonical implementation_self_assessment_summary projection.
+    var implementationSelfAssessmentSummaryJSON: Data?
+    // Proposal 017 Phase A: engine-owned implementation-entry handoff readback.
+    var implementationHandoffStatusJSON: Data?
 
     @Relationship(inverse: \Idea.runs)
     var idea: Idea?
@@ -101,8 +108,22 @@ import SwiftData
     @Relationship(deleteRule: .cascade)
     var approvals: [Approval] = []
 
-    // Derived current stage (ARCH-PA-002)
+    // Derived current stage (ARCH-PA-002), cursor-first (Proposal 032).
     @MainActor var currentStageID: String? {
+        // Proposal 032: Prefer the durable cursor for current-stage derivation.
+        if let cursor = transitionCursor {
+            switch cursor.settlementPhase {
+            case .transitionSettled, .transitionStarted:
+                return cursor.nextScheduledStateID
+            case .terminal, .awaitingConflictResolution:
+                return cursor.lastCompletedStateID
+            case .awaitingFirstState:
+                break
+            }
+
+            return nil
+        }
+        // Fallback for pre-P032 runs or initial state.
         let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
         return sorted.last(where: {
             $0.status == .running
@@ -112,6 +133,28 @@ import SwiftData
                 || $0.status == .ready
         })?.stageID
             ?? sorted.last(where: { $0.status == .completed })?.stageID
+    }
+
+    /// Proposal 032: Cursor-derived stage label for shell surfaces.
+    /// Returns a label that distinguishes interrupted-transition states
+    /// (e.g. "Scheduled: review" vs. just "review").
+    @MainActor var cursorDerivedStageLabel: String {
+        guard let cursor = transitionCursor else {
+            return currentStageID ?? "None"
+        }
+        switch cursor.settlementPhase {
+        case .transitionSettled:
+            if let next = cursor.nextScheduledStateID {
+                return "Scheduled: \(next)"
+            }
+            return cursor.lastCompletedStateID ?? "None"
+        case .transitionStarted:
+            return cursor.nextScheduledStateID ?? "None"
+        case .terminal, .awaitingConflictResolution:
+            return cursor.lastCompletedStateID ?? "None"
+        case .awaitingFirstState:
+            return currentStageID ?? "Not started"
+        }
     }
 
     init(
@@ -159,6 +202,81 @@ import SwiftData
     }
 }
 
+struct RuntimeTrustPresentation: Equatable, Sendable {
+    let rawValue: String?
+    let semanticValue: String?
+
+    init(trustLevel: String?) {
+        self.rawValue = trustLevel
+        switch trustLevel {
+        case "fixture_verified":
+            self.semanticValue = "fixture_verified"
+        case "runtime_verified", "server_verified":
+            self.semanticValue = "runtime_verified"
+        case "runtime_unverified", "server_unverified":
+            self.semanticValue = "runtime_unverified"
+        default:
+            self.semanticValue = nil
+        }
+    }
+
+    var badgeLabel: String {
+        switch rawValue {
+        case "fixture_verified": return "Fixture / verified"
+        case "server_unverified": return "Legacy (unverified)"
+        case "server_verified": return "Legacy (verified)"
+        case "runtime_verified": return "Verified"
+        case "runtime_unverified": return "Unverified"
+        default: return "Unknown"
+        }
+    }
+
+    var badgeIcon: String {
+        switch semanticValue {
+        case "fixture_verified", "runtime_verified":
+            return "checkmark.shield.fill"
+        case "runtime_unverified":
+            return "shield.lefthalf.filled"
+        default:
+            return "questionmark.circle"
+        }
+    }
+
+    var badgeColorName: String {
+        switch semanticValue {
+        case "fixture_verified", "runtime_verified":
+            return "success"
+        case "runtime_unverified":
+            return "warning"
+        default:
+            return "neutral"
+        }
+    }
+}
+
+extension Run {
+    private var persistedOperatorStatusDominatesTransientStageTruth: Bool {
+        switch status {
+        case .waitingApproval, .blocked, .completed, .failed, .cancelled, .cancelling:
+            return true
+        case .pending, .ready, .running:
+            return false
+        }
+    }
+
+    @MainActor var runtimeTrustPresentation: RuntimeTrustPresentation {
+        RuntimeTrustPresentation(trustLevel: runtimeTrustLevel)
+    }
+
+    @MainActor var normalizedRuntimeTrustLevel: String? {
+        runtimeTrustPresentation.semanticValue
+    }
+
+    @MainActor var runtimeTrustDisplayLabel: String {
+        runtimeTrustPresentation.badgeLabel
+    }
+}
+
 enum RunStatus: String, Codable {
     case pending
     case ready
@@ -200,19 +318,33 @@ extension Run {
         if cancellationRequestedAt != nil && cancellationSettledAt == nil {
             return .cancelling
         }
-        if status == .pending || status == .ready || status == .running {
-            let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
-            if let latestStage = sorted.last {
+        let sorted = RunStageSnapshotLoader.load(for: self).sorted { $0.startedAt < $1.startedAt }
+        if let latestStage = sorted.last {
+            if persistedOperatorStatusDominatesTransientStageTruth {
                 switch latestStage.status {
-                case .waitingApproval:
-                    return .waitingApproval
-                case .blocked:
-                    return .blocked
-                case .failed:
-                    return .failed
-                default:
+                case .pending, .ready, .running:
+                    return status
+                case .waitingApproval, .blocked, .failed:
                     break
+                case .completed, .skipped:
+                    return status
                 }
+            }
+            switch latestStage.status {
+            case .pending:
+                return .pending
+            case .ready:
+                return status == .pending ? .pending : .ready
+            case .running:
+                return .running
+            case .waitingApproval:
+                return .waitingApproval
+            case .blocked:
+                return .blocked
+            case .failed:
+                return .failed
+            case .completed, .skipped:
+                break
             }
         }
         return status
@@ -249,7 +381,7 @@ extension Run {
             case .awaitingFirstState:
                 // No state ever completed — start from the beginning (nil = initial).
                 return nil
-            case .terminal:
+            case .terminal, .awaitingConflictResolution:
                 // Terminal runs shouldn't be resumed, but if called, return last completed.
                 return cursor.lastCompletedStateID
             }
@@ -318,6 +450,115 @@ extension Run {
     }
 }
 
+extension Run {
+    var implementationHandoffStatus: ImplementationHandoffStatus? {
+        get {
+            guard let data = implementationHandoffStatusJSON else { return nil }
+            return try? JSONDecoder().decode(ImplementationHandoffStatus.self, from: data)
+        }
+        set {
+            implementationHandoffStatusJSON = try? JSONEncoder().encode(newValue)
+        }
+    }
+
+    var workflowConflictBridgeV1: WorkflowConflictBridgeV1 {
+        get {
+            guard let data = workflowConflictRecordsJSONV1 else {
+                return WorkflowConflictBridgeV1()
+            }
+            return (try? JSONDecoder().decode(WorkflowConflictBridgeV1.self, from: data))
+                ?? WorkflowConflictBridgeV1()
+        }
+        set {
+            workflowConflictRecordsJSONV1 = try? JSONEncoder().encode(newValue)
+        }
+    }
+
+    var currentWorkflowConflictRecord: WorkflowConflictRecord? {
+        workflowConflictBridgeV1.conflicts.last { $0.status.isCurrentBlocking }
+    }
+
+    func upsertWorkflowConflictRecord(_ record: WorkflowConflictRecord) {
+        var bridge = workflowConflictBridgeV1
+        let now = record.updatedAt
+        if record.status.isCurrentBlocking {
+            bridge.conflicts = bridge.conflicts.map { existing in
+                guard existing.status.isCurrentBlocking,
+                    existing.currentStateID == record.currentStateID,
+                    existing.conflictFingerprint != record.conflictFingerprint,
+                    existing.conflictID != record.conflictID
+                else {
+                    return existing
+                }
+                return existing.updatingStatus(
+                    .superseded,
+                    updatedAt: now,
+                    supersededByConflictID: record.conflictID
+                )
+            }
+        }
+        if let index = bridge.conflicts.firstIndex(where: {
+            $0.conflictFingerprint == record.conflictFingerprint
+                || $0.conflictID == record.conflictID
+        }) {
+            bridge.conflicts[index] = record
+        } else {
+            bridge.conflicts.append(record)
+        }
+        workflowConflictBridgeV1 = bridge
+    }
+
+    @discardableResult
+    func resolveCurrentWorkflowConflicts(
+        currentStateID: String,
+        selectedTransitionID: String,
+        selectedNextStateID: String,
+        stageExecutionID: UUID?,
+        resolvedAt: String
+    ) -> Int {
+        var bridge = workflowConflictBridgeV1
+        var resolvedCount = 0
+        let resolution = WorkflowConflictRecord.graphResolutionRecord(
+            selectedTransitionID: selectedTransitionID,
+            selectedNextStateID: selectedNextStateID,
+            stageExecutionID: stageExecutionID
+        )
+        bridge.conflicts = bridge.conflicts.map { conflict in
+            guard conflict.status.isCurrentBlocking,
+                conflict.currentStateID == currentStateID
+            else {
+                return conflict
+            }
+            resolvedCount += 1
+            return conflict.updatingStatus(
+                .resolved,
+                updatedAt: resolvedAt,
+                resolvedAt: resolvedAt,
+                resolutionRecordJSON: resolution
+            )
+        }
+        workflowConflictBridgeV1 = bridge
+        return resolvedCount
+    }
+
+    func appendWorkflowAdvisoryRejectionRecord(_ record: WorkflowAdvisoryRejectionRecord) {
+        var bridge = workflowConflictBridgeV1
+        if let index = bridge.advisoryRejections.firstIndex(where: {
+            $0.rejectionID == record.rejectionID
+                || (
+                    $0.currentStateID == record.currentStateID
+                        && $0.selectedTransitionID == record.selectedTransitionID
+                        && $0.advisoryHintHash == record.advisoryHintHash
+                )
+        }) {
+            bridge.advisoryRejections[index] = record
+        } else {
+            bridge.advisoryRejections.append(record)
+        }
+        workflowConflictBridgeV1 = bridge
+    }
+}
+
 // MARK: - CancellationSettlementEntry (Proposal 011 — REQ-002)
 
 /// Records per-agent settlement details during cancellation propagation.
@@ -356,7 +597,7 @@ struct FrozenBindingProvenance: Codable, Sendable {
     let configuredProviderDefaultModel: String?
     /// The explicit run-start override model (if any).
     let runOverrideModel: String?
-    /// The final resolved model actually sent to Goose.
+    /// The final resolved model actually sent to the runtime.
     let resolvedModel: String
     /// The final resolved provider family.
     let resolvedProviderFamily: String

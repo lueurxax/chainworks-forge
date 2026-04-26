@@ -76,10 +76,22 @@ struct SettingsTransferService {
 
     @discardableResult
     func importSettings(from fileURL: URL) throws -> [String] {
+        var warnings: [String] = []
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        SecurityScopedAccess.remember(url: fileURL, kind: .settingsFile)
-        let package = try decoder.decode(ExportableSettingsPackage.self, from: SecurityScopedAccess.loadData(from: fileURL))
+        if !SecurityScopedAccess.remember(url: fileURL, kind: .settingsFile) {
+            warnings.append("Imported settings, but access to the selected file could not be bookmarked for future reads.")
+        }
+        let rawData = try SecurityScopedAccess.loadData(from: fileURL)
+        let migratedData: Data
+        do {
+            migratedData = try ProviderSettingsStore.migrateRawTransferPackage(rawData)
+        } catch {
+            ForgeLogger.app.error("Settings transfer package migration failed; falling back to raw package: \(error.localizedDescription)")
+            warnings.append("Imported settings from an older package without full migration diagnostics.")
+            migratedData = rawData
+        }
+        let package = try decoder.decode(ExportableSettingsPackage.self, from: migratedData)
 
         guard package.transferSchemaVersion == Self.currentSchemaVersion else {
             throw SettingsTransferError.unsupportedSchema(package.transferSchemaVersion)
@@ -98,7 +110,7 @@ struct SettingsTransferService {
         appConfigurationStore.replace(with: package.appConfiguration)
         providerSettingsStore.replace(with: package.providerSettings)
 
-        return []
+        return warnings
     }
 
     private func validate(package: ExportableSettingsPackage) throws {

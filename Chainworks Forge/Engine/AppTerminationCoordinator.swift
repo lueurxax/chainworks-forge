@@ -5,47 +5,17 @@ import AppKit
 #endif
 
 @MainActor
-protocol ManagedGooseServerControlling: AnyObject {
-    func stopManagedServer()
-    func prepareForSystemSleep()
-    func reconcileAfterSystemWake() async
-}
-
-extension ManagedGooseServerControlling {
-    func prepareForSystemSleep() {}
-    func reconcileAfterSystemWake() async {}
+protocol ExecutionTerminationControlling: AnyObject {
+    func prepareForTermination()
 }
 
 @MainActor
 class AppTerminationCoordinator: NSObject {
-    #if os(macOS)
-    private let workspaceNotificationCenter: NotificationCenter
-    private var sleepObserver: NSObjectProtocol?
-    private var wakeObserver: NSObjectProtocol?
-    #endif
-
-    var gooseServerManager: ManagedGooseServerControlling?
+    weak var executionTerminationController: ExecutionTerminationControlling?
 
     #if os(macOS)
     override init() {
-        self.workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
         super.init()
-        registerLifecycleObservers()
-    }
-
-    init(workspaceNotificationCenter: NotificationCenter) {
-        self.workspaceNotificationCenter = workspaceNotificationCenter
-        super.init()
-        registerLifecycleObservers()
-    }
-
-    deinit {
-        if let sleepObserver {
-            workspaceNotificationCenter.removeObserver(sleepObserver)
-        }
-        if let wakeObserver {
-            workspaceNotificationCenter.removeObserver(wakeObserver)
-        }
     }
     #else
     override init() {
@@ -54,32 +24,8 @@ class AppTerminationCoordinator: NSObject {
     #endif
 
     func prepareForTermination() {
-        gooseServerManager?.stopManagedServer()
+        executionTerminationController?.prepareForTermination()
     }
-
-    #if os(macOS)
-    private func registerLifecycleObservers() {
-        sleepObserver = workspaceNotificationCenter.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: nil
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { [weak self] in
-                self?.gooseServerManager?.prepareForSystemSleep()
-            }
-        }
-
-        wakeObserver = workspaceNotificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification,
-            object: nil,
-            queue: nil
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.gooseServerManager?.reconcileAfterSystemWake()
-            }
-        }
-    }
-    #endif
 }
 
 #if os(macOS)

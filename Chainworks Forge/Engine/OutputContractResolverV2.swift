@@ -195,11 +195,23 @@ enum OutputContractResolverV2 {
         }
 
         // JSON validation: parse and check required fields
-        if let jsonObject = try? JSONSerialization.jsonObject(with: data),
+        if let jsonObject = parsedJSONObject(from: data),
            let dict = jsonObject as? [String: Any] {
             // Valid JSON — check required fields
             let missingFields = schema.requiredFields.filter { dict[$0] == nil }
             if missingFields.isEmpty {
+                if schema.contractID == "implementation_self_assessment_v2",
+                   let validationError = implementationSelfAssessmentV2ValidationError(in: dict) {
+                    return OutputValidationResult(
+                        outputName: name,
+                        contractID: schema.contractID,
+                        status: .failed,
+                        missingFields: [],
+                        validationError: validationError,
+                        rawPayloadSize: data.count
+                    )
+                }
+
                 return OutputValidationResult(
                     outputName: name,
                     contractID: schema.contractID,
@@ -251,6 +263,189 @@ enum OutputContractResolverV2 {
             validationError: "Output is not valid JSON or not a JSON object",
             rawPayloadSize: data.count
         )
+    }
+
+    private static func parsedJSONObject(from data: Data) -> Any? {
+        if let jsonObject = try? JSONSerialization.jsonObject(with: data) {
+            return jsonObject
+        }
+
+        guard let repairedData = repairedJSONDataIfLikelyQuotedStringIssue(data) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: repairedData)
+    }
+
+    static func implementationSelfAssessmentV2ValidationError(in json: [String: Any]) -> String? {
+        guard strictBool(json["implementation_complete"]) != nil else {
+            return "implementation_self_assessment_v2 field 'implementation_complete' must be a boolean"
+        }
+        guard strictBool(json["verification_green"]) != nil else {
+            return "implementation_self_assessment_v2 field 'verification_green' must be a boolean"
+        }
+        guard let remainingCodeTasks = json["remaining_code_tasks"] as? [Any] else {
+            return "implementation_self_assessment_v2 field 'remaining_code_tasks' must be an array"
+        }
+        guard let handoffTasks = json["handoff_tasks"] as? [Any] else {
+            return "implementation_self_assessment_v2 field 'handoff_tasks' must be an array"
+        }
+        guard json["known_risks"] is [Any] else {
+            return "implementation_self_assessment_v2 field 'known_risks' must be an array"
+        }
+        guard json["tests_run"] is [Any] else {
+            return "implementation_self_assessment_v2 field 'tests_run' must be an array"
+        }
+        guard json["docs_impacted"] is [Any] else {
+            return "implementation_self_assessment_v2 field 'docs_impacted' must be an array"
+        }
+
+        for (index, value) in remainingCodeTasks.enumerated() {
+            guard let task = value as? [String: Any] else {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)] must be an object"
+            }
+            if nonEmptyString(task["summary"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].summary must be a non-empty string"
+            }
+            if nonEmptyString(task["owner"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].owner must be a non-empty string"
+            }
+            if strictBool(task["blocking"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].blocking must be a boolean"
+            }
+            if nonEmptyString(task["evidence"]) == nil {
+                return "implementation_self_assessment_v2 remaining_code_tasks[\(index)].evidence must be a non-empty string"
+            }
+        }
+
+        let allowedOwnerClasses: Set<String> = [
+            "docs",
+            "manual_evidence",
+            "release",
+            "ops",
+            "product",
+            "human_operator",
+            "unknown"
+        ]
+        for (index, value) in handoffTasks.enumerated() {
+            guard let task = value as? [String: Any] else {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)] must be an object"
+            }
+            if nonEmptyString(task["summary"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].summary must be a non-empty string"
+            }
+            guard let ownerClass = nonEmptyString(task["owner_class"]),
+                  allowedOwnerClasses.contains(ownerClass) else {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].owner_class must be one of docs, manual_evidence, release, ops, product, human_operator, unknown"
+            }
+            if nonEmptyString(task["target_stage"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].target_stage must be a non-empty string"
+            }
+            if strictBool(task["blocking_review"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].blocking_review must be a boolean"
+            }
+            if nonEmptyString(task["evidence"]) == nil {
+                return "implementation_self_assessment_v2 handoff_tasks[\(index)].evidence must be a non-empty string"
+            }
+        }
+
+        return nil
+    }
+
+    private static func strictBool(_ value: Any?) -> Bool? {
+        if let boolValue = value as? Bool {
+            return boolValue
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return number.boolValue
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func repairedJSONDataIfLikelyQuotedStringIssue(_ data: Data) -> Data? {
+        guard let raw = String(data: data, encoding: .utf8), raw.contains("\"") else {
+            return nil
+        }
+
+        var repaired = ""
+        repaired.reserveCapacity(raw.utf8.count + 16)
+
+        let scalars = Array(raw.unicodeScalars)
+        var index = 0
+        var inString = false
+        var escaped = false
+
+        while index < scalars.count {
+            let scalar = scalars[index]
+
+            if !inString {
+                repaired.unicodeScalars.append(scalar)
+                if scalar == "\"" {
+                    inString = true
+                }
+                index += 1
+                continue
+            }
+
+            if escaped {
+                repaired.unicodeScalars.append(scalar)
+                escaped = false
+                index += 1
+                continue
+            }
+
+            if scalar == "\\" {
+                repaired.unicodeScalars.append(scalar)
+                escaped = true
+                index += 1
+                continue
+            }
+
+            if scalar == "\"" {
+                let nextSignificant = nextNonWhitespaceScalar(in: scalars, after: index)
+                let isClosingQuote = nextSignificant == nil
+                    || nextSignificant == ","
+                    || nextSignificant == "}"
+                    || nextSignificant == "]"
+                    || nextSignificant == ":"
+
+                if isClosingQuote {
+                    repaired.unicodeScalars.append(scalar)
+                    inString = false
+                } else {
+                    repaired.append("\\\"")
+                }
+                index += 1
+                continue
+            }
+
+            repaired.unicodeScalars.append(scalar)
+            index += 1
+        }
+
+        guard repaired != raw else { return nil }
+        return repaired.data(using: .utf8)
+    }
+
+    private static func nextNonWhitespaceScalar(
+        in scalars: [UnicodeScalar],
+        after index: Int
+    ) -> UnicodeScalar? {
+        var cursor = index + 1
+        while cursor < scalars.count {
+            let scalar = scalars[cursor]
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                return scalar
+            }
+            cursor += 1
+        }
+        return nil
     }
 
     // MARK: - Stem Matching

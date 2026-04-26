@@ -24,7 +24,10 @@ final class RecoveryCoordinator {
     func availableActions(for run: Run) -> [RecoveryAction] {
         guard isProposalLoopReadOnly(run) else { return [] }
 
-        if case .blocked = run.status,
+        let exhaustedWatchdogStage = exhaustedAutomaticWatchdogFailureStage(in: run)
+
+        if exhaustedWatchdogStage == nil,
+           case .blocked = run.status,
            let continuationStateID = interruptedContinuationStateID(for: run) {
             return [
                 .resumeInterrupted(stageID: continuationStateID),
@@ -34,7 +37,7 @@ final class RecoveryCoordinator {
         }
 
         if case .failed = run.status,
-           let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run),
+           let failedStage = exhaustedWatchdogStage ?? lastFailedStage(in: run) ?? lastBlockedStage(in: run),
            let snapshotActions = recoveryActions(from: failedStage),
            !snapshotActions.isEmpty {
             let validated = validateSnapshotActions(snapshotActions, stage: failedStage)
@@ -42,7 +45,7 @@ final class RecoveryCoordinator {
         }
 
         if case .blocked = run.status,
-           let blockedStage = lastBlockedStage(in: run) ?? lastFailedStage(in: run),
+           let blockedStage = exhaustedWatchdogStage ?? lastBlockedStage(in: run) ?? lastFailedStage(in: run),
            let snapshotActions = recoveryActions(from: blockedStage),
            !snapshotActions.isEmpty {
             let validated = validateSnapshotActions(snapshotActions, stage: blockedStage)
@@ -198,7 +201,7 @@ final class RecoveryCoordinator {
             throw RecoveryError.notProposalLoopRun
         }
 
-        guard let stage = run.stageExecutions.first(where: { $0.stageID == stageID }) else {
+        guard let stage = retryTargetStage(in: run, stageID: stageID) else {
             throw RecoveryError.stageNotFound(stageID)
         }
 
@@ -357,21 +360,26 @@ final class RecoveryCoordinator {
         // Proposal 032 §6.4: Read the durable cursor first for recovery context.
         let cursor = run.transitionCursor
 
-        let failedStage = lastFailedStage(in: run) ?? lastBlockedStage(in: run)
+        let exhaustedWatchdogStage = exhaustedAutomaticWatchdogFailureStage(in: run)
+        let failedStage = exhaustedWatchdogStage ?? lastFailedStage(in: run) ?? lastBlockedStage(in: run)
+        let failedAgent = failedStage.flatMap(lastFailedAgent(in:))
         let evidencePacket = failedStage.flatMap { decodeEvidencePacket(from: $0) }
         let validationFailure = failedStage.flatMap { canonicalValidationFailure(for: $0, packet: evidencePacket) }
 
         // Proposal 032: If cursor shows interrupted transition (settled but not started),
         // surface that as the primary reason rather than generic "blocked" or failure evidence
         // from a stage that never actually executed.
-        if let cursor, cursor.settlementPhase == .transitionSettled,
+        if exhaustedWatchdogStage == nil,
+           let cursor, cursor.settlementPhase == .transitionSettled,
            let lastCompleted = cursor.lastCompletedStateID,
            let nextScheduled = cursor.nextScheduledStateID {
             reason = "Interrupted after completing '\(lastCompleted)' — next state '\(nextScheduled)' was scheduled but never started"
         } else if let vf = validationFailure {
             reason = "\(vf.failureClass.rawValue.replacingOccurrences(of: "_", with: " ").capitalized): \(vf.failureSummary)"
+        } else if let supervision = failedAgent?.supervisionClassification {
+            reason = supervision.defaultSummary
         } else if let packet = evidencePacket {
-            reason = "\(packet.failureClass.rawValue.replacingOccurrences(of: "_", with: " ").capitalized): \(packet.failureSummary)"
+            reason = packet.failureSummary
         } else if let details = run.driftDetails {
             reason = details
         } else if run.status == .failed {
@@ -385,12 +393,13 @@ final class RecoveryCoordinator {
         let sorted = run.stageExecutions.sorted { $0.startedAt < $1.startedAt }
         mostRecentStage = sorted.last?.label ?? "None"
 
-        trustSummary = run.runtimeTrustLevel ?? "unknown"
+        trustSummary = run.normalizedRuntimeTrustLevel ?? "unknown"
 
         let actions = availableActions(for: run)
         let persistedSnapshot = failedStage.flatMap { canonicalRecoverySnapshot(for: $0) }
-        let interruptedContinuationAction = interruptedContinuationStateID(for: run)
+        let interruptedContinuationAction = exhaustedWatchdogStage == nil ? interruptedContinuationStateID(for: run)
             .map { RecoveryAction.resumeInterrupted(stageID: $0) }
+            : nil
 
         // Proposal 013 UX-001: For contract mismatch, suggest operator inspection first
         // instead of blind retry. If a persisted recovery snapshot exists, it owns
@@ -398,6 +407,12 @@ final class RecoveryCoordinator {
         let suggestedAction: RecoveryAction?
         if let interruptedContinuationAction {
             suggestedAction = interruptedContinuationAction
+        } else if let preferredStageRetry = preferredSuggestedAction(
+            failedStage: failedStage,
+            failedAgent: failedAgent,
+            availableActions: actions
+        ) {
+            suggestedAction = preferredStageRetry
         } else if let snapshotAction = persistedSnapshot?.recommendedAction.flatMap(recoveryAction(from:)) {
             suggestedAction = snapshotAction
         } else if let vf = validationFailure, vf.failureClass == .outputContractMismatch {
@@ -433,7 +448,10 @@ final class RecoveryCoordinator {
             suggestedAction: suggestedAction,
             allowedActions: actions,
             evidenceSummary: evidenceSummary,
-            failureClass: validationFailure?.failureClass.rawValue ?? evidencePacket?.failureClass.rawValue
+            failureClass: validationFailure?.failureClass.rawValue
+                ?? failedAgent?.supervisionClassification?.rawValue
+                ?? evidencePacket?.supervisionClassification?.rawValue
+                ?? evidencePacket?.failureClass.rawValue
         )
     }
 
@@ -441,7 +459,10 @@ final class RecoveryCoordinator {
 
     /// Build a failed-stage evidence packet for the evidence panel.
     func buildEvidencePacket(for run: Run) -> FailedStageEvidencePacket? {
-        guard let stage = lastFailedStage(in: run) ?? lastBlockedStage(in: run) else { return nil }
+        guard let stage = exhaustedAutomaticWatchdogFailureStage(in: run)
+            ?? lastFailedStage(in: run)
+            ?? lastBlockedStage(in: run)
+        else { return nil }
         if let packet = decodeEvidencePacket(from: stage) {
             return packet
         }
@@ -483,6 +504,19 @@ final class RecoveryCoordinator {
             .filter { $0.status == .blocked }
             .sorted { $0.startedAt < $1.startedAt }
             .last
+    }
+
+    private func exhaustedAutomaticWatchdogFailureStage(in run: Run) -> StageExecution? {
+        run.stageExecutions
+            .filter { $0.status == .failed || $0.status == .blocked }
+            .sorted { $0.startedAt < $1.startedAt }
+            .last { stage in
+                stage.agentExecutions.contains { agent in
+                    agent.status == .failed
+                        && agent.supervisionClassification != nil
+                        && agent.retryReason == "automatic_watchdog_retry"
+                }
+            }
     }
 
     private func lastFailedAgent(in stage: StageExecution) -> AgentExecution? {
@@ -535,7 +569,7 @@ final class RecoveryCoordinator {
             switch cursor.settlementPhase {
             case .transitionSettled, .transitionStarted:
                 return continuationStateIDIfResumable(continuationStateID, stage: continuationStage)
-            case .awaitingFirstState, .terminal:
+            case .awaitingFirstState, .terminal, .awaitingConflictResolution:
                 break
             }
         }
@@ -616,7 +650,16 @@ final class RecoveryCoordinator {
 
     private func recoveryActions(from stage: StageExecution) -> [RecoveryAction]? {
         let snapshot = canonicalRecoverySnapshot(for: stage)
-        let actions = snapshot?.availableActions.compactMap(recoveryAction(from:))
+        guard let snapshot else { return nil }
+        var details: [RecoveryActionDetail] = []
+        if let recommended = snapshot.recommendedAction {
+            details.append(recommended)
+        }
+        details.append(contentsOf: snapshot.availableActions)
+        var actions: [RecoveryAction] = []
+        for action in details.compactMap(recoveryAction(from:)) where !actions.contains(action) {
+            actions.append(action)
+        }
         return actions
     }
 
@@ -638,6 +681,25 @@ final class RecoveryCoordinator {
         case .operatorInspection:
             return nil
         }
+    }
+
+    private func preferredSuggestedAction(
+        failedStage: StageExecution?,
+        failedAgent: AgentExecution?,
+        availableActions: [RecoveryAction]
+    ) -> RecoveryAction? {
+        guard let failedStage, let failedAgent else { return nil }
+        guard failedStage.stageID.contains("implementation_started") || failedStage.stageID.contains("state_7") else {
+            return nil
+        }
+        guard failedAgent.agentID == "lead_orchestrator" else { return nil }
+
+        let stageOnlyReachedOrchestrator = failedStage.agentExecutions.allSatisfy { $0.agentID == "lead_orchestrator" }
+        guard stageOnlyReachedOrchestrator else { return nil }
+
+        let stageRetry = RecoveryAction.retryStage(stageID: failedStage.stageID)
+        guard availableActions.contains(stageRetry) else { return nil }
+        return stageRetry
     }
 
     private func isAggregateStep(_ agent: AgentExecution) -> Bool {

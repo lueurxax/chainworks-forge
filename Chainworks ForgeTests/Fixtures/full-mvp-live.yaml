@@ -10,8 +10,8 @@ workflow:
     single_active_run_per_idea: true
     resume_policy: automatic_on_launch
   required_providers:
-  - codex
-  - claude_code
+  - codex_acp
+  - claude_acp
 variables:
   proposal_score_target: 9.1
   min_individual_proposal_score: 8.5
@@ -36,7 +36,7 @@ scoring:
     - security_report.status == 'pass'
     - prepush_review_report.status == 'pass'
     - docs_report.status in ['pass', 'not_needed']
-    - tests_result.green == true
+    - tests_result.status == 'green'
 initial_state: state_1_idea_received
 states:
   state_1_idea_received:
@@ -188,8 +188,10 @@ states:
     owner: lead_orchestrator
     approval: required
     transitions:
-    - to: state_7_implementation_started
-      when: approval.granted == true
+      - to: state_7_implementation_started
+        when: approval.granted == true
+      - to: state_5_proposal_refined
+        when: approval.rejected == true
 
   state_7_implementation_started:
     label: Implementation started
@@ -219,13 +221,13 @@ states:
         - changed_files_manifest
         - tests_result
     transitions:
-    - to: state_8_implementation_continued
-      when: implementation_self_assessment.seemingly_complete == false
-    - to: state_9_implementation_reviewed
-      when: implementation_self_assessment.seemingly_complete == true
+      - to: state_8_implementation_continued
+        when: implementation_self_assessment_v2.status == 'needs_code_fixes' or implementation_self_assessment_v2.status == 'invalid' or implementation_self_assessment_v2.status == 'unknown'
+      - to: state_9_implementation_reviewed
+        when: implementation_self_assessment_v2.status == 'complete' or implementation_self_assessment_v2.status == 'handoff_required' or implementation_self_assessment_v2.status == 'blocked'
 
   state_8_implementation_continued:
-    label: Implementation continued until seemingly complete
+    label: Implementation continued until code-owned work is resolved
     owner: code_writer
     run:
       sequence:
@@ -245,10 +247,10 @@ states:
       counter: implementation_progress_count
       max: vars.max_implementation_progress_cycles
     transitions:
-    - to: state_9_implementation_reviewed
-      when: implementation_self_assessment.seemingly_complete == true
-    - to: state_8_implementation_continued
-      when: implementation_self_assessment.seemingly_complete == false
+      - to: state_9_implementation_reviewed
+        when: implementation_self_assessment_v2.status == 'complete' or implementation_self_assessment_v2.status == 'handoff_required' or implementation_self_assessment_v2.status == 'blocked'
+      - to: state_8_implementation_continued
+        when: implementation_self_assessment_v2.status == 'needs_code_fixes' or implementation_self_assessment_v2.status == 'invalid' or implementation_self_assessment_v2.status == 'unknown'
 
   state_9_implementation_reviewed:
     label: Implementation reviewed against proposal
@@ -298,15 +300,16 @@ states:
         - audit_report
         - prepush_review_report
         - approved_proposal
+        - implementation_self_assessment
         outputs:
         - implementation_review_summary
         - orchestrator_summary
         - run_state
     transitions:
     - to: state_10_implementation_refined
-      when: audit_report.status != vars.implementation_target_status
+      when: audit_report.status != vars.implementation_target_status or implementation_review_summary.status == 'release_evidence_blocked'
     - to: state_11_manual_release
-      when: audit_report.status == vars.implementation_target_status and security_report.status == 'pass' and prepush_review_report.status == 'pass'
+      when: audit_report.status == vars.implementation_target_status and security_report.status == 'pass' and prepush_review_report.status == 'pass' and implementation_review_summary.status != 'release_evidence_blocked'
 
   state_10_implementation_refined:
     label: Implementation refined

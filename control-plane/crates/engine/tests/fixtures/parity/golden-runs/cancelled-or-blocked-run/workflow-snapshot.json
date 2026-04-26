@@ -1,0 +1,18 @@
+{
+  "schema_version": "workflow-snapshot.v1",
+  "workflow_id": "cancelled-or-blocked-run",
+  "title": "Cancelled Or Blocked Run",
+  "initial_state": "blocked",
+  "states": [
+    {
+      "stage_id": "blocked",
+      "label": "Blocked",
+      "owner": "fixture_agent",
+      "outputs": [
+        "blocked_recovery"
+      ],
+      "next_stage": null,
+      "terminal": true
+    }
+  ]
+}

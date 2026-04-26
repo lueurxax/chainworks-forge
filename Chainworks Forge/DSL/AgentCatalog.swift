@@ -7,20 +7,20 @@ enum RuntimeCapabilityClass: String, Codable, Sendable {
     case lifecycleCapable = "lifecycle_capable"
     case controlCapable = "control_capable"
     case operatorGrade = "operator_grade"
-    /// Legacy Goose REST/SSE runtime, operator-grade equivalent.
+    /// Legacy REST/SSE runtime, operator-grade equivalent.
     case legacyOperatorGrade = "legacy_operator_grade"
 }
 
 /// Proposal 026: Declares a runtime transport adapter's identity and capabilities.
 struct RuntimeProfile: Codable, Sendable {
     let capabilityClass: RuntimeCapabilityClass
-    /// Adapter family identifier (e.g. "goose", "claude_agent_acp", "gemini_cli_acp").
+    /// Adapter family identifier (e.g. "claude_agent_acp", "gemini_cli_acp", "codex_acp").
     let adapterFamily: String
     /// Required runtime capabilities (e.g. ["streaming", "tools", "permission_callbacks"]).
     let requires: [String]
-    /// Transport mechanism (e.g. "goose_server", "acp_stdio", "acp_http").
+    /// Transport mechanism (e.g. "acp_stdio", "acp_http").
     let transportKind: String
-    /// MCP realization strategy (e.g. "goose_extension", "acp_native", nil).
+    /// MCP realization strategy (e.g. "acp_native", nil).
     let mcpRealizationPath: String?
 
     enum CodingKeys: String, CodingKey {
@@ -34,7 +34,7 @@ struct RuntimeProfile: Codable, Sendable {
 
 // MARK: - Agent Catalog (top-level)
 
-struct AgentCatalog: Codable, Sendable {
+nonisolated struct AgentCatalog: Codable, Sendable {
     let schemaVersion: Int
     let app: AppConfig
     let paths: [String: String]
@@ -143,6 +143,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let outputs: [String]
     let outputContract: String?
     let requiresHumanApproval: Bool
+    let xcodeBrokerRequired: Bool?
+    let xcodeShimInjectionSignal: Bool?
+    let requiresXcodeHostExecution: Bool?
     let prompt: String
     let notes: String?
     
@@ -161,6 +164,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         case requiredTools = "required_tools"
         case outputContract = "output_contract"
         case requiresHumanApproval = "requires_human_approval"
+        case xcodeBrokerRequired = "xcode_broker_required"
+        case xcodeShimInjectionSignal = "xcode_shim_injection_signal"
+        case requiresXcodeHostExecution = "requires_xcode_host_execution"
         case sessionReuseScope = "session_reuse_scope"
         case sessionFamilyID = "session_family_id"
     }
@@ -180,6 +186,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         outputs: [String],
         outputContract: String? = nil,
         requiresHumanApproval: Bool,
+        xcodeBrokerRequired: Bool? = nil,
+        xcodeShimInjectionSignal: Bool? = nil,
+        requiresXcodeHostExecution: Bool? = nil,
         prompt: String,
         notes: String? = nil,
         sessionReuseScope: String? = nil,
@@ -199,6 +208,9 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         self.outputs = outputs
         self.outputContract = outputContract
         self.requiresHumanApproval = requiresHumanApproval
+        self.xcodeBrokerRequired = xcodeBrokerRequired
+        self.xcodeShimInjectionSignal = xcodeShimInjectionSignal
+        self.requiresXcodeHostExecution = requiresXcodeHostExecution
         self.prompt = prompt
         self.notes = notes
         self.sessionReuseScope = sessionReuseScope
@@ -213,6 +225,8 @@ struct BackendProfile: Codable, Sendable {
     let temperature: Double
     let maxTurns: Int
     let structuredOutput: String
+    /// Canonical runtime-owned MCP requirement set (P033).
+    let mcp: [String]
     /// Proposal 026: References a key in AgentCatalog.runtimeProfiles.
     let runtimeProfile: String?
 
@@ -220,6 +234,7 @@ struct BackendProfile: Codable, Sendable {
         case provider, model, effort, temperature
         case maxTurns = "max_turns"
         case structuredOutput = "structured_output"
+        case mcp
         case runtimeProfile = "runtime_profile"
     }
 
@@ -230,6 +245,7 @@ struct BackendProfile: Codable, Sendable {
         temperature: Double,
         maxTurns: Int,
         structuredOutput: String,
+        mcp: [String] = [],
         runtimeProfile: String? = nil
     ) {
         self.provider = provider
@@ -238,6 +254,7 @@ struct BackendProfile: Codable, Sendable {
         self.temperature = temperature
         self.maxTurns = maxTurns
         self.structuredOutput = structuredOutput
+        self.mcp = Array(Set(mcp)).sorted()
         self.runtimeProfile = runtimeProfile
     }
 
@@ -249,6 +266,7 @@ struct BackendProfile: Codable, Sendable {
         temperature = try container.decode(Double.self, forKey: .temperature)
         maxTurns = try container.decode(Int.self, forKey: .maxTurns)
         structuredOutput = try container.decode(String.self, forKey: .structuredOutput)
+        mcp = Array(Set(try container.decodeIfPresent([String].self, forKey: .mcp) ?? [])).sorted()
         runtimeProfile = try container.decodeIfPresent(String.self, forKey: .runtimeProfile)
     }
 }
@@ -392,7 +410,7 @@ struct MCPPermissions: Codable, Sendable {
     }
 }
 
-struct MCPPolicyConfig: Codable, Sendable, Equatable {
+nonisolated struct MCPPolicyConfig: Codable, Sendable, Equatable {
     let defaultProfile: String
     let runtimeAuthority: String
     let permissionProfileMCPMode: String

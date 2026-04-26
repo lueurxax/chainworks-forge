@@ -27,7 +27,8 @@ final class StageRetryCoordinator {
     func retryFailedAgent(
         run: Run,
         stage: StageExecution,
-        failedAgent: AgentExecution
+        failedAgent: AgentExecution,
+        retryReason: String = "agent_retry_via_recovery"
     ) throws -> AgentExecution {
         guard failedAgent.status == .failed else {
             throw StageRetryError.agentNotFailed(failedAgent.agentID)
@@ -35,7 +36,7 @@ final class StageRetryCoordinator {
 
         // Compute next agent attempt number
         let existingAttempts = stage.agentExecutions
-            .filter { $0.agentID == failedAgent.agentID }
+            .filter { $0.agentID == failedAgent.agentID && $0.taskName == failedAgent.taskName }
             .count
         let nextAgentAttempt = existingAttempts + 1
 
@@ -48,7 +49,7 @@ final class StageRetryCoordinator {
             provider: failedAgent.provider,
             effort: failedAgent.effort
         )
-        retryExec.retryReason = "agent_retry_via_recovery"
+        retryExec.retryReason = retryReason
         retryExec.agentAttemptNumber = nextAgentAttempt
         retryExec.supersedesAgentExecutionID = failedAgent.id
         retryExec.resolvedBackendProfileID = failedAgent.resolvedBackendProfileID
@@ -105,8 +106,16 @@ final class StageRetryCoordinator {
             throw StageRetryError.stageNotFailed(stage.stageID)
         }
 
+        let now = Date()
+
         // Mark old stage as terminal
-        stage.completedAt = stage.completedAt ?? Date()
+        stage.completedAt = stage.completedAt ?? now
+        supersedeActiveAttempts(
+            in: run,
+            for: stage,
+            terminalStatus: stage.status == .failed ? .failed : .blocked,
+            now: now
+        )
 
         // Create new stage execution with incremented attempt
         let newStage = StageExecution(
@@ -125,6 +134,7 @@ final class StageRetryCoordinator {
 
         // Update run status
         run.status = .ready
+        rebindContinuationCursor(run: run, retryStage: newStage, previousCursor: run.transitionCursor, now: now)
 
         return newStage
     }
@@ -146,9 +156,16 @@ final class StageRetryCoordinator {
             let retryActionType: RecoveryActionType = isAggregate
                 ? .retryFailedAggregateStep
                 : .retryFailedAgent
-            let retryActionDescription = isAggregate
-                ? "Retry only the failed aggregate step '\(failedAgent.agentTitle)' in the same run. Reviewer outputs are reused."
-                : "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused."
+            let retryActionDescription: String = {
+                if failedAgent.retryReason == "automatic_watchdog_retry",
+                   let supervision = failedAgent.supervisionClassification {
+                    return "Automatic watchdog retry already consumed after \(supervision.defaultSummary.lowercased()). Retry only the failed agent '\(failedAgent.agentTitle)' in the same run."
+                }
+                if isAggregate {
+                    return "Retry only the failed aggregate step '\(failedAgent.agentTitle)' in the same run. Reviewer outputs are reused."
+                }
+                return "Retry only the failed agent '\(failedAgent.agentTitle)'. Successful sibling agents will be reused."
+            }()
             let retryAgentAction = RecoveryActionDetail(
                 action: retryActionType,
                 stageID: failedStage.stageID,
@@ -217,6 +234,75 @@ final class StageRetryCoordinator {
             validationFailureID: validationFailure?.id,
             source: .runtimePolicy
         )
+    }
+}
+
+// MARK: - Stage Retry Helpers
+
+@MainActor
+private extension StageRetryCoordinator {
+    func supersedeActiveAttempts(
+        in run: Run,
+        for supersededStage: StageExecution,
+        terminalStatus: StageStatus,
+        now: Date
+    ) {
+        let activeStatuses: Set<StageStatus> = [.pending, .ready, .running]
+        let activeAgentStatuses: Set<AgentStatus> = [.pending, .ready, .running]
+
+        let conflictingAttempts = run.stageExecutions.filter { candidate in
+            candidate.id != supersededStage.id
+                && candidate.stageID == supersededStage.stageID
+                && candidate.iteration == supersededStage.iteration
+                && activeStatuses.contains(candidate.status)
+        }
+
+        for conflictingStage in conflictingAttempts {
+            conflictingStage.status = terminalStatus
+            conflictingStage.completedAt = conflictingStage.completedAt ?? now
+
+            for agent in conflictingStage.agentExecutions where activeAgentStatuses.contains(agent.status) {
+                agent.status = .failed
+                agent.completedAt = agent.completedAt ?? now
+                agent.settledAt = agent.settledAt ?? now
+                agent.canonicalOutcome = agent.canonicalOutcome ?? .failedBeforeOutput
+                agent.transportErrorKind = agent.transportErrorKind ?? .unknown
+                agent.providerStopReason = agent.providerStopReason ?? "superseded_by_stage_retry"
+                agent.logSnippet = mergedSupersededExecutionLog(existing: agent.logSnippet)
+            }
+        }
+    }
+
+    func rebindContinuationCursor(
+        run: Run,
+        retryStage: StageExecution,
+        previousCursor: TransitionCursor?,
+        now: Date
+    ) {
+        let cursor = previousCursor ?? .initial()
+        let rebound = TransitionCursor(
+            sequenceNumber: cursor.sequenceNumber + 1,
+            lastCompletedStateID: cursor.lastCompletedStateID,
+            lastCompletedStageExecutionID: cursor.lastCompletedStageExecutionID,
+            nextScheduledStateID: retryStage.stageID,
+            nextScheduledIteration: retryStage.iteration,
+            nextScheduledAttemptNumber: retryStage.attemptNumber,
+            scheduledStageExecutionID: retryStage.id,
+            settlementPhase: .transitionSettled,
+            updatedAt: now
+        )
+        run.persistTransitionCursor(rebound)
+    }
+
+    func mergedSupersededExecutionLog(existing: String?) -> String {
+        let message = "Superseded by stage retry before completion."
+        guard let existing, existing.isEmpty == false else {
+            return message
+        }
+        if existing.contains(message) {
+            return existing
+        }
+        return "\(existing)\n\(message)"
     }
 }
 

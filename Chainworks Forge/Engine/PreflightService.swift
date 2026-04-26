@@ -40,12 +40,24 @@ enum PreflightStatus: String, Codable, Equatable, Sendable {
 struct PreflightService {
     let appConfigurationStore: AppConfigurationStore
     let providerRegistry: ProviderRegistry
+    let extensionRegistryProvider: any RuntimeExtensionRegistryProvider
+
+    init(
+        appConfigurationStore: AppConfigurationStore,
+        providerRegistry: ProviderRegistry,
+        extensionRegistryProvider: any RuntimeExtensionRegistryProvider = CodexExtensionRegistryReader()
+    ) {
+        self.appConfigurationStore = appConfigurationStore
+        self.providerRegistry = providerRegistry
+        self.extensionRegistryProvider = extensionRegistryProvider
+    }
 
     func runReport(
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
         startOptions: RunStartOptions,
+        requiresRuntimeMCPValidation: Bool = true,
         idea: Idea? = nil,
         effectiveProjectRootPath: String? = nil
     ) async -> PreflightReport {
@@ -145,6 +157,27 @@ struct PreflightService {
                     status: .pass,
                     message: "Resolved \(providerBindings.count) provider binding(s)"
                 ))
+            } catch let resolverError as BackendProfileResolverError {
+                providerBindings = [:]
+                if case .providerNotEnabled(let family) = resolverError {
+                    let message = "Provider family \(family.displayName) is configured but not enabled. Enable it in Settings to use this runtime profile."
+                    checks.append(PreflightCheck(
+                        category: "Rollout",
+                        title: "Provider Not Enabled — \(family.displayName)",
+                        status: .fail,
+                        message: message
+                    ))
+                    blockingIssues.append(message)
+                } else {
+                    let message = resolverError.localizedDescription
+                    checks.append(PreflightCheck(
+                        category: "Providers",
+                        title: "Provider Binding Resolution",
+                        status: .fail,
+                        message: message
+                    ))
+                    blockingIssues.append(message)
+                }
             } catch {
                 providerBindings = [:]
                 let message = error.localizedDescription
@@ -183,8 +216,8 @@ struct PreflightService {
 
         // Proposal 029: Validate adapter family registration (fail-closed)
         for (agentID, binding) in providerBindings {
-            let family = binding.adapterFamily ?? "goose"
-            let knownFamilies: Set<String> = ["goose", "claude_agent_acp", "gemini_cli_acp", "codex_acp", "auggie_cli_acp", "junie_cli_acp"]
+            let family = binding.adapterFamily ?? "claude_agent_acp"
+            let knownFamilies: Set<String> = ["claude_agent_acp", "gemini_cli_acp", "codex_acp", "auggie_cli_acp", "junie_cli_acp"]
             if !knownFamilies.contains(family) {
                 let msg = "Agent '\(agentID)' uses unregistered adapter family '\(family)'. Register the adapter before adding its runtime profile."
                 checks.append(PreflightCheck(category: "Runtime", title: "Adapter Registration", status: .fail, message: msg))
@@ -197,6 +230,7 @@ struct PreflightService {
                 plan: plan,
                 catalog: loadedCatalog,
                 bindings: providerBindings,
+                requiresRuntimeMCPValidation: requiresRuntimeMCPValidation,
                 checks: &checks,
                 warnings: &warnings,
                 blockingIssues: &blockingIssues
@@ -328,6 +362,7 @@ struct PreflightService {
         workflowURL: URL,
         catalogURL: URL,
         plan: RunPlan?,
+        requiresRuntimeMCPValidation: Bool = true,
         idea: Idea? = nil,
         effectiveProjectRootPath: String? = nil
     ) async -> PreflightReport {
@@ -336,6 +371,7 @@ struct PreflightService {
             catalogURL: catalogURL,
             plan: plan,
             startOptions: RunStartOptions(),
+            requiresRuntimeMCPValidation: requiresRuntimeMCPValidation,
             idea: idea,
             effectiveProjectRootPath: effectiveProjectRootPath
         )
@@ -515,37 +551,6 @@ struct PreflightService {
         )).sorted().joined(separator: ", ")
 
         let snapshot = providerRegistry.healthSnapshot(for: provider.id)
-        if provider.transport == .gooseServer {
-            let title = "\(provider.displayName) Reachability"
-            if usesConfiguredTransport {
-                let reachabilityIssue = snapshot.flatMap { ProviderAdapterSupport.gooseServerReachabilityIssue(from: $0.blockingIssues) }
-                if let reachabilityIssue {
-                    checks.append(PreflightCheck(
-                        category: "Providers",
-                        title: title,
-                        status: .fail,
-                        message: reachabilityIssue
-                    ))
-                    blockingIssues.append(reachabilityIssue)
-                } else if let endpoint = provider.endpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !endpoint.isEmpty {
-                    checks.append(PreflightCheck(
-                        category: "Providers",
-                        title: title,
-                        status: snapshot == nil ? .warn : .pass,
-                        message: snapshot == nil
-                            ? "Reachability has not been checked yet"
-                            : "Goose server is reachable at \(ProviderAdapterSupport.gooseStatusURLString(for: endpoint))"
-                    ))
-                }
-            } else if !effectiveBindings.isEmpty {
-                checks.append(PreflightCheck(
-                    category: "Providers",
-                    title: title,
-                    status: .pass,
-                    message: "Effective bindings use runtime-managed transport (\(runtimeSummary)); configured Goose reachability is not on the execution path."
-                ))
-            }
-        }
         let healthStatus: PreflightCheckStatus
         let healthMessage: String
         if usesConfiguredTransport || effectiveBindings.isEmpty {
@@ -616,13 +621,13 @@ struct PreflightService {
         warnings: inout [String],
         blockingIssues: inout [String]
     ) {
-        let runtimeProfiles = catalog.runtimeProfiles ?? [:]
+        let runtimeProfiles = catalog.runtimeProfiles
         for (agentID, binding) in bindings {
             guard let profileID = binding.runtimeProfileID,
                   let profile = runtimeProfiles[profileID] else { continue }
 
             let provider = providerRegistry.configuredProviders.first { $0.id == binding.configuredProviderID }
-            let capabilities = provider?.capabilities ?? ProviderCapabilities.default(for: provider?.family ?? .codex)
+            let capabilities = provider?.capabilities ?? ProviderCapabilities.default(for: provider?.family ?? .codexACP)
 
             let unsatisfied = profile.requires.filter { !capabilities.satisfies($0) }
             if unsatisfied.isEmpty {
@@ -649,11 +654,12 @@ struct PreflightService {
         plan: RunPlan,
         catalog: AgentCatalog,
         bindings: [String: ResolvedProviderBinding],
+        requiresRuntimeMCPValidation: Bool,
         checks: inout [PreflightCheck],
         warnings: inout [String],
         blockingIssues: inout [String]
     ) {
-        let gooseRegistry = try? GooseExtensionRegistryReader().snapshot()
+        let runtimeRegistry = try? extensionRegistryProvider.registrySnapshot()
         let resolver = MCPPolicyResolver()
         let activeAgents = plan.agentBindings.values.sorted { $0.id < $1.id }
 
@@ -662,42 +668,60 @@ struct PreflightService {
                 agent: agent,
                 catalog: catalog,
                 providerBinding: bindings[agent.id],
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             )
             return !resolution.requestedExtensions.isEmpty
         }
 
         let registryStatus: PreflightCheckStatus
         let registryMessage: String
-        if let gooseRegistry {
+        if !requiresRuntimeMCPValidation {
+            registryStatus = anyRequestedMCP ? .warn : .pass
+            registryMessage = anyRequestedMCP
+                ? "Runtime MCP validation skipped for simulated execution mode."
+                : "Simulated execution mode selected; no runtime MCP validation required."
+            if anyRequestedMCP {
+                warnings.append(registryMessage)
+            }
+        } else if let runtimeRegistry {
             registryStatus = .pass
-            registryMessage = "Loaded Goose extension registry from \(gooseRegistry.configURL.path) (\(gooseRegistry.installedExtensionIDs.count) installed)"
+            registryMessage = "Loaded runtime extension registry from \(runtimeRegistry.configURL.path) (\(runtimeRegistry.installedExtensionIDs.count) installed)"
         } else if anyRequestedMCP {
             registryStatus = .fail
-            registryMessage = "Goose extension registry is unavailable, but one or more agents request MCP extensions."
+            registryMessage = "Runtime extension registry is unavailable, but one or more agents request MCP extensions."
             blockingIssues.append(registryMessage)
         } else {
             registryStatus = .warn
-            registryMessage = "Goose extension registry is unavailable; zero-MCP sessions remain valid."
+            registryMessage = "Runtime extension registry is unavailable; zero-MCP sessions remain valid."
             warnings.append(registryMessage)
         }
 
         checks.append(PreflightCheck(
             category: "MCP",
-            title: "Goose Extension Registry",
+            title: "Runtime Extension Registry",
             status: registryStatus,
             message: registryMessage
         ))
 
         for agent in activeAgents {
+            if !requiresRuntimeMCPValidation, !agent.requestedMCPServerIDs.isEmpty {
+                let requested = agent.requestedMCPServerIDs.sorted().joined(separator: ",")
+                checks.append(PreflightCheck(
+                    category: "MCP",
+                    title: "Backend MCP — \(agent.id)",
+                    status: .warn,
+                    message: "Simulated execution mode skips runtime MCP validation; backend '\(agent.backendProfileID ?? "none")' requests [\(requested)]."
+                ))
+                continue
+            }
             let resolution = resolver.resolve(
                 agent: agent,
                 catalog: catalog,
                 providerBinding: bindings[agent.id],
-                gooseRegistry: gooseRegistry
+                runtimeRegistry: runtimeRegistry
             )
             let summary = [
-                "profile=\(resolution.profileID)",
+                "backend=\(resolution.profileID)",
                 "requested=\(resolution.requestedExtensions.joined(separator: ","))",
                 "effective=\(resolution.predictedEffectiveExtensions.joined(separator: ","))",
                 "denied=\(resolution.deniedExtensions.joined(separator: ","))"
@@ -720,7 +744,7 @@ struct PreflightService {
 
             checks.append(PreflightCheck(
                 category: "MCP",
-                title: "MCP Profile — \(agent.id)",
+                title: "Backend MCP — \(agent.id)",
                 status: status,
                 message: message
             ))

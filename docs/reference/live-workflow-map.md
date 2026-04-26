@@ -1,6 +1,6 @@
 # Live Workflow Map
 
-Stable reference for the run-topology visualization baseline that was previously carried by Proposal 010's live workflow-visualization slice.
+Stable reference for the run-topology visualization baseline.
 
 ## Purpose
 

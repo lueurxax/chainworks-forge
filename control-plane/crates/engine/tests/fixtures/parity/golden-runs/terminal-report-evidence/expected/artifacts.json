@@ -1,0 +1,1 @@
+{"artifacts":[{"name":"execution_evidence","contract_id":"evidence.packet","stage_id":"execute","format":"json","report_kind":"failed_stage_evidence"},{"name":"terminal_report","contract_id":"report.final","stage_id":"terminal_report","format":"json","report_kind":"release_report"}]}

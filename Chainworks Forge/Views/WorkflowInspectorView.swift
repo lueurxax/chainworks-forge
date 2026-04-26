@@ -356,6 +356,7 @@ struct WorkflowInspectorView: View {
         } catch let error as YAMLParserError {
             switch error {
             case .fileNotFound(let path): fullState = .fileNotFound(path)
+            case .fileReadFailed(let path, let inner): fullState = .decodeError(path, inner)
             case .decodingFailed(let path, let inner): fullState = .decodeError(path, inner)
             }
         } catch {
@@ -375,6 +376,7 @@ struct WorkflowInspectorView: View {
         } catch let error as YAMLParserError {
             switch error {
             case .fileNotFound(let path): compactState = .fileNotFound(path)
+            case .fileReadFailed(let path, let inner): compactState = .decodeError(path, inner)
             case .decodingFailed(let path, let inner): compactState = .decodeError(path, inner)
             }
         } catch {

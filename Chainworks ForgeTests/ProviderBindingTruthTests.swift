@@ -14,7 +14,7 @@ struct ProviderBindingTruthTests {
             providerIdentifier: "codex",
             model: "gpt-5-codex",
             effort: "high",
-            transport: "goose_server",
+            transport: "acp_http",
             adapterVersion: "v1"
         )
 
@@ -31,7 +31,7 @@ struct ProviderBindingTruthTests {
             providerIdentifier: "claude_code",
             model: "gpt-5-codex",
             effort: "high",
-            transport: "goose_server",
+            transport: "acp_http",
             adapterVersion: "v1"
         )
 

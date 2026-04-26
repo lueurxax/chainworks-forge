@@ -266,6 +266,41 @@ struct Proposal013Tests {
         #expect(result?.status == .failed)
     }
 
+    @Test("Validation repairs reviewer JSON with unescaped quotes inside string values")
+    func validationRepairsReviewerJSONWithInnerQuotes() {
+        let catalog = makeTestCatalog(withContracts: [
+            "proposal_review_v1": ArtifactContract(
+                format: "json",
+                requiredFields: ["agent_id", "score", "decision", "summary"]
+            )
+        ])
+        let agent = makeTestResolvedAgent(
+            outputContract: "proposal_review_v1",
+            outputs: ["proposal_review_architect"]
+        )
+
+        let malformedJSON = Data(
+            """
+            {
+              "agent_id": "proposal_reviewer_architect",
+              "score": 4,
+              "decision": "revise",
+              "summary": "Dashboard widget cleanup depends on persisted state migration (`@AppStorage("dashboard_widgets")`) and needs a stricter migration contract."
+            }
+            """.utf8
+        )
+
+        let results = OutputContractResolverV2.validateOutputs(
+            ["proposal_review_architect": malformedJSON],
+            agent: agent,
+            catalog: catalog
+        )
+
+        let result = results["proposal_review_architect"]
+        #expect(result?.status == .passed)
+        #expect(result?.validationError == nil)
+    }
+
     @Test("Validation passes for valid JSON output with missing optional fields")
     func validationPassesForMissingOptionalFields() {
         let catalog = makeTestCatalog(withContracts: [
@@ -859,6 +894,54 @@ struct Proposal013Tests {
         #expect(result.isBlocking == false)
     }
 
+    @Test("StructuredOutputSchemaGate treats second-wave ACP transports as structured-output capable")
+    func structuredOutputGateSupportsSecondWaveACP() {
+        let catalog = makeTestCatalog(
+            withContracts: [:],
+            backendProfiles: [
+                "auggie_acp_profile": BackendProfile(
+                    provider: "auggie",
+                    model: "auggie-default",
+                    effort: "medium",
+                    temperature: 0,
+                    maxTurns: 8,
+                    structuredOutput: "preferred",
+                    runtimeProfile: "auggie_cli_acp"
+                ),
+                "junie_acp_profile": BackendProfile(
+                    provider: "junie",
+                    model: "junie-default",
+                    effort: "medium",
+                    temperature: 0,
+                    maxTurns: 8,
+                    structuredOutput: "preferred",
+                    runtimeProfile: "junie_cli_acp"
+                )
+            ],
+            runtimeProfiles: [
+                "auggie_cli_acp": RuntimeProfile(
+                    capabilityClass: .controlCapable,
+                    adapterFamily: "auggie_cli_acp",
+                    requires: ["streaming", "tools"],
+                    transportKind: "acp_stdio",
+                    mcpRealizationPath: "acp_native"
+                ),
+                "junie_cli_acp": RuntimeProfile(
+                    capabilityClass: .controlCapable,
+                    adapterFamily: "junie_cli_acp",
+                    requires: ["streaming", "tools"],
+                    transportKind: "acp_stdio",
+                    mcpRealizationPath: "acp_native"
+                )
+            ]
+        )
+
+        let results = StructuredOutputSchemaGate.validate(catalog: catalog)
+        #expect(results.count == 2)
+        #expect(results.allSatisfy { $0.transportSupportsStructured })
+        #expect(results.allSatisfy { !$0.isBlocking })
+    }
+
     // MARK: - Layer Q: Output Contract Declarative Bridge
 
     @Test("OutputContractDeclarativeBridge verifies V1-V2 binding parity")
@@ -1372,16 +1455,13 @@ struct Proposal013Tests {
         )
 
         let liveConfig = LiveRuntimeConfiguration(
-            baseURL: URL(string: "http://fixture.local")!,
-            apiKey: nil,
             override: LiveExecutionOverride(
                 enabled: true,
-                provider: "claude_code",
+                provider: "claude_acp",
                 model: "fixture-model",
                 effort: "high"
             ),
-            transportMode: .fixtureProposal013AggregateFailure,
-            transportAPI: .bespoke
+            transportMode: .fixtureProposal013AggregateFailure
         )
         let service = ExecutionService(
             modelContext: context,
@@ -1839,6 +1919,789 @@ struct Proposal013Tests {
         #expect(payload.retryPath == "Retry agent 'proposal_reviewer_product_owner' in stage 'state_4_proposal_reviewed'")
     }
 
+    @MainActor
+    @Test("RunReportBuilder prefers supervision classification over generic timeout wording")
+    func runReportPrefersSupervisionClassificationOverGenericTimeoutWording() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let blockedStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 201),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedAgent.completedAt = Date(timeIntervalSince1970: 220)
+        failedAgent.canonicalOutcome = .timedOutBeforeOutput
+        failedAgent.supervisionClassification = .idleHangAfterFirstEdit
+        failedAgent.logSnippet = "Execution timed out"
+        failedAgent.outcomeEnvelopeJSON = try JSONEncoder().encode(
+            OutcomeEnvelope(
+                canonicalOutcome: .timedOutBeforeOutput,
+                transportErrorKind: .timeout,
+                providerStopReason: nil,
+                outputPresence: .none,
+                rawErrorMessage: "Execution timed out",
+                rawFinishEvent: nil
+            )
+        )
+        failedAgent.stageExecution = blockedStage
+        context.insert(failedAgent)
+
+        let builder = RunReportBuilder(modelContext: context)
+        let payload = builder.buildReportPayload(for: run, version: 12)
+
+        #expect(payload.blockedReason?.localizedCaseInsensitiveContains("first edit") == true)
+        #expect(payload.blockedReason == payload.failureEvidenceSummaries.first?.failureSummary)
+    }
+
+    @MainActor
+    @Test("RunReportBuilder carries supervision classification through failure evidence summary")
+    func runReportCarriesSupervisionClassificationThroughFailureEvidenceSummary() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let blockedStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 201),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedAgent.completedAt = Date(timeIntervalSince1970: 220)
+        failedAgent.canonicalOutcome = .failedBeforeOutput
+        failedAgent.supervisionClassification = .mutationSideEffectMissing
+        failedAgent.logSnippet = "Mutating tool reported success, but no filesystem side effect was observed"
+        failedAgent.stageExecution = blockedStage
+        context.insert(failedAgent)
+
+        let builder = RunReportBuilder(modelContext: context)
+        let payload = builder.buildReportPayload(for: run, version: 13)
+        let summary = try #require(payload.failureEvidenceSummaries.first)
+
+        #expect(summary.failureClass == SupervisionClassification.mutationSideEffectMissing.rawValue)
+        #expect(summary.failureSummary == SupervisionClassification.mutationSideEffectMissing.defaultSummary)
+    }
+
+    @MainActor
+    @Test("RunReportBuilder latest summary carries supervision recovery truth")
+    func runReportLatestSummaryCarriesSupervisionRecoveryTruth() throws {
+        let context = try makeP013TestContext()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("p013-summary-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+
+        let run = Run(
+            startedAt: Date(),
+            status: .blocked,
+            workflowID: "wf-test",
+            workflowTitle: "Test Workflow",
+            workflowSnapshotHash: "hash",
+            catalogSnapshotHash: "catalog",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            workspaceRoot: tempRoot.path,
+            artifactRoot: tempRoot.appendingPathComponent("artifacts", isDirectory: true).path,
+            planCompilerVersion: 1
+        )
+        context.insert(run)
+
+        let blockedStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+
+        let failedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 201),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedAgent.completedAt = Date(timeIntervalSince1970: 220)
+        failedAgent.canonicalOutcome = .failedBeforeOutput
+        failedAgent.supervisionClassification = .idleHangAfterFirstEdit
+        failedAgent.retryReason = "automatic_watchdog_retry"
+        failedAgent.stageExecution = blockedStage
+        context.insert(failedAgent)
+
+        let snapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(),
+            runID: run.id,
+            recommendedAction: RecoveryActionDetail(
+                action: .retryFailedAgent,
+                stageID: blockedStage.stageID,
+                agentID: failedAgent.agentID,
+                explanation: "Retry the failed code writer in place.",
+                staysInSameRun: true,
+                reusesSiblingOutputs: true,
+                reExecutesWholeStage: false
+            ),
+            availableActions: [],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        blockedStage.recoverySnapshotJSON = try JSONEncoder().encode(snapshot)
+
+        let builder = RunReportBuilder(modelContext: context)
+        let payload = builder.buildReportPayload(for: run, version: 14)
+        try builder.emitLatestSummary(for: run, basedOn: payload)
+
+        let summaryURL = URL(fileURLWithPath: run.artifactRoot)
+            .appendingPathComponent("reports", isDirectory: true)
+            .appendingPathComponent("run_summary_latest.json")
+        let data = try Data(contentsOf: summaryURL)
+        let summary = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        #expect(summary?["blockedReason"] as? String == SupervisionClassification.idleHangAfterFirstEdit.defaultSummary)
+        #expect((summary?["failureEvidenceSummaries"] as? [[String: Any]])?.first?["failureClass"] as? String == SupervisionClassification.idleHangAfterFirstEdit.rawValue)
+        #expect(summary?["retryPath"] as? String == "Retry agent 'code_writer' in stage 'state_8_implementation_continued'")
+    }
+
+    @MainActor
+    @Test("ExecutionService emits a fresh run report when execution pauses at an approval gate")
+    func approvalGatePauseEmitsFreshRunReport() async throws {
+        let context = try makeP013TestContext()
+        let workspace = makeTestWorkspace()
+        let run = makeTestRun(workspace: workspace, context: context, workflowID: "wf-approval", workflowTitle: "Approval WF")
+
+        let plan = RunPlan(
+            workflowID: "wf-approval",
+            workflowTitle: "Approval WF",
+            states: [
+                "start": ExecutableState(
+                    id: "start",
+                    label: "Proposal Refined",
+                    type: .start,
+                    ownerAgentID: "proposal_writer",
+                    runBlock: ExecutableRunBlock(phases: [
+                        .sequential([AgentTask(agent: "proposal_writer", task: "refresh_proposal", inputs: nil, outputs: ["proposal_current"])])
+                    ]),
+                    runAfterApproval: nil,
+                    transitions: [ExecutableTransition(to: "end", condition: .approvalGranted)],
+                    approvalRequired: true,
+                    approvalPolicy: "proposal_review",
+                    loop: nil
+                ),
+                "end": ExecutableState(
+                    id: "end",
+                    label: "End",
+                    type: .end,
+                    ownerAgentID: "proposal_writer",
+                    runBlock: nil,
+                    runAfterApproval: nil,
+                    transitions: [],
+                    approvalRequired: false,
+                    approvalPolicy: nil,
+                    loop: nil
+                )
+            ],
+            initialStateID: "start",
+            agentBindings: [
+                "proposal_writer": makeTestAgent(
+                    id: "proposal_writer",
+                    mode: "proposal_authoring",
+                    provider: "codex",
+                    model: "GPT-5.4",
+                    outputs: ["proposal_current"]
+                )
+            ],
+            variables: [:],
+            scoring: nil,
+            failurePolicy: nil,
+            workflowSnapshotHash: "wf-hash",
+            catalogSnapshotHash: "cat-hash",
+            workflowSnapshotJSON: Data(),
+            catalogSnapshotJSON: Data(),
+            planCompilerVersion: RunPlan.currentCompilerVersion
+        )
+
+        let executor = StaticResultExecutor(result: AgentResult(
+            outputs: ["proposal_current": Data("updated proposal".utf8)],
+            logSnippet: nil,
+            costCents: 1,
+            succeeded: true,
+            errorMessage: nil,
+            sessionID: nil,
+            durationSeconds: 0.1,
+            providerReceipt: nil,
+            resolvedModel: "GPT-5.4",
+            configuredProviderID: nil,
+            adapterVersion: nil,
+            canonicalOutcome: .completed,
+            sessionReuseDisposition: .fresh,
+            outputPresence: .durableOutput
+        ))
+
+        let service = ExecutionService(modelContext: context, executor: executor)
+        service.startRun(run: run, plan: plan, workspace: workspace)
+
+        await awaitCondition("Run should pause at approval boundary", timeout: 3.0) {
+            run.status == .waitingApproval
+        }
+
+        #expect(run.latestReportVersion == 1)
+
+        let latestSummaryURL = workspace.artifactRoot
+            .appendingPathComponent("reports", isDirectory: true)
+            .appendingPathComponent("run_summary_latest.json")
+        #expect(FileManager.default.fileExists(atPath: latestSummaryURL.path))
+
+        let payload = try JSONSerialization.jsonObject(with: Data(contentsOf: latestSummaryURL)) as? [String: Any]
+        #expect(payload?["status"] as? String == RunStatus.waitingApproval.rawValue)
+    }
+
+    @MainActor
+    @Test("RunReportBuilder latest summary snapshot prefers live running truth over stale blocked report history")
+    func latestSummarySnapshotPrefersLiveRunningTruthOverStaleBlockedHistory() throws {
+        let context = try makeP013TestContext()
+        let workspace = makeTestWorkspace()
+        let run = makeTestRun(
+            workspace: workspace,
+            context: context,
+            workflowID: "wf-running-summary",
+            workflowTitle: "Running Summary WF"
+        )
+        run.status = .running
+        run.completedAt = Date(timeIntervalSince1970: 500)
+        run.driftDetails = "Execution stalled after the last session closed before the workflow could transition."
+        run.latestReportVersion = 10
+        run.persistTransitionCursor(.seededForResume(nextScheduledStateID: "state_8_implementation_continued"))
+
+        let blockedStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .blocked,
+            iteration: 10,
+            attemptNumber: 1
+        )
+        blockedStage.run = run
+        context.insert(blockedStage)
+        try context.save()
+
+        let builder = RunReportBuilder(modelContext: context)
+        try builder.emitLatestSummarySnapshot(for: run)
+
+        let summaryURL = workspace.artifactRoot
+            .appendingPathComponent("reports", isDirectory: true)
+            .appendingPathComponent("run_summary_latest.json")
+        let payload = try JSONSerialization.jsonObject(with: Data(contentsOf: summaryURL)) as? [String: Any]
+
+        #expect(payload?["status"] as? String == RunStatus.running.rawValue)
+        #expect(payload?["blockedReason"] as? String == nil)
+        #expect(payload?["resumePath"] as? String == nil)
+        #expect(payload?["completedAt"] as? String == nil)
+    }
+
+    @MainActor
+    @Test("RunReportBuilder counts same-stage automatic watchdog retries in retries performed")
+    func runReportCountsAutomaticWatchdogRetriesInRetriesPerformed() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let stage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        stage.run = run
+        context.insert(stage)
+
+        let firstAttempt = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        firstAttempt.stageExecution = stage
+        context.insert(firstAttempt)
+
+        let retryAttempt = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 150),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        retryAttempt.agentAttemptNumber = 2
+        retryAttempt.retryReason = "automatic_watchdog_retry"
+        retryAttempt.stageExecution = stage
+        context.insert(retryAttempt)
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 37)
+        #expect(payload.retriesPerformed == 1)
+        #expect(payload.recoveryActionsTaken.contains("automatic_watchdog_retry"))
+    }
+
+    @MainActor
+    @Test("RunReportBuilder prefers interrupted continuation cursor over stale historical blocked retry snapshot")
+    func runReportPrefersInterruptedContinuationCursorOverStaleHistoricalRetrySnapshot() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        run.driftDetails = "Workflow source has changed (hash mismatch); Agent catalog source has changed (hash mismatch) Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
+        context.insert(run)
+
+        let implementationReviewed = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed against proposal",
+            startedAt: Date(timeIntervalSince1970: 10),
+            status: .completed,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        implementationReviewed.run = run
+        context.insert(implementationReviewed)
+
+        let staleBlockedStage = StageExecution(
+            stageID: "state_7_implementation_started",
+            label: "Implementation started",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        staleBlockedStage.run = run
+        context.insert(staleBlockedStage)
+
+        let staleFailedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "implement",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "chatgpt_codex",
+            effort: "high"
+        )
+        staleFailedAgent.completedAt = Date(timeIntervalSince1970: 30)
+        staleFailedAgent.logSnippet = "Finish: stop\nExecution stalled after the runtime session closed before the workflow could transition. Resume required."
+        staleFailedAgent.stageExecution = staleBlockedStage
+        context.insert(staleFailedAgent)
+
+        let staleRetryAgent = RecoveryActionDetail(
+            action: .retryFailedAgent,
+            stageID: staleBlockedStage.stageID,
+            agentID: staleFailedAgent.agentID,
+            explanation: "Retry the failed code writer attempt.",
+            staysInSameRun: true,
+            reusesSiblingOutputs: false,
+            reExecutesWholeStage: false
+        )
+        let staleSnapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 31),
+            runID: run.id,
+            recommendedAction: staleRetryAgent,
+            availableActions: [
+                staleRetryAgent,
+                RecoveryActionDetail(
+                    action: .cloneRunFrozenSnapshot,
+                    stageID: nil,
+                    agentID: nil,
+                    explanation: "Clone fallback.",
+                    staysInSameRun: false,
+                    reusesSiblingOutputs: false,
+                    reExecutesWholeStage: false
+                )
+            ],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        staleBlockedStage.recoverySnapshotJSON = try JSONEncoder().encode(staleSnapshot)
+
+        let interruptedContinuationStage = StageExecution(
+            stageID: "state_10_implementation_refined",
+            label: "Implementation refined",
+            startedAt: Date(timeIntervalSince1970: 40),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 2
+        )
+        interruptedContinuationStage.run = run
+        context.insert(interruptedContinuationStage)
+
+        let interruptedAgent = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "refine_implementation",
+            startedAt: Date(timeIntervalSince1970: 41),
+            status: .failed,
+            provider: "chatgpt_codex",
+            effort: "high"
+        )
+        interruptedAgent.completedAt = Date(timeIntervalSince1970: 50)
+        interruptedAgent.logSnippet = "Finish: stop\nExecution stalled after the runtime session closed before the workflow could transition. Resume required."
+        interruptedAgent.stageExecution = interruptedContinuationStage
+        context.insert(interruptedAgent)
+
+        run.persistTransitionCursor(
+            TransitionCursor.initial()
+                .settlingTransition(
+                    completedStateID: implementationReviewed.stageID,
+                    completedStageExecutionID: nil,
+                    nextStateID: interruptedContinuationStage.stageID,
+                    nextIteration: interruptedContinuationStage.iteration,
+                    nextAttemptNumber: interruptedContinuationStage.attemptNumber
+                )
+                .markingTransitionStarted()
+        )
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 16)
+
+        #expect(payload.transitionCursorNextScheduledStateID == "state_10_implementation_refined")
+        #expect(payload.transitionCursorSettlementPhase == "transition_started")
+        #expect(payload.blockedReason?.contains("Execution stalled") == true)
+        #expect(payload.retryPath == nil)
+        #expect(payload.resumePath == "Use Resume Interrupted to continue from the transition cursor continuation state; clone run is fallback only.")
+        #expect(payload.failureEvidenceSummaries.contains { $0.stageID == "state_10_implementation_refined" })
+    }
+
+    @MainActor
+    @Test("RunReportBuilder prefers exhausted watchdog retry truth over stale interrupted continuation cursor")
+    func runReportPrefersExhaustedWatchdogRetryTruthOverInterruptedCursor() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        run.driftDetails = "Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
+        context.insert(run)
+
+        let failedStage = StageExecution(
+            stageID: "state_8_implementation_continued",
+            label: "Implementation continued",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        failedStage.run = run
+        context.insert(failedStage)
+
+        let failedRetry = AgentExecution(
+            agentID: "code_writer",
+            agentTitle: "Code Writer",
+            taskName: "continue_implementation",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedRetry.completedAt = Date(timeIntervalSince1970: 150)
+        failedRetry.supervisionClassification = .idleHangAfterFirstEdit
+        failedRetry.retryReason = "automatic_watchdog_retry"
+        failedRetry.logSnippet = SupervisionClassification.idleHangAfterFirstEdit.defaultSummary
+        failedRetry.stageExecution = failedStage
+        context.insert(failedRetry)
+
+        let retryAction = RecoveryActionDetail(
+            action: .retryFailedAgent,
+            stageID: failedStage.stageID,
+            agentID: failedRetry.agentID,
+            explanation: "Retry the failed code writer explicitly.",
+            staysInSameRun: true,
+            reusesSiblingOutputs: true,
+            reExecutesWholeStage: false
+        )
+        let snapshot = RecoveryActionSnapshot(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 151),
+            runID: run.id,
+            recommendedAction: retryAction,
+            availableActions: [retryAction],
+            validationFailureID: nil,
+            source: .runtimePolicy
+        )
+        failedStage.recoverySnapshotJSON = try JSONEncoder().encode(snapshot)
+
+        let interruptedContinuationStage = StageExecution(
+            stageID: "state_9_implementation_reviewed",
+            label: "Implementation reviewed",
+            startedAt: Date(timeIntervalSince1970: 200),
+            status: .running,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        interruptedContinuationStage.run = run
+        context.insert(interruptedContinuationStage)
+
+        run.persistTransitionCursor(
+            TransitionCursor.initial()
+                .settlingTransition(
+                    completedStateID: failedStage.stageID,
+                    completedStageExecutionID: nil,
+                    nextStateID: interruptedContinuationStage.stageID,
+                    nextIteration: interruptedContinuationStage.iteration,
+                    nextAttemptNumber: interruptedContinuationStage.attemptNumber
+                )
+                .markingTransitionStarted()
+        )
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 37)
+        #expect(payload.blockedReason == SupervisionClassification.idleHangAfterFirstEdit.defaultSummary)
+        #expect(payload.retryPath == "Retry agent 'code_writer' in stage 'state_8_implementation_continued'")
+        #expect(payload.resumePath == "Use same-run recovery from the canonical recovery snapshot; clone run is fallback only.")
+        #expect(payload.driftNote == nil)
+    }
+
+    @MainActor
+    @Test("RunReportBuilder suppresses superseded historical failures after later stage completions")
+    func runReportSuppressesSupersededHistoricalFailuresAfterLaterCompletions() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        context.insert(run)
+
+        let oldDraftFailure = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 20),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        oldDraftFailure.run = run
+        context.insert(oldDraftFailure)
+
+        let oldDraftAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSince1970: 21),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        oldDraftAgent.completedAt = Date(timeIntervalSince1970: 30)
+        oldDraftAgent.logSnippet = "Agent 'proposal_writer' timed out after 1800s"
+        oldDraftAgent.stageExecution = oldDraftFailure
+        context.insert(oldDraftAgent)
+
+        let completedDraft = StageExecution(
+            stageID: "state_2_proposal_drafted",
+            label: "Proposal drafted",
+            startedAt: Date(timeIntervalSince1970: 40),
+            status: .completed,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        completedDraft.run = run
+        context.insert(completedDraft)
+
+        let completedDraftAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "draft_initial_proposal",
+            startedAt: Date(timeIntervalSince1970: 41),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        completedDraftAgent.completedAt = Date(timeIntervalSince1970: 55)
+        completedDraftAgent.stageExecution = completedDraft
+        context.insert(completedDraftAgent)
+
+        let oldRefineFailure = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 60),
+            status: .blocked,
+            iteration: 1,
+            attemptNumber: 1
+        )
+        oldRefineFailure.run = run
+        context.insert(oldRefineFailure)
+
+        let oldRefineAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "revise_proposal",
+            startedAt: Date(timeIntervalSince1970: 61),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        oldRefineAgent.completedAt = Date(timeIntervalSince1970: 70)
+        oldRefineAgent.logSnippet = "Interrupted by app restart before settlement. Manual resume required."
+        oldRefineAgent.stageExecution = oldRefineFailure
+        context.insert(oldRefineAgent)
+
+        let completedRefine = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 80),
+            status: .completed,
+            iteration: 2,
+            attemptNumber: 1
+        )
+        completedRefine.run = run
+        context.insert(completedRefine)
+
+        let completedRefineAgent = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "revise_proposal",
+            startedAt: Date(timeIntervalSince1970: 81),
+            status: .completed,
+            provider: "codex",
+            effort: "high"
+        )
+        completedRefineAgent.completedAt = Date(timeIntervalSince1970: 90)
+        completedRefineAgent.stageExecution = completedRefine
+        context.insert(completedRefineAgent)
+
+        let currentReviewFailure = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .failed,
+            iteration: 3,
+            attemptNumber: 1
+        )
+        currentReviewFailure.run = run
+        context.insert(currentReviewFailure)
+
+        let architect = AgentExecution(
+            agentID: "proposal_reviewer_architect",
+            agentTitle: "Proposal Reviewer / Architect",
+            taskName: "review_proposal_as_architect",
+            startedAt: Date(timeIntervalSince1970: 101),
+            status: .failed,
+            provider: "codex",
+            effort: "extra high"
+        )
+        architect.completedAt = Date(timeIntervalSince1970: 110)
+        architect.logSnippet = "Session creation failed (attempt 0): Live execution blocked: MCP policy could not be honored. MCP server 'xcode' has no runtime mapping for 'claude_agent'."
+        architect.stageExecution = currentReviewFailure
+        context.insert(architect)
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 10)
+
+        #expect(payload.failureEvidenceSummaries.count == 1)
+        #expect(payload.failureEvidenceSummaries.first?.stageID == "state_4_proposal_reviewed")
+        #expect(payload.failureEvidenceSummaries.first?.failureSummary.contains("no runtime mapping for 'claude_agent'") == true)
+        #expect(payload.blockedReason?.contains("no runtime mapping for 'claude_agent'") == true)
+        #expect(payload.retryPath == "Retry agent 'proposal_reviewer_architect' in stage 'state_4_proposal_reviewed'")
+        #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_2_proposal_drafted" })
+        #expect(!payload.failureEvidenceSummaries.contains { $0.stageID == "state_5_proposal_refined" })
+    }
+
+    @MainActor
+    @Test("RunReportBuilder suppresses stale nonterminal stage iterations and stale interrupted drift note after a later concrete failure")
+    func runReportSuppressesStaleRunningIterationAndInterruptedDriftNote() throws {
+        let context = try makeP013TestContext()
+        let run = makeTestRun(status: .blocked)
+        run.driftDetails = "Run was interrupted by app restart before reaching a terminal state. Use Resume Interrupted to continue."
+        context.insert(run)
+
+        let reviewCompleted = StageExecution(
+            stageID: "state_4_proposal_reviewed",
+            label: "Proposal reviewed",
+            startedAt: Date(timeIntervalSince1970: 100),
+            status: .completed,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        reviewCompleted.completedAt = Date(timeIntervalSince1970: 110)
+        reviewCompleted.run = run
+        context.insert(reviewCompleted)
+
+        let staleRunningRefine = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 120),
+            status: .running,
+            iteration: 6,
+            attemptNumber: 1
+        )
+        staleRunningRefine.run = run
+        context.insert(staleRunningRefine)
+
+        let currentFailedRefine = StageExecution(
+            stageID: "state_5_proposal_refined",
+            label: "Proposal refined",
+            startedAt: Date(timeIntervalSince1970: 130),
+            status: .failed,
+            iteration: 7,
+            attemptNumber: 1
+        )
+        currentFailedRefine.completedAt = Date(timeIntervalSince1970: 140)
+        currentFailedRefine.run = run
+        context.insert(currentFailedRefine)
+
+        let failedWriter = AgentExecution(
+            agentID: "proposal_writer",
+            agentTitle: "Proposal Writer",
+            taskName: "revise_proposal",
+            startedAt: Date(timeIntervalSince1970: 131),
+            status: .failed,
+            provider: "codex",
+            effort: "high"
+        )
+        failedWriter.completedAt = Date(timeIntervalSince1970: 140)
+        failedWriter.logSnippet = "Stream processing failed: Streaming failed: Codex ACP stream ended before final result was received"
+        failedWriter.stageExecution = currentFailedRefine
+        context.insert(failedWriter)
+
+        let payload = RunReportBuilder(modelContext: context).buildReportPayload(for: run, version: 13)
+
+        #expect(payload.stageTimeline.contains {
+            $0.label == "Proposal refined" && $0.iteration == 7 && $0.status == "failed"
+        })
+        #expect(!payload.stageTimeline.contains {
+            $0.label == "Proposal refined" && $0.iteration == 6 && $0.status == "running"
+        })
+        #expect(payload.failureEvidenceSummaries.count == 1)
+        #expect(payload.failureEvidenceSummaries.first?.stageID == "state_5_proposal_refined")
+        #expect(payload.blockedReason?.contains("Codex ACP stream ended before final result was received") == true)
+        #expect(payload.driftNote == nil)
+    }
+
     @Test("Proposal013 app proof accepts canonical aggregate evidence without enum-specific failure coupling")
     func proposal013AppProofCanonicalPassRule() {
         let packet = FailedStageEvidencePacket(
@@ -1851,6 +2714,10 @@ struct Proposal013Tests {
             failedAgentTitle: "Lead / Orchestrator",
             failureSummary: "Aggregate summary contract validation failed after reviewer outputs were persisted.",
             failureClass: .agentReportedFailure,
+            supervisionClassification: nil,
+            canonicalOutcome: nil,
+            transportErrorKind: nil,
+            outputPresence: nil,
             rawOutputsExist: true,
             receiptExists: false,
             transcriptExists: true,
@@ -1890,7 +2757,7 @@ private func makeTestCatalog(
         schemaVersion: 1,
         app: AppConfig(
             name: "test",
-            runtime: "goose",
+            runtime: "claude_agent",
             transport: "http",
             description: "test",
             ideaInputMode: "text",

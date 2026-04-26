@@ -1,0 +1,244 @@
+/* Forge macOS UI kit styles — Apple HIG aligned */
+@import url("../../colors_and_type.css");
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--font-text);
+  color: var(--label);
+  background: var(--bg-canvas);
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input { font-family: inherit; }
+
+/* Sidebar */
+.fg-sidebar {
+  width: 232px;
+  background: var(--bg-tertiary);
+  border-right: 0.5px solid var(--separator);
+  display: flex; flex-direction: column;
+  padding: 14px 12px;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.fg-sidebar .brand {
+  display:flex; gap:9px; align-items:center;
+  padding: 6px 8px 14px 8px;
+}
+.fg-sidebar .brand .name {
+  font: 600 13px/16px var(--font-display);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.fg-sidebar .brand .sub {
+  font: var(--t-caption2);
+  color: var(--label-tertiary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.fg-section-label {
+  font: var(--t-caption2);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--label-tertiary);
+  letter-spacing: 0.04em;
+  padding: 10px 8px 4px 8px;
+}
+.fg-nav-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font: var(--t-callout);
+  color: var(--label);
+  cursor: pointer;
+  user-select: none;
+}
+.fg-nav-item:hover { background: var(--bg-fill-quaternary); }
+.fg-nav-item.active {
+  background: var(--tint);
+  color: white;
+}
+.fg-nav-item .count {
+  margin-left: auto;
+  font: var(--t-caption1);
+  color: var(--label-tertiary);
+}
+.fg-nav-item.active .count { color: rgba(255,255,255,0.85); }
+.fg-nav-item.active svg { color: white !important; }
+
+/* Toolbar */
+.fg-toolbar {
+  height: 52px;
+  border-bottom: 0.5px solid var(--separator);
+  background: rgba(255,255,255,0.72);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  display: flex; align-items: center;
+  padding: 0 16px;
+  gap: 12px;
+  position: sticky; top: 0; z-index: 5;
+}
+.fg-toolbar .title {
+  font: 600 14px/18px var(--font-text);
+}
+.fg-toolbar .spacer { flex: 1; }
+
+/* Main */
+.fg-main {
+  flex: 1;
+  display: flex; flex-direction: column;
+  background: var(--bg-canvas);
+  min-width: 0;
+  overflow: hidden;
+}
+.fg-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px 32px 24px;
+}
+
+/* Inspector pane */
+.fg-inspector {
+  width: 360px;
+  background: var(--bg-tertiary);
+  border-left: 0.5px solid var(--separator);
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+/* Card */
+.fg-card {
+  background: var(--bg-elevated);
+  border-radius: var(--r-6);
+  box-shadow: var(--shadow-2), var(--hairline-all);
+  padding: 14px 16px;
+}
+.fg-panel {
+  background: var(--bg-elevated);
+  border-radius: var(--r-7);
+  border: 0.5px solid var(--separator);
+}
+
+/* Buttons */
+.fg-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font: 600 13px/18px var(--font-text);
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: 0;
+  cursor: pointer;
+  background: var(--bg-fill-tertiary);
+  color: var(--label);
+  transition: opacity 0.15s cubic-bezier(.32,.72,0,1);
+}
+.fg-btn:hover { opacity: 0.85; }
+.fg-btn:active { opacity: 0.7; transform: scale(0.96); }
+.fg-btn.primary { background: var(--tint); color: white; box-shadow: inset 0 0.5px 0 rgba(255,255,255,0.4), 0 1px 2px rgba(0,0,0,0.08); }
+.fg-btn.success { background: var(--status-success); color: white; }
+.fg-btn.destructive { background: var(--status-error); color: white; }
+.fg-btn.ghost { background: transparent; color: var(--tint); padding: 6px 8px; }
+
+/* Capsule */
+.fg-cap {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px;
+  font: 600 11px/13px var(--font-text);
+  border-radius: 999px;
+}
+.fg-cap .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+
+/* Section header */
+.fg-section-header {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin-bottom: 10px;
+}
+.fg-section-header .titles { display:flex; flex-direction:column; gap: 1px; }
+.fg-section-header .t { font: 600 15px/20px var(--font-text); }
+.fg-section-header .s { font: var(--t-footnote); color: var(--label-secondary); }
+
+/* Stage rail (run timeline) */
+.fg-stage-rail {
+  position: relative;
+  padding-left: 22px;
+}
+.fg-stage-rail::before {
+  content: ""; position: absolute;
+  left: 8px; top: 4px; bottom: 4px;
+  width: 1px;
+  background: var(--separator);
+}
+.fg-stage {
+  position: relative;
+  padding: 8px 0;
+}
+.fg-stage::before {
+  content: ""; position: absolute;
+  left: -19px; top: 14px;
+  width: 11px; height: 11px;
+  border-radius: 999px;
+  background: var(--bg-fill-secondary);
+  box-shadow: 0 0 0 3px var(--bg-canvas);
+}
+.fg-stage.done::before { background: var(--status-success); }
+.fg-stage.running::before { background: var(--status-running); animation: pulse 1.6s cubic-bezier(.32,.72,0,1) infinite; }
+.fg-stage.approval::before { background: var(--status-approval); }
+.fg-stage.failed::before { background: var(--status-error); }
+@keyframes pulse {
+  0%,100% { box-shadow: 0 0 0 3px var(--bg-canvas), 0 0 0 0 rgba(10,132,255,0.4); }
+  50%     { box-shadow: 0 0 0 3px var(--bg-canvas), 0 0 0 6px rgba(10,132,255,0.0); }
+}
+
+/* Toolbar segmented */
+.fg-segmented {
+  display: inline-flex;
+  background: var(--bg-fill-tertiary);
+  border-radius: 8px;
+  padding: 2px;
+}
+.fg-segmented > div {
+  font: 600 12px/16px var(--font-text);
+  padding: 4px 11px;
+  border-radius: 6px;
+  color: var(--label-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.fg-segmented > div.active {
+  background: var(--bg-elevated);
+  color: var(--label);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+/* Idea field */
+.fg-idea-input {
+  width: 100%;
+  background: var(--bg-elevated);
+  border-radius: 10px;
+  padding: 10px 12px;
+  border: 0;
+  outline: none;
+  box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.10);
+  font: var(--t-body);
+  color: var(--label);
+}
+.fg-idea-input:focus { box-shadow: inset 0 0 0 1.5px var(--tint); }
+
+/* Mono */
+.mono { font-family: var(--font-mono); font-size: 12px; }
+
+/* Approval banner */
+.fg-approval-banner {
+  background: linear-gradient(180deg, rgba(255,214,10,0.10), rgba(255,214,10,0.04));
+  border: 0.5px solid rgba(255,214,10,0.45);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex; gap: 12px; align-items: flex-start;
+}
+
+/* Forge brand splash */
+.fg-splash {
+  background: radial-gradient(circle at 30% 40%, #24344B 0%, #0E1623 50%, #04080D 100%);
+  color: #F8FAFC;
+}

@@ -3,12 +3,15 @@ import Yams
 
 nonisolated enum YAMLParserError: Error, LocalizedError {
     case fileNotFound(String)
+    case fileReadFailed(String, Error)
     case decodingFailed(String, Error)
 
     var errorDescription: String? {
         switch self {
         case .fileNotFound(let path):
             return "YAML file not found: \(path)"
+        case .fileReadFailed(let path, let error):
+            return "Failed to read YAML at \(path): \(error.localizedDescription)"
         case .decodingFailed(let path, let error):
             return "Failed to decode YAML at \(path): \(error.localizedDescription)"
         }
@@ -56,9 +59,14 @@ struct YAMLParser: Sendable {
         guard SecurityScopedAccess.fileExists(at: url) else {
             throw YAMLParserError.fileNotFound(url.path)
         }
-        guard let string = try? SecurityScopedAccess.loadString(from: url) else {
-            throw YAMLParserError.fileNotFound(url.path)
+        do {
+            return try SecurityScopedAccess.loadString(from: url)
+        } catch {
+            let message = "Failed to read YAML at \(url.path): \(error.localizedDescription)"
+            Task { @MainActor in
+                ForgeLogger.app.error(message)
+            }
+            throw YAMLParserError.fileReadFailed(url.path, error)
         }
-        return string
     }
 }

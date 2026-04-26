@@ -21,9 +21,9 @@ struct Proposal026Tests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .claude,
+                        family: .claudeACP,
                         displayName: "Claude Test",
-                        transport: .gooseServer,
+                        transport: .cli,
                         authMode: .apiKey,
                         defaultModel: "sonnet"
                     )
@@ -185,6 +185,17 @@ struct Proposal026Tests {
             Issue.record("Expected .toolCallFinished, got \(String(describing: toolCallCompleted))")
         }
 
+        let toolCallFailed = ACPStreamEventMapper.mapSessionUpdate([
+            "type": "tool_call_update",
+            "status": "failed",
+            "name": "get_lazy_artifact"
+        ])
+        if case .toolCallFinished(let toolName, _) = toolCallFailed {
+            #expect(toolName == "get_lazy_artifact")
+        } else {
+            Issue.record("Expected failed tool update to map as .toolCallFinished, got \(String(describing: toolCallFailed))")
+        }
+
         let thoughtChunk = ACPStreamEventMapper.mapSessionUpdate([
             "type": "agent_thought_chunk",
             "content": "Analyzing the problem"
@@ -195,39 +206,290 @@ struct Proposal026Tests {
             Issue.record("Expected .textChunk with thinking prefix, got \(String(describing: thoughtChunk))")
         }
 
+        let structuredMessageChunk = ACPStreamEventMapper.mapSessionUpdate([
+            "type": "agent_message_chunk",
+            "content": [
+                "type": "text",
+                "text": "Using "
+            ]
+        ])
+        if case .textChunk(let text) = structuredMessageChunk {
+            #expect(text == "Using ")
+        } else {
+            Issue.record("Expected .textChunk from structured chunk, got \(String(describing: structuredMessageChunk))")
+        }
+
         let permissionEvents = ACPStreamEventMapper.mapNotificationEvents(
             method: "session/request_permission",
             params: [
                 "tool": "read"
             ]
         )
-        #expect(permissionEvents.count == 2)
-        if permissionEvents.count == 2 {
+        #expect(permissionEvents.count == 1)
+        if permissionEvents.count == 1 {
             if case .toolCallStarted(let toolName, _) = permissionEvents[0] {
                 #expect(toolName == "permission:read")
             } else {
                 Issue.record("Expected permission start event, got \(String(describing: permissionEvents.first))")
             }
-            if case .toolCallFinished(let toolName, _) = permissionEvents[1] {
-                #expect(toolName == "permission:read")
-            } else {
-                Issue.record("Expected permission finish event, got \(String(describing: permissionEvents.dropFirst().first))")
-            }
         }
 
         let errorEvents = ACPStreamEventMapper.mapNotificationEvents(
             method: "session/error",
-            params: ["message": "Connection lost"]
+            params: [
+                "message": "Connection lost",
+                "code": -32603,
+                "data": ["reason": "Method not found"]
+            ]
         )
         #expect(errorEvents.count == 1)
         if case .error(let message) = errorEvents.first {
-            #expect(message == "Connection lost")
+            #expect(message.contains("Connection lost"))
+            #expect(message.contains("code -32603"))
+            #expect(message.contains("Method not found"))
         } else {
             Issue.record("Expected .error, got \(String(describing: errorEvents.first))")
         }
     }
 
+    @Test("ACPProtocolSupport builds selected permission outcome response")
+    func acpPermissionSelectionResponseShape() throws {
+        let response = try #require(ACPProtocolSupport.permissionSelectionResponse(
+            requestID: 0,
+            params: [
+                "options": [
+                    [
+                        "optionId": "approved",
+                        "kind": "allow_once"
+                    ],
+                    [
+                        "optionId": "abort",
+                        "kind": "reject_once"
+                    ]
+                ]
+            ]
+        ))
+
+        #expect(response["jsonrpc"] as? String == "2.0")
+        #expect(response["id"] as? Int == 0)
+
+        let result = try #require(response["result"] as? [String: Any])
+        let outcome = try #require(result["outcome"] as? [String: Any])
+        #expect(outcome["outcome"] as? String == "selected")
+        #expect(outcome["optionId"] as? String == "approved")
+    }
+
+    @Test("ACPProtocolSupport formats JSON-RPC errors with code and data")
+    func acpJSONRPCErrorFormattingIncludesData() {
+        let formatted = ACPProtocolSupport.formatJSONRPCError([
+            "code": -32603,
+            "message": "Internal error",
+            "data": "failed to deserialize response"
+        ], fallback: "Unknown ACP error")
+
+        #expect(formatted.contains("Internal error"))
+        #expect(formatted.contains("-32603"))
+        #expect(formatted.contains("failed to deserialize response"))
+    }
+
+    @Test("ACPProtocolSupport classifies Gemini capacity exhaustion stderr")
+    func acpGeminiProviderDiagnosticClassification() throws {
+        let diagnostic = try #require(ACPProtocolSupport.geminiProviderDiagnostic(
+            fromStderrLine: "Attempt 1 failed with status 429. No capacity available for model gemini-3.1-pro-preview on the server. MODEL_CAPACITY_EXHAUSTED"
+        ))
+
+        #expect(diagnostic.source == "gemini_stderr")
+        #expect(diagnostic.severity == .error)
+        #expect(diagnostic.normalizedReason == "model_capacity_exhausted")
+        #expect(diagnostic.message.contains("status 429"))
+    }
+
+    @Test("ACPProtocolSupport treats Gemini session close unsupported as non-persisted warning")
+    func acpGeminiSessionCloseUnsupportedClassification() throws {
+        let diagnostic = try #require(ACPProtocolSupport.geminiProviderDiagnostic(
+            fromStderrLine: #"Error handling request {"method":"session/close"} {"code":-32601,"message":"Method not found": session/close","data":{"method":"session/close"}}"#
+        ))
+
+        #expect(diagnostic.source == "gemini_stderr")
+        #expect(diagnostic.severity == .warning)
+        #expect(diagnostic.normalizedReason == "session_close_unsupported")
+        #expect(ACPProtocolSupport.shouldPersistProviderDiagnostic(diagnostic) == false)
+    }
+
+    @Test("ACPProtocolSupport classifies Codex exec command create-process failures")
+    func acpCodexExecCommandCreateProcessFailureClassification() throws {
+        let diagnostic = try #require(ACPProtocolSupport.codexProviderDiagnostic(
+            fromStderrLine: #"2026-04-11T21:32:22.773041Z ERROR codex_core::tools::router: error=exec_command failed for `/bin/zsh -lc "nl -ba ios/CryptoSavingsTracker/Services/FamilySharing/FamilyShareServices.swift | sed -n '1160,1275p'"`: CreateProcess { message: "Rejected(\"Failed to create unified exec process: No such file or directory (os error 2)\")" }"#
+        ))
+
+        #expect(diagnostic.source == "codex_stderr")
+        #expect(diagnostic.severity == .error)
+        #expect(diagnostic.normalizedReason == "exec_command_create_process_failed")
+        #expect(diagnostic.message.contains("exec_command failed"))
+    }
+
+    @Test("ACPSubprocessManager can read stderr lines for provider diagnostics")
+    func acpSubprocessManagerReadsStderrLines() async throws {
+        let manager = ACPSubprocessManager(
+            executablePath: "/bin/sh",
+            arguments: [
+                "-lc",
+                "echo provider-boom 1>&2"
+            ]
+        )
+
+        try manager.launch()
+        defer { manager.terminate() }
+
+        var iterator = manager.readStderrLines().makeAsyncIterator()
+        let line = try await iterator.next()
+        #expect(line == "provider-boom")
+    }
+
+    @Test("ClaudeAgentACPTransport repairs zero-byte workspace settings before launch")
+    func claudeTransportRepairsZeroByteWorkspaceSettings() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("p026-claude-settings-zero-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let claudeDirectory = tempDir.appendingPathComponent(".claude", isDirectory: true)
+        try FileManager.default.createDirectory(at: claudeDirectory, withIntermediateDirectories: true)
+        let settingsURL = claudeDirectory.appendingPathComponent("settings.json")
+        FileManager.default.createFile(atPath: settingsURL.path, contents: Data())
+
+        let repair = try ClaudeAgentACPTransport.sanitizeWorkspaceSettingsIfNeeded(
+            workingDirectory: tempDir.path,
+            fileManager: .default
+        )
+
+        let result = try #require(repair)
+        #expect(result.settingsURL == settingsURL)
+        #expect(result.reason == .emptyFile)
+        #expect(FileManager.default.fileExists(atPath: result.backupURL.path))
+        let repairedContents = try String(contentsOf: settingsURL, encoding: .utf8)
+        #expect(repairedContents == "{}\n")
+        let backupData = try Data(contentsOf: result.backupURL)
+        #expect(backupData.isEmpty)
+    }
+
+    @Test("ClaudeAgentACPTransport repairs malformed workspace settings before launch")
+    func claudeTransportRepairsMalformedWorkspaceSettings() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("p026-claude-settings-invalid-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let claudeDirectory = tempDir.appendingPathComponent(".claude", isDirectory: true)
+        try FileManager.default.createDirectory(at: claudeDirectory, withIntermediateDirectories: true)
+        let settingsURL = claudeDirectory.appendingPathComponent("settings.json")
+        try "{\"model\":".write(to: settingsURL, atomically: true, encoding: .utf8)
+
+        let repair = try ClaudeAgentACPTransport.sanitizeWorkspaceSettingsIfNeeded(
+            workingDirectory: tempDir.path,
+            fileManager: .default
+        )
+
+        let result = try #require(repair)
+        #expect(result.settingsURL == settingsURL)
+        #expect(result.reason == .invalidJSON)
+        #expect(FileManager.default.fileExists(atPath: result.backupURL.path))
+        let repairedContents = try String(contentsOf: settingsURL, encoding: .utf8)
+        #expect(repairedContents == "{}\n")
+        let backupContents = try String(contentsOf: result.backupURL, encoding: .utf8)
+        #expect(backupContents == "{\"model\":")
+    }
+
     // MARK: - Test 5: ACP transports can be instantiated
+
+
+
+    @Test("ExecutionEventBridge reuses tool name for in-progress ACP updates by toolCallId")
+    func executionEventBridgeReusesToolNameForInProgressUpdate() async throws {
+        let bridge = ExecutionEventBridge()
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.toolCallStarted(
+                toolName: "search",
+                raw: #"{"toolCallId":"call_123","name":"search"}"#
+            ))
+            continuation.yield(.toolCallStarted(
+                toolName: "unknown",
+                raw: #"{"toolCallId":"call_123","content":"progress"}"#
+            ))
+            continuation.finish()
+        }
+
+        let collector = SharedEventCollector()
+        _ = try await bridge.processStream(stream) { event in
+            collector.append(event)
+        }
+
+        let toolEvents = collector.events.filter { $0.type == .toolCallStarted }
+        #expect(toolEvents.count == 2)
+        #expect(toolEvents.last?.toolName == "search")
+        #expect(toolEvents.last?.detail == "Tool: search")
+    }
+
+    @Test("ExecutionEventBridge marks failed ACP tool updates as unsuccessful tool calls")
+    func executionEventBridgeMarksFailedToolUpdateUnsuccessful() async throws {
+        let bridge = ExecutionEventBridge()
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.toolCallStarted(
+                toolName: "get_lazy_artifact",
+                raw: #"{"toolCallId":"call_123","name":"get_lazy_artifact"}"#
+            ))
+            continuation.yield(.toolCallFinished(
+                toolName: "get_lazy_artifact",
+                raw: #"{"toolCallId":"call_123","name":"get_lazy_artifact","status":"failed","rawOutput":{"stdout":"lazy artifact not found: proposal_review_architect_json\n"}}"#
+            ))
+            continuation.finish()
+        }
+
+        _ = try await bridge.processStream(stream) { _ in }
+
+        #expect(bridge.toolCalls.count == 1)
+        #expect(bridge.toolCalls[0].toolName == "get_lazy_artifact")
+        #expect(bridge.toolCalls[0].succeeded == false)
+    }
+
+    @Test("ExecutionEventBridge meaningful progress stays nil for thinking chunks and weak discovery tools")
+    func executionEventBridgeMeaningfulProgressIgnoresWeakActivity() async throws {
+        let bridge = ExecutionEventBridge()
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.textChunk(text: "[thinking] analyzing"))
+            continuation.yield(.toolCallStarted(
+                toolName: "search",
+                raw: #"{"toolCallId":"call_weak","name":"search"}"#
+            ))
+            continuation.yield(.toolCallFinished(
+                toolName: "search",
+                raw: #"{"toolCallId":"call_weak","name":"search","status":"completed"}"#
+            ))
+            continuation.finish()
+        }
+
+        _ = try await bridge.processStream(stream) { _ in }
+
+        #expect(bridge.lastMeaningfulProgressAt == nil)
+        #expect(bridge.toolCalls.count == 1)
+    }
+
+    @Test("ExecutionEventBridge meaningful progress records strong tool activity")
+    func executionEventBridgeMeaningfulProgressRecordsStrongToolActivity() async throws {
+        let bridge = ExecutionEventBridge()
+        let stream = AsyncThrowingStream<RuntimeStreamEvent, Error> { continuation in
+            continuation.yield(.toolCallStarted(
+                toolName: "review",
+                raw: #"{"toolCallId":"call_strong","name":"review"}"#
+            ))
+            continuation.finish()
+        }
+
+        _ = try await bridge.processStream(stream) { _ in }
+
+        #expect(bridge.lastMeaningfulProgressAt != nil)
+        #expect(bridge.toolCalls.count == 1)
+    }
 
     @Test("ClaudeAgentACPTransport and GeminiCLIACPTransport instantiate cleanly")
     func acpTransportInstantiation() {
@@ -243,12 +505,12 @@ struct Proposal026Tests {
         #expect(geminiProtocol.mcpRuntimeNamespace == "gemini_cli")
     }
 
-    // MARK: - Test 6: Goose default path when runtimeProfileID is nil
+    // MARK: - Test 6: Default path when runtimeProfileID is nil
 
-    @Test("Resolver defaults to goose adapter family when runtimeProfileID is nil")
-    func gooseDefaultPathWhenNoRuntimeProfile() throws {
+    @Test("Resolver defaults to claude_agent_acp adapter family when runtimeProfileID is nil")
+    func defaultPathWhenNoRuntimeProfile() throws {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("p026-goose-default-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("p026-default-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -257,9 +519,9 @@ struct Proposal026Tests {
             initialSettings: ProviderSettings(
                 configuredProviders: [
                     ConfiguredProvider(
-                        family: .claude,
+                        family: .claudeACP,
                         displayName: "Claude Default",
-                        transport: .gooseServer,
+                        transport: .cli,
                         authMode: .apiKey,
                         defaultModel: "sonnet"
                     )
@@ -271,7 +533,7 @@ struct Proposal026Tests {
         )
         let registry = ProviderRegistry(
             settingsStore: store,
-            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.p026-goose-default", useInMemoryStore: true)
+            secretStore: KeychainSecretStore(serviceName: "com.chainworks.tests.p026-default", useInMemoryStore: true)
         )
         let resolver = BackendProfileResolverV2(providerRegistry: registry)
 
@@ -295,8 +557,8 @@ struct Proposal026Tests {
         )
 
         let plan = RunPlan(
-            workflowID: "p026_goose_test",
-            workflowTitle: "P026 Goose Default",
+            workflowID: "p026_default_test",
+            workflowTitle: "P026 Default",
             states: [:],
             initialStateID: "state_1",
             agentBindings: [agent.id: agent],
@@ -317,7 +579,7 @@ struct Proposal026Tests {
         )
 
         let binding = try #require(bindings["legacy_agent"])
-        #expect(binding.adapterFamily == "goose")
+        #expect(binding.adapterFamily == "claude_agent_acp")
         #expect(binding.capabilityClass == .legacyOperatorGrade)
     }
 
@@ -345,7 +607,7 @@ struct Proposal026Tests {
 
         agent.runtimeSessionID = "session-abc-123"
         #expect(agent.runtimeSessionID == "session-abc-123")
-        #expect(agent.gooseSessionID == "session-abc-123")
+        #expect(agent.runtimeSessionID == "session-abc-123")
     }
 
     // MARK: - Test 8: Executed canonical ACP proposal loop proof
@@ -362,19 +624,17 @@ struct Proposal026Tests {
     func canonicalCatalogClaudeACPIntent() throws {
         let catalog = try loadTestCanonicalCatalog()
 
-        let claudeBackendProfiles = catalog.backendProfiles.filter { $0.value.provider == "claude_code" }
+        let claudeBackendProfiles = catalog.backendProfiles.filter {
+            ProviderFamily.from(runtimeIdentifier: $0.value.provider) == .claudeACP
+        }
         #expect(!claudeBackendProfiles.isEmpty)
         #expect(claudeBackendProfiles.values.allSatisfy { $0.runtimeProfile == "claude_agent_acp" })
 
         let claudeBackendIDs = Set(claudeBackendProfiles.keys)
         let supportedClaudeMCP = Set(["xcode", "context7"])
 
-        for agent in catalog.agents where claudeBackendIDs.contains(agent.backendProfile) {
-            let profileID = agent.mcpProfile ?? catalog.mcpPolicy.defaultProfile
-            guard let profile = catalog.mcpProfiles[profileID] else {
-                continue
-            }
-            #expect(Set(profile.allRequestedExtensions).isSubset(of: supportedClaudeMCP))
+        for (backendID, profile) in claudeBackendProfiles where claudeBackendIDs.contains(backendID) {
+            #expect(Set(profile.mcp).isSubset(of: supportedClaudeMCP))
         }
     }
 
@@ -388,19 +648,11 @@ struct Proposal026Tests {
 
     // MARK: - Test 9: Executed canonical ACP implementation proof
 
-    @Test("Claude Agent ACP-backed implementation path reaches manual release gate without downgrading runtime truth")
-    func claudeACPBackedImplementationPathProof() async throws {
+    @Test("Codex ACP-backed implementation path reaches manual release gate without downgrading runtime truth")
+    func codexACPBackedImplementationPathProof() async throws {
         try await assertImplementationPathProof(
-            runtimeProfileID: "claude_agent_acp",
-            transportFactory: { ClaudeAgentACPTransport(executablePath: $0) }
-        )
-    }
-
-    @Test("Gemini CLI ACP-backed implementation path reaches manual release gate without downgrading runtime truth")
-    func geminiACPBackedImplementationPathProof() async throws {
-        try await assertImplementationPathProof(
-            runtimeProfileID: "gemini_cli_acp",
-            transportFactory: { GeminiCLIACPTransport(executablePath: $0) }
+            runtimeProfileID: "codex_acp",
+            transportFactory: { CodexACPTransport(executablePath: $0) }
         )
     }
 
@@ -599,13 +851,13 @@ struct Proposal026Tests {
         #expect(reportAgents.allSatisfy { $0.runtimeProfileID == runtimeProfileID })
         #expect(reportAgents.allSatisfy { $0.actualAdapterFamily == runtimeProfileID })
         #expect(reportAgents.allSatisfy { $0.actualCapabilityClass == RuntimeCapabilityClass.operatorGrade.rawValue })
-        if runtimeProfileID == "claude_agent_acp" {
+        if runtimeProfileID == "claude_agent_acp" || runtimeProfileID == "codex_acp" {
             let securityExecutions = agentExecutions.filter { $0.agentID == "security_checker" }
             let prepushExecutions = agentExecutions.filter { $0.agentID == "prepush_code_reviewer" }
             #expect(!securityExecutions.isEmpty)
             #expect(!prepushExecutions.isEmpty)
             #expect(securityExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("context7") })
-            #expect(prepushExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).contains("xcode") })
+            #expect(prepushExecutions.allSatisfy { decodeStringArray($0.effectiveMCPRuntimeExtensionIDsJSON).isEmpty })
         }
     }
 
@@ -634,6 +886,7 @@ struct Proposal026Tests {
                 temperature: agent.temperature,
                 permissionProfile: agent.permissionProfile,
                 mcpProfileID: agent.mcpProfileID,
+                requestedMCPServerIDs: agent.requestedMCPServerIDs,
                 skillRef: agent.skillRef,
                 skillRole: agent.skillRole,
                 resolvedSkill: agent.resolvedSkill,

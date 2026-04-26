@@ -102,6 +102,33 @@ struct ArtifactManagerTests {
         #expect(readBack == testData)
     }
 
+    @Test("persistOutputs saves artifact rows durably for a fresh context")
+    func persistOutputsSavesArtifactRowsDurablyForFreshContext() throws {
+        let workspace = makeWorkspace()
+        let agent = makeAgent()
+        let stageExec = StageExecution(stageID: "stage_1", label: "Test Stage")
+        context.insert(stageExec)
+        let agentExec = makeAgentExecution(stageExec: stageExec)
+
+        let artifacts = try manager.persistOutputs(
+            outputs: ["durable_output": Data("durable".utf8)],
+            agent: agent,
+            agentExecution: agentExec,
+            workspace: workspace,
+            stageID: "stage_1",
+            iteration: 1,
+            attemptNumber: 1
+        )
+
+        let persistedIDs = Set(artifacts.map(\.id))
+        let freshContext = ModelContext(container)
+        let freshManager = ArtifactManager(modelContext: freshContext)
+        let refetched = try freshManager.artifacts(forRunID: workspace.runID)
+
+        #expect(Set(refetched.map(\.id)) == persistedIDs)
+        #expect(refetched.count == 1)
+    }
+
     @Test("persistOutputs handles multiple outputs")
     func persistMultipleOutputs() throws {
         let workspace = makeWorkspace()

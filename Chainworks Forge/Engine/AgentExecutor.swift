@@ -62,6 +62,10 @@ struct ExecutionContext: Sendable {
     
     /// Proposal 018: Optional session lineage ID to force reuse or inspect.
     var sessionLineageID: UUID?
+    /// Proposal 037: Durable agent retry lineage for receipts and operator surfaces.
+    let agentAttemptNumber: Int?
+    let retryReason: String?
+    let supersedesAgentExecutionID: UUID?
 
     init(
         workspace: RunWorkspace,
@@ -82,7 +86,10 @@ struct ExecutionContext: Sendable {
         strategyAssignmentMode: String? = nil,
         contextStrategyProfile: ContextStrategyProfile? = nil,
         handoffPacket: HandoffPacket? = nil,
-        sessionLineageID: UUID? = nil
+        sessionLineageID: UUID? = nil,
+        agentAttemptNumber: Int? = nil,
+        retryReason: String? = nil,
+        supersedesAgentExecutionID: UUID? = nil
     ) {
         self.workspace = workspace
         self.projectRoot = projectRoot
@@ -103,6 +110,9 @@ struct ExecutionContext: Sendable {
         self.contextStrategyProfile = contextStrategyProfile
         self.handoffPacket = handoffPacket
         self.sessionLineageID = sessionLineageID
+        self.agentAttemptNumber = agentAttemptNumber
+        self.retryReason = retryReason
+        self.supersedesAgentExecutionID = supersedesAgentExecutionID
     }
 }
 
@@ -135,6 +145,8 @@ struct AgentResult: Sendable {
     let adapterVersion: String?
     /// Canonical terminal outcome for this attempt.
     let canonicalOutcome: AgentCanonicalOutcome?
+    /// Proposal 037: watchdog/mutation-specific refinement of terminal truth.
+    let supervisionClassification: SupervisionClassification?
     /// Proposal 018: Session lineage results
     let sessionLineageID: UUID?
     let sessionGenerationID: UUID?
@@ -165,6 +177,8 @@ struct AgentResult: Sendable {
     let mcpServerMetrics: [MCPServerExecutionMetric]
     /// Raw accumulated text from the agent's stream (for error classification when errors arrive as text, not transport failures).
     let accumulatedText: String?
+    /// Receipt-facing Codex telemetry captured from usage/tool events.
+    let codexTelemetry: CodexReceiptTelemetry?
     /// Supporting diagnostic envelope for later readers.
     let outcomeEnvelope: OutcomeEnvelope?
     /// Unique lazy-evidence artifacts actually fetched during execution.
@@ -183,6 +197,7 @@ struct AgentResult: Sendable {
         configuredProviderID: UUID?,
         adapterVersion: String?,
         canonicalOutcome: AgentCanonicalOutcome? = nil,
+        supervisionClassification: SupervisionClassification? = nil,
         sessionLineageID: UUID? = nil,
         sessionGenerationID: UUID? = nil,
         sessionReuseDisposition: SessionReuseDisposition? = nil,
@@ -199,6 +214,7 @@ struct AgentResult: Sendable {
         mcpSessionStartupLatencyMilliseconds: Int? = nil,
         mcpServerMetrics: [MCPServerExecutionMetric] = [],
         accumulatedText: String? = nil,
+        codexTelemetry: CodexReceiptTelemetry? = nil,
         outcomeEnvelope: OutcomeEnvelope? = nil,
         lazyEvidenceArtifactHits: [String] = []
     ) {
@@ -214,6 +230,7 @@ struct AgentResult: Sendable {
         self.configuredProviderID = configuredProviderID
         self.adapterVersion = adapterVersion
         self.canonicalOutcome = canonicalOutcome
+        self.supervisionClassification = supervisionClassification
         self.sessionLineageID = sessionLineageID
         self.sessionGenerationID = sessionGenerationID
         self.sessionReuseDisposition = sessionReuseDisposition
@@ -230,6 +247,7 @@ struct AgentResult: Sendable {
         self.mcpSessionStartupLatencyMilliseconds = mcpSessionStartupLatencyMilliseconds
         self.mcpServerMetrics = mcpServerMetrics
         self.accumulatedText = accumulatedText
+        self.codexTelemetry = codexTelemetry
         self.outcomeEnvelope = outcomeEnvelope
         self.lazyEvidenceArtifactHits = lazyEvidenceArtifactHits
     }

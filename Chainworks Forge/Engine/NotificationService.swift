@@ -15,6 +15,7 @@ final class NotificationService {
     private(set) var pendingAttentionCount: Int = 0
     private(set) var isMenuBarEnabled: Bool = false
     private var preferences: NotificationPreferences
+    private var authorizationStatus: UNAuthorizationStatus?
 
     init(preferences: NotificationPreferences = .defaultPreferences) {
         self.preferences = preferences
@@ -27,6 +28,7 @@ final class NotificationService {
         let center = UNUserNotificationCenter.current()
         do {
             let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
+            authorizationStatus = granted ? .authorized : .denied
             if !granted {
                 ForgeLogger.notification.info("User denied notification authorization")
             }
@@ -118,6 +120,7 @@ final class NotificationService {
 
     func updatePreferences(_ newPreferences: NotificationPreferences) {
         preferences = newPreferences
+        _ = newPreferences.save()
     }
 
     // MARK: - Helpers
@@ -126,13 +129,24 @@ final class NotificationService {
         guard !Self.notificationsSuppressedForCurrentProcess else { return }
         // Guard: skip scheduling in unit-test contexts where notification center may not be available
         guard NSApp != nil else { return }
+        if let authorizationStatus, !Self.isDeliveryAllowed(for: authorizationStatus) {
+            return
+        }
         let request = UNNotificationRequest(
             identifier: id,
             content: content,
             trigger: nil // Immediate delivery
         )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
+        Task { @MainActor [weak self] in
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            self?.authorizationStatus = settings.authorizationStatus
+            guard Self.isDeliveryAllowed(for: settings.authorizationStatus) else {
+                return
+            }
+            do {
+                try await center.add(request)
+            } catch {
                 ForgeLogger.notification.error("Failed to schedule: \(error.localizedDescription)")
             }
         }
@@ -148,5 +162,14 @@ final class NotificationService {
     private static var notificationsSuppressedForCurrentProcess: Bool {
         processEnvironment["CHAINWORKS_IN_MEMORY_STORE"] == "1"
             || processEnvironment.keys.contains(where: { $0.hasPrefix("CHAINWORKS_UI_TEST") })
+    }
+
+    private static func isDeliveryAllowed(for status: UNAuthorizationStatus) -> Bool {
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            return true
+        default:
+            return false
+        }
     }
 }

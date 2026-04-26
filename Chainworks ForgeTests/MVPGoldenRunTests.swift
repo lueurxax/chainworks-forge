@@ -8,7 +8,7 @@ import SwiftData
 struct MVPGoldenRunTests {
     private func encodeFixtureProviderBindings(for plan: RunPlan) throws -> Data {
         let bindings = Dictionary(uniqueKeysWithValues: plan.agentBindings.map { agentID, agent in
-            let family = ProviderFamily.from(runtimeIdentifier: agent.provider) ?? .claude
+            let family = ProviderFamily.from(runtimeIdentifier: agent.provider) ?? .claudeACP
             let binding = ResolvedProviderBinding(
                 agentID: agentID,
                 backendProfileID: agent.backendProfileID,
@@ -17,7 +17,7 @@ struct MVPGoldenRunTests {
                 providerIdentifier: family.runtimeProviderIdentifier,
                 model: agent.model,
                 effort: agent.effort,
-                transport: ProviderTransport.gooseServer.rawValue,
+                transport: ProviderTransport.cli.rawValue,
                 adapterVersion: "fixture-v1"
             )
             return (agentID, binding)
@@ -48,19 +48,16 @@ struct MVPGoldenRunTests {
             )
         )
         #expect(run.providerBindingSnapshotJSON != nil)
-        let transport = FixtureGooseTransport(scenario: .fullMVPSuccess)
+        let transport = FixtureACPTransport(scenario: .fullMVPSuccess)
         let executor = RuntimeAgentExecutor(transport: transport)
         let liveConfiguration = LiveRuntimeConfiguration(
-            baseURL: URL(string: "http://fixture.local")!,
-            apiKey: nil,
             override: LiveExecutionOverride(
                 enabled: true,
-                provider: "claude_code",
+                provider: "claude_acp",
                 model: "fixture-model",
                 effort: "high"
             ),
-            transportMode: .fixtureFullMVPSuccess,
-            transportAPI: .bespoke
+            transportMode: .fixtureFullMVPSuccess
         )
         let service = ExecutionService(
             modelContext: context,

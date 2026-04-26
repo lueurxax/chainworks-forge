@@ -15,10 +15,14 @@ This document describes the SwiftData persistence layer of Chainworks Forge. All
                      │ Approval │          │   Agent     │
                      │          │          │  Execution  │
                      └──────────┘          └─────┬───────┘
-                                                 │ *
-                                           ┌─────▼───────┐
-                                           │  Artifact   │
-                                           └─────────────┘
+                          │                      │ *
+              ┌───────────▼───────────┐    ┌─────▼───────┐
+              │ Lead Mediation (Rust) │    │  Artifact   │
+              └───────────┬───────────┘    └─────────────┘
+                          │ 1
+              ┌───────────▼───────────┐
+              │  Confirmation (Rust)  │
+              └───────────────────────┘
 ```
 
 ## Models
@@ -57,6 +61,7 @@ One execution instance of a workflow for one idea. Stores both mutable execution
 | `status` | `RunStatus` | Current lifecycle state |
 | `loopCounters` | `[String: Int]` | e.g. `proposal_revision_cycles: 2` |
 | `totalCostCents` | `Int64?` | Total cost in minor currency units (cents); `$12.34` = `1234` |
+| `workflow_conflict_records_json_v1` | `String?` | JSON bridge for Phase A workflow conflicts and advisory rejections |
 
 #### Immutable provenance snapshot (RunPlanSnapshot)
 
@@ -83,7 +88,7 @@ These fields are `private(set)` and frozen at run creation. They record the exac
 
 #### Derived properties
 
-`currentStageID` is a **computed property**, not stored. It derives the current stage from the `stageExecutions` collection using priority ordering: `running` > `waitingApproval` > `blocked` > `ready` > last `completed`. This eliminates divergence risk across retries, skips, blocked states, and resume.
+`currentStageID` is now **cursor-first**. It is a computed property that first resolves continuation from durable transition cursor metadata (and only falls back to `stageExecutions` ordering when cursor metadata is absent). This preserves resume truth when mixed or stale stage rows exist and makes continuation deterministic across resume/restart paths.
 
 #### Relationships
 
@@ -121,28 +126,35 @@ Tracks the execution of a single stage (state) in the workflow.
 
 **File:** `Models/AgentExecution.swift`
 
-Tracks a single agent's work within a stage.
+Tracks a single agent's work. This model uses a general
+owner model (ARCH-037) to support lead-mediated conflicts.
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | `UUID` | Unique identifier |
+| `ownerKind` | `String` | `stage_execution` · `lead_conflict_mediation` |
+| `ownerID` | `UUID` | References the owner record |
 | `agentID` | `String` | Agent identifier from the catalog |
 | `agentTitle` | `String` | Human-readable agent name |
 | `taskName` | `String` | Task from workflow YAML |
 | `startedAt` | `Date` | When agent started |
 | `completedAt` | `Date?` | When agent finished |
 | `status` | `AgentStatus` | Current lifecycle state |
-| `provider` | `String` | `claude_code`, `codex`, or `gemini` |
+| `provider` | `String` | ACP-backed provider identifier |
 | `effort` | `String` | `low` · `medium` · `high` · `critical` |
-| `costCents` | `Int64?` | Cost in minor units; `$0.73` = `73` |
-| `logSnippet` | `String?` | Last N lines of log for quick preview |
-| `gooseSessionID` | `String?` | Goose session tracking |
+| `costCents` | `Int64?` | Cost in minor units |
+| `logSnippet` | `String?` | Last N lines of log |
+| `runtimeSessionID` | `String?` | Runtime session tracking |
+| `leadMediationRecordID` | `UUID?` | Linked mediation record (P017) |
+| `originStageID` | `String?` | Origin stage lineage |
+| `originStageExecutionID`| `UUID?` | Origin stage execution lineage |
+| `stageExecutionID` | `UUID?` | Compatibility stage-execution ID (null for mediation) |
 
 #### Relationships
 
 | Relationship | Target | Delete Rule |
 |---|---|---|
-| `stageExecution` | `StageExecution` | Inverse of `StageExecution.agentExecutions` |
+| `stageExecution` | `StageExecution?` | Optional; non-null for stage-owned work |
 | `artifacts` | `[Artifact]` | Cascade |
 
 ### `Approval`
@@ -197,6 +209,51 @@ Metadata for a durable output produced by an agent. Content lives on disk; Swift
 |---|---|---|
 | `agentExecution` | `AgentExecution` | Inverse of `AgentExecution.artifacts` |
 
+## Control-Plane Only Models (Rust)
+
+The following models live exclusively in the Rust control-plane (`control-plane/crates/domain/src/mediation.rs`) and are not yet mirrored in SwiftData.
+
+### `LeadConflictMediationRecord`
+
+Tracks the lifecycle of a system-lead mediation for a workflow conflict.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `runID` | `String` | Run being mediated |
+| `conflictID` | `String` | Original blocking conflict identifier |
+| `conflictFingerprint`| `String` | Deterministic fingerprint for the conflict |
+| `status` | `LeadMediationStatus` | `pending` · `queued` · `running` · `awaiting_output_validation` · `operator_confirmation_required` · `settled` · `terminal_unverifiable` · `canceled` · `superseded` |
+| `leadAgentID` | `String` | System lead agent chosen for mediation |
+| `chosenAction` | `String?` | Action chosen by the lead |
+| `chosenNextStateID`| `String?` | Target next state ID |
+| `operatorRationale` | `String?` | Sanitized plain-text rationale for the operator |
+| `sanitizedProgress` | `String?` | Non-empty progress string for pending/queued states |
+| `validationErrors` | `String?` | JSON-serialized validation errors |
+| `settlementResult`| `String?` | Result classification (e.g., `rejected_clone_manual`) |
+| `confirmationSubjectID`| `String?` | Link to the operator confirmation item |
+| `costSummaryJSON` | `String?` | Structured cents-based cost data |
+
+### `LeadMediationConfirmation`
+
+A separate store for operator sign-off on mediation outcomes. These are unioned with stage approvals in the `approvals.list` MCP tool.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `mediationRecordID`| `String` | Linked mediation record |
+| `runID` | `String` | Run ID |
+| `conflictID` | `String` | Conflict ID |
+| `conflictFingerprint`| `String` | Fingerprint to validate against stale outcomes |
+| `status` | `ConfirmationStatus` | `pending` · `resolved` · `superseded` · `expired` · `canceled` |
+| `suggestedAction` | `String` | The lead's recommendation for the operator |
+| `requestedAt` | `Date` | When the confirmation was requested |
+| `deadlineAt` | `Date?` | Expiration window; engine-owned watchdog settles fail-closed on expiry |
+| `readbackRef` | `String?` | Reference for report or GraphQL awareness navigation |
+| `idempotencyScopeKey`| `String?` | Prevents duplicate resolutions |
+| `resolvedAt` | `Date?` | Resolution timestamp |
+| `resolvedByPrincipalID`| `String?` | Identity of the resolving operator |
+
 ## Status enums
 
 ### `RunStatus` (8 states)
@@ -231,7 +288,7 @@ Metadata for a durable output produced by an agent. Content lives on disk; Swift
 |---|---|
 | `pending` | Not yet scheduled |
 | `ready` | Dependencies met, waiting for provider |
-| `running` | Actively executing via Goose |
+| `running` | Actively executing via the selected ACP runtime |
 | `completed` | Finished successfully |
 | `failed` | Finished with error |
 | `cancelled` | Stopped by user or orchestrator |

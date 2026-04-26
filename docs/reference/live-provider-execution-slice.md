@@ -6,10 +6,10 @@ It describes the current fixture-backed live runtime contract, the app surfaces 
 
 ## Status
 
-- State: implemented and proven against real Goose.app (2026-03-24)
+- State: implemented as ACP-only live execution baseline
 - Scope owner: current app runtime and UI shell
 - Backing workflow: `examples/workflows/proposal-loop-live.yaml`
-- Live transport: runtime-profile-selected `RuntimeTransportProtocol` adapter, including Goose compatibility transport, ACP-native adapters, or deterministic fixture transport
+- Live transport: runtime-profile-selected `RuntimeTransportProtocol` adapter or deterministic ACP fixture transport
 
 Current repo-backed ACP families in this slice are:
 
@@ -22,7 +22,6 @@ Current repo-backed ACP families in this slice are:
 - [workspace-isolation-risk.md](workspace-isolation-risk.md)
 - [architecture-decisions.md](architecture-decisions.md)
 - [workflow-execution-engine.md](workflow-execution-engine.md)
-- [goose-server-transport.md](goose-server-transport.md)
 - [acp-runtime-transport.md](acp-runtime-transport.md)
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
@@ -46,9 +45,9 @@ This slice proves the control-plane model without introducing writable repo side
 ### In scope
 
 - live-mode execution for the proposal loop only
-- `GooseAgentExecutor`, `GooseSessionBridge`, `GooseTransport`, and `ExecutionEventBridge`
+- `RuntimeAgentExecutor`, `RuntimeSessionBridge`, runtime adapters, and `ExecutionEventBridge`
 - fixture-backed live transport used by the app and tests
-- app-launched Start Run, Run Progress, approval, and artifact-inspection surfaces
+- read-only/diagnostic Start Run, Run Progress, approval, and artifact-inspection surfaces (per P031-r18)
 - durable transcript, receipt, proposal, review, and summary artifacts
 - fail-closed read-only launch policy
 - structured artifact validation before success and transition evaluation
@@ -67,15 +66,14 @@ This slice proves the control-plane model without introducing writable repo side
 SwiftUI App
   -> ExecutionService
     -> WorkflowOrchestrator
-      -> GooseAgentExecutor
-        -> GooseSessionBridge
+      -> RuntimeAgentExecutor
+        -> RuntimeSessionBridge
           -> selected RuntimeTransportProtocol adapter
       -> ArtifactManager / ArtifactStorage
       -> Approval flow
 ```
 
-The app remains the control plane. Goose is one execution substrate, not the source of truth.
-The same control-plane rules also apply when the selected runtime is ACP-native.
+The app remains the control plane. ACP adapters are execution substrates, not the source of truth.
 
 Control-plane responsibilities stay in app code:
 
@@ -208,28 +206,29 @@ The point is to make a live run inspectable after the fact without relying on hi
 
 ### 7.1 Start Run
 
-The Start Run surface exposes:
+The Start Run surface (Diagnostic-only placeholder in P031) exposes:
 
 - workflow selection
 - simulated vs live mode
 - resolved live-agent summary
 - safety framing in product language
 - explicit missing-runtime guidance when live mode cannot start
+- **diagnostic identifiers** for execution via external workflows (CLI / MCP)
 
 ### 7.2 Run Progress
 
-The live run surface keeps the important state above the fold:
+The live run surface (GraphQL read-only in P031) keeps the important state above the fold:
 
 - current phase
 - live agent activity
-- approval state
+- approval state (Diagnostic-only)
 - decision context
 - spend or explicit unavailable state
 - shortcuts to the latest proposal, review summary, and receipt artifacts
 
 ### 7.3 Approval and artifact inspection
 
-At approval time, the operator can inspect:
+At approval time, the operator can inspect (Read-only) :
 
 - current proposal draft
 - latest review summary
@@ -240,7 +239,7 @@ The artifact inspector renders both user-facing markdown and raw structured/prov
 
 ### 7.4 Resume
 
-Waiting-approval state is restored on relaunch.
+Waiting-approval state is restored on relaunch as a diagnostic decision point.
 
 The live slice is allowed to resume only for safe interrupted states. Ambiguous or partial provider executions must block or fail clearly rather than auto-resume silently.
 
@@ -248,10 +247,9 @@ The live slice is allowed to resume only for safe interrupted states. Ambiguous 
 
 Primary implementation files:
 
-- `Chainworks Forge/Engine/GooseTransport.swift`
-- `Chainworks Forge/Engine/FixtureGooseTransport.swift`
-- `Chainworks Forge/Engine/GooseSessionBridge.swift`
-- `Chainworks Forge/Engine/GooseAgentExecutor.swift`
+- `Chainworks Forge/Engine/FixtureACPTransport.swift`
+- `Chainworks Forge/Engine/RuntimeSessionBridge.swift`
+- `Chainworks Forge/Engine/RuntimeAgentExecutor.swift`
 - `Chainworks Forge/Engine/ExecutionEventBridge.swift`
 - `Chainworks Forge/Engine/ExecutionReceiptBuilder.swift`
 - `Chainworks Forge/Engine/ExecutionService.swift`
@@ -262,8 +260,8 @@ Primary implementation files:
 
 Primary verification files:
 
-- `Chainworks ForgeTests/GooseAgentExecutorTests.swift`
-- `Chainworks ForgeTests/GooseSessionBridgeTests.swift`
+- `Chainworks ForgeTests/RuntimeAgentExecutorTests.swift`
+- `Chainworks ForgeTests/RuntimeSessionBridgeTests.swift`
 - `Chainworks ForgeTests/LiveProposalWorkflowTests.swift`
 - `Chainworks ForgeTests/EndToEndTests.swift`
 - `Chainworks ForgeTests/OrchestratorTests.swift`
@@ -276,7 +274,7 @@ Primary verification files:
 The live slice is proven at two levels:
 
 **Fixture-backed proof:**
-- Start Run sheet launches the live slice from inside the app
+- diagnostic Start Run placeholder is reachable
 - Run progress, approval, and stable outcome are reachable
 - Artifact inspector opens proposal and receipt-style artifacts
 - At least one non-happy path is proven
@@ -287,10 +285,8 @@ The live slice is proven at two levels:
 - same-tree approved-host `full` is green on the current baseline
 - adapter-specific details now live in the transport references instead of a separate proposal trail
 
-See [goose-server-transport.md](goose-server-transport.md) for transport details.
-
 ## 10. Follow-On Boundary
 
 This document covers the implemented live runtime contract for the proposal loop.
 
-The transport layer supports Goose compatibility execution, ACP-native execution, and deterministic fixtures. Later operator-shell, provider-settings, and delivery-slice work builds on top of this baseline rather than redefining it.
+The transport layer supports ACP-native execution and deterministic ACP fixtures. Later operator-shell, provider-settings, and delivery-slice work builds on top of this baseline rather than redefining it.

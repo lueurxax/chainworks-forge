@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Run card</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{font-family:var(--font-text);color:var(--label);-webkit-font-smoothing:antialiased;height:200px;overflow:hidden;}
+  .card{padding:20px 24px;height:100%;box-sizing:border-box;}
+  .lbl{font:var(--t-caption2);letter-spacing:var(--tracking-wide);color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .row{display:flex;gap:12px;align-items:center;}
+  .row.tight{gap:6px;}
+  .stack{display:flex;flex-direction:column;gap:12px;}
+  .meta{display:flex;flex-direction:column;gap:2px;}
+  .meta .name{font:var(--t-caption1);font-weight:600;color:var(--label);}
+  .meta .val{font-family:var(--font-mono);font-size:10.5px;color:var(--label-secondary);}
+  .capsule{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;font:var(--t-caption1);font-weight:600;border-radius:999px;}
+</style></head>
+<body><div class="card">
+<div style="background:#fff;border-radius:14px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,0.05), 0 4px 12px rgba(0,0,0,0.04), inset 0 0 0 0.5px rgba(0,0,0,0.06);max-width:580px;">
+  <div class="row" style="justify-content:space-between;align-items:flex-start;">
+    <div class="stack" style="gap:4px;">
+      <div style="font:600 13px/18px var(--font-text);color:var(--label-tertiary);font-family:var(--font-mono);">RUN-0248 · proposal-loop-live</div>
+      <div style="font:600 17px/22px var(--font-display);letter-spacing:-0.022em;">Bound stage-settlement reads to projection truth</div>
+    </div>
+    <span class="capsule" style="color:#B8860B;background:color-mix(in srgb, #B8860B 14%, transparent);"><span style="width:6px;height:6px;border-radius:999px;background:#B8860B;display:inline-block;"></span>Awaiting approval</span>
+  </div>
+  <div class="row" style="margin-top:12px;gap:18px;">
+    <div class="stack" style="gap:2px;"><div class="lbl">Stage</div><div style="font:var(--t-callout);">4 · review</div></div>
+    <div class="stack" style="gap:2px;"><div class="lbl">Provider</div><div style="font:var(--t-callout);">Claude Code</div></div>
+    <div class="stack" style="gap:2px;"><div class="lbl">Started</div><div style="font:var(--t-callout);">2m ago</div></div>
+  </div>
+</div>
+</div></body></html>

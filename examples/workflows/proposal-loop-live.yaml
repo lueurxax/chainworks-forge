@@ -19,7 +19,7 @@ workflow:
     resume_policy: automatic_on_launch
     requires_project_access: true
   required_providers:
-    - claude_code
+    - claude_acp
 
 variables:
   proposal_score_target: 8.5

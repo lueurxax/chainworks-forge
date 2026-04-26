@@ -1,0 +1,13 @@
+{
+  "schema_version": "agent-catalog-snapshot.v1",
+  "agents": [
+    {
+      "id": "fixture_agent",
+      "provider": "claude"
+    }
+  ],
+  "artifact_templates": {
+    "artifact_index_source": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/artifact_index_source.json",
+    "graphql_mcp_readback": "${CHAINWORKS_META_ROOT:-.chainworks}/p041/graphql_mcp_readback.json"
+  }
+}

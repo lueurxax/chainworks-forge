@@ -63,16 +63,6 @@
       </BuildableProductRunnable>
       <EnvironmentVariables>
          <EnvironmentVariable
-            key = "CHAINWORKS_GOOSE_BASE_URL"
-            value = "https://127.0.0.1:51200"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-         <EnvironmentVariable
-            key = "CHAINWORKS_GOOSE_API_KEY"
-            value = "chainworks-dev-secret"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-         <EnvironmentVariable
             key = "CHAINWORKS_LIVE_PROVIDER"
             value = "claude-code"
             isEnabled = "YES">

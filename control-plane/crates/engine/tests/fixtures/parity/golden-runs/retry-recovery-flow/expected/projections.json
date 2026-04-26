@@ -1,0 +1,1 @@
+{"run_status":"completed","stages":[{"stage_id":"attempt_1","label":"Attempt 1","status":"completed","attempt_number":1},{"stage_id":"retry_1","label":"Retry 1","status":"completed","attempt_number":2}],"readback_surfaces":["run_projection","stage_projection","artifact_index","graphql_readback","mcp_report_readback"]}

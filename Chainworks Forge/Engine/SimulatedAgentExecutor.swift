@@ -38,10 +38,7 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         // Proposal 013: V2 resolver — catalog-driven contract resolution
         let expectedOutputs = OutputContractResolverV2.expectedOutputs(for: task, agent: agent)
 
-        // Record execution
-        _lock.lock()
-        _executedTasks.append((agentID: agent.id, task: task.task, stageID: context.stageID))
-        _lock.unlock()
+        recordExecutedTask(agentID: agent.id, task: task.task, stageID: context.stageID)
 
         // Simulated delay
         if simulatedDelay > 0 {
@@ -125,11 +122,17 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         )
     }
 
+    private func recordExecutedTask(agentID: String, task: String, stageID: String) {
+        _lock.lock()
+        defer { _lock.unlock() }
+        _executedTasks.append((agentID: agentID, task: task, stageID: stageID))
+    }
+
     /// Reset tracking state (for test setup).
     func reset() {
         _lock.lock()
+        defer { _lock.unlock() }
         _executedTasks.removeAll()
         failingAgentIDs.removeAll()
-        _lock.unlock()
     }
 }

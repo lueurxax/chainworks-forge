@@ -1,0 +1,275 @@
+{
+  "schema_version": "p031-thin-ui-inventory-v1",
+  "status": "ready",
+  "governed_swift_files": [
+    {
+      "path": "Chainworks Forge/Views/RunsHomeView.swift",
+      "description": "Primary GraphQL-only run list and run detail shell."
+    },
+    {
+      "path": "Chainworks Forge/Views/DaemonLifecycleSurface.swift",
+      "description": "Daemon lifecycle readback surface."
+    },
+    {
+      "path": "Chainworks Forge/Views/WorkflowInspectorView.swift",
+      "description": "Compiled workflow readback surface."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "description": "P031 GraphQL read request validator, embedded operation owner, read store, coordinator, presenters, and test doubles."
+    }
+  ],
+  "governed_graphql_documents": [],
+  "embedded_graphql_documents": [
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "owner": "P031GraphQLDocuments",
+      "operation_names": [
+        "P031RunsHome",
+        "P031RunDetail",
+        "P031StageDetail",
+        "P031Stages",
+        "P031ApprovalInbox",
+        "P031Artifacts",
+        "P031ReportMetadata",
+        "P031RunStatusChanged",
+        "P031DaemonStatus",
+        "P031DaemonStatusChanged"
+      ]
+    }
+  ],
+  "generated_graphql_outputs": [],
+  "degraded_fail_closed_files": [],
+  "explicit_exclusions": [
+    {
+      "path": "Chainworks Forge/Views/AgentCatalogView.swift",
+      "reason": "Agent catalog configuration surface remains outside P031 workflow-truth UI scope."
+    },
+    {
+      "path": "Chainworks Forge/Views/AgentSessionInspector.swift",
+      "reason": "Agent session diagnostics remain outside P031 workflow-truth UI scope."
+    },
+    {
+      "path": "Chainworks Forge/Views/ArchivedIdeasView.swift",
+      "reason": "Idea archive surface is outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/ArtifactContentRenderer.swift",
+      "reason": "Renderer component is shared display plumbing, not a workflow-truth owner."
+    },
+    {
+      "path": "Chainworks Forge/Views/CompletedRunExportHub.swift",
+      "reason": "Export hub remains outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/DeliveryPreflightReportView.swift",
+      "reason": "Delivery preflight diagnostics are outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/FailedStageEvidencePanel.swift",
+      "reason": "Failed-stage evidence diagnostics are outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/FirstRunSetupWizard.swift",
+      "reason": "Setup wizard remains outside P031 workflow-truth UI scope."
+    },
+    {
+      "path": "Chainworks Forge/Views/ForegroundBannerView.swift",
+      "reason": "Global banner component is shared presentation plumbing."
+    },
+    {
+      "path": "Chainworks Forge/Views/IdeaListView.swift",
+      "reason": "Idea list is outside P031 governed run/stage/artifact/report workflow surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/IdeaDetailView.swift",
+      "reason": "Legacy idea detail placeholder is outside P031 governed run/stage/artifact/report workflow surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/IdeasArchiveView.swift",
+      "reason": "Idea archive is outside P031 governed run/stage/artifact/report workflow surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/MVPSignOffSummaryView.swift",
+      "reason": "MVP sign-off summary is outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/MenuBarStatusView.swift",
+      "reason": "Menu bar status surface is outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/PilotReadinessView.swift",
+      "reason": "Pilot readiness diagnostics are outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/PreflightReportView.swift",
+      "reason": "Preflight report diagnostics are outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/ProviderSettingsView.swift",
+      "reason": "Provider settings remain outside P031 workflow-truth UI scope."
+    },
+    {
+      "path": "Chainworks Forge/Views/ProviderSetupEvidencePanel.swift",
+      "reason": "Provider setup evidence remains outside P031 workflow-truth UI scope."
+    },
+    {
+      "path": "Chainworks Forge/Views/ProviderTroubleshootingPanel.swift",
+      "reason": "Provider troubleshooting remains outside P031 workflow-truth UI scope."
+    },
+    {
+      "path": "Chainworks Forge/Views/ReleaseGateView.swift",
+      "reason": "Release gate surface remains outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/RunProgressView.swift",
+      "reason": "Legacy run progress surface remains outside the new P031 governed dashboard."
+    },
+    {
+      "path": "Chainworks Forge/Views/RunStartModePresentation.swift",
+      "reason": "Run-start presentation remains outside P031 because run starts are removed from governed UI."
+    },
+    {
+      "path": "Chainworks Forge/Views/RunStartOverridesView.swift",
+      "reason": "Run-start overrides remain outside P031 because run starts are removed from governed UI."
+    },
+    {
+      "path": "Chainworks Forge/Views/RunSurfacePaneRouting.swift",
+      "reason": "Pane routing is shared presentation plumbing."
+    },
+    {
+      "path": "Chainworks Forge/Views/RunTimelineInspectorView.swift",
+      "reason": "Timeline inspector remains outside P031 governed workflow read surfaces."
+    },
+    {
+      "path": "Chainworks Forge/Views/SessionReuseBadge.swift",
+      "reason": "Session reuse badge is shared diagnostic presentation."
+    },
+    {
+      "path": "Chainworks Forge/Views/StartRunSheet.swift",
+      "reason": "Start-run sheet remains outside P031 because write controls are removed from governed UI."
+    },
+    {
+      "path": "Chainworks Forge/Views/StrategyBadge.swift",
+      "reason": "Strategy badge is shared diagnostic presentation."
+    }
+  ],
+  "allowed_static_guard_matches": [
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "graphql_mutations",
+      "line_contains": "must not execute GraphQL mutation operation",
+      "reason": "The request validator names GraphQL mutation as a rejected operation kind."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"ideas.create\", []),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"runs.start\", [\"idea_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"runs.cancel\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"stages.retry\", [\"run_id\", \"stage_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"approvals.resolve\", [\"approval_id\", \"run_id\", \"stage_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"steward.run_analysis\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"session.reset\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"session.resume\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"runs.clone\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"runs.compare\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"experiments.launch\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"runtime.health\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "(\"agents.reset\", [\"run_id\"]),",
+      "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "forRemovedControlID: \"approvals.resolve\"",
+      "reason": "The approval diagnostic state resolves guide data by removed control id without invoking the control."
+    }
+  ],
+  "forbidden_pattern_groups": [
+    {
+      "id": "mcp",
+      "description": "P031 governed UI must not import, instantiate, or call MCP clients or tools."
+    },
+    {
+      "id": "graphql_mutations",
+      "description": "P031 governed UI may issue GraphQL queries/subscriptions only."
+    },
+    {
+      "id": "local_write_fallback",
+      "description": "P031 governed UI must not call local mutation or recovery services."
+    },
+    {
+      "id": "command_plumbing",
+      "description": "P031 governed UI must not construct command receipts or command identities."
+    },
+    {
+      "id": "raw_truth_probing",
+      "description": "P031 governed UI must not inspect raw workflow truth files or artifact directories."
+    },
+    {
+      "id": "removed_write_controls",
+      "description": "P031 governed UI must not expose removed write controls."
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # Idea Lifecycle
 
-Stable reference for the implemented idea-lifecycle baseline that was previously carried by Proposal 010's archive slice.
+Stable reference for the idea-lifecycle baseline.
 
 ## Purpose
 
@@ -63,6 +63,8 @@ It only changes the idea's lifecycle visibility.
 ## Shell ownership
 
 Archive belongs to the `Ideas` flow.
+
+Per P031-r18, idea creation (`ideas.create`) is **prohibited** within the governed macOS UI. Operators must use external CLI or MCP workflows to create new ideas. The macOS UI provides read-only management (Archive, Restore) for existing ideas.
 
 Canonical operator path:
 

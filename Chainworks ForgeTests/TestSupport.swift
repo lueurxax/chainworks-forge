@@ -25,7 +25,7 @@ enum TestModelContainerRetainer {
 /// Includes all Chainworks Forge model types.
 @MainActor
 func makeTestModelContext() throws -> ModelContext {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self,
@@ -41,7 +41,7 @@ func makeTestModelContext() throws -> ModelContext {
 /// Creates an in-memory ModelContainer + ModelContext pair suitable for XCTestCase setUp.
 @MainActor
 func makeTestModelContainer() throws -> (container: ModelContainer, context: ModelContext) {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let schema = Schema([
         Idea.self, Run.self, StageExecution.self,
         AgentExecution.self, Approval.self, Artifact.self,
@@ -206,14 +206,14 @@ func makeTestRun(
 final class TestBundleMarker: NSObject {}
 
 @discardableResult
-private func installPortableGooseRegistryFixtureIfNeeded(file: StaticString = #filePath) -> String? {
+private func installPortableMCPRegistryFixtureIfNeeded(file: StaticString = #filePath) -> String? {
     let repoRoot = testRepositoryRootURL(file: file)
-    let fixturePath = repoRoot.appendingPathComponent("examples/goose/goose-config-fixture.yaml").path
+    let fixturePath = repoRoot.appendingPathComponent("examples/mcp/mcp-config-fixture.yaml").path
     guard FileManager.default.isReadableFile(atPath: fixturePath) else {
         return nil
     }
 
-    setenv(GooseExtensionRegistryReader.environmentConfigPathKey, fixturePath, 1)
+    setenv(CodexExtensionRegistryReader.environmentConfigPathKey, fixturePath, 1)
     return fixturePath
 }
 
@@ -274,7 +274,7 @@ private func materializePortableSkillBundles(
 
 @discardableResult
 func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let source = try String(contentsOf: sourceURL, encoding: .utf8)
     let localizedBundles = try materializePortableSkillBundles(nextTo: destinationURL)
     let rewritten = portableExternalSkillRewrites(
@@ -287,6 +287,17 @@ func writePortableCatalogCopy(from sourceURL: URL, to destinationURL: URL) throw
     return destinationURL
 }
 
+@discardableResult
+func writePortableWorkflowCopy(from sourceURL: URL, to destinationURL: URL) throws -> URL {
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    try FileManager.default.createDirectory(
+        at: destinationURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try source.write(to: destinationURL, atomically: true, encoding: .utf8)
+    return destinationURL
+}
+
 /// Loads the canonical workflow fixture from the test bundle.
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
@@ -296,12 +307,16 @@ func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
             Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
             "workflow.yaml fixture must be bundled with tests"
         )
-    return try YAMLParser.loadWorkflow(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("examples/workflows", isDirectory: true)
+        .appendingPathComponent("chainworks-test-workflow-\(UUID().uuidString).yaml")
+    try writePortableWorkflowCopy(from: url, to: portableURL)
+    return try YAMLParser.loadWorkflow(from: portableURL)
 }
 
 /// Loads the canonical agent catalog fixture from the test bundle.
 func loadTestCanonicalCatalog() throws -> AgentCatalog {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
     let url = FileManager.default.isReadableFile(atPath: repoURL.path)
         ? repoURL
@@ -310,6 +325,7 @@ func loadTestCanonicalCatalog() throws -> AgentCatalog {
             "agents.yaml fixture must be bundled with tests"
         )
     let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("examples/agents", isDirectory: true)
         .appendingPathComponent("chainworks-test-catalog-\(UUID().uuidString).yaml")
     try writePortableCatalogCopy(from: url, to: portableURL)
     return try YAMLParser.loadAgentCatalog(from: portableURL)
@@ -326,7 +342,7 @@ func loadTestStewardConfig() throws -> StewardConfig {
 
 /// Loads the live proposal loop workflow fixture from the test bundle.
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
     let url = FileManager.default.isReadableFile(atPath: repoURL.path)
         ? repoURL
@@ -334,12 +350,15 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
             Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
             "proposal-loop-live.yaml fixture must be bundled with tests"
         )
-    return try YAMLParser.loadWorkflow(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("chainworks-test-proposal-loop-live-\(UUID().uuidString).yaml")
+    try writePortableWorkflowCopy(from: url, to: portableURL)
+    return try YAMLParser.loadWorkflow(from: portableURL)
 }
 
 /// Loads the full MVP live workflow fixture from the test bundle.
 func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
-    _ = installPortableGooseRegistryFixtureIfNeeded()
+    _ = installPortableMCPRegistryFixtureIfNeeded()
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml")
     let url = FileManager.default.isReadableFile(atPath: repoURL.path)
         ? repoURL
@@ -347,7 +366,10 @@ func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
             Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
             "full-mvp-live.yaml fixture must be bundled with tests"
         )
-    return try YAMLParser.loadWorkflow(from: url)
+    let portableURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("chainworks-test-full-mvp-live-\(UUID().uuidString).yaml")
+    try writePortableWorkflowCopy(from: url, to: portableURL)
+    return try YAMLParser.loadWorkflow(from: portableURL)
 }
 
 /// Loads the compact workflow fixture from the test bundle.

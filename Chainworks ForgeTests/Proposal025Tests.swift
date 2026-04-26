@@ -6,12 +6,12 @@ import SwiftData
 @MainActor
 @Suite("Proposal 025", .serialized)
 struct Proposal025Tests {
-    @Test("Portable Goose registry fixture overrides unreadable inherited config path")
-    func portableGooseRegistryFixtureOverridesUnreadableInheritedPath() throws {
-        let envKey = GooseExtensionRegistryReader.environmentConfigPathKey
+    @Test("Portable MCP registry fixture overrides unreadable inherited config path")
+    func portableMCPRegistryFixtureOverridesUnreadableInheritedPath() throws {
+        let envKey = CodexExtensionRegistryReader.environmentConfigPathKey
         let original = ProcessInfo.processInfo.environment[envKey]
         let unreadablePath = FileManager.default.temporaryDirectory
-            .appendingPathComponent("missing-goose-\(UUID().uuidString).yaml", isDirectory: false)
+            .appendingPathComponent("missing-mcp-\(UUID().uuidString).yaml", isDirectory: false)
             .path
 
         setenv(envKey, unreadablePath, 1)
@@ -26,14 +26,14 @@ struct Proposal025Tests {
         _ = try makeTestModelContext()
 
         let resolved = ProcessInfo.processInfo.environment[envKey]
-        let expectedSuffix = "/examples/goose/goose-config-fixture.yaml"
+        let expectedSuffix = "/examples/mcp/mcp-config-fixture.yaml"
         #expect(resolved?.hasSuffix(expectedSuffix) == true)
         #expect(resolved != unreadablePath)
     }
 
-    @Test("Goose registry reader falls back to repo fixture on test hosts")
-    func gooseRegistryReaderFallsBackToRepoFixtureOnTestHosts() {
-        let envKey = GooseExtensionRegistryReader.environmentConfigPathKey
+    @Test("Codex registry reader falls back to repo fixture on test hosts")
+    func codexRegistryReaderFallsBackToRepoFixtureOnTestHosts() {
+        let envKey = CodexExtensionRegistryReader.environmentConfigPathKey
         let original = ProcessInfo.processInfo.environment[envKey]
         unsetenv(envKey)
         defer {
@@ -44,8 +44,8 @@ struct Proposal025Tests {
             }
         }
 
-        let reader = GooseExtensionRegistryReader()
-        #expect(reader.configURL.path.hasSuffix("/examples/goose/goose-config-fixture.yaml"))
+        let reader = CodexExtensionRegistryReader()
+        #expect(reader.configURL.path.hasSuffix("/examples/mcp/mcp-config-fixture.yaml"))
     }
 
     @Test("Simulated canonical contract outputs satisfy bundled workflow thresholds")
@@ -97,6 +97,677 @@ struct Proposal025Tests {
         #expect((finalFeatureReport?["cost_currency"] as? String) == "USD")
     }
 
+    @Test("Implementation self-assessment adapter renders canonical blocked verification status")
+    func implementationSelfAssessmentAdapterDerivesBlockedVerificationStatus() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let artifactURL = tempRoot.appendingPathComponent("self-assessment.json")
+        try Data("""
+        {
+          "contract_id": "implementation_self_assessment_v2",
+          "status": "blocked",
+          "implementation_complete": true,
+          "verification_green": false,
+          "remaining_code_task_count": 0,
+          "blocking_remaining_code_task_count": 0,
+          "handoff_task_count": 1,
+          "blocking_review_handoff_task_count": 1,
+          "remaining_code_tasks": [],
+          "handoff_tasks": [
+            {
+              "summary": "Collect signed-in smoke evidence",
+              "owner_class": "manual_evidence",
+              "target_stage": "release",
+              "blocking_review": true,
+              "evidence": "Manual evidence is outside code_writer ownership."
+            }
+          ],
+          "known_risks": ["Verification blocked by missing toolchain"],
+          "tests_run": ["cargo test: blocked"],
+          "docs_impacted": [],
+          "owner_class_counts": {
+            "manual_evidence": 1
+          },
+          "target_stage_summaries": [
+            {
+              "target_stage": "release",
+              "count": 1,
+              "blocking_review_count": 1
+            }
+          ],
+          "validation_errors": [],
+          "warnings": []
+        }
+        """.utf8).write(to: artifactURL)
+
+        let artifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: artifactURL.path,
+            runID: UUID(),
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: [artifact]))
+        #expect(summary.status == "blocked")
+        #expect(summary.verificationLabel == "Blocked")
+        #expect(summary.remainingCodeTasks.isEmpty)
+        #expect(summary.handoffTasks.count == 1)
+        #expect(summary.evidenceText.contains("cargo test: blocked"))
+    }
+
+    @Test("Implementation self-assessment adapter renders canonical invalid validation evidence")
+    func implementationSelfAssessmentAdapterMarksMalformedV2PayloadsInvalid() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let artifactURL = tempRoot.appendingPathComponent("self-assessment-invalid.json")
+        try Data("""
+        {
+          "status": "invalid",
+          "implementation_complete": true,
+          "verification_green": null,
+          "remaining_code_tasks": [],
+          "handoff_tasks": [],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": [],
+          "owner_class_counts": {},
+          "target_stage_summaries": [],
+          "validation_errors": [
+            {
+              "code": "missing_required_field",
+              "message": "required field verification_green is missing",
+              "pointer": "$.verification_green"
+            }
+          ],
+          "warnings": []
+        }
+        """.utf8).write(to: artifactURL)
+
+        let artifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: artifactURL.path,
+            runID: UUID(),
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: [artifact]))
+        #expect(summary.status == "invalid")
+        #expect(summary.validationErrors.contains { $0.pointer == "$.verification_green" })
+        #expect(summary.evidenceText.contains("$.verification_green"))
+    }
+
+    @Test("Implementation self-assessment adapter synthesizes validation evidence for invalid task rows")
+    func implementationSelfAssessmentAdapterSynthesizesValidationEvidenceForInvalidTaskRows() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let artifactURL = tempRoot.appendingPathComponent("self-assessment-invalid-task.json")
+        try Data("""
+        {
+          "status": "invalid",
+          "implementation_complete": true,
+          "verification_green": true,
+          "remaining_code_tasks": [
+            {
+              "summary": "Fix validation evidence",
+              "owner": "code_writer",
+              "blocking": true,
+              "evidence": "   "
+            }
+          ],
+          "handoff_tasks": [
+            {
+              "summary": "Route review handoff",
+              "owner_class": "not_a_class",
+              "target_stage": "state_9_implementation_reviewed",
+              "blocking_review": true,
+              "evidence": "Owner class must be normalized."
+            }
+          ],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": [],
+          "owner_class_counts": {},
+          "target_stage_summaries": [],
+          "validation_errors": [
+            {
+              "code": "empty_required_string",
+              "message": "required field evidence must not be empty",
+              "pointer": "$.remaining_code_tasks[0].evidence"
+            },
+            {
+              "code": "invalid_owner_class",
+              "message": "unknown handoff owner_class: not_a_class",
+              "pointer": "$.handoff_tasks[0].owner_class"
+            }
+          ],
+          "warnings": []
+        }
+        """.utf8).write(to: artifactURL)
+
+        let artifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: artifactURL.path,
+            runID: UUID(),
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: [artifact]))
+        #expect(summary.status == "invalid")
+        #expect(summary.validationErrors.contains { $0.pointer == "$.remaining_code_tasks[0].evidence" })
+        #expect(summary.validationErrors.contains { $0.pointer == "$.handoff_tasks[0].owner_class" })
+    }
+
+    @Test("Implementation self-assessment adapter renders unknown owner class as Human Triage")
+    func implementationSelfAssessmentAdapterRendersUnknownOwnerClassAsHumanTriage() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let artifactURL = tempRoot.appendingPathComponent("self-assessment-unknown-owner.json")
+        try Data("""
+        {
+          "status": "handoff_required",
+          "implementation_complete": true,
+          "verification_green": true,
+          "remaining_code_tasks": [],
+          "handoff_tasks": [
+            {
+              "summary": "Operator triage required",
+              "owner_class": "unknown",
+              "target_stage": "state_9_implementation_reviewed",
+              "blocking_review": false,
+              "evidence": "Ownership is not classified yet."
+            }
+          ],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": [],
+          "owner_class_counts": {
+            "unknown": 1
+          },
+          "target_stage_summaries": [
+            {
+              "target_stage": "state_9_implementation_reviewed",
+              "count": 1,
+              "blocking_review_count": 0
+            }
+          ],
+          "validation_errors": [],
+          "warnings": []
+        }
+        """.utf8).write(to: artifactURL)
+
+        let artifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: artifactURL.path,
+            runID: UUID(),
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: [artifact]))
+        #expect(summary.status == "handoff_required")
+        #expect(summary.handoffTasks.first?.owner == "Human Triage")
+    }
+
+    @Test("Implementation self-assessment adapter preserves canonical summary evidence fields")
+    func implementationSelfAssessmentAdapterPreservesCanonicalSummaryEvidenceFields() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let artifactURL = tempRoot.appendingPathComponent("self-assessment-summary.json")
+        try Data("""
+        {
+          "status": "invalid",
+          "implementation_complete": true,
+          "verification_green": true,
+          "remaining_code_tasks": [
+            {
+              "summary": "Fix nested validation",
+              "owner": "code_writer",
+              "blocking": true,
+              "evidence": "Missing boolean must fail closed.",
+              "source_pointer": "$.remaining_code_tasks[0]"
+            }
+          ],
+          "handoff_tasks": [],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": [],
+          "owner_class_counts": {
+            "release": 1
+          },
+          "target_stage_summaries": [
+            {
+              "target_stage": "state_10_release",
+              "count": 1,
+              "blocking_review_count": 1
+            }
+          ],
+          "validation_errors": [
+            {
+              "code": "missing_bool",
+              "message": "remaining_code_tasks[0].blocking must be a boolean",
+              "pointer": "$.remaining_code_tasks[0].blocking"
+            }
+          ],
+          "warnings": [
+            {
+              "code": "compat",
+              "message": "legacy v1 fallback was ignored",
+              "pointer": "$"
+            }
+          ]
+        }
+        """.utf8).write(to: artifactURL)
+
+        let artifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: artifactURL.path,
+            runID: UUID(),
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: [artifact]))
+        #expect(summary.status == "invalid")
+        #expect(summary.validationErrors.first?.code == "missing_bool")
+        #expect(summary.warnings.first?.message == "legacy v1 fallback was ignored")
+        #expect(summary.ownerClassCounts["release"] == 1)
+        #expect(summary.targetStageSummaries.first?.blockingReviewCount == 1)
+        #expect(summary.remainingCodeTasks.first?.sourcePointer == "$.remaining_code_tasks[0]")
+        #expect(summary.evidenceText.contains("$.remaining_code_tasks[0].blocking"))
+    }
+
+    @Test("Implementation self-assessment adapter prefers embedded canonical review summary over raw artifact")
+    func implementationSelfAssessmentAdapterPrefersEmbeddedCanonicalReviewSummary() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let rawArtifactURL = tempRoot.appendingPathComponent("self-assessment-raw.json")
+        try Data("""
+        {
+          "implementation_complete": false,
+          "verification_green": true,
+          "remaining_code_tasks": [
+            {
+              "summary": "Raw file says code loop",
+              "owner": "code_writer",
+              "blocking": true,
+              "evidence": "This raw artifact must not override the canonical summary."
+            }
+          ],
+          "handoff_tasks": [],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": []
+        }
+        """.utf8).write(to: rawArtifactURL)
+        let reviewSummaryURL = tempRoot.appendingPathComponent("implementation-review-summary.json")
+        try Data("""
+        {
+          "status": "release_evidence_blocked",
+          "implementation_self_assessment_summary": {
+            "status": "blocked",
+            "implementation_complete": true,
+            "verification_green": false,
+            "remaining_code_tasks": [],
+            "handoff_tasks": [],
+            "known_risks": ["Verification is blocked downstream."],
+            "tests_run": ["proposal-054: blocked"],
+            "docs_impacted": [],
+            "owner_class_counts": {},
+            "target_stage_summaries": [],
+            "validation_errors": [],
+            "warnings": []
+          }
+        }
+        """.utf8).write(to: reviewSummaryURL)
+
+        let rawArtifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: rawArtifactURL.path,
+            runID: UUID(),
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+        let reviewArtifact = Artifact(
+            name: "implementation_review_summary",
+            contractID: "implementation_review_summary_v1",
+            format: .json,
+            filePath: reviewSummaryURL.path,
+            runID: rawArtifact.runID,
+            stageID: "state_9_implementation_reviewed",
+            agentID: "lead_orchestrator",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: [rawArtifact, reviewArtifact]))
+        #expect(summary.status == "blocked")
+        #expect(summary.verificationGreen == false)
+        #expect(summary.remainingCodeTasks.isEmpty)
+        #expect(summary.sourceArtifactName == "implementation_review_summary.implementation_self_assessment_summary")
+    }
+
+    @Test("Implementation self-assessment adapter prefers run canonical projection over raw artifact")
+    func implementationSelfAssessmentAdapterPrefersRunCanonicalProjection() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        let rawArtifactURL = tempRoot.appendingPathComponent("self-assessment-raw.json")
+        try Data("""
+        {
+          "implementation_complete": false,
+          "verification_green": true,
+          "remaining_code_tasks": [
+            {
+              "summary": "Raw artifact wants another code pass",
+              "owner": "code_writer",
+              "blocking": true,
+              "evidence": "The run projection must be preferred."
+            }
+          ],
+          "handoff_tasks": [],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": []
+        }
+        """.utf8).write(to: rawArtifactURL)
+
+        let run = Run(
+            workflowID: "full_mvp_live",
+            workflowTitle: "Full MVP",
+            workflowSnapshotHash: "wf",
+            catalogSnapshotHash: "cat",
+            workflowSourcePath: "workflow.yaml",
+            catalogSourcePath: "agents.yaml",
+            workflowSnapshotJSON: Data("{}".utf8),
+            catalogSnapshotJSON: Data("{}".utf8)
+        )
+        run.implementationSelfAssessmentSummaryJSON = Data("""
+        {
+          "status": "blocked",
+          "implementation_complete": true,
+          "verification_green": false,
+          "remaining_code_tasks": [],
+          "handoff_tasks": [],
+          "known_risks": ["Verification is blocked downstream."],
+          "tests_run": ["proposal-054: blocked"],
+          "docs_impacted": [],
+          "owner_class_counts": {},
+          "target_stage_summaries": [],
+          "validation_errors": [],
+          "warnings": []
+        }
+        """.utf8)
+
+        let rawArtifact = Artifact(
+            name: "implementation_self_assessment",
+            contractID: "implementation_self_assessment_v2",
+            format: .json,
+            filePath: rawArtifactURL.path,
+            runID: run.id,
+            stageID: "state_8_implementation_continued",
+            agentID: "code_writer",
+            provider: "test"
+        )
+
+        let summary = try #require(ImplementationSelfAssessmentDisplayAdapter.summary(from: run, artifacts: [rawArtifact]))
+        #expect(summary.status == "blocked")
+        #expect(summary.verificationGreen == false)
+        #expect(summary.remainingCodeTasks.isEmpty)
+        #expect(summary.sourceArtifactName == "run.implementation_self_assessment_summary")
+    }
+
+    @Test("Implementation self-assessment projection exposes transition statuses from canonical summaries")
+    func implementationSelfAssessmentProjectionExposesTransitionStatusesFromCanonicalSummaries() throws {
+        let cases: [(String, String)] = [
+            (
+                "complete",
+                """
+                {
+                  "status": "complete",
+                  "implementation_complete": true,
+                  "verification_green": true,
+                  "remaining_code_tasks": [],
+                  "handoff_tasks": [],
+                  "known_risks": [],
+                  "tests_run": ["proposal-054: pass"],
+                  "docs_impacted": [],
+                  "owner_class_counts": {},
+                  "target_stage_summaries": [],
+                  "validation_errors": [],
+                  "warnings": []
+                }
+                """
+            ),
+            (
+                "needs_code_fixes",
+                """
+                {
+                  "status": "needs_code_fixes",
+                  "implementation_complete": false,
+                  "verification_green": true,
+                  "remaining_code_tasks": [],
+                  "handoff_tasks": [],
+                  "known_risks": [],
+                  "tests_run": ["proposal-054: failing"],
+                  "docs_impacted": [],
+                  "owner_class_counts": {},
+                  "target_stage_summaries": [],
+                  "validation_errors": [],
+                  "warnings": []
+                }
+                """
+            ),
+            (
+                "blocked",
+                """
+                {
+                  "status": "blocked",
+                  "implementation_complete": true,
+                  "verification_green": false,
+                  "remaining_code_tasks": [],
+                  "handoff_tasks": [],
+                  "known_risks": ["xcodebuild unavailable"],
+                  "tests_run": ["proposal-054: blocked"],
+                  "docs_impacted": [],
+                  "owner_class_counts": {},
+                  "target_stage_summaries": [],
+                  "validation_errors": [],
+                  "warnings": []
+                }
+                """
+            ),
+            (
+                "handoff_required",
+                """
+                {
+                  "status": "handoff_required",
+                  "implementation_complete": true,
+                  "verification_green": true,
+                  "remaining_code_tasks": [],
+                  "handoff_tasks": [
+                    {
+                      "summary": "Capture signed-in smoke evidence",
+                      "owner_class": "manual_evidence",
+                      "target_stage": "state_9_implementation_reviewed",
+                      "blocking_review": true,
+                      "evidence": "Manual smoke evidence remains outside code_writer."
+                    }
+                  ],
+                  "known_risks": [],
+                  "tests_run": ["proposal-054: pass"],
+                  "docs_impacted": [],
+                  "owner_class_counts": {
+                    "manual_evidence": 1
+                  },
+                  "target_stage_summaries": [
+                    {
+                      "target_stage": "state_9_implementation_reviewed",
+                      "count": 1,
+                      "blocking_review_count": 1
+                    }
+                  ],
+                  "validation_errors": [],
+                  "warnings": []
+                }
+                """
+            ),
+            (
+                "invalid",
+                """
+                {
+                  "status": "invalid",
+                  "implementation_complete": true,
+                  "verification_green": null,
+                  "remaining_code_tasks": [],
+                  "handoff_tasks": [],
+                  "known_risks": [],
+                  "tests_run": [],
+                  "docs_impacted": [],
+                  "owner_class_counts": {},
+                  "target_stage_summaries": [],
+                  "validation_errors": [
+                    {
+                      "code": "missing_required_field",
+                      "message": "required field verification_green is missing",
+                      "pointer": "/verification_green"
+                    }
+                  ],
+                  "warnings": []
+                }
+                """
+            ),
+            (
+                "unknown",
+                """
+                {
+                  "status": "unknown",
+                  "implementation_complete": true,
+                  "verification_green": null,
+                  "remaining_code_tasks": [],
+                  "handoff_tasks": [],
+                  "known_risks": [],
+                  "tests_run": [],
+                  "docs_impacted": [],
+                  "owner_class_counts": {},
+                  "target_stage_summaries": [],
+                  "validation_errors": [],
+                  "warnings": [
+                    {
+                      "code": "legacy_v1_compatibility",
+                      "message": "legacy implementation_self_assessment was mapped by the canonical domain parser",
+                      "pointer": "/seemingly_complete"
+                    }
+                  ]
+                }
+                """
+            ),
+        ]
+
+        for (expectedStatus, payload) in cases {
+            let canonicalData = try #require(
+                ImplementationSelfAssessmentSummaryProjection.canonicalSummaryData(
+                    from: Data(payload.utf8),
+                    artifactName: "implementation_self_assessment"
+                )
+            )
+            let object = try #require(
+                JSONSerialization.jsonObject(with: canonicalData) as? [String: Any]
+            )
+            #expect(object["status"] as? String == expectedStatus)
+
+            let fields = try #require(
+                ImplementationSelfAssessmentSummaryProjection.scalarFields(
+                    fromCanonicalSummaryData: canonicalData
+                )
+            )
+            guard case .string(let projectedStatus) = fields["status"] else {
+                Issue.record("status scalar was not projected for \(expectedStatus)")
+                continue
+            }
+            #expect(projectedStatus == expectedStatus)
+        }
+    }
+
+    @Test("Implementation self-assessment projection ignores raw v2 artifacts")
+    func implementationSelfAssessmentProjectionIgnoresRawV2Artifacts() {
+        let payload = """
+        {
+          "implementation_complete": true,
+          "verification_green": true,
+          "remaining_code_tasks": [],
+          "handoff_tasks": [],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": []
+        }
+        """
+
+        let canonicalData = ImplementationSelfAssessmentSummaryProjection.canonicalSummaryData(
+            from: Data(payload.utf8),
+            artifactName: "implementation_self_assessment"
+        )
+        #expect(canonicalData == nil)
+    }
+
+    @Test("Implementation self-assessment strict validation rejects malformed nested task fields")
+    func implementationSelfAssessmentStrictValidationRejectsMalformedNestedTaskFields() {
+        let catalog = makeP054TestCatalog()
+        let agent = makeP054CodeWriterAgent()
+        let data = Data("""
+        {
+          "implementation_complete": true,
+          "verification_green": true,
+          "remaining_code_tasks": [
+            {
+              "summary": "Missing blocking",
+              "owner": "code_writer",
+              "evidence": "The blocking field must be explicit."
+            }
+          ],
+          "handoff_tasks": [],
+          "known_risks": [],
+          "tests_run": [],
+          "docs_impacted": []
+        }
+        """.utf8)
+
+        let results = OutputContractResolverV2.validateOutputs(
+            ["implementation_self_assessment": data],
+            agent: agent,
+            catalog: catalog
+        )
+
+        let result = results["implementation_self_assessment"]
+        #expect(result?.status == .failed)
+        #expect(result?.validationError?.contains("remaining_code_tasks[0].blocking") == true)
+    }
+
     @Test("Portability-sensitive runtime sources avoid workstation-specific absolute paths")
     func portabilitySensitiveSourcesAvoidHardcodedUserPaths() throws {
         let repoRoot = testRepositoryRootURL()
@@ -106,7 +777,7 @@ struct Proposal025Tests {
             "Chainworks Forge/Views/ReleaseGateView.swift",
             "Chainworks Forge/Views/IdeaListView.swift",
             "Chainworks ForgeTests/Chainworks_ForgeTests.swift",
-            "Chainworks ForgeTests/GooseSessionBridgeTests.swift"
+            "Chainworks ForgeTests/RuntimeSessionBridgeTests.swift"
         ]
 
         for relativePath in sensitiveFiles {
@@ -240,7 +911,6 @@ struct Proposal025Tests {
         let repoRoot = testRepositoryRootURL()
         let sensitiveFiles = [
             "Chainworks Forge/Chainworks_ForgeApp.swift",
-            "Chainworks Forge/Views/UITestDirectSurfaces.swift",
             "Chainworks Forge/Engine/SampleRunLauncher.swift"
         ]
         let forbiddenFragments = [
@@ -356,7 +1026,7 @@ struct Proposal025Tests {
         let workspace = makeTestWorkspace()
         let run = makeTestRun(workspace: workspace, context: context)
         run.status = .blocked
-        run.driftDetails = "Goose extension registry is unavailable, but one or more agents request MCP extensions."
+        run.driftDetails = "Extension registry is unavailable, but one or more agents request MCP extensions."
 
         let summary = SessionReuseKPIExporter.exportKPIs(for: run.id, context: context)
         #expect(summary.mcpTelemetry.totalMCPPreflightBlockedRuns == 1)
@@ -462,4 +1132,73 @@ struct Proposal025Tests {
         #expect(bindingB.actualMCPExtensions == ["xcode"])
         #expect(bindingB.deniedMCPExtensions.isEmpty)
     }
+}
+
+private func makeP054TestCatalog() -> AgentCatalog {
+    AgentCatalog(
+        schemaVersion: 1,
+        app: AppConfig(
+            name: "test",
+            runtime: "claude_agent",
+            transport: "http",
+            description: "test",
+            ideaInputMode: "text",
+            singleActiveRunPerIdea: true,
+            runResumePolicy: "automatic_on_launch",
+            requiredProviders: []
+        ),
+        paths: [:],
+        artifacts: [:],
+        skills: [:],
+        contracts: [
+            "implementation_self_assessment_v2": ArtifactContract(
+                format: "json",
+                requiredFields: [
+                    "implementation_complete",
+                    "verification_green",
+                    "remaining_code_tasks",
+                    "handoff_tasks",
+                    "known_risks",
+                    "tests_run",
+                    "docs_impacted"
+                ]
+            )
+        ],
+        backendProfiles: [
+            "test_profile": BackendProfile(
+                provider: "codex",
+                model: "gpt-5.4",
+                effort: "high",
+                temperature: 0.0,
+                maxTurns: 20,
+                structuredOutput: "required"
+            )
+        ],
+        permissionProfiles: [:],
+        runtimeProfiles: [:],
+        agents: []
+    )
+}
+
+private func makeP054CodeWriterAgent() -> ResolvedAgent {
+    ResolvedAgent(
+        id: "code_writer",
+        title: "Code Writer",
+        mode: "implementation",
+        backendProfileID: "test_profile",
+        provider: "codex",
+        model: "gpt-5.4",
+        effort: "high",
+        maxTurns: 18,
+        temperature: 0.0,
+        permissionProfile: "WRITE",
+        skillRef: "code_writer_core",
+        skillRole: nil,
+        prompt: "Implement the proposal",
+        outputContract: "implementation_self_assessment_v2",
+        requiresHumanApproval: false,
+        inputs: [],
+        outputs: ["implementation_self_assessment"],
+        worktreeWriteEnabled: true
+    )
 }

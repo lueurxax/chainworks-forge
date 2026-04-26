@@ -1,6 +1,6 @@
 # Context Strategy and Experiment Framework
 
-Stable reference for the implemented context-strategy, experiment, lazy-evidence, and strategy-recommendation slice that was previously tracked by Proposal 019.
+Stable reference for the context-strategy, experiment, lazy-evidence, and strategy-recommendation slice.
 
 ## Purpose
 
@@ -14,8 +14,6 @@ This document is the stable contract for:
 - model-tier escalation for retryable non-contract failures,
 - normalized strategy telemetry and scoring,
 - and shell-owned badges, recommendation output, and operator overrides.
-
-For implementation and proof status, use [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md).
 
 ## Scope
 
@@ -54,7 +52,7 @@ Clone-with-current may recompile against current disk config, but that must crea
 
 `HandoffCompiler` owns context selection, summarization, promoted-artifact inclusion, and lazy references.
 
-`GooseSessionBridge` remains the only owner of the final provider-facing `ExecutionPacket`.
+`RuntimeSessionBridge` remains the only owner of the final provider-facing `ExecutionPacket`.
 
 `BindingFingerprintBuilder` continues to hash the effective execution surface that is actually sent to the provider, including strategy-owned handoff material once it has been embedded into the final packet.
 
@@ -165,12 +163,10 @@ No separate experiment dashboard is required for this slice to remain valid.
 The strongest current proof owners for this slice are:
 
 - `Proposal019Tests`
-- `GooseSessionBridgeTests`
-- `GooseAgentExecutorTests`
+- `RuntimeSessionBridgeTests`
+- `RuntimeAgentExecutorTests`
 - `OrchestratorTests`
 - `scripts/test-gate.sh proposal-019`
-
-For the consolidated proof story, use [../evidence/context-strategy-and-experiment-framework-proof.md](../evidence/context-strategy-and-experiment-framework-proof.md).
 
 ## Adjacent References
 
