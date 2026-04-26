@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    ideas, runs, stages, work_items,
+    ideas, runs, sessions, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentOutputSettlement, AgentStatus, ArtifactSourceClaimState};
@@ -158,7 +158,11 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
         claimed.artifact_claim_key.agent_execution_id,
         claimed.agent_execution_id
     );
-    assert_eq!(claimed.session_generation_id.len(), 36);
+    let claimed_session_generation_id = claimed
+        .session_generation_id
+        .as_deref()
+        .expect("session-scoped claim should carry a provisional generation id");
+    assert_eq!(claimed_session_generation_id.len(), 36);
 
     let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
         .await
@@ -167,7 +171,7 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
     assert_eq!(executions[0].id, claimed.agent_execution_id);
     assert_eq!(
         executions[0].session_generation_id.as_deref(),
-        Some(claimed.session_generation_id.as_str())
+        Some(claimed_session_generation_id)
     );
     let facts =
         agent_execution_runtime_facts::find_by_execution_id(&pool, claimed.agent_execution_id)
@@ -187,7 +191,7 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
     assert_eq!(claim.claim_state.to_string(), "active");
     assert_eq!(
         claim.current_session_generation_id.as_deref(),
-        Some(claimed.session_generation_id.as_str())
+        Some(claimed_session_generation_id)
     );
 
     let persisted_work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
@@ -207,8 +211,373 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
     );
     assert_eq!(
         persisted_payload["p058_claimed"]["session_policy_decision"]["generation"]["id"],
-        claimed.session_generation_id
+        claimed_session_generation_id
     );
+
+    work_items::complete(&pool, &claimed.work_item_id)
+        .await
+        .unwrap();
+    let settled_execution = agent_executions::find_by_id(&pool, claimed.agent_execution_id)
+        .await
+        .unwrap()
+        .expect("preclaimed execution remains readable after work item completion");
+    assert_eq!(
+        settled_execution.status,
+        AgentStatus::Completed,
+        "completing a preclaimed InvokeAgent work item must not leave its execution running"
+    );
+    assert!(
+        settled_execution.completed_at.is_some(),
+        "completed preclaimed execution must have terminal timestamp"
+    );
+    let closed_claim =
+        artifact_contracts::load_source_generation_claim(&pool, &claimed.artifact_claim_key)
+            .await
+            .unwrap()
+            .expect("preclaimed artifact claim remains readable after work item completion");
+    assert_eq!(
+        closed_claim.claim_state.to_string(),
+        "closed",
+        "completing a preclaimed InvokeAgent work item must close its active source claim"
+    );
+    work_items::fail(&pool, &claimed.work_item_id, "late transport error")
+        .await
+        .unwrap();
+    let terminal_work = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == claimed.work_item_id)
+        .expect("completed work item remains readable");
+    assert_eq!(
+        terminal_work.status,
+        WorkItemStatus::Completed,
+        "late failure must not overwrite terminal completed work item truth"
+    );
+}
+
+#[tokio::test]
+async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_generation() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 no session scope".into(),
+            body: "claim/start without reuse".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "docs".into(),
+            label: "Docs".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "invoke-work-item-no-session".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "docs",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "docs_guardian",
+                "provider": "gemini",
+                "model": "gemini-2.5-flash",
+                "prompt": "check docs",
+                "task_name": "docs",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": null,
+                "session_family_id": null,
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("docs".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("claim/start should claim non-session InvokeAgent");
+    assert!(claimed.session_generation_id.is_none());
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].id, claimed.agent_execution_id);
+    assert!(executions[0].session_lineage_id.is_none());
+    assert!(executions[0].session_generation_id.is_none());
+    assert!(executions[0].session_reuse_disposition.is_none());
+
+    let claim =
+        artifact_contracts::load_source_generation_claim(&pool, &claimed.artifact_claim_key)
+            .await
+            .unwrap()
+            .expect("active artifact claim");
+    assert_eq!(claim.claim_state.to_string(), "active");
+    assert!(claim.current_session_generation_id.is_none());
+
+    let persisted_work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let persisted_claimed = persisted_work_items
+        .iter()
+        .find(|item| item.id == claimed.work_item_id)
+        .expect("claimed work item persisted");
+    assert_eq!(persisted_claimed.status, WorkItemStatus::Running);
+    let persisted_started_at: Option<String> =
+        sqlx::query_scalar("SELECT started_at FROM work_items WHERE id = ?1")
+            .bind(&claimed.work_item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(persisted_started_at.is_some());
+    let persisted_payload: serde_json::Value =
+        serde_json::from_str(&persisted_claimed.payload_json).unwrap();
+    assert_eq!(
+        persisted_payload["p058_claimed"]["agent_execution_id"],
+        claimed.agent_execution_id.to_string()
+    );
+    assert!(persisted_payload["p058_claimed"]
+        .get("session_generation_id")
+        .is_none());
+    assert!(persisted_payload["p058_claimed"]
+        .get("session_policy_decision")
+        .is_none());
+}
+
+#[tokio::test]
+async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let agent_execution_id = AgentExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 legacy no session scope".into(),
+            body: "claim/start legacy fake generation".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "docs".into(),
+            label: "Docs".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claim_key = ArtifactSourceGenerationClaimKey {
+        run_id,
+        stage_execution_id,
+        agent_execution_id,
+        source_work_item_id: "legacy-preclaimed-no-session".into(),
+    };
+    let now = Utc::now();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: agent_execution_id,
+            stage_execution_id,
+            agent_id: "docs_guardian".into(),
+            provider: "gemini".into(),
+            model: Some("gemini-2.5-flash".into()),
+            status: AgentStatus::Running,
+            started_at: now,
+            completed_at: None,
+            session_lineage_id: Some("fake-generation".into()),
+            session_generation_id: Some("fake-generation".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner".into()),
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            actual_xcode_runtime_observation_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    artifact_contracts::insert_source_generation_claim(
+        &pool,
+        ArtifactSourceGenerationClaim {
+            key: claim_key.clone(),
+            current_session_generation_id: Some("fake-generation".into()),
+            claim_state: ArtifactSourceClaimState::Active,
+            superseding_work_item_id: None,
+            superseded_by_agent_execution_id: None,
+            supersession_journal_id: None,
+            superseded_at: None,
+            closed_at: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "legacy-preclaimed-no-session".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "docs",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "docs_guardian",
+                "provider": "gemini",
+                "model": "gemini-2.5-flash",
+                "prompt": "check docs",
+                "task_name": "docs",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": null,
+                "session_family_id": null,
+                "worktree_write_enabled": false,
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id.to_string(),
+                    "artifact_claim_key": claim_key,
+                    "session_generation_id": "fake-generation",
+                    "session_policy_decision": {
+                        "generation": { "id": "fake-generation" }
+                    }
+                }
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("docs".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("legacy preclaim should be reclaimed");
+    assert!(claimed.session_generation_id.is_none());
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert!(executions[0].session_lineage_id.is_none());
+    assert!(executions[0].session_generation_id.is_none());
+    assert!(executions[0].session_reuse_disposition.is_none());
+
+    let claim =
+        artifact_contracts::load_source_generation_claim(&pool, &claimed.artifact_claim_key)
+            .await
+            .unwrap()
+            .expect("claim remains active until output import closes it");
+    assert!(claim.current_session_generation_id.is_none());
+
+    let persisted_work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let persisted_claimed = persisted_work_items
+        .iter()
+        .find(|item| item.id == claimed.work_item_id)
+        .expect("claimed work item persisted");
+    let persisted_payload: serde_json::Value =
+        serde_json::from_str(&persisted_claimed.payload_json).unwrap();
+    assert!(persisted_payload["p058_claimed"]
+        .get("session_generation_id")
+        .is_none());
+    assert!(persisted_payload["p058_claimed"]
+        .get("session_policy_decision")
+        .is_none());
 }
 
 #[tokio::test]
@@ -342,6 +711,117 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_without_new_ex
 }
 
 #[tokio::test]
+async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_execution() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 terminal settlement".into(),
+            body: "terminal InvokeAgent work item settles its preclaimed execution".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "invoke-terminal-before-repair".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "implementation",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "claude",
+                "model": "sonnet",
+                "declared_outputs": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer"
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("claim/start should preclaim execution");
+    work_items::fail(
+        &pool,
+        "invoke-terminal-before-repair",
+        "provider startup failed",
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+    assert_eq!(summary.agent_executions_settled, 1);
+
+    let execution = agent_executions::find_by_id(&pool, claimed.agent_execution_id)
+        .await
+        .unwrap()
+        .expect("preclaimed execution remains addressable");
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert!(
+        execution.completed_at.is_some(),
+        "terminal preclaimed execution must receive completed_at"
+    );
+}
+
+#[tokio::test]
 async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_creation() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-invoke.sqlite");
@@ -447,6 +927,106 @@ async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_cre
         .await
         .unwrap();
     assert!(executions.is_empty());
+}
+
+#[tokio::test]
+async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 null reuse".into(),
+            body: "explicit null session reuse scope".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "explicit-null-reuse-invoke".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "implementation",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "docs_guardian",
+                "provider": "gemini",
+                "model": "flash",
+                "session_reuse_scope": null,
+                "session_family_id": null,
+                "declared_outputs": []
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("explicit null session_reuse_scope should mean no reuse, not legacy missing");
+
+    assert_eq!(claimed.source_work_item_id, "explicit-null-reuse-invoke");
+    let failed = work_items::list_by_status(&pool, WorkItemStatus::Failed)
+        .await
+        .unwrap();
+    assert!(
+        failed.is_empty(),
+        "explicit null reuse must not fail closed"
+    );
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].session_reuse_scope, None);
 }
 
 #[tokio::test]
@@ -563,6 +1143,172 @@ async fn proposal_058_production_executor_fails_sessionless_invoke_before_proces
         .await
         .unwrap();
     assert!(executions.is_empty());
+}
+
+#[tokio::test]
+async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let db_path = tempdir.path().join("production-loop-invoke.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 production loop".into(),
+            body: "production loop claims invoke_agent".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now() - Duration::minutes(1);
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "production-loop-invoke".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "implementation",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "fixture-missing",
+                "model": "fixture",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "declared_outputs": []
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let queue = WorkQueue::new(pool.clone());
+    let events = event_bus::new_bus(16);
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        queue.clone(),
+    ));
+    let executor = Arc::new(BackgroundExecutor::new(
+        pool.clone(),
+        queue,
+        orchestrator,
+        Arc::new(acp::AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    ));
+    let handle = Arc::clone(&executor).start();
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+            let item = items
+                .iter()
+                .find(|item| item.id == "production-loop-invoke")
+                .unwrap();
+            if matches!(
+                item.status,
+                WorkItemStatus::Completed | WorkItemStatus::Failed | WorkItemStatus::Cancelled
+            ) {
+                return item.status.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("production executor loop must claim InvokeAgent work without a non-invoke wake item");
+
+    handle.abort();
+
+    assert_ne!(status, WorkItemStatus::Pending);
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "claim/start must create the AgentExecution before provider execution"
+    );
+    assert_eq!(
+        executions[0].status,
+        AgentStatus::Failed,
+        "ACP startup errors must not leave precreated AgentExecution rows running"
+    );
+    assert!(
+        executions[0].completed_at.is_some(),
+        "failed startup execution must be terminal"
+    );
+    let session_generation_id = executions[0]
+        .session_generation_id
+        .as_deref()
+        .expect("preclaimed execution must be rebound to real session generation before ACP");
+    let generation = sessions::find_generation_by_id(&pool, session_generation_id)
+        .await
+        .unwrap()
+        .expect("session generation referenced by preclaimed execution must exist");
+    assert_eq!(generation.runtime_provider, "fixture-missing");
+    assert_eq!(generation.runtime_model, "fixture");
+    let claim_key = ArtifactSourceGenerationClaimKey {
+        run_id,
+        stage_execution_id,
+        agent_execution_id: executions[0].id,
+        source_work_item_id: "production-loop-invoke".into(),
+    };
+    let claim = artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+        .await
+        .unwrap()
+        .expect("preclaimed artifact claim remains addressable");
+    assert_eq!(
+        claim.current_session_generation_id.as_deref(),
+        Some(session_generation_id),
+        "artifact claim CAS token must track the real session generation, not the preclaim placeholder"
+    );
 }
 
 #[tokio::test]

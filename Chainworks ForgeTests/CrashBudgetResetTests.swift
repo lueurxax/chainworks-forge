@@ -40,7 +40,7 @@ final class CrashBudgetResetTests: XCTestCase {
     // MARK: - Coordinator
 
     @MainActor
-    func test_perform_reset_deletes_file_and_requests_single_restart() throws {
+    func test_perform_reset_deletes_file_and_requests_single_restart() async throws {
         let tmp = try makeTempAppSupportDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: tmp)
@@ -53,7 +53,7 @@ final class CrashBudgetResetTests: XCTestCase {
             restarter: restarter
         )
 
-        let result = coordinator.performReset()
+        let result = await coordinator.performReset()
 
         XCTAssertTrue(result.isFullySuccessful)
         XCTAssertEqual(restarter.restartCount, 1,
@@ -63,7 +63,7 @@ final class CrashBudgetResetTests: XCTestCase {
     }
 
     @MainActor
-    func test_perform_reset_noop_when_already_absent_still_requests_restart() throws {
+    func test_perform_reset_noop_when_already_absent_still_requests_restart() async throws {
         // §6.2: the operator may click Reset preemptively before the
         // daemon records a crash. In that case there is no file to
         // delete but we still want to kick the daemon so UI stays in
@@ -79,7 +79,7 @@ final class CrashBudgetResetTests: XCTestCase {
             restarter: restarter
         )
 
-        let result = coordinator.performReset()
+        let result = await coordinator.performReset()
 
         XCTAssertTrue(result.isFullySuccessful)
         XCTAssertEqual(restarter.restartCount, 1)
@@ -91,7 +91,7 @@ final class CrashBudgetResetTests: XCTestCase {
     }
 
     @MainActor
-    func test_perform_reset_reports_restart_error_while_still_deleting_file() throws {
+    func test_perform_reset_reports_restart_error_while_still_deleting_file() async throws {
         let tmp = try makeTempAppSupportDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: tmp)
@@ -105,7 +105,7 @@ final class CrashBudgetResetTests: XCTestCase {
             restarter: restarter
         )
 
-        let result = coordinator.performReset()
+        let result = await coordinator.performReset()
 
         XCTAssertNotNil(result.restartError,
                         "coordinator must surface restart failures to the UI")
@@ -134,12 +134,12 @@ final class CrashBudgetResetTests: XCTestCase {
 @MainActor
 private final class CountingRestarter: DaemonRestarter {
     var restartCount: Int = 0
-    func requestRestart() throws { restartCount += 1 }
+    func requestRestart() async throws { restartCount += 1 }
 }
 
 @MainActor
 private final class FailingRestarter: DaemonRestarter {
     let error: Error
     init(error: Error) { self.error = error }
-    func requestRestart() throws { throw error }
+    func requestRestart() async throws { throw error }
 }

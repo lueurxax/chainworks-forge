@@ -18,7 +18,8 @@ workflow:
 variables:
   proposal_score_target: 8.5
   min_individual_proposal_score: 8
-  implementation_target_status: Implemented
+  audit_target_status: implemented
+  implementation_review_target_status: code_complete
   max_proposal_revision_cycles: 6
   max_implementation_progress_cycles: 10
   max_implementation_revision_cycles: 8
@@ -35,7 +36,7 @@ scoring:
       - blocker_count == 0
   implementation:
     implemented_when:
-      - audit_report.status == vars.implementation_target_status
+      - audit_report.status == vars.audit_target_status
       - security_report.status == 'pass'
       - prepush_review_report.status == 'pass'
       - docs_report.status in ['pass', 'not_needed']
@@ -312,9 +313,9 @@ states:
             - run_state
     transitions:
       - to: state_11_manual_release
-        when: implementation_review_summary.status == vars.implementation_target_status and implementation_review_summary.status != 'release_evidence_blocked'
+        when: implementation_self_assessment_v2.blocking_remaining_code_tasks == 0
       - to: state_10_implementation_refined
-        when: implementation_review_summary.status != vars.implementation_target_status or implementation_review_summary.status == 'release_evidence_blocked'
+        when: implementation_self_assessment_v2.blocking_remaining_code_tasks > 0
 
   state_10_implementation_refined:
     label: Implementation refined

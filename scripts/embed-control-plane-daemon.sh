@@ -197,4 +197,11 @@ fi
 # informational only — the value in the binary is the exported one.
 echo "embed-control-plane-daemon: bundled daemon sha ${GIT_SHA}"
 
+# App-side lifecycle/read surfaces compare this stamp with the live
+# daemon's `/ready` build_sha so operators see an explicit update-required
+# state even when the GraphQL schema version did not change.
+BUNDLED_SHA_RESOURCE_DIR="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH:-${CONTENTS_FOLDER_PATH:-Contents}/Resources}"
+mkdir -p "${BUNDLED_SHA_RESOURCE_DIR}"
+printf '%s\n' "${GIT_SHA}" > "${BUNDLED_SHA_RESOURCE_DIR}/bundled-daemon-build-sha.txt"
+
 echo "embed-control-plane-daemon: ok → ${DEST_BIN}"

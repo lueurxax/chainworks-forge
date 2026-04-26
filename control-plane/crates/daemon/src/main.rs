@@ -286,12 +286,13 @@ async fn main() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
-    let host_interruption_service = HostInterruptionService::with_capacity_config_and_runtime_cleanup(
-        pool.clone(),
-        work_queue.clone(),
-        InvokeAgentCapacityConfig::default(),
-        acp.clone(),
-    );
+    let host_interruption_service =
+        HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+            pool.clone(),
+            work_queue.clone(),
+            InvokeAgentCapacityConfig::default(),
+            acp.clone(),
+        );
     let _runtime_heartbeat_monitor =
         spawn_runtime_heartbeat_monitor(host_interruption_service.clone());
     let _native_host_interruption_monitor =

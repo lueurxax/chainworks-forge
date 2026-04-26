@@ -288,15 +288,17 @@ struct DaemonLifecycleBanner: View {
     }
 
     private func performCrashBudgetReset() {
-        let result = CrashBudgetResetCoordinator.shared.performReset()
-        crashBudgetResetResultSummary = result.summary
-        showCrashBudgetResetResultAlert = true
-        // After a successful reset the daemon should come back up on
-        // its own; refresh the view model so the banner picks up the
-        // next heartbeat rather than staying pinned on the old failed
-        // frame.
-        if result.isFullySuccessful {
-            Task { await viewModel.refresh() }
+        Task { @MainActor in
+            let result = await CrashBudgetResetCoordinator.shared.performReset()
+            crashBudgetResetResultSummary = result.summary
+            showCrashBudgetResetResultAlert = true
+            // After a successful reset the daemon should come back up
+            // on its own; refresh the view model so the banner picks
+            // up the next heartbeat rather than staying pinned on the
+            // old failed frame.
+            if result.isFullySuccessful {
+                await viewModel.refresh()
+            }
         }
     }
 

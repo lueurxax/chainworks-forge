@@ -1,0 +1,79 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Iconography rules</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{font-family:var(--font-text);color:var(--label);-webkit-font-smoothing:antialiased;height:220px;overflow:hidden;}
+  .card{padding:20px 24px;height:100%;box-sizing:border-box;}
+  .lbl{font:var(--t-caption2);letter-spacing:var(--tracking-wide);color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .row{display:flex;gap:12px;align-items:center;}
+  .row.tight{gap:6px;}
+  .stack{display:flex;flex-direction:column;gap:12px;}
+  .chip{display:flex;align-items:center;gap:8px;background:#fff;padding:6px 10px 6px 8px;border-radius:8px;box-shadow:inset 0 0 0 0.5px rgba(0,0,0,0.08);}
+  .chip .meta{display:flex;flex-direction:column;gap:0;}
+  .chip .name{font:600 11px/14px var(--font-text);}
+  .chip .api{font-family:var(--font-mono);font-size:9.5px;color:var(--label-tertiary);}
+</style></head>
+<body><div class="card">
+<div class="stack" style="gap:10px;">
+
+  <div class="lbl">SF Symbols (production) · Lucide (web mocks)</div>
+  <div class="row" style="gap:12px;flex-wrap:wrap;">
+
+    <!-- Running · bolt.fill -->
+    <div class="chip">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="#0A84FF" style="flex-shrink:0;">
+        <path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/>
+      </svg>
+      <div class="meta"><div class="name">Running</div><div class="api">bolt.circle.fill</div></div>
+    </div>
+
+    <!-- Approved · checkmark.seal.fill -->
+    <div class="chip">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="#34C759" style="flex-shrink:0;">
+        <path d="M12 2l2.4 2.6 3.5-.5.5 3.5L21 10l-2.6 2.4.5 3.5-3.5.5L12 19l-2.4-2.6-3.5.5-.5-3.5L3 10l2.6-2.4-.5-3.5 3.5-.5z"/>
+      </svg>
+      <div class="meta"><div class="name">Approved</div><div class="api">checkmark.seal.fill</div></div>
+    </div>
+
+    <!-- Failed · xmark.circle.fill — properly centered cross on a 24×24 grid -->
+    <div class="chip">
+      <svg width="16" height="16" viewBox="0 0 24 24" style="flex-shrink:0;">
+        <circle cx="12" cy="12" r="10" fill="#FF3B30"/>
+        <path d="M8.5 8.5l7 7M15.5 8.5l-7 7" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <div class="meta"><div class="name">Failed</div><div class="api">xmark.circle.fill</div></div>
+    </div>
+
+    <!-- Blocked · pause.circle.fill — centered pair of bars -->
+    <div class="chip">
+      <svg width="16" height="16" viewBox="0 0 24 24" style="flex-shrink:0;">
+        <circle cx="12" cy="12" r="10" fill="#FF9F0A"/>
+        <rect x="9" y="8"  width="2" height="8" rx="1" fill="#fff"/>
+        <rect x="13" y="8" width="2" height="8" rx="1" fill="#fff"/>
+      </svg>
+      <div class="meta"><div class="name">Blocked</div><div class="api">pause.circle.fill</div></div>
+    </div>
+
+    <!-- Pending · clock -->
+    <div class="chip">
+      <svg width="16" height="16" viewBox="0 0 24 24" style="flex-shrink:0;">
+        <circle cx="12" cy="12" r="10" fill="none" stroke="#8E8E93" stroke-width="2"/>
+        <path d="M12 7v5l3.5 2" stroke="#8E8E93" stroke-width="2" stroke-linecap="round" fill="none"/>
+      </svg>
+      <div class="meta"><div class="name">Pending</div><div class="api">clock</div></div>
+    </div>
+
+    <!-- Cancelled · slash.circle.fill -->
+    <div class="chip">
+      <svg width="16" height="16" viewBox="0 0 24 24" style="flex-shrink:0;">
+        <circle cx="12" cy="12" r="10" fill="#C7C7CC"/>
+        <path d="M6.5 6.5l11 11" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <div class="meta"><div class="name">Cancelled</div><div class="api">slash.circle.fill</div></div>
+    </div>
+
+  </div>
+  <div style="font:var(--t-footnote);color:var(--label-secondary);">No emoji · no unicode glyphs · no hand-drawn SVG.</div>
+</div>
+</div></body></html>

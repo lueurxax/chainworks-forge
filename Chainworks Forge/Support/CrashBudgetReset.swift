@@ -103,7 +103,7 @@ protocol DaemonRestarter {
     /// lifecycle banner will re-surface state once the daemon comes
     /// back or stays down). Implementations should be idempotent.
     @MainActor
-    func requestRestart() throws
+    func requestRestart() async throws
 }
 
 #if os(macOS)
@@ -119,14 +119,26 @@ struct SMAppServiceDaemonRestarter: DaemonRestarter {
     }
 
     @MainActor
-    func requestRestart() throws {
+    func requestRestart() async throws {
         let service = SMAppService.agent(plistName: plistName)
         // Unregister may throw if the service wasn't registered — that
         // is fine, the subsequent register() is what matters.
-        try? service.unregister()
+        try? await service.unregister()
         try service.register()
     }
 }
+
+#if DEBUG
+/// Debug/dev restarter. The app bootstrap intentionally avoids
+/// `SMAppService` in Debug because LWCR rejects Apple Development
+/// signing; the reset UI must use the same process-supervisor path.
+struct DebugPackagedDaemonRestarter: DaemonRestarter {
+    @MainActor
+    func requestRestart() async throws {
+        try await Chainworks_ForgeApp.restartPackagedDaemonAgent()
+    }
+}
+#endif
 #endif
 
 /// High-level façade used by the UI button. Combines the file delete
@@ -139,14 +151,19 @@ struct CrashBudgetResetCoordinator {
     let restarter: DaemonRestarter?
 
     /// Default production binding. Uses live `FileManager` + a real
-    /// `SMAppServiceDaemonRestarter` on macOS and a no-op restarter on
+    /// daemon restarter on macOS and a no-op restarter on
     /// platforms where SMAppService is unavailable.
     static var shared: CrashBudgetResetCoordinator {
         #if os(macOS)
+        #if DEBUG
+        let restarter: DaemonRestarter? = DebugPackagedDaemonRestarter()
+        #else
+        let restarter: DaemonRestarter? = SMAppServiceDaemonRestarter()
+        #endif
         return CrashBudgetResetCoordinator(
             appSupportDir: CrashBudgetFiles.defaultAppSupportDir(),
             fileManager: .default,
-            restarter: SMAppServiceDaemonRestarter()
+            restarter: restarter
         )
         #else
         return CrashBudgetResetCoordinator(
@@ -160,7 +177,7 @@ struct CrashBudgetResetCoordinator {
     /// Perform the reset flow. Returns a typed result so the UI knows
     /// whether to celebrate or warn the operator. Does not throw —
     /// every failure mode is captured in the returned value.
-    func performReset() -> CrashBudgetResetResult {
+    func performReset() async -> CrashBudgetResetResult {
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: appSupportDir)
         let fileOutcome = CrashBudgetFiles.deleteCrashBudgetFile(
             at: url,
@@ -169,7 +186,7 @@ struct CrashBudgetResetCoordinator {
         var restartError: Error?
         if fileOutcome.isSuccess, let restarter = restarter {
             do {
-                try restarter.requestRestart()
+                try await restarter.requestRestart()
             } catch {
                 restartError = error
             }

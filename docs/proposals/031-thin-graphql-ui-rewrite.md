@@ -3,7 +3,7 @@
 Revision: `031-2026-04-24-r19-degraded-state-correction`
 Source packet: prior run `8dd01a54-0791-43e0-b526-5ed92c95b34f`, r18  
 Current run: `72409268-9dea-4ece-82f6-6ef29b4a446e`  
-Status: ready for aggregate re-review only. Implementation approval remains rejected/stale until this GraphQL-only scope is reviewed and approved.
+Status: stopped at GraphQL-only read-boundary stabilization. Do not continue P031 as the vehicle for visual/product polish; remaining visual, dogfood, and stabilization tails are handed off to P032/P036.
 
 ## Executive Summary
 
@@ -15,7 +15,15 @@ This restart keeps the prior r18 packet as the baseline and converts it into a s
 
 ## Decision Summary
 
-Approve P031 only for Phase 0 contract hardening after aggregate re-review. Do not begin Swift screen migration, dogfood, or flag removal until the phase-specific gates in this proposal pass.
+Stop P031 after landing the GraphQL-only read boundary and thin read surfaces. Treat P031 as the architectural cutover proposal, not the product-polish proposal. Do not use P031 to continue visual restoration, navigation redesign, dogfood sign-off, or write-path restoration work.
+
+Follow-up ownership:
+
+- P032 owns stabilization, release-readiness evidence, dogfood/sign-off, degraded drills/waivers, daemon lifecycle polish, freshness evidence, and documentation cleanup.
+- P036 owns visual and navigation restoration over the GraphQL read model: richer run/stage cards, definitions/catalog ergonomics, idea/catalog surfaces, stage-transition visualization, artifact browsing ergonomics, and overall operator flow.
+- Future write-path proposals own any interactive create/start/cancel/retry/approve behavior. P031 does not restore UI writes.
+
+The old Swift-local UI remains useful only as a visual and ergonomic reference. Mutation affordances from that UI are explicitly out of scope unless a later proposal defines an approved non-MCP, non-GraphQL-mutation transport.
 
 Hard decisions:
 
@@ -24,7 +32,42 @@ Hard decisions:
 - Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.
 - Full report payload rendering remains outside P031 and defaults to a P0 follow-up unless Phase 0d evidence proves metadata-only inspection is acceptable.
 - P031 does not preserve or restore the old Swift-orchestrator path. Fail-closed behavior means disabling or degrading affected thin UI surfaces while the control-plane database and GraphQL projections remain the source of truth; no local workflow writes are restored.
-- The stale r7 GraphQL+MCP implementation approval is non-authoritative. Re-review of the r19 GraphQL-only scope is required before implementation approval.
+- The stale r7 GraphQL+MCP implementation approval is non-authoritative. No further P031 implementation approval should be pursued unless P031 is explicitly reopened; product polish now belongs to P032/P036.
+
+## Stop-State Handoff: Visual Diff and Deferred Tails
+
+Visual baseline commit: `1cca56b9abd622ad7dc4e38304985cbf49e66780` (`2026-04-19T19:05:19+03:00`, `Add P060: lead-driven reviewer routing and expanded reviewer catalog`).
+
+This is the last pre-control-plane visual/ergonomic baseline selected for P031 handoff. It is the parent of the first large control-plane land commit `a17b1cd04ac38f46f61111c647911f03844b4a33` from 2026-04-21. Use it only as a visual reference. It includes old Swift-local mutation paths that are not P031-compatible and must not be restored through P031.
+
+Current P031 state:
+
+- The governed workflow UI reads through GraphQL-backed presenters.
+- The app exposes read-only Runs Home, run detail, stage transitions, artifacts, catalog context, approvals diagnostics, reports metadata, and daemon lifecycle.
+- Artifact rendering now performs content-based markdown/JSON handling instead of trusting file extensions alone.
+- Artifact browsing has a first-pass GraphQL-only filter/group/detail layout.
+- Write controls remain unavailable or diagnostic-only.
+
+Visual/ergonomic regressions to carry forward:
+
+| Surface | Pre-control-plane visual behavior worth preserving | Current P031 state | Follow-up owner |
+| --- | --- | --- | --- |
+| Runs Home rows | Status-grouped rows with clear attention lanes, compact action affordances, provenance/status chips, and strong card scanability. | GraphQL rows are functionally readable but visually flatter and less informative. | P036 |
+| Run detail | Dedicated panels for progress, workflow map, recovery, reports, comparisons, and artifact drill-in. | Single thin read-detail stack; useful for proof of read-boundary, not product-complete inspection. | P036 |
+| Stage visualization | `WorkflowMapView` had horizontal stage cards, chevron flow, current-stage outline, hover/tap detail popover, loop progress, occurrences, and transition labels. | P031 has a vertical transition list. It is truthful but loses the map/card affordance and stage-level density. | P036 |
+| Handoffs and agent panels | Old workflow map separated topology, handoffs, agents, telemetry, and timeline. | P031 exposes a simplified stage transition surface. | P036 |
+| Artifact hierarchy | Old `RunArtifactHierarchyView` grouped by stage/agent/semantic bucket, had promoted artifacts, filters, search, badges, and artifact rows with timestamps. | P031 has partial GraphQL-only grouping/filtering and split list/detail, but should be polished against the old hierarchy behavior. | P036 |
+| Artifact inspector | Old inspector had provenance chips, produced-by/consumed-by traceability, pin/open actions, proposal-loop summaries, and format-aware rendering. | P031 focuses on safe read-only payload rendering. Provenance/traceability/actions need GraphQL-backed replacements or explicit deferral. | P036 for UX, P032 for evidence/docs |
+| Ideas | Old Ideas surface had sidebar cards, summary strip, archive/new idea flows, approval bar, and idea detail with run context. | P031 does not restore a full GraphQL-only idea/catalog experience. | P036 |
+| Agent catalog | Old catalog retained a two-pane detail form with summary strip and validation issues, but was still flat. | Current thin UI only provides limited catalog context in run detail. Full definitions/catalog inspection belongs outside P031. | P036 |
+| Workflow inspector/catalog | Old inspector showed workflow state details but sorted poorly; P036 already owns execution-order sorting and definitions consolidation. | P031 does not replace the full definitions experience. | P036 |
+| Dogfood/readiness evidence | P031 audits identified missing dogfood/sign-off, VoiceOver spot check or waiver, degraded drill/waiver, and post-dogfood approval re-entry. | Stop P031 before forcing audit closure on an incomplete product surface. | P032 |
+
+P031 close rule:
+
+- Keep the GraphQL-only boundary and tests as durable repository truth.
+- Do not spend more P031 work on restoring visual richness or write-path viability.
+- Move all remaining work into P032/P036 or later write-path proposals before launching through Chainworks.
 
 ## Problem
 
@@ -614,6 +657,8 @@ This section resolves reviewer feedback explicitly. No disagreement is hidden.
 
 ## Follow-Ups
 
+These historical P031 follow-ups are retained for traceability. New work should be launched through P032, P036, or a dedicated write-path proposal rather than by reopening P031.
+
 | ID | Priority | Expected Start | Description |
 | --- | --- | --- | --- |
 | `P031-FOLLOWUP-APPROVAL-WRITE-PATH` | P0 immediate next proposal | Before P031 Phase 3 flag removal decision | Define approved non-MCP, non-GraphQL-mutation approval decision transport if interactive approvals must return to macOS UI. |
@@ -654,4 +699,10 @@ Post-dogfood write-path readiness:
 
 ## Final Recommendation
 
-Proceed to aggregate re-review for this GraphQL-only r19 correction proposal. Do not request implementation approval until reviewers have evaluated this corrected scope. Do not begin Swift screen migration until Phase 0 produces executable guardrails. Do not start dogfood until operator workflow, degraded-state, report-priority, and UX/accessibility evidence is ready. Do not restore the old local Swift-orchestrator behavior.
+Stop P031 here. Treat the landed GraphQL-only read boundary and read-model guardrails as the durable P031 outcome, then move the remaining work to follow-up proposals:
+
+- P032: stabilization, dogfood/readiness evidence, degraded-state drills or waivers, daemon/schema lifecycle polish, freshness metrics, and documentation cleanup.
+- P036: visual parity and navigation consolidation over the GraphQL read model.
+- Separate write-path proposals: any future in-app create/start/cancel/retry/approve controls.
+
+Do not request another P031 audit to close product polish gaps. Do not restore the old local Swift-orchestrator behavior, local UI writes, UI MCP calls, or GraphQL mutations.

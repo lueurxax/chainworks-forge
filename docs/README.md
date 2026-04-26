@@ -40,6 +40,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### ACP transport and sessions
 
 - [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, and capacity management
+- [reference/xcode-mcp-bridge-pool.md](reference/xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, and broker health
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
 
@@ -62,12 +63,12 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Operator experience
 
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
-- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed UI write controls (P031)
-- [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — GraphQL projection read contract for the thin macOS client
-- [reference/run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
-- [reference/live-workflow-map.md](live-workflow-map.md) — Workflow topology and agent-activity surface
-- [reference/artifact-content-rendering.md](artifact-content-rendering.md) — Unified read-only markdown/JSON rendering
-- [reference/provider-platform.md](provider-platform.md) — Multi-provider/settings/diagnostics baseline and capacity caps
+- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls
+- [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client
+- [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
+- [reference/live-workflow-map.md](reference/live-workflow-map.md) — Workflow topology and agent-activity surface
+- [reference/artifact-content-rendering.md](reference/artifact-content-rendering.md) — Unified read-only markdown/JSON rendering
+- [reference/provider-platform.md](reference/provider-platform.md) — Multi-provider/settings/diagnostics baseline and capacity caps
 - [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — Archive/restore lifecycle for ideas
 - [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — UI readability, accessibility, shared status semantics
 - [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — Forge token lane, brand assets, visual rollout
@@ -91,13 +92,14 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 Design intent and work-in-progress lives under [`proposals/`](proposals). When a proposal reaches implemented/ready status, its content is folded into `reference/` and the proposal file is retired.
 
+The durable thin UI boundary has been folded into [`reference/query-projections-and-client-consumption-contract.md`](reference/query-projections-and-client-consumption-contract.md). New macOS UI proposals should depend on that reference contract and the P032/P036 handoff docs rather than treating historical proposal text as the active architecture source.
+
 ## Examples
 
 Runnable agent catalogs and workflow presets live under [`../examples`](../examples):
 
 - [../examples/README.md](../examples/README.md)
 - [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
-- [../examples/agents/agents_with_gemini.yaml](../examples/agents/agents_with_gemini.yaml)
 - [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
 - [../examples/workflows/proposal-loop-live.yaml](../examples/workflows/proposal-loop-live.yaml)
 - [../examples/workflows/full-mvp-live.yaml](../examples/workflows/full-mvp-live.yaml)

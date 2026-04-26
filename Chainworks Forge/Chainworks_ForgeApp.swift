@@ -25,8 +25,7 @@ struct Chainworks_ForgeApp: App {
 
     init() {
         if Self.shouldDisableWindowRestoration {
-            UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
-            UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
+            Self.applyWindowRestorationDefaults()
             Self.clearSavedWindowState()
         }
         if Self.isUIAutomationHost {
@@ -69,8 +68,56 @@ struct Chainworks_ForgeApp: App {
     private static func clearSavedWindowState() {
         #if os(macOS)
         NSApplication.shared.disableRelaunchOnLogin()
+        clearSavedWindowState(
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "xax.Chainworks-Forge"
+        )
         #endif
     }
+
+    static func applyWindowRestorationDefaults(
+        userDefaults: UserDefaults = .standard
+    ) {
+        userDefaults.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+        userDefaults.set(true, forKey: "ApplePersistenceIgnoreState")
+    }
+
+    static func savedApplicationStateURL(
+        bundleIdentifier: String,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        homeDirectory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Saved Application State", isDirectory: true)
+            .appendingPathComponent("\(bundleIdentifier).savedState", isDirectory: true)
+    }
+
+    static func clearSavedWindowState(
+        bundleIdentifier: String,
+        fileManager: FileManager = .default,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) {
+        let url = savedApplicationStateURL(
+            bundleIdentifier: bundleIdentifier,
+            homeDirectory: homeDirectory
+        )
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        try? fileManager.removeItem(at: url)
+    }
+
+    #if os(macOS)
+    @MainActor
+    static func applyWindowRestorationPolicy(to window: NSWindow) {
+        window.isRestorable = false
+        window.restorationClass = nil
+    }
+
+    @MainActor
+    static func applyWindowRestorationPolicyToOpenWindows() {
+        for window in NSApp.windows {
+            applyWindowRestorationPolicy(to: window)
+        }
+    }
+    #endif
 
     static func packagedDaemonAgentPlistURL(
         in bundleURL: URL,

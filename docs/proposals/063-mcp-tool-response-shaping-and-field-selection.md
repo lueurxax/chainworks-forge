@@ -5,7 +5,7 @@
 | Date | 2026-04-20 |
 | Status | Draft (amended by P068: agent callers must use MCP-only continuation paths; GraphQL is UI-only) |
 | Author | Andrey Khasanov |
-| Depends on | [reference/mcp-northbound-control-plane-server.md](../reference/mcp-northbound-control-plane-server.md), [031-thin-graphql-ui-rewrite.md](031-thin-graphql-ui-rewrite.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md](068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md) |
+| Depends on | [reference/mcp-northbound-control-plane-server.md](../reference/mcp-northbound-control-plane-server.md), [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md](068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md) |
 | Scope | Make every MCP tool response safe to consume by an LLM agent caller (Claude Code, Claude Desktop, other MCP clients) by establishing a tool-response size budget, trimming oversized fields by default, giving callers explicit field-selection / include-by-opt-in semantics, **and retaining per-round review scores so the inspection tools can return a real score trajectory instead of the last snapshot**. |
 | Goal | An agent using the MCP surface for routine inspection (`runs.get`, `reports.get`, `steward.get_analysis`, `reviews.score_trajectory`) receives a response that fits inside its tool-result context budget, with explicit MCP `include` escape hatches for the rare cases where a full blob is genuinely needed. Per P068, GraphQL remains the macOS UI read surface and must not be presented as the agent fallback. |
 
@@ -13,7 +13,7 @@
 
 ## 1. Context and Motivation
 
-P029 made MCP the northbound command surface and GraphQL the read surface. P031 doubled down: clients read via GraphQL projections, mutate via MCP tools. Both locked in the split.
+P029 made MCP the northbound command surface and GraphQL the UI read surface. The canonical thin UI contract locks the macOS app to GraphQL projection reads, while P068 assigns agent inspection and control to MCP.
 
 In practice, callers-who-are-themselves-LLM-agents (Claude Code, Claude Desktop, automation pipelines) also want to **inspect** run/report/steward state via MCP — it is the required surface for agent operation. Today that works for compact tools (`ideas.list`, `runs.list`) but falls over on rich-record tools.
 

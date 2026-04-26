@@ -89,7 +89,7 @@ This proposal does not include:
 
 - changing `examples/workflows/full-mvp-live.yaml` from 15 to 3
 - removing soft checkpoint behavior
-- changing P051 Xcode MCP bridge pooling
+- changing the implemented [Xcode MCP bridge pool](../reference/xcode-mcp-bridge-pool.md)
 - changing ACP provider retry/reuse semantics
 - manually repairing historical artifacts for existing runs unless an operator explicitly requests it
 - Swift app UI changes, except optional read-only projection if an implemented surface already shows loop budget fields

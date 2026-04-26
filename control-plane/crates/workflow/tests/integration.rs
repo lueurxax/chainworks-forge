@@ -242,15 +242,15 @@ fn test_compile_full_mvp_live_plan() {
         "architect MCP intent comes from codex_architect_high backend_profile"
     );
 
-    // Verify code_writer → codex
+    // Verify code_writer → claude
     let s7 = &plan.states["state_7_implementation_started"];
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
-    assert_eq!(cw_task.unwrap().agent.provider, "codex");
+    assert_eq!(cw_task.unwrap().agent.provider, "claude");
     assert_eq!(
         cw_task.unwrap().agent.requested_mcp_server_ids,
-        vec!["context7".to_string(), "xcode".to_string()],
-        "code_writer MCP intent comes from codex_builder_high backend_profile"
+        vec!["xcode".to_string()],
+        "code_writer MCP intent comes from claude_builder_high backend_profile"
     );
 
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
@@ -288,6 +288,44 @@ fn test_compile_full_mvp_live_plan() {
 
     // Verify variables were loaded
     assert!(plan.variables.contains_key("proposal_score_target"));
+    assert_eq!(
+        plan.variables
+            .get("audit_target_status")
+            .and_then(|value| value.as_str()),
+        Some("implemented"),
+        "audit transition target must use canonical audit_report_v1 status"
+    );
+    assert_eq!(
+        plan.variables
+            .get("implementation_review_target_status")
+            .and_then(|value| value.as_str()),
+        Some("code_complete"),
+        "implementation review target must use canonical implementation_review_summary_v1 status"
+    );
+}
+
+#[test]
+fn workflow_status_targets_use_canonical_contract_values() {
+    for workflow_name in ["workflow.yaml", "full-mvp-live.yaml"] {
+        let wf_path = format!("{}/workflows/{workflow_name}", fixtures_dir());
+        let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+        let plan = compiler::compile(&wf_path, &cat_path).expect("should compile plan");
+
+        assert_eq!(
+            plan.variables
+                .get("audit_target_status")
+                .and_then(|value| value.as_str()),
+            Some("implemented"),
+            "{workflow_name} must compare audit_report_v1 against canonical status"
+        );
+        assert_eq!(
+            plan.variables
+                .get("implementation_review_target_status")
+                .and_then(|value| value.as_str()),
+            Some("code_complete"),
+            "{workflow_name} must compare implementation_review_summary_v1 against canonical status"
+        );
+    }
 }
 
 #[test]
@@ -874,6 +912,18 @@ fn test_compile_n_phase_ordering() {
         phase_1[0].agent.agent_id, "proposal_implementation_auditor",
         "phase 1 task must be the auditor"
     );
+    assert!(
+        phase_1[0].agent.requested_mcp_server_ids.is_empty(),
+        "proposal implementation auditor must not acquire interactive Xcode MCP leases"
+    );
+    assert!(
+        !phase_1[0].agent.xcode_broker_required,
+        "proposal implementation auditor must not require the Xcode MCP broker"
+    );
+    assert!(
+        phase_1[0].agent.requires_xcode_host_execution,
+        "proposal implementation auditor may still use host Xcode command shims for non-interactive verification"
+    );
 
     let phase_2: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 2).collect();
     assert_eq!(
@@ -884,6 +934,18 @@ fn test_compile_n_phase_ordering() {
     assert_eq!(
         phase_2[0].agent.agent_id, "prepush_code_reviewer",
         "phase 2 task must be prepush_code_reviewer"
+    );
+    assert!(
+        phase_2[0].agent.requested_mcp_server_ids.is_empty(),
+        "prepush review must not acquire MCP runtimes; it reviews existing artifacts and diffs"
+    );
+    assert!(
+        !phase_2[0].agent.xcode_broker_required,
+        "prepush review must not acquire an Xcode broker lease"
+    );
+    assert!(
+        !phase_2[0].agent.requires_xcode_host_execution,
+        "prepush review must not depend on host Xcode execution"
     );
 
     let phase_3: Vec<_> = s9.tasks.iter().filter(|t| t.phase == 3).collect();

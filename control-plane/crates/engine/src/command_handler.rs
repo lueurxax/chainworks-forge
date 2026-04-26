@@ -1,7 +1,7 @@
 use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -1070,6 +1070,15 @@ impl CommandHandler {
                     .execute(&mut *retry_tx)
                     .await?;
                 self.maybe_inject_retry_stage_failure("update_run_for_retry")?;
+                supersede_current_workflow_conflict_for_stage_retry_tx(
+                    &mut retry_tx,
+                    c.run_id,
+                    &c.stage_id,
+                    now,
+                    journal_id,
+                )
+                .await?;
+                self.maybe_inject_retry_stage_failure("supersede_workflow_conflict")?;
                 let legacy_discovery_override_id =
                     if let Some(input) = legacy_discovery_override_input.as_ref() {
                         Some(
@@ -1761,6 +1770,14 @@ impl CommandHandler {
             .bind(run_id.to_string())
             .execute(&mut *retry_tx)
             .await?;
+        supersede_current_workflow_conflict_for_stage_retry_tx(
+            &mut retry_tx,
+            run_id,
+            stage_id,
+            now,
+            journal_id,
+        )
+        .await?;
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2186,5 +2203,58 @@ async fn apply_quota_retry_budget_for_stage_tx(
             }
         }
     }
+    Ok(())
+}
+
+async fn supersede_current_workflow_conflict_for_stage_retry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    now: DateTime<Utc>,
+    journal_id: &str,
+) -> Result<()> {
+    let Some(conflict) = workflow_conflicts::get_current_blocking_conflict_tx(tx, run_id).await?
+    else {
+        return Ok(());
+    };
+
+    if conflict.current_state_id != stage_id {
+        return Ok(());
+    }
+
+    workflow_conflicts::transition_conflict_status_tx(
+        tx,
+        &conflict.conflict_id,
+        WorkflowConflictStatus::Superseded,
+        now,
+        Some(serde_json::json!({
+            "resolution_kind": "operator_stage_retry",
+            "stage_id": stage_id,
+            "journal_id": journal_id,
+        })),
+        None,
+        None,
+    )
+    .await?;
+
+    workflow_conflicts::upsert_transition_cursor_tx(
+        tx,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: stage_id.to_string(),
+            cursor_status: "stage_retry_scheduled".to_string(),
+            resume_policy: "continue_from_selected_transition".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: Some(stage_id.to_string()),
+            conflict_id: Some(conflict.conflict_id),
+            conflict_fingerprint: Some(conflict.conflict_fingerprint),
+            candidate_transition_hash: Some(conflict.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: now,
+        },
+    )
+    .await?;
+
     Ok(())
 }

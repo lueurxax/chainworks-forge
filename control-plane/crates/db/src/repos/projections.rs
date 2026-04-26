@@ -65,14 +65,14 @@ pub struct StageSummaryRow {
 ///
 /// Primary table is `runs`; `run_summaries` is LEFT-JOINed so that runs whose
 /// projection hasn't been rebuilt yet are still returned (with zero counts).
-/// Status is sourced from `run_summaries` when available, falling back to `runs`.
+/// Status is sourced from canonical `runs`; summary lag is exposed separately.
 pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
         r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
-                  COALESCE(rs.status, r.status) AS status,
+                  r.status AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
@@ -127,7 +127,7 @@ pub async fn list_by_idea_projection(
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
-                  COALESCE(rs.status, r.status) AS status,
+                  r.status AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
@@ -239,7 +239,7 @@ pub async fn find_run_projection(
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
-                  COALESCE(rs.status, r.status) AS status,
+                  r.status AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,

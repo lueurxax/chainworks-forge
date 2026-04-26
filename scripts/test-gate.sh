@@ -2449,9 +2449,9 @@ PY
     python3 - <<'PY'
 from pathlib import Path
 
-source = Path("docs/proposals/051-shared-xcode-mcp-bridge-pool.md")
+source = Path("docs/reference/xcode-mcp-bridge-pool.md")
 if not source.exists():
-    raise SystemExit(f"p051-scaffold: missing source proposal {source}")
+    raise SystemExit(f"p051-scaffold: missing stable bridge-pool reference {source}")
 
 lines = source.read_text().splitlines()
 stale_checks = [
@@ -2511,7 +2511,7 @@ for label, needles in strict_stale_checks:
 
 if stale:
     raise SystemExit(
-        "p051-scaffold: docs/proposals/051-shared-xcode-mcp-bridge-pool.md still contains "
+        "p051-scaffold: docs/reference/xcode-mcp-bridge-pool.md still contains "
         "stale contrary guidance: " + ", ".join(stale)
     )
 PY
@@ -2992,6 +2992,7 @@ PY
     # the 2 most recent in case an in-flight build or the `xcresult`
     # viewer still has a handle on one.
     if [[ -d "$TMP_BASE" ]]; then
+      compgen -G "$TMP_BASE/p042-swift-*-DerivedData" >/dev/null && \
       ls -dt "$TMP_BASE"/p042-swift-*-DerivedData 2>/dev/null \
         | tail -n +3 \
         | while read -r stale; do

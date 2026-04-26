@@ -724,6 +724,40 @@ enum P031GraphQLResponseDecoder {
   }
 }
 
+enum P031ReadErrorPresenter {
+  nonisolated static let schemaMismatchTitle = "Daemon schema mismatch"
+
+  nonisolated static func description(for error: Error) -> String {
+    if isSchemaMismatch(error) {
+      return "\(schemaMismatchTitle): restart daemon to load the bundled GraphQL schema. \(rawDescription(for: error))"
+    }
+    return error.localizedDescription
+  }
+
+  nonisolated static func isSchemaMismatchDescription(_ description: String?) -> Bool {
+    guard let description else { return false }
+    return description.contains(schemaMismatchTitle)
+      || isSchemaMismatchMessage(description)
+  }
+
+  nonisolated private static func isSchemaMismatch(_ error: Error) -> Bool {
+    guard case .graphqlErrors(let messages) = error as? P031GraphQLReadBoundaryError else {
+      return false
+    }
+    return messages.contains(where: isSchemaMismatchMessage)
+  }
+
+  nonisolated private static func isSchemaMismatchMessage(_ message: String) -> Bool {
+    let lowercased = message.lowercased()
+    return (lowercased.contains("unknown field") || lowercased.contains("cannot query field"))
+      && (lowercased.contains("gql") || lowercased.contains("type"))
+  }
+
+  nonisolated private static func rawDescription(for error: Error) -> String {
+    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+  }
+}
+
 enum P031FreshnessState: String, Codable, CaseIterable, Equatable, Sendable {
   case live
   case refreshing
@@ -1003,9 +1037,9 @@ struct P031TargetedReadRefreshCoordinator<Store: P031WorkflowReadStore>: Sendabl
         value: nil,
         freshness: WorkflowFreshnessReducer.reduce(
           currentFreshness,
-          event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+          event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
         ),
-        errorDescription: error.localizedDescription
+        errorDescription: P031ReadErrorPresenter.description(for: error)
       )
     }
   }
@@ -2306,7 +2340,7 @@ enum P031OperatorWritePathGuideResolver {
         guide: nil,
         approvalResolutionState: .unavailable,
         summaryPresentation: P031OperatorWritePathGuidePresenter.unavailablePresentation(),
-        errorDescription: error.localizedDescription
+        errorDescription: P031ReadErrorPresenter.description(for: error)
       )
     }
   }
@@ -2994,11 +3028,15 @@ enum P031ArtifactRenderMode: Equatable, Sendable {
 
 struct P031ArtifactViewerPresentation: Equatable, Sendable {
   let artifactID: String
+  let stageID: String
+  let agentID: String?
+  let contractID: String
+  let format: String
   let title: String
   let subtitle: String
   let renderMode: P031ArtifactRenderMode
   let payloadState: P031PayloadAvailabilityState
-  let payloadText: String?
+  let preparedPreview: ArtifactPreparedPreview?
   let unavailableReason: String?
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
@@ -3067,6 +3105,7 @@ struct P031ReportMetadataListPresentation: Equatable, Sendable {
 
 struct P031DaemonLifecyclePresentation: Equatable, Sendable {
   let state: P031DaemonLifecycleState?
+  let buildSHA: String?
   let title: String
   let detailLabel: String?
   let badgeLabels: [String]
@@ -3116,11 +3155,11 @@ enum P031RunsHomePresenter {
       rows: [],
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .runsHome),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 
@@ -3234,11 +3273,11 @@ enum P031ApprovalInboxPresenter {
       rows: [],
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .approvalsQueue),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 
@@ -3356,11 +3395,11 @@ enum P031RunDetailPresenter {
       catalogContext: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .runDetail),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 }
@@ -3401,11 +3440,11 @@ enum P031StageDetailPresenter {
       stage: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .stageDetail),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 }
@@ -3543,22 +3582,26 @@ enum P031ArtifactViewerPresenter {
     let payloadText = artifact.payloadText?.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasPayload = payloadText?.isEmpty == false
     let renderMode: P031ArtifactRenderMode
+    let preparedPreview: ArtifactPreparedPreview?
     switch artifact.payloadAvailabilityState {
     case .metadataOnly, .payloadDeferred:
       renderMode = .metadataOnly
+      preparedPreview = nil
     case .generating, .unavailable:
       renderMode = .unavailable
+      preparedPreview = nil
     case .available:
-      if !hasPayload {
-        renderMode = .unavailable
-      } else if normalizedFormat == "markdown" || normalizedFormat == "md" {
-        renderMode = .markdown
-      } else if normalizedFormat == "json" {
-        renderMode = .json
-      } else if normalizedFormat == "diff" || normalizedFormat == "patch" {
-        renderMode = .diff
+      if let payloadText, hasPayload {
+        let preview = makePreparedPreview(
+          forPayload: payloadText,
+          normalizedFormat: normalizedFormat,
+          artifactName: artifact.name
+        )
+        renderMode = Self.renderMode(forIntent: preview.intent)
+        preparedPreview = preview
       } else {
-        renderMode = .plainText
+        renderMode = .unavailable
+        preparedPreview = nil
       }
     }
     let subtitle = [
@@ -3580,11 +3623,15 @@ enum P031ArtifactViewerPresenter {
     ].compactMap { $0 }.filter { !$0.isEmpty }
     return P031ArtifactViewerPresentation(
       artifactID: artifact.id,
+      stageID: artifact.stageID,
+      agentID: artifact.agentID,
+      contractID: artifact.contractID,
+      format: artifact.format,
       title: artifact.name,
       subtitle: subtitle,
       renderMode: renderMode,
       payloadState: artifact.payloadAvailabilityState,
-      payloadText: hasPayload ? payloadText : nil,
+      preparedPreview: preparedPreview,
       unavailableReason: unavailableReason(for: renderMode, reason: payloadUnavailableReason),
       freshnessState: artifact.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
@@ -3600,6 +3647,47 @@ enum P031ArtifactViewerPresenter {
       return reason
     case .markdown, .json, .diff, .plainText:
       return nil
+    }
+  }
+
+  nonisolated private static func makePreparedPreview(
+    forPayload payloadText: String,
+    normalizedFormat: String,
+    artifactName: String
+  ) -> ArtifactPreparedPreview {
+    let context = ArtifactRenderContext.explicitNamed(
+      format: declaredArtifactFormat(normalizedFormat),
+      artifactName: artifactName
+    )
+    let intent = ArtifactPresentationIntent.resolve(content: payloadText, context: context)
+    return ArtifactPreviewPolicy.prepare(content: payloadText, intent: intent)
+  }
+
+  nonisolated private static func declaredArtifactFormat(_ normalizedFormat: String) -> ArtifactFormat {
+    switch normalizedFormat {
+    case "markdown", "md":
+      return .markdown
+    case "diff", "patch":
+      return .diff
+    case "report":
+      return .report
+    default:
+      return .json
+    }
+  }
+
+  nonisolated private static func renderMode(forIntent intent: ArtifactPresentationIntent)
+    -> P031ArtifactRenderMode
+  {
+    switch intent {
+    case .markdownDocument:
+      return .markdown
+    case .jsonTree:
+      return .json
+    case .diff:
+      return .diff
+    case .plainText:
+      return .plainText
     }
   }
 }
@@ -3664,11 +3752,11 @@ enum P031StageListPresenter {
       rows: [],
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .stages),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 }
@@ -3748,11 +3836,11 @@ enum P031ArtifactListPresenter {
       rows: [],
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .artifacts),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 }
@@ -3786,11 +3874,11 @@ enum P031ReportMetadataListPresenter {
       rows: [],
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .reportMetadata),
       emptyStateTitle: nil,
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 }
@@ -3818,6 +3906,7 @@ enum P031DaemonLifecyclePresenter {
 
     return P031DaemonLifecyclePresentation(
       state: status.state,
+      buildSHA: status.buildSHA,
       title: title,
       detailLabel: detailParts.isEmpty ? nil : detailParts.joined(separator: " / "),
       badgeLabels: badgeLabels(for: status.state),
@@ -3839,16 +3928,17 @@ enum P031DaemonLifecyclePresenter {
   ) -> P031DaemonLifecyclePresentation {
     P031DaemonLifecyclePresentation(
       state: nil,
+      buildSHA: nil,
       title: "Daemon unavailable",
       detailLabel: nil,
       badgeLabels: ["Unavailable"],
       copyItems: [],
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: error.localizedDescription)
+        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .daemonLifecycle),
-      errorDescription: error.localizedDescription
+      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 

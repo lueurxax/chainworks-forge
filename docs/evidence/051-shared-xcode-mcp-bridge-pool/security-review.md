@@ -2,7 +2,7 @@
 
 Date: 2026-04-25
 
-Status: fixture/readback security review complete; broad rollout remains held by live dogfood and operator sign-off.
+Status: fixture/readback security review complete; scoped broker/readback closeout is signed off. Broad release remains held by P042 release-host packaging proof.
 
 Reviewer: Codex implementation audit, using the P051 `rust_security_reviewer`, `api_contract_reviewer`, and `observability_rollout_reviewer` lenses.
 
@@ -33,12 +33,4 @@ The implemented P051 fixture/readback path satisfies the targeted security contr
 
 ## Residual Rollout Holds
 
-This review does not claim live operator sign-off. Before broad `shim_enforced` rollout, attach live dogfood evidence for:
-
-- token leakage review across real daemon logs, reports, and Swift readback;
-- modal count under a parallel Xcode-capable provider run;
-- fake-home boundary results;
-- observation completeness and append pressure metrics;
-- explicit operator or release-owner `GO` decision.
-
-Current stop sign: `docs/evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md`.
+Live dogfood and scoped closeout sign-off are recorded in `docs/evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md`. Before broad `shim_enforced` rollout, complete the production packaged-daemon release proof through P042 `proposal-042-packaging`.

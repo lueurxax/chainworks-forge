@@ -579,6 +579,7 @@ pub struct AcpSessionNewSpec {
     pub mode: String,
     pub extra: Option<Value>,
     pub config_options: Vec<(String, String)>,
+    pub set_mode_after_session_new: bool,
 }
 
 impl AcpSessionNewSpec {
@@ -588,6 +589,7 @@ impl AcpSessionNewSpec {
             mode: mode.into(),
             extra: None,
             config_options: Vec::new(),
+            set_mode_after_session_new: false,
         }
     }
 
@@ -597,6 +599,7 @@ impl AcpSessionNewSpec {
             mode: config.mode.to_string(),
             extra: config.extra,
             config_options: config.config_options,
+            set_mode_after_session_new: config.set_mode_after_session_new,
         }
     }
 
@@ -606,6 +609,7 @@ impl AcpSessionNewSpec {
             mode: &self.mode,
             extra: self.extra.clone(),
             config_options: self.config_options.clone(),
+            set_mode_after_session_new: self.set_mode_after_session_new,
         }
     }
 }
@@ -698,6 +702,7 @@ pub trait AcpAdapter: Send + Sync {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        crate::transport::isolate_process_group(&mut command);
 
         let child = command.spawn().with_context(|| {
             format!(
@@ -783,6 +788,7 @@ pub trait AcpAdapter: Send + Sync {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        crate::transport::isolate_process_group(&mut command);
 
         let args = if launch_spec.args.is_empty() {
             String::new()

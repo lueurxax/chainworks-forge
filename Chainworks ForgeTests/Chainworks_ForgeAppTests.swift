@@ -12,6 +12,45 @@ struct Chainworks_ForgeAppTests {
         ]))
     }
 
+    @Test("Window restoration defaults disable AppKit persistent UI snapshots")
+    func windowRestorationDefaultsDisablePersistentUISnapshots() {
+        let suiteName = "ChainworksForgeAppTests-\(UUID().uuidString)"
+        let defaults = try! #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        Chainworks_ForgeApp.applyWindowRestorationDefaults(userDefaults: defaults)
+
+        #expect(defaults.bool(forKey: "NSQuitAlwaysKeepsWindows") == false)
+        #expect(defaults.bool(forKey: "ApplePersistenceIgnoreState") == true)
+    }
+
+    @Test("Saved application state cleanup removes only the app snapshot directory")
+    func savedApplicationStateCleanupRemovesOnlyAppSnapshotDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChainworksForgeAppTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let appState = Chainworks_ForgeApp.savedApplicationStateURL(
+            bundleIdentifier: "xax.Chainworks-Forge",
+            homeDirectory: root
+        )
+        let otherState = Chainworks_ForgeApp.savedApplicationStateURL(
+            bundleIdentifier: "xax.Other-App",
+            homeDirectory: root
+        )
+        try FileManager.default.createDirectory(at: appState, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: otherState, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: appState.appendingPathComponent("windows.plist"))
+
+        Chainworks_ForgeApp.clearSavedWindowState(
+            bundleIdentifier: "xax.Chainworks-Forge",
+            homeDirectory: root
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: appState.path))
+        #expect(FileManager.default.fileExists(atPath: otherState.path))
+    }
+
     @Test("UI automation host detection stays environment scoped")
     func uiAutomationHostDetectionIsEnvironmentScoped() {
         #expect(Chainworks_ForgeApp.isUIAutomationHost(for: [

@@ -132,11 +132,13 @@ The current controlled contracts are:
 
 Contract normalization is explicit and contract-specific:
 
-- `prepush_review_v1`: `PASS`, `PASS_WITH_NOTES`, and `pass` normalize to `pass`; `BLOCK` and `needs_fixes` normalize to `block`.
-- `docs_report_v1`: `success`, `synced`, and `pass` normalize to `pass`; `not_needed` remains `not_needed`; `blocked` normalizes to `block`.
+- `prepush_review_v1`: `PASS`, `PASS_WITH_NOTES`, `pass`, and reviewer `conditional_pass` normalize to `pass`; `BLOCK`, `needs_fixes`, and reviewer `changes_required` normalize to `block`.
+- `security_report_v1`: `PASS`, `pass`, and reviewer `pass_with_notes` normalize to `pass`; `BLOCK`, `block`, and reviewer `fail` normalize to `block`.
+- `docs_report_v1`: `success`, `synced`, `aligned`, and `pass` normalize to `pass`; `not_needed` remains `not_needed`; `blocked` normalizes to `block`.
 - `audit_report_v1`: implementation truth comes from `implementation_status`; release evidence blockers stay in a separate `release_evidence_status` dimension and must not make code completeness look incomplete.
 - `implementation_self_assessment_v2`: `implementation_complete`, `verification_green`, and blocking `remaining_code_tasks` are canonical dimensions. The workflow implementation loop reads `implementation_complete`, not legacy `seemingly_complete`.
 - `tests_result_v1`: status is the canonical test outcome; workflow guards read `tests_result_v1.status`, not legacy `tests_result.green`.
+- `implementation_review_summary_v1`: reviewer `changes_required`, `blocked`, and `block` normalize to `needs_code_fixes`; `release_evidence_blocked` remains separate so non-code release evidence can be routed without disguising source-code readiness.
 
 ### Implementation self-assessment and handoff
 

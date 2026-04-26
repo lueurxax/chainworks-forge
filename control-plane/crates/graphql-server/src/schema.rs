@@ -1,3 +1,4 @@
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -222,11 +223,17 @@ impl QueryRoot {
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let run = runs::find_by_id(pool, parsed_run_id).await?;
         let items = projections::list_artifacts_projection(pool, run_id.as_str()).await?;
+        let mut bulk_preview_budget_remaining = P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES;
         Ok(items
             .into_iter()
             .map(|row| {
                 let mut artifact = GqlArtifact::from(row.clone());
-                attach_p031_artifact_payload(&row, run.as_ref(), &mut artifact);
+                attach_p031_artifact_payload(
+                    &row,
+                    run.as_ref(),
+                    &mut artifact,
+                    &mut bulk_preview_budget_remaining,
+                );
                 artifact
             })
             .collect())
@@ -606,21 +613,35 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     Ok(run)
 }
 
-const P031_ARTIFACT_PAYLOAD_MAX_BYTES: i64 = 1024 * 1024;
+const P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES: usize = 120_000;
+const P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES: usize = 1_000_000;
+
+struct P031ArtifactPayloadPreview {
+    text: String,
+    truncated: bool,
+    bytes_read: usize,
+}
 
 fn attach_p031_artifact_payload(
     row: &db::repos::projections::ArtifactIndexRow,
     run: Option<&domain::run::Run>,
     artifact: &mut GqlArtifact,
+    bulk_preview_budget_remaining: &mut usize,
 ) {
     if artifact.report_kind.is_some() || row.format == "report" {
         return;
     }
 
-    if row.size_bytes.unwrap_or(0) > P031_ARTIFACT_PAYLOAD_MAX_BYTES {
-        mark_payload_unavailable(
+    let estimated_preview_bytes = row
+        .size_bytes
+        .and_then(|size| usize::try_from(size).ok())
+        .filter(|size| *size > 0)
+        .map(|size| size.min(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES))
+        .unwrap_or(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
+    if estimated_preview_bytes > *bulk_preview_budget_remaining {
+        mark_payload_deferred(
             artifact,
-            "Artifact payload is larger than the P031 GraphQL preview limit",
+            "Artifact payload preview deferred because the bulk artifact list reached its payload preview budget",
         );
         return;
     }
@@ -641,12 +662,31 @@ fn attach_p031_artifact_payload(
         return;
     };
 
-    match std::fs::read_to_string(path) {
-        Ok(payload) => {
-            artifact.payload_text = Some(payload);
+    match read_p031_artifact_payload_preview(&path) {
+        Ok(preview) => {
+            let consumed_preview_bytes = estimated_preview_bytes.max(
+                preview
+                    .bytes_read
+                    .min(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES),
+            );
+            if consumed_preview_bytes > *bulk_preview_budget_remaining {
+                mark_payload_deferred(
+                    artifact,
+                    "Artifact payload preview deferred because the bulk artifact list reached its payload preview budget",
+                );
+                return;
+            }
+            *bulk_preview_budget_remaining =
+                bulk_preview_budget_remaining.saturating_sub(consumed_preview_bytes);
+            artifact.payload_text = Some(preview.text);
             artifact.payload_availability_state = GqlPayloadAvailabilityState::Available;
             artifact.payload_unavailable_reason_code = None;
-            artifact.server_debug_detail = None;
+            artifact.server_debug_detail = preview.truncated.then(|| {
+                format!(
+                    "Artifact payload preview capped at {} bytes; full payload remains server-owned",
+                    P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES
+                )
+            });
         }
         Err(err) => {
             mark_payload_unavailable(
@@ -657,10 +697,52 @@ fn attach_p031_artifact_payload(
     }
 }
 
+fn read_p031_artifact_payload_preview(path: &Path) -> io::Result<P031ArtifactPayloadPreview> {
+    let file = std::fs::File::open(path)?;
+    let mut limited = file.take((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES + 1) as u64);
+    let mut bytes = Vec::with_capacity(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES + 1);
+    limited.read_to_end(&mut bytes)?;
+
+    let truncated = bytes.len() > P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES;
+    if truncated {
+        bytes.truncate(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
+    }
+    let bytes_read = bytes.len();
+
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(P031ArtifactPayloadPreview {
+            text,
+            truncated,
+            bytes_read,
+        }),
+        Err(err) => {
+            let valid_up_to = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid_up_to);
+            let text = String::from_utf8(bytes).map_err(|utf8_err| {
+                io::Error::new(io::ErrorKind::InvalidData, utf8_err.to_string())
+            })?;
+            Ok(P031ArtifactPayloadPreview {
+                text,
+                truncated: true,
+                bytes_read,
+            })
+        }
+    }
+}
+
 fn mark_payload_unavailable(artifact: &mut GqlArtifact, detail: &str) {
     artifact.payload_text = None;
     artifact.payload_availability_state = GqlPayloadAvailabilityState::Unavailable;
     artifact.payload_unavailable_reason_code = Some(GqlPayloadUnavailableReasonCode::NotAvailable);
+    artifact.server_debug_detail = Some(detail.to_string());
+}
+
+fn mark_payload_deferred(artifact: &mut GqlArtifact, detail: &str) {
+    artifact.payload_text = None;
+    artifact.payload_availability_state = GqlPayloadAvailabilityState::PayloadDeferred;
+    artifact.payload_unavailable_reason_code =
+        Some(GqlPayloadUnavailableReasonCode::PayloadDeferredByP031);
     artifact.server_debug_detail = Some(detail.to_string());
 }
 
@@ -3473,6 +3555,225 @@ mod tests {
             artifact["payloadText"],
             serde_json::json!("# Proposal\n\nGraphQL payload")
         );
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
+    async fn proposal_031_artifact_payload_text_is_capped_for_bulk_readback() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let artifact_root =
+            std::env::temp_dir().join(format!("p031-artifact-preview-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let artifact_path = artifact_root.join("large.md");
+        let payload = format!(
+            "{}tail-marker",
+            "large artifact preview line\n"
+                .repeat((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES / 28) + 256)
+        );
+        fs::write(&artifact_path, &payload).unwrap();
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "proposal".into(),
+                agent_id: "proposal_writer".into(),
+                name: "large.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: artifact_path.to_string_lossy().into_owned(),
+                checksum_sha256: None,
+                size_bytes: Some(payload.len() as i64),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactPayloadPreview {{
+                      artifacts(runId: "{run_id}") {{
+                        payloadAvailabilityState
+                        payloadText
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 capped artifact payload query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifacts"][0];
+        let preview = artifact["payloadText"].as_str().unwrap();
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("available")
+        );
+        assert!(preview.len() <= P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
+        assert!(preview.starts_with("large artifact preview line"));
+        assert!(!preview.contains("tail-marker"));
+        assert!(
+            artifact["serverDebugDetail"]
+                .as_str()
+                .unwrap()
+                .contains("preview capped"),
+            "truncated payloads should expose operator-visible preview metadata"
+        );
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
+    async fn proposal_031_artifact_payload_text_has_bulk_response_budget() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "p031-artifact-bulk-preview-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let payload = format!(
+            "{}tail-marker",
+            "bulk artifact preview line\n"
+                .repeat((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES / 27) + 8)
+        );
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+
+        for index in 0..10 {
+            let artifact_id = ArtifactId::new();
+            let artifact_path = artifact_root.join(format!("large-{index}.md"));
+            fs::write(&artifact_path, &payload).unwrap();
+            artifacts::insert(
+                &pool,
+                &Artifact {
+                    id: artifact_id,
+                    run_id,
+                    stage_id: "proposal".into(),
+                    agent_id: "proposal_writer".into(),
+                    name: format!("large-{index}.md"),
+                    contract_id: "proposal_markdown_v1".into(),
+                    format: ArtifactFormat::Markdown,
+                    file_path: artifact_path.to_string_lossy().into_owned(),
+                    checksum_sha256: None,
+                    // Stale discovery metadata can under-report size. The
+                    // response budget must be enforced from actual preview
+                    // bytes, not only the indexed size.
+                    size_bytes: Some(0),
+                    provider: "test".into(),
+                    model: None,
+                    created_at: Utc::now(),
+                    is_pinned: false,
+                    report_kind: None,
+                    report_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactPayloadBulkBudget {{
+                      artifacts(runId: "{run_id}") {{
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        payloadText
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 bulk artifact payload query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifacts = json["artifacts"].as_array().unwrap();
+        let available_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["payloadAvailabilityState"] == serde_json::json!("available")
+            })
+            .count();
+        let deferred_count = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["payloadAvailabilityState"] == serde_json::json!("payload_deferred")
+            })
+            .count();
+        let total_payload_bytes: usize = artifacts
+            .iter()
+            .filter_map(|artifact| artifact["payloadText"].as_str())
+            .map(str::len)
+            .sum();
+
+        assert_eq!(available_count, 8);
+        assert_eq!(deferred_count, 2);
+        assert!(total_payload_bytes <= P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact["payloadUnavailableReasonCode"]
+                == serde_json::json!("PAYLOAD_DEFERRED_BY_P031")
+                && artifact["serverDebugDetail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("bulk artifact list reached its payload preview budget")
+        }));
 
         let _ = fs::remove_dir_all(&artifact_root);
     }

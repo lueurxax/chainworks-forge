@@ -1131,6 +1131,10 @@ fn top_reason_for_item(
     active: &ActiveCounts,
     capacity: &InvokeAgentCapacityConfig,
 ) -> String {
+    if item.startup_recovery_requeued {
+        return "startup_recovery_backpressure".to_string();
+    }
+
     if let Some(run_id) = item.run_id.as_deref() {
         if active.by_run.get(run_id).copied().unwrap_or(0)
             >= capacity.per_run_active_agent_executions as i64
@@ -1155,10 +1159,6 @@ fn top_reason_for_item(
 
     if active.global >= capacity.global_active_agent_executions as i64 {
         return "global_capacity".to_string();
-    }
-
-    if item.startup_recovery_requeued {
-        return "startup_recovery_backpressure".to_string();
     }
 
     "queued".to_string()

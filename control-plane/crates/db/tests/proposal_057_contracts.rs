@@ -146,6 +146,78 @@ async fn proposal_057_active_index_is_sqlite_owned_and_json_export_is_rebuildabl
 }
 
 #[tokio::test]
+async fn proposal_057_repairs_legacy_invalid_contract_statuses_after_vocab_expansion() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let (run_id, _) = seed_run(&pool).await;
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        r#"INSERT INTO artifact_contract_generations
+           (generation_id, run_id, artifact_id, contract_id, canonical_path, raw_path, raw_status,
+            canonical_status, source_agent_execution_id, source_stage_execution_id,
+            source_session_generation_id, source_work_item_id, supersedes_generation_id,
+            output_settlement, source_generation_verified, valid, partial, warnings_json,
+            validation_errors_json, canonical_dimensions_json, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"#,
+    )
+    .bind("gen-docs-aligned")
+    .bind(run_id.to_string())
+    .bind(ArtifactId::new().to_string())
+    .bind("docs_report_v1")
+    .bind("docs/report.json")
+    .bind("docs/report.json")
+    .bind("aligned")
+    .bind("invalid")
+    .bind("agent-docs")
+    .bind("stage-review")
+    .bind("session-1")
+    .bind("work-1")
+    .bind(Option::<String>::None)
+    .bind("valid_outputs_from_completed_execution")
+    .bind(1_i64)
+    .bind(0_i64)
+    .bind(0_i64)
+    .bind("[]")
+    .bind(r#"["unknown status value: aligned"]"#)
+    .bind("{}")
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let before =
+        artifact_contracts::canonical_contract_field(&pool, run_id, "docs_report", "status")
+            .await
+            .unwrap();
+    assert_eq!(before, None);
+
+    let repaired =
+        artifact_contracts::repair_contract_status_normalization_and_rebuild(&pool, run_id)
+            .await
+            .unwrap();
+    assert_eq!(repaired, 1);
+
+    let after =
+        artifact_contracts::canonical_contract_field(&pool, run_id, "docs_report", "status")
+            .await
+            .unwrap();
+    assert_eq!(after, Some(serde_json::json!("pass")));
+
+    let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("projection row");
+    assert_eq!(
+        projection.active_index_json["contracts"]["docs_report_v1"]["status"],
+        "pass"
+    );
+    assert_eq!(
+        projection.active_index_json["contracts"]["docs_report_v1"]["validation_errors"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
 async fn proposal_057_implementation_and_tests_contract_fields_are_canonical() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let tmp = tempfile::tempdir().unwrap();

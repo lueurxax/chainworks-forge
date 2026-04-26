@@ -179,6 +179,39 @@ pub async fn update_mcp_actual(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn update_session_policy(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    session_lineage_id: Option<&str>,
+    session_generation_id: Option<&str>,
+    rehydrated_from_checkpoint_artifact_id: Option<&str>,
+    invocation_owner_key: Option<&str>,
+    session_reuse_disposition: Option<&str>,
+    session_reset_reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_executions
+         SET session_lineage_id = ?1,
+             session_generation_id = ?2,
+             rehydrated_from_checkpoint_artifact_id = ?3,
+             invocation_owner_key = ?4,
+             session_reuse_disposition = ?5,
+             session_reset_reason = ?6
+         WHERE id = ?7",
+    )
+    .bind(session_lineage_id)
+    .bind(session_generation_id)
+    .bind(rehydrated_from_checkpoint_artifact_id)
+    .bind(invocation_owner_key)
+    .bind(session_reuse_disposition)
+    .bind(session_reset_reason)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn append_xcode_runtime_observation(
     pool: &SqlitePool,
     id: AgentExecutionId,

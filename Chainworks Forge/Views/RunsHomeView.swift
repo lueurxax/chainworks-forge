@@ -116,6 +116,28 @@ struct RunsHomeView: View {
     private var runDetailPane: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                if let message = model.daemonSchemaMismatchMessage {
+                    P031DaemonUpdateRequiredCard(
+                        title: "Daemon schema mismatch",
+                        message: message,
+                        restartError: model.daemonRestartError,
+                        isRestarting: model.isRestartingDaemon,
+                        onRestart: {
+                            Task { await model.restartDaemonForUpdateRequired() }
+                        }
+                    )
+                } else if let message = model.daemonBuildMismatchMessage {
+                    P031DaemonUpdateRequiredCard(
+                        title: "Daemon update required",
+                        message: message,
+                        restartError: model.daemonRestartError,
+                        isRestarting: model.isRestartingDaemon,
+                        onRestart: {
+                            Task { await model.restartDaemonForUpdateRequired() }
+                        }
+                    )
+                }
+
                 if let runDetail = model.runDetail {
                     P031RunDetailSummaryCard(presentation: runDetail)
                     P031IdeaContextCard(presentation: runDetail.ideaContext)
@@ -149,6 +171,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var daemonLifecycle: P031DaemonLifecyclePresentation?
     @Published private(set) var writePathGuideSummary: P031OperatorWritePathGuideSummaryPresentation
     @Published private(set) var isLoading = false
+    @Published private(set) var isRestartingDaemon = false
+    @Published private(set) var daemonRestartError: String?
     @Published private(set) var selectedRunID: String?
 
     private let writePathGuideReference: String?
@@ -156,6 +180,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadRunDetailAction: @Sendable (String, P031FreshnessSnapshot) async -> P031RunDetailPresentation
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
+    private let restartDaemonAction: @MainActor @Sendable () async -> String?
+    private let bundledDaemonBuildSHAAction: @Sendable () -> String?
 
     private var didLoad = false
     private var orientationDismissed = false
@@ -168,11 +194,42 @@ final class P031ThinReadDashboardModel: ObservableObject {
         writePathGuideReference != nil
     }
 
+    var daemonSchemaMismatchMessage: String? {
+        [
+            runsHome?.errorDescription,
+            runDetail?.errorDescription,
+            approvalInbox?.errorDescription,
+            daemonLifecycle?.errorDescription,
+        ]
+        .compactMap { $0 }
+        .first(where: P031ReadErrorPresenter.isSchemaMismatchDescription)
+    }
+
+    var daemonBuildMismatchMessage: String? {
+        guard let liveBuildSHA = daemonLifecycle?.buildSHA?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !liveBuildSHA.isEmpty,
+              let bundledBuildSHA = bundledDaemonBuildSHAAction()?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bundledBuildSHA.isEmpty,
+              !Self.buildSHA(liveBuildSHA, matches: bundledBuildSHA)
+        else {
+            return nil
+        }
+        return "Live daemon build \(liveBuildSHA) does not match bundled daemon build \(bundledBuildSHA). Restart daemon to load the bundled control plane."
+    }
+
     init<Store: P031WorkflowReadStore>(
         coordinator: P031ThinWorkflowScreenCoordinator<Store>,
-        writePathGuideReference: String? = nil
+        writePathGuideReference: String? = nil,
+        restartDaemonAction: @escaping @MainActor @Sendable () async -> String? = {
+            await P031ThinReadDashboardModel.restartPackagedDaemon()
+        },
+        bundledDaemonBuildSHAAction: @escaping @Sendable () -> String? = {
+            P031ThinReadDashboardModel.bundledDaemonBuildSHA()
+        }
     ) {
         self.writePathGuideReference = writePathGuideReference
+        self.restartDaemonAction = restartDaemonAction
+        self.bundledDaemonBuildSHAAction = bundledDaemonBuildSHAAction
         writePathGuideSummary = coordinator.loadOperatorWritePathGuideSummary()
         loadRunsHomeAction = { currentFreshness, showFirstRunOrientation in
             await coordinator.loadRunsHome(
@@ -268,10 +325,95 @@ final class P031ThinReadDashboardModel: ObservableObject {
 #endif
     }
 
+    func restartDaemonForSchemaMismatch() async {
+        await restartDaemonForUpdateRequired()
+    }
+
+    func restartDaemonForUpdateRequired() async {
+        guard !isRestartingDaemon else { return }
+        isRestartingDaemon = true
+        daemonRestartError = nil
+        defer { isRestartingDaemon = false }
+
+        if let error = await restartDaemonAction() {
+            daemonRestartError = error
+            return
+        }
+        await refreshAll()
+    }
+
     private func loadRunDetail(for runID: String) async {
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
         runDetail = presentation
+    }
+
+    private static func restartPackagedDaemon() async -> String? {
+#if os(macOS)
+        do {
+            try await Chainworks_ForgeApp.restartPackagedDaemonAgent()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+#else
+        return "Daemon restart is only available on macOS."
+#endif
+    }
+
+    nonisolated static func bundledDaemonBuildSHA(bundle: Bundle = .main) -> String? {
+        guard let url = bundle.url(forResource: "bundled-daemon-build-sha", withExtension: "txt"),
+              let raw = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    nonisolated private static func buildSHA(
+        _ liveBuildSHA: String,
+        matches bundledBuildSHA: String
+    ) -> Bool {
+        liveBuildSHA == bundledBuildSHA
+            || liveBuildSHA.hasPrefix("\(bundledBuildSHA)-")
+            || bundledBuildSHA.hasPrefix("\(liveBuildSHA)-")
+    }
+}
+
+private struct P031DaemonUpdateRequiredCard: View {
+    let title: String
+    let message: String
+    let restartError: String?
+    let isRestarting: Bool
+    let onRestart: () -> Void
+
+    var body: some View {
+        P031CalloutCard(
+            title: title,
+            bodyText: message,
+            accentColor: .orange
+        ) {
+            HStack(spacing: 10) {
+                Button {
+                    onRestart()
+                } label: {
+                    Label(
+                        isRestarting ? "Restarting daemon" : "Restart daemon",
+                        systemImage: "arrow.triangle.2.circlepath"
+                    )
+                }
+                .disabled(isRestarting)
+                .controlSize(.small)
+                .accessibilityIdentifier("p031-daemon-schema-mismatch-restart")
+
+                if let restartError {
+                    Text(restartError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
     }
 }
 
@@ -688,72 +830,101 @@ private struct P031ArtifactListCard: View {
 private struct P031ArtifactViewerCard: View {
     let rows: [P031ArtifactViewerPresentation]
     @State private var selectedArtifactID: String?
+    @State private var artifactSearchText = ""
+    @State private var selectedStageID = P031ArtifactViewerCard.allFilterID
+    @State private var selectedAgentID = P031ArtifactViewerCard.allFilterID
+    @State private var selectedTypeID = P031ArtifactViewerCard.allFilterID
+    @State private var selectedGrouping: P031ArtifactGrouping = .stage
+    private let artifactViewerPaneHeight: CGFloat = 620
+    private let artifactPreviewTopAnchorID = "p031-artifact-preview-top"
+    private static let allFilterID = "__all__"
+    private static let unknownAgentID = "__unknown_agent__"
 
-    private var selectedRow: P031ArtifactViewerPresentation? {
+    private func selectedRow(in visibleRows: [P031ArtifactViewerPresentation]) -> P031ArtifactViewerPresentation? {
         if let selectedArtifactID,
-           let row = rows.first(where: { $0.artifactID == selectedArtifactID }) {
+           let row = visibleRows.first(where: { $0.artifactID == selectedArtifactID }) {
             return row
         }
-        return rows.first
+        return visibleRows.first
+    }
+
+    private var visibleRows: [P031ArtifactViewerPresentation] {
+        rows.filter(matchesFilters)
+    }
+
+    private func groupedRows(from visibleRows: [P031ArtifactViewerPresentation]) -> [P031ArtifactGroup] {
+        var groups: [P031ArtifactGroup] = []
+        var groupIndexByID: [String: Int] = [:]
+        for row in visibleRows {
+            let group = selectedGrouping.group(for: row)
+            if let index = groupIndexByID[group.id] {
+                groups[index].rows.append(row)
+            } else {
+                groupIndexByID[group.id] = groups.count
+                groups.append(P031ArtifactGroup(id: group.id, title: group.title, rows: [row]))
+            }
+        }
+        return groups
+    }
+
+    private var stageOptions: [P031ArtifactFilterOption] {
+        filterOptions(from: rows.map { ($0.stageID, "Stage \($0.stageID)") })
+    }
+
+    private var agentOptions: [P031ArtifactFilterOption] {
+        filterOptions(
+            from: rows.map { row in
+                let id = agentFilterID(for: row)
+                return (id, agentTitle(forFilterID: id))
+            }
+        )
+    }
+
+    private var typeOptions: [P031ArtifactFilterOption] {
+        filterOptions(
+            from: rows.map { row in
+                let kind = P031ArtifactTypeFilter.resolve(row)
+                return (kind.rawValue, kind.title)
+            }
+        )
+    }
+
+    private var filtersAreActive: Bool {
+        !artifactSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || selectedStageID != Self.allFilterID
+            || selectedAgentID != Self.allFilterID
+            || selectedTypeID != Self.allFilterID
     }
 
     var body: some View {
+        let visibleRows = visibleRows
+        let selectedRow = selectedRow(in: visibleRows)
+        let groupedRows = groupedRows(from: visibleRows)
+        let selectedRowID = selectedRow?.artifactID
+
         VStack(alignment: .leading, spacing: 12) {
             Text("Artifacts")
                 .font(.headline)
             if rows.isEmpty {
                 P031EmptySectionRow(title: "No artifacts", detail: "No artifact projections returned.")
             } else {
-                HStack(alignment: .top, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(rows, id: \.artifactID) { row in
-                            Button {
-                                selectedArtifactID = row.artifactID
-                            } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    HStack {
-                                        Text(row.title)
-                                            .font(.caption.weight(.semibold))
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                        Spacer()
-                                        P031FreshnessBadge(state: row.freshnessState)
-                                    }
-                                    Text(row.subtitle)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                    Label(label(for: row), systemImage: symbol(for: row.renderMode))
-                                        .font(.caption2.weight(.medium))
-                                }
-                                .padding(10)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(
-                                    row.artifactID == selectedRow?.artifactID
-                                        ? Color.accentColor.opacity(0.12)
-                                        : Color(nsColor: .controlBackgroundColor),
-                                    in: RoundedRectangle(cornerRadius: 10)
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(
-                                            row.artifactID == selectedRow?.artifactID
-                                                ? Color.accentColor.opacity(0.45)
-                                                : Color.clear,
-                                            lineWidth: 1
-                                        )
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(row.accessibilityLabel)
-                        }
+                VStack(alignment: .leading, spacing: 12) {
+                    filterControls(visibleCount: visibleRows.count)
+
+                    HStack(alignment: .top, spacing: 14) {
+                        artifactList(
+                            visibleRows: visibleRows,
+                            groupedRows: groupedRows,
+                            selectedRowID: selectedRowID
+                        )
+                            .frame(width: 320)
+
+                        Divider()
+
+                        artifactPreviewScroll(selectedRow: selectedRow)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
-                    .frame(width: 260)
-
-                    Divider()
-
-                    artifactPreview
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .frame(height: artifactViewerPaneHeight)
                 }
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -762,8 +933,182 @@ private struct P031ArtifactViewerCard: View {
         }
     }
 
+    private func filterControls(visibleCount: Int) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Picker("Stage", selection: $selectedStageID) {
+                    Text("All stages").tag(Self.allFilterID)
+                    ForEach(stageOptions) { option in
+                        Text(option.title).tag(option.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("p031-artifact-stage-filter")
+
+                Picker("Agent", selection: $selectedAgentID) {
+                    Text("All agents").tag(Self.allFilterID)
+                    ForEach(agentOptions) { option in
+                        Text(option.title).tag(option.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("p031-artifact-agent-filter")
+
+                Picker("Type", selection: $selectedTypeID) {
+                    Text("All types").tag(Self.allFilterID)
+                    ForEach(typeOptions) { option in
+                        Text(option.title).tag(option.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityIdentifier("p031-artifact-type-filter")
+
+                Picker("Group", selection: $selectedGrouping) {
+                    ForEach(P031ArtifactGrouping.allCases) { grouping in
+                        Text(grouping.title).tag(grouping)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 280)
+                .accessibilityIdentifier("p031-artifact-grouping-picker")
+
+                Spacer(minLength: 8)
+
+                if filtersAreActive {
+                    Button("Reset", systemImage: "xmark.circle") {
+                        resetFilters()
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
+            }
+
+            HStack(spacing: 8) {
+                TextField("Search artifacts", text: $artifactSearchText)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("p031-artifact-filter-search")
+
+                Text("\(visibleCount)/\(rows.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func artifactList(
+        visibleRows: [P031ArtifactViewerPresentation],
+        groupedRows: [P031ArtifactGroup],
+        selectedRowID: String?
+    ) -> some View {
+        ScrollViewReader { proxy in
+            List {
+                if visibleRows.isEmpty {
+                    P031EmptySectionRow(
+                        title: "No matching artifacts",
+                        detail: "Adjust artifact filters or search text."
+                    )
+                } else {
+                    ForEach(groupedRows) { group in
+                        artifactGroupSection(group, selectedRowID: selectedRowID)
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .accessibilityIdentifier("p031-artifact-list-scroll")
+            .onChange(of: selectedRowID) { _, newValue in
+                guard let newValue else { return }
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    proxy.scrollTo(newValue, anchor: .center)
+                }
+            }
+        }
+    }
+
+    private func artifactGroupSection(_ group: P031ArtifactGroup, selectedRowID: String?) -> some View {
+        Section {
+            ForEach(group.rows, id: \.artifactID) { row in
+                artifactListRow(for: row, selectedRowID: selectedRowID)
+                    .id(row.artifactID)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 4))
+                    .listRowSeparator(.hidden)
+            }
+        } header: {
+            HStack {
+                Text(group.title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Text("\(group.rows.count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            .accessibilityIdentifier("p031-artifact-group-section")
+        }
+    }
+
+    private func artifactListRow(for row: P031ArtifactViewerPresentation, selectedRowID: String?) -> some View {
+        Button {
+            selectedArtifactID = row.artifactID
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(row.title)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    P031FreshnessBadge(state: row.freshnessState)
+                }
+                Text(row.subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Label(label(for: row), systemImage: symbol(for: row.renderMode))
+                    .font(.caption2.weight(.medium))
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                row.artifactID == selectedRowID
+                    ? Color.accentColor.opacity(0.12)
+                    : Color(nsColor: .controlBackgroundColor),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(
+                        row.artifactID == selectedRowID
+                            ? Color.accentColor.opacity(0.45)
+                            : Color.clear,
+                        lineWidth: 1
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(row.accessibilityLabel)
+    }
+
+    private func artifactPreviewScroll(selectedRow: P031ArtifactViewerPresentation?) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Color.clear
+                    .frame(height: 0)
+                    .id(artifactPreviewTopAnchorID)
+                artifactPreview(selectedRow: selectedRow)
+                    .padding(.trailing, 6)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .accessibilityIdentifier("p031-artifact-preview-scroll")
+            .onChange(of: selectedRow?.artifactID) { _, _ in
+                proxy.scrollTo(artifactPreviewTopAnchorID, anchor: .top)
+            }
+        }
+    }
+
     @ViewBuilder
-    private var artifactPreview: some View {
+    private func artifactPreview(selectedRow: P031ArtifactViewerPresentation?) -> some View {
         if let selectedRow {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
@@ -774,9 +1119,9 @@ private struct P031ArtifactViewerCard: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
-                if let payloadText = selectedRow.payloadText,
+                if let preparedPreview = selectedRow.preparedPreview,
                    let context = renderContext(for: selectedRow) {
-                    ArtifactContentRenderer(content: payloadText, context: context)
+                    ArtifactContentRenderer(preparedPreview: preparedPreview, context: context)
                         .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
                 } else {
                     P031EmptySectionRow(
@@ -786,7 +1131,71 @@ private struct P031ArtifactViewerCard: View {
                     )
                 }
             }
+        } else if !rows.isEmpty {
+            P031EmptySectionRow(
+                title: "No artifact selected",
+                detail: "Adjust artifact filters to select a renderable artifact."
+            )
         }
+    }
+
+    private func matchesFilters(_ row: P031ArtifactViewerPresentation) -> Bool {
+        if selectedStageID != Self.allFilterID, row.stageID != selectedStageID {
+            return false
+        }
+        if selectedAgentID != Self.allFilterID, agentFilterID(for: row) != selectedAgentID {
+            return false
+        }
+        if selectedTypeID != Self.allFilterID,
+           P031ArtifactTypeFilter.resolve(row).rawValue != selectedTypeID {
+            return false
+        }
+
+        let query = artifactSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        return searchableText(for: row).localizedCaseInsensitiveContains(query)
+    }
+
+    private func searchableText(for row: P031ArtifactViewerPresentation) -> String {
+        [
+            row.title,
+            row.subtitle,
+            row.stageID,
+            row.agentID,
+            row.contractID,
+            row.format,
+            row.unavailableReason,
+        ]
+        .compactMap { $0 }
+        .joined(separator: " ")
+    }
+
+    private func filterOptions(from pairs: [(String, String)]) -> [P031ArtifactFilterOption] {
+        var titleByID: [String: String] = [:]
+        for pair in pairs where !pair.0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            titleByID[pair.0, default: pair.1] = pair.1
+        }
+        return titleByID
+            .map { P031ArtifactFilterOption(id: $0.key, title: $0.value) }
+            .sorted {
+                $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            }
+    }
+
+    private func agentFilterID(for row: P031ArtifactViewerPresentation) -> String {
+        let agent = row.agentID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return agent?.isEmpty == false ? agent! : Self.unknownAgentID
+    }
+
+    private func agentTitle(forFilterID id: String) -> String {
+        id == Self.unknownAgentID ? "Unknown agent" : id
+    }
+
+    private func resetFilters() {
+        artifactSearchText = ""
+        selectedStageID = Self.allFilterID
+        selectedAgentID = Self.allFilterID
+        selectedTypeID = Self.allFilterID
     }
 
     private func renderContext(for row: P031ArtifactViewerPresentation) -> ArtifactRenderContext? {
@@ -835,6 +1244,167 @@ private struct P031ArtifactViewerCard: View {
             return "info.circle"
         case .unavailable:
             return "exclamationmark.triangle"
+        }
+    }
+}
+
+private struct P031ArtifactFilterOption: Identifiable, Equatable {
+    let id: String
+    let title: String
+}
+
+private struct P031ArtifactGroup: Identifiable, Equatable {
+    let id: String
+    let title: String
+    var rows: [P031ArtifactViewerPresentation]
+}
+
+private enum P031ArtifactGrouping: String, CaseIterable, Identifiable {
+    case stage
+    case agent
+    case type
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .stage:
+            return "Stage"
+        case .agent:
+            return "Agent"
+        case .type:
+            return "Type"
+        }
+    }
+
+    func group(for row: P031ArtifactViewerPresentation) -> P031ArtifactGroup {
+        switch self {
+        case .stage:
+            return P031ArtifactGroup(id: "stage:\(row.stageID)", title: "Stage \(row.stageID)", rows: [])
+        case .agent:
+            let agent = row.agentID?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = agent?.isEmpty == false ? agent! : "Unknown agent"
+            return P031ArtifactGroup(id: "agent:\(title)", title: title, rows: [])
+        case .type:
+            let kind = P031ArtifactTypeFilter.resolve(row)
+            return P031ArtifactGroup(id: "type:\(kind.rawValue)", title: kind.title, rows: [])
+        }
+    }
+}
+
+private enum P031ArtifactTypeFilter: String, CaseIterable, Identifiable {
+    case summary
+    case review
+    case report
+    case diff
+    case diagnostic
+    case receipt
+    case transcript
+    case release
+    case delivery
+    case test
+    case markdown
+    case json
+    case text
+    case metadata
+    case unavailable
+    case other
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .summary:
+            return "Summary"
+        case .review:
+            return "Review"
+        case .report:
+            return "Report"
+        case .diff:
+            return "Diff"
+        case .diagnostic:
+            return "Diagnostic"
+        case .receipt:
+            return "Receipt"
+        case .transcript:
+            return "Transcript"
+        case .release:
+            return "Release"
+        case .delivery:
+            return "Delivery"
+        case .test:
+            return "Test"
+        case .markdown:
+            return "Markdown"
+        case .json:
+            return "JSON"
+        case .text:
+            return "Text"
+        case .metadata:
+            return "Metadata"
+        case .unavailable:
+            return "Unavailable"
+        case .other:
+            return "Other"
+        }
+    }
+
+    static func resolve(_ row: P031ArtifactViewerPresentation) -> P031ArtifactTypeFilter {
+        let haystack = [
+            row.title,
+            row.contractID,
+            row.subtitle,
+            row.format,
+        ]
+        .joined(separator: " ")
+        .lowercased()
+
+        if haystack.contains("summary") {
+            return .summary
+        }
+        if haystack.contains("review") {
+            return .review
+        }
+        if haystack.contains("report") {
+            return .report
+        }
+        if haystack.contains("diff") || haystack.contains("patch") || row.renderMode == .diff {
+            return .diff
+        }
+        if haystack.contains("diagnostic") || haystack.contains("trace")
+            || haystack.contains("debug") || haystack.contains("log") {
+            return .diagnostic
+        }
+        if haystack.contains("receipt") {
+            return .receipt
+        }
+        if haystack.contains("transcript") {
+            return .transcript
+        }
+        if haystack.contains("release") || haystack.contains("manifest") {
+            return .release
+        }
+        if haystack.contains("delivery") || haystack.contains("publish")
+            || haystack.contains("upload") {
+            return .delivery
+        }
+        if haystack.contains("test") {
+            return .test
+        }
+
+        switch row.renderMode {
+        case .markdown:
+            return .markdown
+        case .json:
+            return .json
+        case .diff:
+            return .diff
+        case .plainText:
+            return .text
+        case .metadataOnly:
+            return .metadata
+        case .unavailable:
+            return .unavailable
         }
     }
 }

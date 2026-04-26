@@ -919,12 +919,12 @@ Command:
 
 ### `p051-scaffold`
 
-Proposal 051 scaffold gate for the shared Xcode MCP bridge pool substrate.
+Historical bridge-pool scaffold gate alias for the shared Xcode MCP bridge pool substrate.
 
 Scope:
 
-- static stale-guidance check for the checked-in P051 proposal
-- workflow/catalog P051 field and lint fixtures
+- static stale-guidance check for the stable Xcode MCP bridge pool reference
+- workflow/catalog Xcode broker field and lint fixtures
 - DB/domain Xcode runtime observation append and persistence fixtures
 - ACP provider capability / brokered Xcode intent fixtures
 - Xcode MCP bridge pool lease, capacity, target-resolution, and observation fixtures
@@ -935,14 +935,14 @@ Use when:
 
 - changing brokered Xcode MCP intent resolution, provider HTTP MCP capability checks, or session/new lease attachment
 - changing Xcode runtime observation shape, append semantics, or broker failure classes
-- changing daemon/API scaffolding that must remain compatible with the full P051 gate
+- changing daemon/API scaffolding that must remain compatible with the full bridge-pool gate
 - reproving scaffold readiness before broader live Xcode proof
 
 Host policy:
 
 - local Rust toolchain required
 - no live provider account, Xcode consent interaction, simulator, remote UI host, or live dogfood run required
-- fixture evidence only; this gate does not satisfy P051 pre-ship dogfood/sign-off
+- fixture evidence only; this gate does not prove production packaged-daemon release readiness
 
 Command:
 
@@ -952,18 +952,18 @@ Command:
 
 Important:
 
-- the gate fails if `docs/proposals/051-shared-xcode-mcp-bridge-pool.md` reintroduces stale contrary guidance for the implemented contract
-- P051 dependency/readiness artifacts live under [../evidence/051-shared-xcode-mcp-bridge-pool/](../evidence/051-shared-xcode-mcp-bridge-pool/)
+- the gate fails if [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md) reintroduces stale contrary guidance for the implemented contract
+- bridge-pool dependency/readiness evidence lives under [../evidence/051-shared-xcode-mcp-bridge-pool/](../evidence/051-shared-xcode-mcp-bridge-pool/)
 
 ### `proposal-051|p051`
 
-Proposal 051 shared Xcode MCP bridge pool fixture/readback gate.
+Historical gate aliases for the shared Xcode MCP bridge pool fixture/readback gate.
 
 Scope:
 
 - all `p051-scaffold` checks
-- domain artifact-contract compatibility fixture used by P051 readback
-- repeated workflow/DB/ACP/engine P051 fixture inventory under the full gate target directory
+- domain artifact-contract compatibility fixture used by bridge-pool readback
+- repeated workflow/DB/ACP/engine bridge-pool fixture inventory under the full gate target directory
 - GraphQL and MCP server compile checks
 - focused Swift readback tests for timeline inspector and daemon lifecycle broker health consumption
 
@@ -971,13 +971,13 @@ Use when:
 
 - changing implemented shared Xcode MCP bridge pool behavior
 - changing Xcode runtime observation readback in GraphQL, MCP reports, or Swift operator surfaces
-- preparing fixture-level P051 readiness evidence before live dogfood
+- preparing fixture/readback evidence for the implemented bridge-pool contract
 
 Host policy:
 
 - local Rust and macOS Swift test toolchains required
 - no remote UI host or app-launched dogfood proof is run by this gate
-- this is a fixture/readback gate, not release-owner sign-off
+- this is a fixture/readback gate, not production packaged-daemon release proof
 
 Command:
 
@@ -990,8 +990,8 @@ Important:
 
 - `proposal-051` and `p051` are aliases
 - the stable behavior reference is [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md)
-- P051 pre-ship readiness still requires a separate live dogfood/sign-off artifact; do not mark the proposal fully complete from this gate alone
-- the current dogfood stop sign is [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md)
+- scoped broker/readback closeout sign-off is recorded in [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md)
+- broad release or broad `shim_enforced` rollout still requires the P042 `proposal-042-packaging` release-host proof
 
 ### `proposal-054|p054`
 

@@ -1,6 +1,6 @@
 # Xcode MCP Bridge Pool
 
-Stable reference for the implemented Proposal 051 Xcode MCP bridge pool behavior.
+Stable reference for the implemented Xcode MCP bridge pool behavior.
 
 The bridge pool is the Chainworks-owned boundary for Xcode-capable ACP agents. It keeps provider fake-home isolation intact while moving Xcode MCP and selected Xcode shell execution through daemon-owned host-user services.
 
@@ -15,9 +15,9 @@ This reference covers:
 - Xcode runtime observations,
 - shim dispatch for direct Xcode commands,
 - minimum operator readback surfaces,
-- and P051 verification gates.
+- verification gates and the production release boundary.
 
-It does not claim live dogfood sign-off. Fixture and static evidence can prove broker mechanics; live modal behavior and release-owner approval remain separate readiness evidence.
+The scoped broker/readback implementation has live dogfood sign-off recorded under `docs/evidence/051-shared-xcode-mcp-bridge-pool/`. Production packaged-daemon validation remains owned by the release-host packaging lane in [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md).
 
 ## Brokered MCP Path
 
@@ -129,6 +129,6 @@ Use the staged gate names in [test-gates.md](test-gates.md):
 ./scripts/test-gate.sh p051
 ```
 
-`p051-scaffold` is the fixture/static substrate gate. `proposal-051|p051` composes the scaffold gate with the broader fixture/readback lane.
+`p051-scaffold` is the fixture/static substrate gate. `proposal-051|p051` composes the scaffold gate with the broader fixture/readback lane. These historical gate aliases remain stable after proposal retirement.
 
-Live dogfood is intentionally outside these fixture gates. P051 pre-ship readiness still requires a parallel Xcode-capable dogfood run, modal-count evidence, observation completeness evidence, token-leakage review, and operator or release-owner sign-off.
+The scoped broker/readback closeout sign-off is recorded in [../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md](../evidence/051-shared-xcode-mcp-bridge-pool/dogfood-signoff.md). Broad release or broad `shim_enforced` rollout still requires the P042 `proposal-042-packaging` release-host proof before shipping the production packaged daemon path.

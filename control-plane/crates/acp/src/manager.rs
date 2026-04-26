@@ -448,7 +448,23 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: reusing live session"
         );
 
-        let mut result = session.prompt(&req).await?;
+        let mut result = match session.prompt(&req).await {
+            Ok(result) => result,
+            Err(err) => {
+                self.live_sessions
+                    .lock()
+                    .await
+                    .remove(session_generation_id);
+                let cleanup = self
+                    .live_xcode_leases
+                    .lock()
+                    .await
+                    .remove(session_generation_id);
+                let _ = session.close().await;
+                self.release_xcode_leases(cleanup).await;
+                return Err(err);
+            }
+        };
         result.session_generation_id = Some(session_generation_id.to_string());
         result.reused_existing_session = true;
         self.record_xcode_prompt_observations(&req, &result).await;

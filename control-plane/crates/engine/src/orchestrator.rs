@@ -5,13 +5,15 @@ use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, ideas, runs, stages, workflow_conflicts,
+    approvals, artifact_contracts, artifacts, ideas, projections, runs, stages, workflow_conflicts,
 };
 use db::work_item::WorkItemKind;
 use domain::agent::AgentOutputSettlement;
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
-use domain::artifact_contracts::ImplementationSelfAssessmentStatus;
+use domain::artifact_contracts::{
+    contract_status_allowed_values, ImplementationSelfAssessmentStatus,
+};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, ArtifactId, RunId};
 use domain::run::RunStatus;
@@ -596,6 +598,9 @@ impl Orchestrator {
                                     status: RunStatus::WaitingApproval,
                                 });
                             }
+                            projections::rebuild_run_summary(&self.pool, run_id).await?;
+                            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+                            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
                             return Ok(());
                         }
                         // Non-manual-gate Pending stages are left to fall
@@ -684,6 +689,9 @@ impl Orchestrator {
                     status: RunStatus::WaitingApproval,
                 });
             }
+            projections::rebuild_run_summary(&self.pool, run_id).await?;
+            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
             return Ok(());
         }
 
@@ -2870,6 +2878,9 @@ impl Orchestrator {
         if field_name == "seemingly_complete" {
             return extract_json_field(&summary_json, "implementation_complete");
         }
+        if field_name == "blocking_remaining_code_tasks" {
+            return extract_json_field(&summary_json, "blocking_remaining_code_task_count");
+        }
         extract_json_field(&summary_json, field_name)
     }
 
@@ -3840,6 +3851,18 @@ fn build_task_prompt(
             for field in &schema.required_fields {
                 parts.push(format!("- `{}`", field));
             }
+            if schema.required_fields.iter().any(|field| field == "status") {
+                if let Some(allowed_values) = contract_status_allowed_values(&schema.contract_id) {
+                    parts.push(format!(
+                        "Allowed values for `status`: {}.",
+                        allowed_values
+                            .iter()
+                            .map(|value| format!("`{value}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
             if schema.contract_id == "implementation_self_assessment_v2" {
                 parts.push(String::from(
                     "Required nested shapes for `implementation_self_assessment_v2`:\n\
@@ -4506,6 +4529,100 @@ mod tests {
             declared.target_path,
             format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json")
         );
+    }
+
+    #[test]
+    fn implementation_review_prompts_include_allowed_status_enums_for_each_role() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let mut plan = test_plan();
+        let fixtures = [
+            (
+                "proposal_implementation_auditor",
+                "audit_report",
+                "audit_report_v1",
+                vec!["implemented", "needs_code_fixes", "invalid", "unknown"],
+            ),
+            (
+                "security_checker",
+                "security_report",
+                "security_report_v1",
+                vec!["pass", "block", "invalid", "unknown"],
+            ),
+            (
+                "docs_guardian",
+                "docs_report",
+                "docs_report_v1",
+                vec!["pass", "not_needed", "block", "invalid", "unknown"],
+            ),
+            (
+                "prepush_code_reviewer",
+                "prepush_review_report",
+                "prepush_review_v1",
+                vec!["pass", "block", "invalid", "unknown"],
+            ),
+            (
+                "lead_orchestrator",
+                "implementation_review_summary",
+                "implementation_review_summary_v1",
+                vec![
+                    "code_complete",
+                    "needs_code_fixes",
+                    "release_evidence_blocked",
+                    "invalid",
+                ],
+            ),
+            (
+                "code_writer",
+                "implementation_self_assessment",
+                "implementation_self_assessment_v2",
+                vec![
+                    "complete",
+                    "needs_code_fixes",
+                    "blocked",
+                    "handoff_required",
+                    "unknown",
+                    "invalid",
+                ],
+            ),
+        ];
+
+        for (agent_id, output_name, contract_id, allowed_values) in fixtures {
+            plan.artifact_paths.insert(
+                output_name.to_string(),
+                format!("${{CHAINWORKS_META_ROOT:-.chainworks}}/{output_name}.json"),
+            );
+            let mut task = reviewer_task();
+            task.agent.agent_id = agent_id.to_string();
+            task.agent.output_contract = Some(contract_id.to_string());
+            task.outputs = vec![output_name.to_string()];
+            task.output_schemas.clear();
+            task.output_schemas.insert(
+                output_name.to_string(),
+                OutputSchema {
+                    contract_id: contract_id.to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: Some(output_name.to_string()),
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string()],
+                },
+            );
+
+            let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+            assert!(
+                prompt.contains("Allowed values for `status`:"),
+                "{agent_id} prompt should state allowed status values"
+            );
+            for allowed in allowed_values {
+                assert!(
+                    prompt.contains(&format!("`{allowed}`")),
+                    "{agent_id} prompt should include canonical status `{allowed}`"
+                );
+            }
+        }
     }
 
     #[test]

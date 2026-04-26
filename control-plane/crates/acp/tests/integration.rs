@@ -88,6 +88,64 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    pub fn create_set_mode_script(
+        tmpdir: &std::path::Path,
+        observed_mode_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_set_mode.py");
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, pathlib
+
+observed_mode_path = pathlib.Path({observed_mode_path:?})
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/new":
+    sys.exit(1)
+session_id = "fixture-session-set-mode"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/set_mode":
+    sys.exit(1)
+observed_mode_path.write_text(msg.get("params", {{}}).get("modeId", ""))
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/prompt":
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+
+recv()
+sys.exit(0)
+"#,
+            observed_mode_path = observed_mode_path.to_string_lossy().to_string(),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server that emits duplicate session/update chunks
     /// containing a residual absolute Xcode command path.
     pub fn create_residual_xcode_warning_script(tmpdir: &std::path::Path) -> String {
@@ -1403,6 +1461,68 @@ async fn http_mcp_servers_session_new_serialization_tests() {
     assert_eq!(server["headers"][0]["name"], "Authorization");
     assert_eq!(server["headers"][0]["value"], "Bearer redacted");
     assert!(server.get("command").is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transport_sends_set_mode_after_session_new_when_configured() {
+    use acp::transport::{AcpSessionConfig, AcpTransportSession};
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let observed_mode_path = tmp.path().join("observed-mode.txt");
+    let script = fixture::create_set_mode_script(tmp.path(), &observed_mode_path);
+    let child = Command::new(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+    };
+    let config = AcpSessionConfig {
+        set_mode_after_session_new: true,
+        ..AcpSessionConfig::default()
+    };
+
+    let mut session = AcpTransportSession::start(child, &req, &config)
+        .await
+        .unwrap();
+    let result = session.prompt(&req).await.unwrap();
+    assert_eq!(result.0, domain::agent::AgentStatus::Completed);
+    session.close().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(observed_mode_path).unwrap(),
+        "bypassPermissions"
+    );
 }
 
 #[cfg(unix)]

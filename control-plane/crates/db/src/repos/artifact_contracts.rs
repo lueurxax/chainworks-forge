@@ -127,6 +127,96 @@ pub async fn upsert_generation_and_rebuild_tx(
     rebuild_run_state_projection_tx(tx, input.run_id).await
 }
 
+pub async fn repair_contract_status_normalization_and_rebuild(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<u64> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let repaired = repair_contract_status_normalization_tx(&mut tx, run_id).await?;
+    rebuild_run_state_projection_tx(&mut tx, run_id).await?;
+    tx.commit().await?;
+    export_projection_files(pool, run_id).await?;
+    Ok(repaired)
+}
+
+pub async fn repair_contract_status_normalization_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<u64> {
+    let run_id_str = run_id.to_string();
+    let rows = sqlx::query(
+        r#"SELECT generation_id, contract_id, raw_path, raw_status, warnings_json,
+                  source_generation_verified
+           FROM artifact_contract_generations
+           WHERE run_id = ?1 AND valid = 0"#,
+    )
+    .bind(&run_id_str)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut repaired = 0_u64;
+    for row in rows {
+        let generation_id: String = row.get("generation_id");
+        let contract_id: String = row.get("contract_id");
+        let raw_path: String = row.get("raw_path");
+        let raw_status: String = row.get("raw_status");
+        let normalized =
+            normalize_contract_status(&contract_id, &raw_status).map_err(anyhow::Error::msg)?;
+        if !normalized.valid {
+            continue;
+        }
+
+        let mut warnings: Vec<String> =
+            serde_json::from_str(&row.get::<String, _>("warnings_json"))?;
+        for warning in normalized.warnings {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        let warnings_json = serde_json::to_string(&warnings)?;
+        let validation_errors_json = serde_json::to_string(&normalized.validation_errors)?;
+        let canonical_dimensions_json =
+            canonical_dimensions_json_for_generation(&contract_id, &raw_path)?;
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"UPDATE artifact_contract_generations
+               SET canonical_status = ?1,
+                   valid = 1,
+                   warnings_json = ?2,
+                   validation_errors_json = ?3,
+                   canonical_dimensions_json = ?4
+               WHERE generation_id = ?5"#,
+        )
+        .bind(&normalized.canonical_status)
+        .bind(&warnings_json)
+        .bind(&validation_errors_json)
+        .bind(&canonical_dimensions_json)
+        .bind(&generation_id)
+        .execute(&mut **tx)
+        .await?;
+
+        if row.get::<i64, _>("source_generation_verified") != 0 {
+            sqlx::query(
+                r#"INSERT INTO active_artifact_contracts (run_id, contract_id, generation_id, updated_at)
+                   VALUES (?1, ?2, ?3, ?4)
+                   ON CONFLICT(run_id, contract_id) DO UPDATE SET
+                     generation_id = excluded.generation_id,
+                     updated_at = excluded.updated_at"#,
+            )
+            .bind(&run_id_str)
+            .bind(&contract_id)
+            .bind(&generation_id)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        repaired += 1;
+    }
+
+    Ok(repaired)
+}
+
 pub async fn record_run_state_advisory_tx(
     tx: &mut Transaction<'_, Sqlite>,
     input: ActiveArtifactGenerationInput,
@@ -332,6 +422,22 @@ pub async fn finalize_pending_retry_supersession_tx(
     Ok(())
 }
 
+pub async fn finalize_pending_retry_supersession_for_work_item(
+    pool: &SqlitePool,
+    superseding_work_item_id: &str,
+    new_agent_execution_id: AgentExecutionId,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    finalize_pending_retry_supersession_tx(
+        &mut tx,
+        superseding_work_item_id,
+        new_agent_execution_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn close_source_generation_claim(
     pool: &SqlitePool,
     key: &ArtifactSourceGenerationClaimKey,
@@ -361,6 +467,30 @@ pub async fn close_source_generation_claim_tx(
     .bind(&key.source_work_item_id)
     .bind(ArtifactSourceClaimState::Active.to_string())
     .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_source_generation_claim_session(
+    pool: &SqlitePool,
+    key: &ArtifactSourceGenerationClaimKey,
+    current_session_generation_id: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"UPDATE artifact_source_generation_claims
+           SET current_session_generation_id = ?1, updated_at = ?2
+           WHERE run_id = ?3 AND stage_execution_id = ?4 AND agent_execution_id = ?5
+             AND source_work_item_id = ?6 AND claim_state = ?7"#,
+    )
+    .bind(current_session_generation_id)
+    .bind(&now)
+    .bind(key.run_id.to_string())
+    .bind(key.stage_execution_id.to_string())
+    .bind(key.agent_execution_id.to_string())
+    .bind(&key.source_work_item_id)
+    .bind(ArtifactSourceClaimState::Active.to_string())
+    .execute(pool)
     .await?;
     Ok(())
 }

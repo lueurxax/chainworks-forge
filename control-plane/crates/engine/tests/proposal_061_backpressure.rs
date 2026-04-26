@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
@@ -22,13 +22,16 @@ use domain::commands::{
 };
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
-use domain::provider::ProviderFamily;
+use domain::provider::{
+    InvokeAgentCapacityConfig as DomainInvokeAgentCapacityConfig, ProviderFamily,
+};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use engine::command_handler::CommandHandler;
 use engine::executor::{
     claim_next_invoke_agent_with_start_with_capacity,
-    has_capacity_eligible_pending_invoke_agent_for_start, InvokeAgentCapacityConfig,
+    has_capacity_eligible_pending_invoke_agent_for_start,
+    InvokeAgentCapacityConfig as StartCapacityConfig,
 };
 use engine::host_interruption::{
     HostInterruptionEvent, HostInterruptionKind, HostInterruptionRuntimeCleanup,
@@ -464,7 +467,7 @@ async fn command_handler_refreshes_scheduler_projection_with_configured_capacity
     .await
     .unwrap();
 
-    let capacity = InvokeAgentCapacityConfig {
+    let capacity = DomainInvokeAgentCapacityConfig {
         global_active_agent_executions: 20,
         per_run_active_agent_executions: 10,
         provider_caps: BTreeMap::from([(ProviderFamily::Codex, 1)]),
@@ -887,6 +890,79 @@ async fn startup_repair_readback_counts_requeued_invoke_backpressure() {
     assert_eq!(readback.affected_run_count, 1);
     assert_eq!(readback.queued_under_startup_recovery_backpressure_count, 1);
     assert!(readback.next_retry_or_backoff_time.is_some());
+}
+
+#[tokio::test]
+async fn startup_repair_requeues_abandoned_running_invoke_agent() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 abandoned invoke".into(),
+            body: "restart recovery".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation"),
+    )
+    .await
+    .unwrap();
+
+    let execution = make_running_execution(stage_execution_id, "gemini");
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+    let mut invoke = make_invoke_work_item(
+        "abandoned-running-invoke",
+        run_id,
+        stage_execution_id,
+        "implementation",
+        "gemini",
+        -60,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["p058_claimed"] = serde_json::json!({
+        "agent_execution_id": execution_id.to_string()
+    });
+    invoke.payload_json = payload.to_string();
+    invoke.status = WorkItemStatus::Running;
+    work_items::enqueue(&pool, &invoke).await.unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.work_items_requeued, 1);
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let recovered = items
+        .iter()
+        .find(|item| item.id == "abandoned-running-invoke")
+        .expect("abandoned invoke should remain durable");
+    assert_eq!(recovered.status, WorkItemStatus::Pending);
+    assert!(
+        recovered
+            .payload_json
+            .contains("startup_repair_abandoned_invoke_agent"),
+        "startup recovery reason should be persisted in payload"
+    );
 }
 
 #[tokio::test]
@@ -1521,10 +1597,10 @@ async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_
     .await
     .unwrap();
 
-    let capacity = InvokeAgentCapacityConfig {
-        global_active_agent_executions: 6,
-        per_run_active_agent_executions: 10,
-        provider_caps: BTreeMap::from([(ProviderFamily::Gemini, 1), (ProviderFamily::Codex, 3)]),
+    let capacity = StartCapacityConfig {
+        max_active_total: 6,
+        max_active_per_run: 10,
+        provider_caps: HashMap::from([("gemini".into(), 1), ("codex".into(), 3)]),
     };
 
     let claimed = claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
@@ -1607,10 +1683,10 @@ async fn invoke_agent_capacity_precheck_reports_when_all_pending_work_is_blocked
     .await
     .unwrap();
 
-    let capacity = InvokeAgentCapacityConfig {
-        global_active_agent_executions: 6,
-        per_run_active_agent_executions: 10,
-        provider_caps: BTreeMap::from([(ProviderFamily::Gemini, 1), (ProviderFamily::Codex, 3)]),
+    let capacity = StartCapacityConfig {
+        max_active_total: 6,
+        max_active_per_run: 10,
+        provider_caps: HashMap::from([("gemini".into(), 1), ("codex".into(), 3)]),
     };
 
     work_items::enqueue(
@@ -1748,7 +1824,11 @@ async fn invoke_agent_claim_prefers_least_recently_served_run_within_candidate_w
 
     let claimed = claim_next_invoke_agent_with_start_with_capacity(
         &pool,
-        &InvokeAgentCapacityConfig::default(),
+        &StartCapacityConfig {
+            max_active_total: usize::MAX,
+            max_active_per_run: usize::MAX,
+            provider_caps: HashMap::new(),
+        },
     )
     .await
     .unwrap()
@@ -1976,6 +2056,122 @@ async fn host_interruption_records_epoch_cancels_execution_and_requeues_invoke_w
         health.last_host_interruption_epoch_id.as_deref(),
         Some(summary.epoch_id.as_str())
     );
+}
+
+#[tokio::test]
+async fn network_migration_records_epoch_without_cancelling_active_prompt() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 network migration".into(),
+            body: "network migration should be non-disruptive".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation"),
+    )
+    .await
+    .unwrap();
+
+    let mut execution = make_running_execution(stage_execution_id, "claude");
+    execution.started_at = now - Duration::seconds(45);
+    execution.session_generation_id = Some("generation-network-migration".into());
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let mut work_item = make_invoke_work_item(
+        "claude-running-network-migration",
+        run_id,
+        stage_execution_id,
+        "implementation",
+        "claude",
+        -40,
+    );
+    work_item.status = WorkItemStatus::Running;
+    work_items::enqueue(&pool, &work_item).await.unwrap();
+
+    let runtime_cleanup = Arc::new(RecordingRuntimeCleanup::default());
+    let service = HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        domain::provider::InvokeAgentCapacityConfig::default(),
+        runtime_cleanup.clone(),
+    );
+    let summary = service
+        .record_and_requeue(HostInterruptionEvent {
+            kind: HostInterruptionKind::NetworkMigration,
+            started_at: now,
+            ended_at: Some(now),
+            monotonic_gap_ms: None,
+            wall_clock_gap_ms: None,
+            details_json: Some(r#"{"source":"network_path_change"}"#.into()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(summary.affected_executions, 0);
+    assert_eq!(summary.cancelled_executions, 0);
+    assert_eq!(summary.retries_enqueued, 0);
+    assert_eq!(summary.runtime_cleanup_attempted, 0);
+    assert!(
+        runtime_cleanup
+            .closed_generations
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "network migration must not close an active ACP prompt"
+    );
+
+    let stored_execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .expect("execution should remain queryable");
+    assert_eq!(stored_execution.status, AgentStatus::Running);
+
+    let running = work_items::list_by_status(&pool, WorkItemStatus::Running)
+        .await
+        .unwrap();
+    assert!(
+        running
+            .iter()
+            .any(|item| item.id == "claude-running-network-migration"),
+        "network migration must leave the active work item running"
+    );
+
+    let affected_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM host_interruption_affected_executions WHERE epoch_id = ?1",
+    )
+    .bind(&summary.epoch_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(affected_count, 0);
+
+    let epoch_kind: String =
+        sqlx::query_scalar("SELECT kind FROM host_interruption_epochs WHERE id = ?1")
+            .bind(&summary.epoch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch_kind, "network_migration");
 }
 
 #[tokio::test]
@@ -2403,4 +2599,91 @@ async fn host_interruption_retry_does_not_consume_provider_quota_budget() {
         .unwrap()
         .expect("execution should remain queryable");
     assert_eq!(stored_execution.status, AgentStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn transient_persistence_contention_requeues_running_work_without_failure_settlement() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 transient DB contention".into(),
+            body: "SQLITE_BUSY should reschedule work, not fail the run".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation_reviewed"),
+    )
+    .await
+    .unwrap();
+
+    let mut work_item = make_invoke_work_item(
+        "p061-transient-persistence-contention",
+        run_id,
+        stage_execution_id,
+        "implementation_reviewed",
+        "codex",
+        -1,
+    );
+    work_item.status = WorkItemStatus::Running;
+    work_item.attempt_count = 2;
+    work_items::enqueue(&pool, &work_item).await.unwrap();
+
+    let requeued = work_items::requeue_running_after_transient_persistence_contention(
+        &pool,
+        &work_item.id,
+        now,
+        "error returned from database: (code: 5) database is locked",
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        requeued,
+        "running work item should be rescheduled after transient SQLite contention"
+    );
+    let stored = work_items::find_by_id(&pool, &work_item.id)
+        .await
+        .unwrap()
+        .expect("work item should remain durable");
+    assert_eq!(stored.status, WorkItemStatus::Pending);
+    assert_eq!(
+        stored.attempt_count, 2,
+        "requeue must not spend a claim attempt"
+    );
+    assert!(
+        stored.scheduled_at > now,
+        "transient contention retry should use backoff instead of immediate hot-looping"
+    );
+    assert_eq!(
+        stored.last_error.as_deref(),
+        Some("transient_persistence_contention: error returned from database: (code: 5) database is locked")
+    );
+
+    let failed_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE status = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        failed_count, 0,
+        "transient SQLite contention must not create failed work truth"
+    );
 }

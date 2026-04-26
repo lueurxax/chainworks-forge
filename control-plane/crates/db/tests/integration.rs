@@ -1738,6 +1738,88 @@ async fn test_projection_parity_after_rebuild() {
     assert_eq!(stage_b.status, StageStatus::Failed.to_string());
 }
 
+/// Northbound projections must expose canonical run status even when the
+/// denormalized summary row has not caught up yet.
+#[tokio::test]
+async fn test_projection_status_uses_canonical_run_when_summary_lags() {
+    let pool = test_pool().await;
+
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Lagging summary idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::Running,
+        workflow_id: "wf-lag".into(),
+        workflow_title: "Lag Workflow".into(),
+        workspace_root: "/tmp/lag".into(),
+        artifact_root: "/tmp/lag/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("review".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
+    runs::update_status(&pool, run.id, RunStatus::Blocked)
+        .await
+        .unwrap();
+
+    let active = projections::list_active_projection(&pool).await.unwrap();
+    let active_row = active
+        .iter()
+        .find(|row| row.id == run.id.to_string())
+        .expect("active projection row");
+    assert_eq!(active_row.status, "blocked");
+    assert!(active_row.projection_lag);
+
+    let by_idea = projections::list_by_idea_projection(&pool, &idea.id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(by_idea[0].status, "blocked");
+    assert!(by_idea[0].projection_lag);
+
+    let found = projections::find_run_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap()
+        .expect("run projection");
+    assert_eq!(found.status, "blocked");
+    assert!(found.projection_lag);
+}
+
 // ---------------------------------------------------------------------------
 // File-backed SQLite durability proof (REQ-002 / READY-001)
 //

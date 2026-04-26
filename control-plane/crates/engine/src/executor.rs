@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,10 +31,10 @@ use domain::agent::{
 };
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
-    known_contract_id, parse_implementation_self_assessment_v2, ActiveArtifactGenerationInput,
-    ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey, ContractParseContext,
-    SourceGenerationImportDecision, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    contract_status_allowed_values, known_contract_id, parse_implementation_self_assessment_v2,
+    ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey,
+    ContractParseContext, SourceGenerationImportDecision,
+    IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH, IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
@@ -44,6 +45,7 @@ use domain::discovery::{
     DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::ids::RunId;
+use domain::provider::ProviderFamily;
 use domain::run::DeliveryConfiguration;
 use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
@@ -54,7 +56,10 @@ use crate::contracts::{
     TaskValidationSummary,
 };
 use crate::event_bus::EventSender;
-use crate::failure_classifier::{classify_observation, observation_from_acp_error_message};
+use crate::failure_classifier::{
+    classify_observation, observation_from_acp_error_message, RuntimeFailureClassification,
+    RuntimeFailureObservation,
+};
 use crate::git_manifest::generate_changed_files_manifest_if_declared;
 use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
 use crate::orchestrator::Orchestrator;
@@ -64,6 +69,26 @@ use crate::session::fingerprint::{
 };
 use crate::session::policy::{ensure_policy, SessionPolicyDecision, SessionPolicyInput};
 use crate::work_queue::WorkQueue;
+
+const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
+
+#[derive(Debug)]
+struct WorkItemRequeued {
+    work_item_id: String,
+    reason: &'static str,
+}
+
+impl fmt::Display for WorkItemRequeued {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "work item {} requeued for {}",
+            self.work_item_id, self.reason
+        )
+    }
+}
+
+impl std::error::Error for WorkItemRequeued {}
 
 struct DbXcodeRuntimeObservationSink {
     pool: SqlitePool,
@@ -145,7 +170,7 @@ pub struct ClaimedInvokeAgentStart {
     pub run_id: domain::ids::RunId,
     pub stage_execution_id: domain::ids::StageExecutionId,
     pub agent_execution_id: domain::ids::AgentExecutionId,
-    pub session_generation_id: String,
+    pub session_generation_id: Option<String>,
     pub artifact_claim_key: domain::artifact_contracts::ArtifactSourceGenerationClaimKey,
 }
 
@@ -218,11 +243,54 @@ async fn claim_next_invoke_agent_with_start_internal(
 ) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
     let candidates =
         work_items::select_pending_invoke_agents_for_start(pool, chrono::Utc::now(), 128).await?;
+    let mut ranked_candidates = Vec::with_capacity(candidates.len());
     for item in candidates {
+        let last_served_at = if let Some(run_id) = item.run_id {
+            scheduler::get_service_state(pool, "run", &run_id.to_string())
+                .await?
+                .and_then(|state| state.last_served_at)
+        } else {
+            None
+        };
+        ranked_candidates.push((last_served_at, item));
+    }
+    ranked_candidates.sort_by(|(left_last_served, left), (right_last_served, right)| {
+        match (left_last_served, right_last_served) {
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(left_at), Some(right_at)) if left_at != right_at => left_at.cmp(right_at),
+            _ => left
+                .scheduled_at
+                .cmp(&right.scheduled_at)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id)),
+        }
+    });
+
+    for (_, item) in ranked_candidates {
         if !invoke_item_has_start_capacity(pool, &item, capacity).await? {
             continue;
         }
         if let Some(claimed) = claim_invoke_agent_work_item_with_start(pool, item).await? {
+            if let Some(run_id) = claimed.1.run_id {
+                let now = chrono::Utc::now();
+                scheduler::upsert_service_state(
+                    pool,
+                    &scheduler::SchedulerServiceState {
+                        scope: "run".into(),
+                        scope_id: run_id.to_string(),
+                        last_served_at: Some(now),
+                        last_claimed_work_item_id: Some(claimed.0.work_item_id.clone()),
+                        updated_at: now,
+                    },
+                )
+                .await?;
+            }
+            scheduler::refresh_queue_summaries(
+                pool,
+                &scheduler_capacity_config_from_start_capacity(capacity),
+            )
+            .await?;
             return Ok(Some(claimed));
         }
     }
@@ -242,6 +310,8 @@ async fn invoke_item_has_start_capacity(
     if provider.is_empty() {
         return Ok(false);
     }
+    let provider_family =
+        ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
 
     let running_status = AgentStatus::Running.to_string();
     let total_active: i64 =
@@ -269,12 +339,12 @@ async fn invoke_item_has_start_capacity(
         }
     }
 
-    if let Some(provider_cap) = capacity.provider_caps.get(provider) {
+    if let Some(provider_cap) = capacity.provider_caps.get(&provider_family) {
         let provider_active: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_executions WHERE status = ?1 AND provider = ?2",
+            "SELECT COUNT(*) FROM agent_executions WHERE status = ?1 AND COALESCE(provider_family, provider) = ?2",
         )
         .bind(&running_status)
-        .bind(provider)
+        .bind(&provider_family)
         .fetch_one(pool)
         .await?;
         if provider_active as usize >= *provider_cap {
@@ -283,6 +353,25 @@ async fn invoke_item_has_start_capacity(
     }
 
     Ok(true)
+}
+
+fn scheduler_capacity_config_from_start_capacity(
+    capacity: &InvokeAgentCapacityConfig,
+) -> domain::provider::InvokeAgentCapacityConfig {
+    let provider_caps = capacity
+        .provider_caps
+        .iter()
+        .filter_map(|(provider, cap)| {
+            ProviderFamily::resolve(provider)
+                .ok()
+                .map(|family| (family, *cap))
+        })
+        .collect();
+    domain::provider::InvokeAgentCapacityConfig {
+        global_active_agent_executions: capacity.max_active_total,
+        per_run_active_agent_executions: capacity.max_active_per_run,
+        provider_caps,
+    }
 }
 
 async fn claim_invoke_agent_work_item_with_start(
@@ -303,12 +392,57 @@ async fn claim_invoke_agent_work_item_with_start(
         return Ok(None);
     }
 
+    let session_reuse_scope = payload
+        .get("session_reuse_scope")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let session_family_id = payload
+        .get("session_family_id")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+
     if let Some(existing) = payload.get("p058_claimed") {
-        let claimed = claimed_invoke_agent_start_from_payload(&item, existing)?;
-        mark_invoke_work_item_running(pool, &item.id).await?;
+        let mut claimed = claimed_invoke_agent_start_from_payload(&item, existing)?;
         let mut running_item = item;
         running_item.status = WorkItemStatus::Running;
         running_item.attempt_count += 1;
+        if session_reuse_scope.is_none() && claimed.session_generation_id.is_some() {
+            claimed.session_generation_id = None;
+            if let Some(claimed_object) = payload
+                .get_mut("p058_claimed")
+                .and_then(|value| value.as_object_mut())
+            {
+                claimed_object.remove("session_generation_id");
+                claimed_object.remove("session_policy_decision");
+            }
+            let payload_json = serde_json::to_string(&payload)?;
+            update_invoke_work_item_claimed_payload_and_running(
+                pool,
+                &running_item.id,
+                &payload_json,
+            )
+            .await?;
+            agent_executions::update_session_policy(
+                pool,
+                claimed.agent_execution_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            artifact_contracts::update_source_generation_claim_session(
+                pool,
+                &claimed.artifact_claim_key,
+                None,
+            )
+            .await?;
+            running_item.payload_json = payload_json;
+        } else {
+            mark_invoke_work_item_running(pool, &running_item.id).await?;
+        }
         return Ok(Some((claimed, running_item)));
     }
 
@@ -340,14 +474,6 @@ async fn claim_invoke_agent_work_item_with_start(
         .get("model")
         .and_then(|value| value.as_str())
         .map(String::from);
-    let session_reuse_scope = payload
-        .get("session_reuse_scope")
-        .and_then(|value| value.as_str())
-        .map(String::from);
-    let session_family_id = payload
-        .get("session_family_id")
-        .and_then(|value| value.as_str())
-        .map(String::from);
     let task_name = payload
         .get("task_name")
         .and_then(|value| value.as_str())
@@ -355,7 +481,9 @@ async fn claim_invoke_agent_work_item_with_start(
         .to_string();
     let now = chrono::Utc::now();
     let agent_execution_id = domain::ids::AgentExecutionId::new();
-    let session_generation_id = uuid::Uuid::new_v4().to_string();
+    let session_generation_id = session_reuse_scope
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
     let owner_execution_lineage_id = stage_execution_id.to_string();
     let run_id_str = run_id.to_string();
     let invocation_owner_key = invocation_owner_key(&InvocationOwnerKeyInput {
@@ -378,13 +506,13 @@ async fn claim_invoke_agent_work_item_with_start(
             started_at: now,
             completed_at: None,
             owner_execution_lineage_id: Some(owner_execution_lineage_id),
-            session_lineage_id: Some(session_generation_id.clone()),
-            session_generation_id: Some(session_generation_id.clone()),
+            session_lineage_id: session_generation_id.clone(),
+            session_generation_id: session_generation_id.clone(),
             rehydrated_from_checkpoint_artifact_id: None,
             invocation_owner_key: Some(invocation_owner_key),
             session_reuse_scope,
             session_family_id,
-            session_reuse_disposition: Some("fresh".into()),
+            session_reuse_disposition: session_generation_id.as_ref().map(|_| "fresh".into()),
             session_reset_reason: None,
             backend_profile_id: None,
             requested_mcp_extensions_json: None,
@@ -416,7 +544,7 @@ async fn claim_invoke_agent_work_item_with_start(
         pool,
         domain::artifact_contracts::ArtifactSourceGenerationClaim {
             key: artifact_claim_key.clone(),
-            current_session_generation_id: Some(session_generation_id.clone()),
+            current_session_generation_id: session_generation_id.clone(),
             claim_state: domain::agent::ArtifactSourceClaimState::Active,
             superseding_work_item_id: None,
             superseded_by_agent_execution_id: None,
@@ -426,6 +554,12 @@ async fn claim_invoke_agent_work_item_with_start(
             created_at: now,
             updated_at: now,
         },
+    )
+    .await?;
+    artifact_contracts::finalize_pending_retry_supersession_for_work_item(
+        pool,
+        &item.id,
+        agent_execution_id,
     )
     .await?;
 
@@ -438,16 +572,19 @@ async fn claim_invoke_agent_work_item_with_start(
         session_generation_id,
         artifact_claim_key,
     };
-    payload["p058_claimed"] = serde_json::json!({
+    let mut claimed_payload = serde_json::json!({
         "agent_execution_id": claimed.agent_execution_id.to_string(),
         "artifact_claim_key": claimed.artifact_claim_key,
-        "session_generation_id": claimed.session_generation_id,
-        "session_policy_decision": {
-            "generation": {
-                "id": claimed.session_generation_id
-            }
-        }
     });
+    if let Some(session_generation_id) = claimed.session_generation_id.as_deref() {
+        claimed_payload["session_generation_id"] = serde_json::json!(session_generation_id);
+        claimed_payload["session_policy_decision"] = serde_json::json!({
+            "generation": {
+                "id": session_generation_id
+            }
+        });
+    }
+    payload["p058_claimed"] = claimed_payload;
     let payload_json = serde_json::to_string(&payload)?;
     update_invoke_work_item_claimed_payload_and_running(pool, &item.id, &payload_json).await?;
     let mut running_item = item;
@@ -478,8 +615,7 @@ fn claimed_invoke_agent_start_from_payload(
         .pointer("/session_policy_decision/generation/id")
         .or_else(|| claimed.get("session_generation_id"))
         .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow::anyhow!("p058_claimed missing session generation id"))?
-        .to_string();
+        .map(String::from);
     Ok(ClaimedInvokeAgentStart {
         work_item_id: item.id.clone(),
         source_work_item_id: artifact_claim_key.source_work_item_id.clone(),
@@ -492,10 +628,12 @@ fn claimed_invoke_agent_start_from_payload(
 }
 
 async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
     let updated = sqlx::query(
-        "UPDATE work_items SET status = ?1, attempt_count = attempt_count + 1 WHERE id = ?2 AND status = ?3",
+        "UPDATE work_items SET status = ?1, started_at = ?2, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?3 AND status = ?4",
     )
     .bind(WorkItemStatus::Running.to_string())
+    .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
     .execute(pool)
@@ -512,11 +650,13 @@ async fn update_invoke_work_item_claimed_payload_and_running(
     work_item_id: &str,
     payload_json: &str,
 ) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
     let updated = sqlx::query(
-        "UPDATE work_items SET payload_json = ?1, status = ?2, attempt_count = attempt_count + 1 WHERE id = ?3 AND status = ?4",
+        "UPDATE work_items SET payload_json = ?1, status = ?2, started_at = ?3, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?4 AND status = ?5",
     )
     .bind(payload_json)
     .bind(WorkItemStatus::Running.to_string())
+    .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
     .execute(pool)
@@ -1391,6 +1531,23 @@ fn runtime_facts_for_acp_error(
     facts
 }
 
+fn suppress_interactive_review_xcode_mcp_for_invocation(
+    agent_id: &str,
+    backend_profile_id: Option<&str>,
+    permission_profile: Option<&str>,
+) -> bool {
+    let readonly_review_permission =
+        matches!(permission_profile, Some("RO_VERIFY" | "RO_PREPUSH_VERIFY"));
+    readonly_review_permission
+        && (matches!(
+            agent_id,
+            "proposal_implementation_auditor" | "prepush_code_reviewer"
+        ) || matches!(
+            backend_profile_id,
+            Some("codex_audit_high" | "claude_prepush_medium")
+        ))
+}
+
 fn is_reused_live_session_transport_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("no live acp session registered for generation id")
@@ -1400,13 +1557,34 @@ fn is_reused_live_session_transport_error(message: &str) -> bool {
         || lower.contains("epipe")
         || lower.contains("stdout closed")
         || lower.contains("transport closed")
+        || lower.contains("session closed during active prompt")
+}
+
+fn is_active_prompt_closed_transport_error(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("session closed during active prompt")
+}
+
+fn is_work_item_requeued(error: &Error) -> bool {
+    error.downcast_ref::<WorkItemRequeued>().is_some()
+}
+
+fn is_transient_persistence_contention_error(error: &Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("error returned from database: (code: 5)")
+        || message.contains("error returned from database: (code: 6)")
+        || message.contains("sqlite_busy")
+        || message.contains("sqlite_locked")
+        || message.contains("database is locked")
+        || message.contains("database is busy")
 }
 
 fn runtime_facts_for_execution_result(
     agent_exec_id: domain::ids::AgentExecutionId,
     result_status: AgentStatus,
     validation_summary: Option<&TaskValidationSummary>,
-    observed_failure_kind: Option<AgentFailureKind>,
+    observed_failure_classification: Option<RuntimeFailureClassification>,
     now: chrono::DateTime<chrono::Utc>,
     close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
 ) -> AgentExecutionRuntimeFacts {
@@ -1419,7 +1597,21 @@ fn runtime_facts_for_execution_result(
                 .iter()
                 .all(|result| result.status == domain::validation::ValidationStatus::Passed)
     });
+    let provider_quota_classification = observed_failure_classification
+        .as_ref()
+        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota);
     match validation_summary.and_then(|summary| summary.failure_class.as_ref()) {
+        Some(domain::validation::ValidationFailureClass::NoOutputProduced)
+            if provider_quota_classification.is_some() =>
+        {
+            let classification = provider_quota_classification.expect("checked above");
+            facts.failure_kind = Some(classification.failure_kind.clone());
+            facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+            facts.retry_after = classification.retry_after;
+            facts.transport_error_code = classification.transport_error_code.clone();
+            facts.supervision_classification = classification.supervision_classification.clone();
+            facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        }
         Some(domain::validation::ValidationFailureClass::NoOutputProduced) => {
             facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
             facts.operator_action_hint = Some(OperatorActionHint::Retry);
@@ -1433,15 +1625,31 @@ fn runtime_facts_for_execution_result(
             facts.output_settlement = AgentOutputSettlement::InvalidRequiredOutputs;
         }
         None if result_status == AgentStatus::Failed && facts.valid_required_outputs => {
-            facts.failure_kind =
-                Some(observed_failure_kind.unwrap_or(AgentFailureKind::ProviderInternalError));
-            facts.operator_action_hint = Some(OperatorActionHint::Retry);
+            if let Some(classification) = observed_failure_classification.as_ref() {
+                facts.failure_kind = Some(classification.failure_kind.clone());
+                facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+                facts.retry_after = classification.retry_after;
+                facts.transport_error_code = classification.transport_error_code.clone();
+                facts.supervision_classification =
+                    classification.supervision_classification.clone();
+            } else {
+                facts.failure_kind = Some(AgentFailureKind::ProviderInternalError);
+                facts.operator_action_hint = Some(OperatorActionHint::Retry);
+            }
             facts.output_settlement = AgentOutputSettlement::ValidOutputsFromFailedExecution;
         }
         None if result_status == AgentStatus::Failed => {
-            facts.failure_kind =
-                Some(observed_failure_kind.unwrap_or(AgentFailureKind::ProviderInternalError));
-            facts.operator_action_hint = Some(OperatorActionHint::Retry);
+            if let Some(classification) = observed_failure_classification.as_ref() {
+                facts.failure_kind = Some(classification.failure_kind.clone());
+                facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+                facts.retry_after = classification.retry_after;
+                facts.transport_error_code = classification.transport_error_code.clone();
+                facts.supervision_classification =
+                    classification.supervision_classification.clone();
+            } else {
+                facts.failure_kind = Some(AgentFailureKind::ProviderInternalError);
+                facts.operator_action_hint = Some(OperatorActionHint::Retry);
+            }
             facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
         }
         None => {
@@ -1649,15 +1857,14 @@ fn session_reuse_reason_for_policy_decision(decision: &SessionPolicyDecision) ->
     }
 }
 
-fn observed_failure_kind_for_execution_result(
+fn observed_failure_classification_for_execution_result(
     result_status: &AgentStatus,
     transcript_text: Option<&str>,
-) -> Option<AgentFailureKind> {
+) -> Option<RuntimeFailureClassification> {
     if *result_status != AgentStatus::Failed {
         return None;
     }
-    transcript_text
-        .map(|text| classify_observation(observation_from_acp_error_message(text)).failure_kind)
+    transcript_text.map(|text| classify_observation(observation_from_acp_error_message(text)))
 }
 
 fn redact_runtime_message(message: &str) -> String {
@@ -2056,8 +2263,41 @@ impl BackgroundExecutor {
                 info!(item_id = %item_id, kind = %kind, "process_next_item: processing");
                 match self.process_item(item).await {
                     Ok(()) => {
-                        self.work_queue.complete(&item_id).await?;
+                        if let Err(e) = self.work_queue.complete(&item_id).await {
+                            if is_transient_persistence_contention_error(&e) {
+                                let message = e.to_string();
+                                let requeued = self
+                                    .work_queue
+                                    .requeue_after_transient_persistence_contention(
+                                        &item_id, &message,
+                                    )
+                                    .await?;
+                                if requeued {
+                                    warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention during completion");
+                                    return Ok(true);
+                                }
+                            }
+                            return Err(e);
+                        }
                         Ok(true)
+                    }
+                    Err(e) if is_work_item_requeued(&e) => {
+                        info!(item_id = %item_id, kind = %kind, reason = %e, "Work item requeued");
+                        Ok(true)
+                    }
+                    Err(e) if is_transient_persistence_contention_error(&e) => {
+                        let message = e.to_string();
+                        let requeued = self
+                            .work_queue
+                            .requeue_after_transient_persistence_contention(&item_id, &message)
+                            .await?;
+                        if requeued {
+                            warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention");
+                            Ok(true)
+                        } else {
+                            self.work_queue.fail(&item_id, &message).await?;
+                            Err(e)
+                        }
                     }
                     Err(e) => {
                         self.work_queue.fail(&item_id, &e.to_string()).await?;
@@ -2082,6 +2322,99 @@ impl BackgroundExecutor {
         .map(|(_, item)| item))
     }
 
+    async fn auto_requeue_active_prompt_close(
+        &self,
+        item: &WorkItem,
+        claimed: &ClaimedInvokeAgentStart,
+        policy_decision: Option<&SessionPolicyDecision>,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        error: &Error,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let message = error.to_string();
+        if !is_active_prompt_closed_transport_error(&message)
+            || item.attempt_count >= ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS
+        {
+            return Ok(false);
+        }
+
+        let runtime_facts =
+            runtime_facts_for_acp_error(claimed.agent_execution_id, error, completed_at);
+        agent_executions::update_completed(
+            &self.pool,
+            claimed.agent_execution_id,
+            AgentStatus::Failed,
+            completed_at,
+        )
+        .await?;
+        agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await?;
+
+        if let Some(decision) = policy_decision {
+            let _ = self.acp.close_session(&decision.generation.id).await;
+            sessions::end_generation(
+                &self.pool,
+                &decision.generation.id,
+                domain::session::SessionGenerationStatus::Invalidated,
+                "active_prompt_transport_closed",
+                completed_at,
+            )
+            .await?;
+            sessions::insert_event(
+                &self.pool,
+                &domain::session::SessionEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    lineage_id: decision.lineage.id.clone(),
+                    generation_id: decision.generation.id.clone(),
+                    event_type: domain::session::SessionEventType::Invalidated,
+                    recorded_at: completed_at,
+                    details_json: Some(
+                        serde_json::json!({ "reason": "active_prompt_transport_closed" })
+                            .to_string(),
+                    ),
+                },
+            )
+            .await?;
+        }
+
+        let requeued = work_items::requeue_running_invoke_agent_after_active_prompt_close(
+            &self.pool,
+            &item.id,
+            &claimed.artifact_claim_key,
+            policy_decision.map(|decision| decision.generation.id.as_str()),
+            completed_at,
+            "active_prompt_transport_closed",
+        )
+        .await?;
+        if !requeued {
+            return Ok(false);
+        }
+
+        self.work_queue.refresh_scheduler_projection().await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: stage_id.to_string(),
+                agent_id: agent_id.to_string(),
+                provider: provider.to_string(),
+                event_kind: "session_requeued_after_transport_closed".to_string(),
+            });
+        warn!(
+            run_id = %run_id,
+            stage_id = %stage_id,
+            agent_id = %agent_id,
+            agent_execution_id = %claimed.agent_execution_id,
+            work_item_id = %item.id,
+            attempt_count = item.attempt_count,
+            max_attempts = ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS,
+            "ACP active prompt closed; requeued InvokeAgent with a fresh session"
+        );
+        Ok(true)
+    }
+
     async fn run_loop(self: &Arc<Self>) {
         info!("BackgroundExecutor: starting work loop");
         loop {
@@ -2100,7 +2433,55 @@ impl BackgroundExecutor {
                             match executor.process_item(item).await {
                                 Ok(()) => {
                                     if let Err(e) = executor.work_queue.complete(&item_id).await {
-                                        error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                        if is_transient_persistence_contention_error(&e) {
+                                            let message = e.to_string();
+                                            match executor
+                                                .work_queue
+                                                .requeue_after_transient_persistence_contention(
+                                                    &item_id, &message,
+                                                )
+                                                .await
+                                            {
+                                                Ok(true) => {
+                                                    warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention during completion");
+                                                }
+                                                Ok(false) => {
+                                                    error!(item_id = %item_id, error = %message, "Transient SQLite contention during completion but work item was no longer running");
+                                                }
+                                                Err(e2) => {
+                                                    error!(item_id = %item_id, error = %e2, "Failed to requeue work item after transient SQLite contention during completion");
+                                                }
+                                            }
+                                        } else {
+                                            error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                        }
+                                    }
+                                }
+                                Err(e) if is_work_item_requeued(&e) => {
+                                    info!(item_id = %item_id, kind = %kind, reason = %e, "Work item requeued");
+                                }
+                                Err(e) if is_transient_persistence_contention_error(&e) => {
+                                    let message = e.to_string();
+                                    match executor
+                                        .work_queue
+                                        .requeue_after_transient_persistence_contention(
+                                            &item_id, &message,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention");
+                                        }
+                                        Ok(false) => {
+                                            if let Err(e2) =
+                                                executor.work_queue.fail(&item_id, &message).await
+                                            {
+                                                error!(item_id = %item_id, error = %e2, "Failed to mark work item failed after transient contention requeue no-op");
+                                            }
+                                        }
+                                        Err(e2) => {
+                                            error!(item_id = %item_id, error = %e2, "Failed to requeue work item after transient SQLite contention");
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -2117,7 +2498,55 @@ impl BackgroundExecutor {
                         match self.process_item(item).await {
                             Ok(()) => {
                                 if let Err(e) = self.work_queue.complete(&item_id).await {
-                                    error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                    if is_transient_persistence_contention_error(&e) {
+                                        let message = e.to_string();
+                                        match self
+                                            .work_queue
+                                            .requeue_after_transient_persistence_contention(
+                                                &item_id, &message,
+                                            )
+                                            .await
+                                        {
+                                            Ok(true) => {
+                                                warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention during completion");
+                                            }
+                                            Ok(false) => {
+                                                error!(item_id = %item_id, error = %message, "Transient SQLite contention during completion but work item was no longer running");
+                                            }
+                                            Err(e2) => {
+                                                error!(item_id = %item_id, error = %e2, "Failed to requeue work item after transient SQLite contention during completion");
+                                            }
+                                        }
+                                    } else {
+                                        error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                    }
+                                }
+                            }
+                            Err(e) if is_work_item_requeued(&e) => {
+                                info!(item_id = %item_id, kind = %kind, reason = %e, "Work item requeued");
+                            }
+                            Err(e) if is_transient_persistence_contention_error(&e) => {
+                                let message = e.to_string();
+                                match self
+                                    .work_queue
+                                    .requeue_after_transient_persistence_contention(
+                                        &item_id, &message,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention");
+                                    }
+                                    Ok(false) => {
+                                        if let Err(e2) =
+                                            self.work_queue.fail(&item_id, &message).await
+                                        {
+                                            error!(item_id = %item_id, error = %e2, "Failed to mark work item failed after transient contention requeue no-op");
+                                        }
+                                    }
+                                    Err(e2) => {
+                                        error!(item_id = %item_id, error = %e2, "Failed to requeue work item after transient SQLite contention");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -2215,9 +2644,25 @@ impl BackgroundExecutor {
                 let skill_ref = payload["skill_ref"].as_str().map(String::from);
                 let skill_role = payload["skill_role"].as_str().map(String::from);
                 let skill_snapshot_hash = payload["skill_snapshot_hash"].as_str().map(String::from);
-                let requested_mcp_server_ids: Vec<String> =
+                let mut requested_mcp_server_ids: Vec<String> =
                     serde_json::from_value(payload["requested_mcp_server_ids"].clone())
                         .unwrap_or_default();
+                if suppress_interactive_review_xcode_mcp_for_invocation(
+                    &agent_id,
+                    payload["backend_profile_id"].as_str(),
+                    payload["permission_profile"].as_str(),
+                ) {
+                    let before = requested_mcp_server_ids.len();
+                    requested_mcp_server_ids.retain(|id| id != "xcode");
+                    if requested_mcp_server_ids.len() != before {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            "Suppressing interactive Xcode MCP lease for read-only review/audit invocation"
+                        );
+                    }
+                }
                 let mut mcp_resolution = crate::mcp::resolve_mcp_servers(
                     &requested_mcp_server_ids,
                     backend_profile_id.as_deref(),
@@ -2248,7 +2693,11 @@ impl BackgroundExecutor {
                     .unwrap_or_default();
                 let session_reuse_scope = payload["session_reuse_scope"].as_str().map(String::from);
                 let session_family_id = payload["session_family_id"].as_str().map(String::from);
-                let xcode_broker_required = payload["xcode_broker_required"]
+                let xcode_broker_required = !suppress_interactive_review_xcode_mcp_for_invocation(
+                    &agent_id,
+                    backend_profile_id.as_deref(),
+                    permission_profile.as_deref(),
+                ) && payload["xcode_broker_required"]
                     .as_bool()
                     .unwrap_or_else(|| requested_mcp_server_ids.iter().any(|id| id == "xcode"));
                 let xcode_shim_injection_signal = payload["xcode_shim_injection_signal"]
@@ -2360,15 +2809,12 @@ impl BackgroundExecutor {
                     }),
                 };
 
-                let mut policy_decision: Option<SessionPolicyDecision> = if preclaimed_start
-                    .is_none()
-                    && session_reuse_scope.is_some()
-                    && !xcode_shim_required
-                {
-                    Some(ensure_policy(&self.pool, policy_input.clone()).await?)
-                } else {
-                    None
-                };
+                let mut policy_decision: Option<SessionPolicyDecision> =
+                    if session_reuse_scope.is_some() && !xcode_shim_required {
+                        Some(ensure_policy(&self.pool, policy_input.clone()).await?)
+                    } else {
+                        None
+                    };
                 if let Some(decision) = policy_decision.as_ref() {
                     if decision.should_reuse_live_session
                         && !self
@@ -2416,6 +2862,39 @@ impl BackgroundExecutor {
                         reuse_live_session = decision.should_reuse_live_session,
                         "Session policy evaluated"
                     );
+                }
+                if let (Some(claimed), Some(decision)) =
+                    (preclaimed_start.as_ref(), policy_decision.as_ref())
+                {
+                    let disposition = serde_json::to_value(&decision.disposition)
+                        .ok()
+                        .and_then(|value| value.as_str().map(String::from));
+                    agent_executions::update_session_policy(
+                        &self.pool,
+                        claimed.agent_execution_id,
+                        Some(&decision.lineage.id),
+                        Some(&decision.generation.id),
+                        decision
+                            .generation
+                            .rehydrated_from_checkpoint_artifact_id
+                            .as_deref(),
+                        Some(&decision.generation.invocation_owner_key),
+                        disposition.as_deref(),
+                        decision.session_reset_reason.as_deref(),
+                    )
+                    .await?;
+                    artifact_contracts::update_source_generation_claim_session(
+                        &self.pool,
+                        &claimed.artifact_claim_key,
+                        Some(&decision.generation.id),
+                    )
+                    .await?;
+
+                    let mut facts =
+                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
+                    facts.session_reuse_reason =
+                        Some(session_reuse_reason_for_policy_decision(decision));
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
                 }
                 if let Some(decision) = policy_decision.as_ref() {
                     self.persist_session_checkpoint_artifact_if_needed(
@@ -2682,7 +3161,7 @@ impl BackgroundExecutor {
                 };
                 let estimated_prompt_tokens =
                     std::cmp::max(1_i64, (execution_prompt.chars().count() as i64) / 4);
-                let mut req = acp::ExecutionRequest {
+                let req = acp::ExecutionRequest {
                     agent_execution_id: Some(agent_exec_id),
                     run_id,
                     stage_execution_id: Some(stage_execution_id.to_string()),
@@ -2728,7 +3207,100 @@ impl BackgroundExecutor {
                         event_kind: "session_started".to_string(),
                     });
 
-                let result = self.acp.execute(req).await?;
+                let mut result = match self.acp.execute(req.clone()).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let completed_at = chrono::Utc::now();
+                        if let Some(claimed) = preclaimed_start.as_ref() {
+                            if self
+                                .auto_requeue_active_prompt_close(
+                                    &item,
+                                    claimed,
+                                    policy_decision.as_ref(),
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                    &provider,
+                                    &error,
+                                    completed_at,
+                                )
+                                .await?
+                            {
+                                return Err(WorkItemRequeued {
+                                    work_item_id: item.id.clone(),
+                                    reason: "active_prompt_transport_closed",
+                                }
+                                .into());
+                            }
+                        }
+                        let runtime_facts =
+                            runtime_facts_for_acp_error(agent_exec_id, &error, completed_at);
+                        if let Err(update_error) = agent_executions::update_completed(
+                            &self.pool,
+                            agent_exec_id,
+                            AgentStatus::Failed,
+                            completed_at,
+                        )
+                        .await
+                        {
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                agent_execution_id = %agent_exec_id,
+                                error = %update_error,
+                                "Failed to mark ACP startup failure execution as failed"
+                            );
+                        }
+                        if let Err(update_error) =
+                            agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await
+                        {
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                agent_execution_id = %agent_exec_id,
+                                error = %update_error,
+                                "Failed to persist ACP startup failure runtime facts"
+                            );
+                        }
+                        let _ =
+                            self.events
+                                .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                                    run_id,
+                                    stage_id: stage_id.clone(),
+                                    agent_id: agent_id.clone(),
+                                    provider: provider.clone(),
+                                    event_kind: "session_failed".to_string(),
+                                });
+                        return Err(error);
+                    }
+                };
+                match agent_executions::find_by_id(&self.pool, agent_exec_id).await? {
+                    Some(current_execution) if current_execution.status == AgentStatus::Running => {
+                    }
+                    Some(current_execution) => {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            agent_execution_id = %agent_exec_id,
+                            current_status = %current_execution.status,
+                            "Discarding late ACP result for agent execution that is no longer running"
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            agent_execution_id = %agent_exec_id,
+                            "Discarding late ACP result for missing agent execution"
+                        );
+                        return Ok(());
+                    }
+                }
 
                 if !requested_mcp_server_ids.is_empty() {
                     let actual_mcp_extensions_json =
@@ -2756,7 +3328,7 @@ impl BackgroundExecutor {
                 let mut acp_git_manifest_status: Option<String> = None;
                 let mut acp_exact_output_acceptance_latency_ms: Option<u64> = None;
                 let mut acp_resume_discovery_warning: Option<String> = None;
-                let declared_output_settlement = if !declared_outputs.is_empty() {
+                let mut declared_output_settlement = if !declared_outputs.is_empty() {
                     let manifest_started = Instant::now();
                     match generate_changed_files_manifest_if_declared(
                         &declared_outputs,
@@ -2859,6 +3431,106 @@ impl BackgroundExecutor {
                     None
                 };
 
+                let mut output_contract_repair_turn_count = 0_i64;
+                if let Some(settlement) = declared_output_settlement.as_ref() {
+                    let captured = build_captured_outputs_from_discovery_decisions(
+                        &declared_outputs,
+                        &settlement.decisions,
+                        &settlement.accepted_payloads,
+                    );
+                    let validation = validate_task_outputs(&captured);
+                    if validation_summary_requires_output_contract_repair(&validation) {
+                        if let Some(session_generation_id) =
+                            result.session_generation_id.clone().or_else(|| {
+                                policy_decision
+                                    .as_ref()
+                                    .map(|decision| decision.generation.id.clone())
+                            })
+                        {
+                            let mut repair_req = req.clone();
+                            repair_req.prompt =
+                                output_contract_repair_prompt(&validation, &declared_outputs);
+                            repair_req.reuse_existing_session = true;
+                            repair_req.keep_session_alive = true;
+                            repair_req.session_generation_id = Some(session_generation_id.clone());
+                            repair_req.provider_session_id = result
+                                .provider_session_id
+                                .clone()
+                                .or_else(|| repair_req.provider_session_id.clone());
+
+                            match self
+                                .acp
+                                .prompt_session(&session_generation_id, repair_req)
+                                .await
+                            {
+                                Ok(repair_result) => {
+                                    output_contract_repair_turn_count += 1;
+                                    match settle_agent_outputs_from_discovery_decisions(
+                                        &declared_outputs,
+                                        &expected_outputs,
+                                        &repair_result.discovered_artifacts,
+                                        &repair_result.pre_prompt_expected_outputs,
+                                    ) {
+                                        Ok(repair_settlement) => {
+                                            let repair_captured =
+                                                build_captured_outputs_from_discovery_decisions(
+                                                    &declared_outputs,
+                                                    &repair_settlement.decisions,
+                                                    &repair_settlement.accepted_payloads,
+                                                );
+                                            let repair_validation =
+                                                validate_task_outputs(&repair_captured);
+                                            if repair_validation.failure_class.is_none() {
+                                                merge_contract_repair_result(
+                                                    &mut result,
+                                                    repair_result,
+                                                );
+                                                declared_output_settlement =
+                                                    Some(repair_settlement);
+                                                info!(
+                                                    run_id = %run_id,
+                                                    stage_id = %stage_id,
+                                                    agent_id = %agent_id,
+                                                    "Output contract repair turn produced valid declared outputs"
+                                                );
+                                            } else {
+                                                warn!(
+                                                    run_id = %run_id,
+                                                    stage_id = %stage_id,
+                                                    agent_id = %agent_id,
+                                                    failure = ?repair_validation.failure_summary,
+                                                    "Output contract repair turn did not produce valid declared outputs"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => warn!(
+                                            run_id = %run_id,
+                                            stage_id = %stage_id,
+                                            agent_id = %agent_id,
+                                            error = %error,
+                                            "Output contract repair settlement failed"
+                                        ),
+                                    }
+                                }
+                                Err(error) => warn!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    agent_id = %agent_id,
+                                    error = %error,
+                                    "Output contract repair turn failed"
+                                ),
+                            }
+                        } else {
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                "Output contract repair skipped because no live session generation is available"
+                            );
+                        }
+                    }
+                }
+
                 if let (Some(decision), Some(provider_session_id)) = (
                     policy_decision.as_ref(),
                     result.provider_session_id.as_deref(),
@@ -2868,11 +3540,13 @@ impl BackgroundExecutor {
                         .as_ref()
                         .and_then(|usage| usage.input_tokens)
                         .unwrap_or(estimated_prompt_tokens);
+                    let session_turn_count =
+                        decision.generation.turn_count + 1 + output_contract_repair_turn_count;
                     sessions::update_generation_usage(
                         &self.pool,
                         &decision.generation.id,
                         provider_session_id,
-                        decision.generation.turn_count + 1,
+                        session_turn_count,
                         actual_input_tokens,
                         result.cost_cents.unwrap_or(0),
                         actual_input_tokens,
@@ -2924,13 +3598,13 @@ impl BackgroundExecutor {
                         agent_execution_id: agent_exec_id,
                         source_work_item_id: item.id.clone(),
                     });
-                let source_session_generation_id = preclaimed_start
+                let source_session_generation_id = policy_decision
                     .as_ref()
-                    .map(|claimed| claimed.session_generation_id.as_str())
+                    .map(|decision| decision.generation.id.as_str())
                     .or_else(|| {
-                        policy_decision
+                        preclaimed_start
                             .as_ref()
-                            .map(|decision| decision.generation.id.as_str())
+                            .and_then(|claimed| claimed.session_generation_id.as_deref())
                     });
                 let transcript_artifact = self
                     .persist_transcript_artifact_if_present(
@@ -3078,7 +3752,7 @@ impl BackgroundExecutor {
                         &artifact_claim_key,
                         source_session_generation_id,
                         result.status.clone(),
-                        observed_failure_kind_for_execution_result(
+                        observed_failure_classification_for_execution_result(
                             &result.status,
                             result.transcript_text.as_deref(),
                         ),
@@ -3770,7 +4444,7 @@ impl BackgroundExecutor {
         artifact_claim_key: &ArtifactSourceGenerationClaimKey,
         session_generation_id: Option<&str>,
         result_status: AgentStatus,
-        observed_failure_kind: Option<AgentFailureKind>,
+        observed_failure_classification: Option<RuntimeFailureClassification>,
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
         discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
@@ -3789,7 +4463,7 @@ impl BackgroundExecutor {
             agent_exec_id,
             result_status.clone(),
             validation_summary.as_ref(),
-            observed_failure_kind,
+            observed_failure_classification,
             completed_at,
             close_diagnostic,
         );
@@ -3962,11 +4636,19 @@ impl BackgroundExecutor {
             agent_execution_discovery_diagnostics::upsert_tx(&mut tx, discovery_diagnostics)
                 .await?;
         }
-        agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
-        if session_generation_id.is_some() {
-            artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key)
-                .await?;
+        if runtime_facts.failure_kind == Some(AgentFailureKind::ProviderQuota) {
+            let ledger = agent_retry_budget_ledger::upsert_quota_failure_tx(
+                &mut tx,
+                artifact_claim_key.run_id,
+                stage_execution_id,
+                agent_exec_id,
+                runtime_facts.retry_after,
+            )
+            .await?;
+            runtime_facts.quota_ledger_id = Some(ledger.id);
         }
+        agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
+        artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
         for artifact in declared_artifacts_to_insert {
@@ -4815,6 +5497,7 @@ fn prompt_with_runtime_invocation_contract(
             "- `{}` -> `{}`\n",
             output.output_name, output.target_path
         ));
+        append_status_allowed_values_for_declared_output(&mut prompt, output);
         if let (Some(name), Some(path)) = (
             output.companion_output_name.as_deref(),
             output.companion_path.as_deref(),
@@ -4829,7 +5512,160 @@ fn prompt_with_runtime_invocation_contract(
          keys. You must not finish this turn without `CHAINWORKS_OUTPUT` when required outputs are \
          listed.\n",
     );
+    append_docs_noop_contract_guidance(&mut prompt, input.declared_outputs);
     prompt
+}
+
+fn append_status_allowed_values_for_declared_output(prompt: &mut String, output: &DeclaredOutput) {
+    let Some(schema) = output.schema.as_ref() else {
+        return;
+    };
+    if !schema.required_fields.iter().any(|field| field == "status") {
+        return;
+    }
+    let Some(allowed_values) = contract_status_allowed_values(&schema.contract_id) else {
+        return;
+    };
+    prompt.push_str(&format!(
+        "  Allowed values for `status`: {}.\n",
+        allowed_values
+            .iter()
+            .map(|value| format!("`{value}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+}
+
+fn append_docs_noop_contract_guidance(prompt: &mut String, declared_outputs: &[DeclaredOutput]) {
+    let has_docs_report = declared_outputs
+        .iter()
+        .any(|output| output.output_name == "docs_report");
+    let has_docs_delta = declared_outputs
+        .iter()
+        .any(|output| output.output_name == "docs_delta");
+    if !(has_docs_report || has_docs_delta) {
+        return;
+    }
+
+    prompt.push_str(
+        "\nDocumentation no-op is a valid structured result. If documentation is already aligned, \
+         still emit the required outputs instead of omitting them:\n",
+    );
+    if has_docs_report {
+        prompt.push_str(
+            "<<<CHAINWORKS_OUTPUT:docs_report>>>{\"status\":\"not_needed\",\"changed_docs\":[],\"missing_docs\":[],\"followups\":[]}<<<END_CHAINWORKS_OUTPUT>>>\n",
+        );
+    }
+    if has_docs_delta {
+        prompt.push_str(
+            "<<<CHAINWORKS_OUTPUT:docs_delta>>>{\"files\":[],\"summary\":\"No documentation changes required.\"}<<<END_CHAINWORKS_OUTPUT>>>\n",
+        );
+    }
+}
+
+fn validation_summary_requires_output_contract_repair(summary: &TaskValidationSummary) -> bool {
+    matches!(
+        summary.failure_class,
+        Some(
+            domain::validation::ValidationFailureClass::NoOutputProduced
+                | domain::validation::ValidationFailureClass::EmptyOutput
+                | domain::validation::ValidationFailureClass::OutputContractMismatch
+        )
+    )
+}
+
+fn output_contract_repair_prompt(
+    validation: &TaskValidationSummary,
+    declared_outputs: &[DeclaredOutput],
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("### Output Contract Repair\n");
+    prompt.push_str(
+        "The previous response did not satisfy the required output contract. Do not redo unrelated implementation work. Return only corrected `CHAINWORKS_OUTPUT` blocks for the outputs listed below.\n",
+    );
+    if let Some(summary) = validation.failure_summary.as_deref() {
+        prompt.push_str(&format!("- Validation failure: {summary}\n"));
+    }
+    for result in &validation.output_results {
+        if result.status == domain::validation::ValidationStatus::Passed {
+            continue;
+        }
+        prompt.push_str(&format!("- `{}` failed", result.output_name));
+        if let Some(contract_id) = result.contract_id.as_deref() {
+            prompt.push_str(&format!(" contract `{contract_id}`"));
+        }
+        if !result.missing_fields.is_empty() {
+            prompt.push_str(&format!(
+                "; missing fields: {}",
+                result.missing_fields.join(", ")
+            ));
+        }
+        if let Some(error) = result.validation_error.as_deref() {
+            prompt.push_str(&format!("; error: {error}"));
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("\nRequired corrected output envelopes:\n");
+    for output in declared_outputs {
+        prompt.push_str(&format!("<<<CHAINWORKS_OUTPUT:{}>>>\n", output.output_name));
+        append_status_allowed_values_for_declared_output(&mut prompt, output);
+        prompt.push_str("{ /* valid JSON matching the declared contract */ }\n");
+        prompt.push_str("<<<END_CHAINWORKS_OUTPUT>>>\n");
+    }
+    append_docs_noop_contract_guidance(&mut prompt, declared_outputs);
+    prompt
+}
+
+fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp::ExecutionResult) {
+    initial.status = repair.status;
+    initial.artifact_paths.extend(repair.artifact_paths);
+    initial.discovered_artifacts = repair.discovered_artifacts;
+    initial.pre_prompt_expected_outputs = repair.pre_prompt_expected_outputs;
+    initial.cost_cents =
+        Some(initial.cost_cents.unwrap_or_default() + repair.cost_cents.unwrap_or_default());
+    initial.usage = repair.usage.or_else(|| initial.usage.clone());
+    initial.provider_session_id = repair
+        .provider_session_id
+        .or(initial.provider_session_id.clone());
+    initial.reused_existing_session = repair.reused_existing_session;
+    initial.session_generation_id = repair
+        .session_generation_id
+        .or(initial.session_generation_id.clone());
+    initial.mcp_observation = repair
+        .mcp_observation
+        .or_else(|| initial.mcp_observation.clone());
+    if !repair.actual_mcp_extensions.is_empty() {
+        initial.actual_mcp_extensions = repair.actual_mcp_extensions;
+    }
+    if !repair.actual_mcp_runtime_ids.is_empty() {
+        initial.actual_mcp_runtime_ids = repair.actual_mcp_runtime_ids;
+    }
+    initial.mcp_session_startup_latency_ms = repair
+        .mcp_session_startup_latency_ms
+        .or(initial.mcp_session_startup_latency_ms);
+    initial
+        .xcode_shim_warning_events
+        .extend(repair.xcode_shim_warning_events);
+    initial.close_diagnostic = repair.close_diagnostic.or(initial.close_diagnostic.take());
+    initial.acp_prompt_duration_ms = repair
+        .acp_prompt_duration_ms
+        .or(initial.acp_prompt_duration_ms);
+    initial.acp_pre_prompt_metadata_latency_ms = repair
+        .acp_pre_prompt_metadata_latency_ms
+        .or(initial.acp_pre_prompt_metadata_latency_ms);
+    initial.acp_pre_prompt_metadata_timeout |= repair.acp_pre_prompt_metadata_timeout;
+    initial.acp_pre_prompt_metadata_digest_bytes += repair.acp_pre_prompt_metadata_digest_bytes;
+    initial.legacy_broad_discovery_snapshot = repair
+        .legacy_broad_discovery_snapshot
+        .or_else(|| initial.legacy_broad_discovery_snapshot.clone());
+    initial.transcript_text = match (initial.transcript_text.take(), repair.transcript_text) {
+        (Some(initial_text), Some(repair_text)) => Some(format!(
+            "{initial_text}\n\n--- output contract repair turn ---\n{repair_text}"
+        )),
+        (None, Some(repair_text)) => Some(repair_text),
+        (Some(initial_text), None) => Some(initial_text),
+        (None, None) => None,
+    };
 }
 
 #[cfg(test)]
@@ -4874,6 +5710,85 @@ mod tests {
         assert!(prompt.contains("stale"));
         assert!(prompt.contains("CHAINWORKS_OUTPUT"));
         assert!(prompt.contains("must not finish this turn without"));
+    }
+
+    #[test]
+    fn runtime_invocation_contract_spells_out_docs_noop_outputs() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "docs_report".to_string(),
+                target_path: "/workspace/.chainworks/docs/report.json".to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "docs_delta".to_string(),
+                target_path: "/workspace/.chainworks/docs/changed-files.json".to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Review docs".to_string(),
+            RuntimeInvocationContractInput {
+                run_id: RunId::new().to_string(),
+                stage_id: "state_9_implementation_reviewed".to_string(),
+                stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
+                agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                work_item_id: "work-docs".to_string(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        assert!(prompt.contains("\"status\":\"not_needed\""));
+        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:docs_report>>>"));
+        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:docs_delta>>>"));
+        assert!(prompt.contains("\"files\":[]"));
+    }
+
+    #[test]
+    fn output_contract_repair_prompt_names_missing_outputs_and_exact_envelopes() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "implementation_review_summary".to_string(),
+            target_path: "/workspace/.chainworks/review/implementation-summary.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "implementation_review_summary".to_string(),
+                contract_id: Some("implementation_review_summary_v1".to_string()),
+                status: domain::validation::ValidationStatus::Failed,
+                missing_fields: vec!["status".to_string()],
+                validation_error: Some("required output was not produced".to_string()),
+                raw_payload_size: 0,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some(
+                "implementation_review_summary: required output was not produced".to_string(),
+            ),
+        };
+
+        let prompt = output_contract_repair_prompt(&validation, &declared_outputs);
+
+        assert!(validation_summary_requires_output_contract_repair(
+            &validation
+        ));
+        assert!(prompt.contains("implementation_review_summary"));
+        assert!(prompt.contains("required output was not produced"));
+        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
+        assert!(prompt.contains("Do not redo unrelated implementation work"));
     }
 
     #[test]
@@ -4954,6 +5869,25 @@ mod tests {
             stable_fingerprint, volatile_fingerprint,
             "including runtime ids in the session fingerprint would force fresh sessions"
         );
+    }
+
+    #[test]
+    fn p051_runtime_guard_suppresses_interactive_xcode_mcp_for_review_invocations() {
+        assert!(suppress_interactive_review_xcode_mcp_for_invocation(
+            "proposal_implementation_auditor",
+            Some("codex_audit_high"),
+            Some("RO_VERIFY")
+        ));
+        assert!(suppress_interactive_review_xcode_mcp_for_invocation(
+            "prepush_code_reviewer",
+            Some("claude_prepush_medium"),
+            Some("RO_PREPUSH_VERIFY")
+        ));
+        assert!(!suppress_interactive_review_xcode_mcp_for_invocation(
+            "code_writer",
+            Some("codex_writer_high"),
+            Some("WRITE")
+        ));
     }
 
     #[test]
@@ -5159,7 +6093,9 @@ mod tests {
             domain::ids::AgentExecutionId::new(),
             AgentStatus::Failed,
             Some(&validation),
-            Some(AgentFailureKind::ProviderQuota),
+            Some(classify_observation(
+                RuntimeFailureObservation::ProviderQuota { retry_after: None },
+            )),
             chrono::Utc::now(),
             None,
         );
@@ -5169,6 +6105,44 @@ mod tests {
             &validation,
             &facts.failure_kind.unwrap().to_string()
         ));
+    }
+
+    #[test]
+    fn provider_quota_observation_overrides_no_output_validation_failure() {
+        let retry_after = chrono::DateTime::parse_from_rfc3339("2026-04-26T19:45:06Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            Some(classify_observation(
+                RuntimeFailureObservation::ProviderQuota {
+                    retry_after: Some(retry_after),
+                },
+            )),
+            chrono::Utc::now(),
+            None,
+        );
+
+        assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
+        assert_eq!(
+            facts.operator_action_hint,
+            Some(OperatorActionHint::WaitUntilRetryAfter)
+        );
+        assert_eq!(facts.retry_after, Some(retry_after));
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
     }
 
     #[test]

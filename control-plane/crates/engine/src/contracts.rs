@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use domain::artifact::ArtifactFormat;
 use domain::artifact_contracts::{
-    parse_implementation_self_assessment_v2, ContractParseContext,
+    contract_status_allowed_values, parse_implementation_self_assessment_v2, ContractParseContext,
     ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
@@ -184,19 +184,42 @@ pub fn validate_output(
             .cloned()
             .collect();
 
-        let validation_error = (!missing_fields.is_empty())
-            .then(|| format!("Missing required fields: {}", missing_fields.join(", ")));
+        let mut validation_errors = Vec::new();
+        if !missing_fields.is_empty() {
+            validation_errors.push(format!(
+                "Missing required fields: {}",
+                missing_fields.join(", ")
+            ));
+        }
+        if schema.required_fields.iter().any(|field| field == "status") {
+            if let Some(raw_status) = obj.get("status").and_then(|value| value.as_str()) {
+                if let Some(allowed) = contract_status_allowed_values(&schema.contract_id) {
+                    if !allowed.contains(&raw_status) {
+                        validation_errors.push(format!(
+                            "Invalid status `{}` for contract `{}`; allowed values for status: {}",
+                            raw_status,
+                            schema.contract_id,
+                            allowed
+                                .iter()
+                                .map(|value| format!("`{value}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                }
+            }
+        }
 
         OutputValidationResult {
             output_name: output_name.to_string(),
             contract_id: Some(schema.contract_id.clone()),
-            status: if missing_fields.is_empty() {
+            status: if validation_errors.is_empty() {
                 ValidationStatus::Passed
             } else {
                 ValidationStatus::Failed
             },
             missing_fields,
-            validation_error,
+            validation_error: (!validation_errors.is_empty()).then(|| validation_errors.join("; ")),
             raw_payload_size: content.len(),
         }
     } else {
@@ -596,6 +619,50 @@ mod tests {
         let result = validate_output("proposal_review", br#"{"summary":"ok"}"#, Some(&schema));
         assert_eq!(result.status, ValidationStatus::Failed);
         assert_eq!(result.missing_fields, vec!["status"]);
+    }
+
+    #[test]
+    fn validate_output_rejects_status_values_outside_contract_enum() {
+        let schema = OutputSchema {
+            contract_id: "audit_report_v1".to_string(),
+            format: "json".to_string(),
+            human_format: None,
+            machine_format: Some("json".to_string()),
+            validation_mode: Some("strict_structured".to_string()),
+            normalized_artifact_name: Some("audit_report".to_string()),
+            raw_artifact_name: None,
+            required_fields: vec![
+                "status".to_string(),
+                "matches_proposal".to_string(),
+                "missing_items".to_string(),
+                "extra_items".to_string(),
+                "defects".to_string(),
+                "required_fixes".to_string(),
+            ],
+        };
+        let result = validate_output(
+            "audit_report",
+            br#"{"status":"Not Implemented","matches_proposal":false,"missing_items":[],"extra_items":[],"defects":[],"required_fixes":[]}"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Failed);
+        assert!(result
+            .validation_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("allowed values for status"));
+
+        let alias_result = validate_output(
+            "audit_report",
+            br#"{"status":"Implemented","matches_proposal":true,"missing_items":[],"extra_items":[],"defects":[],"required_fixes":[]}"#,
+            Some(&schema),
+        );
+        assert_eq!(
+            alias_result.status,
+            ValidationStatus::Failed,
+            "runtime output validation should require canonical status values, not legacy aliases"
+        );
     }
 
     #[test]

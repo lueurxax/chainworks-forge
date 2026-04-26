@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifact_contracts, artifacts, ideas, runs, sessions, stages,
-    work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
+    ideas, projections, runs, sessions, stages, work_items, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
@@ -382,6 +385,58 @@ async fn test_startup_repair_skips_clean_runs() {
 }
 
 #[tokio::test]
+async fn proposal_017_startup_repair_requeues_abandoned_steward_analysis() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "abandoned-steward-analysis".into(),
+            kind: db::work_item::WorkItemKind::StewardAnalysis,
+            payload_json: serde_json::json!({
+                "reason": "config_change",
+                "completed_run_id": RunId::new().to_string()
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: None,
+            stage_id: None,
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_inspected, 0);
+    assert_eq!(summary.work_items_requeued, 1);
+
+    let row: (String, i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, attempt_count, started_at, last_error FROM work_items WHERE id = ?1",
+    )
+    .bind("abandoned-steward-analysis")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1, 2);
+    assert_eq!(row.2, None);
+    assert_eq!(
+        row.3.as_deref(),
+        Some("startup_repair_abandoned_steward_analysis")
+    );
+}
+
+#[tokio::test]
 async fn proposal_017_startup_repair_respects_conflict_cursor_resume_policy() {
     let pool = test_pool().await;
 
@@ -444,6 +499,80 @@ async fn proposal_017_startup_repair_respects_conflict_cursor_resume_policy() {
         .expect("cursor remains readable after startup repair");
     assert_eq!(stored.resume_policy, "await_conflict_resolution");
     assert_eq!(stored.conflict_id.as_deref(), Some("conflict-startup"));
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_cancels_stale_advance_for_conflict_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: "stage_test".into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some("conflict-startup".into()),
+            conflict_fingerprint: Some("sha256:startup-conflict".into()),
+            candidate_transition_hash: Some("sha256:candidates".into()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "stale-advance-cursor".into(),
+            kind: db::work_item::WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "reason": "startup_catchup"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: None,
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.work_items_requeued, 0);
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, db::work_item::WorkItemKind::AdvanceRun);
+    assert_eq!(items[0].status, db::work_item::WorkItemStatus::Cancelled);
+    assert_eq!(
+        items[0].last_error.as_deref(),
+        Some("startup_repair_transition_cursor_parked")
+    );
 }
 
 #[tokio::test]
@@ -567,6 +696,63 @@ async fn proposal_017_startup_repair_resumes_selected_transition_cursor() {
     assert_eq!(work.len(), 1);
     assert_eq!(work[0].kind, db::work_item::WorkItemKind::AdvanceRun);
     assert_eq!(work[0].stage_id, None);
+}
+
+#[tokio::test]
+async fn proposal_017_startup_repair_requeues_abandoned_advance_without_blocking_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("review".into());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "abandoned-advance".into(),
+            kind: db::work_item::WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "reason": "startup_catchup"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: None,
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_repaired, 1);
+    assert_eq!(summary.work_items_requeued, 1);
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, db::work_item::WorkItemKind::AdvanceRun);
+    assert_eq!(items[0].status, db::work_item::WorkItemStatus::Pending);
+    assert_eq!(items[0].attempt_count, 2);
+    assert_eq!(
+        items[0].last_error.as_deref(),
+        Some("startup_repair_abandoned_advance_run")
+    );
 }
 
 #[tokio::test]
@@ -1543,6 +1729,110 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
         .find(|s| s.stage_id == "blocked_stage" && s.attempt_number == 2)
         .expect("blocked completed current stage retry must create a new attempt");
     assert_eq!(new_stage.status, StageStatus::Pending);
+}
+
+#[tokio::test]
+async fn test_retry_stage_supersedes_workflow_conflict_cursor() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+    let current_state_id = "blocked_stage";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Completed);
+    stage.stage_id = current_state_id.into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: "blocked_stage__to__next_stage__0".into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: "next_stage".into(),
+        condition_expression_id: Some("required_artifact_present".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["audit_report_v1".into()],
+        missing_artifacts: vec!["audit_report_v1".into()],
+        missing_fields: Vec::new(),
+        source_artifact_ids: Vec::new(),
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some("required artifact missing".into()),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::Unresolved,
+    );
+    let conflict_id = conflict.conflict_id.clone();
+    let conflict_fingerprint = conflict.conflict_fingerprint.clone();
+    let candidate_hash = conflict.candidate_transition_hash.clone();
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some(conflict_id.clone()),
+            conflict_fingerprint: Some(conflict_fingerprint),
+            candidate_transition_hash: Some(candidate_hash),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: current_state_id.into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let superseded = workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+        .await
+        .unwrap();
+    assert!(
+        superseded.is_none(),
+        "stage retry should supersede the stale blocking workflow conflict"
+    );
+
+    let cursor = workflow_conflicts::get_transition_cursor(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("retry must leave a non-blocking transition cursor");
+    assert_eq!(cursor.cursor_status, "stage_retry_scheduled");
+    assert_eq!(
+        cursor.resume_policy, "continue_from_selected_transition",
+        "startup recovery must not park a run on a superseded conflict after retry"
+    );
+    assert_eq!(cursor.conflict_id.as_deref(), Some(conflict_id.as_str()));
+    assert_eq!(
+        cursor.selected_next_state_id.as_deref(),
+        Some(current_state_id)
+    );
 }
 
 #[tokio::test]
@@ -5206,6 +5496,9 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "code_writer",
                 "provider": "claude",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "self-assessment",
                 "declared_outputs": [{
                     "output_name": "implementation_self_assessment",
                     "target_path": target_path.to_string_lossy(),
@@ -5472,7 +5765,28 @@ async fn blocked_implementation_assessment_synthesizes_release_hold_review_summa
     let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
     assert_eq!(
         updated.current_state.as_deref(),
-        Some("state_10_implementation_refined")
+        Some("state_11_manual_release")
+    );
+
+    orchestrator.advance_run(run_id).await.unwrap();
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(updated.status, RunStatus::WaitingApproval);
+
+    let release_stage = stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|stage| stage.stage_id == "state_11_manual_release")
+        .expect("non-code release blocker should create manual release gate stage");
+    assert_eq!(release_stage.status, StageStatus::WaitingApproval);
+
+    let release_approvals = approvals::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        release_approvals.iter().any(|approval| {
+            approval.stage_id == "state_11_manual_release"
+                && approval.decision == ApprovalDecision::Requested
+        }),
+        "non-code release blocker should request operator release approval"
     );
 
     let queued_invocations = work_items::list_by_run(&pool, run_id)
@@ -5682,8 +5996,19 @@ sys.exit(0)
         )
         .await
         .unwrap();
-    assert!(executor.process_next_item().await.unwrap());
-    assert!(executor.process_next_item().await.unwrap());
+    for _ in 0..8 {
+        let daemon_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+        if daemon_artifacts
+            .iter()
+            .any(|artifact| artifact.file_path.ends_with("second.json"))
+        {
+            break;
+        }
+        assert!(
+            executor.process_next_item().await.unwrap(),
+            "executor should process queued coordination or invoke work before second turn artifact appears"
+        );
+    }
 
     let generation_after = sessions::find_active_generation(&pool, &lineage.id)
         .await
@@ -5713,6 +6038,175 @@ sys.exit(0)
             .collect::<Vec<_>>()
     );
 
+    acp.close_session(&generation.id).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_agent_repairs_missing_required_output_in_same_live_session() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("contract-repair.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let output_path = tmp
+        .path()
+        .join(".chainworks/review/implementation-summary.json");
+    std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+
+    let script = tmp.path().join("acp_contract_repair_fixture.py");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}})
+msg = recv()
+session_id = "contract-repair-session"
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":session_id}})
+
+msg = recv()
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{"type":"text","text":"I forgot the required output."}]}}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+prompt_text = msg.get("params",{}).get("prompt",[{}])[0].get("text","")
+if "Output Contract Repair" not in prompt_text:
+    sys.exit(2)
+payload = {"status":"code_complete","open_blockers":0,"must_fix":[],"recommended_next_step":"continue"}
+send({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","message":{"content":[{"type":"text","text":"<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>" + json.dumps(payload) + "<<<END_CHAINWORKS_OUTPUT>>>"}]}}}})
+send({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn","sessionId":session_id}})
+
+msg = recv()
+if msg and msg.get("method") == "session/close":
+    sys.exit(0)
+sys.exit(0)
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
+        script.to_str().unwrap(),
+    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "contract_repair_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("contract_repair_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "contract_repair_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "lead_orchestrator",
+                "provider": "claude",
+                "prompt": "aggregate implementation reviews",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "contract-repair",
+                "declared_outputs": [{
+                    "output_name": "implementation_review_summary",
+                    "target_path": output_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "implementation_review_summary_v1",
+                        "format": "json",
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "required_fields": ["status", "open_blockers", "must_fix", "recommended_next_step"]
+                    }
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let settled = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.status, StageStatus::Completed);
+    let output_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(output_json["status"], "code_complete");
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].status, AgentStatus::Completed);
+    let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, executions[0].id)
+        .await
+        .unwrap()
+        .expect("runtime facts should be persisted");
+    assert!(facts.valid_required_outputs);
+    assert_eq!(
+        facts.output_settlement,
+        domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution
+    );
+
+    let lineage =
+        sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "contract-repair")
+            .await
+            .unwrap()
+            .expect("lineage should exist");
+    let generation = sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("active generation should exist");
+    assert_eq!(generation.turn_count, 2);
     acp.close_session(&generation.id).await.unwrap();
 }
 
@@ -6934,6 +7428,155 @@ sys.exit(0)
     );
 }
 
+#[derive(Default)]
+struct ActivePromptCloseOnceAdapter {
+    attempts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
+    fn provider_name(&self) -> &str {
+        "active_prompt_close_once"
+    }
+
+    async fn execute(&self, req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            anyhow::bail!("ACP session closed during active prompt");
+        }
+        Ok(acp::ExecutionResult {
+            agent_execution_id: req
+                .agent_execution_id
+                .expect("test request should carry agent execution id"),
+            status: AgentStatus::Completed,
+            artifact_paths: Vec::new(),
+            discovered_artifacts: Vec::new(),
+            pre_prompt_expected_outputs: Vec::new(),
+            transcript_text: Some("recovered".into()),
+            cost_cents: None,
+            usage: None,
+            provider_session_id: Some("recovered-provider-session".into()),
+            reused_existing_session: false,
+            session_generation_id: req.session_generation_id.clone(),
+            mcp_observation: None,
+            actual_mcp_extensions: Vec::new(),
+            actual_mcp_runtime_ids: Vec::new(),
+            mcp_session_startup_latency_ms: None,
+            xcode_shim_warning_events: Vec::new(),
+            close_diagnostic: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt() {
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+    let workspace_root = tempfile::tempdir().unwrap();
+    let workspace_root = workspace_root.path().display().to_string();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "active_prompt_recovery_stage".into();
+    stage.started_at = now;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+        ActivePromptCloseOnceAdapter::default(),
+    )]));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("active_prompt_recovery_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "active_prompt_recovery_stage",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "recovery-agent",
+                "provider": "active_prompt_close_once",
+                "prompt": "recover after active prompt close",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "recovery-family",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("InvokeAgent work item should exist after first attempt");
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Pending);
+    let requeued_payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    assert!(
+        requeued_payload.get("p058_claimed").is_none(),
+        "auto recovery must clear the failed preclaim so retry gets a new agent execution"
+    );
+    assert_eq!(
+        requeued_payload
+            .pointer("/acp_active_prompt_recovery/reason")
+            .and_then(|value| value.as_str()),
+        Some("active_prompt_transport_closed")
+    );
+
+    let executions_after_first = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions_after_first.len(), 1);
+    assert_eq!(executions_after_first[0].status, AgentStatus::Failed);
+
+    assert!(executor.process_next_item().await.unwrap());
+    let executions_after_second = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions_after_second.len(), 2);
+    assert!(
+        executions_after_second
+            .iter()
+            .any(|execution| execution.status == AgentStatus::Completed),
+        "second attempt should complete after automatic requeue"
+    );
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("InvokeAgent work item should exist after recovery");
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Completed);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact(
@@ -7904,6 +8547,15 @@ async fn test_post_approval_retry_requires_fresh_approval() {
         1,
         "retry must create exactly one fresh Requested approval record, got {}",
         fresh_requests.len()
+    );
+    let pending_inbox = projections::list_pending_inbox_projection(&pool)
+        .await
+        .unwrap();
+    assert!(
+        pending_inbox
+            .iter()
+            .any(|row| row.id == fresh_requests[0].id.to_string()),
+        "fresh Requested approval must be visible in approval_inbox projection"
     );
 
     // Run status must reflect the pending approval checkpoint.

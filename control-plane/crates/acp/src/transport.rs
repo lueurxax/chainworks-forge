@@ -99,6 +99,11 @@ pub struct AcpSessionConfig<'a> {
     /// Errors are logged but do not fail the session (providers that don't
     /// support the method respond with `Method not found`).
     pub config_options: Vec<(String, String)>,
+
+    /// Some ACP providers expose a mode catalog in `session/new` but do not
+    /// apply `session/new.params.mode`. For those providers, send
+    /// `session/set_mode` with `modeId` immediately after session creation.
+    pub set_mode_after_session_new: bool,
 }
 
 impl Default for AcpSessionConfig<'_> {
@@ -118,6 +123,7 @@ impl Default for AcpSessionConfig<'_> {
                 }
             })),
             config_options: Vec::new(),
+            set_mode_after_session_new: false,
         }
     }
 }
@@ -217,6 +223,9 @@ const HANDSHAKE_TIMEOUT: Duration = DEFAULT_HANDSHAKE_TIMEOUT;
 /// Max silence between messages before we consider the session hung.
 /// Reset on every received line (including notifications).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Max time without meaningful agent progress while the transport remains alive.
+/// Keepalive/status-only ACP messages reset transport idleness, but not progress.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
 
@@ -1086,6 +1095,10 @@ pub(crate) async fn probe_initialize_with_timeout(
     match timeout(SHUTDOWN_WAIT, child.wait()).await {
         Ok(Ok(_)) => {}
         _ => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                signal_process_group(pid, libc::SIGTERM);
+            }
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -1334,6 +1347,27 @@ impl AcpTransportSession {
         let mcp_session_startup_latency_ms = mcp_observation
             .as_ref()
             .map(|_| startup_started.elapsed().as_millis() as i64);
+
+        if config.set_mode_after_session_new {
+            let set_mode_id = next_id!();
+            send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": set_mode_id,
+                    "method": "session/set_mode",
+                    "params": {
+                        "sessionId": session_id,
+                        "modeId": config.mode,
+                    }
+                }),
+            )
+            .await
+            .context("ACP: send session/set_mode")?;
+            await_response(&mut reader, set_mode_id, HANDSHAKE_TIMEOUT)
+                .await
+                .context("ACP: session/set_mode handshake")?;
+        }
 
         for (config_id, value) in &config.config_options {
             let sco_id = next_id!();
@@ -1623,6 +1657,7 @@ impl AcpTransportSession {
 
         let mut line = String::new();
         let mut last_activity = Instant::now();
+        let mut last_progress = Instant::now();
         let mut streamed_text = String::new();
         let mut streamed_text_truncated = false;
         let mut latest_usage_snapshot = None;
@@ -1635,6 +1670,14 @@ impl AcpTransportSession {
                 bail!(
                     "ACP session idle timeout: no message for {}s (session={})",
                     IDLE_TIMEOUT.as_secs(),
+                    self.session_id
+                );
+            }
+            let progress_idle = last_progress.elapsed();
+            if progress_idle >= PROGRESS_TIMEOUT {
+                bail!(
+                    "ACP session progress timeout: no meaningful progress for {}s (session={})",
+                    PROGRESS_TIMEOUT.as_secs(),
                     self.session_id
                 );
             }
@@ -1721,6 +1764,7 @@ impl AcpTransportSession {
                                         "ACP: failed to send permission grant: {e}"
                                     );
                                 }
+                                last_progress = Instant::now();
                             }
                         }
                         continue;
@@ -1737,6 +1781,9 @@ impl AcpTransportSession {
                             }
                         }
                         if let Some(chunk) = extract_text_chunk(&parsed) {
+                            if !strip_ansi(&chunk).trim().is_empty() {
+                                last_progress = Instant::now();
+                            }
                             push_streamed_transcript_chunk(
                                 &mut streamed_text,
                                 &chunk,
@@ -2020,6 +2067,10 @@ impl AcpTransportSession {
                     "ACP subprocess did not exit within {}s — force-killing",
                     SHUTDOWN_WAIT.as_secs()
                 );
+                #[cfg(unix)]
+                if let Some(pid) = self.child.id() {
+                    signal_process_group(pid, libc::SIGTERM);
+                }
                 let _ = self.child.kill().await;
                 let _ = self.child.wait().await;
                 merge_close_diagnostic(

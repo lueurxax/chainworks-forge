@@ -1,0 +1,177 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Buttons</title>
+<link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;padding:0;background:var(--bg-canvas);}
+  body{
+    font-family:var(--font-text);color:var(--label);
+    -webkit-font-smoothing:antialiased;
+    padding:20px 24px;box-sizing:border-box;
+  }
+  .stack{display:flex;flex-direction:column;gap:14px;}
+  .lbl{font:var(--t-caption2);letter-spacing:0.05em;color:var(--label-tertiary);text-transform:uppercase;font-weight:600;}
+  .meta{font:var(--t-caption1);color:var(--label-secondary);margin-top:2px;}
+
+  /* —— Stages —————————————————————————————— */
+  .stage-dark{
+    position:relative;border-radius:14px;overflow:hidden;
+    padding:28px 32px;
+    background:radial-gradient(120% 80% at 50% 50%, #1A2433 0%, #0E1623 55%, #04080D 100%);
+    box-shadow:0 1px 2px rgba(4,8,13,0.20), 0 14px 36px rgba(4,8,13,0.32);
+  }
+  .stage-dark::after{
+    content:"";position:absolute;inset:0;
+    background:radial-gradient(60% 40% at 30% 35%, rgba(255,255,255,0.05), transparent 70%);
+    pointer-events:none;
+  }
+  .stage-light{
+    position:relative;border-radius:14px;overflow:hidden;
+    padding:28px 32px;
+    background:
+      radial-gradient(70% 110% at 12% 18%, #FFD8A8 0%, transparent 55%),
+      radial-gradient(60% 100% at 88% 24%, #B7D4FF 0%, transparent 55%),
+      radial-gradient(60% 100% at 30% 92%, #C9F0D8 0%, transparent 55%),
+      radial-gradient(70% 110% at 78% 88%, #F4C7E2 0%, transparent 55%),
+      linear-gradient(180deg, #F2F2F7 0%, #E9E9F0 100%);
+    box-shadow:0 1px 2px rgba(4,8,13,0.06), 0 12px 28px rgba(4,8,13,0.10);
+  }
+  .eyebrow{
+    font:var(--t-caption2);letter-spacing:0.18em;
+    text-transform:uppercase;font-weight:600;
+    margin-bottom:18px;
+  }
+  .stage-dark  .eyebrow{ color:rgba(235,235,245,0.55); }
+  .stage-light .eyebrow{ color:var(--label-tertiary); }
+
+  .group{display:flex;flex-direction:column;gap:14px;}
+  .group + .group{margin-top:18px;}
+  .grouplbl{
+    font:var(--t-caption2);letter-spacing:0.05em;
+    text-transform:uppercase;font-weight:600;
+  }
+  .stage-dark  .grouplbl{ color:rgba(235,235,245,0.42); }
+  .stage-light .grouplbl{ color:var(--label-tertiary); }
+
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+
+  /* —— Liquid Glass button —————————————————— */
+  .gbtn{
+    position:relative;isolation:isolate;
+    display:inline-flex;align-items:center;gap:6px;
+    font:600 13px/18px var(--font-text);
+    padding:8px 16px;border:0;border-radius:10px;cursor:pointer;
+    color: var(--fg, var(--label));
+    background:
+      linear-gradient(180deg,
+        color-mix(in srgb, var(--c, #FFFFFF) 32%, rgba(255,255,255,0.55)) 0%,
+        color-mix(in srgb, var(--c, #FFFFFF) 18%, rgba(255,255,255,0.28)) 100%);
+    backdrop-filter: blur(16px) saturate(180%);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    box-shadow:
+      0 1px 2px rgba(15,20,30,0.10),
+      0 6px 16px color-mix(in srgb, var(--c, #8E8E93) 22%, transparent),
+      inset 0 1px 0 rgba(255,255,255,0.85),
+      inset 0 -0.5px 0 color-mix(in srgb, var(--c, #000) 24%, transparent),
+      inset 0 0 0 0.5px color-mix(in srgb, var(--c, #000) 30%, rgba(255,255,255,0.55));
+    text-shadow: 0 0.5px 0 rgba(255,255,255,0.35);
+    transition: transform .12s ease, box-shadow .12s ease;
+  }
+  .gbtn::before{
+    content:"";position:absolute;inset:0.5px 0.5px auto 0.5px;height:46%;
+    border-radius:10px 10px 14px 14px / 10px 10px 80% 80%;
+    background:linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0));
+    pointer-events:none;
+  }
+  .gbtn:active{ transform: scale(0.97); }
+
+  .gbtn.primary  { --c:#0A84FF; --fg:#0B2E6B; }
+  .gbtn.success  { --c:#34C759; --fg:#0B4A1E; }
+  .gbtn.danger   { --c:#FF3B30; --fg:#5A0D08; }
+  .gbtn.warning  { --c:#FF9F0A; --fg:#5C3500; }
+
+  .gbtn.clear{
+    color: var(--label);
+    background:linear-gradient(180deg, rgba(255,255,255,0.65), rgba(255,255,255,0.32));
+    box-shadow:
+      0 1px 2px rgba(15,20,30,0.08),
+      0 4px 12px rgba(15,20,30,0.06),
+      inset 0 1px 0 rgba(255,255,255,0.85),
+      inset 0 -0.5px 0 rgba(0,0,0,0.06),
+      inset 0 0 0 0.5px rgba(0,0,0,0.10);
+  }
+
+  .gbtn.plain{
+    background:transparent;box-shadow:none;color:#0A84FF;
+    backdrop-filter:none;padding:8px 10px;
+  }
+  .gbtn.plain::before{display:none;}
+
+  /* —— Dark-stage variants of clear & plain —————————————— */
+  .stage-dark .gbtn.clear{
+    color:#FAFBFD;
+    background:linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0.06));
+    box-shadow:
+      0 1px 2px rgba(0,0,0,0.30),
+      0 4px 12px rgba(0,0,0,0.25),
+      inset 0 1px 0 rgba(255,255,255,0.20),
+      inset 0 -0.5px 0 rgba(0,0,0,0.20),
+      inset 0 0 0 0.5px rgba(255,255,255,0.16);
+    text-shadow:none;
+  }
+  .stage-dark .gbtn.plain{ color:#5AC8FA; }
+
+  .ic{width:13px;height:13px;display:inline-block;}
+</style></head>
+<body>
+
+<div class="stack">
+  <div>
+    <div class="lbl">Button · Liquid Glass</div>
+    <div class="meta">Tinted = primary / destructive / success. Clear = secondary chrome. Plain = inline action.</div>
+  </div>
+
+  <div class="stage-dark">
+    <div class="eyebrow">On dark surface</div>
+
+    <div class="group">
+      <div class="grouplbl">Action hierarchy</div>
+      <div class="row">
+        <button class="gbtn primary">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5v14l11-7z"/></svg>
+          Resume run
+        </button>
+        <button class="gbtn clear">Open report</button>
+        <button class="gbtn plain">Cancel</button>
+        <button class="gbtn danger">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          Discard run
+        </button>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="grouplbl">Approval gate (paired)</div>
+      <div class="row">
+        <button class="gbtn success">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg>
+          Approve &amp; continue
+        </button>
+        <button class="gbtn clear">Reject</button>
+        <button class="gbtn plain" style="color:rgba(235,235,245,0.55);">Hold</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="stage-light">
+    <div class="eyebrow">On light surface · sizes</div>
+    <div class="row">
+      <button class="gbtn primary" style="font-size:14px;padding:10px 18px;border-radius:11px;">Large</button>
+      <button class="gbtn primary">Default</button>
+      <button class="gbtn primary" style="font-size:11.5px;padding:5px 11px;border-radius:8px;">Small</button>
+      <button class="gbtn clear">Secondary</button>
+      <button class="gbtn plain">Plain</button>
+    </div>
+  </div>
+</div>
+
+</body></html>

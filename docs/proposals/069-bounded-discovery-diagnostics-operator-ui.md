@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-23 |
-| Status | Draft / Blocked |
+| Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [031-thin-graphql-ui-rewrite.md](031-thin-graphql-ui-rewrite.md), [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [artifact-discovery-and-settlement-optimization.md](../reference/artifact-discovery-and-settlement-optimization.md) |
-| Blocked by | P031 thin UI cutover and its GraphQL-only read boundary |
-| Scope | Implement macOS operator UI surfaces for bounded discovery diagnostics after P031 establishes the thin UI ownership model. |
+| Depends on | [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [artifact-discovery-and-settlement-optimization.md](../reference/artifact-discovery-and-settlement-optimization.md) |
+| Blocked by | Affected surfaces must consume the canonical thin UI read contract; no dependency on historical proposal files |
+| Scope | Implement macOS operator UI surfaces for bounded discovery diagnostics on top of the thin UI ownership model. |
 | Goal | Let operators inspect missing/stale/rejected output diagnostics, startup timing, discovery mode, caps, and source-change evidence from the macOS UI without making control-plane readiness depend on legacy Swift UI work. |
 
 **Gate naming note:** implementation owns the future canonical gate alias `proposal-069|p069`. It must be added to `scripts/test-gate.sh` and `docs/reference/test-gates.md` when work starts.
@@ -18,20 +18,20 @@
 
 The Rust control plane implements the bounded ACP artifact discovery and settlement model. It removes broad pre-`initialize` filesystem discovery, adds typed expected-output specs, persists discovery diagnostics, and exposes durable readback for operators and support tooling.
 
-The bounded discovery design also described a macOS operator UI. That UI work is valuable, but it does not block control-plane sign-off. The macOS app is in the middle of P031, which rewrites governed workflow screens into a thin GraphQL-only read UI over server projections. Adding discovery-specific Swift surfaces before that boundary lands would recreate the legacy UI ownership problem P031 is meant to remove.
+The bounded discovery design also described a macOS operator UI. That UI work is valuable, but it does not block control-plane sign-off. Governed workflow screens now use the canonical thin UI boundary: GraphQL-only reads over server projections. Adding discovery-specific Swift surfaces must extend that boundary, not recreate the legacy UI ownership problem.
 
-P069 owns rendering bounded discovery truth in the macOS operator app after P031. Durable discovery truth and server readback remain owned by the control-plane reference contract.
+P069 owns rendering bounded discovery truth in the macOS operator app after the thin UI boundary. Durable discovery truth and server readback remain owned by the control-plane reference contract.
 
 ---
 
 ## 2. Non-Negotiable Boundary
 
-### 2.1 P069 is blocked by P031
+### 2.1 P069 builds on the thin UI boundary
 
-P069 implementation must not begin until P031 has either:
+P069 implementation must start from [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). For any affected surface, the implementation must either:
 
-- landed the governed thin UI read path for the affected screens, or
-- produced a named implementation-ready slice that P069 can build on without using legacy Swift workflow truth.
+- add discovery diagnostics to an existing governed thin UI read surface, or
+- first create a server-owned GraphQL read slice for that surface without using legacy Swift workflow truth.
 
 Until then, missing macOS UI surfaces are not a control-plane readiness blocker.
 
@@ -57,7 +57,7 @@ P069 may request additional GraphQL projection fields, but it must not create a 
 
 ## 3. In Scope
 
-- Add read-only discovery diagnostics to P031-governed Run Detail, Stage Detail, report, artifact, and failed-stage evidence surfaces.
+- Add read-only discovery diagnostics to governed thin UI Run Detail, Stage Detail, report, artifact, and failed-stage evidence surfaces.
 - Render missing, stale, rejected, unauthorized-root, oversized, capped, metadata-timeout, symlink-escape, and contract-invalid output states from server-provided fields.
 - Show discovery mode: exact path, bounded meta-root, provider envelope, `CHAINWORKS_OUTPUT`, legacy fallback, resume warning, missing metadata, and override-active.
 - Show startup timing attribution that separates Forge local overhead from provider latency when those metrics are present.
@@ -146,7 +146,7 @@ Minimum fields:
 ## 8. Acceptance Criteria
 
 - Control-plane readiness checks do not require macOS UI surfaces; they verify only the control-plane/API/readback contract.
-- P069 implementation starts only after the P031 thin UI boundary exists for the affected surfaces.
+- P069 implementation starts from the canonical thin UI boundary for the affected surfaces.
 - Governed UI code reads discovery diagnostics through GraphQL only.
 - Static guards fail if governed UI code imports/calls MCP, reads SQLite, scans local artifacts for truth, or defines GraphQL mutations for discovery diagnostics.
 - Operators can distinguish missing, stale, rejected, unauthorized, oversized, capped, metadata-timeout, and source-change failure states without reading raw JSON.

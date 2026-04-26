@@ -1,721 +1,768 @@
-# Target State: Rust Control Plane + ACP Runtimes + GraphQL Thin Client + MCP Northbound Control
+# Target State: Rust Control Plane + ACP Runtimes + GraphQL Thin Client + MCP External Control Plane
 
-## 1. Цель документа
+## 1. Purpose
 
-Зафиксировать **целевое состояние системы** после архитектурного поворота.
+This document defines the desired target architecture for Chainworks Forge after the current architectural consolidation.
 
-Целевая система должна состоять из:
+The system should become a **local-first control plane** with:
 
-- **локального Rust-сервера** как единственного владельца доменной логики и orchestration truth,
-- **ACP-адаптеров** как southbound интерфейса к агентным рантаймам,
-- **GraphQL** как единственного client-facing API для тонкого SwiftUI-клиента,
-- **MCP-сервера** как northbound control-plane интерфейса для внешнего управления, автоматизации, создания идей и запуска workflow,
-- **SwiftUI-клиента** как тонкой оболочки над серверными projections и командами, без собственной workflow-логики.
-
----
-
-## 2. Краткая формула целевого состояния
-
-> **Rust daemon = мозг системы**  
-> **ACP = южный интерфейс к агентам**  
-> **GraphQL = единственный интерфейс для SwiftUI-клиента**  
-> **MCP = внешний control plane для агентов и автоматизаций**  
-> **SwiftUI = view layer, а не источник workflow-логики**
+- a **single-process Rust server** as the only owner of domain and orchestration logic,
+- **SQLite** as the local persistence layer,
+- local artifact storage on disk,
+- **ACP** as the southbound interface to agent runtimes,
+- **GraphQL** as the only API used by the SwiftUI client,
+- **MCP** as the external northbound control plane for automation, external agents, and operator commands,
+- **SwiftUI** as a thin observer and approval console.
 
 ---
 
-## 3. Базовые принципы
+## 2. One-line architecture
 
-### 3.1 Сервер — единственный владелец истины
-Ни UI, ни ACP-рантайм, ни MCP-клиент не владеют workflow truth.
+> **Rust server = brain**  
+> **SQLite + local files = local truth storage**  
+> **ACP = agent runtime interface**  
+> **GraphQL = only SwiftUI interface**  
+> **MCP = external control plane**  
+> **SwiftUI = observer + approval console**
 
-Только Rust-сервер является владельцем:
-- run truth,
-- stage truth,
-- approval truth,
-- artifact metadata truth,
-- recovery truth,
-- session lineage truth,
+---
+
+## 3. Core principles
+
+### 3.1 The Rust server owns all product truth
+
+Only the Rust server owns:
+
+- idea state,
+- run state,
+- stage state,
+- approval state,
+- artifact metadata,
 - runtime binding truth,
-- run compaction truth,
-- archive / supersession truth.
+- session lineage truth,
+- recovery truth,
+- compaction truth,
+- reports and projections.
 
-### 3.2 ACP — транспорт к агентам, но не источник доменной логики
-ACP-рантаймы отвечают за:
-- запуск агентной сессии,
-- prompt lifecycle,
+Neither the SwiftUI client, nor ACP runtimes, nor MCP clients own domain truth.
+
+### 3.2 ACP is southbound only
+
+ACP is the server’s interface to agent runtimes.
+
+ACP runtimes may provide:
+
+- session lifecycle,
+- prompt execution,
 - tool execution,
-- stream updates,
-- runtime permission surface,
-- session state внутри конкретного рантайма.
+- streaming updates,
+- runtime permissions,
+- runtime receipts,
+- runtime capability evidence.
 
-ACP-рантаймы **не** отвечают за:
-- выбор следующего stage,
-- approval semantics,
-- retry legality,
-- recovery policy,
-- итоговую report truth,
-- domain orchestration.
+ACP runtimes do **not** decide:
 
-### 3.3 GraphQL — единственный client-facing API для SwiftUI
-SwiftUI-клиент работает **исключительно через GraphQL API**.
+- which workflow stage comes next,
+- which retry is legal,
+- how approvals work,
+- how run recovery works,
+- what the canonical report truth is.
 
-GraphQL нужен как:
-- read/query слой,
-- subscriptions/streaming слой,
-- command/mutation façade для UI.
+### 3.3 GraphQL is the only SwiftUI API
 
-SwiftUI **не использует embedded MCP client** и не разговаривает с MCP напрямую.
+The SwiftUI app talks only to GraphQL.
 
-### 3.4 MCP — внешний северный control plane
-MCP нужен как внешний control-plane интерфейс для:
-- внешних агентов,
-- automation clients,
-- CLI/ops flows,
-- создания новых идей,
-- запуска и управления runs,
-- approvals, retries, resets, comparisons и других операторских действий вне UI.
+It does not call:
 
-### 3.5 UI — тонкий, disposable, replaceable
-SwiftUI-клиент должен:
-- читать projections,
-- подписываться на live state,
-- инициировать минимальный набор operator actions,
-- не принимать workflow decisions,
-- не реконструировать run truth “по косвенным признакам”.
+- MCP,
+- ACP,
+- SQLite directly,
+- local artifact paths directly as source of truth,
+- any legacy client-owned orchestration APIs.
+
+GraphQL is used for:
+
+- queries,
+- subscriptions,
+- a minimal approval mutation surface.
+
+### 3.4 MCP is the external control plane
+
+MCP is the control interface for:
+
+- external agents,
+- automation,
+- operator scripts,
+- CLI-like control flows,
+- creating ideas,
+- starting runs,
+- cancelling runs,
+- retrying stages/agents,
+- resetting sessions,
+- compacting runs,
+- managing experiments.
+
+MCP is not used by the SwiftUI client.
+
+### 3.5 The SwiftUI client is intentionally weak
+
+The SwiftUI app should be:
+
+- a read surface,
+- a live subscription surface,
+- an approval surface,
+- an artifact/report viewer.
+
+It should not be an orchestration runtime.
 
 ---
 
-## 4. Целевая топология
+## 4. Target topology
 
 ```text
-┌────────────────────────────────────────────────────┐
-│                  SwiftUI Client                    │
-│   Thin UI over GraphQL queries, subscriptions,    │
-│                  and mutations                     │
-└──────────────────────┬─────────────────────────────┘
-                       │
-                       │ GraphQL
-                       │
-┌──────────────────────▼─────────────────────────────┐
-│                 Rust Control Plane                 │
-│                                                    │
-│  - domain engine                                   │
-│  - workflow state machine / orchestration          │
-│  - run / stage / approval truth                    │
-│  - projection builder                              │
-│  - artifact index + metadata                       │
-│  - session lineage manager                         │
-│  - GraphQL server                                  │
-│  - MCP server                                      │
-│  - ACP runtime manager                             │
-└───────────────┬─────────────────────┬──────────────┘
-                │                     │
-          SQLite / local FS     ACP adapters
-                │                     │
-                │               Claude Agent ACP
-                │               Gemini CLI ACP
-                │               Auggie ACP
-                │               Junie ACP
-                │               ...
+┌──────────────────────────────────────────────────────────┐
+│                      SwiftUI Client                      │
+│                                                          │
+│  - GraphQL queries                                       │
+│  - GraphQL subscriptions                                 │
+│  - GraphQL approval mutations only                       │
+│  - no MCP                                                │
+│  - no ACP                                                │
+│  - no workflow logic                                     │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+                              │ GraphQL
+                              │
+┌─────────────────────────────▼────────────────────────────┐
+│                    Rust Local Server                     │
+│                                                          │
+│  Domain Engine                                           │
+│  Workflow / Orchestration Engine                         │
+│  Projection Engine                                       │
+│  Approval Engine                                         │
+│  Artifact Governance / Run Compaction                    │
+│  Recovery Engine                                         │
+│  Session Lineage Manager                                 │
+│  ACP Runtime Manager                                     │
+│  GraphQL Server                                          │
+│  MCP Server                                              │
+└───────────────┬─────────────────────────────┬────────────┘
+                │                             │
+                │                             │
+        SQLite + local FS                     │ ACP
+                │                             │
+                │                     Claude Agent ACP
+                │                     Gemini CLI ACP
+                │                     Auggie ACP
+                │                     Junie ACP
+                │                     future ACP runtimes
+                │
+┌───────────────▼─────────────────────────────┐
+│             Local Persistence               │
+│                                             │
+│  SQLite: state, projections, metadata       │
+│  File store: artifacts, reports, receipts   │
+└─────────────────────────────────────────────┘
+
+
+External control clients / agents
+        │
+        │ MCP
+        ▼
+┌─────────────────────────────────────────────┐
+│            Rust MCP Control Plane           │
+└─────────────────────────────────────────────┘
 ```
 
 ---
 
-## 5. Основные серверные подсистемы
+## 5. Server responsibilities
 
 ## 5.1 Domain Engine
-Главный внутренний слой, который реализует:
+
+Owns the rules of the product:
+
+- idea lifecycle,
 - run lifecycle,
-- stage transitions,
-- approvals,
+- workflow progression,
+- stage settlement,
+- approval semantics,
 - retries,
-- recovery rules,
-- report semantics,
-- session lineage policy,
-- proposal loop fidelity,
-- MCP policy evaluation,
-- runtime binding freeze.
+- cancellation,
+- recovery policy,
+- artifact governance,
+- compaction rules,
+- report truth,
+- runtime selection,
+- MCP/ACP capability interpretation.
 
-Это **главный мозг** системы.
+## 5.2 Workflow / Orchestration Engine
 
-Он также владеет:
-- run compaction policy,
-- artifact supersession rules,
-- archive eligibility rules,
-- projection rebuild after compaction,
-- canonical compact snapshot emission.
+Runs inside the Rust server.
 
-## 5.2 Workflow / Orchestration Layer
-На текущем target state orchestration живёт **внутри самого Rust-сервера**.
+It is application-owned, not an external workflow engine.
 
-Важно:
-- это не внешний workflow engine;
-- это не логика в UI;
-- это application-owned orchestration layer.
+Responsibilities:
 
-Он отвечает за:
-- progression between states,
-- wait points,
-- retry/reset/cancel handling,
-- policy enforcement,
-- adapter invocation scheduling.
+- execute workflow state machine,
+- schedule agent invocations,
+- wait for approvals,
+- apply retry/cancel/recovery rules,
+- preserve run/stage truth,
+- handle failed/blocked states,
+- issue projection updates.
+
+Non-goals:
+
+- distributed execution,
+- horizontal scaling,
+- exactly-once financial-grade guarantees,
+- external workflow platform integration.
 
 ## 5.3 ACP Runtime Manager
-Слой, который:
-- выбирает runtime profile,
-- создаёт ACP-сессии,
-- привязывает `cwd` / workspace / MCP set,
-- следит за requested→effective runtime truth,
-- сохраняет runtime receipts/events,
-- отдаёт доменному слою структурированную execution truth.
 
-Этот слой **не принимает продуктовые решения**.  
-Он исполняет решение domain engine.
+Owns interaction with agent runtimes.
+
+Responsibilities:
+
+- select runtime profile,
+- start ACP sessions,
+- attach workspace/cwd,
+- attach effective MCP tool set for the agent runtime where applicable,
+- collect runtime events,
+- collect tool-call evidence,
+- record runtime receipts,
+- expose effective runtime capabilities.
+
+The ACP Runtime Manager never owns product decisions.
 
 ## 5.4 Projection Engine
-Сервер обязан строить projections/read models для UI и reporting.
 
-Минимальные projections:
-- ideas
-- runs
-- stages
-- approvals
-- artifacts
-- reports
-- runtime health
-- active sessions
-- proposal-loop metrics
-- unresolved backlog / score-lift view
-- compacted run summary
-- archived artifact summary
-- compaction report summary
+Builds server-owned read models for GraphQL.
 
-## 5.5 GraphQL Layer
-GraphQL публикует:
-- query types,
+Minimum projections:
+
+- ideas,
+- runs,
+- stages,
+- approvals,
+- artifacts,
+- reports,
+- runtime status,
+- active sessions,
+- compaction status,
+- proposal-loop metrics,
+- unresolved score-lift backlog,
+- recovery recommendations.
+
+## 5.5 Artifact Governance / Run Compaction
+
+The server owns run compaction and artifact governance.
+
+Responsibilities:
+
+- classify artifacts,
+- archive superseded artifacts,
+- exact deduplication,
+- repair stale links where deterministic,
+- rebuild projections,
+- emit compaction reports,
+- emit canonical compaction snapshots.
+
+Compaction is allowed only for:
+
+- `completed`,
+- `failed`,
+- `blocked`.
+
+Compaction is not allowed for:
+
+- `running`,
+- `pending`,
+- `ready`,
+- `waitingApproval`.
+
+Run compaction is an MCP-controlled operation, not a SwiftUI mutation.
+
+## 5.6 GraphQL Server
+
+GraphQL is the SwiftUI-facing API.
+
+Responsibilities:
+
+- queries,
 - subscriptions,
-- UI-safe mutations / command façades.
+- approval mutations only.
 
-Среди обязательных command façades должен существовать и server-owned maintenance command для run compaction.
+GraphQL should not become a second orchestration API.
 
-Важное правило:
-- GraphQL для UI — единственный клиентский API,
-- но GraphQL mutations не становятся вторым независимым control plane;
-- их семантика должна совпадать с server-owned command model.
+## 5.7 MCP Server
 
-## 5.6 MCP Server
-MCP server публикует доменные команды и ресурсы для **внешних** клиентов.
+MCP is the external control plane.
 
-Минимальный набор tool categories:
-- ideas
-- runs
-- approvals
-- stages
-- sessions
-- artifacts
-- reports
-- experiments
-- runtime health
+Responsibilities:
 
-MCP server не должен публиковать внутренние низкоуровневые мутации вида:
-- `set_stage_status`
-- `set_run_state`
-- `inject_artifact_without_provenance`
+- expose domain-level tools,
+- expose run/artifact/report resources,
+- allow external agents to operate the system,
+- provide automation entry points,
+- enforce caller capability boundaries.
 
-Он публикует **доменные действия**, а не внутренние ручки.
-
-Среди них должен быть и explicit compaction command, например:
-- `runs.compact`
-
-## 5.7 Persistence Layer
-Минимальный target state:
-- **SQLite** для server-owned state,
-- **локальный файловый store** для artifact contents,
-- **SQLite + file paths** для metadata/projections.
-
-Никакой обязательной внешней инфраструктуры.
-
-Важное уточнение по параллелизму:
-- SQLite остаётся целевой persistence-моделью для текущего этапа.
-- Масштабирование локальных proposal runs достигается не увеличением числа writers, а короткими сериализованными write transactions и executor backpressure.
-- Активный run и активное агентное выполнение — разные вещи: run может оставаться активным, пока его следующий agent work item стоит в очереди из-за capacity.
-
-## 5.8 Run Compaction and Artifact Governance
-Сервер обязан поддерживать server-owned maintenance command для compaction eligible runs.
-
-Этот слой отвечает за:
-- агрессивное уменьшение active artifact surface,
-- archive / supersession policy,
-- duplicate collapse,
-- link repair,
-- projection rebuild after compaction,
-- emission of canonical compact snapshots,
-- compaction reports.
-
-Важное правило target state:
-- compaction доступен только для `completed`, `failed`, `blocked` runs;
-- compaction не разрешён для `running`, `ready`, `waitingApproval`, `pending`.
-
-Модель может помогать с semantic clustering и human-readable summary,
-но destructive apply, archive truth и repair truth всегда остаются server-owned.
+MCP is not an internal bus.
 
 ---
 
-## 6. Интерфейсы
+## 6. GraphQL contract
 
-## 6.1 Southbound: ACP
-ACP — единственный стратегический путь к агентным рантаймам.
+## 6.1 Queries
 
-Target state:
-- ACP-совместимые runtime profiles выбираются на уровне backend/runtime profile,
-- runtime truth замораживается в run snapshot,
-- сервер умеет работать с несколькими ACP-compatible providers.
+GraphQL queries expose read projections.
 
-Первый target set:
-- Claude Agent ACP
-- Gemini CLI ACP
-- Auggie ACP
-- Junie ACP
+Examples:
 
-## 6.2 Northbound: MCP
-MCP — публичный control-plane интерфейс для внешних клиентов.
+```graphql
+query {
+  runs(filter: { status: RUNNING }) {
+    id
+    title
+    status
+    currentStage {
+      id
+      label
+      status
+    }
+  }
+}
+```
 
-Примеры canonical tools:
+Minimum query families:
+
+- `ideas`
+- `runs`
+- `stages`
+- `approvals`
+- `artifacts`
+- `reports`
+- `runtimeStatus`
+- `activeSessions`
+- `proposalMetrics`
+- `compactionStatus`
+
+## 6.2 Subscriptions
+
+GraphQL subscriptions are required.
+
+Minimum subscriptions:
+
+- active run updates,
+- stage updates,
+- approval inbox updates,
+- runtime/session status updates,
+- artifact/report availability updates,
+- compaction status updates.
+
+Subscriptions are not optional in the target state.
+
+## 6.3 Mutations
+
+SwiftUI may use only approval decision mutations.
+
+Allowed GraphQL mutations:
+
+- `approveApproval`
+- `rejectApproval`
+
+No other UI mutation is part of the target state.
+
+### 6.3.1 Allowed mutations
+
+```graphql
+mutation ApproveApproval($approvalId: ID!, $comment: String) {
+  approveApproval(approvalId: $approvalId, comment: $comment) {
+    approval {
+      id
+      decision
+      decidedAt
+    }
+    run {
+      id
+      status
+    }
+  }
+}
+```
+
+```graphql
+mutation RejectApproval($approvalId: ID!, $reason: String!) {
+  rejectApproval(approvalId: $approvalId, reason: $reason) {
+    approval {
+      id
+      decision
+      decidedAt
+      comment
+    }
+    run {
+      id
+      status
+    }
+  }
+}
+```
+
+### 6.3.2 Explicitly forbidden UI mutations
+
+The SwiftUI client must not expose GraphQL mutations for:
+
+- create idea,
+- start run,
+- cancel run,
+- retry stage,
+- retry agent,
+- reset session,
+- reset agent session,
+- compact run,
+- clone run,
+- change runtime profile,
+- change context strategy,
+- change MCP/runtime configuration.
+
+Those operations are MCP-only.
+
+---
+
+## 7. MCP control plane
+
+MCP exposes external domain commands.
+
+## 7.1 Ideas
 
 - `ideas.create`
 - `ideas.list`
+- `ideas.get`
+
+## 7.2 Runs
+
 - `runs.start`
 - `runs.get`
+- `runs.list`
 - `runs.cancel`
+- `runs.clone`
+- `runs.compact`
+
+## 7.3 Approvals
+
 - `approvals.list`
 - `approvals.resolve`
+
+Approvals may be resolved through MCP by authorized external operator clients, but SwiftUI also has approval mutations through GraphQL.
+
+## 7.4 Retry / recovery
+
 - `stages.retry`
+- `agents.retry`
 - `sessions.reset_agent`
+- `runs.recover`
+- `runs.explain_blocked`
+
+## 7.5 Artifacts and reports
+
 - `artifacts.get`
 - `reports.get`
 - `reports.compare`
+
+## 7.6 Runtime
+
 - `runtime.health`
+- `runtime.list_profiles`
+- `runtime.effective_capabilities`
+
+## 7.7 Experiments
+
 - `experiments.start`
-- `runs.compact`
-
-Примеры resources:
-
-- `idea://{id}`
-- `run://{id}`
-- `artifact://{id}`
-- `report://{id}`
-- `workflow://{id}`
-
-## 6.3 Client-facing: GraphQL
-GraphQL publishes read-oriented models such as:
-
-- `idea(id)`
-- `ideas(filter, paging)`
-- `run(id)`
-- `runs(filter, paging)`
-- `stage(id)`
-- `approvalInbox`
-- `artifact(id)`
-- `report(id)`
-- `runtimeStatus`
-- `activeSessions`
-- `proposalMetrics(runId)`
-- `compactionStatus(runId)`
-- `compactionReport(runId)`
-
-Обязательная часть target state:
-- **GraphQL subscriptions** для live surfaces.
-
-Минимальные live subscriptions:
-- active run updates
-- active stage updates
-- approval inbox updates
-- runtime/session status updates
-- report availability / artifact readiness where useful
+- `experiments.list`
+- `experiments.report`
 
 ---
 
-## 7. Роль SwiftUI-клиента
+## 8. UI operator boundary
 
-## 7.1 Что клиент должен делать
-- показывать список идей, runs, approvals, artifacts, reports;
-- открывать детальные представления;
-- инициировать минимальный набор operator actions через GraphQL mutations;
-- показывать projections, а не вычислять их;
-- быть заменяемым;
-- уметь запускать `Compact Run` для eligible runs и показывать compacted result.
+## 8.1 SwiftUI can do
 
-## 7.2 Что клиент НЕ должен делать
-- считать, какой stage следующий;
-- решать, можно ли retry/reset/cancel;
-- восстанавливать execution truth из частичных артефактов;
-- владеть session state как canonical source;
-- агрегировать review truth;
-- реализовывать recovery semantics;
-- использовать MCP напрямую.
+- view ideas,
+- view runs,
+- view active run state,
+- view stage flow,
+- view approval inbox,
+- approve/reject approvals,
+- view artifacts,
+- view reports,
+- view runtime health,
+- view compaction reports,
+- view suggested MCP actions.
 
-## 7.3 Минимально допустимые UI-действия
-В target state UI должен уметь очень мало:
+## 8.2 SwiftUI cannot do
 
-- создать идею (через GraphQL mutation)
-- стартовать run
-- открыть details
-- approve / reject
-- retry / cancel / reset там, где это разрешил сервер
-- compare reports
-- открыть artifacts / evidence
-- compact completed / failed / blocked runs
+- create ideas,
+- start runs,
+- reset sessions,
+- retry stages/agents,
+- compact runs,
+- cancel runs,
+- mutate runtime profiles,
+- change context strategy,
+- perform recovery actions.
 
-И всё это должно проходить через server-owned command semantics.
+## 8.3 Suggested MCP actions in UI
 
----
+The UI may show suggested external actions, for example:
 
-## 8. Командная и query-модель
+- “Run is blocked. Suggested MCP action: `runs.recover`.”
+- “Session lineage appears stale. Suggested MCP action: `sessions.reset_agent`.”
+- “Run has high artifact noise. Suggested MCP action: `runs.compact`.”
+- “Stage can be retried via MCP: `stages.retry`.”
 
-### Canonical rule
-- **Commands / mutations для UI**: GraphQL
-- **Commands / control для внешних клиентов**: MCP
-- **Reads / projections для UI**: GraphQL
-
-Compaction follows the same split:
-- UI triggers run compaction through GraphQL mutation
-- external operators/agents trigger it through MCP
-- all compaction semantics remain server-owned
-
-### Важное уточнение
-MCP остаётся canonical внешним control plane,  
-но SwiftUI-клиент **не обязан** использовать MCP как transport.
-
-UI взаимодействует только с GraphQL API, а GraphQL command semantics должны быть согласованы с server-owned domain commands.
+The UI must not execute those actions itself.
 
 ---
 
-## 9. Данные и хранение
+## 9. Persistence
 
 ## 9.1 SQLite
-SQLite хранит:
-- ideas
-- runs
-- stages
-- approvals
-- agent executions
-- runtime bindings
-- session lineage metadata
-- projections
-- reports metadata
-- experiment metadata
-- audit/events metadata where needed
-- run compaction records
-- artifact supersession / archive pointers
-- compact snapshot metadata
+
+SQLite stores:
+
+- ideas,
+- runs,
+- stages,
+- approvals,
+- agent executions,
+- runtime bindings,
+- runtime capabilities,
+- session lineage metadata,
+- artifact metadata,
+- report metadata,
+- projections,
+- compaction metadata,
+- experiment metadata,
+- logs metadata where useful.
 
 ## 9.2 File artifact store
-Отдельно на диске:
-- proposal artifacts
-- review artifacts
-- reports
-- transcripts
-- runtime receipts
-- evidence bundles
-- visual artifacts
-- archived compact bundles
-- run compaction snapshots
 
-В SQLite хранятся:
-- paths
-- checksums
-- provenance
-- ownership
-- linkage to runs/stages/agents
+The file store contains:
+
+- proposal artifacts,
+- review artifacts,
+- reports,
+- transcripts,
+- ACP runtime receipts,
+- tool-call evidence,
+- compaction bundles,
+- compaction reports,
+- visual evidence.
+
+SQLite stores:
+
+- paths,
+- checksums,
+- artifact class,
+- provenance,
+- ownership,
+- archive pointers,
+- supersession relationships.
 
 ---
 
-## 10. Runtime truth и ownership
+## 10. Runtime capability publication
 
-## 10.1 Источник истины
-Server-owned SQLite + domain engine projections.
+The system does not need to hard-code a public taxonomy like:
 
-## 10.2 ACP runtime truth
-ACP runtime truth — важная, но subordinate truth.
-Она нужна для:
-- execution evidence,
-- session status,
-- runtime receipts,
-- permission/tool trace,
-- requested→effective adapter truth.
+- lifecycle-capable,
+- control-capable,
+- operator-grade.
 
-Но ACP runtime **не** является владельцем:
-- domain transitions,
-- approval semantics,
-- run truth,
-- report truth.
+However, the server must publish **effective runtime capabilities** for every runtime profile.
 
-## 10.3 MCP truth
-MCP truth — это не state truth, а **внешняя command truth**:
-- какие команды допустимы,
-- что requested,
-- кем вызвано,
-- чем закончилось.
+Examples of capability fields:
 
-## 10.4 GraphQL truth
-GraphQL truth для UI — это:
-- read truth over projections,
-- command façade truth for the client.
+- supports session load,
+- supports streaming updates,
+- supports permission callbacks,
+- supports tool-call visibility,
+- supports MCP attach,
+- supports runtime model mutation,
+- supports usage telemetry,
+- supports replay/history.
 
-GraphQL не является вторым доменным владельцем.  
-Он публикует server-owned truth.
+This allows the product to make runtime-specific decisions without pretending that all ACP runtimes are equally capable.
 
 ---
 
 ## 11. Local-first operational model
 
-Target state intentionally остаётся **локальным**.
+The target system is local-first.
 
-### Это означает:
-- один локальный Rust daemon
-- одна SQLite database
-- локальный artifact store
-- локальный SwiftUI app
-- локальные ACP runtimes
-- локальный GraphQL server
-- локальный MCP server
-- никакой обязательной распределённой инфраструктуры
+## 11.1 Single-process singleton
 
-### Операционный выбор
-На текущем этапе принимается режим:
+The server is a single-process singleton.
 
-> **single-process singleton**
+There should be no local service zoo.
 
-То есть:
-- без зоопарка сервисов,
-- без оркестрации набора локальных демонов,
-- без обязательного multi-process control plane.
+No required:
 
-### Допустимые ограничения target state
-- потеря части in-flight состояния допустима, если canonical domain truth и archive semantics остаются внятными;
-- horizontal scalability не является текущей целью;
-- exactly-once guarantees не являются текущим обязательным свойством;
-- multi-user and remote deployment are out of scope.
-
-### Целевой локальный параллелизм
-
-Текущий product target для локального single-process singleton:
-
-- **5 active runs** должны работать стабильно без ручного babysitting.
-- **10 active runs** допустимы как bounded stretch target, если executor backpressure держит количество одновременно активных agent executions в пределах capacity.
-- **20 одновременно активных agent executions** являются целевым потолком для review fan-out, но только через явные global/per-run/provider caps.
-
-Начальная capacity-модель:
-
-- глобальный лимит активных agent executions: 20;
-- per-run лимит активных agent executions: 4;
-- provider caps по умолчанию: Gemini 4, Codex 10, Claude 8, Auggie 1, Junie 1.
-- ACP provider subprocess запускается в отдельной process group; `session/close` вызывается даже после transport error в `session/prompt`, чтобы не оставлять MCP/plugin descendants после idle timeout.
-- Sleep/wake ноутбука и смена Wi-Fi/network path считаются host interruption epoch: running ACP executions, пересёкшие такой epoch, должны закрываться, классифицироваться как retryable host interruption, и переочередиться с jitter/backoff под теми же capacity caps, а не превращаться в массовые permanent provider failures.
-
-Когда capacity закончилась, правильное поведение системы:
-
-- не падать и не помечать work как failed только из-за capacity;
-- оставить work pending/backpressured;
-- показать причину backpressure в projections/GraphQL/MCP;
-- продолжить выполнение, когда освободится слот.
-- после завершения последнего `InvokeAgent` надежно разбудить/запланировать `AdvanceRun` или finalizer, чтобы stage не оставался `running` без активных agents и без pending work.
-
-Это означает, что целевая система должна выдерживать 5-10 active runs как operator workload и до 20 внешних agent processes только в рамках capacity-модели, а не через бесконтрольный fan-out.
-
----
-
-## 12. Security / trust model
-
-Даже для локального режима нужны базовые инварианты:
-
-- только сервер принимает продуктовые решения;
-- MCP server должен уметь разделять хотя бы:
-  - operator clients
-  - automation/agent clients
-  - read-only clients
-- ACP runtime requested vs effective capabilities должны логироваться;
-- artifact provenance и command provenance должны быть queryable;
-- UI не должен иметь “секретных” команд, которых нет в server control plane.
-
----
-
-## 13. Наблюдаемость
-
-Target state должен поддерживать:
-
-### 13.1 Runtime observability
-- ACP session status
-- runtime adapter choice
-- provider/model truth
-- requested/effective MCP set
-- session lineage state
-- resets / retries / compactions
-
-### 13.2 Product observability
-- run progression
-- stage settlement
-- approvals
-- blocked reasons
-- recovery recommendations
-- proposal-loop quality metrics
-- report truth
-- compaction status
-- compact snapshot truth
-- archive/supersession truth
-
-### 13.3 Operator observability
-- active run timeline
-- approval inbox
-- unresolved backlog
-- failed-stage evidence
-- runtime health panel
-- compaction report
-- compacted run summary
-- optional archived-artifact access path
-
-### 13.4 GraphQL live UX
-Поскольку subscriptions считаются критически необходимыми, thin client должен иметь live surfaces без постоянного polling:
-- run updates
-- stage updates
-- approvals
-- session/runtime status
-
----
-
-## 14. Migration intent
-
-Target state задаёт **куда прийти**, а не как именно выполнить переход.
-
-High-level путь:
-1. Сначала серверная копия логики появляется без изменения клиента.
-2. Потом MCP northbound control plane становится доступен.
-3. Потом GraphQL projections и subscriptions стабилизируются.
-4. Потом SwiftUI-клиент становится thin client.
-5. Server-owned maintenance commands such as run compaction become the only valid compaction path.
-6. Потом старый client-owned orchestration слой умирает.
-
----
-
-## 15. Что НЕ входит в target state
-
-Target state не требует сейчас:
-
-- распределённого сервера,
 - Temporal,
-- Kafka/NATS/Redis,
-- внешней workflow-платформы,
-- Postgres как обязательной замены SQLite,
-- multi-region deployment,
+- Redis,
+- Kafka,
+- NATS,
+- Postgres,
+- cloud deployment,
+- external workflow platform.
+
+## 11.2 Local server responsibilities
+
+The singleton server hosts:
+
+- domain engine,
+- orchestration engine,
+- GraphQL server,
+- MCP server,
+- ACP runtime manager,
+- projection engine,
+- persistence access,
+- artifact governance.
+
+## 11.3 Acceptable limitations
+
+The target state accepts:
+
+- local-only operation,
+- no horizontal scaling,
+- no multi-user guarantees,
+- no financial-grade exactly-once guarantees,
+- possible loss of some in-flight non-canonical state.
+
+---
+
+## 12. Observability
+
+## 12.1 Product observability
+
+Must expose:
+
+- run status,
+- stage status,
+- approval status,
+- blocked reasons,
+- recovery suggestions,
+- proposal-loop metrics,
+- report status,
+- compaction status.
+
+## 12.2 Runtime observability
+
+Must expose:
+
+- runtime profile,
+- ACP provider family,
+- model/provider truth,
+- effective runtime capabilities,
+- session status,
+- tool-call evidence,
+- MCP requested/effective tool set where applicable.
+
+## 12.3 UI observability
+
+SwiftUI should show:
+
+- active runs,
+- approval inbox,
+- run timeline,
+- artifact hierarchy,
+- reports,
+- runtime degraded states,
+- compaction status,
+- suggested MCP actions.
+
+---
+
+## 13. Migration intent
+
+The target state should be reached in phases.
+
+## Phase 1 — Server parity copy
+
+- Rust server implements a server-side copy of current logic.
+- Client remains unchanged.
+- Old client data remains in the client and finishes there.
+- No migration of old data is required.
+
+## Phase 2 — MCP external control plane
+
+- MCP server exposes external control operations.
+- External agents and operator scripts can create ideas and start runs.
+- Reset/retry/compact/recovery are MCP-first.
+
+## Phase 3 — GraphQL read and live subscriptions
+
+- GraphQL projections and subscriptions stabilize.
+- UI can read server state.
+
+## Phase 4 — Thin SwiftUI client
+
+- SwiftUI switches to GraphQL-only.
+- UI supports approvals only as mutation.
+- All other operator actions remain MCP-only.
+
+## Phase 5 — Legacy client logic removal
+
+- Client-owned orchestration logic is removed.
+- Server-owned logic becomes the only active path.
+
+---
+
+## 14. What is explicitly not part of the target state
+
+The target state does not require:
+
 - server cloud migration,
-- сложной auth federation,
-- строгих exactly-once guarantees,
-- полного отказа от локального режима,
-- 10-20 одновременно активных agent executions,
-- compaction для running runs.
+- distributed orchestration,
+- Temporal,
+- remote database,
+- multi-node deployment,
+- full audit journal as first-class projection,
+- UI-driven reset/retry/compact/start/create flows,
+- embedded MCP client inside SwiftUI,
+- direct ACP calls from SwiftUI.
 
 ---
 
-## 16. Признаки того, что target state достигнут
+## 15. Success criteria
 
-Систему можно считать достигшей target state, когда одновременно выполняются следующие свойства:
+Target state is reached when:
 
-1. Вся orchestration/domain логика живёт в Rust-сервере.
-2. SwiftUI-клиент не владеет workflow truth.
-3. ACP — единственный стратегический southbound интерфейс к агентам.
-4. MCP — canonical внешний northbound control plane.
-5. GraphQL — единственный client-facing API для SwiftUI.
-6. GraphQL subscriptions обеспечивают live thin-client UX.
-7. SQLite + local artifact store достаточны для текущего продукта.
-8. Система работает как single-process singleton.
-9. UI можно переписать или заменить без риска потерять workflow semantics.
-10. Внешний агент-клиент может управлять системой через MCP без участия UI.
-11. Server-owned projections достаточны, чтобы UI не реконструировал правду сам.
-12. Server-owned run compaction exists for `completed`, `failed`, and `blocked` runs.
-13. Compaction emits a canonical compact snapshot, preserves archive truth, and materially reduces active artifact noise.
-14. 5 active runs работают стабильно на локальном Rust/SQLite daemon без SQLite lock failures, stale running executions и ручного babysitting.
-15. До 10 active runs могут находиться в системе одновременно, при этом surplus agent work явно queued/backpressured, а не запускается бесконтрольно.
-16. До 20 active agent executions могут выполняться одновременно только под global/per-run/provider caps и с доказательством через proposal-061 gate.
+1. the Rust server owns all orchestration/domain logic;
+2. SwiftUI communicates only through GraphQL;
+3. GraphQL subscriptions provide live UI state;
+4. SwiftUI mutations are limited to approval decisions;
+5. MCP is the external command/control plane;
+6. ACP is the only strategic southbound runtime interface;
+7. SQLite and local file store are sufficient for current persistence;
+8. the server runs as a single-process singleton;
+9. run compaction is server-owned and MCP-controlled;
+10. UI can be replaced without losing workflow semantics.
 
 ---
 
-## 17. Разъяснение по runtime capability classes
+## 16. Final statement
 
-Ранее оставался открытый вопрос: нужно ли закреплять capability classes вроде:
-- `lifecycle-capable`
-- `control-capable`
-- `operator-grade`
+The target architecture is intentionally local and compact.
 
-### Что это значит простыми словами
-Это не про пользовательские роли и не про UI.
-Это просто способ классифицировать ACP runtime adapters по их зрелости.
+It avoids both extremes:
 
-Например:
+- a fat client that owns orchestration,
+- and a distributed backend platform with unnecessary infrastructure.
 
-- **lifecycle-capable**  
-  умеет создать сессию, отправить prompt и отменить её
+The desired end state is:
 
-- **control-capable**  
-  кроме этого, даёт достаточно truth для session/load, runtime mutation, requested→effective MCP
+> a local Rust control plane with SQLite, ACP agent runtimes, GraphQL thin UI, and MCP external control.
 
-- **operator-grade**  
-  кроме этого, даёт достаточно observability для live timeline, permission callbacks, tool visibility, recovery/report surfaces
-
-### Решение для target state
-Эти классы **не нужно фиксировать в target state как жёсткий пользовательский контракт**.
-
-Target state должен зафиксировать только более простую и практичную вещь:
-
-> сервер знает и публикует effective capabilities каждого runtime profile.
-
-А вот конкретная taxonomy capability classes может жить на уровне:
-- runtime profile implementation
-- ACP adapter architecture
-- compatibility matrix
-- transport/probe docs
-
-То есть target state не требует заранее прибить именно эти три названия.  
-Но он требует, чтобы система **понимала и публиковала, что конкретный runtime реально умеет**.
-
----
-
-## 18. Решённые вопросы
-
-### Q1. Должен ли SwiftUI-клиент отправлять mutations напрямую через embedded MCP client?
-**Нет.**
-SwiftUI-клиент работает исключительно только с GraphQL API.
-
-### Q2. Нужны ли GraphQL subscriptions?
-**Да, критически необходимы.**
-
-### Q3. Нужен ли единый command journal / audit log как first-class projection?
-**Нет, на текущем этапе достаточно логов и run-scoped evidence.**
-
-### Q4. Нужно ли закрепить runtime capability classes уже в target state?
-**Нет, не как жёсткую taxonomy target state.**
-Но сервер должен публиковать effective runtime capabilities.
-
-### Q5. Должен ли локальный сервер быть строго single-process singleton?
-**Да.**
-На текущем этапе оставляем single-process singleton и не связываемся с ворохом сервисов и их оркестрацией.
-
----
-
-## 19. Итог
-
-Целевая система — это **локальный control plane**, а не “толстый клиент с агентами”.
-
-Сервер становится мозгом.
-ACP становится южной интеграцией.
-GraphQL становится единственным интерфейсом для SwiftUI.
-MCP становится внешним интерфейсом управления и автоматизации.
-SwiftUI остаётся удобной оболочкой, но перестаёт быть источником решений.
-
-Это даёт:
-- более чистый центр системы,
-- лучшую заменяемость UI,
-- лучшую автоматизируемость,
-- более явную product truth,
-- server-owned maintenance operations вроде run compaction,
-- и гораздо более здоровую архитектуру для дальнейшего роста.
+This keeps the system powerful, automatable, and inspectable while making the client dramatically simpler.

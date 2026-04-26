@@ -22,7 +22,7 @@ dogfood scope.
 
 | Evidence | Status | Location |
 |---|---|---|
-| HTTP streaming feasibility research | Complete | `docs/proposals/051-shared-xcode-mcp-bridge-pool.review/http-streaming-feasibility.md` |
+| Brokered HTTP MCP contract | Complete | `docs/reference/xcode-mcp-bridge-pool.md` |
 | Dependency audit | Complete | `docs/evidence/051-shared-xcode-mcp-bridge-pool/dependency-audit.md` |
 | Targeted fixture security review | Complete | `docs/evidence/051-shared-xcode-mcp-bridge-pool/security-review.md` |
 | Stable behavior reference | Complete | `docs/reference/xcode-mcp-bridge-pool.md` |

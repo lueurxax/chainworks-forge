@@ -5,7 +5,7 @@
 | Date | 2026-04-22 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md), [060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md](060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md), [051-shared-xcode-mcp-bridge-pool.md](051-shared-xcode-mcp-bridge-pool.md), [rust-control-plane.md#capacity-aware-scheduling-and-backpressure](../reference/rust-control-plane.md#capacity-aware-scheduling-and-backpressure) |
+| Depends on | [017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md), [060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md](060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md), [xcode-mcp-bridge-pool.md](../reference/xcode-mcp-bridge-pool.md), [rust-control-plane.md#capacity-aware-scheduling-and-backpressure](../reference/rust-control-plane.md#capacity-aware-scheduling-and-backpressure) |
 | Scope | Split implementation work into lead-owned slices and route each slice to the minimal agent profile and MCP capability set needed for that slice. |
 | Goal | Avoid one-size-fits-all implementation agents by letting the lead describe multiple concrete work slices while the orchestrator selects safe, capability-minimal agent profiles per slice. |
 

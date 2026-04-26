@@ -5,7 +5,7 @@
 | Date | 2026-04-22 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [rust-control-plane.md#provider-runtime-homes-and-toolchain-caches](../reference/rust-control-plane.md#provider-runtime-homes-and-toolchain-caches), [051-shared-xcode-mcp-bridge-pool.md](051-shared-xcode-mcp-bridge-pool.md) |
+| Depends on | [rust-control-plane.md#provider-runtime-homes-and-toolchain-caches](../reference/rust-control-plane.md#provider-runtime-homes-and-toolchain-caches), [xcode-mcp-bridge-pool.md](../reference/xcode-mcp-bridge-pool.md) |
 | Scope | Add adapter-local cache/build directory mappings for Swift/Xcode and Go provider sessions under the generic `TOOLCHAIN_HOME` contract documented in the Rust control-plane reference. |
 | Goal | Daemon-launched agents that build Swift/Xcode or Go projects get writable, isolated, observable toolchain caches without making the scheduler or proposal workflow language-specific. |
 

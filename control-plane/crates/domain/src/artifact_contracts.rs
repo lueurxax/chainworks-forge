@@ -17,6 +17,32 @@ pub struct NormalizedContractStatus {
     pub warnings: Vec<String>,
 }
 
+pub fn contract_status_allowed_values(contract_id: &str) -> Option<&'static [&'static str]> {
+    match contract_id {
+        "prepush_review_v1" | "security_report_v1" => {
+            Some(&["pass", "block", "invalid", "unknown"])
+        }
+        "docs_report_v1" => Some(&["pass", "not_needed", "block", "invalid", "unknown"]),
+        "audit_report_v1" => Some(&["implemented", "needs_code_fixes", "invalid", "unknown"]),
+        "implementation_review_summary_v1" => Some(&[
+            "code_complete",
+            "needs_code_fixes",
+            "release_evidence_blocked",
+            "invalid",
+        ]),
+        "implementation_self_assessment_v2" => Some(&[
+            "complete",
+            "needs_code_fixes",
+            "blocked",
+            "handoff_required",
+            "unknown",
+            "invalid",
+        ]),
+        "tests_result_v1" => Some(&["green", "red", "blocked", "unknown"]),
+        _ => None,
+    }
+}
+
 pub fn normalize_contract_status(
     contract_id: &str,
     raw_status: &str,
@@ -24,14 +50,16 @@ pub fn normalize_contract_status(
     let raw = raw_status.trim();
     let normalized = match contract_id {
         "prepush_review_v1" => match raw {
-            "PASS" | "PASS_WITH_NOTES" | "pass" => Some("pass"),
-            "BLOCK" | "needs_fixes" | "block" => Some("block"),
+            "PASS" | "PASS_WITH_NOTES" | "pass" | "conditional_pass" => Some("pass"),
+            "BLOCK" | "needs_fixes" | "block" | "changes_required" | "fail" | "failed" => {
+                Some("block")
+            }
             "invalid" => Some("invalid"),
             "unknown" => Some("unknown"),
             _ => None,
         },
         "docs_report_v1" => match raw {
-            "success" | "synced" | "pass" => Some("pass"),
+            "success" | "synced" | "pass" | "aligned" => Some("pass"),
             "not_needed" => Some("not_needed"),
             "blocked" | "block" => Some("block"),
             "invalid" => Some("invalid"),
@@ -39,8 +67,8 @@ pub fn normalize_contract_status(
             _ => None,
         },
         "security_report_v1" => match raw {
-            "PASS" | "pass" => Some("pass"),
-            "BLOCK" | "block" => Some("block"),
+            "PASS" | "pass" | "pass_with_notes" => Some("pass"),
+            "BLOCK" | "block" | "fail" | "failed" => Some("block"),
             "invalid" => Some("invalid"),
             "unknown" => Some("unknown"),
             _ => None,
@@ -56,7 +84,9 @@ pub fn normalize_contract_status(
         },
         "implementation_review_summary_v1" => match raw {
             "code_complete" | "implemented" => Some("code_complete"),
-            "needs_code_fixes" => Some("needs_code_fixes"),
+            "needs_code_fixes" | "changes_required" | "blocked" | "block" => {
+                Some("needs_code_fixes")
+            }
             "release_evidence_blocked" => Some("release_evidence_blocked"),
             "invalid" => Some("invalid"),
             _ => None,

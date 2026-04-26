@@ -340,9 +340,14 @@ fn build_agent_lookup(
         let permission_profile = agent.permission_profile.clone();
         let skill_ref = agent.skill_ref.clone();
         let skill_role = agent.skill_role.clone();
-        let requested_mcp_server_ids = profile.mcp.clone().unwrap_or_default();
+        let mut requested_mcp_server_ids = profile.mcp.clone().unwrap_or_default();
         let xcode_signals =
             direct_command_scan.signals_for_agent(&agent.id, permission_profile.as_deref());
+        let suppress_interactive_review_xcode_mcp =
+            suppress_interactive_review_xcode_mcp(agent.mode.as_deref());
+        if suppress_interactive_review_xcode_mcp {
+            requested_mcp_server_ids.retain(|id| id != "xcode");
+        }
         let xcode_mcp_requested = requested_mcp_server_ids.iter().any(|id| id == "xcode");
 
         // Resolve skill if referenced.
@@ -420,8 +425,8 @@ fn build_agent_lookup(
                 worktree_strategy: wt_strategy,
                 session_reuse_scope,
                 session_family_id,
-                xcode_broker_required: agent.xcode_broker_required.unwrap_or(false)
-                    || xcode_mcp_requested,
+                xcode_broker_required: !suppress_interactive_review_xcode_mcp
+                    && (agent.xcode_broker_required.unwrap_or(false) || xcode_mcp_requested),
                 xcode_shim_injection_signal: agent.xcode_shim_injection_signal.unwrap_or(false)
                     || xcode_signals.xcode_shim_injection_signal,
                 requires_xcode_host_execution: agent.requires_xcode_host_execution.unwrap_or(false)
@@ -431,6 +436,10 @@ fn build_agent_lookup(
         );
     }
     Ok(lookup)
+}
+
+fn suppress_interactive_review_xcode_mcp(mode: Option<&str>) -> bool {
+    matches!(mode, Some("audit" | "prepush_review"))
 }
 
 /// Normalize YAML provider names to canonical provider families.
