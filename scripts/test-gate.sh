@@ -1665,6 +1665,7 @@ Available gates:
   proposal-060-calibration|p060-calibration
                   Proposal 060 routing calibration control artifact gate
   proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
+  proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -2868,6 +2869,52 @@ PY
       cargo test -p mcp-server proposal_061 -- --nocapture
     )
     log "Proposal 061 control-plane gate passed"
+    ;;
+  proposal-064|p064)
+    log "Proposal 064 Phase 0 gate: main-sync and knowledge readback contracts"
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+required = {
+    "docs/proposals/064-control-artifacts/dogfood-baseline-20260421.v1.json": "p064_dogfood_baseline_v1",
+    "docs/proposals/064-control-artifacts/phase-0-kickoff.v1.json": "p064_phase_0_kickoff_v1",
+}
+for rel, schema in required.items():
+    path = root / rel
+    if not path.exists():
+        raise SystemExit(f"proposal-064: missing {rel}")
+    data = json.loads(path.read_text())
+    if data.get("schema_version") != schema:
+        raise SystemExit(f"proposal-064: {rel} schema_version must be {schema}")
+    if data.get("status") != "recorded":
+        raise SystemExit(f"proposal-064: {rel} status must be recorded")
+
+migration = (root / "control-plane/crates/db/migrations/031_p064_main_sync_and_knowledge_capsules.sql").read_text()
+for needle in [
+    "main_sync_attempts",
+    "worktree_mutation_barriers",
+    "run_knowledge_capsules",
+    "run_knowledge_capsule_attachments",
+    "ALTER TABLE work_items ADD COLUMN worktree_access_mode",
+    "ALTER TABLE background_leases ADD COLUMN worktree_resource_key",
+    "idx_background_leases_worktree_owner",
+]:
+    if needle not in migration:
+        raise SystemExit(f"proposal-064: migration missing {needle}")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-064-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain main_sync -- --nocapture &&
+      cargo test -p engine main_sync_fixtures -- --nocapture &&
+      cargo test -p mcp-server p064_operator_tools_are_registered_but_hidden_until_modes_enable_runtime -- --nocapture &&
+      cargo test -p mcp-server test_mcp_tools_call_denied_returns_method_not_found -- --nocapture &&
+      cargo test -p graphql-server proposal_064_run_query_exposes_sync_and_capsule_readback -- --nocapture
+    )
+    log "Proposal 064 Phase 0 gate passed"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_graphql::futures_util::StreamExt;
 use async_graphql::*;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tokio_stream::wrappers::BroadcastStream;
 
 use db::repos::{
@@ -135,6 +135,12 @@ async fn enrich_run_with_artifact_contracts(
     } else {
         None
     };
+    gql.main_sync_readback_json = Some(async_graphql::Json(
+        proposal_064_main_sync_readback(pool, run_id).await?,
+    ));
+    gql.knowledge_capsule_readback_json = Some(async_graphql::Json(
+        proposal_064_knowledge_capsule_readback(pool, run_id).await?,
+    ));
     Ok(())
 }
 
@@ -631,6 +637,178 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         None
     };
     Ok(run)
+}
+
+async fn proposal_064_command_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+    command_types: &[&str],
+) -> Result<serde_json::Value> {
+    let placeholders = command_types
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, command_type, result_status, created_at, completed_at, caller_surface, caller_principal_id, caller_tool \
+         FROM command_journal \
+         WHERE run_id = ? AND command_type IN ({placeholders}) \
+         ORDER BY created_at DESC LIMIT 8"
+    );
+    let mut query = sqlx::query(&sql).bind(run_id.to_string());
+    for command_type in command_types {
+        query = query.bind(*command_type);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let commands = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.try_get::<String, _>("id").ok(),
+                "command_type": row.try_get::<String, _>("command_type").ok(),
+                "result_status": row.try_get::<String, _>("result_status").ok(),
+                "created_at": row.try_get::<String, _>("created_at").ok(),
+                "completed_at": row.try_get::<Option<String>, _>("completed_at").ok().flatten(),
+                "caller_surface": row.try_get::<Option<String>, _>("caller_surface").ok().flatten(),
+                "caller_principal_id": row.try_get::<Option<String>, _>("caller_principal_id").ok().flatten(),
+                "caller_tool": row.try_get::<Option<String>, _>("caller_tool").ok().flatten(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let pending = commands
+        .iter()
+        .filter(|command| command["result_status"] == "pending")
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "latest_commands": commands,
+        "pending_commands": pending,
+    }))
+}
+
+async fn proposal_064_main_sync_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let latest_attempt = sqlx::query(
+        "SELECT id, idempotency_key, trigger_reason, status, barrier_id, conflict_count, resolver_work_item_id, error_message, requested_by_stage_id, requested_by_work_item_id, created_at, started_at, completed_at \
+         FROM main_sync_attempts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let barrier = sqlx::query(
+        "SELECT id, owner_id, owner_kind, status, reason, acquired_at, heartbeat_at, expires_at, released_at \
+         FROM worktree_mutation_barriers WHERE run_id = ? AND status IN ('pending', 'active') ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let active_consumers = sqlx::query(
+        "SELECT id, worktree_resource_key, owner_id, worktree_access_mode, owner_kind, reason, acquired_at, expires_at, heartbeat_at \
+         FROM background_leases WHERE run_id = ? AND worktree_resource_key IS NOT NULL AND released_at IS NULL ORDER BY acquired_at DESC LIMIT 16",
+    )
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let command_readback = proposal_064_command_readback(
+        pool,
+        run_id,
+        &[
+            "MainSyncRequest",
+            "MainSyncRetry",
+            "MainSyncSetRunOverride",
+            "MainSyncRepairState",
+            "MainSyncRecordRecoveryDecision",
+        ],
+    )
+    .await?;
+
+    Ok(serde_json::json!({
+        "schema_version": "p064_main_sync_readback_v1",
+        "mode": "off",
+        "operator_tools_enabled": false,
+        "latest_attempt": latest_attempt.map(|row| serde_json::json!({
+            "id": row.try_get::<String, _>("id").ok(),
+            "idempotency_key": row.try_get::<String, _>("idempotency_key").ok(),
+            "trigger_reason": row.try_get::<String, _>("trigger_reason").ok(),
+            "status": row.try_get::<String, _>("status").ok(),
+            "barrier_id": row.try_get::<Option<String>, _>("barrier_id").ok().flatten(),
+            "conflict_count": row.try_get::<Option<i64>, _>("conflict_count").ok().flatten(),
+            "resolver_work_item_id": row.try_get::<Option<String>, _>("resolver_work_item_id").ok().flatten(),
+            "error_message": row.try_get::<Option<String>, _>("error_message").ok().flatten(),
+            "requested_by_stage_id": row.try_get::<Option<String>, _>("requested_by_stage_id").ok().flatten(),
+            "requested_by_work_item_id": row.try_get::<Option<String>, _>("requested_by_work_item_id").ok().flatten(),
+            "created_at": row.try_get::<String, _>("created_at").ok(),
+            "started_at": row.try_get::<Option<String>, _>("started_at").ok().flatten(),
+            "completed_at": row.try_get::<Option<String>, _>("completed_at").ok().flatten(),
+        })),
+        "active_barrier": barrier.map(|row| serde_json::json!({
+            "id": row.try_get::<String, _>("id").ok(),
+            "owner_id": row.try_get::<String, _>("owner_id").ok(),
+            "owner_kind": row.try_get::<String, _>("owner_kind").ok(),
+            "status": row.try_get::<String, _>("status").ok(),
+            "reason": row.try_get::<String, _>("reason").ok(),
+            "acquired_at": row.try_get::<Option<String>, _>("acquired_at").ok().flatten(),
+            "heartbeat_at": row.try_get::<Option<String>, _>("heartbeat_at").ok().flatten(),
+            "expires_at": row.try_get::<String, _>("expires_at").ok(),
+            "released_at": row.try_get::<Option<String>, _>("released_at").ok().flatten(),
+        })),
+        "active_consumers": active_consumers.into_iter().map(|row| serde_json::json!({
+            "lease_id": row.try_get::<String, _>("id").ok(),
+            "resource_key": row.try_get::<String, _>("worktree_resource_key").ok(),
+            "owner_id": row.try_get::<String, _>("owner_id").ok(),
+            "access_mode": row.try_get::<Option<String>, _>("worktree_access_mode").ok().flatten(),
+            "owner_kind": row.try_get::<Option<String>, _>("owner_kind").ok().flatten(),
+            "reason": row.try_get::<Option<String>, _>("reason").ok().flatten(),
+            "acquired_at": row.try_get::<String, _>("acquired_at").ok(),
+            "expires_at": row.try_get::<String, _>("expires_at").ok(),
+            "heartbeat_at": row.try_get::<Option<String>, _>("heartbeat_at").ok().flatten(),
+        })).collect::<Vec<_>>(),
+        "commands": command_readback,
+    }))
+}
+
+async fn proposal_064_knowledge_capsule_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let attachments = sqlx::query(
+        "SELECT a.id, a.capsule_id, a.match_rule, a.attachment_reason, a.injected, a.injected_byte_count, a.injected_token_count, a.truncated, a.stale_main, a.ignored, a.ignored_reason, a.created_at, c.source_run_id, c.source_proposal_id, c.source_status, c.status AS capsule_status \
+         FROM run_knowledge_capsule_attachments a \
+         JOIN run_knowledge_capsules c ON c.id = a.capsule_id \
+         WHERE a.target_run_id = ? ORDER BY a.created_at DESC LIMIT 16",
+    )
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let command_readback =
+        proposal_064_command_readback(pool, run_id, &["KnowledgeCapsuleIgnore"]).await?;
+
+    Ok(serde_json::json!({
+        "schema_version": "p064_knowledge_capsule_readback_v1",
+        "mode": "off",
+        "operator_tools_enabled": false,
+        "attached_capsules": attachments.into_iter().map(|row| serde_json::json!({
+            "attachment_id": row.try_get::<String, _>("id").ok(),
+            "capsule_id": row.try_get::<String, _>("capsule_id").ok(),
+            "source_run_id": row.try_get::<String, _>("source_run_id").ok(),
+            "source_proposal_id": row.try_get::<Option<String>, _>("source_proposal_id").ok().flatten(),
+            "source_status": row.try_get::<String, _>("source_status").ok(),
+            "capsule_status": row.try_get::<String, _>("capsule_status").ok(),
+            "match_rule": row.try_get::<String, _>("match_rule").ok(),
+            "attachment_reason": row.try_get::<String, _>("attachment_reason").ok(),
+            "injected": row.try_get::<i64, _>("injected").unwrap_or_default() != 0,
+            "injected_byte_count": row.try_get::<Option<i64>, _>("injected_byte_count").ok().flatten(),
+            "injected_token_count": row.try_get::<Option<i64>, _>("injected_token_count").ok().flatten(),
+            "truncated": row.try_get::<i64, _>("truncated").unwrap_or_default() != 0,
+            "stale_main": row.try_get::<i64, _>("stale_main").unwrap_or_default() != 0,
+            "ignored": row.try_get::<i64, _>("ignored").unwrap_or_default() != 0,
+            "ignored_reason": row.try_get::<Option<String>, _>("ignored_reason").ok().flatten(),
+            "created_at": row.try_get::<String, _>("created_at").ok(),
+        })).collect::<Vec<_>>(),
+        "commands": command_readback,
+    }))
 }
 
 const P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES: usize = 120_000;
@@ -2007,6 +2185,107 @@ mod tests {
             .unwrap();
 
         assert_eq!(run.delivery_configuration_json, Some(delivery_json));
+    }
+
+    #[tokio::test]
+    async fn proposal_064_run_query_exposes_sync_and_capsule_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO main_sync_attempts (id, run_id, idempotency_key, trigger_reason, status, conflict_count, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind("attempt-1")
+        .bind(run_id.to_string())
+        .bind("before-review-1")
+        .bind("before_review")
+        .bind("waiting_for_barrier")
+        .bind(0_i64)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktree_mutation_barriers (id, run_id, worktree_resource_key, owner_id, owner_kind, status, reason, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind("barrier-1")
+        .bind(run_id.to_string())
+        .bind(format!("run-worktree:{run_id}"))
+        .bind("main-sync")
+        .bind("main_sync")
+        .bind("pending")
+        .bind("active reader")
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id_string = run_id.to_string();
+        db::repos::command_journal::record(
+            &pool,
+            "journal-1",
+            "MainSyncRequest",
+            "{}",
+            Some(&run_id_string),
+            Utc::now(),
+            Some("mcp"),
+            Some("operator"),
+            Some("operator"),
+            Some("runs.main_sync.request"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    {{
+                      run(id: "{run_id}") {{
+                        mainSyncReadbackJson
+                        knowledgeCapsuleReadbackJson
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let main_sync = &json["run"]["mainSyncReadbackJson"];
+        assert_eq!(
+            main_sync["schema_version"], "p064_main_sync_readback_v1",
+            "unexpected P064 readback payload: {json}"
+        );
+        assert_eq!(main_sync["latest_attempt"]["status"], "waiting_for_barrier");
+        assert_eq!(main_sync["active_barrier"]["owner_kind"], "main_sync");
+        assert_eq!(
+            main_sync["commands"]["pending_commands"][0]["command_type"],
+            "MainSyncRequest"
+        );
+        assert_eq!(
+            json["run"]["knowledgeCapsuleReadbackJson"]["schema_version"],
+            "p064_knowledge_capsule_readback_v1"
+        );
     }
 
     #[tokio::test]

@@ -193,7 +193,16 @@ Nonisolated, `Sendable` disk I/O layer.
 - Path layout: `{artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}`
 - Path traversal guard: rejects any resolved path outside `workspaceRoot`.
 - Atomic writes with SHA-256 checksums.
+
+### Worktree Mutation Barrier (P064)
+
+To protect worktrees during orchestrated mutations (like main-sync), the engine uses an exclusive mutation barrier.
+- **Barrier Acquisition**: Active sync or repair tasks request an exclusive barrier.
+- **Consumer Blocking**: The scheduler prevents new read/write work items from being claimed while the barrier is active for a worktree.
+- **Read-only Reviewers**: Review agents that read directly from the implementation worktree must declare `read` access and are subject to barrier blocking.
+
 ### Transition Evaluator (`TransitionEvaluator.swift`)
+...
 
 Stateless evaluator for transition `when` clauses (ARCH-031). Supports only
 canonical patterns:

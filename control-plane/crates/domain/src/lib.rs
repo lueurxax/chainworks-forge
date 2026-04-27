@@ -9,6 +9,7 @@ pub mod events;
 pub mod idea;
 pub mod ids;
 pub mod lifecycle;
+pub mod main_sync;
 pub mod mediation;
 pub mod provider;
 pub mod run;

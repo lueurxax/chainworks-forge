@@ -56,6 +56,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/run-control.md](reference/run-control.md) — Stop/cancel, two-phase cancellation settlement, terminal-history rules
 - [reference/release-gate.md](reference/release-gate.md) — Manual release gate: post-approval execution, native git/publish, delivery receipts
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Repo-backed delivery slice: worktrees, implementation loop, manual release, assessment and handoff
+- [proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md](proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md) — Run worktree main sync and cross-run knowledge transfer (Phase 0 contract freeze)
 - [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Idea-owned workspace and frozen run project contract
 - [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Provider/model truth and provenance contract
 - [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — Benchmark, recovery/export, launch-gate sign-off

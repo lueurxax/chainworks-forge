@@ -122,7 +122,18 @@ Repo-backed implementation is isolated by `WorktreeProvisioner` and `RepoSafetyG
 - artifact output remains outside the source tree under run storage,
 - prompt packets explicitly tell agents to trust the provided project/worktree roots over any unexpected server cwd.
 
+### Worktree Main Sync (P064)
+
+Implementation worktrees may drift behind local main during long-running implementation or review loops.
+- **Sync Trigger**: Sync can be triggered before implementation starts, before retries, before review, or on explicit operator request.
+- **Barrier Protection**: Active sync acquires an exclusive mutation barrier that blocks all other worktree consumers (readers and writers).
+- **Preservation**: Dirty work is preserved via a `chore: preserve run work before main sync` commit before any merge attempt.
+- **Conflict Handling**: Merge conflicts result in an aborted merge and a resolver work item to handle the conflict manually.
+
+Note: Main sync is currently in **Phase 0 contract freeze**.
+
 ## Implementation slice
+...
 
 Implementation begins only after the implementation-approval gate.
 

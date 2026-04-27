@@ -128,6 +128,12 @@ impl CommandJournalEntry {
             Command::RetryStage(_) => "RetryStage",
             Command::ResolveWorkflowConflictTransition(_) => "ResolveWorkflowConflictTransition",
             Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
+            Command::MainSyncRequest(_) => "MainSyncRequest",
+            Command::MainSyncRetry(_) => "MainSyncRetry",
+            Command::MainSyncSetRunOverride(_) => "MainSyncSetRunOverride",
+            Command::MainSyncRepairState(_) => "MainSyncRepairState",
+            Command::MainSyncRecordRecoveryDecision(_) => "MainSyncRecordRecoveryDecision",
+            Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
@@ -143,6 +149,12 @@ impl CommandJournalEntry {
             Command::RetryStage(c) => Some(c.run_id.to_string()),
             Command::ResolveWorkflowConflictTransition(c) => Some(c.run_id.to_string()),
             Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRequest(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRetry(c) => Some(c.run_id.to_string()),
+            Command::MainSyncSetRunOverride(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRepairState(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRecordRecoveryDecision(c) => Some(c.run_id.to_string()),
+            Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
@@ -373,6 +385,18 @@ impl CommandHandler {
             && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: OverrideLegacyDiscoveryPolicy requires operator principal");
+        }
+        if matches!(
+            &cmd,
+            Command::MainSyncRequest(_)
+                | Command::MainSyncRetry(_)
+                | Command::MainSyncSetRunOverride(_)
+                | Command::MainSyncRepairState(_)
+                | Command::MainSyncRecordRecoveryDecision(_)
+                | Command::KnowledgeCapsuleIgnore(_)
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
         }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
@@ -653,6 +677,30 @@ impl CommandHandler {
                 .await?;
                 Ok(CommandResult::ArtifactContractOverrideCreated { override_id })
             }
+
+            Command::MainSyncRequest(_) => Err(anyhow!(
+                "not implemented: MainSyncRequest is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncRetry(_) => Err(anyhow!(
+                "not implemented: MainSyncRetry is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncSetRunOverride(_) => Err(anyhow!(
+                "not implemented: MainSyncSetRunOverride is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncRepairState(_) => Err(anyhow!(
+                "not implemented: MainSyncRepairState is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncRecordRecoveryDecision(_) => Err(anyhow!(
+                "not implemented: MainSyncRecordRecoveryDecision is frozen in Phase 0 only"
+            )),
+
+            Command::KnowledgeCapsuleIgnore(_) => Err(anyhow!(
+                "not implemented: KnowledgeCapsuleIgnore is frozen in Phase 0 only"
+            )),
 
             Command::ApproveStage(c) => {
                 let now = Utc::now();

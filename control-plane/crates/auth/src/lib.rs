@@ -214,13 +214,19 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 16] {
+fn all_tool_capabilities() -> [CapabilityToolId; 22] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
         CapabilityToolId::RunsStart,
         CapabilityToolId::RunsList,
         CapabilityToolId::RunsGet,
+        CapabilityToolId::RunsMainSyncRequest,
+        CapabilityToolId::RunsMainSyncRetry,
+        CapabilityToolId::RunsMainSyncSetOverride,
+        CapabilityToolId::RunsMainSyncRepairState,
+        CapabilityToolId::RunsMainSyncRecordRecoveryDecision,
+        CapabilityToolId::RunsKnowledgeCapsuleIgnore,
         CapabilityToolId::RunsCancel,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
@@ -246,6 +252,14 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         }
         CapabilityToolId::RunsList => true,
         CapabilityToolId::RunsGet => true,
+        CapabilityToolId::RunsMainSyncRequest => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RunsMainSyncRetry => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RunsMainSyncSetOverride => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RunsMainSyncRepairState => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RunsMainSyncRecordRecoveryDecision => {
+            matches!(class, PrincipalClass::Operator)
+        }
+        CapabilityToolId::RunsKnowledgeCapsuleIgnore => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsCancel => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::ApprovalsList => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
@@ -339,6 +353,14 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "runs.start" => Some(CapabilityToolId::RunsStart),
         "runs.list" => Some(CapabilityToolId::RunsList),
         "runs.get" => Some(CapabilityToolId::RunsGet),
+        "runs.main_sync.request" => Some(CapabilityToolId::RunsMainSyncRequest),
+        "runs.main_sync.retry" => Some(CapabilityToolId::RunsMainSyncRetry),
+        "runs.main_sync.set_override" => Some(CapabilityToolId::RunsMainSyncSetOverride),
+        "runs.main_sync.repair_state" => Some(CapabilityToolId::RunsMainSyncRepairState),
+        "runs.main_sync.record_recovery_decision" => {
+            Some(CapabilityToolId::RunsMainSyncRecordRecoveryDecision)
+        }
+        "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
@@ -421,6 +443,7 @@ mod tests {
     fn operator_has_all_tools() {
         let p = Principal::new("op", PrincipalClass::Operator);
         assert!(is_tool_allowed(&p, "runs.start"));
+        assert!(is_tool_allowed(&p, "runs.main_sync.request"));
         assert!(is_tool_allowed(&p, "approvals.resolve"));
         assert!(is_tool_allowed(&p, "stages.retry"));
     }
@@ -431,6 +454,7 @@ mod tests {
         assert!(is_tool_allowed(&p, "runs.start"));
         assert!(!is_tool_allowed(&p, "approvals.resolve"));
         assert!(!is_tool_allowed(&p, "stages.retry"));
+        assert!(!is_tool_allowed(&p, "runs.main_sync.request"));
         assert!(!is_tool_allowed(&p, "runs.cancel"));
     }
 

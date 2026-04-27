@@ -1,0 +1,37 @@
+{
+  "schema_version": "p064_phase_0_kickoff_v1",
+  "proposal_id": "P064",
+  "phase": "Phase 0",
+  "decision": "GO",
+  "owners": {
+    "implementation_operator": "Andrey Khasanov",
+    "phase_0_implementer": "Chainworks orchestrator code_writer",
+    "phase_1_implementer": "Chainworks orchestrator code_writer"
+  },
+  "p061_relationship": {
+    "mode": "parallel_with_dependency_guard",
+    "notes": "P064 Phase 0 freezes contracts and readback while P061 continues scheduler/write-coordination hardening. P064 Phase 1 barrier/claim behavior remains constrained by P061 readiness."
+  },
+  "p061_escalation_clock": {
+    "starts_at": "2026-04-27T00:00:00Z",
+    "duration": "P14D",
+    "escalates_at": "2026-05-11T00:00:00Z",
+    "condition": "If P061 claim/write-coordination readiness is still blocking P064 Phase 1, create an explicit release-owner decision record instead of silently advancing."
+  },
+  "evidence_refs": [
+    "docs/proposals/064-control-artifacts/dogfood-baseline-20260421.v1.json",
+    "control-plane/crates/db/migrations/031_p064_main_sync_and_knowledge_capsules.sql",
+    "control-plane/crates/domain/src/main_sync.rs",
+    "control-plane/crates/engine/src/main_sync_fixtures.rs"
+  ],
+  "risks_accepted": [
+    "P064 runtime Git mutation remains disabled in Phase 0.",
+    "MCP operator tools are registered for capability-contract freeze but hidden while main_sync.mode and knowledge_capsules.mode are off."
+  ],
+  "follow_up_actions": [
+    "Phase 1 must implement repositories, projections, barrier behavior, and duplicate idempotency handling before any Git mutation ships.",
+    "Phase 2 must add inspect/no-op/clean merge in manual_only allowlist mode.",
+    "Phase 4 prompt injection remains off until capsule quality and value gates pass."
+  ],
+  "status": "recorded"
+}
