@@ -148,6 +148,9 @@ Tools are namespaced:
 **Implementation self-assessment detail extension:**
 `runs.get` and `runs.list` (detail view) include `implementation_self_assessment_summary` in the response payload.
 
+**Operator Retry Instruction readback (P065):**
+`runs.get` includes compact retry-instruction provenance. `reports.get` includes full binding and delivery records, including raw text for operator-class principals.
+
 Resources follow two URI families:
 
 **Entity URIs** (P027 contract):
@@ -408,6 +411,8 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |
 | `run_knowledge_capsule_match_keys` | P064: Search keys for capsule relevance matching (proposal id, artifact path, etc.) |
 | `run_knowledge_capsule_attachments` | P064: Links between matching capsules and an active run |
+| `retry_operator_instruction_bindings` | P065: Durable parent bindings for operator-guided retries (ARCH-065) |
+| `retry_operator_instruction_deliveries` | P065: Per-work-item delivery records for retry instructions (ARCH-065) |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
@@ -520,7 +525,7 @@ The command handler at `crates/engine/src/command_handler.rs` processes eleven c
 | `StartRun` | Validates YAML (if provided), inserts run, activates idea, enqueues `AdvanceRun`. |
 | `ApproveStage` | Resolves approval as Granted, settles manual gates or activates compute stages, enqueues `AdvanceRun`. |
 | `RejectStage` | Resolves approval as Rejected, marks stage Blocked. |
-| `RetryStage` | Marks old stage Skipped, creates new `StageExecution` with incremented attempt, enqueues `AdvanceRun`. |
+| `RetryStage` | Marks old stage Skipped, creates new `StageExecution` with incremented attempt, enqueues `AdvanceRun`. Supports optional `operator_instruction` (P065). |
 | `ResolveWorkflowConflictTransition` | Resolves a blocking workflow conflict by selecting a legal graph transition manually. |
 | `OverrideLegacyDiscoveryPolicy` | Overrides the artifact discovery policy for a specific stage execution. |
 | `CancelRun` | Sets run to Cancelling, rebuilds projections. |

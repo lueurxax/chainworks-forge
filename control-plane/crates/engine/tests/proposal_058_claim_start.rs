@@ -1462,6 +1462,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1643,6 +1644,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1671,6 +1673,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )

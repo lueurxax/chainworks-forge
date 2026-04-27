@@ -1454,6 +1454,7 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1530,6 +1531,7 @@ async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no
                 agent_execution_id: None,
                 legacy_discovery_override_policy: Some(LegacyBroadDiscoveryPolicy::WorkflowOptIn),
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1666,6 +1668,7 @@ async fn test_retry_stage_targets_latest_matching_attempt() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1720,6 +1723,7 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1814,6 +1818,7 @@ async fn test_retry_stage_supersedes_workflow_conflict_cursor() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1920,6 +1925,7 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
                 agent_execution_id: Some(failed_lead_id),
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2045,6 +2051,7 @@ async fn test_retry_stage_with_dead_target_generation_falls_back_to_stage_retry(
                 agent_execution_id: Some(failed_lead_id),
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2194,6 +2201,7 @@ async fn test_retry_stage_rejects_active_latest_attempt() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2271,6 +2279,7 @@ agents:
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -8513,6 +8522,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )

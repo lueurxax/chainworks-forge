@@ -20,7 +20,7 @@
   },
   "evidence_refs": [
     "docs/proposals/064-control-artifacts/dogfood-baseline-20260421.v1.json",
-    "control-plane/crates/db/migrations/031_p064_main_sync_and_knowledge_capsules.sql",
+    "control-plane/crates/db/migrations/033_p064_main_sync_and_knowledge_capsules.sql",
     "control-plane/crates/domain/src/main_sync.rs",
     "control-plane/crates/engine/src/main_sync_fixtures.rs"
   ],

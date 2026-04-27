@@ -164,10 +164,11 @@ Live executor using the selected ACP runtime transport. Per-execution flow:
 1. Validate workspace boundaries.
 2. Capture pre-prompt metadata for the per-execution baseline.
 3. Create an isolated session via `RuntimeSessionBridge`.
-4. Stream execution events through `ExecutionEventBridge`.
-5. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
-7. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
+4. **Prompt Augmentation (P065)**: if an operator retry instruction is active, the executor renders a reserved engine-owned prompt section (`## Operator Retry Instruction`) before the task text.
+5. Stream execution events through `ExecutionEventBridge`.
+6. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
+7. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
+8. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
 before the transport closed, governed by the discovery settlement policy.

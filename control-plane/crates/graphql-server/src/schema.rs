@@ -1317,6 +1317,8 @@ impl MutationRoot {
                 .map(parse_legacy_broad_discovery_policy)
                 .transpose()?,
             legacy_discovery_override_reason,
+            // P065: GraphQL retry_stage remains unchanged in v1 — always None.
+            operator_instruction: None,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;

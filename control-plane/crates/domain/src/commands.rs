@@ -92,6 +92,9 @@ pub struct RetryStageCmd {
     pub legacy_discovery_override_policy: Option<LegacyBroadDiscoveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_discovery_override_reason: Option<String>,
+    /// P065: Optional one-shot operator instruction for the retry-created invocation scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_instruction: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -454,6 +454,13 @@ PROPOSAL_061_TESTS=(
   "stale_unreferenced_acp_home_is_removed"
 )
 
+PROPOSAL_065_TESTS=(
+  "domain retry_instruction"
+  "engine command_journal_redact"
+  "engine proposal_065_operator_retry_instruction"
+  "mcp-server tools::stages"
+)
+
 PROPOSAL_029_MCP_TESTS=(
   # Principal table bootstrap (auth/tests/principals_bootstrap.rs)
   "auth test_principals_file_created_with_owner_only_permissions"
@@ -1666,6 +1673,7 @@ Available gates:
                   Proposal 060 routing calibration control artifact gate
   proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
   proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
+  proposal-065|p065  Proposal 065 operator retry instruction contract gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -3018,7 +3026,7 @@ for rel, schema in required.items():
     if data.get("status") != "recorded":
         raise SystemExit(f"proposal-064: {rel} status must be recorded")
 
-migration = (root / "control-plane/crates/db/migrations/031_p064_main_sync_and_knowledge_capsules.sql").read_text()
+migration = (root / "control-plane/crates/db/migrations/033_p064_main_sync_and_knowledge_capsules.sql").read_text()
 for needle in [
     "main_sync_attempts",
     "worktree_mutation_barriers",
@@ -3042,6 +3050,23 @@ PY
       cargo test -p graphql-server proposal_064_run_query_exposes_sync_and_capsule_readback -- --nocapture
     )
     log "Proposal 064 Phase 0 gate passed"
+    ;;
+  proposal-065|p065)
+    log "Proposal 065 control-plane gate: operator retry instruction contract"
+    (
+      cd "$ROOT_DIR/control-plane"
+      # R11 speed-up: per-crate batching
+      for spec in "${PROPOSAL_065_TESTS[@]}"; do
+        crate="${spec%% *}"
+        test_name="${spec#* }"
+        log "proposal-065: focused crate=$crate test=$test_name"
+        if ! cargo test -p "$crate" "$test_name" -- --nocapture; then
+          echo "proposal-065: FAIL — $crate::$test_name returned a non-zero exit"
+          exit 1
+        fi
+      done
+    )
+    log "Proposal 065 control-plane gate passed"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"

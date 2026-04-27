@@ -98,6 +98,17 @@ GroupBox appears immediately after the Blocker Summary. It provides:
 
 If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
 
+### Guided Retries (P065)
+
+Operators can attach a short instruction to the `stages.retry` command. While the macOS UI remains read-only for this feature in v1, the read anchors are explicit:
+
+- `RunTimelineInspectorView`: show a compact `Guided Retry` badge on retry attempts with instruction provenance.
+- `StageDetailView`: add a `Retry Instruction` group with scope kind, journal id, actor, created-at timestamp, and aggregate delivery status.
+- `FailedStageEvidencePanel`: mirror `Retry Instruction` evidence whenever the failed or blocked attempt came from an instructed retry.
+- `RunReportView`: include `Retry Instruction Provenance` with fallback marker and delivery rows.
+
+**Redaction Pattern:** Non-operator readers see a restricted marker ("Instruction Present (Restricted to Operators)") and provenance, but never raw instruction text.
+
 ## Runtime provenance
 
 Operator surfaces must expose runtime trust instead of hiding it behind generic success/failure labels.
@@ -146,6 +157,7 @@ Report content includes:
 - MCP requested / predicted / actual / denied truth,
 - stage and approval summary,
 - agent/provider/model/effort usage,
+- **Guided Retry Provenance (P065)**: include retry-instruction actor, timestamp, scope kind, and delivery status.
 - pinned artifacts,
 - recovery notes,
 - deterministic outcome.
