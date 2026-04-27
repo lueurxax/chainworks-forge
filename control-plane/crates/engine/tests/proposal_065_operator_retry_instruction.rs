@@ -486,6 +486,11 @@ async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery
             owner_id: Some(old_stage_execution_id.to_string()),
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await

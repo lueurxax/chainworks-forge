@@ -2010,6 +2010,57 @@ PY
       die "P017 R4 OPS-002: mediation_late_output_ignored_total has no production caller"
     fi
 
+    # ── R5 closure guards (API-003 + REL-002 + OPS-003) ────────────────
+    # API-003: per-attempt artifact direct linkage.
+    P017_R5_ARTIFACT_MIGRATION="$ROOT_DIR/control-plane/crates/db/migrations/032_p017_per_attempt_artifact_linkage.sql"
+    if [[ ! -f "$P017_R5_ARTIFACT_MIGRATION" ]]; then
+      die "P017 R5 API-003: missing migration 032_p017_per_attempt_artifact_linkage.sql"
+    fi
+    if ! grep -q "agent_execution_id" "$P017_R5_ARTIFACT_MIGRATION"; then
+      die "P017 R5 API-003: migration 032 must add artifacts.agent_execution_id column"
+    fi
+    if ! grep -q "list_by_agent_execution" "$ROOT_DIR/control-plane/crates/db/src/repos/artifacts.rs"; then
+      die "P017 R5 API-003: artifacts repo missing list_by_agent_execution"
+    fi
+    if ! grep -q "list_by_agent_execution" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 R5 API-003: MCP execution_attempts.artifacts must use list_by_agent_execution"
+    fi
+    if ! grep -q "list_by_agent_execution" "$ROOT_DIR/control-plane/crates/graphql-server/src/types/run.rs"; then
+      die "P017 R5 API-003: GraphQL execution_attempts.artifacts must use list_by_agent_execution"
+    fi
+    if ! grep -q "execution_id_direct" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 R5 API-003: MCP must label tier-2 artifacts as execution_id_direct"
+    fi
+    # REL-002: attribution + completion atomic in single transaction.
+    if ! grep -q "mediation.complete_with_attribution" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R5 REL-002: executor must commit completion+attribution in a single transaction"
+    fi
+    if ! grep -q "update_attempt_attribution_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R5 REL-002: executor must call update_attempt_attribution_tx (transactional variant)"
+    fi
+    # OPS-003: 4 new metric helpers + production callers + tests.
+    P017_R5_HELPERS=(
+      "record_advisory_rejection_tx"
+      "record_invalid_next_stage_hint_non_blocking_tx"
+      "record_workflow_conflict_current_tx"
+      "record_terminal_unverifiable_tx"
+    )
+    for h in "${P017_R5_HELPERS[@]}"; do
+      if ! grep -q "$h" "$ROOT_DIR/control-plane/crates/db/src/repos/workflow_conflicts.rs"; then
+        die "P017 R5 OPS-003: missing helper $h"
+      fi
+    done
+    P017_R5_TESTS=(
+      "p017_advisory_rejection_metrics_emit"
+      "p017_workflow_conflict_current_metric_emits"
+      "p017_terminal_unverifiable_metric_emits"
+    )
+    for t in "${P017_R5_TESTS[@]}"; do
+      if ! grep -q "$t" "$OPS_001_DB_PATH"; then
+        die "P017 R5 OPS-003: missing metric emit test $t"
+      fi
+    done
+
     log "Proposal 017 gate passed"
     ;;
   proposal-018|p018)
