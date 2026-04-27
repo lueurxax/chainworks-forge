@@ -2074,6 +2074,108 @@ async fn test_projection_status_uses_canonical_run_when_summary_lags() {
     assert!(found.projection_lag);
 }
 
+/// Northbound run summaries must expose canonical pending approval counts even
+/// when the denormalized run summary has not caught up yet.
+#[tokio::test]
+async fn test_projection_pending_approvals_uses_canonical_approvals_when_summary_lags() {
+    let pool = test_pool().await;
+
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Lagging approval summary idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::WaitingApproval,
+        workflow_id: "wf-approval-lag".into(),
+        workflow_title: "Approval Lag Workflow".into(),
+        workspace_root: "/tmp/approval-lag".into(),
+        artifact_root: "/tmp/approval-lag/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("manual_gate".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let requested_at = Utc::now();
+    let approval = Approval {
+        id: ApprovalId::new(),
+        run_id: run.id,
+        stage_id: "manual_gate".into(),
+        decision: ApprovalDecision::Requested,
+        requested_at,
+        decided_at: None,
+        comment: None,
+        expires_at: None,
+    };
+    approvals::insert(&pool, &approval).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
+
+    approvals::resolve(
+        &pool,
+        approval.id,
+        ApprovalDecision::Granted,
+        Utc::now(),
+        Some("approved".into()),
+    )
+    .await
+    .unwrap();
+
+    let active = projections::list_active_projection(&pool).await.unwrap();
+    let active_row = active
+        .iter()
+        .find(|row| row.id == run.id.to_string())
+        .expect("active projection row");
+    assert_eq!(active_row.pending_approvals, 0);
+    assert!(active_row.projection_lag);
+
+    let by_idea = projections::list_by_idea_projection(&pool, &idea.id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(by_idea[0].pending_approvals, 0);
+    assert!(by_idea[0].projection_lag);
+
+    let found = projections::find_run_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap()
+        .expect("run projection");
+    assert_eq!(found.pending_approvals, 0);
+    assert!(found.projection_lag);
+}
+
 // ---------------------------------------------------------------------------
 // File-backed SQLite durability proof (REQ-002 / READY-001)
 //

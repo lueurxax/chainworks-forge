@@ -6,7 +6,7 @@
 | Status | Correction / Amendment |
 | Corrects | `038-run-compaction-artifact-governance-and-canonical-snapshot-maintenance.md` |
 | Depends on | Proposal 072 |
-| Goal | Correct P038 so `Compact Run` is an MCP-only operational command. SwiftUI may inspect compaction status and reports through GraphQL, but may not initiate compaction. |
+| Goal | Correct P038 so launching `Compact Run` is an MCP-only operational command. SwiftUI may inspect compaction status and reports through GraphQL, but may not initiate compaction. |
 
 ---
 
@@ -23,7 +23,7 @@ That conflicts with the target boundary:
 `Compact Run` is a maintenance operation.
 It archives artifacts, repairs links, rebuilds projections, and emits canonical compaction artifacts.
 
-That must remain an MCP-controlled operator action, not a UI mutation.
+Launching it must remain an MCP-controlled operator action, not a UI mutation.
 
 ---
 
@@ -51,6 +51,7 @@ Add/keep MCP tool:
 
 The MCP tool:
 - validates run eligibility,
+- is the only supported compaction launch path,
 - executes compaction,
 - returns compaction report identifiers,
 - returns archive/dedup counts,
@@ -74,7 +75,13 @@ GraphQL must **not** expose:
 - `compactRun`
 - `runCompact`
 - `startCompaction`
+- `launchCompaction`
 - any equivalent UI-facing compaction mutation.
+
+GraphQL also must not expose an indirect launch path through a generic
+operator-action mutation, action router, command proxy, or local fallback. If a
+future UI needs to suggest compaction, it may display the MCP tool name and the
+required identifiers only.
 
 ---
 
@@ -91,6 +98,8 @@ SwiftUI may show:
 - suggestion: “To compact this run, use MCP tool `runs.compact`.”
 
 SwiftUI may not provide a `Compact Run` button.
+SwiftUI may not launch compaction through GraphQL, MCP, a local service, or a
+generic action router.
 
 ---
 
@@ -116,11 +125,12 @@ Compaction remains forbidden for:
 P038 is complete when:
 
 1. `runs.compact` exists as an MCP tool;
-2. no SwiftUI GraphQL mutation can trigger compaction;
-3. GraphQL can display compaction status/report/snapshot;
-4. compacted runs are easier to inspect;
-5. compaction remains unavailable for running runs;
-6. static checks prevent SwiftUI from invoking compaction.
+2. `runs.compact` is the only supported compaction launch path;
+3. no SwiftUI GraphQL mutation, generic action router, MCP client, or local fallback can trigger compaction;
+4. GraphQL can display compaction status/report/snapshot;
+5. compacted runs are easier to inspect;
+6. compaction remains unavailable for running runs;
+7. static checks prevent SwiftUI from invoking compaction.
 
 ---
 

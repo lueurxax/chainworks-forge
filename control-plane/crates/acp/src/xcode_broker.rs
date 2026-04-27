@@ -32,6 +32,11 @@ use crate::{
 };
 
 const XCODE_MCP_ACTION_REQUIRED_AFTER: Duration = Duration::from_secs(5);
+const XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+#[cfg(test)]
+const XCODE_MCP_BACKEND_SHUTDOWN_WAIT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const XCODE_MCP_BACKEND_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct XcodeMcpBridgePoolConfig {
@@ -80,6 +85,7 @@ struct LeaseRecord {
     endpoint: String,
     authorization_hash: String,
     state: XcodeMcpLeaseState,
+    last_activity_at: Instant,
     first_connect_deadline: Instant,
     mcp_policy: BrokerMcpPolicy,
     target_snapshot: Option<XcodeTargetSnapshot>,
@@ -91,6 +97,7 @@ struct XcodeMcpBridgePoolState {
     target_probe_context: Option<HostProbeContext>,
     health_last_state: Option<XcodeBrokerHealthState>,
     health_last_transition_at: String,
+    helper_cleanup_reaped_leases_total: u64,
 }
 
 pub struct XcodeMcpBridgePool {
@@ -169,6 +176,9 @@ pub struct XcodeBrokerHealthSnapshot {
     pub broker_disabled: bool,
     pub backend_available: bool,
     pub observation_persistence_failures: u64,
+    pub stale_lease_count: usize,
+    pub backend_session_count: usize,
+    pub helper_cleanup_reaped_leases_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +210,10 @@ pub trait XcodeMcpBackend: Send + Sync {
 
     async fn release_lease(&self, _lease_id: &str) -> Result<()> {
         Ok(())
+    }
+
+    async fn active_backend_session_count(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -318,6 +332,10 @@ impl XcodeMcpBackend for XcodeMcpProcessBackend {
         }
         Ok(())
     }
+
+    async fn active_backend_session_count(&self) -> Option<usize> {
+        Some(self.registry.lock().await.sessions.len())
+    }
 }
 
 impl XcodeMcpProcessBackendSession {
@@ -353,6 +371,7 @@ impl XcodeMcpProcessBackendSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        crate::transport::isolate_process_group(&mut command);
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -456,10 +475,25 @@ impl XcodeMcpProcessBackendSession {
     }
 
     async fn close(&mut self) -> Result<()> {
+        let child_pid = self.child.id();
         let _ = self.stdin.shutdown().await;
-        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+        match tokio::time::timeout(XCODE_MCP_BACKEND_SHUTDOWN_WAIT, self.child.wait()).await {
             Ok(Ok(_status)) => Ok(()),
             _ => {
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    crate::transport::signal_process_group(pid, libc::SIGTERM);
+                }
+                if tokio::time::timeout(XCODE_MCP_BACKEND_SHUTDOWN_WAIT, self.child.wait())
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+                {
+                    return Ok(());
+                }
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    crate::transport::signal_process_group(pid, libc::SIGKILL);
+                }
                 let _ = self.child.kill().await;
                 let _ = self.child.wait().await;
                 Ok(())
@@ -649,8 +683,22 @@ impl XcodeMcpBridgePool {
     }
 
     pub async fn health_snapshot(&self) -> XcodeBrokerHealthSnapshot {
+        let backend_session_count = match self.backend.as_ref() {
+            Some(backend) => backend.active_backend_session_count().await.unwrap_or(0),
+            None => 0,
+        };
         let mut state_guard = self.state.lock().await;
         let active_leases = state_guard.leases.len();
+        let now = Instant::now();
+        let stale_lease_count = state_guard
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.state == XcodeMcpLeaseState::Active
+                    && now.duration_since(lease.last_activity_at)
+                        >= XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT
+            })
+            .count();
         let queued_leases = self.queued_lease_count();
         let broker_disabled = self.broker_disabled();
         let backend_available = self.has_backend();
@@ -661,6 +709,8 @@ impl XcodeMcpBridgePool {
             XcodeBrokerHealthState::Disabled
         } else if !backend_available {
             XcodeBrokerHealthState::Failed
+        } else if stale_lease_count > 0 {
+            XcodeBrokerHealthState::Degraded
         } else if queued_leases > 0 || active_leases >= self.config.max_active_leases {
             XcodeBrokerHealthState::Degraded
         } else if observation_persistence_failures > 0 {
@@ -680,6 +730,7 @@ impl XcodeMcpBridgePool {
             broker_disabled,
             backend_available,
             active_leases,
+            stale_lease_count,
             queued_leases,
             self.config.max_active_leases,
             observation_persistence_failures,
@@ -702,6 +753,9 @@ impl XcodeMcpBridgePool {
             broker_disabled,
             backend_available,
             observation_persistence_failures,
+            stale_lease_count,
+            backend_session_count,
+            helper_cleanup_reaped_leases_total: state_guard.helper_cleanup_reaped_leases_total,
         }
     }
 
@@ -730,9 +784,11 @@ impl XcodeMcpBridgePool {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is closing");
             }
             if lease.state == XcodeMcpLeaseState::Active {
+                lease.last_activity_at = Instant::now();
                 return Ok(XcodeBrokerHttpRouteState::AlreadyActive);
             }
             lease.state = XcodeMcpLeaseState::Active;
+            lease.last_activity_at = Instant::now();
             (
                 lease.agent_execution_id,
                 self.lease_observation(
@@ -827,10 +883,11 @@ impl XcodeMcpBridgePool {
             bail!("xcode_mcp_backend_unavailable: backend process routing is not yet attached");
         };
         let context = {
-            let state = self.state.lock().await;
-            let Some(lease) = state.leases.get(lease_id) else {
+            let mut state = self.state.lock().await;
+            let Some(lease) = state.leases.get_mut(lease_id) else {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
             };
+            lease.last_activity_at = Instant::now();
             XcodeMcpBackendRequestContext {
                 run_id: lease.run_id,
                 lease_id: lease_id.to_string(),
@@ -1027,12 +1084,14 @@ impl XcodeMcpBridgePool {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
             };
             if lease.state == XcodeMcpLeaseState::Active {
+                lease.last_activity_at = Instant::now();
                 return Ok(());
             }
             if lease.state == XcodeMcpLeaseState::Closing {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is closing");
             }
             lease.state = XcodeMcpLeaseState::Active;
+            lease.last_activity_at = Instant::now();
             (
                 lease.agent_execution_id,
                 self.lease_observation(
@@ -1162,6 +1221,68 @@ impl XcodeMcpBridgePool {
         }
 
         Ok(drifted_lease_ids)
+    }
+
+    pub async fn cleanup_idle_active_leases(&self) -> Result<Vec<String>> {
+        self.cleanup_idle_active_leases_older_than(XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT)
+            .await
+    }
+
+    pub async fn cleanup_idle_active_leases_older_than(
+        &self,
+        idle_timeout: Duration,
+    ) -> Result<Vec<String>> {
+        let now = Instant::now();
+        let mut observations = Vec::new();
+        let mut stale_lease_ids = Vec::new();
+        {
+            let mut state = self.state.lock().await;
+            let stale = state
+                .leases
+                .iter()
+                .filter_map(|(lease_id, lease)| {
+                    (lease.state == XcodeMcpLeaseState::Active
+                        && now.duration_since(lease.last_activity_at) >= idle_timeout)
+                        .then(|| lease_id.clone())
+                })
+                .collect::<Vec<_>>();
+
+            for lease_id in stale {
+                let Some(lease) = state.leases.remove(&lease_id) else {
+                    continue;
+                };
+                let idle_ms = now.duration_since(lease.last_activity_at).as_millis() as i64;
+                observations.push((
+                    lease.agent_execution_id,
+                    self.lease_observation_with_target(
+                        lease_id.clone(),
+                        lease.endpoint,
+                        lease.agent_execution_id,
+                        "lease_idle_timeout",
+                        Some(XcodeRuntimeFailureClass::BrokerInfrastructure),
+                        format!(
+                            "Released brokered Xcode MCP lease '{lease_id}' after {idle_ms} ms without provider activity"
+                        ),
+                        Some(state.leases.len() as i64),
+                        lease.target_snapshot.as_ref(),
+                    ),
+                ));
+                stale_lease_ids.push(lease_id);
+            }
+            state.helper_cleanup_reaped_leases_total += stale_lease_ids.len() as u64;
+        }
+
+        for (agent_execution_id, observation) in observations {
+            self.record_observation(agent_execution_id, observation)
+                .await;
+        }
+
+        if !stale_lease_ids.is_empty() {
+            self.release_backend_leases(&stale_lease_ids).await;
+            self.queue_notify.notify_waiters();
+        }
+
+        Ok(stale_lease_ids)
     }
 
     fn broker_disabled(&self) -> bool {
@@ -1649,6 +1770,7 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
                         endpoint: endpoint.clone(),
                         authorization_hash: hash_secret(&bearer_token),
                         state: XcodeMcpLeaseState::Reserved,
+                        last_activity_at: Instant::now(),
                         first_connect_deadline: Instant::now() + self.config.first_connect_timeout,
                         mcp_policy: BrokerMcpPolicy::from_intent(
                             intent,
@@ -1950,6 +2072,7 @@ fn xcode_broker_health_reason(
     broker_disabled: bool,
     backend_available: bool,
     active_leases: usize,
+    stale_lease_count: usize,
     queued_leases: usize,
     max_active_leases: usize,
     observation_persistence_failures: u64,
@@ -1964,6 +2087,14 @@ fn xcode_broker_health_reason(
         return (
             "xcode_mcp_backend_unavailable".to_string(),
             "Xcode broker failed: backend unavailable".to_string(),
+        );
+    }
+    if stale_lease_count > 0 {
+        return (
+            "xcode_mcp_stale_leases".to_string(),
+            format!(
+                "Xcode broker degraded: {stale_lease_count} stale helper lease(s) need cleanup"
+            ),
         );
     }
     if observation_persistence_failures > 0 {
@@ -2017,6 +2148,31 @@ mod tests {
         }
     }
 
+    struct RecordingBackend {
+        released: Mutex<Vec<String>>,
+        session_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl XcodeMcpBackend for RecordingBackend {
+        async fn forward_json_rpc(
+            &self,
+            _context: XcodeMcpBackendRequestContext,
+            _request: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({"jsonrpc":"2.0","result":{}}))
+        }
+
+        async fn release_lease(&self, lease_id: &str) -> Result<()> {
+            self.released.lock().await.push(lease_id.to_string());
+            Ok(())
+        }
+
+        async fn active_backend_session_count(&self) -> Option<usize> {
+            Some(self.session_count.load(Ordering::Acquire))
+        }
+    }
+
     #[tokio::test]
     async fn observation_persistence_failure_degrades_broker_health() {
         let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
@@ -2049,6 +2205,128 @@ mod tests {
         assert!(health.operator_message.contains("observation persistence"));
         assert_eq!(health.observation_persistence_failures, 1);
         assert!(health.backend_available);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_backend_close_reaps_backend_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let child_pid_path = temp.path().join("backend-child.pid");
+        let mut snapshot = target_snapshot(XcodeTargetSelectionConfidence::ExplicitPid);
+        snapshot.operator_home = temp.path().to_string_lossy().to_string();
+        snapshot.darwin_tmpdir = temp.path().to_string_lossy().to_string();
+        snapshot.developer_dir = "/usr".to_string();
+        let context = XcodeMcpBackendRequestContext {
+            run_id: RunId::new(),
+            lease_id: "lease-process-group".to_string(),
+            endpoint: "http://127.0.0.1:0/xcode-mcp/lease-process-group".to_string(),
+            agent_execution_id: None,
+            target_snapshot: Some(snapshot),
+        };
+        let config = XcodeMcpProcessBackendConfig {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "sleep 60 & echo $! > \"$1\"; wait".to_string(),
+                "xcode-broker-test".to_string(),
+                child_pid_path.to_string_lossy().to_string(),
+            ],
+            request_timeout: Duration::from_secs(1),
+        };
+
+        let mut session = XcodeMcpProcessBackendSession::spawn(&config, &context)
+            .await
+            .unwrap();
+        let child_pid = wait_for_pid_file(&child_pid_path).await;
+
+        session.close().await.unwrap();
+
+        assert!(
+            wait_for_process_exit(child_pid).await,
+            "backend close must reap child processes in the backend process group"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_active_leases_degrade_broker_health_with_helper_metrics() {
+        let backend = Arc::new(RecordingBackend {
+            released: Mutex::new(Vec::new()),
+            session_count: AtomicUsize::new(3),
+        });
+        let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+            XcodeMcpBridgePoolConfig::default(),
+            Arc::new(NoopXcodeRuntimeObservationSink),
+            backend,
+        );
+        let now = Instant::now();
+        pool.state.lock().await.leases.insert(
+            "lease-stale".to_string(),
+            LeaseRecord {
+                run_id: RunId::new(),
+                agent_execution_id: None,
+                endpoint: "http://127.0.0.1:0/xcode-mcp/lease-stale".to_string(),
+                authorization_hash: hash_secret("token"),
+                state: XcodeMcpLeaseState::Active,
+                last_activity_at: now
+                    - XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT
+                    - Duration::from_secs(1),
+                first_connect_deadline: now + Duration::from_secs(60),
+                mcp_policy: BrokerMcpPolicy::allow_all(),
+                target_snapshot: None,
+            },
+        );
+
+        let health = pool.health_snapshot().await;
+
+        assert_eq!(health.state, XcodeBrokerHealthState::Degraded);
+        assert_eq!(health.reason_code, "xcode_mcp_stale_leases");
+        assert_eq!(health.stale_lease_count, 1);
+        assert_eq!(health.backend_session_count, 3);
+        assert_eq!(health.helper_cleanup_reaped_leases_total, 0);
+        assert!(!health.can_acquire_new_xcode_leases);
+    }
+
+    #[tokio::test]
+    async fn cleanup_idle_active_leases_releases_backend_and_tracks_reaped_total() {
+        let backend = Arc::new(RecordingBackend {
+            released: Mutex::new(Vec::new()),
+            session_count: AtomicUsize::new(1),
+        });
+        let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+            XcodeMcpBridgePoolConfig::default(),
+            Arc::new(NoopXcodeRuntimeObservationSink),
+            backend.clone(),
+        );
+        let now = Instant::now();
+        pool.state.lock().await.leases.insert(
+            "lease-stale".to_string(),
+            LeaseRecord {
+                run_id: RunId::new(),
+                agent_execution_id: None,
+                endpoint: "http://127.0.0.1:0/xcode-mcp/lease-stale".to_string(),
+                authorization_hash: hash_secret("token"),
+                state: XcodeMcpLeaseState::Active,
+                last_activity_at: now - Duration::from_secs(60),
+                first_connect_deadline: now + Duration::from_secs(60),
+                mcp_policy: BrokerMcpPolicy::allow_all(),
+                target_snapshot: None,
+            },
+        );
+
+        let cleaned = pool
+            .cleanup_idle_active_leases_older_than(Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert_eq!(cleaned, vec!["lease-stale".to_string()]);
+        assert_eq!(pool.active_lease_count().await, 0);
+        assert_eq!(
+            backend.released.lock().await.as_slice(),
+            ["lease-stale".to_string()]
+        );
+        let health = pool.health_snapshot().await;
+        assert_eq!(health.stale_lease_count, 0);
+        assert_eq!(health.helper_cleanup_reaped_leases_total, 1);
     }
 
     #[test]
@@ -2123,5 +2401,38 @@ mod tests {
             darwin_tmpdir: None,
             alive,
         }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &Path) -> libc::pid_t {
+        for _ in 0..50 {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(pid) = raw.trim().parse::<libc::pid_t>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for child pid file at {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: libc::pid_t) -> bool {
+        for _ in 0..100 {
+            if !process_exists(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: libc::pid_t) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }

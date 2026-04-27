@@ -1393,11 +1393,25 @@ async fn latest_invalid_generations_in_tx(
     run_id: &str,
 ) -> Result<Vec<serde_json::Value>> {
     let rows = sqlx::query(
-        r#"SELECT contract_id, canonical_path, raw_path, raw_status, validation_errors_json,
-                  output_settlement, created_at
-           FROM artifact_contract_generations
-           WHERE run_id = ?1 AND valid = 0
-           ORDER BY created_at DESC"#,
+        r#"SELECT g.contract_id, g.canonical_path, g.raw_path, g.raw_status,
+                  g.validation_errors_json, g.output_settlement, g.created_at
+           FROM artifact_contract_generations g
+           WHERE g.run_id = ?1
+             AND g.valid = 0
+             AND NOT EXISTS (
+               SELECT 1
+               FROM active_artifact_contracts a
+               JOIN artifact_contract_generations active_g
+                 ON active_g.generation_id = a.generation_id
+               WHERE a.run_id = g.run_id
+                 AND a.contract_id = g.contract_id
+                 AND active_g.valid = 1
+                 AND (
+                   active_g.created_at >= g.created_at
+                   OR active_g.supersedes_generation_id = g.generation_id
+                 )
+             )
+           ORDER BY g.created_at DESC"#,
     )
     .bind(run_id)
     .fetch_all(&mut **tx)

@@ -119,6 +119,9 @@ nonisolated struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
     let brokerDisabled: Bool
     let backendAvailable: Bool
     let observationPersistenceFailures: Int
+    let staleLeaseCount: Int
+    let backendSessionCount: Int
+    let helperCleanupReapedLeasesTotal: Int
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -136,6 +139,9 @@ nonisolated struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
         case brokerDisabled = "broker_disabled"
         case backendAvailable = "backend_available"
         case observationPersistenceFailures = "observation_persistence_failures"
+        case staleLeaseCount = "stale_lease_count"
+        case backendSessionCount = "backend_session_count"
+        case helperCleanupReapedLeasesTotal = "helper_cleanup_reaped_leases_total"
     }
 
     init(from decoder: Decoder) throws {
@@ -162,6 +168,12 @@ nonisolated struct XcodeBrokerHealthSnapshot: Codable, Sendable, Equatable {
         observationPersistenceFailures = try c.decodeIfPresent(
             Int.self,
             forKey: .observationPersistenceFailures
+        ) ?? 0
+        staleLeaseCount = try c.decodeIfPresent(Int.self, forKey: .staleLeaseCount) ?? 0
+        backendSessionCount = try c.decodeIfPresent(Int.self, forKey: .backendSessionCount) ?? 0
+        helperCleanupReapedLeasesTotal = try c.decodeIfPresent(
+            Int.self,
+            forKey: .helperCleanupReapedLeasesTotal
         ) ?? 0
     }
 }
