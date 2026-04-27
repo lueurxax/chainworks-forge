@@ -25,7 +25,8 @@
 //! | `ApproveStage`       | `comment`                      | **redact** |
 //! | `RejectStage`        | `run_id`, `stage_id`           | preserve   |
 //! | `RejectStage`        | `comment`                      | **redact** |
-//! | `RetryStage`         | all fields                     | preserve   |
+//! | `RetryStage`         | `run_id`, `stage_id`, etc.     | preserve   |
+//! | `RetryStage`         | `operator_instruction`         | **redact** |
 //! | `OverrideLegacyDiscoveryPolicy` | all fields            | preserve   |
 //! | `CancelRun`          | all fields                     | preserve   |
 //! | `ResetSession`       | all fields                     | preserve   |
@@ -84,7 +85,11 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
             }
         }
         Command::RetryStage(_) => {
-            // §8.1: preserve all fields.
+            // §8.1: preserve identity/structural fields. P065: redact free-form
+            // operator_instruction text (same rationale as ApproveStage.comment).
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "operator_instruction");
+            }
         }
         Command::ResolveWorkflowConflictTransition(_) => {
             // Operator conflict-resolution selections are audit material.
@@ -298,11 +303,11 @@ mod tests {
         assert_eq!(inner["stage_id"], Value::String("state_4".into()));
     }
 
-    // ── RetryStage / CancelRun / ResetSession / RunStewardAnalysis ──
-    //    (preserve-all variants — every field must survive round-trip)
+    // ── RetryStage ────────────────────────────────────────────────────
+    //    P065: operator_instruction is redacted; all other fields preserved.
 
     #[test]
-    fn test_redact_retry_stage_preserves_all_fields() {
+    fn test_redact_retry_stage_preserves_structural_fields_without_instruction() {
         let run_id = RunId::new();
         let cmd = Command::RetryStage(RetryStageCmd {
             run_id,
@@ -311,14 +316,44 @@ mod tests {
             agent_execution_id: None,
             legacy_discovery_override_policy: None,
             legacy_discovery_override_reason: None,
+            operator_instruction: None,
         });
         let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         let redacted = round_trip(&cmd);
         assert_eq!(
             original, redacted,
-            "RetryStage must be preserved field-for-field"
+            "RetryStage without instruction must be preserved field-for-field"
         );
     }
+
+    #[test]
+    fn test_redact_retry_stage_redacts_operator_instruction() {
+        let run_id = RunId::new();
+        let cmd = Command::RetryStage(RetryStageCmd {
+            run_id,
+            stage_id: "state_7".into(),
+            consume_quota_budget_now: false,
+            agent_execution_id: None,
+            legacy_discovery_override_policy: None,
+            legacy_discovery_override_reason: None,
+            operator_instruction: Some("Focus only on the GraphQL scheduler slice".into()),
+        });
+        let v = round_trip(&cmd);
+        let inner = inner(&v);
+        assert_eq!(
+            inner["operator_instruction"],
+            Value::String(REDACTED.to_string()),
+            "operator_instruction must be replaced by [REDACTED]"
+        );
+        let serialized = serde_json::to_string(&v).unwrap();
+        assert!(!serialized.contains("GraphQL scheduler slice"));
+        // structural fields still preserved
+        assert_eq!(inner["run_id"], serde_json::json!(run_id));
+        assert_eq!(inner["stage_id"], Value::String("state_7".into()));
+    }
+
+    // ── CancelRun / ResetSession / RunStewardAnalysis ────────────────
+    //    (preserve-all variants)
 
     #[test]
     fn test_redact_cancel_run_preserves_run_id() {
@@ -403,6 +438,16 @@ mod tests {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            Command::RetryStage(RetryStageCmd {
+                run_id: RunId::new(),
+                stage_id: "s".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: Some("Focus on X".into()),
             }),
             Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
                 run_id: RunId::new(),

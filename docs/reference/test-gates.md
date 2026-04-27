@@ -1230,6 +1230,37 @@ Important:
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
 - the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
 
+### `proposal-065|p065`
+
+Operator retry instruction contract gate.
+
+Scope:
+
+- `stages.retry` MCP input schema extension with `operator_instruction`
+- `RetryStageCmd` domain command extension
+- validation for 1-2000 character length and control character rejection
+- durable command-journal persistence and redaction
+- retry-attempt parent binding and child delivery persistence
+- targeted retry work-item payload injection
+- full-stage retry fan-out delivery logic
+- operator-only capability enforcement
+
+Use when:
+
+- changing retry instruction validation or persistence
+- changing orchestrator/executor instruction delivery
+- changing readback/provenance for operator instructions
+
+Host policy:
+
+- local Rust toolchain required; no UI target or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-065
+```
+
 ### `full`
 
 Expensive repo-wide sign-off gate.

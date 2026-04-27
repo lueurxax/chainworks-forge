@@ -385,6 +385,31 @@ late evidence and does not update active artifact truth.
 
 This retry truth is stage-owned and depends on the lower execution-truth substrate documented in [execution-truth-and-recovery.md](execution-truth-and-recovery.md).
 
+### Operator retry instructions
+
+Operators can attach a durable, one-shot instruction to a stage or agent retry
+attempt using the `operator_instruction` field on `stages.retry`.
+
+Rules for retry instructions:
+
+- **Scope**: The instruction is bound only to the next retry attempt and the
+  invocation(s) it creates. It does not become sticky context for later stages,
+  cloned runs, or unrelated retry attempts.
+- **Validation**: Instructions must be 1-2000 characters, trimmed of surrounding
+  whitespace, and free of non-whitespace ASCII control characters.
+- **Auditability**: Instructions are persisted in the `command_journal` (redacted
+  in read-only summaries) and in a dedicated `retry_operator_instruction_bindings`
+  table.
+- **Delivery**: For targeted agent retries, the instruction is injected directly
+  into the work-item payload. For full-stage retries, the orchestrator manages
+  fan-out delivery to each retry-created invocation.
+- **Immutability**: Once accepted, the instruction cannot be mutated. Issuing a
+  new retry with a different instruction creates a fresh scope.
+
+Agent prompt guidance instructs recipients to obey the instruction within the
+approved proposal boundaries and report conflicts instead of silently overriding
+frozen truth.
+
 ### Recovery is narrow before clone-run
 
 The canonical recovery surfaces remain:

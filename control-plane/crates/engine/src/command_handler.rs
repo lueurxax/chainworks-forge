@@ -8,8 +8,8 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
-    ideas, legacy_discovery_overrides, projections, runs, scheduler, sessions, stages, work_items,
-    workflow_conflicts,
+    ideas, legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
+    sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::approval::ApprovalDecision;
@@ -57,6 +57,8 @@ pub enum CommandResult {
         run_id: RunId,
         stage_id: String,
         legacy_discovery_override_id: Option<String>,
+        /// P065: binding id when operator instruction was attached.
+        retry_instruction_binding_id: Option<String>,
     },
     WorkflowConflictTransitionSelected {
         run_id: RunId,
@@ -360,6 +362,16 @@ impl CommandHandler {
         {
             anyhow::bail!(
                 "forbidden: RetryStage legacy_discovery_override_policy requires operator principal"
+            );
+        }
+        // P065: operator_instruction requires operator principal
+        if matches!(
+            &cmd,
+            Command::RetryStage(c) if c.operator_instruction.is_some()
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!(
+                "forbidden: RetryStage operator_instruction requires operator principal"
             );
         }
         if matches!(&cmd, Command::ResolveWorkflowConflictTransition(_))
@@ -912,6 +924,16 @@ impl CommandHandler {
             }
 
             Command::RetryStage(c) => {
+                // P065: validate operator_instruction early (before any DB writes)
+                let validated_instruction = if let Some(ref raw) = c.operator_instruction {
+                    Some(
+                        domain::retry_instruction::validate_operator_instruction(raw)
+                            .map_err(|e| anyhow!("operator_instruction validation: {e}"))?,
+                    )
+                } else {
+                    None
+                };
+
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
                         anyhow::bail!(
@@ -925,6 +947,9 @@ impl CommandHandler {
                             agent_execution_id,
                             c.consume_quota_budget_now,
                             journal_id,
+                            journal,
+                            validated_instruction.as_deref(),
+                            &caller,
                         )
                         .await;
                 }
@@ -1116,6 +1141,34 @@ impl CommandHandler {
                     } else {
                         None
                     };
+                // P065: create parent binding for operator instruction (full-stage retry).
+                // Child delivery rows are deferred to the orchestrator's fanout.
+                let retry_instruction_binding_id =
+                    if let Some(ref instruction_text) = validated_instruction {
+                        let binding =
+                            retry_operator_instructions::create_for_retry_attempt_tx(
+                                &mut retry_tx,
+                                &domain::retry_instruction::RetryInstructionBindingInput {
+                                    journal_id: journal_id.to_string(),
+                                    run_id: c.run_id,
+                                    stage_id: c.stage_id.clone(),
+                                    source_stage_execution_id: old_stage.id,
+                                    retry_stage_execution_id: new_stage.id,
+                                    retry_attempt_number: next_attempt_number,
+                                    target_agent_execution_id: None,
+                                    scope_kind: domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry,
+                                    instruction_text: instruction_text.clone(),
+                                    created_by_principal_id: caller.principal_id.clone(),
+                                    created_by_principal_class: caller.principal_class.to_string(),
+                                },
+                            )
+                            .await?;
+                        Some(binding.binding_id)
+                    } else {
+                        None
+                    };
+                self.maybe_inject_retry_stage_failure("create_retry_instruction_binding")?;
+
                 artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
                     &mut retry_tx,
                     c.run_id,
@@ -1169,6 +1222,7 @@ impl CommandHandler {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
                     legacy_discovery_override_id,
+                    retry_instruction_binding_id,
                 })
             }
 
@@ -1989,7 +2043,10 @@ impl CommandHandler {
         stage_id: &str,
         consume_quota_budget_now: bool,
         journal_id: &str,
+        journal: &CommandJournalEntry,
         retry_reason: &str,
+        validated_instruction: Option<&str>,
+        caller: &CallerContext,
     ) -> Result<CommandResult> {
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
@@ -2054,6 +2111,21 @@ impl CommandHandler {
         let retry_tx_started = Instant::now();
         let mut retry_tx =
             db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
+        command_journal::record_tx(
+            &mut retry_tx,
+            &journal.id,
+            journal.command_type,
+            &journal.payload_json,
+            journal.run_id.as_deref(),
+            journal.created_at,
+            journal.caller_surface.as_deref(),
+            journal.caller_principal_id.as_deref(),
+            journal.caller_principal_class.as_deref(),
+            journal.caller_tool.as_deref(),
+            journal.request_id.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -2092,6 +2164,35 @@ impl CommandHandler {
             journal_id,
         )
         .await?;
+        // P065: create binding for fallback full-stage retry path
+        let retry_instruction_binding_id =
+            if let Some(instruction_text) = validated_instruction {
+                let scope_kind = if retry_reason == "operator_retry_stale_targeted_retry" {
+                    domain::retry_instruction::RetryInstructionScopeKind::TargetedRetryFallbackFullStage
+                } else {
+                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry
+                };
+                let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                    &mut retry_tx,
+                    &domain::retry_instruction::RetryInstructionBindingInput {
+                        journal_id: journal_id.to_string(),
+                        run_id,
+                        stage_id: stage_id.to_string(),
+                        source_stage_execution_id: old_stage.id,
+                        retry_stage_execution_id: new_stage.id,
+                        retry_attempt_number: next_attempt_number,
+                        target_agent_execution_id: None,
+                        scope_kind,
+                        instruction_text: instruction_text.to_string(),
+                        created_by_principal_id: caller.principal_id.clone(),
+                        created_by_principal_class: caller.principal_class.to_string(),
+                    },
+                )
+                .await?;
+                Some(binding.binding_id)
+            } else {
+                None
+            };
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2112,6 +2213,7 @@ impl CommandHandler {
             },
         )
         .await?;
+        command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
         retry_tx.commit().await?;
         db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
 
@@ -2122,6 +2224,7 @@ impl CommandHandler {
             run_id,
             stage_id: stage_id.to_string(),
             legacy_discovery_override_id: None,
+            retry_instruction_binding_id,
         })
     }
 
@@ -2132,6 +2235,9 @@ impl CommandHandler {
         agent_execution_id: domain::ids::AgentExecutionId,
         consume_quota_budget_now: bool,
         journal_id: &str,
+        journal: &CommandJournalEntry,
+        validated_instruction: Option<&str>,
+        caller: &CallerContext,
     ) -> Result<CommandResult> {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
@@ -2246,7 +2352,10 @@ impl CommandHandler {
                         stage_id,
                         consume_quota_budget_now,
                         journal_id,
+                        journal,
                         "operator_retry_stale_targeted_retry",
+                        validated_instruction,
+                        caller,
                     )
                     .await;
             }
@@ -2319,6 +2428,21 @@ impl CommandHandler {
         let retry_tx_started = Instant::now();
         let mut retry_tx =
             db::pool::begin_immediate_with_retry(&self.pool, "command.RetryAgentExecution").await?;
+        command_journal::record_tx(
+            &mut retry_tx,
+            &journal.id,
+            journal.command_type,
+            &journal.payload_json,
+            journal.run_id.as_deref(),
+            journal.created_at,
+            journal.caller_surface.as_deref(),
+            journal.caller_principal_id.as_deref(),
+            journal.caller_principal_class.as_deref(),
+            journal.caller_tool.as_deref(),
+            journal.request_id.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -2341,6 +2465,52 @@ impl CommandHandler {
             .bind(run_id.to_string())
             .execute(&mut *retry_tx)
             .await?;
+        // P065: create parent binding + child delivery for targeted retry
+        let retry_instruction_binding_id =
+            if let Some(instruction_text) = validated_instruction {
+                let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                    &mut retry_tx,
+                    &domain::retry_instruction::RetryInstructionBindingInput {
+                        journal_id: journal_id.to_string(),
+                        run_id,
+                        stage_id: stage_id.to_string(),
+                        source_stage_execution_id: old_stage.id,
+                        retry_stage_execution_id: new_stage.id,
+                        retry_attempt_number: next_attempt_number,
+                        target_agent_execution_id: Some(agent_execution_id),
+                        scope_kind:
+                            domain::retry_instruction::RetryInstructionScopeKind::TargetedRetry,
+                        instruction_text: instruction_text.to_string(),
+                        created_by_principal_id: caller.principal_id.clone(),
+                        created_by_principal_class: caller.principal_class.to_string(),
+                    },
+                )
+                .await?;
+                // For targeted retry, the work item is known now — create child delivery row.
+                retry_operator_instructions::create_for_work_item_tx(
+                    &mut retry_tx,
+                    &binding.binding_id,
+                    Some(&retry_work_item_id),
+                    None,
+                )
+                .await?;
+                // Inject metadata into the payload so executor can find it.
+                if let Some(object) = retry_payload.as_object_mut() {
+                    object.insert(
+                        "operator_retry_instruction".into(),
+                        serde_json::json!({
+                            "binding_id": binding.binding_id,
+                            "journal_id": binding.journal_id,
+                            "scope_kind": binding.scope_kind.to_string(),
+                            "instruction": binding.instruction_text,
+                            "instruction_sha256": binding.instruction_sha256,
+                        }),
+                    );
+                }
+                Some(binding.binding_id)
+            } else {
+                None
+            };
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2357,6 +2527,7 @@ impl CommandHandler {
             },
         )
         .await?;
+        command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
         retry_tx.commit().await?;
         db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
 
@@ -2381,6 +2552,7 @@ impl CommandHandler {
             run_id,
             stage_id: stage_id.to_string(),
             legacy_discovery_override_id: None,
+            retry_instruction_binding_id,
         })
     }
 

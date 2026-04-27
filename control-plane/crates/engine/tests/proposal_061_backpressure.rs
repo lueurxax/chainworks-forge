@@ -395,6 +395,7 @@ async fn approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_a
                     consume_quota_budget_now: false,
                     legacy_discovery_override_policy: None,
                     legacy_discovery_override_reason: None,
+                    operator_instruction: None,
                 }),
                 CallerContext::test_fixture(),
             )
@@ -1049,6 +1050,7 @@ async fn retry_stage_capacity_refresh_clears_superseded_invoke_backpressure() {
                 consume_quota_budget_now: false,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1189,6 +1191,7 @@ async fn retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_
                     consume_quota_budget_now: false,
                     legacy_discovery_override_policy: None,
                     legacy_discovery_override_reason: None,
+                    operator_instruction: None,
                 }),
                 CallerContext::test_fixture(),
             )
