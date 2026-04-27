@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
     // ── Lifecycle reporter owns the authoritative DaemonStatus ─────────
     let events = new_bus(1024);
     let binary_schema_version = migrate::binary_schema_version();
-    let build_sha = option_env!("GIT_SHA").unwrap_or("dev");
+    let build_sha = packaging::resolved_build_sha();
     let reporter = LifecycleReporter::new(binary_schema_version, build_sha, events.clone());
     reporter.set_state(DaemonLifecycleState::Starting);
 
@@ -509,6 +509,9 @@ fn spawn_xcode_broker_health_publisher(reporter: LifecycleReporter, pool: Arc<Xc
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
+            let _ = pool.cleanup_first_connect_timeouts().await;
+            let _ = pool.cleanup_pid_drift().await;
+            let _ = pool.cleanup_idle_active_leases().await;
             reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
                 pool.health_snapshot().await,
             ));
@@ -562,6 +565,9 @@ fn xcode_broker_health_for_lifecycle(
         broker_disabled: health.broker_disabled,
         backend_available: health.backend_available,
         observation_persistence_failures: health.observation_persistence_failures,
+        stale_lease_count: health.stale_lease_count,
+        backend_session_count: health.backend_session_count,
+        helper_cleanup_reaped_leases_total: health.helper_cleanup_reaped_leases_total,
     }
 }
 

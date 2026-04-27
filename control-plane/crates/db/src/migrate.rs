@@ -315,6 +315,10 @@ async fn open_pool(database_url: &str) -> Result<SqlitePool, MigrationError> {
     let opts = SqliteConnectOptions::from_str(database_url)
         .map_err(|e| MigrationError::IoError(format!("parse {database_url}: {e}")))?
         .create_if_missing(true)
+        // Migrations must be able to rebuild legacy tables even when
+        // historical data already contains dangling foreign keys. The
+        // runtime pool re-enables enforcement after preflight succeeds.
+        .foreign_keys(false)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .busy_timeout(crate::pool::SQLITE_BUSY_TIMEOUT);
     SqlitePoolOptions::new()

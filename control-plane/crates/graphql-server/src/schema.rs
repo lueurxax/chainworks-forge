@@ -547,6 +547,9 @@ pub struct GqlXcodeBrokerHealthSnapshot {
     pub broker_disabled: bool,
     pub backend_available: bool,
     pub observation_persistence_failures: i32,
+    pub stale_lease_count: i32,
+    pub backend_session_count: i32,
+    pub helper_cleanup_reaped_leases_total: i32,
 }
 
 impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealthSnapshot {
@@ -567,6 +570,9 @@ impl From<domain::lifecycle::XcodeBrokerHealthSnapshot> for GqlXcodeBrokerHealth
             broker_disabled: s.broker_disabled,
             backend_available: s.backend_available,
             observation_persistence_failures: s.observation_persistence_failures as i32,
+            stale_lease_count: s.stale_lease_count as i32,
+            backend_session_count: s.backend_session_count as i32,
+            helper_cleanup_reaped_leases_total: s.helper_cleanup_reaped_leases_total as i32,
         }
     }
 }
@@ -1255,20 +1261,34 @@ impl SubscriptionRoot {
             let pool = pool.clone();
             let fut = async move {
                 let event = msg.ok()?;
-                match event {
+                let refresh_run_id = match event {
                     DomainEvent::RunStatusChanged { run_id, .. }
-                    | DomainEvent::RunStarted { run_id, .. } => {
-                        if let Some(fid) = filter_run_id {
-                            if run_id != fid {
-                                return None;
-                            }
-                        }
-                        match run_from_projection_or_canonical(&pool, run_id).await {
-                            Ok(run) => Some(Ok(run)),
-                            Err(err) => Some(Err(err)),
-                        }
+                    | DomainEvent::RunStarted { run_id, .. }
+                    | DomainEvent::StageStatusChanged { run_id, .. }
+                    | DomainEvent::ApprovalRequested { run_id, .. }
+                    | DomainEvent::ArtifactCreated { run_id, .. }
+                    | DomainEvent::RuntimeStatusChanged { run_id, .. }
+                    | DomainEvent::MediationConfirmationResolved { run_id, .. } => Some(run_id),
+                    DomainEvent::ApprovalResolved { approval_id, .. } => {
+                        approvals::find_by_id(&pool, approval_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|approval| approval.run_id)
                     }
-                    _ => None,
+                    DomainEvent::SchedulerBackpressureChanged { run_id, .. } => {
+                        run_id.and_then(|id| id.parse().ok())
+                    }
+                    DomainEvent::DaemonStatusChanged { .. } => None,
+                }?;
+                if let Some(fid) = filter_run_id {
+                    if refresh_run_id != fid {
+                        return None;
+                    }
+                }
+                match run_from_projection_or_canonical(&pool, refresh_run_id).await {
+                    Ok(run) => Some(Ok(run)),
+                    Err(err) => Some(Err(err)),
                 }
             };
             fut
@@ -3155,6 +3175,69 @@ mod tests {
         assert_eq!(
             json["runStatusChanged"]["pendingApprovals"],
             serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_subscription_refreshes_on_runtime_progress_events() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = p043_test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let mut stream = schema.execute_stream(
+            Request::new(format!(
+                r#"
+                subscription RuntimeProgressRefreshesRun {{
+                  runStatusChanged(runId: "{run_id}") {{
+                    id
+                    status
+                    freshnessState
+                  }}
+                }}
+                "#
+            ))
+            .data(test_principal()),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus.send(DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: "state_9".into(),
+                agent_id: "code_writer".into(),
+                provider: "codex".into(),
+                event_kind: "session_started".into(),
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("runtime progress run subscription frame timed out")
+            .expect("runtime progress run subscription ended");
+        assert!(
+            frame.errors.is_empty(),
+            "runtime progress run subscription must succeed: {frame:?}"
+        );
+        let json = frame.data.into_json().unwrap();
+        assert_eq!(
+            json["runStatusChanged"]["id"],
+            serde_json::json!(run_id.to_string())
         );
     }
 
@@ -5424,6 +5507,9 @@ mod tests {
             broker_disabled: false,
             backend_available: true,
             observation_persistence_failures: 0,
+            stale_lease_count: 1,
+            backend_session_count: 1,
+            helper_cleanup_reaped_leases_total: 2,
         });
 
         let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
@@ -5446,6 +5532,7 @@ mod tests {
                           operatorMessage poolId activeLeases queuedLeases
                           maxActiveLeases maxQueuedLeases brokerDisabled
                           backendAvailable observationPersistenceFailures
+                          staleLeaseCount backendSessionCount helperCleanupReapedLeasesTotal
                         }
                       }
                     }"#,
@@ -5482,6 +5569,9 @@ mod tests {
         assert_eq!(health["brokerDisabled"], false);
         assert_eq!(health["backendAvailable"], true);
         assert_eq!(health["observationPersistenceFailures"], 0);
+        assert_eq!(health["staleLeaseCount"], 1);
+        assert_eq!(health["backendSessionCount"], 1);
+        assert_eq!(health["helperCleanupReapedLeasesTotal"], 2);
         // The json field carries the full P042 §5.2 wire shape (snake_case).
         let json_str = data["daemonStatus"]["json"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
@@ -5495,6 +5585,7 @@ mod tests {
             parsed["xcode_broker_health"]["can_acquire_new_xcode_leases"],
             false
         );
+        assert_eq!(parsed["xcode_broker_health"]["stale_lease_count"], 1);
     }
 
     #[tokio::test]

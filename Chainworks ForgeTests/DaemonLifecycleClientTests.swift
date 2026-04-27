@@ -57,6 +57,9 @@ final class DaemonLifecycleClientTests: XCTestCase {
             "broker_disabled": false,
             "backend_available": true,
             "observation_persistence_failures": 3,
+            "stale_lease_count": 1,
+            "backend_session_count": 2,
+            "helper_cleanup_reaped_leases_total": 4,
             "reason_code": "xcode_observation_persist_failed",
             "can_acquire_new_xcode_leases": false,
             "active_lease_count": 8,
@@ -79,6 +82,9 @@ final class DaemonLifecycleClientTests: XCTestCase {
         XCTAssertEqual(status.xcodeBrokerHealth?.brokerDisabled, false)
         XCTAssertEqual(status.xcodeBrokerHealth?.backendAvailable, true)
         XCTAssertEqual(status.xcodeBrokerHealth?.observationPersistenceFailures, 3)
+        XCTAssertEqual(status.xcodeBrokerHealth?.staleLeaseCount, 1)
+        XCTAssertEqual(status.xcodeBrokerHealth?.backendSessionCount, 2)
+        XCTAssertEqual(status.xcodeBrokerHealth?.helperCleanupReapedLeasesTotal, 4)
         XCTAssertEqual(status.xcodeBrokerHealth?.reasonCode, "xcode_observation_persist_failed")
         XCTAssertEqual(status.xcodeBrokerHealth?.canAcquireNewXcodeLeases, false)
         XCTAssertEqual(status.xcodeBrokerHealth?.activeLeaseCount, 8)

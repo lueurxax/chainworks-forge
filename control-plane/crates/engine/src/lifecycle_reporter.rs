@@ -292,6 +292,9 @@ mod tests {
             broker_disabled: false,
             backend_available: true,
             observation_persistence_failures: 0,
+            stale_lease_count: 0,
+            backend_session_count: 1,
+            helper_cleanup_reaped_leases_total: 0,
         };
 
         reporter.set_xcode_broker_health(health.clone());

@@ -68,7 +68,13 @@ pub struct StageSummaryRow {
 /// Status is sourced from canonical `runs`; summary lag is exposed separately.
 pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
-        r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
+        r#"WITH canonical_pending AS (
+             SELECT run_id, COUNT(*) AS pending_approvals
+             FROM approvals
+             WHERE decision IN ('pending','requested')
+             GROUP BY run_id
+           )
+           SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
@@ -76,13 +82,19 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
-                  COALESCE(rs.pending_approvals, 0) AS pending_approvals,
+                  COALESCE(cp.pending_approvals, 0) AS pending_approvals,
                   r.chainworks_meta_root,
                   CASE WHEN rs.run_id IS NULL THEN 0 ELSE 1 END AS projection_present,
                   rs.updated_at AS projection_updated_at,
-                  CASE WHEN rs.run_id IS NULL OR rs.status != r.status THEN 1 ELSE 0 END AS projection_lag
+                  CASE
+                    WHEN rs.run_id IS NULL
+                      OR rs.status != r.status
+                      OR COALESCE(rs.pending_approvals, 0) != COALESCE(cp.pending_approvals, 0)
+                    THEN 1 ELSE 0
+                  END AS projection_lag
            FROM runs r
            LEFT JOIN run_summaries rs ON rs.run_id = r.id
+           LEFT JOIN canonical_pending cp ON cp.run_id = r.id
            WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
            ORDER BY r.started_at DESC"#,
     )
@@ -123,7 +135,13 @@ pub async fn list_by_idea_projection(
     idea_id: &str,
 ) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
-        r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
+        r#"WITH canonical_pending AS (
+             SELECT run_id, COUNT(*) AS pending_approvals
+             FROM approvals
+             WHERE decision IN ('pending','requested')
+             GROUP BY run_id
+           )
+           SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
@@ -131,13 +149,19 @@ pub async fn list_by_idea_projection(
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
-                  COALESCE(rs.pending_approvals, 0) AS pending_approvals,
+                  COALESCE(cp.pending_approvals, 0) AS pending_approvals,
                   r.chainworks_meta_root,
                   CASE WHEN rs.run_id IS NULL THEN 0 ELSE 1 END AS projection_present,
                   rs.updated_at AS projection_updated_at,
-                  CASE WHEN rs.run_id IS NULL OR rs.status != r.status THEN 1 ELSE 0 END AS projection_lag
+                  CASE
+                    WHEN rs.run_id IS NULL
+                      OR rs.status != r.status
+                      OR COALESCE(rs.pending_approvals, 0) != COALESCE(cp.pending_approvals, 0)
+                    THEN 1 ELSE 0
+                  END AS projection_lag
            FROM runs r
            LEFT JOIN run_summaries rs ON rs.run_id = r.id
+           LEFT JOIN canonical_pending cp ON cp.run_id = r.id
            WHERE r.idea_id = ?
            ORDER BY r.started_at DESC"#,
     )
@@ -235,7 +259,13 @@ pub async fn find_run_projection(
     run_id: &str,
 ) -> Result<Option<RunProjectionRow>> {
     let row = sqlx::query(
-        r#"SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
+        r#"WITH canonical_pending AS (
+             SELECT run_id, COUNT(*) AS pending_approvals
+             FROM approvals
+             WHERE decision IN ('pending','requested')
+             GROUP BY run_id
+           )
+           SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
@@ -243,13 +273,19 @@ pub async fn find_run_projection(
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
                   COALESCE(rs.failed_stages, 0) AS failed_stages,
-                  COALESCE(rs.pending_approvals, 0) AS pending_approvals,
+                  COALESCE(cp.pending_approvals, 0) AS pending_approvals,
                   r.chainworks_meta_root,
                   CASE WHEN rs.run_id IS NULL THEN 0 ELSE 1 END AS projection_present,
                   rs.updated_at AS projection_updated_at,
-                  CASE WHEN rs.run_id IS NULL OR rs.status != r.status THEN 1 ELSE 0 END AS projection_lag
+                  CASE
+                    WHEN rs.run_id IS NULL
+                      OR rs.status != r.status
+                      OR COALESCE(rs.pending_approvals, 0) != COALESCE(cp.pending_approvals, 0)
+                    THEN 1 ELSE 0
+                  END AS projection_lag
            FROM runs r
            LEFT JOIN run_summaries rs ON rs.run_id = r.id
+           LEFT JOIN canonical_pending cp ON cp.run_id = r.id
            WHERE r.id = ?"#,
     )
     .bind(run_id)

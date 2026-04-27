@@ -1499,10 +1499,10 @@ protocol P031WorkflowReadStore: Sendable {
   func fetchArtifacts(runID: String) async throws -> [P031ArtifactReadModel]
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel]
   func fetchDaemonStatus() async throws -> P031DaemonStatusReadModel
-  func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
+  nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
   >
-  func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error>
+  nonisolated func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error>
 }
 
 struct P031GraphQLDocumentSet: Equatable, Sendable {
@@ -1882,7 +1882,7 @@ struct P031GraphQLWorkflowReadStore<
     return try Self.decodeDaemonStatusJSON(payload.daemonStatus.json)
   }
 
-  func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
+  nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
   > {
     try subscriptionClient.subscribe(
@@ -1894,7 +1894,7 @@ struct P031GraphQLWorkflowReadStore<
     .map { payload in payload.runStatusChanged }
   }
 
-  func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error> {
+  nonisolated func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error> {
     try subscriptionClient.subscribe(
       DaemonStatusChangedPayload.self,
       operationName: "P031DaemonStatusChanged",
@@ -2072,7 +2072,7 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     return daemonStatus
   }
 
-  func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
+  nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
   > {
     let events = runStatusEvents[runID, default: []]
@@ -2084,7 +2084,7 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     }
   }
 
-  func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error> {
+  nonisolated func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error> {
     let events = daemonStatusEvents
     return AsyncThrowingStream { continuation in
       for event in events {
@@ -2096,7 +2096,7 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
 }
 
 extension AsyncThrowingStream {
-  fileprivate func map<Mapped>(
+  nonisolated fileprivate func map<Mapped>(
     _ transform: @escaping @Sendable (Element) throws -> Mapped
   ) -> AsyncThrowingStream<Mapped, Error> {
     AsyncThrowingStream<Mapped, Error> { continuation in
@@ -4185,7 +4185,7 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
 struct P031ThinWorkflowSubscriptionCoordinator<Store: P031WorkflowReadStore>: Sendable {
   let store: Store
 
-  func runStatusPresentations(
+  nonisolated func runStatusPresentations(
     runID: String,
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date = Date()
@@ -4200,7 +4200,7 @@ struct P031ThinWorkflowSubscriptionCoordinator<Store: P031WorkflowReadStore>: Se
     }
   }
 
-  func daemonLifecyclePresentations(
+  nonisolated func daemonLifecyclePresentations(
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date = Date()
   ) throws -> AsyncThrowingStream<P031DaemonLifecyclePresentation, Error> {

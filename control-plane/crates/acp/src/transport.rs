@@ -267,7 +267,7 @@ pub fn isolate_process_group(cmd: &mut tokio::process::Command) {
 }
 
 #[cfg(unix)]
-fn signal_process_group(pid: u32, signal: libc::c_int) {
+pub(crate) fn signal_process_group(pid: u32, signal: libc::c_int) {
     if pid > libc::pid_t::MAX as u32 {
         return;
     }
