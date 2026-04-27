@@ -1,0 +1,15 @@
+{
+  "schema": "routing_calibration_report_v1",
+  "proposal_revision_id": "P060-r16-2026-04-22",
+  "source_commit": "7ac5f7854",
+  "cases": [
+    { "scenario": "UI macos", "expected_selection": ["proposal_reviewer_ui", "proposal_reviewer_macos"] },
+    { "scenario": "rust retry resume", "expected_selection": ["proposal_reviewer_rust_architect", "proposal_reviewer_reliability"] },
+    { "scenario": "security api", "expected_selection": ["proposal_reviewer_security", "proposal_reviewer_api_contract"] },
+    { "scenario": "reliability", "expected_selection": ["proposal_reviewer_reliability"] },
+    { "scenario": "rollout", "expected_selection": ["proposal_reviewer_observability_rollout"] },
+    { "scenario": "under_specified", "expected_selection": ["proposal_reviewer_product_owner", "proposal_reviewer_architect"], "warning": "caution" },
+    { "scenario": "override force_include force_exclude", "expected_selection": ["proposal_reviewer_security"] },
+    { "scenario": "mandatory_overflow", "expected_outcome": "fail_closed routing_conflict no_agentselectionplanv1" }
+  ]
+}

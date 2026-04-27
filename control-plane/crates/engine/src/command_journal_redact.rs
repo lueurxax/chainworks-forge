@@ -184,6 +184,7 @@ mod tests {
             },
             workflow_yaml_path: "examples/workflows/w.yaml".into(),
             agent_catalog_yaml_path: "examples/agents/a.yaml".into(),
+            review_routing_json: None,
         })
     }
 

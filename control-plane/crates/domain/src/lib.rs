@@ -11,6 +11,7 @@ pub mod ids;
 pub mod lifecycle;
 pub mod mediation;
 pub mod provider;
+pub mod routing;
 pub mod run;
 pub mod session;
 pub mod stage;

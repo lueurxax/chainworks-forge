@@ -103,6 +103,11 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         states.insert(state_id.clone(), compiled);
     }
 
+    // P060: Compile dynamic candidate bindings from routing metadata.
+    // Must happen before consuming cat.artifacts.
+    let dynamic_candidate_bindings =
+        compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash);
+
     // Artifact name → path template from the catalog's `artifacts:` section.
     let artifact_paths: HashMap<String, String> =
         cat.artifacts.unwrap_or_default().into_iter().collect();
@@ -120,6 +125,7 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
         catalog_snapshot_hash,
         workflow_snapshot_json,
         catalog_snapshot_json,
+        dynamic_candidate_bindings,
     })
 }
 
@@ -500,6 +506,26 @@ fn compile_state(
     let degraded_output_policy =
         compile_degraded_output_policy(state.degraded_output_policy.as_ref(), contracts)?;
 
+    // P060: Compile dynamic_parallel and system_task definitions.
+    let dynamic_parallel = state
+        .run
+        .as_ref()
+        .and_then(|rb| rb.dynamic_parallel.as_ref())
+        .map(|dp| CompiledDynamicParallel {
+            selector_artifact: dp.selector_artifact.clone(),
+            output_contract: dp.output_contract.clone(),
+            inputs: dp.inputs.clone(),
+        });
+
+    let system_task = state
+        .run
+        .as_ref()
+        .and_then(|rb| rb.system_task.as_ref())
+        .map(|st| CompiledSystemTask {
+            task_type: st.task_type.clone(),
+            executor_mode: st.executor_mode.clone(),
+        });
+
     Ok(CompiledState {
         id: state_id.to_string(),
         label: state.label.clone(),
@@ -512,6 +538,8 @@ fn compile_state(
         transitions,
         loop_config,
         degraded_output_policy,
+        dynamic_parallel,
+        system_task,
     })
 }
 
@@ -696,6 +724,14 @@ fn compile_agent_task(
         }
     }
 
+    // P060: propagate selected_outputs_from from DSL definition.
+    let selected_outputs_from = at.selected_outputs_from.as_ref().map(|sof| {
+        CompiledSelectedOutputsFrom {
+            source_plan: sof.source_plan.clone(),
+            output_contract: sof.output_contract.clone(),
+        }
+    });
+
     Ok(CompiledTask {
         agent,
         task_name: at.task.clone(),
@@ -705,6 +741,7 @@ fn compile_agent_task(
         output_schemas,
         parallel,
         phase: 0, // caller overrides for then-tasks
+        selected_outputs_from,
     })
 }
 
@@ -945,6 +982,112 @@ fn builtin_skill_content(name: &str) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+/// P060: Compile dynamic candidate bindings from a catalog for routing.
+///
+/// Extracts agents with `routing` metadata and builds frozen
+/// `CompiledDynamicAgentBinding` entries for the proposal review router.
+pub fn compile_dynamic_candidate_bindings(
+    cat: &catalog::AgentCatalogFile,
+    catalog_snapshot_hash: &str,
+) -> Vec<domain::routing::CompiledDynamicAgentBinding> {
+    let agents = cat.agents.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let empty_profiles = HashMap::new();
+    let profiles = cat.backend_profiles.as_ref().unwrap_or(&empty_profiles);
+
+    let mut bindings = Vec::new();
+    for agent in agents {
+        let Some(ref routing) = agent.routing else {
+            continue;
+        };
+
+        // Build a minimal ResolvedAgent snapshot for the binding.
+        let resolved_snapshot = serde_json::json!({
+            "agent_id": agent.id,
+            "backend_profile_id": agent.backend_profile,
+            "provider": profiles.get(&agent.backend_profile).map(|p| &p.provider),
+            "model": profiles.get(&agent.backend_profile).and_then(|p| p.model.as_ref()),
+            "prompt": agent.prompt,
+            "output_contract": agent.output_contract,
+        });
+
+        let resolved_agent_snapshot_json = serde_json::to_string(&resolved_snapshot)
+            .unwrap_or_else(|_| "{}".into());
+
+        let output_contracts = agent
+            .output_contract
+            .as_ref()
+            .map(|c| vec![c.clone()])
+            .unwrap_or_default();
+
+        let permission_hash = sha256_string(
+            agent.permission_profile.as_deref().unwrap_or("default"),
+        );
+        let worktree_hash = sha256_string(
+            &agent
+                .worktree_policy
+                .as_ref()
+                .map(|wp| wp.strategy.clone())
+                .unwrap_or_default(),
+        );
+        let mcp_profile_hash = sha256_string(
+            &profiles
+                .get(&agent.backend_profile)
+                .and_then(|p| p.mcp.as_ref())
+                .map(|m| m.join(","))
+                .unwrap_or_default(),
+        );
+        let skill_hash = sha256_string(
+            agent.skill_ref.as_deref().unwrap_or("none"),
+        );
+        let routing_metadata_json = serde_json::to_string(routing)
+            .unwrap_or_default();
+        let routing_metadata_hash = sha256_string(&routing_metadata_json);
+
+        let binding_id = format!("bind-{}", agent.id);
+
+        bindings.push(domain::routing::CompiledDynamicAgentBinding {
+            binding_id,
+            agent_id: agent.id.clone(),
+            resolved_agent_snapshot_json,
+            output_contracts,
+            permission_hash,
+            worktree_hash,
+            mcp_profile_hash,
+            skill_hash,
+            routing_metadata_hash,
+            enabled_for_proposal_review: routing.enabled_for_proposal_review,
+            rollout_wave: routing.rollout_wave.clone().unwrap_or_else(|| "unknown".into()),
+            catalog_snapshot_hash: catalog_snapshot_hash.into(),
+            routing_metadata: domain::routing::RoutingMetadata {
+                routing_id: routing.routing_id.clone(),
+                family: routing.family.clone(),
+                capabilities: routing.capabilities.clone(),
+                stacks: routing.stacks.clone(),
+                surfaces: routing.surfaces.clone(),
+                risks: routing.risks.clone(),
+                enabled_for_proposal_review: routing.enabled_for_proposal_review,
+                rollout_wave: routing.rollout_wave.clone().unwrap_or_else(|| "unknown".into()),
+                mandatory_when: routing.mandatory_when.clone(),
+                usually_pair_with: routing.usually_pair_with.clone(),
+                close_alternatives: routing.close_alternatives.clone(),
+            },
+        });
+    }
+
+    bindings
+}
+
+/// P060: Compile dynamic candidate bindings from already-parsed YAML paths.
+pub fn compile_dynamic_candidate_bindings_from_paths(
+    catalog_path: &str,
+) -> Result<Vec<domain::routing::CompiledDynamicAgentBinding>> {
+    let cat = catalog::load(catalog_path).context("loading agent catalog for routing bindings")?;
+    let catalog_snapshot_json =
+        canonical_json_string(&cat).context("serializing catalog snapshot for bindings")?;
+    let catalog_snapshot_hash = sha256_string(&catalog_snapshot_json);
+    Ok(compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash))
 }
 
 fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {

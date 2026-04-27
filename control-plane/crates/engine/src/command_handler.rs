@@ -459,6 +459,43 @@ impl CommandHandler {
                         return Err(error);
                     }
                 };
+
+                // P060: Validate review_routing_json if present.
+                let validated_review_routing_json = if let Some(ref json_str) = c.review_routing_json {
+                    match serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json_str) {
+                        Ok(opts) => {
+                            // Basic validation: reject duplicates in force_include/force_exclude.
+                            let mut seen = std::collections::HashSet::new();
+                            for agent_id in opts.force_include.iter().chain(opts.force_exclude.iter()) {
+                                if !seen.insert(agent_id.as_str()) {
+                                    let error = anyhow!("review_routing_json: duplicate agent_id '{agent_id}' in force_include/force_exclude");
+                                    let message = error.to_string();
+                                    self.record_failed_command_transaction(
+                                        journal,
+                                        "command.StartRun",
+                                        &message,
+                                    )
+                                    .await?;
+                                    return Err(error);
+                                }
+                            }
+                            // Re-serialize for canonical storage.
+                            Some(serde_json::to_string(&opts).unwrap_or_else(|_| json_str.clone()))
+                        }
+                        Err(error) => {
+                            let message = format!("review_routing_json: {error}");
+                            self.record_failed_command_transaction(
+                                journal,
+                                "command.StartRun",
+                                &message,
+                            )
+                            .await?;
+                            return Err(anyhow!(message));
+                        }
+                    }
+                } else {
+                    None
+                };
                 let delivery_preflight_json =
                     if let Some(delivery_configuration_json) = &c.delivery_configuration_json {
                         let delivery_config: domain::run::DeliveryConfiguration =
@@ -587,6 +624,8 @@ impl CommandHandler {
                     // P050: Per-run workspace isolation. All YAML artifact paths
                     // resolve through this meta root instead of shared .chainworks/.
                     chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
+                    // P060: Frozen review routing options.
+                    review_routing_json: validated_review_routing_json,
                 };
                 runs::insert_tx(&mut tx, &run).await?;
                 // Activate the idea when its first run starts.

@@ -112,6 +112,7 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     }
 }
 
@@ -3015,6 +3016,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: delivery_configuration_json.clone(),
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -3820,6 +3822,7 @@ async fn delivery_preflight_success_persists_run_owned_result() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -3873,6 +3876,7 @@ async fn delivery_preflight_failure_blocks_before_run_creation() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -3911,6 +3915,7 @@ async fn release_workflow_without_delivery_configuration_blocks_before_run_creat
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: None,
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -4445,6 +4450,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -4739,6 +4745,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -4892,6 +4899,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -5071,6 +5079,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                     .to_string_lossy()
                     .into_owned(),
             ),
+            review_routing_json: None,
         },
     )
     .await
@@ -5271,6 +5280,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                     .to_string_lossy()
                     .into_owned(),
             ),
+            review_routing_json: None,
         },
     )
     .await
@@ -5495,6 +5505,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -5943,6 +5954,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6365,6 +6377,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6622,6 +6635,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6838,6 +6852,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -7346,6 +7361,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -7748,6 +7764,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -8751,6 +8768,7 @@ async fn test_state_11_to_state_12_happy_path() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -9485,6 +9503,7 @@ fn test_runs_start_does_not_accept_chainworks_meta_root_override() {
         workflow_yaml_path: "/tmp/wf.yaml".into(),
         agent_catalog_yaml_path: "/tmp/cat.yaml".into(),
         delivery_configuration_json: None,
+        review_routing_json: None,
     };
     // If this compiles, StartRunCmd has no chainworks_meta_root field — the daemon owns it.
     let _ = cmd;

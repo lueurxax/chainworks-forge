@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::approval::ApprovalDecision;
-use crate::ids::{ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use crate::ids::{
+    ApprovalId, ArtifactId, IdeaId, RoutingReceiptId, RunId, StageExecutionId, SystemExecutionId,
+};
 use crate::lifecycle::DaemonStatus;
 use crate::mediation::MediationConfirmationDecision;
 use crate::run::RunStatus;
@@ -57,6 +59,15 @@ pub enum DomainEvent {
         mediation_record_id: String,
         confirmation_subject_id: String,
         decision: MediationConfirmationDecision,
+    },
+    /// P060: System routing task completed (succeeded or failed).
+    RoutingCompleted {
+        run_id: RunId,
+        stage_id: String,
+        system_execution_id: SystemExecutionId,
+        receipt_id: RoutingReceiptId,
+        status: String,
+        plan_hash: Option<String>,
     },
     /// Durable scheduler backpressure notification changed (P061).
     /// Payload mirrors the operator readback shape so GraphQL and MCP can

@@ -54,6 +54,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
         workflow_snapshot_json: None,
         catalog_snapshot_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     }
 }
 

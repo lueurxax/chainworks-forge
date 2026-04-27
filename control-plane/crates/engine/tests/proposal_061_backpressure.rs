@@ -74,6 +74,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     }
 }
 
@@ -1487,6 +1488,7 @@ async fn start_run_closes_journal_with_run_wake_and_scheduler_refresh() {
                 delivery_configuration_json: Some(delivery_configuration_json),
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )

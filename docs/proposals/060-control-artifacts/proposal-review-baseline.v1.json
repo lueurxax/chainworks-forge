@@ -1,0 +1,19 @@
+{
+  "schema": "proposal_review_baseline_v1",
+  "proposal_revision_id": "P060-r16-2026-04-22",
+  "source_commit": "7ac5f7854",
+  "fixed_quartet": { "reviewer_count": 4 },
+  "token_measurement_mode": "proxy",
+  "corpus_membership": [
+    { "id": "ui", "tags": ["ui_only", "macos", "swiftui"], "reviewer_outputs": ["proposal_review_v1"], "quality_baseline": "fixed_quartet reviewer_count" },
+    { "id": "rust", "tags": ["rust_backend", "control_plane"], "reviewer_outputs": ["proposal_review_v1"], "quality_baseline": "fixed_quartet reviewer_count" },
+    { "id": "security", "tags": ["security_api", "graphql", "security"], "reviewer_outputs": ["proposal_review_v1"], "quality_baseline": "fixed_quartet reviewer_count" },
+    { "id": "retry", "tags": ["reliability_retry", "resume", "retry"], "reviewer_outputs": ["proposal_review_v1"], "quality_baseline": "fixed_quartet reviewer_count" },
+    { "id": "rollout", "tags": ["rollout", "cutover", "release"], "reviewer_outputs": ["proposal_review_v1"], "quality_baseline": "fixed_quartet reviewer_count" },
+    { "id": "mixed", "tags": ["mixed_stack", "swift", "rust"], "reviewer_outputs": ["proposal_review_v1"], "quality_baseline": "fixed_quartet reviewer_count" }
+  ],
+  "dependency_confirmations": {
+    "p017": "informative_only",
+    "p047": "extension fallback confirmed"
+  }
+}

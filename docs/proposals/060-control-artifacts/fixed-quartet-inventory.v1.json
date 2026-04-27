@@ -1,0 +1,15 @@
+{
+  "schema": "hardcoded_fixed_quartet_inventory_v1",
+  "proposal_revision_id": "P060-r16-2026-04-22",
+  "source_commit": "7ac5f7854",
+  "reviewers": ["product_owner", "ux", "ui", "architect"],
+  "rows": [
+    { "surface": "Swift", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" },
+    { "surface": "Rust", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" },
+    { "surface": "fixtures", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" },
+    { "surface": "reports", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" },
+    { "surface": "feedback_fidelity", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" },
+    { "surface": "rereview_scope", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" },
+    { "surface": "ui_views", "assumption": "fixed_quartet product_owner ux ui architect", "migration": "legacy_behavior" }
+  ]
+}
