@@ -1259,7 +1259,8 @@ impl SubscriptionRoot {
                     | DomainEvent::ApprovalRequested { run_id, .. }
                     | DomainEvent::ArtifactCreated { run_id, .. }
                     | DomainEvent::RuntimeStatusChanged { run_id, .. }
-                    | DomainEvent::MediationConfirmationResolved { run_id, .. } => Some(run_id),
+                    | DomainEvent::MediationConfirmationResolved { run_id, .. }
+                    | DomainEvent::RoutingCompleted { run_id, .. } => Some(run_id),
                     DomainEvent::ApprovalResolved { approval_id, .. } => {
                         approvals::find_by_id(&pool, approval_id)
                             .await
