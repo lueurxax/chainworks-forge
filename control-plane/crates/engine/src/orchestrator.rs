@@ -1824,11 +1824,51 @@ impl Orchestrator {
             None => return Ok(false),
         };
 
-        // Legacy fixed mode skips routing.
-        if routing_options.mode == domain::routing::ReviewRoutingMode::LegacyFixed {
-            info!(run_id = %run_id, "P060: Legacy fixed mode — skipping system routing");
+        // P060 Phase 3 / OPS-001: feature-flag cutover.
+        // `domain::routing::resolve_effective_routing_mode` consults the
+        // daemon-level `CHAINWORKS_P060_ROUTING_MODE_OVERRIDE` env var so
+        // operators can force every run into a specific mode for staged
+        // rollout / emergency rollback.
+        let resolution =
+            domain::routing::resolve_effective_routing_mode(&routing_options.mode);
+        match &resolution {
+            domain::routing::EffectiveRoutingModeResolution::OverriddenByEnv { from, to } => {
+                info!(
+                    run_id = %run_id,
+                    run_mode = %from,
+                    override_mode = %to,
+                    "P060 cutover flag: overriding per-run routing mode"
+                );
+            }
+            domain::routing::EffectiveRoutingModeResolution::OverrideUnrecognized {
+                raw,
+                per_run,
+            } => {
+                warn!(
+                    run_id = %run_id,
+                    raw = %raw,
+                    per_run = %per_run,
+                    "P060 cutover flag: unrecognized value, falling back to per-run mode"
+                );
+            }
+            domain::routing::EffectiveRoutingModeResolution::UsedPerRunMode(_) => {}
+        }
+        let effective_mode = resolution.effective();
+
+        // Legacy fixed mode skips routing entirely.
+        if effective_mode == domain::routing::ReviewRoutingMode::LegacyFixed {
+            info!(
+                run_id = %run_id,
+                "P060: Legacy fixed mode — skipping system routing"
+            );
             return Ok(false);
         }
+
+        // Shadow dynamic mode: run the algorithm, persist evidence, but
+        // DO NOT take over dispatch. The legacy fixed quartet still
+        // drives reviewer invocations. This lets operators A/B compare
+        // the dynamic plan against actual fixed output before cutover.
+        let is_shadow = effective_mode == domain::routing::ReviewRoutingMode::ShadowDynamic;
 
         // Check if the plan has dynamic candidate bindings.
         if plan.dynamic_candidate_bindings.is_empty() {
@@ -1839,7 +1879,8 @@ impl Orchestrator {
         info!(
             run_id = %run_id,
             stage = %stage.stage_id,
-            mode = %routing_options.mode,
+            mode = %effective_mode,
+            shadow = is_shadow,
             candidates = plan.dynamic_candidate_bindings.len(),
             "P060: Executing system routing for proposal review"
         );
@@ -1954,15 +1995,36 @@ impl Orchestrator {
                 };
                 artifacts::insert(&self.pool, &artifact).await?;
 
-                // Emit routing completed event.
+                // Emit routing completed event. The status label
+                // distinguishes a real production routing run from a
+                // shadow comparison so operators can filter dashboards.
+                let event_status = if is_shadow {
+                    "shadow_succeeded".to_string()
+                } else {
+                    "succeeded".to_string()
+                };
                 let _ = self.events.send(DomainEvent::RoutingCompleted {
                     run_id,
                     stage_id: stage.stage_id.clone(),
                     system_execution_id: system_execution.id,
                     receipt_id: receipt.receipt_id,
-                    status: "succeeded".to_string(),
+                    status: event_status,
                     plan_hash: Some(selection_plan.plan_hash),
                 });
+
+                // Phase 3 shadow mode: even though the routing succeeded,
+                // do NOT take over dispatch. Returning `false` lets the
+                // orchestrator fall through to the legacy fixed-quartet
+                // task dispatch, while the artifact + DB rows above are
+                // available for operator A/B comparison.
+                if is_shadow {
+                    info!(
+                        run_id = %run_id,
+                        plan_hash = %system_execution.id,
+                        "P060: Shadow routing recorded — yielding dispatch to legacy fixed quartet"
+                    );
+                    return Ok(false);
+                }
 
                 Ok(true)
             }
@@ -1975,14 +2037,39 @@ impl Orchestrator {
                 warn!(
                     run_id = %run_id,
                     failure = %failure_kind,
-                    "P060: Routing failed — setting stage validation failure"
+                    shadow = is_shadow,
+                    "P060: Routing failed"
                 );
 
-                // Persist system execution and routing receipt.
+                // Persist system execution and routing receipt regardless
+                // of mode — operators need the diagnostic in shadow runs too.
                 db::repos::system_executions::insert(&self.pool, &system_execution).await?;
                 db::repos::routing_receipts::insert(&self.pool, &receipt).await?;
 
-                // Set stage validation failure JSON.
+                // P060 Phase 3: in shadow mode, a routing failure must NOT
+                // block the run — the legacy fixed quartet still drives
+                // dispatch and the failure is recorded as observational
+                // evidence only. Emit a shadow_failed event and yield.
+                if is_shadow {
+                    let _ = self.events.send(DomainEvent::RoutingCompleted {
+                        run_id,
+                        stage_id: stage.stage_id.clone(),
+                        system_execution_id: system_execution.id,
+                        receipt_id: receipt.receipt_id,
+                        status: "shadow_failed".to_string(),
+                        plan_hash: None,
+                    });
+                    info!(
+                        run_id = %run_id,
+                        failure = %failure_kind,
+                        "P060: Shadow routing failure recorded — yielding dispatch to legacy fixed quartet"
+                    );
+                    return Ok(false);
+                }
+
+                // Production dynamic mode: the routing failure is a
+                // hard stage-level conflict. Set validation failure JSON
+                // and block the run.
                 stages::update_validation_failure_json(
                     &self.pool,
                     stage.id,
@@ -1990,7 +2077,6 @@ impl Orchestrator {
                 )
                 .await?;
 
-                // Settle the stage as blocked (routing conflict).
                 let now = Utc::now();
                 stages::settle(
                     &self.pool,

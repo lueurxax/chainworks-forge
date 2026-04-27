@@ -234,6 +234,126 @@ impl RoutingEvidenceRef {
     }
 }
 
+/// Outcome of an evidence projection authorization check.
+///
+/// `Full` returns the full `RoutingEvidenceRef` including
+/// `normalized_value`, `path`, `symbol`, and `span` raw fields.
+/// `Redacted` returns hash-only projection (these raw fields become None).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingEvidenceProjection {
+    Full,
+    Redacted,
+}
+
+/// P060 Phase 3 / OPS-001 closure for evidence redaction:
+/// the canonical authorizer that EVERY reader (GraphQL, MCP, reports.get,
+/// recovery readback, artifact rendering) must consult before exposing
+/// `RoutingEvidenceRef` data.
+///
+/// Today the policy is:
+/// - Only `PrincipalClass::Operator` is even eligible for the
+///   `operator_debug_routing_evidence` capability.
+/// - The capability is gated by env var
+///   `CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE=1` — set on the daemon
+///   to opt-in for full evidence dumps; default-deny preserves evidence
+///   redaction for normal operator interactions.
+///
+/// The authorizer is a stateless value type so callers can store it once
+/// per request/connection. It does **not** consult the auth crate's
+/// `CapabilityToolId` because evidence-projection is per-field, not
+/// per-tool; tool-level checks already gated the call site.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingEvidenceProjectionAuthorizer {
+    projection: RoutingEvidenceProjection,
+}
+
+impl RoutingEvidenceProjectionAuthorizer {
+    /// Construct a default-deny authorizer (always Redacted).
+    pub const fn redacted_only() -> Self {
+        Self {
+            projection: RoutingEvidenceProjection::Redacted,
+        }
+    }
+
+    /// Construct an authorizer for an Operator with the env-gated
+    /// `operator_debug_routing_evidence` capability granted.
+    pub const fn full() -> Self {
+        Self {
+            projection: RoutingEvidenceProjection::Full,
+        }
+    }
+
+    /// Check the env var and decide projection level. Caller-supplied
+    /// principal class scopes whether even the env-var grant applies.
+    ///
+    /// Use this at every readback site that constructs a projection from
+    /// an authenticated principal context.
+    pub fn for_principal_class<P>(class: &P) -> Self
+    where
+        P: PrincipalClassDebugRoutingHook + ?Sized,
+    {
+        if !class.is_operator_with_full_routing_evidence() {
+            return Self::redacted_only();
+        }
+        let allow = std::env::var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if allow {
+            Self::full()
+        } else {
+            Self::redacted_only()
+        }
+    }
+
+    /// Returns the projection level this authorizer represents.
+    pub fn projection(&self) -> RoutingEvidenceProjection {
+        self.projection
+    }
+
+    /// Project a single evidence ref through the authorizer.
+    pub fn project_ref(&self, evidence: &RoutingEvidenceRef) -> RoutingEvidenceRef {
+        match self.projection {
+            RoutingEvidenceProjection::Full => evidence.clone(),
+            RoutingEvidenceProjection::Redacted => evidence.redacted(),
+        }
+    }
+
+    /// Project an evidence-ref list through the authorizer.
+    pub fn project_refs(&self, evidence: &[RoutingEvidenceRef]) -> Vec<RoutingEvidenceRef> {
+        evidence.iter().map(|e| self.project_ref(e)).collect()
+    }
+}
+
+impl Default for RoutingEvidenceProjectionAuthorizer {
+    fn default() -> Self {
+        Self::redacted_only()
+    }
+}
+
+/// Hook trait for "is this principal class a fully-trusted operator?"
+/// Lives in `domain::routing` so it doesn't pull in the auth crate's
+/// `Principal` token surface — readers convert their own principal type
+/// into a class-level boolean before calling the authorizer.
+///
+/// `auth::Principal` and `domain::PrincipalClass` both implement this;
+/// readers that already know they're operator-trusted can pass `&true`
+/// (impl on bool below).
+pub trait PrincipalClassDebugRoutingHook {
+    fn is_operator_with_full_routing_evidence(&self) -> bool;
+}
+
+impl PrincipalClassDebugRoutingHook for bool {
+    fn is_operator_with_full_routing_evidence(&self) -> bool {
+        *self
+    }
+}
+
+impl PrincipalClassDebugRoutingHook for crate::PrincipalClass {
+    fn is_operator_with_full_routing_evidence(&self) -> bool {
+        matches!(self, crate::PrincipalClass::Operator)
+    }
+}
+
 /// Frozen hashes of all routing inputs for determinism verification.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InputSnapshotHashes {
@@ -259,6 +379,67 @@ pub enum ReviewRoutingMode {
 impl Default for ReviewRoutingMode {
     fn default() -> Self {
         Self::LegacyFixed
+    }
+}
+
+/// Env var name that operators set on the daemon to override every run's
+/// per-YAML routing mode. Used for emergency rollback and staged cutover.
+pub const ROUTING_MODE_OVERRIDE_ENV: &str = "CHAINWORKS_P060_ROUTING_MODE_OVERRIDE";
+
+/// Outcome of resolving the effective routing mode for a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectiveRoutingModeResolution {
+    /// No env override; the per-run mode applies.
+    UsedPerRunMode(ReviewRoutingMode),
+    /// Env override was present and parsed; it wins.
+    OverriddenByEnv {
+        from: ReviewRoutingMode,
+        to: ReviewRoutingMode,
+    },
+    /// Env override was present but unparseable; fell back to per-run mode.
+    OverrideUnrecognized {
+        raw: String,
+        per_run: ReviewRoutingMode,
+    },
+}
+
+impl EffectiveRoutingModeResolution {
+    /// The mode the orchestrator should actually use.
+    pub fn effective(&self) -> ReviewRoutingMode {
+        match self {
+            Self::UsedPerRunMode(mode) | Self::OverriddenByEnv { to: mode, .. } => mode.clone(),
+            Self::OverrideUnrecognized { per_run, .. } => per_run.clone(),
+        }
+    }
+}
+
+/// P060 Phase 3 / OPS-001 cutover feature flag: resolve the effective
+/// routing mode for a run, considering the per-run YAML setting and the
+/// daemon-level `CHAINWORKS_P060_ROUTING_MODE_OVERRIDE` env var.
+///
+/// The env var lets operators force every run into a specific mode for
+/// staged rollout (e.g. start at `legacy_fixed`, flip to `shadow_dynamic`
+/// for one release window, flip to `dynamic` for cutover, flip back to
+/// `legacy_fixed` for an emergency rollback).
+///
+/// Unrecognized env values are treated as no-override (with the caller
+/// expected to log a warning) so a typo can never leak credentials or
+/// crash the run.
+pub fn resolve_effective_routing_mode(
+    per_run_mode: &ReviewRoutingMode,
+) -> EffectiveRoutingModeResolution {
+    match std::env::var(ROUTING_MODE_OVERRIDE_ENV) {
+        Ok(raw) => match raw.parse::<ReviewRoutingMode>() {
+            Ok(override_mode) => EffectiveRoutingModeResolution::OverriddenByEnv {
+                from: per_run_mode.clone(),
+                to: override_mode,
+            },
+            Err(_) => EffectiveRoutingModeResolution::OverrideUnrecognized {
+                raw,
+                per_run: per_run_mode.clone(),
+            },
+        },
+        Err(_) => EffectiveRoutingModeResolution::UsedPerRunMode(per_run_mode.clone()),
     }
 }
 
@@ -450,6 +631,86 @@ mod tests {
         assert_eq!(terms.total(), 25);
     }
 
+    /// P060 Phase 3: prove the authorizer redacts evidence by default and
+    /// surfaces full fields only when explicitly granted Full.
+    #[test]
+    fn routing_evidence_projection_authorizer_default_is_redacted() {
+        let evidence = sample_evidence_ref();
+        let auth = RoutingEvidenceProjectionAuthorizer::default();
+        assert_eq!(
+            auth.projection(),
+            RoutingEvidenceProjection::Redacted,
+            "default authorizer must default-deny"
+        );
+        let projected = auth.project_ref(&evidence);
+        assert!(projected.normalized_value.is_none());
+        assert!(projected.path.is_none());
+        assert!(projected.symbol.is_none());
+        assert!(projected.span.is_none());
+        assert_eq!(projected.evidence_id, evidence.evidence_id);
+        assert_eq!(projected.hash, evidence.hash);
+    }
+
+    #[test]
+    fn routing_evidence_projection_authorizer_full_preserves_fields() {
+        let evidence = sample_evidence_ref();
+        let auth = RoutingEvidenceProjectionAuthorizer::full();
+        assert_eq!(auth.projection(), RoutingEvidenceProjection::Full);
+        let projected = auth.project_ref(&evidence);
+        assert_eq!(projected.normalized_value.as_deref(), Some("security"));
+        assert_eq!(projected.path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(projected.symbol.as_deref(), Some("validate_token"));
+        assert_eq!(projected.span.as_deref(), Some("10:15"));
+    }
+
+    /// Mutex for env-var-dependent tests so parallel test runs don't race
+    /// on the process-global `CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE`.
+    static ROUTING_EVIDENCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn routing_evidence_projection_authorizer_redacts_for_non_operators() {
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE", "1");
+        let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
+            &crate::PrincipalClass::Agent,
+        );
+        std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
+        assert_eq!(auth.projection(), RoutingEvidenceProjection::Redacted);
+    }
+
+    #[test]
+    fn routing_evidence_projection_authorizer_requires_env_for_operator() {
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
+        let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
+            &crate::PrincipalClass::Operator,
+        );
+        assert_eq!(auth.projection(), RoutingEvidenceProjection::Redacted);
+    }
+
+    #[test]
+    fn routing_evidence_projection_authorizer_grants_operator_with_env() {
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE", "1");
+        let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
+            &crate::PrincipalClass::Operator,
+        );
+        std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
+        assert_eq!(auth.projection(), RoutingEvidenceProjection::Full);
+    }
+
+    fn sample_evidence_ref() -> RoutingEvidenceRef {
+        RoutingEvidenceRef {
+            evidence_id: "e1".into(),
+            evidence_type: "keyword".into(),
+            hash: "abc123".into(),
+            normalized_value: Some("security".into()),
+            path: Some("src/auth.rs".into()),
+            symbol: Some("validate_token".into()),
+            span: Some("10:15".into()),
+        }
+    }
+
     #[test]
     fn routing_evidence_redacted_drops_raw_fields() {
         let evidence = RoutingEvidenceRef {
@@ -481,6 +742,63 @@ mod tests {
         ] {
             let s2: SystemExecutionStatus = s.to_string().parse().unwrap();
             assert_eq!(s, &s2);
+        }
+    }
+
+    /// P060 Phase 3 / OPS-001: feature-flag cutover resolver.
+    static ROUTING_MODE_OVERRIDE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_effective_routing_mode_no_env_returns_per_run_mode() {
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
+        let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
+        assert_eq!(res.effective(), ReviewRoutingMode::Dynamic);
+        assert!(matches!(
+            res,
+            EffectiveRoutingModeResolution::UsedPerRunMode(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_effective_routing_mode_env_legacy_overrides_dynamic() {
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "legacy_fixed");
+        let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
+        std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
+        assert_eq!(res.effective(), ReviewRoutingMode::LegacyFixed);
+        assert!(matches!(
+            res,
+            EffectiveRoutingModeResolution::OverriddenByEnv {
+                from: ReviewRoutingMode::Dynamic,
+                to: ReviewRoutingMode::LegacyFixed,
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_effective_routing_mode_env_shadow_overrides_legacy() {
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "shadow_dynamic");
+        let res = resolve_effective_routing_mode(&ReviewRoutingMode::LegacyFixed);
+        std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
+        assert_eq!(res.effective(), ReviewRoutingMode::ShadowDynamic);
+    }
+
+    #[test]
+    fn resolve_effective_routing_mode_unrecognized_env_falls_back_to_per_run() {
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "totally_made_up");
+        let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
+        std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
+        // Falls back to per-run; effective() returns the per-run mode.
+        assert_eq!(res.effective(), ReviewRoutingMode::Dynamic);
+        match res {
+            EffectiveRoutingModeResolution::OverrideUnrecognized { raw, per_run } => {
+                assert_eq!(raw, "totally_made_up");
+                assert_eq!(per_run, ReviewRoutingMode::Dynamic);
+            }
+            other => panic!("expected OverrideUnrecognized, got {other:?}"),
         }
     }
 
