@@ -298,6 +298,14 @@ impl McpServer {
                     );
                 };
 
+                if !tools::p064_operator_tool_enabled(&tool_name) {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        format!("Method not found: {tool_name}"),
+                    );
+                }
+
                 if !principal.tool_capabilities.contains(&tool_id) {
                     return JsonRpcResponse::error(
                         id,
@@ -378,6 +386,7 @@ impl McpServer {
         let ids = tools::all_capability_tool_ids();
         auth::filter_tools(principal, &ids)
             .into_iter()
+            .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(tools::mcp_tool_for)
             .collect()
     }
@@ -840,6 +849,7 @@ mod p029_capability_tests {
         let ids = tools::all_capability_tool_ids();
         auth::filter_tools(principal, &ids)
             .into_iter()
+            .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(|id| tools::mcp_tool_for(id).name)
             .collect()
     }
@@ -855,6 +865,9 @@ mod p029_capability_tests {
     /// returns `true` iff the call would be allowed, `false` iff it would
     /// return `-32601 Method not found`.
     fn tools_call_allowed(principal: &Principal, tool_name: &str) -> bool {
+        if !tools::p064_operator_tool_enabled(tool_name) {
+            return false;
+        }
         let Some(id) = tools::capability_id_for(tool_name) else {
             return false;
         };
@@ -913,6 +926,12 @@ mod p029_capability_tests {
             assert!(names.contains(expected), "agent missing {expected}");
         }
         for forbidden in [
+            "runs.main_sync.request",
+            "runs.main_sync.retry",
+            "runs.main_sync.set_override",
+            "runs.main_sync.repair_state",
+            "runs.main_sync.record_recovery_decision",
+            "runs.knowledge_capsule.ignore",
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
@@ -973,6 +992,8 @@ mod p029_capability_tests {
 
         // Unknown tool name also denied (capability_id_for returns None).
         let op = Principal::new("op", PrincipalClass::Operator);
+        assert!(!tools_call_allowed(&op, "runs.main_sync.request"));
+        assert!(!tools_call_allowed(&op, "runs.knowledge_capsule.ignore"));
         assert!(!tools_call_allowed(&op, "does.not.exist"));
     }
 

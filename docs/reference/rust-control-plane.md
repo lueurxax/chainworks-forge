@@ -140,7 +140,7 @@ Tools are namespaced:
 | Namespace | Tools |
 |---|---|
 | `ideas.*` | `ideas.create`, `ideas.list` |
-| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel` |
+| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore` |
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
 | `stages.*` | `stages.retry` |
 | `reports.*` | `reports.get` |
@@ -165,7 +165,30 @@ Resources follow two URI families:
 
 Implementation: `crates/mcp-server/src/server.rs` (dispatch and resource reads), `crates/mcp-server/src/tools/` (per-namespace handlers).
 
+## Worktree safety and mutation barrier (P064)
+
+The daemon implements a worktree-safety contract that protects implementation worktrees during concurrent access and main-sync operations.
+
+### Worktree access mode
+Every work item or system task declares its worktree access:
+- `none` — no worktree access.
+- `read` — read-only access (e.g. review agents).
+- `write` — write-enabled access (e.g. implementation agents).
+
+### Worktree mutation barrier
+The `WorktreeMutationBarrier` ensures that sensitive operations like `git merge` or `git archive` happen in isolation.
+- Active sync acquires an exclusive barrier.
+- While the barrier is active, the scheduler blocks new `read` and `write` work for the same worktree.
+- Existing consumers holding a lease must complete or expire before the barrier moves from `pending` to `active`.
+
+### Main sync and knowledge capsules
+- **Main Sync**: Orchestrated synchronization of local main into a run worktree with durable attempt history and conflict routing.
+- **Knowledge Capsules**: Compact cross-run knowledge emitted from completed runs, matched and injected into future runs to prevent repeat mistakes.
+
+Note: Main sync and knowledge capsule logic is currently in **Phase 0 contract freeze**.
+
 ## Workflow engine
+...
 
 ### Compilation
 
@@ -380,6 +403,11 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `lead_conflict_mediations` | Durable mediation lifecycle (id, run_id, conflict_id, status, lead_agent_id, settlement_result) |
 | `lead_mediation_confirmations` | Separate store for mediation confirmations (id, mediation_id, status, deadline_at, suggested_action) |
 | `workflow_conflict_metric_events` | Durable rollout metric events for workflow conflict recovery, mediation, Phase C validation, and dogfood decisions |
+| `main_sync_attempts` | P064: Lifecycle of worktree sync attempts (status, preservation commit, merge commit, results) |
+| `main_sync_conflict_files` | P064: Files that conflicted during a sync attempt |
+| `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |
+| `run_knowledge_capsule_match_keys` | P064: Search keys for capsule relevance matching (proposal id, artifact path, etc.) |
+| `run_knowledge_capsule_attachments` | P064: Links between matching capsules and an active run |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
@@ -500,6 +528,12 @@ The command handler at `crates/engine/src/command_handler.rs` processes eleven c
 | `RunStewardAnalysis` | Triggers a Steward system-health analysis. |
 | `OverrideArtifactContract` | Applies a manual operator override to an artifact contract's status. |
 | `ResolveLeadMediationConfirmation` | Resolves a lead mediation confirmation (P017 Phase B) via the engine-owned settlement boundary. |
+| `MainSyncRequest` | P064: Queue or dedupe a main-sync request (Phase 0 contract only). |
+| `MainSyncRetry` | P064: Retry a failed sync attempt (Phase 0 contract only). |
+| `MainSyncSetRunOverride` | P064: Set per-run main-sync mode override (Phase 0 contract only). |
+| `MainSyncRepairState` | P064: Reconcile sync state after failure (Phase 0 contract only). |
+| `MainSyncRecordRecoveryDecision` | P064: Record operator recovery decision (Phase 0 contract only). |
+| `KnowledgeCapsuleIgnore` | P064: Mark a capsule as ignored for the current run (Phase 0 contract only). |
 
 ## Recovery service
 

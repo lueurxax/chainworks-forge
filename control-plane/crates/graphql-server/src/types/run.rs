@@ -56,6 +56,8 @@ pub struct GqlRun {
     pub implementation_handoff_status_json: Option<Json<serde_json::Value>>,
     pub legacy_discovery_overrides_json: Option<String>,
     pub implementation_self_assessment_summary: Option<GqlImplementationSelfAssessmentSummary>,
+    pub main_sync_readback_json: Option<Json<serde_json::Value>>,
+    pub knowledge_capsule_readback_json: Option<Json<serde_json::Value>>,
 }
 
 impl From<Run> for GqlRun {
@@ -100,6 +102,8 @@ impl From<Run> for GqlRun {
             implementation_handoff_status_json: None,
             legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
+            main_sync_readback_json: None,
+            knowledge_capsule_readback_json: None,
         }
     }
 }
@@ -164,6 +168,8 @@ impl From<RunProjectionRow> for GqlRun {
             implementation_handoff_status_json: None,
             legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
+            main_sync_readback_json: None,
+            knowledge_capsule_readback_json: None,
         }
     }
 }

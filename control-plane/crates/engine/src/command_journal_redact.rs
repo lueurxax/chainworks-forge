@@ -27,6 +27,12 @@
 //! | `RejectStage`        | `comment`                      | **redact** |
 //! | `RetryStage`         | all fields                     | preserve   |
 //! | `OverrideLegacyDiscoveryPolicy` | all fields            | preserve   |
+//! | `MainSyncRequest`    | all fields                     | preserve   |
+//! | `MainSyncRetry`      | all fields                     | preserve   |
+//! | `MainSyncSetRunOverride` | all fields                 | preserve   |
+//! | `MainSyncRepairState` | all fields                    | preserve   |
+//! | `MainSyncRecordRecoveryDecision` | all fields          | preserve   |
+//! | `KnowledgeCapsuleIgnore` | all fields                 | preserve   |
 //! | `CancelRun`          | all fields                     | preserve   |
 //! | `ResetSession`       | all fields                     | preserve   |
 //! | `RunStewardAnalysis` | `reason`, `artifact_base`      | preserve   |
@@ -92,6 +98,24 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::OverrideLegacyDiscoveryPolicy(_) => {
             // P053: preserve typed override fields for operator audit.
         }
+        Command::MainSyncRequest(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncRetry(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncSetRunOverride(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncRepairState(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncRecordRecoveryDecision(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::KnowledgeCapsuleIgnore(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
         Command::CancelRun(_) => {
             // §8.1: preserve all fields.
         }
@@ -147,9 +171,12 @@ fn redact_field_if_present(obj: &mut serde_json::Map<String, Value>, field: &str
 mod tests {
     use super::*;
     use domain::commands::{
-        ApproveStageCmd, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
-        ResetSessionCmd, ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd,
-        RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+        ApproveStageCmd, CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
+        MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
+        MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
+        OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
+        ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+        RunStewardAnalysisCmd, StartRunCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -418,6 +445,39 @@ mod tests {
                 legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy::WorkflowOptIn,
                 legacy_discovery_override_reason: "operator override".into(),
             }),
+            Command::MainSyncRequest(MainSyncRequestCmd {
+                run_id: RunId::new(),
+                trigger_reason: MainSyncTriggerReason::BeforeReview,
+                idempotency_key: "run-1:before-review".into(),
+                requested_by_stage_id: Some("state_8".into()),
+                requested_by_work_item_id: Some("work-item-1".into()),
+            }),
+            Command::MainSyncRetry(MainSyncRetryCmd {
+                run_id: RunId::new(),
+                idempotency_key: "run-1:retry".into(),
+                failed_attempt_id: Some("attempt-1".into()),
+                reason: Some("operator retry".into()),
+            }),
+            Command::MainSyncSetRunOverride(MainSyncSetRunOverrideCmd {
+                run_id: RunId::new(),
+                mode: MainSyncMode::ManualOnly,
+                reason: "freeze automatic sync".into(),
+            }),
+            Command::MainSyncRepairState(MainSyncRepairStateCmd {
+                run_id: RunId::new(),
+                attempt_id: Some("attempt-1".into()),
+                recovery_note: Some("repair barrier lease".into()),
+            }),
+            Command::MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd {
+                run_id: RunId::new(),
+                decision: MainSyncRecoveryDecision::RetrySync,
+                summary: "retry after repair".into(),
+            }),
+            Command::KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd {
+                run_id: RunId::new(),
+                capsule_id: "capsule-1".into(),
+                reason: "irrelevant to current subsystem".into(),
+            }),
             Command::CancelRun(CancelRunCmd {
                 run_id: RunId::new(),
             }),
@@ -460,6 +520,12 @@ mod tests {
                 Command::RetryStage(_) => {}
                 Command::ResolveWorkflowConflictTransition(_) => {}
                 Command::OverrideLegacyDiscoveryPolicy(_) => {}
+                Command::MainSyncRequest(_) => {}
+                Command::MainSyncRetry(_) => {}
+                Command::MainSyncSetRunOverride(_) => {}
+                Command::MainSyncRepairState(_) => {}
+                Command::MainSyncRecordRecoveryDecision(_) => {}
+                Command::KnowledgeCapsuleIgnore(_) => {}
                 Command::CancelRun(_) => {}
                 Command::ResetSession(_) => {}
                 Command::RunStewardAnalysis(_) => {}
