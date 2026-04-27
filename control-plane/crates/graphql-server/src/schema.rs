@@ -1881,6 +1881,11 @@ mod tests {
                 owner_id: None,
                 lead_mediation_record_id: None,
                 origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
             },
         )
         .await
@@ -2507,6 +2512,11 @@ mod tests {
             owner_id: Some(mediation_id.into()),
             lead_mediation_record_id: Some(mediation_id.into()),
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)

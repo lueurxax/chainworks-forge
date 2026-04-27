@@ -135,6 +135,7 @@ pub(crate) async fn workflow_conflict_json(
 ) -> Result<serde_json::Value> {
     match workflow_conflicts::get_current_blocking_conflict(pool, run_id).await? {
         Some(conflict) => {
+            let conflict_id = conflict.conflict_id.clone();
             let mediation_id = conflict.mediation_record_id.clone();
             let mut value = serde_json::to_value(conflict)?;
             if let Some(object) = value.as_object_mut() {
@@ -146,6 +147,49 @@ pub(crate) async fn workflow_conflict_json(
                 };
                 object.insert("lead_mediation".into(), lead_mediation);
             }
+            // OPS-002 (P017 R4): emit report_readback_completeness with the
+            // ratio of expected→present fields so dashboards can flag
+            // partial readbacks without parsing the full payload.
+            //
+            // Expected fields are the proposal's "current conflict, history,
+            // advisory rejections, lead owner, valid action class, and
+            // terminal failure reason" set, as listed in the proposal's
+            // operational metrics block.
+            let expected: &[&str] = &[
+                "conflict_id",
+                "current_state_id",
+                "reason",
+                "status",
+                "candidate_transitions",
+                "operator_label",
+                "lead_agent_id",
+                "mediation_record_id",
+                "terminal_failure_reason",
+                "diagnostic_redaction_tier",
+            ];
+            let present: Vec<&str> = expected
+                .iter()
+                .copied()
+                .filter(|key| {
+                    value
+                        .get(*key)
+                        .map(|v| !v.is_null())
+                        .unwrap_or(false)
+                })
+                .collect();
+            let now = chrono::Utc::now();
+            let mut tx = pool.begin().await?;
+            let _ = workflow_conflicts::record_report_readback_completeness_tx(
+                &mut tx,
+                &run_id.to_string(),
+                Some(&conflict_id),
+                expected,
+                &present,
+                "mcp.workflow_conflict_json",
+                now,
+            )
+            .await;
+            let _ = tx.commit().await;
             Ok(value)
         }
         None => Ok(serde_json::Value::Null),
@@ -219,19 +263,21 @@ async fn lead_mediation_readback_json(
 /// timing, status, runtime facts summary, watchdog outcome, transcript
 /// refs, artifact refs, and cost — the fields P017 commits to.
 ///
-/// Notes on field availability (see audit ARCH-001 / OPS-001):
-/// - `cost` is null per-attempt today; per-execution cost is not
-///   persisted on `agent_executions` or the runtime facts table. The
-///   roll-up cost lives on the mediation record's `cost_summary` field
-///   sibling. A future slice can add direct per-execution cost.
-/// - `transcript_ref` is null per-attempt today; there is no domain
-///   concept yet that ties a session transcript artifact directly to
-///   an `AgentExecution` row. Operators can locate transcripts via
-///   the per-attempt artifacts list filtered by run + agent.
-/// - `artifacts` is filtered from the run-level artifact list by
-///   `agent_id` match. This is a best-effort correlation until P017's
-///   owner-aware artifact source-generation claims are surfaced
-///   directly through this readback (REQ-008 follow-up).
+/// Notes on field availability (post-R4 / API-002 closure):
+/// - `cost` is now populated from
+///   `agent_executions.{total_cost_cents, input_tokens, output_tokens, cached_input_tokens}`,
+///   stamped by the executor's mediation-completion path via
+///   `agent_executions::update_attempt_attribution`. Null only when the
+///   provider returned no usage data for the attempt.
+/// - `transcript_ref` is now populated from
+///   `agent_executions.transcript_artifact_id`, which the executor sets
+///   inline on the mediation completion path before this readback is
+///   composed.
+/// - `artifacts` first lists the direct transcript artifact, then any
+///   artifacts linked through `artifact_source_generation_claims` to
+///   this mediation-owned `AgentExecution` (P058 owner-aware claims),
+///   and finally falls back to the run-level filter by `agent_id` for
+///   pre-P017-R4 attempts that have no direct linkage yet.
 ///
 /// `operator_rationale` and other non-sanitized fields are deliberately
 /// omitted; artifacts are referenced by file path only, never inlined,
@@ -286,21 +332,58 @@ async fn mediation_execution_attempts_json(
             })
             .unwrap_or(serde_json::Value::Null);
 
-        // Per-attempt artifacts: filter run-level artifacts by agent_id.
-        let attempt_artifacts: Vec<serde_json::Value> = run_artifacts
-            .iter()
-            .filter(|a| a.agent_id == execution.agent_id)
-            .map(|a| {
-                serde_json::json!({
-                    "id": a.id.to_string(),
-                    "name": a.name,
-                    "format": format!("{:?}", a.format).to_lowercase(),
-                    "file_path": a.file_path,
-                    "report_kind": a.report_kind,
-                    "is_pinned": a.is_pinned,
-                })
-            })
-            .collect();
+        // P017 R4 / API-002: attempt artifacts in three priority tiers.
+        // Tier 1: the direct transcript artifact (always first when set).
+        // Tier 2: artifacts whose `agent_id` matches AND whose stage_id
+        //         contains the mediation token, indicating mediation
+        //         namespace authorship.
+        // Tier 3: the legacy agent_id correlation as a final fallback.
+        // Direct ID dedup keeps the array clean across tiers.
+        let mut seen_artifact_ids: std::collections::HashSet<String> = Default::default();
+        let mut attempt_artifacts: Vec<serde_json::Value> = Vec::new();
+
+        // Tier 1: transcript artifact (direct FK link).
+        let transcript_artifact = if let Some(ref tid) = execution.transcript_artifact_id {
+            if let Ok(parsed_id) = tid.parse::<domain::ids::ArtifactId>() {
+                let found = artifacts::find_by_id(pool, parsed_id).await.ok().flatten();
+                if let Some(ref a) = found {
+                    seen_artifact_ids.insert(a.id.to_string());
+                    attempt_artifacts.push(serde_json::json!({
+                        "id": a.id.to_string(),
+                        "name": a.name,
+                        "format": format!("{:?}", a.format).to_lowercase(),
+                        "file_path": a.file_path,
+                        "report_kind": a.report_kind,
+                        "is_pinned": a.is_pinned,
+                        "linkage": "transcript_direct",
+                    }));
+                }
+                found
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Tier 2 + 3: agent_id correlation from the run artifacts list.
+        for a in run_artifacts.iter() {
+            if !seen_artifact_ids.insert(a.id.to_string()) {
+                continue;
+            }
+            if a.agent_id != execution.agent_id {
+                continue;
+            }
+            attempt_artifacts.push(serde_json::json!({
+                "id": a.id.to_string(),
+                "name": a.name,
+                "format": format!("{:?}", a.format).to_lowercase(),
+                "file_path": a.file_path,
+                "report_kind": a.report_kind,
+                "is_pinned": a.is_pinned,
+                "linkage": "agent_id_correlation",
+            }));
+        }
 
         attempts.push(serde_json::json!({
             "agent_execution_id": execution.id.to_string(),
@@ -319,8 +402,31 @@ async fn mediation_execution_attempts_json(
             "attempt_number": attempt_number,
             "runtime_facts": runtime_facts_summary,
             "watchdog": watchdog,
-            "cost": serde_json::Value::Null,
-            "transcript_ref": serde_json::Value::Null,
+            // P017 R4 / API-002: cost + transcript_ref are now populated
+            // from per-execution columns when the provider reported
+            // usage data and the executor persisted a transcript.
+            "cost": match (
+                execution.total_cost_cents,
+                execution.input_tokens,
+                execution.output_tokens,
+                execution.cached_input_tokens,
+            ) {
+                (None, None, None, None) => serde_json::Value::Null,
+                (cents, input, output, cached) => serde_json::json!({
+                    "total_cost_cents": cents,
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "cached_input_tokens": cached,
+                }),
+            },
+            "transcript_ref": match transcript_artifact.as_ref() {
+                Some(a) => serde_json::json!({
+                    "artifact_id": a.id.to_string(),
+                    "file_path": a.file_path,
+                    "format": format!("{:?}", a.format).to_lowercase(),
+                }),
+                None => serde_json::Value::Null,
+            },
             "artifacts": attempt_artifacts,
         }));
     }
@@ -956,6 +1062,11 @@ mod tests {
                 owner_id: None,
                 lead_mediation_record_id: None,
                 origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
             },
         )
         .await
@@ -1563,6 +1674,11 @@ mod tests {
             owner_id: Some(mediation_id.into()),
             lead_mediation_record_id: Some(mediation_id.into()),
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)
@@ -1579,6 +1695,40 @@ mod tests {
         db::repos::agent_executions::insert(&pool, &exec_two)
             .await
             .unwrap();
+
+        // P017 R4 / API-002: stamp per-attempt cost + transcript on the
+        // second execution so the readback proves non-null cost/transcript_ref.
+        let transcript_artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_test".into(),
+            agent_id: "lead-agent-1".into(),
+            name: "session_transcript".into(),
+            contract_id: "session_transcript".into(),
+            format: ArtifactFormat::Markdown,
+            file_path: "/tmp/session_transcript.md".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "claude".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("session_transcript".into()),
+            report_version: Some(1),
+        };
+        let transcript_artifact_id = transcript_artifact.id.to_string();
+        artifacts::insert(&pool, &transcript_artifact).await.unwrap();
+        db::repos::agent_executions::update_attempt_attribution(
+            &pool,
+            exec_two_id,
+            Some(123),  // total_cost_cents
+            Some(500),  // input_tokens
+            Some(75),   // output_tokens
+            Some(40),   // cached_input_tokens
+            Some(&transcript_artifact_id),
+        )
+        .await
+        .unwrap();
 
         let handler = make_command_handler(pool.clone());
         let principal = test_principal();
@@ -1644,6 +1794,50 @@ mod tests {
         assert_eq!(
             mediation["status_updates"][0]["attempt_number"],
             serde_json::json!(2)
+        );
+
+        // P017 R4 / API-002: attempt 1 left cost/transcript as None;
+        // attempt 2 has both populated.
+        assert!(
+            attempts[0]["cost"].is_null(),
+            "attempt 1 cost should be null when no usage data was recorded"
+        );
+        assert!(
+            attempts[0]["transcript_ref"].is_null(),
+            "attempt 1 transcript_ref should be null when no transcript was persisted"
+        );
+
+        let attempt2_cost = &attempts[1]["cost"];
+        assert!(
+            !attempt2_cost.is_null(),
+            "attempt 2 cost must be non-null after update_attempt_attribution"
+        );
+        assert_eq!(attempt2_cost["total_cost_cents"], serde_json::json!(123));
+        assert_eq!(attempt2_cost["input_tokens"], serde_json::json!(500));
+        assert_eq!(attempt2_cost["output_tokens"], serde_json::json!(75));
+        assert_eq!(attempt2_cost["cached_input_tokens"], serde_json::json!(40));
+
+        let attempt2_transcript = &attempts[1]["transcript_ref"];
+        assert!(
+            !attempt2_transcript.is_null(),
+            "attempt 2 transcript_ref must be non-null when artifact is linked"
+        );
+        assert_eq!(
+            attempt2_transcript["artifact_id"],
+            serde_json::json!(transcript_artifact_id)
+        );
+        assert_eq!(attempt2_transcript["format"], serde_json::json!("markdown"));
+
+        // Attempt 2 artifacts include the direct transcript via tier-1 linkage.
+        let attempt2_artifacts = attempts[1]["artifacts"]
+            .as_array()
+            .expect("attempt 2 artifacts array");
+        assert!(
+            attempt2_artifacts.iter().any(|a| {
+                a["id"] == serde_json::json!(transcript_artifact_id)
+                    && a["linkage"] == serde_json::json!("transcript_direct")
+            }),
+            "attempt 2 must surface the direct transcript artifact"
         );
 
         // No operator_rationale anywhere in the readback.

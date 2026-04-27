@@ -371,18 +371,75 @@ async fn build_mediation_execution_attempts(
                 "retry_after": f.retry_after.map(|t| t.to_rfc3339()),
             }))
         });
-        let artifact_refs: Vec<GqlMediationAttemptArtifact> = run_artifacts
-            .iter()
-            .filter(|a| a.agent_id == execution.agent_id)
-            .map(|a| GqlMediationAttemptArtifact {
+        // P017 R4 / API-002: artifacts in tiered priority — direct
+        // transcript artifact first, then agent_id correlation as a
+        // fallback. Direct ID dedup keeps the array clean across tiers.
+        let mut seen_artifact_ids: std::collections::HashSet<String> = Default::default();
+        let mut artifact_refs: Vec<GqlMediationAttemptArtifact> = Vec::new();
+        let transcript_artifact = if let Some(ref tid) = execution.transcript_artifact_id {
+            if let Ok(parsed_id) = tid.parse::<domain::ids::ArtifactId>() {
+                let found = db::repos::artifacts::find_by_id(pool, parsed_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(ref a) = found {
+                    seen_artifact_ids.insert(a.id.to_string());
+                    artifact_refs.push(GqlMediationAttemptArtifact {
+                        id: ID(a.id.to_string()),
+                        name: a.name.clone(),
+                        format: format!("{:?}", a.format).to_lowercase(),
+                        file_path: a.file_path.clone(),
+                        report_kind: a.report_kind.clone(),
+                        is_pinned: a.is_pinned,
+                    });
+                }
+                found
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        for a in run_artifacts.iter() {
+            if !seen_artifact_ids.insert(a.id.to_string()) {
+                continue;
+            }
+            if a.agent_id != execution.agent_id {
+                continue;
+            }
+            artifact_refs.push(GqlMediationAttemptArtifact {
                 id: ID(a.id.to_string()),
                 name: a.name.clone(),
                 format: format!("{:?}", a.format).to_lowercase(),
                 file_path: a.file_path.clone(),
                 report_kind: a.report_kind.clone(),
                 is_pinned: a.is_pinned,
-            })
-            .collect();
+            });
+        }
+
+        // P017 R4 / API-002: cost + transcript_ref now populated from
+        // per-execution columns when present.
+        let cost_json = match (
+            execution.total_cost_cents,
+            execution.input_tokens,
+            execution.output_tokens,
+            execution.cached_input_tokens,
+        ) {
+            (None, None, None, None) => None,
+            (cents, input, output, cached) => Some(Json(serde_json::json!({
+                "total_cost_cents": cents,
+                "input_tokens": input,
+                "output_tokens": output,
+                "cached_input_tokens": cached,
+            }))),
+        };
+        let transcript_json = transcript_artifact.as_ref().map(|a| {
+            Json(serde_json::json!({
+                "artifact_id": a.id.to_string(),
+                "file_path": a.file_path,
+                "format": format!("{:?}", a.format).to_lowercase(),
+            }))
+        });
 
         attempts.push(GqlMediationExecutionAttempt {
             agent_execution_id: ID(execution.id.to_string()),
@@ -405,8 +462,8 @@ async fn build_mediation_execution_attempts(
             attempt_number,
             runtime_facts: runtime_facts_json,
             watchdog: watchdog_json,
-            cost: None,
-            transcript_ref: None,
+            cost: cost_json,
+            transcript_ref: transcript_json,
             artifacts: artifact_refs,
         });
     }

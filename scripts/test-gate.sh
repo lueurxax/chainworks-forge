@@ -1939,6 +1939,68 @@ PY
       die "P017 OPS-001: external_catalog_warning_total has no production caller in command_handler.rs"
     fi
 
+    # ── R4 closure guards (API-002 + OPS-002) ──────────────────────────
+    # API-002: per-attempt cost + transcript_ref populated by executor.
+    if ! grep -q "update_attempt_attribution" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R4 API-002: executor must call update_attempt_attribution for mediation completions"
+    fi
+    if ! grep -q "p017_per_attempt_cost_and_transcript_persisted" \
+        "$ROOT_DIR/control-plane/crates/db/tests/proposal_017_workflow_conflict_persistence.rs"; then
+      die "P017 R4 API-002: missing per-attempt cost+transcript persistence test"
+    fi
+    P017_R4_MIGRATION="$ROOT_DIR/control-plane/crates/db/migrations/031_p017_metric_inventory_and_attempt_attribution.sql"
+    if [[ ! -f "$P017_R4_MIGRATION" ]]; then
+      die "P017 R4 API-002/OPS-002: missing migration 031_p017_metric_inventory_and_attempt_attribution.sql"
+    fi
+    for col in transcript_artifact_id total_cost_cents input_tokens output_tokens; do
+      if ! grep -q "$col" "$P017_R4_MIGRATION"; then
+        die "P017 R4 API-002: migration 031 must add $col column"
+      fi
+    done
+
+    # OPS-002: 6 new metric helpers (5 audit-named + Phase C fail path).
+    P017_R4_HELPERS=(
+      "record_phase_c_validation_failure_tx"
+      "record_duplicate_mediation_session_tx"
+      "record_report_readback_completeness_tx"
+      "record_phase_c_lead_inventory_external_catalog_tx"
+      "record_mediation_late_output_ignored_tx"
+      "record_mediation_retry_budget_exhausted_tx"
+    )
+    for h in "${P017_R4_HELPERS[@]}"; do
+      if ! grep -q "$h" "$ROOT_DIR/control-plane/crates/db/src/repos/workflow_conflicts.rs"; then
+        die "P017 R4 OPS-002: missing helper $h in workflow_conflicts.rs"
+      fi
+    done
+    P017_R4_TESTS=(
+      "p017_phase_c_validation_failure_metric_emits_without_run"
+      "p017_duplicate_mediation_session_metric_emits"
+      "p017_report_readback_completeness_metric_emits"
+      "p017_phase_c_lead_inventory_external_catalog_metric_emits"
+      "p017_mediation_late_output_ignored_metric_emits"
+    )
+    for t in "${P017_R4_TESTS[@]}"; do
+      if ! grep -q "$t" "$OPS_001_DB_PATH"; then
+        die "P017 R4 OPS-002: missing metric emit test $t"
+      fi
+    done
+    # Production callers for the new emissions.
+    if ! grep -q "record_phase_c_validation_failure" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R4 OPS-002: phase_c_validation_outcome_total fail path has no production caller"
+    fi
+    if ! grep -q "record_phase_c_lead_inventory_external_catalog_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R4 OPS-002: phase_c_lead_inventory_external_catalog_total has no production caller"
+    fi
+    if ! grep -q "record_duplicate_mediation_session_tx" "$ROOT_DIR/control-plane/crates/engine/src/orchestrator.rs"; then
+      die "P017 R4 OPS-002: duplicate_mediation_session_total has no production caller"
+    fi
+    if ! grep -q "record_report_readback_completeness_tx" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 R4 OPS-002: report_readback_completeness has no production caller"
+    fi
+    if ! grep -q "record_mediation_late_output_ignored_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R4 OPS-002: mediation_late_output_ignored_total has no production caller"
+    fi
+
     log "Proposal 017 gate passed"
     ;;
   proposal-018|p018)

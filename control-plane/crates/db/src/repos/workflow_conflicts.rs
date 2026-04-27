@@ -12,7 +12,10 @@ use domain::workflow_conflict::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowConflictMetricEvent {
     pub event_id: String,
-    pub run_id: String,
+    /// Owning run id. Nullable since migration 031 to support
+    /// daemon-level events that fire before a run row exists (e.g.
+    /// Phase C compile-fail outcome).
+    pub run_id: Option<String>,
     pub conflict_id: Option<String>,
     pub metric_name: String,
     pub labels_json: serde_json::Value,
@@ -326,7 +329,7 @@ pub async fn record_recovery_action_chosen_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: conflict.run_id.clone(),
+            run_id: Some(conflict.run_id.clone()),
             conflict_id: Some(conflict.conflict_id.clone()),
             metric_name: "recovery_action_chosen_total".to_string(),
             labels_json: serde_json::json!({
@@ -354,7 +357,7 @@ pub async fn record_phase_c_validation_outcome_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             conflict_id: None,
             metric_name: "phase_c_validation_outcome_total".to_string(),
             labels_json: serde_json::json!({
@@ -397,7 +400,7 @@ pub async fn record_lead_mediation_attempt_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             conflict_id: conflict_id.map(|s| s.to_string()),
             metric_name: "lead_mediation_attempt_total".to_string(),
             labels_json: serde_json::json!({
@@ -436,13 +439,227 @@ pub async fn record_external_catalog_warning_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             conflict_id: None,
             metric_name: "external_catalog_warning_total".to_string(),
             labels_json: serde_json::json!({
                 "warning_kind": warning_kind,
                 "decision": decision,
                 "source_surface": source_surface,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002 (P017 R4 audit): emit `phase_c_validation_outcome_total` for
+/// the **fail-closed compile** path. Run id is None because this fires
+/// when `workflow::compiler::compile()` returns Err and the run row
+/// never gets inserted.
+///
+/// Migration 031 made `workflow_conflict_metric_events.run_id` NULL-able
+/// specifically to support this daemon-level event without an FK
+/// violation.
+pub async fn record_phase_c_validation_failure_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    failure_kind: &str,
+    workflow_path: Option<&str>,
+    catalog_path: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: None,
+            conflict_id: None,
+            metric_name: "phase_c_validation_outcome_total".to_string(),
+            labels_json: serde_json::json!({
+                "outcome": "fail",
+                "source": "compile",
+                "failure_kind": failure_kind,
+                "workflow_path": workflow_path,
+                "catalog_path": catalog_path,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+pub async fn record_phase_c_validation_failure(
+    pool: &SqlitePool,
+    failure_kind: &str,
+    workflow_path: Option<&str>,
+    catalog_path: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    record_phase_c_validation_failure_tx(
+        &mut tx, failure_kind, workflow_path, catalog_path, occurred_at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// OPS-002: emit `duplicate_mediation_session_total` when the
+/// orchestrator finds an existing active mediation while attempting to
+/// create a new one for the same conflict (resume idempotency).
+pub async fn record_duplicate_mediation_session_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: &str,
+    mediation_record_id: &str,
+    detection_source: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: Some(conflict_id.to_string()),
+            metric_name: "duplicate_mediation_session_total".to_string(),
+            labels_json: serde_json::json!({
+                "mediation_record_id": mediation_record_id,
+                "detection_source": detection_source,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `report_readback_completeness` to record whether a
+/// composed `workflow_conflict` readback exposes all expected fields
+/// (current conflict, history, advisory rejections, lead owner, valid
+/// action class, terminal failure reason) for a given run.
+///
+/// `value` is a ratio in [0, 1] — fraction of expected fields present.
+pub async fn record_report_readback_completeness_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: Option<&str>,
+    expected_fields: &[&str],
+    present_fields: &[&str],
+    surface: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let ratio = if expected_fields.is_empty() {
+        1.0
+    } else {
+        present_fields.len() as f64 / expected_fields.len() as f64
+    };
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: conflict_id.map(|s| s.to_string()),
+            metric_name: "report_readback_completeness".to_string(),
+            labels_json: serde_json::json!({
+                "surface": surface,
+                "expected_fields": expected_fields,
+                "present_fields": present_fields,
+            }),
+            value: ratio,
+            unit: "ratio".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `phase_c_lead_inventory_external_catalog_total` when the
+/// daemon evaluates an executable catalog's external-catalog inventory
+/// and reaches an enforcement decision.
+pub async fn record_phase_c_lead_inventory_external_catalog_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: Option<&str>,
+    inventory_result: &str,
+    enforcement_decision: &str,
+    catalog_path: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.map(|s| s.to_string()),
+            conflict_id: None,
+            metric_name: "phase_c_lead_inventory_external_catalog_total".to_string(),
+            labels_json: serde_json::json!({
+                "inventory_result": inventory_result,
+                "enforcement_decision": enforcement_decision,
+                "catalog_path": catalog_path,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `mediation_late_output_ignored_total` when a mediation
+/// completion arrives after the mediation is already terminal and the
+/// late output is ignored.
+pub async fn record_mediation_late_output_ignored_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: Option<&str>,
+    mediation_record_id: &str,
+    reason: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: conflict_id.map(|s| s.to_string()),
+            metric_name: "mediation_late_output_ignored_total".to_string(),
+            labels_json: serde_json::json!({
+                "mediation_record_id": mediation_record_id,
+                "reason": reason,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `mediation_retry_budget_exhausted_total` when an
+/// owner-aware retry budget for a mediation is exhausted.
+pub async fn record_mediation_retry_budget_exhausted_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    mediation_record_id: &str,
+    provider_profile_id: Option<&str>,
+    conflict_reason: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "mediation_retry_budget_exhausted_total".to_string(),
+            labels_json: serde_json::json!({
+                "mediation_record_id": mediation_record_id,
+                "provider_profile_id": provider_profile_id,
+                "conflict_reason": conflict_reason,
             }),
             value: 1.0,
             unit: "count".to_string(),
@@ -714,7 +931,7 @@ async fn record_terminal_metric_events_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: record.run_id.clone(),
+            run_id: Some(record.run_id.clone()),
             conflict_id: Some(record.conflict_id.clone()),
             metric_name: "workflow_conflict_time_to_resolution_seconds".to_string(),
             labels_json: serde_json::json!({
@@ -732,7 +949,7 @@ async fn record_terminal_metric_events_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: record.run_id.clone(),
+            run_id: Some(record.run_id.clone()),
             conflict_id: Some(record.conflict_id.clone()),
             metric_name: "conflict_reason_to_action_outcome_total".to_string(),
             labels_json: serde_json::json!({

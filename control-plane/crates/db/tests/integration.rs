@@ -189,6 +189,11 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
@@ -232,6 +237,11 @@ async fn p017_mediation_owned_agent_execution_does_not_require_stage_execution()
         owner_id: Some("mediation-001".into()),
         lead_mediation_record_id: Some("mediation-001".into()),
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
 
     agent_executions::insert(&pool, &execution)
@@ -289,6 +299,11 @@ async fn p017_mediation_owned_retry_budget_and_artifact_claims_are_owner_keyed()
         owner_id: Some("mediation-claim-001".into()),
         lead_mediation_record_id: Some("mediation-claim-001".into()),
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -852,6 +867,11 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1002,6 +1022,11 @@ async fn proposal_048_persistence_fields_round_trip() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1158,6 +1183,11 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1573,6 +1603,11 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -1607,6 +1642,11 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await

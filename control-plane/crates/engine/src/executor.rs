@@ -531,6 +531,11 @@ async fn claim_invoke_agent_work_item_with_start(
             owner_id: Some(stage_execution_id.to_string()),
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await?;
@@ -3238,6 +3243,14 @@ impl BackgroundExecutor {
                         },
                         lead_mediation_record_id: mediation_record_id.clone(),
                         origin_stage_execution_id: origin_stage_execution_id.clone(),
+                        // P017 R4 / API-002: cost & transcript filled in by
+                        // update_attempt_attribution_tx after the provider
+                        // returns; insertion-time row holds None.
+                        total_cost_cents: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                        transcript_artifact_id: None,
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
                 }
@@ -3726,6 +3739,23 @@ impl BackgroundExecutor {
                         completed_at,
                     )
                     .await?;
+                    // OPS-002 (P017 R4): emit mediation_late_output_ignored_total
+                    // per ignored late output so dashboards can detect
+                    // unexpected provider lag against superseded/canceled
+                    // mediations.
+                    if let Some(ref med_id) = mediation_record_id {
+                        let mut metric_tx = self.pool.begin().await?;
+                        let _ = db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
+                            &mut metric_tx,
+                            &run_id.to_string(),
+                            None,
+                            med_id,
+                            "mediation_terminal_or_missing",
+                            completed_at,
+                        )
+                        .await;
+                        let _ = metric_tx.commit().await;
+                    }
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     return Ok(());
                 }
@@ -3787,6 +3817,23 @@ impl BackgroundExecutor {
                         completed_at,
                     )
                     .await?;
+                    // OPS-002 (P017 R4): emit mediation_late_output_ignored_total
+                    // per ignored late output so dashboards can detect
+                    // unexpected provider lag against superseded/canceled
+                    // mediations.
+                    if let Some(ref med_id) = mediation_record_id {
+                        let mut metric_tx = self.pool.begin().await?;
+                        let _ = db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
+                            &mut metric_tx,
+                            &run_id.to_string(),
+                            None,
+                            med_id,
+                            "mediation_terminal_or_missing",
+                            completed_at,
+                        )
+                        .await;
+                        let _ = metric_tx.commit().await;
+                    }
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     return Ok(());
                 }
@@ -4084,6 +4131,59 @@ impl BackgroundExecutor {
                         completed_at,
                     )
                     .await?;
+                    // P017 R4 / API-002: persist per-attempt cost +
+                    // transcript attribution so MCP/GraphQL
+                    // `execution_attempts.cost` and `transcript_ref` are
+                    // populated. The transcript artifact (if persisted by
+                    // `persist_transcript_artifact_if_present` lower in
+                    // this function) is captured in
+                    // `mediation_transcript_artifact_id` below; for the
+                    // mediation branch we persist the transcript inline
+                    // so we can attribute it directly here without a
+                    // round-trip lookup.
+                    let mediation_transcript_artifact = self
+                        .persist_transcript_artifact_if_present(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            agent_exec_id,
+                            completed_at,
+                            result.transcript_text.as_deref(),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                    let mediation_transcript_artifact_id = mediation_transcript_artifact
+                        .as_ref()
+                        .map(|artifact| artifact.id.to_string());
+                    let usage_cost_cents = result
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.cost_cents)
+                        .or(result.cost_cents);
+                    let usage_input_tokens = result.usage.as_ref().and_then(|u| u.input_tokens);
+                    let usage_output_tokens = result.usage.as_ref().and_then(|u| u.output_tokens);
+                    let usage_cached_input_tokens =
+                        result.usage.as_ref().and_then(|u| u.cached_input_tokens);
+                    if let Err(attribution_err) = agent_executions::update_attempt_attribution(
+                        &self.pool,
+                        agent_exec_id,
+                        usage_cost_cents,
+                        usage_input_tokens,
+                        usage_output_tokens,
+                        usage_cached_input_tokens,
+                        mediation_transcript_artifact_id.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            agent_execution_id = %agent_exec_id,
+                            error = %attribution_err,
+                            "P017: failed to persist per-attempt cost/transcript attribution"
+                        );
+                    }
                     if let Some(med_id) = mediation_record_id.as_deref() {
                         let mut tx = db::pool::begin_immediate_with_retry(
                             &self.pool,

@@ -252,6 +252,11 @@ fn make_agent_execution(
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     }
 }
 
@@ -6927,6 +6932,11 @@ sys.exit(0)
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -9700,6 +9710,11 @@ async fn p017_mediation_cancel_run_cascade() {
         owner_id: Some(mediation_id.clone()),
         lead_mediation_record_id: Some(mediation_id.clone()),
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &mediation_execution)
         .await

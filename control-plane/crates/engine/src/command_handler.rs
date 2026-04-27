@@ -224,6 +224,29 @@ fn find_source_invoke_work_item<'a>(
         .max_by_key(|item| item.created_at)
 }
 
+/// OPS-002 (P017 R4): classify the workflow-compile error so the
+/// `phase_c_validation_outcome_total` fail-path metric carries a
+/// bounded `failure_kind` label.
+///
+/// The classifier matches on the typed prefix the compile error emits
+/// (`lead_missing`, `lead_ambiguous`, `lead_backend_profile_missing`,
+/// `lead_permission_profile_missing`, `lead_resolution_contract_missing`)
+/// and falls back to `other_compile_failure` so cardinality stays bounded.
+fn classify_phase_c_failure_kind(error_message: &str) -> String {
+    for kind in [
+        "lead_missing",
+        "lead_ambiguous",
+        "lead_backend_profile_missing",
+        "lead_permission_profile_missing",
+        "lead_resolution_contract_missing",
+    ] {
+        if error_message.contains(kind) {
+            return kind.to_string();
+        }
+    }
+    "other_compile_failure".to_string()
+}
+
 fn frozen_legacy_broad_discovery_policy(run: &Run) -> Result<LegacyBroadDiscoveryPolicy> {
     let Some(snapshot_json) = run.workflow_snapshot_json.as_deref() else {
         return Ok(LegacyBroadDiscoveryPolicy::Disabled);
@@ -450,6 +473,18 @@ impl CommandHandler {
                     Ok(plan) => plan,
                     Err(error) => {
                         let message = error.to_string();
+                        // OPS-002 (P017 R4): emit phase_c_validation_outcome_total
+                        // for the FAIL-CLOSED compile path. Run id is None
+                        // because the run row never gets inserted.
+                        let failure_kind = classify_phase_c_failure_kind(&message);
+                        let _ = db::repos::workflow_conflicts::record_phase_c_validation_failure(
+                            &self.pool,
+                            &failure_kind,
+                            Some(c.workflow_yaml_path.as_str()),
+                            Some(c.agent_catalog_yaml_path.as_str()),
+                            now,
+                        )
+                        .await;
                         self.record_failed_command_transaction(
                             journal,
                             "command.StartRun",
@@ -564,8 +599,8 @@ impl CommandHandler {
                     cancellation_settled_at: None,
                     cancellation_settlement_log: None,
                     current_state: Some(plan.initial_state),
-                    workflow_yaml_path: Some(c.workflow_yaml_path),
-                    agent_catalog_yaml_path: Some(c.agent_catalog_yaml_path),
+                    workflow_yaml_path: Some(c.workflow_yaml_path.clone()),
+                    agent_catalog_yaml_path: Some(c.agent_catalog_yaml_path.clone()),
                     // Worktree fields — provisioned later by the orchestrator
                     // when the first write-enabled implementation state is entered.
                     worktree_root: None,
@@ -598,6 +633,23 @@ impl CommandHandler {
                     run_id,
                     "pass",
                     "compile",
+                    now,
+                )
+                .await?;
+                // OPS-002 (P017 R4): emit phase_c_lead_inventory_external_catalog_total
+                // per-run with the inventory result observed at compile time.
+                // For the bundled-only catalog path (the local operator's
+                // current evidence inventory says zero active externals),
+                // this is `inventory_result=zero_active_externals` +
+                // `enforcement_decision=waive_warning_window` per the
+                // attested evidence at
+                // docs/proposals/017-evidence/phase-c-external-catalog-enforcement-inventory.json.
+                db::repos::workflow_conflicts::record_phase_c_lead_inventory_external_catalog_tx(
+                    &mut tx,
+                    Some(&run_id.to_string()),
+                    "zero_active_externals",
+                    "waive_warning_window",
+                    Some(c.agent_catalog_yaml_path.as_str()),
                     now,
                 )
                 .await?;

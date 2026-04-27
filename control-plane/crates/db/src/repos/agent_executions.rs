@@ -18,7 +18,9 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
                 actual_xcode_runtime_observation_json,
                 mcp_session_startup_latency_ms,
-                owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id"#;
+                owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id,
+                total_cost_cents, input_tokens, output_tokens, cached_input_tokens,
+                transcript_artifact_id"#;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningAgentExecution {
@@ -606,5 +608,74 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         owner_id: row.get("owner_id"),
         lead_mediation_record_id: row.get("lead_mediation_record_id"),
         origin_stage_execution_id: row.get("origin_stage_execution_id"),
+        // P017 R4 / API-002: per-attempt cost & transcript attribution.
+        // Migration 031 added these columns NULLABLE so existing rows
+        // backfill as None and only freshly-completed attempts populate.
+        total_cost_cents: row.get("total_cost_cents"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cached_input_tokens: row.get("cached_input_tokens"),
+        transcript_artifact_id: row.get("transcript_artifact_id"),
     })
+}
+
+/// P017 R4 / API-002: persist per-attempt cost and transcript attribution
+/// for a completed `agent_executions` row. Used by the executor's
+/// mediation-completion path so MCP/GraphQL `execution_attempts.cost`
+/// and `transcript_ref` resolve to non-null values.
+///
+/// Idempotent at the row level — re-running with the same values
+/// produces the same result. Stage-owned executions can also call this
+/// when usage data is available.
+pub async fn update_attempt_attribution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: AgentExecutionId,
+    total_cost_cents: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    transcript_artifact_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_executions
+         SET total_cost_cents = COALESCE(?, total_cost_cents),
+             input_tokens = COALESCE(?, input_tokens),
+             output_tokens = COALESCE(?, output_tokens),
+             cached_input_tokens = COALESCE(?, cached_input_tokens),
+             transcript_artifact_id = COALESCE(?, transcript_artifact_id)
+         WHERE id = ?",
+    )
+    .bind(total_cost_cents)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cached_input_tokens)
+    .bind(transcript_artifact_id)
+    .bind(id.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_attempt_attribution(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    total_cost_cents: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    transcript_artifact_id: Option<&str>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    update_attempt_attribution_tx(
+        &mut tx,
+        id,
+        total_cost_cents,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        transcript_artifact_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
