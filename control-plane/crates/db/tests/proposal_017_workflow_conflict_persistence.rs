@@ -848,6 +848,7 @@ async fn p017_per_attempt_cost_and_transcript_persisted() {
         is_pinned: false,
         report_kind: Some("session_transcript".into()),
         report_version: Some(1),
+        agent_execution_id: None,
     };
     let artifact_id = artifact.id.to_string();
     db::repos::artifacts::insert(&pool, &artifact).await.unwrap();

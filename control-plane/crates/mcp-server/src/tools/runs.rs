@@ -368,6 +368,7 @@ mod tests {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(pool, &artifact).await.unwrap();
         let raw = serde_json::json!({

@@ -371,9 +371,12 @@ async fn build_mediation_execution_attempts(
                 "retry_after": f.retry_after.map(|t| t.to_rfc3339()),
             }))
         });
-        // P017 R4 / API-002: artifacts in tiered priority — direct
-        // transcript artifact first, then agent_id correlation as a
-        // fallback. Direct ID dedup keeps the array clean across tiers.
+        // P017 R5 / API-003: tiered artifact attribution — see MCP
+        // mirror for the full rationale. Tier 1: direct transcript
+        // artifact. Tier 2: direct execution-attempt FK
+        // (`artifacts.agent_execution_id`) — cross-retry isolation.
+        // Tier 3: legacy `agent_id` correlation only as fallback for
+        // pre-R5 attempts with no direct linkage at all.
         let mut seen_artifact_ids: std::collections::HashSet<String> = Default::default();
         let mut artifact_refs: Vec<GqlMediationAttemptArtifact> = Vec::new();
         let transcript_artifact = if let Some(ref tid) = execution.transcript_artifact_id {
@@ -400,11 +403,14 @@ async fn build_mediation_execution_attempts(
         } else {
             None
         };
-        for a in run_artifacts.iter() {
+        // Tier 2: direct execution-attempt FK linkage.
+        let direct_artifacts =
+            db::repos::artifacts::list_by_agent_execution(pool, &execution.id.to_string())
+                .await
+                .unwrap_or_default();
+        let attempt_has_direct_link = !direct_artifacts.is_empty();
+        for a in direct_artifacts.iter() {
             if !seen_artifact_ids.insert(a.id.to_string()) {
-                continue;
-            }
-            if a.agent_id != execution.agent_id {
                 continue;
             }
             artifact_refs.push(GqlMediationAttemptArtifact {
@@ -415,6 +421,25 @@ async fn build_mediation_execution_attempts(
                 report_kind: a.report_kind.clone(),
                 is_pinned: a.is_pinned,
             });
+        }
+        // Tier 3: legacy fallback (only when no direct linkage exists).
+        if !attempt_has_direct_link && transcript_artifact.is_none() {
+            for a in run_artifacts.iter() {
+                if !seen_artifact_ids.insert(a.id.to_string()) {
+                    continue;
+                }
+                if a.agent_id != execution.agent_id {
+                    continue;
+                }
+                artifact_refs.push(GqlMediationAttemptArtifact {
+                    id: ID(a.id.to_string()),
+                    name: a.name.clone(),
+                    format: format!("{:?}", a.format).to_lowercase(),
+                    file_path: a.file_path.clone(),
+                    report_kind: a.report_kind.clone(),
+                    is_pinned: a.is_pinned,
+                });
+            }
         }
 
         // P017 R4 / API-002: cost + transcript_ref now populated from

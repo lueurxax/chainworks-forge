@@ -758,6 +758,7 @@ async fn proposal_058_artifact_projection_populates_source_generation_fields() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         },
     )
     .await

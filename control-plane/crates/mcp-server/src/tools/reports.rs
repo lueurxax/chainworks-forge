@@ -332,13 +332,16 @@ async fn mediation_execution_attempts_json(
             })
             .unwrap_or(serde_json::Value::Null);
 
-        // P017 R4 / API-002: attempt artifacts in three priority tiers.
-        // Tier 1: the direct transcript artifact (always first when set).
-        // Tier 2: artifacts whose `agent_id` matches AND whose stage_id
-        //         contains the mediation token, indicating mediation
-        //         namespace authorship.
-        // Tier 3: the legacy agent_id correlation as a final fallback.
-        // Direct ID dedup keeps the array clean across tiers.
+        // P017 R5 / API-003: attempt artifacts in three tiers.
+        //  Tier 1: direct transcript artifact via FK on agent_executions.
+        //  Tier 2: direct execution-attempt FK on artifacts (R5 canonical
+        //          path) — retries by the same lead agent surface only
+        //          their own artifacts (cross-retry isolation).
+        //  Tier 3: legacy `agent_id` correlation, used only as a fallback
+        //          for attempts that have no direct linkage at all
+        //          (pre-R5 rows). Skipping tier 3 when any direct
+        //          linkage exists is the cross-retry isolation guarantee.
+        // ID dedup across tiers keeps the array clean.
         let mut seen_artifact_ids: std::collections::HashSet<String> = Default::default();
         let mut attempt_artifacts: Vec<serde_json::Value> = Vec::new();
 
@@ -366,12 +369,14 @@ async fn mediation_execution_attempts_json(
             None
         };
 
-        // Tier 2 + 3: agent_id correlation from the run artifacts list.
-        for a in run_artifacts.iter() {
+        // Tier 2: direct execution-attempt FK linkage.
+        let direct_artifacts =
+            artifacts::list_by_agent_execution(pool, &execution.id.to_string())
+                .await
+                .unwrap_or_default();
+        let attempt_has_direct_link = !direct_artifacts.is_empty();
+        for a in direct_artifacts.iter() {
             if !seen_artifact_ids.insert(a.id.to_string()) {
-                continue;
-            }
-            if a.agent_id != execution.agent_id {
                 continue;
             }
             attempt_artifacts.push(serde_json::json!({
@@ -381,8 +386,30 @@ async fn mediation_execution_attempts_json(
                 "file_path": a.file_path,
                 "report_kind": a.report_kind,
                 "is_pinned": a.is_pinned,
-                "linkage": "agent_id_correlation",
+                "linkage": "execution_id_direct",
             }));
+        }
+
+        // Tier 3: legacy `agent_id` correlation. Only reachable when
+        // neither transcript nor direct linkage exists for this attempt.
+        if !attempt_has_direct_link && transcript_artifact.is_none() {
+            for a in run_artifacts.iter() {
+                if !seen_artifact_ids.insert(a.id.to_string()) {
+                    continue;
+                }
+                if a.agent_id != execution.agent_id {
+                    continue;
+                }
+                attempt_artifacts.push(serde_json::json!({
+                    "id": a.id.to_string(),
+                    "name": a.name,
+                    "format": format!("{:?}", a.format).to_lowercase(),
+                    "file_path": a.file_path,
+                    "report_kind": a.report_kind,
+                    "is_pinned": a.is_pinned,
+                    "linkage": "agent_id_correlation",
+                }));
+            }
         }
 
         attempts.push(serde_json::json!({
@@ -1214,6 +1241,7 @@ mod tests {
             is_pinned: false,
             report_kind: report_kind.map(|s| s.to_string()),
             report_version: None,
+            agent_execution_id: None,
         }
     }
 
@@ -1323,6 +1351,7 @@ mod tests {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(pool, &artifact).await.unwrap();
         let raw = serde_json::json!({
@@ -1715,6 +1744,7 @@ mod tests {
             is_pinned: false,
             report_kind: Some("session_transcript".into()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         let transcript_artifact_id = transcript_artifact.id.to_string();
         artifacts::insert(&pool, &transcript_artifact).await.unwrap();
@@ -1879,6 +1909,7 @@ mod tests {
             is_pinned: false,
             report_kind: Some("validation_failure".into()),
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
         validation::insert(
@@ -2070,6 +2101,7 @@ mod tests {
                 is_pinned: false,
                 report_kind: Some("failed_stage_evidence".into()),
                 report_version: Some(1),
+                agent_execution_id: None,
             },
         )
         .await

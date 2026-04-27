@@ -66,6 +66,12 @@ pub async fn upsert_conflict_by_fingerprint_tx(
 
     supersede_current_blocking_conflicts_tx(tx, &stored).await?;
 
+    // OPS-003 (P017 R5): emit `workflow_conflict_current_total` per
+    // upsert keyed by (reason, status) so rollout dashboards can count
+    // current conflicts by classification. Bounded label cardinality:
+    // reason ∈ enum (8), status ∈ enum (6) ⇒ 48 unique label tuples max.
+    record_workflow_conflict_current_tx(tx, &stored, stored.updated_at).await?;
+
     Ok(stored)
 }
 
@@ -73,6 +79,7 @@ pub async fn insert_advisory_rejection(
     pool: &SqlitePool,
     record: &WorkflowAdvisoryRejectionRecord,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"INSERT INTO workflow_advisory_rejections
            (rejection_id, run_id, stage_execution_id, lineage_id, current_state_id,
@@ -95,9 +102,33 @@ pub async fn insert_advisory_rejection(
     .bind(&record.graph_membership_result)
     .bind(record.created_at.to_rfc3339())
     .bind(serde_json::to_string(record)?)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("insert workflow advisory rejection")?;
+    // OPS-003 (P017 R5): every durable advisory rejection record emits
+    // `advisory_rejection_total`. When the advisory hint was rejected
+    // because the next-stage hint was absent from the graph, also emit
+    // `invalid_next_stage_hint_non_blocking_total` so dashboards can
+    // distinguish total volume from invalid-hint volume.
+    record_advisory_rejection_tx(
+        &mut tx,
+        &record.run_id,
+        &record.current_state_id,
+        &record.graph_membership_result,
+        record.created_at,
+    )
+    .await?;
+    if record.graph_membership_result == "absent_from_graph" {
+        record_invalid_next_stage_hint_non_blocking_tx(
+            &mut tx,
+            &record.run_id,
+            &record.current_state_id,
+            record.advisory_next_action.as_deref(),
+            record.created_at,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -630,6 +661,117 @@ pub async fn record_mediation_late_output_ignored_tx(
             labels_json: serde_json::json!({
                 "mediation_record_id": mediation_record_id,
                 "reason": reason,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003 (P017 R5): emit `advisory_rejection_total` per durable
+/// advisory rejection record. Bounded labels: `current_state_id`,
+/// `graph_membership_result`.
+pub async fn record_advisory_rejection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    current_state_id: &str,
+    graph_membership_result: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "advisory_rejection_total".to_string(),
+            labels_json: serde_json::json!({
+                "current_state_id": current_state_id,
+                "graph_membership_result": graph_membership_result,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003: emit `invalid_next_stage_hint_non_blocking_total` when an
+/// advisory next-stage hint is rejected as non-blocking.
+pub async fn record_invalid_next_stage_hint_non_blocking_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    current_state_id: &str,
+    advisory_next_action: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "invalid_next_stage_hint_non_blocking_total".to_string(),
+            labels_json: serde_json::json!({
+                "current_state_id": current_state_id,
+                "advisory_next_action": advisory_next_action,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003: emit `workflow_conflict_current_total` per `(reason, status)`
+/// when a blocking conflict is upserted. Lets dashboards count current
+/// conflicts by reason and status.
+pub async fn record_workflow_conflict_current_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &WorkflowConflictRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(record.run_id.clone()),
+            conflict_id: Some(record.conflict_id.clone()),
+            metric_name: "workflow_conflict_current_total".to_string(),
+            labels_json: serde_json::json!({
+                "reason": record.reason.to_string(),
+                "status": record.status.to_string(),
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003: emit `terminal_unverifiable_total` when a conflict
+/// transitions to `TerminalUnverifiable`, labeled by failure reason.
+pub async fn record_terminal_unverifiable_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: &str,
+    terminal_failure_reason: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: Some(conflict_id.to_string()),
+            metric_name: "terminal_unverifiable_total".to_string(),
+            labels_json: serde_json::json!({
+                "terminal_failure_reason": terminal_failure_reason,
             }),
             value: 1.0,
             unit: "count".to_string(),

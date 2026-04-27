@@ -687,6 +687,7 @@ async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() 
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     let input = ActiveArtifactGenerationInput {
         run_id,

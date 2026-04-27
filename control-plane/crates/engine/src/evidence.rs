@@ -156,6 +156,7 @@ pub async fn build_and_persist_failed_stage_evidence(
         is_pinned: false,
         report_kind: Some("failed_stage_evidence".to_string()),
         report_version: Some(1),
+        agent_execution_id: None,
     };
     artifacts::insert(pool, &artifact).await?;
     Ok(artifact)

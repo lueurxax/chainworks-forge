@@ -1672,6 +1672,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         is_pinned: false,
         report_kind: Some("validation_failure".into()),
         report_version: Some(1),
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
 
@@ -2315,6 +2316,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             is_pinned: false,
             report_kind: Some("execution_report".into()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
         projections::rebuild_all_for_run(&pool, run_id)
@@ -2504,6 +2506,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &art).await.unwrap();
     }

@@ -1083,6 +1083,7 @@ impl Orchestrator {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         artifact_contracts::upsert_generation_and_rebuild(
@@ -1391,6 +1392,7 @@ impl Orchestrator {
             is_pinned: true,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         Ok(Some(artifact))

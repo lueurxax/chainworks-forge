@@ -23,8 +23,8 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, artifact: &Artifact) ->
         r#"
         INSERT INTO artifacts (id, run_id, stage_id, agent_id, name, contract_id, format, file_path,
                                checksum_sha256, size_bytes, provider, model, created_at, is_pinned,
-                               report_kind, report_version)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                               report_kind, report_version, agent_execution_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         "#,
     )
     .bind(id)
@@ -43,6 +43,7 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, artifact: &Artifact) ->
     .bind(is_pinned)
     .bind(&artifact.report_kind)
     .bind(artifact.report_version)
+    .bind(&artifact.agent_execution_id)
     .execute(&mut **tx)
     .await
     .context("insert artifact")?;
@@ -54,7 +55,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: ArtifactId) -> Result<Option<Arti
     let row = sqlx::query(
         r#"SELECT id, run_id, stage_id, agent_id, name, contract_id, format, file_path,
                   checksum_sha256, size_bytes, provider, model, created_at, is_pinned,
-                  report_kind, report_version
+                  report_kind, report_version, agent_execution_id
            FROM artifacts WHERE id = ?1"#,
     )
     .bind(id_str)
@@ -70,7 +71,7 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<Artifac
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_id, agent_id, name, contract_id, format, file_path,
                   checksum_sha256, size_bytes, provider, model, created_at, is_pinned,
-                  report_kind, report_version
+                  report_kind, report_version, agent_execution_id
            FROM artifacts WHERE run_id = ?1 ORDER BY created_at ASC"#,
     )
     .bind(run_id_str)
@@ -90,7 +91,7 @@ pub async fn list_by_stage(
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_id, agent_id, name, contract_id, format, file_path,
                   checksum_sha256, size_bytes, provider, model, created_at, is_pinned,
-                  report_kind, report_version
+                  report_kind, report_version, agent_execution_id
            FROM artifacts WHERE run_id = ?1 AND stage_id = ?2 ORDER BY created_at ASC"#,
     )
     .bind(run_id_str)
@@ -139,5 +140,29 @@ fn parse_artifact_row(r: &sqlx::sqlite::SqliteRow) -> Result<Artifact> {
         is_pinned: is_pinned_val != 0,
         report_kind: r.get("report_kind"),
         report_version: r.get("report_version"),
+        // P017 R5 / API-003: direct execution-attempt linkage.
+        agent_execution_id: r.get("agent_execution_id"),
     })
+}
+
+/// P017 R5 / API-003: list artifacts produced by a specific
+/// `AgentExecution` attempt via the direct
+/// `artifacts.agent_execution_id` FK. Used by MCP/GraphQL
+/// `execution_attempts.artifacts` so retries by the same lead agent
+/// don't cross-attach artifacts.
+pub async fn list_by_agent_execution(
+    pool: &SqlitePool,
+    agent_execution_id: &str,
+) -> Result<Vec<Artifact>> {
+    let rows = sqlx::query(
+        r#"SELECT id, run_id, stage_id, agent_id, name, contract_id, format, file_path,
+                  checksum_sha256, size_bytes, provider, model, created_at, is_pinned,
+                  report_kind, report_version, agent_execution_id
+           FROM artifacts WHERE agent_execution_id = ?1 ORDER BY created_at ASC"#,
+    )
+    .bind(agent_execution_id)
+    .fetch_all(pool)
+    .await
+    .context("list artifacts by agent_execution_id")?;
+    rows.iter().map(parse_artifact_row).collect()
 }

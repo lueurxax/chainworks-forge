@@ -2430,6 +2430,7 @@ agents:
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let raw: serde_json::Value =
@@ -2927,6 +2928,7 @@ agents:
             is_pinned: true,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         },
     )
     .await
@@ -5623,6 +5625,7 @@ async fn malformed_implementation_self_assessment_import_persists_invalid_active
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
 
@@ -5731,6 +5734,7 @@ async fn blocked_implementation_assessment_synthesizes_release_hold_review_summa
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let summary = parse_implementation_self_assessment_v2(
@@ -7072,6 +7076,7 @@ async fn implementation_status_transitions_use_active_contract_summary() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let active_summary = parse_implementation_self_assessment_v2(
@@ -7183,6 +7188,7 @@ async fn implementation_loop_budget_exhaustion_still_allows_complete_exit() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let active_summary = parse_implementation_self_assessment_v2(
@@ -7973,6 +7979,7 @@ async fn test_daemon_vs_swift_report_behavioral_parity() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &art).await.unwrap();
     }
@@ -8855,6 +8862,7 @@ async fn test_state_11_to_state_12_happy_path() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     db::repos::artifacts::insert(&pool, &git_push_artifact)
         .await
@@ -8921,6 +8929,7 @@ async fn test_state_11_to_state_12_happy_path() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     db::repos::artifacts::insert(&pool, &rbm_artifact)
         .await
@@ -8943,6 +8952,7 @@ async fn test_state_11_to_state_12_happy_path() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     db::repos::artifacts::insert(&pool, &cur_artifact)
         .await
@@ -9050,6 +9060,7 @@ async fn test_state_11_to_state_12_happy_path() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         db::repos::artifacts::insert(&pool, &art).await.unwrap();
     }

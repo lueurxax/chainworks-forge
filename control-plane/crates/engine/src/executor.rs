@@ -4124,23 +4124,19 @@ impl BackgroundExecutor {
 
                 let completed_at = chrono::Utc::now();
                 if is_mediation_owned {
-                    agent_executions::update_completed(
-                        &self.pool,
-                        agent_exec_id,
-                        result.status.clone(),
-                        completed_at,
-                    )
-                    .await?;
-                    // P017 R4 / API-002: persist per-attempt cost +
-                    // transcript attribution so MCP/GraphQL
-                    // `execution_attempts.cost` and `transcript_ref` are
-                    // populated. The transcript artifact (if persisted by
-                    // `persist_transcript_artifact_if_present` lower in
-                    // this function) is captured in
-                    // `mediation_transcript_artifact_id` below; for the
-                    // mediation branch we persist the transcript inline
-                    // so we can attribute it directly here without a
-                    // round-trip lookup.
+                    // P017 R5 / REL-002: completion + attribution +
+                    // transcript persistence are now atomic in a single
+                    // transaction. Either the entire mediation
+                    // completion lands (with cost, transcript, and
+                    // attempt attribution intact) or none of it does
+                    // and the orchestrator can re-drive the work item.
+                    //
+                    // The transcript artifact must be persisted to disk
+                    // BEFORE the tx (filesystem write is not
+                    // transactional), but the artifact row insert + the
+                    // agent_execution status update + the attribution
+                    // write are bundled into one tx so a partial state
+                    // is impossible.
                     let mediation_transcript_artifact = self
                         .persist_transcript_artifact_if_present(
                             &run,
@@ -4167,8 +4163,20 @@ impl BackgroundExecutor {
                     let usage_output_tokens = result.usage.as_ref().and_then(|u| u.output_tokens);
                     let usage_cached_input_tokens =
                         result.usage.as_ref().and_then(|u| u.cached_input_tokens);
-                    if let Err(attribution_err) = agent_executions::update_attempt_attribution(
+                    let mut completion_tx = db::pool::begin_immediate_with_retry(
                         &self.pool,
+                        "mediation.complete_with_attribution",
+                    )
+                    .await?;
+                    agent_executions::update_completed_tx(
+                        &mut completion_tx,
+                        agent_exec_id,
+                        result.status.clone(),
+                        completed_at,
+                    )
+                    .await?;
+                    agent_executions::update_attempt_attribution_tx(
+                        &mut completion_tx,
                         agent_exec_id,
                         usage_cost_cents,
                         usage_input_tokens,
@@ -4176,14 +4184,8 @@ impl BackgroundExecutor {
                         usage_cached_input_tokens,
                         mediation_transcript_artifact_id.as_deref(),
                     )
-                    .await
-                    {
-                        tracing::warn!(
-                            agent_execution_id = %agent_exec_id,
-                            error = %attribution_err,
-                            "P017: failed to persist per-attempt cost/transcript attribution"
-                        );
-                    }
+                    .await?;
+                    completion_tx.commit().await?;
                     if let Some(med_id) = mediation_record_id.as_deref() {
                         let mut tx = db::pool::begin_immediate_with_retry(
                             &self.pool,
@@ -4468,7 +4470,7 @@ impl BackgroundExecutor {
                 if let Some(artifact) = transcript_artifact {
                     persisted_artifacts.push(artifact);
                 }
-                let declared_artifacts = self.prepare_declared_output_artifacts(
+                let mut declared_artifacts = self.prepare_declared_output_artifacts(
                     &declared_outputs,
                     declared_output_settlement
                         .as_ref()
@@ -4481,6 +4483,15 @@ impl BackgroundExecutor {
                     completed_at,
                     &mut persisted_paths,
                 )?;
+                // P017 R5 / API-003: stamp the direct execution-attempt FK
+                // on every declared output artifact so MCP/GraphQL
+                // `execution_attempts.artifacts` can attribute outputs
+                // per attempt without falling back to `agent_id`
+                // correlation. Required for cross-retry isolation under
+                // mediation-owned executions; harmless for stage-owned.
+                for artifact in declared_artifacts.iter_mut() {
+                    artifact.agent_execution_id = Some(agent_exec_id.to_string());
+                }
                 persisted_artifacts.extend(declared_artifacts.clone());
 
                 let undeclared_artifacts = self
@@ -5585,6 +5596,7 @@ impl BackgroundExecutor {
                 is_pinned: false,
                 report_kind: None,
                 report_version: None,
+                agent_execution_id: None,
             };
             artifacts::insert(&self.pool, &artifact).await?;
             let _ = self
@@ -5656,6 +5668,11 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: Some("agent_transcript".to_string()),
             report_version: Some(1),
+            // P017 R5 / API-003: stamp the direct execution-attempt FK
+            // so MCP/GraphQL `execution_attempts.artifacts` can attribute
+            // this transcript to the exact attempt that produced it
+            // (cross-retry isolation).
+            agent_execution_id: Some(agent_execution_id.to_string()),
         };
         artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
@@ -5748,6 +5765,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: report_kind.map(str::to_string),
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         if domain::artifact_contracts::known_contract_id(contract_id) {
@@ -5818,6 +5836,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: report_kind.map(str::to_string),
             report_version: None,
+            agent_execution_id: None,
         };
         Ok(Some(artifact))
     }
@@ -5899,6 +5918,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: Some("session_checkpoint".into()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
@@ -5954,6 +5974,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: Some("validation_failure".to_string()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         validation::insert(&self.pool, &record).await?;
@@ -6023,6 +6044,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
