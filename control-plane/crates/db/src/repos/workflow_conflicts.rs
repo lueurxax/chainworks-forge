@@ -1064,6 +1064,20 @@ async fn record_terminal_metric_events_tx(
         return Ok(());
     }
 
+    // OPS-003 (P017 R5): emit `terminal_unverifiable_total` whenever a
+    // conflict transitions into the terminal-unverifiable state, with
+    // bounded `terminal_failure_reason` label.
+    if matches!(record.status, WorkflowConflictStatus::TerminalUnverifiable) {
+        record_terminal_unverifiable_tx(
+            tx,
+            &record.run_id,
+            &record.conflict_id,
+            record.terminal_failure_reason.as_deref(),
+            occurred_at,
+        )
+        .await?;
+    }
+
     let resolution_mode = resolution_mode(record);
     let action_class = action_class(record);
     let elapsed_seconds =

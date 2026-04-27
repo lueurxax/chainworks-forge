@@ -873,6 +873,116 @@ async fn p017_per_attempt_cost_and_transcript_persisted() {
     assert_eq!(after2.total_cost_cents, Some(42));
 }
 
+/// P017 R5 / OPS-003: advisory_rejection_total emits per insert and
+/// also emits invalid_next_stage_hint_non_blocking_total when the
+/// graph_membership_result is `absent_from_graph`.
+#[tokio::test]
+async fn p017_advisory_rejection_metrics_emit() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let rec = advisory_rejection_record(run_id, stage_execution_id);
+    workflow_conflicts::insert_advisory_rejection(&pool, &rec)
+        .await
+        .unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let names: Vec<&str> = events.iter().map(|e| e.metric_name.as_str()).collect();
+    assert!(names.contains(&"advisory_rejection_total"));
+    assert!(names.contains(&"invalid_next_stage_hint_non_blocking_total"));
+
+    let advisory = events
+        .iter()
+        .find(|e| e.metric_name == "advisory_rejection_total")
+        .unwrap();
+    assert_eq!(
+        advisory.labels_json["graph_membership_result"],
+        "absent_from_graph"
+    );
+
+    let invalid = events
+        .iter()
+        .find(|e| e.metric_name == "invalid_next_stage_hint_non_blocking_total")
+        .unwrap();
+    assert_eq!(invalid.labels_json["advisory_next_action"], "revise_proposal");
+}
+
+/// P017 R5 / OPS-003: workflow_conflict_current_total emits per
+/// upsert with (reason, status) labels.
+#[tokio::test]
+async fn p017_workflow_conflict_current_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let rec = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-current",
+        "No declarative transition matched",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &rec)
+        .await
+        .unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "workflow_conflict_current_total")
+        .expect("workflow_conflict_current_total must exist");
+    assert_eq!(
+        event.labels_json["reason"],
+        "no_declarative_transition_matched"
+    );
+    assert_eq!(event.labels_json["status"], "unresolved");
+}
+
+/// P017 R5 / OPS-003: terminal_unverifiable_total emits when a
+/// conflict transitions to TerminalUnverifiable.
+#[tokio::test]
+async fn p017_terminal_unverifiable_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let rec = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-terminal",
+        "No declarative transition matched",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    let stored = workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &rec)
+        .await
+        .unwrap();
+
+    workflow_conflicts::transition_conflict_status(
+        &pool,
+        &stored.conflict_id,
+        WorkflowConflictStatus::TerminalUnverifiable,
+        Utc::now(),
+        None,
+        Some("operator_abandoned_after_lead_failure".into()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "terminal_unverifiable_total")
+        .expect("terminal_unverifiable_total must exist");
+    assert_eq!(
+        event.labels_json["terminal_failure_reason"],
+        "operator_abandoned_after_lead_failure"
+    );
+}
+
 #[tokio::test]
 async fn p017_transition_cursor_upserts_run_settlement_boundary() {
     let pool = test_pool().await;
