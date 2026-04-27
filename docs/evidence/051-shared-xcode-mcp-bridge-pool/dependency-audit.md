@@ -10,7 +10,11 @@ Repo-local convention prefers current `docs/reference/` truth over old proposal 
 
 P051 scaffold can proceed on the current documentation/gate posture. P025, P026, and P029 have registered gates and stable reference coverage sufficient for P051 fixture work. No dependency row below is a current scheduling blocker for fixture-level P051 closeout.
 
-Pre-ship P051 remains blocked by live dogfood/sign-off, tracked separately in [dogfood-signoff.md](dogfood-signoff.md).
+Live dogfood and release-owner sign-off are now complete for the scoped
+broker/readback closeout and are tracked in
+[dogfood-signoff.md](dogfood-signoff.md). Broad release or broad
+`shim_enforced` rollout remains blocked on the P042 release-host
+`proposal-042-packaging` proof for the production packaged daemon path.
 
 ## Dependency Matrix
 

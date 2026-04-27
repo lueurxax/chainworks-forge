@@ -1,6 +1,6 @@
 # MCP Northbound Control-Plane Server
 
-Stable reference for bearer-auth, caller-scoped capability filtering, per-command audit journaling, and `journal_id` surfacing on the Rust control-plane daemon's northbound surfaces (MCP + GraphQL).
+Stable reference for bearer-auth, caller-scoped capability filtering, per-command audit journaling, and `journal_id` surfacing on the Rust control-plane daemon's northbound surfaces.
 
 This document describes the implemented system. It is not a proposal or future-state design.
 
@@ -18,9 +18,11 @@ Related stable docs:
 The Rust control-plane daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`):
 
 - **MCP** — JSON-RPC over stdio and Streamable HTTP (`/mcp`). Serves tools and resources to agents, CLIs, and automations.
-- **GraphQL** — HTTP POST `/graphql` and subscriptions over `/graphql/ws`. Serves queries, mutations, and event streams to clients.
+- **GraphQL** — HTTP POST `/graphql` and subscriptions over `/graphql/ws`. Serves read queries, approval-gate decisions, and event streams to the macOS operator UI.
 
-Both surfaces are authenticated with bearer tokens, filter their visible surface area by the caller's principal class, and converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
+MCP is the external control plane for operational commands. GraphQL is the UI read/subscription surface plus the approval-only human-gate mutation path. Non-approval operational commands such as run start, cancellation, stage retry, session reset, compaction, recovery, cloning, and experiment control are MCP-only.
+
+Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. MCP command tools and approval-gate GraphQL mutations converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
 
 ## Scope
 
@@ -30,11 +32,11 @@ This reference covers:
 - domain-owned typed capability identifiers
 - bearer auth on MCP HTTP, MCP stdio (via `initialize`), GraphQL HTTP, and GraphQL WebSocket transports
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`
-- the five GraphQL mutations and their class policy
+- the GraphQL approval-only mutation boundary and legacy non-UI compatibility boundary
 - `CommandHandler` caller-context propagation and `command_journal` audit row shape
 - the `command_journal` redaction matrix
-- `journal_id` surfacing on MCP command-tool responses and GraphQL mutation payload wrappers
-- the typed `DeliveryPreflight` object on blocked `startRun`
+- `journal_id` surfacing on MCP command-tool responses and approval mutation payload wrappers
+- the typed `DeliveryPreflight` object on blocked MCP `runs.start`
 - the dogfood `.mcp.json` / `CLAUDE.md` contract
 - the canonical `proposal-029-mcp` verification gate
 
@@ -290,28 +292,40 @@ Rationale for the Steward trio: `run_analysis` queues compute work and drives th
 | `chainworks://runs/{run_id}/stages` | yes | no | yes |
 | `chainworks://runs/{run_id}/artifacts` | yes | no | yes |
 
-### GraphQL mutation policy
+### GraphQL mutation boundary
 
-`graphql-server::schema::mutation_allowed` routes each mutation through the same `auth::filter_tools` check:
+GraphQL is not a general-purpose operator command bus. The macOS operator UI may use GraphQL mutations only to resolve human approval gates:
 
 | Mutation | `CapabilityToolId` | Operator | Agent | Observer |
 |---|---|:-:|:-:|:-:|
-| `startRun` | `RunsStart` | yes | yes | no |
 | `approveStage` | `ApprovalsResolve` | yes | no | no |
 | `rejectStage` | `ApprovalsResolve` | yes | no | no |
-| `retryStage` | `StagesRetry` | yes | no | no |
-| `cancelRun` | `RunsCancel` | yes | no | no |
 
 `approveStage` and `rejectStage` share the same capability because they differ only by `ApprovalDecision`; the class policy does not distinguish them. A mutation invoked by a principal whose class is not permitted returns `async_graphql::Error("forbidden")` and writes no `command_journal` row.
+
+The following operations are MCP-only for agents, CLIs, automations, and operator diagnostics:
+
+| Operation | MCP tool | SwiftUI via GraphQL |
+|---|---|---|
+| Create idea | `ideas.create` | no |
+| Start run | `runs.start` | no |
+| Cancel run | `runs.cancel` | no |
+| Retry stage | `stages.retry` | no |
+| Resolve workflow conflict | `workflow_conflicts.resolve` | no |
+| Override legacy discovery policy | `legacy_discovery_override_create` | no |
+| Override artifact contract | `artifacts.override_contract` | no |
+| Run Steward analysis | `steward.run_analysis` | no |
+
+Current Rust schema compatibility note: older non-approval GraphQL mutation resolvers may still exist while P072 is being implemented and tests are being retired. They are legacy compatibility surface, not target-state product API. SwiftUI must not call them, new UI work must not add call sites for them, and reference/gate work should drive their retirement or containment behind explicit compatibility tests.
 
 ### Enforcement points
 
 - `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), and gates every `tools/call` by `principal.tool_capabilities.contains(&tool_id)`. A denied tool returns `-32601 "Method not found: <name>"` (not `"forbidden"`) so the error does not leak capability existence.
 - `resources/list` is filtered by `auth::filter_resources` over `auth::all_resource_templates()`.
 - `resources/read` parses the concrete URI into a `ResourceTemplateId` via `resource_template_id_for_uri`, then calls `auth::match_resource_uri`. A denied read returns `-32002 "Resource not found"`.
-- Every GraphQL mutation resolver reads `Principal` from `async_graphql::Context`, calls `mutation_allowed`, and returns `Error::new("forbidden")` on denial.
+- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, call the same capability policy, and return `Error::new("forbidden")` on denial.
 
-Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (`mutation_allowed`, `capability_id_for`).
+Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers and legacy compatibility resolvers during P072 transition).
 
 ## Caller context and command journal audit
 
@@ -324,14 +338,14 @@ pub struct CallerContext {
     pub surface: CallerSurface,      // Mcp | Graphql
     pub principal_id: String,
     pub principal_class: PrincipalClass,
-    pub caller_tool: String,         // MCP tool name or GraphQL mutation name
+    pub caller_tool: String,         // MCP tool name or approval GraphQL mutation name
 }
 ```
 
 Constructors:
 
 - `CallerContext::mcp(principal_id, &principal_class, tool_name)` — built at every MCP command-tool entry point.
-- `CallerContext::graphql(principal_id, &principal_class, mutation_name)` — built inside every GraphQL mutation resolver after the capability check.
+- `CallerContext::graphql(principal_id, &principal_class, mutation_name)` — built inside GraphQL approval mutation resolvers after the capability check. Legacy non-approval GraphQL mutation rows may still appear until P072 removes or quarantines those resolvers.
 - `CallerContext::test_fixture()` — plain `pub fn` (not `cfg(test)`) so that integration tests in `engine/tests/`, `graphql-server/tests/`, `mcp-server/src/` and `daemon/tests/` can construct a well-formed context without touching auth. Rows tagged with this constructor show `caller_surface = "mcp"`, `principal_id = "test-operator"`, `principal_class = "operator"`, `caller_tool = "test"`.
 
 No `Internal` variant is defined. Extending `CallerSurface` to cover internal callers (executor, recovery) happens only when a future slice routes those callers through `CommandHandler`.
@@ -366,7 +380,7 @@ Migration `011_auth_tracking.sql` adds four nullable TEXT columns to the existin
 | `caller_surface` | `"mcp"` or `"graphql"` (serde `snake_case`) |
 | `caller_principal_id` | principal id from the auth table (e.g. `default-operator`, `observer`, `test-operator`) |
 | `caller_principal_class` | `"operator"`, `"agent"`, or `"observer"` |
-| `caller_tool` | MCP tool name (e.g. `runs.start`) or GraphQL mutation name (e.g. `startRun`) |
+| `caller_tool` | MCP tool name (e.g. `runs.start`) or approval GraphQL mutation name (e.g. `approveStage`) |
 
 Columns are nullable so pre-P029 rows remain readable. Post-P029 rows written through `CommandHandler::handle` always populate all four.
 
@@ -431,38 +445,37 @@ The server currently advertises `protocolVersion: "2024-11-05"`, which predates 
 
 The eight direct tools (`ideas.create`, `ideas.list`, `runs.list`, `runs.get`, `approvals.list`, `reports.get`, `steward.list_analyses`, `steward.get_analysis`) call repo functions directly and bypass `CommandHandler`. They write no `command_journal` row and their response JSON does not include `journal_id`.
 
-### GraphQL mutation payload wrappers
+### GraphQL approval mutation payload wrappers
 
-Each mutation returns a dedicated payload object so that `journalId: ID!` lives on the mutation result and does not pollute shared entity types (`Run`, `Approval`) that read queries also return.
+Approval mutations return dedicated payload objects so that `journalId: ID!` lives on the mutation result and does not pollute shared entity types (`Approval`) that read queries also return.
 
 | Mutation | Return type |
 |---|---|
-| `startRun` | Union `StartRunPayload`, with variants `StartRunStartedPayload { run: Run!, journalId: ID! }` and `StartRunBlockedPayload { deliveryPreflight: DeliveryPreflight!, journalId: ID! }` |
 | `approveStage` | `ApproveStagePayload { approval: Approval!, journalId: ID! }` |
 | `rejectStage` | `RejectStagePayload { approval: Approval!, journalId: ID! }` |
-| `retryStage` | `RetryStagePayload { retried: Boolean!, journalId: ID! }` |
-| `cancelRun` | `CancelRunPayload { cancelled: Boolean!, journalId: ID! }` |
 
 Clients select the field via normal GraphQL syntax:
 
 ```graphql
 mutation {
-  startRun(...) {
-    ... on StartRunStartedPayload { run { id } journalId }
-    ... on StartRunBlockedPayload { deliveryPreflight { passed } journalId }
+  approveStage(runId: "...", stageId: "...") {
+    approval { id decision decidedAt }
+    journalId
   }
 }
 ```
 
-### Blocked `startRun` preflight
+### Blocked `runs.start` preflight
 
-`StartRunBlockedPayload.deliveryPreflight` is a typed `DeliveryPreflight` object, not a JSON string. GraphQL clients select `passed` and individual `checks` via schema introspection; there is no `deliveryPreflightJson` string field on the blocked variant.
+MCP `runs.start` returns a typed blocked delivery-preflight payload when repo-backed run creation is rejected before a run row exists. The payload includes `passed` and individual `checks`; callers must not parse generic error strings to determine preflight status.
+
+Legacy compatibility note: older GraphQL `startRun` may still expose a typed `DeliveryPreflight` wrapper until P072 removes or quarantines non-approval GraphQL command mutations. That wrapper is not part of the SwiftUI target contract.
 
 ### Absent `journal_id`
 
 A command tool call that errors out before `CommandHandler::handle` is reached (capability denial, argument-validation failure) returns only the error variant; no `journal_id` is included, because no `command_journal` row was written. Clients that observe a response without `journal_id` should treat the result as having no audit trail in `command_journal`.
 
-Implementation: `control-plane/crates/mcp-server/src/tools/runs.rs` and sibling tool modules (journal-id insertion inside `content[0].text`), `control-plane/crates/graphql-server/src/schema.rs` (payload wrapper types, mutation resolvers).
+Implementation: `control-plane/crates/mcp-server/src/tools/runs.rs` and sibling tool modules (journal-id insertion inside `content[0].text`), `control-plane/crates/graphql-server/src/schema.rs` (approval payload wrapper types and legacy compatibility resolvers during P072 transition).
 
 ## Dogfood configuration
 
@@ -503,9 +516,9 @@ The gate enumerates a fixed inventory of focused tests covering:
 - capability filtering for tool lists, tool calls, resource lists, and resource reads (including the Steward trio and the `steward-analysis://` resource),
 - command-journal caller-metadata rows (per surface, per class),
 - the §8.1 redaction matrix (one test per decision),
-- `journal_id` surfacing on MCP command tools and every GraphQL mutation payload wrapper,
-- the typed `DeliveryPreflight` object on blocked `startRun`,
-- cross-surface parity between GraphQL and MCP over the same `CommandHandler`,
+- `journal_id` surfacing on MCP command tools and approval GraphQL mutation payload wrappers,
+- the typed `DeliveryPreflight` object on blocked MCP `runs.start`,
+- the P072 routing boundary: GraphQL is read/subscription plus approval-only mutation; MCP owns non-approval operational commands,
 - dogfood `.mcp.json` and `CLAUDE.md` consistency.
 
 For each test in the inventory the gate runs `cargo test -p <crate> <name> -- --nocapture` and post-checks the output for a matching `test <name>` line, so a rename, typo, or deletion fails the gate independently of the test body. After every focused test passes, the gate runs `cargo test --workspace` as a final regression step.
@@ -522,4 +535,4 @@ The following items are explicitly out of scope for this reference:
 - **Per-subscription capability filtering.** All authenticated principals can subscribe to all subscriptions; narrowing is a future slice.
 - **Internal `CallerSurface` variant.** Executor and recovery do not route through `CommandHandler` today. The internal-caller audit lane is reserved for a future command-path consolidation slice.
 - **MCP `structuredContent` typed-output channel.** The server advertises `protocolVersion: "2024-11-05"`; a future protocol-uplift slice adds the typed `structuredContent.journal_id` mirror.
-- **GraphQL mutation retirement.** Both surfaces remain active and both land rows in `command_journal`. Removal of the GraphQL mutations is contingent on a future slice observing zero `caller_surface = "graphql"` rows for an agreed window after the thin-client cutover.
+- **Immediate physical deletion of legacy non-approval GraphQL mutation resolvers.** P072 owns the implementation work to remove or quarantine legacy non-approval GraphQL command mutations. Until then they are compatibility surface only, not a product or SwiftUI action-routing contract.

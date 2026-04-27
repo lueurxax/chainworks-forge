@@ -610,6 +610,90 @@ async fn proposal_057_invalid_contract_is_structured_block_and_disables_raw_fall
 }
 
 #[tokio::test]
+async fn proposal_057_superseded_invalid_contract_does_not_block_active_valid_contract() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let (run_id, _) = seed_run(&pool).await;
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "prepush_review_v1".into(),
+            canonical_path: "review/prepush.json".into(),
+            raw_path: "review/prepush-invalid.json".into(),
+            raw_status: "PASSISH".into(),
+            generation_id: "agent-exec-invalid".into(),
+            source_agent_execution_id: Some("agent-exec-invalid".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: domain::agent::AgentOutputSettlement::None,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "prepush_review_v1".into(),
+            canonical_path: "review/prepush.json".into(),
+            raw_path: "review/prepush-valid.json".into(),
+            raw_status: "pass".into(),
+            generation_id: "agent-exec-valid".into(),
+            source_agent_execution_id: Some("agent-exec-valid".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: Some("agent-exec-invalid".into()),
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let status = artifact_contracts::canonical_contract_field(
+        &pool,
+        run_id,
+        "prepush_review_report",
+        "status",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, Some(serde_json::json!("pass")));
+
+    let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.active_index_json["invalid_required_artifacts"],
+        serde_json::json!([]),
+        "superseded invalid contract generations must not keep transition truth fail-closed"
+    );
+    assert_eq!(
+        projection.active_index_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid_required_artifact")),
+        false
+    );
+}
+
+#[tokio::test]
 async fn proposal_057_agent_written_run_state_is_advisory_and_superseded() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let tmp = tempfile::tempdir().unwrap();

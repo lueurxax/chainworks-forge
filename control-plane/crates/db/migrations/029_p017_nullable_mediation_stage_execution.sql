@@ -1,3 +1,4 @@
+-- no-transaction
 -- P017 Phase B/C: mediation-owned agent executions are not stage-owned.
 -- SQLite cannot drop NOT NULL or FK constraints in place, so rebuild the table
 -- with nullable stage_execution_id while keeping existing columns and data.

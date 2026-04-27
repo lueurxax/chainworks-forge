@@ -666,6 +666,39 @@ mod tests {
     }
 
     #[test]
+    fn validate_output_rejects_prepush_status_alias_before_settlement() {
+        let schema = OutputSchema {
+            contract_id: "prepush_review_v1".to_string(),
+            format: "json".to_string(),
+            human_format: None,
+            machine_format: Some("json".to_string()),
+            validation_mode: Some("strict_structured".to_string()),
+            normalized_artifact_name: Some("prepush_review_report".to_string()),
+            raw_artifact_name: None,
+            required_fields: vec![
+                "status".to_string(),
+                "major_concerns".to_string(),
+                "cleanup_items".to_string(),
+                "test_coverage_notes".to_string(),
+                "release_note".to_string(),
+            ],
+        };
+
+        let result = validate_output(
+            "prepush_review_report",
+            br#"{"status":"pass_with_notes","major_concerns":[],"cleanup_items":[],"test_coverage_notes":[],"release_note":"ok"}"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Failed);
+        assert!(result
+            .validation_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("allowed values for status"));
+    }
+
+    #[test]
     fn expected_output_specs_include_machine_and_companion_policy() {
         let declared = DeclaredOutput {
             output_name: "proposal_review".to_string(),
