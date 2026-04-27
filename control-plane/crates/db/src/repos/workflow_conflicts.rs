@@ -369,6 +369,89 @@ pub async fn record_phase_c_validation_outcome_tx(
     .await
 }
 
+/// OPS-001 (P017 R2 audit): record one `lead_mediation_attempt_total`
+/// metric event per mediation-owned `agent_executions` completion.
+///
+/// `result` summarises the per-attempt outcome — one of:
+/// - `validated_awaiting_confirmation`
+/// - `lead_output_validation_failed`
+/// - `agent_failed`
+/// - `cancelled`
+/// - `other`
+///
+/// `attempt_number` is the durable count of mediation-owned executions
+/// for this mediation at the point the attempt completes (1, 2, …).
+/// `mediation_record_id` keeps attempts grouped per-mediation so the
+/// metric remains bounded label-cardinality wise.
+pub async fn record_lead_mediation_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: Option<&str>,
+    mediation_record_id: &str,
+    lead_agent_id: &str,
+    result: &str,
+    attempt_number: i64,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            conflict_id: conflict_id.map(|s| s.to_string()),
+            metric_name: "lead_mediation_attempt_total".to_string(),
+            labels_json: serde_json::json!({
+                "result": result,
+                "lead_agent_id": lead_agent_id,
+                "mediation_record_id": mediation_record_id,
+                "attempt_number": attempt_number,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-001 (P017 R2 audit): record one `external_catalog_warning_total`
+/// metric event per external-catalog warning decision (e.g. operator
+/// attestation that a legacy/external catalog is being kept opt-in for
+/// the warning window before Phase C fail-closed enforcement).
+///
+/// `warning_kind` is the typed warning code (e.g.
+/// `P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED`).
+/// `decision` is one of `enabled`, `waived`, or `denied`.
+/// `source_surface` indicates where the decision was recorded (e.g.
+/// `legacy_discovery_override`, `phase_c_inventory`).
+pub async fn record_external_catalog_warning_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    warning_kind: &str,
+    decision: &str,
+    source_surface: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            conflict_id: None,
+            metric_name: "external_catalog_warning_total".to_string(),
+            labels_json: serde_json::json!({
+                "warning_kind": warning_kind,
+                "decision": decision,
+                "source_surface": source_surface,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
 pub async fn find_conflict_by_id_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conflict_id: &str,

@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::sync::Arc;
 
-use db::repos::{agent_executions, projections, runs, scheduler, sessions, stages, work_items};
+use db::repos::{
+    agent_executions, lead_conflict_mediations, projections, runs, scheduler, sessions, stages,
+    work_items,
+};
 use domain::agent::AgentStatus;
 use domain::events::DomainEvent;
 use domain::ids::RunId;
@@ -95,6 +98,27 @@ pub async fn begin_settlement_tx(
 
     agent_executions::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
     work_items::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
+
+    // REL-001 (P017 R2 audit): cascade-cancel any active lead-mediation
+    // records for this run so `lead_conflict_mediations` stays consistent
+    // with `agent_executions`. Without this, a mediation-owned execution
+    // ending up `canceled` could leave its mediation row in `queued` /
+    // `running` / `operator_confirmation_required`, splitting durable
+    // mediation truth across two tables and breaking late-output,
+    // resume, and operator readback invariants.
+    let canceled_mediations = lead_conflict_mediations::cancel_active_by_run_tx(
+        tx,
+        &run_id.to_string(),
+        requested_at,
+    )
+    .await?;
+    if canceled_mediations > 0 {
+        tracing::info!(
+            run_id = %run_id,
+            canceled_mediations = canceled_mediations,
+            "Cancelled active lead mediations as part of run cancellation cascade"
+        );
+    }
 
     for stage in stages::list_by_run_tx(tx, run_id).await? {
         if stage.status == domain::stage::StageStatus::Running {

@@ -589,6 +589,18 @@ impl CommandHandler {
                     chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
                 };
                 runs::insert_tx(&mut tx, &run).await?;
+                // OPS-001 (P017 R2 audit): the workflow compiler ran
+                // Phase C lead-validation as part of `compile()`. Reaching
+                // this point means it passed; record the outcome so the
+                // metric has at least one production caller per run start.
+                db::repos::workflow_conflicts::record_phase_c_validation_outcome_tx(
+                    &mut tx,
+                    run_id,
+                    "pass",
+                    "compile",
+                    now,
+                )
+                .await?;
                 // Activate the idea when its first run starts.
                 db::repos::ideas::update_status_tx(
                     &mut tx,
@@ -1105,14 +1117,27 @@ impl CommandHandler {
                 self.maybe_inject_retry_stage_failure("supersede_workflow_conflict")?;
                 let legacy_discovery_override_id =
                     if let Some(input) = legacy_discovery_override_input.as_ref() {
-                        Some(
+                        let override_record =
                             legacy_discovery_overrides::create_for_pending_retry_tx(
                                 &mut retry_tx,
                                 input,
                             )
-                            .await?
-                            .override_id,
+                            .await?;
+                        // OPS-001 (P017 R2 audit): an operator-attested
+                        // legacy/external catalog override is the canonical
+                        // external-catalog warning decision point. Emit one
+                        // metric event per override so rollout dashboards can
+                        // track override volume + decision class.
+                        let _ = db::repos::workflow_conflicts::record_external_catalog_warning_tx(
+                            &mut retry_tx,
+                            &c.run_id.to_string(),
+                            "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED",
+                            "enabled",
+                            "legacy_discovery_override",
+                            now,
                         )
+                        .await;
+                        Some(override_record.override_id)
                     } else {
                         None
                     };

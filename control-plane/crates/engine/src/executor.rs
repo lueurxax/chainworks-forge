@@ -4266,6 +4266,58 @@ impl BackgroundExecutor {
                                     .await?;
                                 }
                             }
+
+                            // OPS-001 (P017 R2 audit): emit one
+                            // `lead_mediation_attempt_total` per mediation-owned
+                            // execution completion, labeled by per-attempt result.
+                            // Attempt number is the durable count of mediation-owned
+                            // executions for this mediation observed before this row
+                            // was committed (so this completion is attempt N+1).
+                            let attempt_number = sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM agent_executions
+                                 WHERE owner_kind = 'lead_conflict_mediation'
+                                   AND lead_mediation_record_id = ?",
+                            )
+                            .bind(med_id)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .unwrap_or(1);
+                            let attempt_result = match result.status {
+                                AgentStatus::Completed => {
+                                    // Distinguishing happy path vs validation failure
+                                    // requires re-reading the just-written status.
+                                    match db::repos::lead_conflict_mediations::find_by_id_tx(
+                                        &mut tx, med_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(med)) => match med.settlement_result.as_deref() {
+                                            Some("lead_output_validation_failed") => {
+                                                "lead_output_validation_failed"
+                                            }
+                                            Some("lead_output_validated") => {
+                                                "validated_awaiting_confirmation"
+                                            }
+                                            _ => "other",
+                                        },
+                                        _ => "other",
+                                    }
+                                }
+                                AgentStatus::Failed => "agent_failed",
+                                AgentStatus::Cancelled => "cancelled",
+                                _ => "other",
+                            };
+                            let _ = db::repos::workflow_conflicts::record_lead_mediation_attempt_tx(
+                                &mut tx,
+                                &mediation.run_id,
+                                Some(&mediation.conflict_id),
+                                med_id,
+                                &mediation.lead_agent_id,
+                                attempt_result,
+                                attempt_number,
+                                completed_at,
+                            )
+                            .await;
                         }
                         tx.commit().await?;
                     }

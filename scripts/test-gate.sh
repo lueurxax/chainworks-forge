@@ -1874,6 +1874,71 @@ PY
       cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p engine p017_mediation_ -- --test-threads=1 --nocapture
     )
+
+    # P017 R2 audit closures: REL-001 (cancel-cascade) + API-001
+    # (execution_attempts readback). These checks fail the gate if the
+    # specific tests that prove the closure are absent. They are the
+    # canonical readiness signals the audit asked for under READY-001.
+    log "Verifying P017 R2 audit closure tests are present..."
+    REL_001_TEST="p017_mediation_cancel_run_cascade"
+    API_001_MCP_TEST="proposal_017_workflow_conflict_lead_mediation_execution_attempts"
+    API_001_GQL_TEST="proposal_017_run_query_exposes_lead_mediation_execution_attempts"
+    if ! grep -q "$REL_001_TEST" "$ROOT_DIR/control-plane/crates/engine/tests/integration.rs"; then
+      die "P017 REL-001 closure missing: expected test $REL_001_TEST in engine integration tests"
+    fi
+    if ! grep -q "$API_001_MCP_TEST" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 API-001 closure missing: expected MCP test $API_001_MCP_TEST"
+    fi
+    if ! grep -q "$API_001_GQL_TEST" "$ROOT_DIR/control-plane/crates/graphql-server/src/schema.rs"; then
+      die "P017 API-001 closure missing: expected GraphQL test $API_001_GQL_TEST"
+    fi
+    # Also assert the source-level contracts: execution_attempts must be
+    # named in both readback projections (catches accidental removal even
+    # if a copycat test still passes).
+    if ! grep -q "execution_attempts" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 API-001: MCP lead_mediation_readback_json missing 'execution_attempts'"
+    fi
+    if ! grep -q "execution_attempts" "$ROOT_DIR/control-plane/crates/graphql-server/src/types/run.rs"; then
+      die "P017 API-001: GraphQL GqlLeadMediation missing 'execution_attempts'"
+    fi
+    if ! grep -q "cancel_active_by_run_tx" "$ROOT_DIR/control-plane/crates/engine/src/cancellation.rs"; then
+      die "P017 REL-001: cancellation.rs does not invoke cancel_active_by_run_tx for lead_conflict_mediations"
+    fi
+
+    # ARCH-001: equivalence record + proof test must both be present.
+    ARCH_001_DOC="docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md"
+    ARCH_001_TEST="p017_mediation_execution_fields_equivalence"
+    if [[ ! -f "$ROOT_DIR/$ARCH_001_DOC" ]]; then
+      die "P017 ARCH-001: missing equivalence record at $ARCH_001_DOC"
+    fi
+    if ! grep -q "$ARCH_001_TEST" "$ROOT_DIR/control-plane/crates/engine/tests/integration.rs"; then
+      die "P017 ARCH-001: missing equivalence proof test $ARCH_001_TEST"
+    fi
+
+    # OPS-001: every committed P017 metric name must have at least one
+    # production caller (not just the existing tx-helper) AND a unit test
+    # that proves it inserts a metric_event row with the right labels.
+    OPS_001_PHASE_C_TEST="p017_phase_c_validation_outcome_metric_emits"
+    OPS_001_ATTEMPT_TEST="p017_lead_mediation_attempt_metric_emits"
+    OPS_001_EXTERNAL_TEST="p017_external_catalog_warning_metric_emits"
+    OPS_001_DB_PATH="$ROOT_DIR/control-plane/crates/db/tests/proposal_017_workflow_conflict_persistence.rs"
+    for t in "$OPS_001_PHASE_C_TEST" "$OPS_001_ATTEMPT_TEST" "$OPS_001_EXTERNAL_TEST"; do
+      if ! grep -q "$t" "$OPS_001_DB_PATH"; then
+        die "P017 OPS-001: missing metric emit test $t in $OPS_001_DB_PATH"
+      fi
+    done
+    # Production caller presence: all three helpers must be invoked outside
+    # the helper definition itself (so the metric actually fires in real runs).
+    if ! grep -q "record_phase_c_validation_outcome_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 OPS-001: phase_c_validation_outcome_total has no production caller in command_handler.rs"
+    fi
+    if ! grep -q "record_lead_mediation_attempt_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 OPS-001: lead_mediation_attempt_total has no production caller in executor.rs"
+    fi
+    if ! grep -q "record_external_catalog_warning_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 OPS-001: external_catalog_warning_total has no production caller in command_handler.rs"
+    fi
+
     log "Proposal 017 gate passed"
     ;;
   proposal-018|p018)

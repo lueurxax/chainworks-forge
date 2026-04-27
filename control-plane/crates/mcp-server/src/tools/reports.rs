@@ -168,6 +168,26 @@ async fn lead_mediation_readback_json(
         .cost_summary_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+
+    // API-001 (P017 R2 audit): expose conflict-scoped execution attempts so
+    // operators and agents can inspect the mediation-owned `AgentExecution`
+    // through the workflow conflict surface that P017 designates as
+    // authoritative. Without this, runtime facts, transcript refs,
+    // watchdog outcome, and cost are not grouped with the conflict.
+    let execution_attempts =
+        mediation_execution_attempts_json(pool, mediation_id, &record).await?;
+    let attempt_count = execution_attempts.len();
+
+    // The synthetic single status_updates entry below is preserved for
+    // backward compatibility with existing readback consumers, but
+    // `attempt_number` now reflects the durable count of mediation-owned
+    // execution rows (was hard-coded to `1`).
+    let attempt_number = if attempt_count == 0 {
+        1
+    } else {
+        attempt_count as i64
+    };
+
     Ok(Some(serde_json::json!({
         "id": record.id,
         "conflict_id": record.conflict_id,
@@ -182,13 +202,129 @@ async fn lead_mediation_readback_json(
             "status": record.status.to_string(),
             "sanitized_progress": record.sanitized_progress.clone(),
             "updated_at": record.updated_at.to_rfc3339(),
-            "attempt_number": 1,
+            "attempt_number": attempt_number,
         }],
         "validation_errors": validation_errors,
         "confirmation_subject_id": record.confirmation_subject_id,
         "superseded_by_event_ref": record.superseded_by_event_ref,
         "cost_summary": cost_summary,
+        "execution_attempts": execution_attempts,
     })))
+}
+
+/// Build the `execution_attempts` array for a mediation: one entry per
+/// mediation-owned `agent_executions` row, sorted by `started_at`.
+///
+/// Each entry preserves owner identity, the nullable `stage_execution_id`,
+/// timing, status, runtime facts summary, watchdog outcome, transcript
+/// refs, artifact refs, and cost — the fields P017 commits to.
+///
+/// Notes on field availability (see audit ARCH-001 / OPS-001):
+/// - `cost` is null per-attempt today; per-execution cost is not
+///   persisted on `agent_executions` or the runtime facts table. The
+///   roll-up cost lives on the mediation record's `cost_summary` field
+///   sibling. A future slice can add direct per-execution cost.
+/// - `transcript_ref` is null per-attempt today; there is no domain
+///   concept yet that ties a session transcript artifact directly to
+///   an `AgentExecution` row. Operators can locate transcripts via
+///   the per-attempt artifacts list filtered by run + agent.
+/// - `artifacts` is filtered from the run-level artifact list by
+///   `agent_id` match. This is a best-effort correlation until P017's
+///   owner-aware artifact source-generation claims are surfaced
+///   directly through this readback (REQ-008 follow-up).
+///
+/// `operator_rationale` and other non-sanitized fields are deliberately
+/// omitted; artifacts are referenced by file path only, never inlined,
+/// so the readback stays sanitized.
+async fn mediation_execution_attempts_json(
+    pool: &SqlitePool,
+    mediation_id: &str,
+    record: &domain::mediation::LeadConflictMediationRecord,
+) -> Result<Vec<serde_json::Value>> {
+    let executions = agent_executions::list_by_mediation_id(pool, mediation_id).await?;
+
+    // Best-effort artifact correlation by agent_id. Parsing run_id from the
+    // mediation record (string form) keeps this query scoped.
+    let run_artifacts = match record.run_id.parse::<RunId>() {
+        Ok(run_id) => artifacts::list_by_run(pool, run_id).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    let mut attempts = Vec::with_capacity(executions.len());
+    for (idx, execution) in executions.iter().enumerate() {
+        let attempt_number = (idx + 1) as i64;
+        let runtime_facts =
+            agent_execution_runtime_facts::find_by_execution_id(pool, execution.id).await?;
+
+        let runtime_facts_summary = runtime_facts
+            .as_ref()
+            .map(|f| {
+                serde_json::json!({
+                    "valid_required_outputs": f.valid_required_outputs,
+                    "failure_kind": f.failure_kind.as_ref().map(|k| k.to_string()),
+                    "failure_message_redacted": f.failure_message_redacted,
+                    "output_settlement": format!("{:?}", f.output_settlement).to_lowercase(),
+                    "late_output_count": f.late_output_count,
+                    "ignored_late_output_count": f.ignored_late_output_count,
+                    "operator_action_hint": f.operator_action_hint.as_ref().map(|h| format!("{:?}", h).to_lowercase()),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+
+        // Watchdog summary derived from the supervision classification + provider exit
+        // status + transport error code. The runtime facts row doesn't have a
+        // dedicated watchdog struct yet; this groups the relevant signals.
+        let watchdog = runtime_facts
+            .as_ref()
+            .map(|f| {
+                serde_json::json!({
+                    "supervision_classification": f.supervision_classification,
+                    "provider_exit_status": f.provider_exit_status,
+                    "transport_error_code": f.transport_error_code,
+                    "retry_after": f.retry_after.map(|t| t.to_rfc3339()),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+
+        // Per-attempt artifacts: filter run-level artifacts by agent_id.
+        let attempt_artifacts: Vec<serde_json::Value> = run_artifacts
+            .iter()
+            .filter(|a| a.agent_id == execution.agent_id)
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id.to_string(),
+                    "name": a.name,
+                    "format": format!("{:?}", a.format).to_lowercase(),
+                    "file_path": a.file_path,
+                    "report_kind": a.report_kind,
+                    "is_pinned": a.is_pinned,
+                })
+            })
+            .collect();
+
+        attempts.push(serde_json::json!({
+            "agent_execution_id": execution.id.to_string(),
+            "owner_kind": execution.owner_kind.clone()
+                .unwrap_or_else(|| "lead_conflict_mediation".to_string()),
+            "owner_id": execution.owner_id.clone()
+                .unwrap_or_else(|| record.id.clone()),
+            "mediation_record_id": record.id.clone(),
+            "stage_execution_id": execution.stage_execution_id.map(|id| id.to_string()),
+            "agent_id": execution.agent_id,
+            "provider": execution.provider,
+            "model": execution.model,
+            "status": execution.status.to_string(),
+            "started_at": execution.started_at.to_rfc3339(),
+            "completed_at": execution.completed_at.map(|t| t.to_rfc3339()),
+            "attempt_number": attempt_number,
+            "runtime_facts": runtime_facts_summary,
+            "watchdog": watchdog,
+            "cost": serde_json::Value::Null,
+            "transcript_ref": serde_json::Value::Null,
+            "artifacts": attempt_artifacts,
+        }));
+    }
+    Ok(attempts)
 }
 
 pub(crate) async fn implementation_handoff_status_json(
@@ -1359,6 +1495,158 @@ mod tests {
             serde_json::json!(42)
         );
 
+        let serialized = serde_json::to_string(&mcp_truth).unwrap();
+        assert!(!serialized.contains("operator_rationale"));
+        assert!(!serialized.contains("operatorRationale"));
+        assert!(!serialized.contains("PRIVATE rationale"));
+    }
+
+    /// P017 R2 / API-001: every mediation-owned `agent_executions` row must
+    /// surface under `workflow_conflict.lead_mediation.execution_attempts`
+    /// in MCP, with owner identity, nullable stage execution ID, runtime
+    /// facts, watchdog, and per-attempt timing.
+    #[tokio::test]
+    async fn proposal_017_workflow_conflict_lead_mediation_execution_attempts() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let mediation_id = "mediation-p017-attempts";
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.status = WorkflowConflictStatus::OperatorConfirmationRequired;
+        conflict.mediation_record_id = Some(mediation_id.into());
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+        db::repos::lead_conflict_mediations::insert(
+            &pool,
+            &make_lead_mediation_record(run_id, &conflict, mediation_id),
+        )
+        .await
+        .unwrap();
+
+        // Insert two mediation-owned agent_executions (no stage_execution_id).
+        let exec_one = AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            stage_execution_id: None,
+            agent_id: "lead-agent-1".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status: domain::agent::AgentStatus::Failed,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: None,
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: Some("lead_conflict_mediation".into()),
+            owner_id: Some(mediation_id.into()),
+            lead_mediation_record_id: Some(mediation_id.into()),
+            origin_stage_execution_id: None,
+        };
+        let exec_one_id = exec_one.id;
+        db::repos::agent_executions::insert(&pool, &exec_one)
+            .await
+            .unwrap();
+
+        let exec_two = AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            started_at: exec_one.started_at + chrono::Duration::seconds(1),
+            status: domain::agent::AgentStatus::Completed,
+            ..exec_one.clone()
+        };
+        let exec_two_id = exec_two.id;
+        db::repos::agent_executions::insert(&pool, &exec_two)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|r| r["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let mediation = &mcp_truth["workflow_conflict"]["lead_mediation"];
+
+        let attempts = mediation["execution_attempts"]
+            .as_array()
+            .expect("execution_attempts array");
+        assert_eq!(attempts.len(), 2, "two attempts expected");
+
+        // Both attempts carry mediation-owned identity and a NULL stage execution id.
+        for attempt in attempts {
+            assert_eq!(
+                attempt["owner_kind"],
+                serde_json::json!("lead_conflict_mediation")
+            );
+            assert_eq!(attempt["owner_id"], serde_json::json!(mediation_id));
+            assert_eq!(
+                attempt["mediation_record_id"],
+                serde_json::json!(mediation_id)
+            );
+            assert!(
+                attempt["stage_execution_id"].is_null(),
+                "mediation-owned attempt has no stage execution id"
+            );
+            assert_eq!(attempt["agent_id"], serde_json::json!("lead-agent-1"));
+            assert_eq!(attempt["provider"], serde_json::json!("claude"));
+            assert!(attempt["started_at"].is_string());
+        }
+
+        // Attempts are sorted by started_at ASC; attempt_number is durable
+        // (1..N), not hard-coded.
+        assert_eq!(
+            attempts[0]["agent_execution_id"],
+            serde_json::json!(exec_one_id.to_string())
+        );
+        assert_eq!(attempts[0]["attempt_number"], serde_json::json!(1));
+        assert_eq!(attempts[0]["status"], serde_json::json!("failed"));
+        assert_eq!(
+            attempts[1]["agent_execution_id"],
+            serde_json::json!(exec_two_id.to_string())
+        );
+        assert_eq!(attempts[1]["attempt_number"], serde_json::json!(2));
+        assert_eq!(attempts[1]["status"], serde_json::json!("completed"));
+
+        // The synthesized status_updates entry now reflects the durable
+        // attempt count instead of hard-coded 1.
+        assert_eq!(
+            mediation["status_updates"][0]["attempt_number"],
+            serde_json::json!(2)
+        );
+
+        // No operator_rationale anywhere in the readback.
         let serialized = serde_json::to_string(&mcp_truth).unwrap();
         assert!(!serialized.contains("operator_rationale"));
         assert!(!serialized.contains("operatorRationale"));

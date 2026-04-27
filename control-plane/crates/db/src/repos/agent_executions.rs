@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
@@ -389,6 +389,33 @@ pub async fn list_by_run_tx(
         .fetch_all(&mut **tx)
         .await?;
 
+    rows.iter().map(parse_agent_execution_row).collect()
+}
+
+/// List every `agent_executions` row owned by the given mediation record,
+/// ordered by `started_at` ASC (so callers can index attempts as 1..N).
+///
+/// API-001 (P017 R2 audit): the workflow-conflict mediation readback must
+/// expose conflict-scoped execution attempts. This focused query avoids
+/// the joinful `list_by_run` and returns only mediation-owned rows for a
+/// single mediation, letting MCP/GraphQL build `execution_attempts`
+/// without scanning the whole run.
+pub async fn list_by_mediation_id(
+    pool: &SqlitePool,
+    mediation_id: &str,
+) -> Result<Vec<AgentExecution>> {
+    let query = format!(
+        "SELECT {SELECT_COLS}
+         FROM agent_executions
+         WHERE owner_kind = 'lead_conflict_mediation'
+           AND lead_mediation_record_id = ?
+         ORDER BY started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(mediation_id)
+        .fetch_all(pool)
+        .await
+        .context("list agent_executions by mediation_id")?;
     rows.iter().map(parse_agent_execution_row).collect()
 }
 
