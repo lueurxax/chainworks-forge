@@ -269,6 +269,14 @@ pub struct GqlMediationAttemptArtifact {
     pub file_path: String,
     pub report_kind: Option<String>,
     pub is_pinned: bool,
+    /// P017 R5 / API-003: tiered attribution label mirrored from MCP.
+    /// One of `"transcript_direct"` (tier 1, via
+    /// `agent_executions.transcript_artifact_id`),
+    /// `"execution_id_direct"` (tier 2, via
+    /// `artifacts.agent_execution_id` — the cross-retry isolation
+    /// guarantee), or `"agent_id_correlation"` (tier 3 legacy
+    /// fallback for pre-R5 attempts).
+    pub linkage: String,
 }
 
 impl From<&LeadConflictMediationRecord> for GqlLeadMediation {
@@ -400,6 +408,7 @@ async fn build_mediation_execution_attempts(
                         file_path: a.file_path.clone(),
                         report_kind: a.report_kind.clone(),
                         is_pinned: a.is_pinned,
+                        linkage: "transcript_direct".to_string(),
                     });
                 }
                 found
@@ -426,6 +435,7 @@ async fn build_mediation_execution_attempts(
                 file_path: a.file_path.clone(),
                 report_kind: a.report_kind.clone(),
                 is_pinned: a.is_pinned,
+                linkage: "execution_id_direct".to_string(),
             });
         }
         // Tier 3: legacy fallback (only when no direct linkage exists).
@@ -444,6 +454,7 @@ async fn build_mediation_execution_attempts(
                     file_path: a.file_path.clone(),
                     report_kind: a.report_kind.clone(),
                     is_pinned: a.is_pinned,
+                    linkage: "agent_id_correlation".to_string(),
                 });
             }
         }

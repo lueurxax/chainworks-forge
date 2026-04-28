@@ -2816,6 +2816,45 @@ mod tests {
             .await
             .unwrap();
 
+        // P017 R6 preempt (mirrors MCP API-002 acceptance): stamp
+        // attempt 2 with concrete cost + transcript artifact via
+        // `update_attempt_attribution` so the GraphQL projection
+        // proves non-null cost/transcript_ref the same way the MCP
+        // test does. R5 audit's verification log explicitly named
+        // this asymmetry as the remaining evidence gap.
+        let transcript_artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_test".into(),
+            agent_id: "lead-agent-1".into(),
+            name: "session_transcript".into(),
+            contract_id: "session_transcript".into(),
+            format: ArtifactFormat::Markdown,
+            file_path: "/tmp/session_transcript_gql.md".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "claude".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("session_transcript".into()),
+            report_version: Some(1),
+            agent_execution_id: Some(exec_two_id.to_string()),
+        };
+        let transcript_artifact_id = transcript_artifact.id.to_string();
+        artifacts::insert(&pool, &transcript_artifact).await.unwrap();
+        db::repos::agent_executions::update_attempt_attribution(
+            &pool,
+            exec_two_id,
+            Some(123),
+            Some(500),
+            Some(75),
+            Some(40),
+            Some(&transcript_artifact_id),
+        )
+        .await
+        .unwrap();
+
         let schema = build_schema(
             pool.clone(),
             make_command_handler(pool.clone()),
@@ -2850,7 +2889,7 @@ mod tests {
                           watchdog
                           cost
                           transcriptRef
-                          artifacts {{ id }}
+                          artifacts {{ id linkage }}
                         }}
                       }}
                     }}
@@ -2914,11 +2953,293 @@ mod tests {
             serde_json::json!(2)
         );
 
+        // P017 R6 preempt / API-002 GraphQL parity: attempt 1 cost +
+        // transcriptRef are null (no usage recorded); attempt 2 has
+        // both populated to the concrete values stamped above. This
+        // mirrors the MCP test's non-null assertions one-for-one and
+        // closes the R5 audit's named GraphQL evidence gap.
+        assert!(
+            attempts[0]["cost"].is_null(),
+            "attempt 1 cost should be null when no usage data was recorded"
+        );
+        assert!(
+            attempts[0]["transcriptRef"].is_null(),
+            "attempt 1 transcriptRef should be null when no transcript was persisted"
+        );
+
+        let attempt2_cost = &attempts[1]["cost"];
+        assert!(
+            !attempt2_cost.is_null(),
+            "attempt 2 cost must be non-null after update_attempt_attribution"
+        );
+        assert_eq!(attempt2_cost["total_cost_cents"], serde_json::json!(123));
+        assert_eq!(attempt2_cost["input_tokens"], serde_json::json!(500));
+        assert_eq!(attempt2_cost["output_tokens"], serde_json::json!(75));
+        assert_eq!(attempt2_cost["cached_input_tokens"], serde_json::json!(40));
+
+        let attempt2_transcript = &attempts[1]["transcriptRef"];
+        assert!(
+            !attempt2_transcript.is_null(),
+            "attempt 2 transcriptRef must be non-null when artifact is linked"
+        );
+        assert_eq!(
+            attempt2_transcript["artifact_id"],
+            serde_json::json!(transcript_artifact_id)
+        );
+        assert_eq!(attempt2_transcript["format"], serde_json::json!("markdown"));
+
+        // P017 R6 preempt / API-003 GraphQL parity: attempt 2's
+        // artifact entry surfaces the transcript via the tier-1
+        // `transcript_direct` linkage label. This is the GraphQL
+        // mirror of the MCP linkage assertion that proves the
+        // tiered attribution model is wired the same way on both
+        // northbound surfaces.
+        let attempt2_artifacts = attempts[1]["artifacts"]
+            .as_array()
+            .expect("attempt 2 artifacts array");
+        assert!(
+            attempt2_artifacts.iter().any(|a| {
+                a["id"] == serde_json::json!(transcript_artifact_id)
+                    && a["linkage"] == serde_json::json!("transcript_direct")
+            }),
+            "attempt 2 must surface the direct transcript artifact with transcript_direct linkage"
+        );
+
         // No operator_rationale anywhere in the readback.
         let serialized = serde_json::to_string(&json).unwrap();
         assert!(!serialized.contains("operatorRationale"));
         assert!(!serialized.contains("operator_rationale"));
         assert!(!serialized.contains("PRIVATE rationale"));
+    }
+
+    /// P017 R6 preempt / API-003 acceptance (GraphQL mirror): prove
+    /// cross-retry artifact isolation through the GraphQL projection.
+    ///
+    /// Two attempts by the *same* lead agent each declare a distinct
+    /// output artifact, each linked to its own `agent_execution_id`.
+    /// The GraphQL tier-2 (`execution_id_direct`) readback must show
+    /// attempt 1 surfacing **only** artifact A and attempt 2 surfacing
+    /// **only** artifact B — never each other's. Mirrors the MCP
+    /// `p017_cross_attempt_artifact_isolation_via_mcp_readback` test.
+    #[tokio::test]
+    async fn p017_cross_attempt_artifact_isolation_via_graphql_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let mediation_id = "mediation-p017-cross-attempt-gql";
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.status = WorkflowConflictStatus::OperatorConfirmationRequired;
+        conflict.mediation_record_id = Some(mediation_id.into());
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+        db::repos::lead_conflict_mediations::insert(
+            &pool,
+            &make_lead_mediation_record(run_id, &conflict, mediation_id),
+        )
+        .await
+        .unwrap();
+
+        let exec_one = domain::agent::AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            stage_execution_id: None,
+            agent_id: "lead-agent-shared".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status: domain::agent::AgentStatus::Failed,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: None,
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: Some("lead_conflict_mediation".into()),
+            owner_id: Some(mediation_id.into()),
+            lead_mediation_record_id: Some(mediation_id.into()),
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+        };
+        let exec_one_id = exec_one.id;
+        db::repos::agent_executions::insert(&pool, &exec_one)
+            .await
+            .unwrap();
+
+        let exec_two = domain::agent::AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            started_at: exec_one.started_at + chrono::Duration::seconds(1),
+            status: domain::agent::AgentStatus::Completed,
+            ..exec_one.clone()
+        };
+        let exec_two_id = exec_two.id;
+        db::repos::agent_executions::insert(&pool, &exec_two)
+            .await
+            .unwrap();
+
+        let artifact_a = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_test".into(),
+            agent_id: "lead-agent-shared".into(),
+            name: "attempt_one_output_gql".into(),
+            contract_id: "lead_mediation_output".into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/attempt_one_output_gql.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "claude".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("lead_mediation_output".into()),
+            report_version: Some(1),
+            agent_execution_id: Some(exec_one_id.to_string()),
+        };
+        let artifact_a_id = artifact_a.id.to_string();
+        artifacts::insert(&pool, &artifact_a).await.unwrap();
+
+        let artifact_b = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_test".into(),
+            agent_id: "lead-agent-shared".into(),
+            name: "attempt_two_output_gql".into(),
+            contract_id: "lead_mediation_output".into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/attempt_two_output_gql.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "claude".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("lead_mediation_output".into()),
+            report_version: Some(1),
+            agent_execution_id: Some(exec_two_id.to_string()),
+        };
+        let artifact_b_id = artifact_b.id.to_string();
+        artifacts::insert(&pool, &artifact_b).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query P017CrossAttemptIsolation {{
+                  run(id: "{run_id}") {{
+                    workflowConflict {{
+                      leadMediation {{
+                        executionAttempts {{
+                          agentExecutionId
+                          artifacts {{ id linkage }}
+                        }}
+                      }}
+                    }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+
+        let json = response.data.into_json().unwrap();
+        let attempts = json["run"]["workflowConflict"]["leadMediation"]
+            ["executionAttempts"]
+            .as_array()
+            .expect("executionAttempts array");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0]["agentExecutionId"],
+            serde_json::json!(exec_one_id.to_string())
+        );
+        assert_eq!(
+            attempts[1]["agentExecutionId"],
+            serde_json::json!(exec_two_id.to_string())
+        );
+
+        // Attempt 1 — sees ONLY artifact A.
+        let attempt_one_artifacts = attempts[0]["artifacts"]
+            .as_array()
+            .expect("attempt 1 artifacts");
+        assert!(
+            attempt_one_artifacts.iter().any(|a| {
+                a["id"] == serde_json::json!(artifact_a_id)
+                    && a["linkage"] == serde_json::json!("execution_id_direct")
+            }),
+            "attempt 1 must surface its own output artifact A via tier-2 linkage"
+        );
+        assert!(
+            !attempt_one_artifacts
+                .iter()
+                .any(|a| a["id"] == serde_json::json!(artifact_b_id)),
+            "attempt 1 must NOT see artifact B (cross-retry isolation)"
+        );
+
+        // Attempt 2 — sees ONLY artifact B.
+        let attempt_two_artifacts = attempts[1]["artifacts"]
+            .as_array()
+            .expect("attempt 2 artifacts");
+        assert!(
+            attempt_two_artifacts.iter().any(|a| {
+                a["id"] == serde_json::json!(artifact_b_id)
+                    && a["linkage"] == serde_json::json!("execution_id_direct")
+            }),
+            "attempt 2 must surface its own output artifact B via tier-2 linkage"
+        );
+        assert!(
+            !attempt_two_artifacts
+                .iter()
+                .any(|a| a["id"] == serde_json::json!(artifact_a_id)),
+            "attempt 2 must NOT see artifact A (cross-retry isolation)"
+        );
+
+        // No tier-3 fallback when tier-2 linkage exists.
+        for attempt in attempts {
+            for art in attempt["artifacts"].as_array().unwrap_or(&Vec::new()) {
+                assert_ne!(
+                    art["linkage"],
+                    serde_json::json!("agent_id_correlation"),
+                    "tier-3 fallback must not be used when tier-2 linkage exists"
+                );
+            }
+        }
     }
 
     #[tokio::test]

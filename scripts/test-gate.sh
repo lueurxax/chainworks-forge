@@ -1878,6 +1878,11 @@ PY
       cargo test -p db --test proposal_017_workflow_conflict_persistence -- --test-threads=1 --nocapture
       cargo test -p mcp-server proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p graphql-server proposal_017_ -- --test-threads=1 --nocapture
+      # P017 R6 preempt: also pick up the lowercase `p017_` prefix
+      # (cross-attempt isolation acceptance tests) — the
+      # `proposal_017_` filter above does not match these names.
+      cargo test -p mcp-server p017_ -- --test-threads=1 --nocapture
+      cargo test -p graphql-server p017_ -- --test-threads=1 --nocapture
 
       # Phase B/C: Lead mediation and owner-aware execution
       cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
@@ -2060,6 +2065,38 @@ PY
         die "P017 R5 OPS-003: missing metric emit test $t"
       fi
     done
+
+    # ── R6 preempt guards (GraphQL parity + cross-attempt isolation) ───
+    # Anticipated R6 audit findings closed before the audit runs:
+    #   * GraphQL P017 attempts test asserts non-null cost/transcript
+    #     (R5 audit named this asymmetry as the remaining evidence gap)
+    #   * MCP + GraphQL each have a dedicated cross-attempt artifact
+    #     isolation acceptance test (R5 API-003 acceptance criteria)
+    #   * GraphQL `GqlMediationAttemptArtifact` carries a `linkage`
+    #     field mirroring MCP's three-tier label
+    P017_R6_GQL_TYPES="$ROOT_DIR/control-plane/crates/graphql-server/src/types/run.rs"
+    if [[ ! -f "$P017_R6_GQL_TYPES" ]]; then
+      die "P017 R6 preempt: missing $P017_R6_GQL_TYPES"
+    fi
+    for linkage in "transcript_direct" "execution_id_direct" "agent_id_correlation"; do
+      if ! grep -q "linkage: \"$linkage\".to_string()" "$P017_R6_GQL_TYPES"; then
+        die "P017 R6 preempt: GraphQL artifact projection missing tier label $linkage"
+      fi
+    done
+    P017_R6_GQL_SCHEMA="$ROOT_DIR/control-plane/crates/graphql-server/src/schema.rs"
+    if ! grep -q "attempt 2 cost must be non-null after update_attempt_attribution" \
+        "$P017_R6_GQL_SCHEMA"; then
+      die "P017 R6 preempt: GraphQL P017 attempts test missing non-null cost assertion"
+    fi
+    if ! grep -q "p017_cross_attempt_artifact_isolation_via_graphql_readback" \
+        "$P017_R6_GQL_SCHEMA"; then
+      die "P017 R6 preempt: GraphQL cross-attempt isolation test missing"
+    fi
+    P017_R6_MCP_REPORTS="$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"
+    if ! grep -q "p017_cross_attempt_artifact_isolation_via_mcp_readback" \
+        "$P017_R6_MCP_REPORTS"; then
+      die "P017 R6 preempt: MCP cross-attempt isolation test missing"
+    fi
 
     log "Proposal 017 gate passed"
     ;;
