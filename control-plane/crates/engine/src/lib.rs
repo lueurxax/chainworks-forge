@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod mediation;
 pub mod orchestrator;
 pub mod preflight;
+pub mod proposal_review_router;
 pub mod recovery;
 pub mod release;
 pub mod session;

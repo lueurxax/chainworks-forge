@@ -1274,6 +1274,7 @@ impl MutationRoot {
             delivery_configuration_json,
             workflow_yaml_path,
             agent_catalog_yaml_path,
+            review_routing_json: None,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -1561,7 +1562,8 @@ impl SubscriptionRoot {
                     | DomainEvent::ApprovalRequested { run_id, .. }
                     | DomainEvent::ArtifactCreated { run_id, .. }
                     | DomainEvent::RuntimeStatusChanged { run_id, .. }
-                    | DomainEvent::MediationConfirmationResolved { run_id, .. } => Some(run_id),
+                    | DomainEvent::MediationConfirmationResolved { run_id, .. }
+                    | DomainEvent::RoutingCompleted { run_id, .. } => Some(run_id),
                     DomainEvent::ApprovalResolved { approval_id, .. } => {
                         approvals::find_by_id(&pool, approval_id)
                             .await
@@ -1910,6 +1912,7 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         }
     }
 

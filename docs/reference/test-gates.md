@@ -1256,10 +1256,51 @@ Host policy:
 - local Rust toolchain required; no UI target or simulator needed
 
 Command:
-
 ```bash
 ./scripts/test-gate.sh proposal-065
 ```
+
+### `proposal-060|p060`
+
+Deterministic reviewer routing and expanded reviewer catalog gate.
+
+Scope:
+
+- `proposal_review_router` SystemTask and `executor_mode: system.routing`
+- `AgentSelectionPlanV1` and `RoutingReceipt` persistence
+- deterministic scoring formula parity (Swift/Rust)
+- mandatory reviewer rules, force_include/exclude overrides, and under_specified fallback
+- dynamic reviewer materialization via `dynamic_parallel`
+- `selected_outputs_from` aggregation for dynamic reviewer sets
+- core specialist reviewer enablement (macOS, Apple architecture, Rust architecture, reliability, security, API contract, observability/rollout)
+- `operator_debug_routing_evidence` capability and hash-only vs raw evidence projection
+- Phase 0b control artifacts: `fixed-quartet-inventory`, `frozen-snapshot-helper-inventory`, `implementation-ticket-map`, `proposal-review-baseline`, `routing-calibration-report`, `routing-contract-fixtures`, and `storage-compatibility-matrix`
+
+Use when:
+
+- changing reviewer routing logic, scoring, or selection rules
+- changing `dynamic_parallel` materialization or `selected_outputs_from` aggregation
+- adding or enabling new specialist reviewers in the catalog
+- changing routing-evidence projection or redaction policy
+- updating routing fixtures or control artifacts
+
+Host policy:
+
+- local Rust and macOS Swift test toolchains required
+- no live provider account, simulator, or network required
+- verifies Phase 0b control artifacts at their canonical paths before runtime work proceeds
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-060
+```
+
+Important:
+
+- `p060` is accepted as an alias
+- the gate fails closed if any Phase 0b control artifact is missing, stale, or revision-mismatched
+- same-head parity for plan_hash and evidence IDs is enforced across Swift and Rust
 
 ### `full`
 

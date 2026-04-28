@@ -13,6 +13,7 @@ pub mod main_sync;
 pub mod mediation;
 pub mod provider;
 pub mod retry_instruction;
+pub mod routing;
 pub mod run;
 pub mod session;
 pub mod stage;

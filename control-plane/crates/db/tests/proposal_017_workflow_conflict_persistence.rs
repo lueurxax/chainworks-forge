@@ -65,6 +65,7 @@ async fn seed_run_and_stage(pool: &sqlx::SqlitePool) -> (RunId, StageExecutionId
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(pool, &run).await.unwrap();
 

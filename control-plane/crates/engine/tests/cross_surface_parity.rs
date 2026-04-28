@@ -81,6 +81,7 @@ fn make_start_cmd(idea_id: IdeaId, delivery_configuration_json: String) -> Comma
         delivery_configuration_json: Some(delivery_configuration_json),
         workflow_yaml_path: test_workflow_yaml_path(),
         agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
+        review_routing_json: None,
     })
 }
 

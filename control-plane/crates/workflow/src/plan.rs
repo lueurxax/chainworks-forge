@@ -35,6 +35,10 @@ pub struct RunPlan {
     pub workflow_snapshot_json: String,
     /// Canonical parsed agent-catalog snapshot JSON.
     pub catalog_snapshot_json: String,
+    /// P060: Dynamic candidate bindings for proposal review routing.
+    /// Compiled from catalog entries with `routing` metadata.
+    #[serde(default)]
+    pub dynamic_candidate_bindings: Vec<domain::routing::CompiledDynamicAgentBinding>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +65,27 @@ pub struct CompiledState {
     pub loop_config: Option<CompiledLoop>,
     #[serde(default)]
     pub degraded_output_policy: DegradedOutputPolicy,
+    /// P060: Dynamic parallel configuration (materializes from selector artifact).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_parallel: Option<CompiledDynamicParallel>,
+    /// P060: System task configuration (no provider invocation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_task: Option<CompiledSystemTask>,
+}
+
+/// P060: Compiled dynamic_parallel block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledDynamicParallel {
+    pub selector_artifact: String,
+    pub output_contract: String,
+    pub inputs: Vec<String>,
+}
+
+/// P060: Compiled system task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledSystemTask {
+    pub task_type: String,
+    pub executor_mode: String,
 }
 
 /// A resolved agent binding: agent ID → provider + model.
@@ -152,6 +177,18 @@ pub struct CompiledTask {
     /// only enqueued after all phase 0 tasks complete.
     #[serde(default)]
     pub phase: u32,
+    /// P060: selected_outputs_from declaration for aggregation tasks.
+    /// When present, the orchestrator resolves selected reviewer artifacts
+    /// and injects them into the task prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_outputs_from: Option<CompiledSelectedOutputsFrom>,
+}
+
+/// P060: Compiled selected_outputs_from configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledSelectedOutputsFrom {
+    pub source_plan: String,
+    pub output_contract: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

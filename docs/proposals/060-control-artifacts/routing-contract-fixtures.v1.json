@@ -1,0 +1,34 @@
+{
+  "schema": "routing_contract_fixtures_v1",
+  "proposal_revision_id": "P060-r16-2026-04-22",
+  "source_commit": "7ac5f7854",
+  "canonicalization": { "evidence_ids": ["e1"], "scores": [9], "selected_order": ["proposal_reviewer_macos"], "plan_hash": "hash", "warnings": ["under_specified"], "validation_failures": ["override_conflict"], "under_specified": true, "mandatory_overflow": true },
+  "dynamic_phase_contract": {
+    "system.routing": "yaml",
+    "system_task": "proposal_review_router",
+    "dynamic_parallel": "yaml",
+    "candidate_bindings": ["compiler-owned"],
+    "selected_outputs_from": { "run_id": "run", "attempt": 1, "plan_hash": "hash", "binding_id": "binding", "agent_execution_id": "agent", "proposal_review_v1": true },
+    "swift": "codable",
+    "rust": "serde",
+    "compiled_plan": "snapshot",
+    "invalid_case": "parity_matrix"
+  },
+  "selected_agents": [
+    { "reviewer_count": 2, "dynamic_parallel": true, "selected_outputs_from": true },
+    { "reviewer_count": 3, "dynamic_parallel": true, "selected_outputs_from": true },
+    { "reviewer_count": 4, "dynamic_parallel": true, "selected_outputs_from": true },
+    { "reviewer_count": 5, "dynamic_parallel": true, "selected_outputs_from": true }
+  ],
+  "validation_guard_cases": ["force_include", "force_exclude", "mandatory_conflict", "disabled_rollout_wave", "unknown_agent", "placeholder_resolved_agent"],
+  "deterministic_parity": { "same_input": true, "swift": "implementation", "rust": "implementation", "selected_order": ["a"], "evidence_ids": ["e1"], "plan_hash": "hash" },
+  "routing_metadata_required_fields": ["routing_id", "family", "capabilities", "stacks", "surfaces", "risks", "enabled_for_proposal_review", "rollout_wave"],
+  "catalog_launch_scope": {
+    "existing": ["proposal_reviewer_product_owner", "proposal_reviewer_ux", "proposal_reviewer_ui", "proposal_reviewer_architect"],
+    "phase_3_core": ["proposal_reviewer_macos", "proposal_reviewer_apple_architect", "proposal_reviewer_rust_architect", "proposal_reviewer_reliability", "proposal_reviewer_security", "proposal_reviewer_api_contract", "proposal_reviewer_observability_rollout"],
+    "phase_3_core_enabled": { "phase_3_core": true, "enabled_for_proposal_review": true },
+    "later_wave": ["proposal_reviewer_ios", "proposal_reviewer_web", "proposal_reviewer_design", "proposal_reviewer_golang", "proposal_reviewer_dba", "proposal_reviewer_performance"],
+    "later_wave_disabled": { "later_wave": true, "enabled_for_proposal_review": false },
+    "disabled_by_rollout_wave": "cannot_materialize"
+  }
+}

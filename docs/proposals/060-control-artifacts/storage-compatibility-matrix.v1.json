@@ -1,0 +1,12 @@
+{
+  "schema": "storage_compatibility_matrix_v1",
+  "proposal_revision_id": "P060-r16-2026-04-22",
+  "source_commit": "7ac5f7854",
+  "matrix": [
+    { "entity": "SystemExecution", "old_run_readback": "hash-only", "rollback_readback": "preserved", "graphql": "exposed", "mcp": "exposed", "report_precedence": "newer wins", "recovery_precedence": "routing first", "migration_behavior": "additive" },
+    { "entity": "RoutingReceipt", "old_run_readback": "missing means none", "rollback_readback": "preserved", "graphql": "exposed", "mcp": "exposed", "report_precedence": "receipt wins", "recovery_precedence": "receipt first", "migration_behavior": "additive" },
+    { "entity": "AgentSelectionPlanV1", "old_run_readback": "absent", "rollback_readback": "preserved", "graphql": "exposed", "mcp": "exposed", "report_precedence": "selected plan", "recovery_precedence": "plan first", "migration_behavior": "additive" },
+    { "entity": "DynamicMaterializationRecord", "old_run_readback": "absent", "rollback_readback": "preserved", "graphql": "exposed", "mcp": "exposed", "report_precedence": "materialization", "recovery_precedence": "idempotency", "migration_behavior": "additive" },
+    { "entity": "ReviewCorpusBundleV2", "old_run_readback": "bundle v1 fallback", "rollback_readback": "preserved", "graphql": "exposed", "mcp": "exposed", "report_precedence": "selected artifacts", "recovery_precedence": "selected outputs", "migration_behavior": "additive" }
+  ]
+}

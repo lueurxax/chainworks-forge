@@ -214,11 +214,13 @@ It may narrow the operator action after a watchdog failure or exhausted retry, b
 
 ### Workflow Conflict Recovery
 
-When declarative graph authority fails to select a valid next state, the run 
-blocks with a `WorkflowConflictRecord`.
+When declarative graph authority fails to select a valid next state, or when
+system routing fails to select a valid reviewer set (e.g., >5 mandatory
+reviewers), the run blocks with a `WorkflowConflictRecord`.
 
 **Conflict Classification:**
 - `unresolved`: Initial state requiring attention.
+- `routing_conflict`: Specifically for deterministic routing failures (P060).
 - `lead_mediation_pending`: Escalated to a system lead for same-run resolution.
 - `operator_confirmation_required`: Lead produced a resolution that requires 
   manual approval.

@@ -3054,6 +3054,63 @@ PY
     ;;
   proposal-060|p060)
     run_proposal060_all_control_artifacts
+    log "Proposal 060 Rust gate: Phase 1 + Phase 2 + Phase 3 focused tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-060-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain --lib routing -- --test-threads=1 --nocapture
+      cargo test -p engine --lib proposal_review_router -- --test-threads=1 --nocapture
+      cargo test -p workflow --test integration p060 -- --test-threads=1 --nocapture
+    )
+
+    # Phase 3 closure guards (audit ARCH/OPS-style).
+    # These die before the gate exits if any of the Phase 3 contracts
+    # have been removed even if a copycat test still passes structurally.
+    log "Verifying P060 Phase 3 closure surfaces..."
+    P060_AUTHORIZER_FILE="$ROOT_DIR/control-plane/crates/domain/src/routing.rs"
+    P060_ORCHESTRATOR_FILE="$ROOT_DIR/control-plane/crates/engine/src/orchestrator.rs"
+    if ! grep -q "RoutingEvidenceProjectionAuthorizer" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: missing RoutingEvidenceProjectionAuthorizer in domain::routing"
+    fi
+    if ! grep -q "PrincipalClassDebugRoutingHook" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: missing PrincipalClassDebugRoutingHook trait in domain::routing"
+    fi
+    if ! grep -q "CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: authorizer missing CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE env gate"
+    fi
+    if ! grep -q "resolve_effective_routing_mode" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: missing resolve_effective_routing_mode in domain::routing"
+    fi
+    if ! grep -q "CHAINWORKS_P060_ROUTING_MODE_OVERRIDE" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: feature-flag env name CHAINWORKS_P060_ROUTING_MODE_OVERRIDE missing"
+    fi
+    if ! grep -q "is_shadow" "$P060_ORCHESTRATOR_FILE"; then
+      die "P060 Phase 3: orchestrator missing shadow-mode dispatch handling"
+    fi
+    if ! grep -q "shadow_succeeded\|shadow_failed" "$P060_ORCHESTRATOR_FILE"; then
+      die "P060 Phase 3: orchestrator missing shadow_succeeded/shadow_failed RoutingCompleted labels"
+    fi
+    if ! grep -q "resolve_effective_routing_mode" "$P060_ORCHESTRATOR_FILE"; then
+      die "P060 Phase 3: orchestrator does not consult resolve_effective_routing_mode"
+    fi
+    # Phase 3 closure tests: at least one test name per contract must exist.
+    P060_DOMAIN_TEST_PATTERNS=(
+      "routing_evidence_projection_authorizer_default_is_redacted"
+      "routing_evidence_projection_authorizer_full_preserves_fields"
+      "routing_evidence_projection_authorizer_redacts_for_non_operators"
+      "routing_evidence_projection_authorizer_grants_operator_with_env"
+      "resolve_effective_routing_mode_no_env_returns_per_run_mode"
+      "resolve_effective_routing_mode_env_legacy_overrides_dynamic"
+      "resolve_effective_routing_mode_env_shadow_overrides_legacy"
+      "resolve_effective_routing_mode_unrecognized_env_falls_back_to_per_run"
+    )
+    for t in "${P060_DOMAIN_TEST_PATTERNS[@]}"; do
+      if ! grep -q "$t" "$P060_AUTHORIZER_FILE"; then
+        die "P060 Phase 3: closure test '$t' missing from domain::routing tests"
+      fi
+    done
+    log "Proposal 060 gate passed"
     ;;
   proposal-060-baseline|p060-baseline|proposal-060-storage|p060-storage|proposal-060-router-fixtures|p060-router-fixtures|proposal-060-snapshot-inventory|p060-snapshot-inventory|proposal-060-fixed-quartet|p060-fixed-quartet|proposal-060-ticket-map|p060-ticket-map|proposal-060-calibration|p060-calibration)
     run_proposal060_control_artifact_gate "$GATE"
