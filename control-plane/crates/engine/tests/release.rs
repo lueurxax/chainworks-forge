@@ -211,6 +211,7 @@ async fn persist_json_artifact<T: serde::Serialize>(
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         },
     )
     .await
@@ -1216,6 +1217,7 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         },
     )
     .await

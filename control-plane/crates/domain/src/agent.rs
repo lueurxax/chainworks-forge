@@ -75,6 +75,27 @@ pub struct AgentExecution {
     pub lead_mediation_record_id: Option<String>,
     /// P017: Origin stage execution ID for mediation-owned executions (compatibility context).
     pub origin_stage_execution_id: Option<String>,
+    // ── P017 R4 / API-002: per-attempt cost & transcript attribution ──
+    /// Total cost in cents reported by the provider for this execution
+    /// attempt (sum of provider-reported `cost_cents`). Always populated
+    /// for mediation-owned executions; stage-owned executions populate
+    /// when the provider reports usage.
+    #[serde(default)]
+    pub total_cost_cents: Option<i64>,
+    /// Provider input tokens for this attempt (from `UsageSnapshot`).
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    /// Provider output tokens for this attempt (from `UsageSnapshot`).
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+    /// Provider cached input tokens for this attempt.
+    #[serde(default)]
+    pub cached_input_tokens: Option<i64>,
+    /// FK into `artifacts.id` for the session-transcript artifact when the
+    /// executor persisted one. Lets MCP/GraphQL `execution_attempts.transcript_ref`
+    /// resolve directly without artifact-name heuristics.
+    #[serde(default)]
+    pub transcript_artifact_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

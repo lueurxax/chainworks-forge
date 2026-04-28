@@ -466,6 +466,524 @@ async fn p017_workflow_conflict_resolution_records_operator_feedback_metrics() {
     }));
 }
 
+/// P017 R2 / OPS-001: phase_c_validation_outcome_total has at least one
+/// production caller and inserts a metric_event with the right labels.
+#[tokio::test]
+async fn p017_phase_c_validation_outcome_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_phase_c_validation_outcome_tx(
+        &mut tx,
+        run_id,
+        "pass",
+        "compile",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.metric_name == "phase_c_validation_outcome_total"
+            && event.labels_json["outcome"] == "pass"
+            && event.labels_json["source"] == "compile"
+    }));
+}
+
+/// P017 R2 / OPS-001: lead_mediation_attempt_total emits with the
+/// per-attempt labels the audit asked for (result, mediation id,
+/// attempt number, lead agent id).
+#[tokio::test]
+async fn p017_lead_mediation_attempt_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_lead_mediation_attempt_tx(
+        &mut tx,
+        &run_id.to_string(),
+        Some("conflict-X"),
+        "med-attempt-1",
+        "lead-agent-1",
+        "validated_awaiting_confirmation",
+        2,
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let attempt_event = events
+        .iter()
+        .find(|event| event.metric_name == "lead_mediation_attempt_total")
+        .expect("lead_mediation_attempt_total metric event must exist");
+    assert_eq!(attempt_event.conflict_id.as_deref(), Some("conflict-X"));
+    assert_eq!(
+        attempt_event.labels_json["result"],
+        "validated_awaiting_confirmation"
+    );
+    assert_eq!(
+        attempt_event.labels_json["mediation_record_id"],
+        "med-attempt-1"
+    );
+    assert_eq!(attempt_event.labels_json["attempt_number"], 2);
+    assert_eq!(attempt_event.labels_json["lead_agent_id"], "lead-agent-1");
+}
+
+/// P017 R2 / OPS-001: external_catalog_warning_total emits with typed
+/// warning kind, decision, and source surface labels.
+#[tokio::test]
+async fn p017_external_catalog_warning_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_external_catalog_warning_tx(
+        &mut tx,
+        &run_id.to_string(),
+        "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED",
+        "enabled",
+        "legacy_discovery_override",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let warning_event = events
+        .iter()
+        .find(|event| event.metric_name == "external_catalog_warning_total")
+        .expect("external_catalog_warning_total metric event must exist");
+    assert_eq!(
+        warning_event.labels_json["warning_kind"],
+        "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED"
+    );
+    assert_eq!(warning_event.labels_json["decision"], "enabled");
+    assert_eq!(
+        warning_event.labels_json["source_surface"],
+        "legacy_discovery_override"
+    );
+}
+
+/// P017 R4 / OPS-002: Phase C compile failure path emits with NULL run_id.
+#[tokio::test]
+async fn p017_phase_c_validation_failure_metric_emits_without_run() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    workflow_conflicts::record_phase_c_validation_failure(
+        &pool,
+        "lead_missing",
+        Some("examples/workflows/test.yaml"),
+        Some("examples/agents/test.yaml"),
+        now,
+    )
+    .await
+    .unwrap();
+
+    // The metric exists with NULL run_id — query directly via SQL since
+    // list_metric_events_for_run is run-scoped.
+    let row: (String, Option<String>, String) = sqlx::query_as(
+        "SELECT metric_name, run_id, labels_json
+         FROM workflow_conflict_metric_events
+         WHERE metric_name = 'phase_c_validation_outcome_total'
+           AND labels_json LIKE '%fail%'
+         LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "phase_c_validation_outcome_total");
+    assert!(row.1.is_none(), "fail-path event must have NULL run_id");
+    assert!(row.2.contains("\"outcome\":\"fail\""));
+    assert!(row.2.contains("lead_missing"));
+}
+
+/// P017 R4 / OPS-002: duplicate_mediation_session_total emits when a
+/// resume / orchestrator replay finds an active mediation already exists.
+#[tokio::test]
+async fn p017_duplicate_mediation_session_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_duplicate_mediation_session_tx(
+        &mut tx,
+        &run_id.to_string(),
+        "conflict-X",
+        "med-X",
+        "try_initiate",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "duplicate_mediation_session_total")
+        .expect("duplicate_mediation_session_total must exist");
+    assert_eq!(event.conflict_id.as_deref(), Some("conflict-X"));
+    assert_eq!(event.labels_json["mediation_record_id"], "med-X");
+    assert_eq!(event.labels_json["detection_source"], "try_initiate");
+}
+
+/// P017 R4 / OPS-002: report_readback_completeness emits a ratio of
+/// expected→present fields with the correct labels.
+#[tokio::test]
+async fn p017_report_readback_completeness_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let expected = ["a", "b", "c", "d"];
+    let present = ["a", "b", "c"];
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_report_readback_completeness_tx(
+        &mut tx,
+        &run_id.to_string(),
+        Some("conflict-Y"),
+        &expected,
+        &present,
+        "mcp.workflow_conflict_json",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "report_readback_completeness")
+        .expect("report_readback_completeness must exist");
+    assert_eq!(event.unit, "ratio");
+    assert!(
+        (event.value - 0.75).abs() < 1e-6,
+        "ratio should be 3/4 = 0.75; got {}",
+        event.value
+    );
+    assert_eq!(
+        event.labels_json["surface"],
+        "mcp.workflow_conflict_json"
+    );
+}
+
+/// P017 R4 / OPS-002: phase_c_lead_inventory_external_catalog_total
+/// emits with the inventory_result + enforcement_decision labels.
+#[tokio::test]
+async fn p017_phase_c_lead_inventory_external_catalog_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_phase_c_lead_inventory_external_catalog_tx(
+        &mut tx,
+        Some(&run_id.to_string()),
+        "zero_active_externals",
+        "waive_warning_window",
+        Some("examples/agents/test.yaml"),
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "phase_c_lead_inventory_external_catalog_total")
+        .expect("phase_c_lead_inventory_external_catalog_total must exist");
+    assert_eq!(
+        event.labels_json["inventory_result"],
+        "zero_active_externals"
+    );
+    assert_eq!(
+        event.labels_json["enforcement_decision"],
+        "waive_warning_window"
+    );
+}
+
+/// P017 R4 / OPS-002: mediation_late_output_ignored_total emits with
+/// the per-mediation reason label.
+#[tokio::test]
+async fn p017_mediation_late_output_ignored_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_mediation_late_output_ignored_tx(
+        &mut tx,
+        &run_id.to_string(),
+        Some("conflict-Z"),
+        "med-Z",
+        "mediation_terminal_or_missing",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "mediation_late_output_ignored_total")
+        .expect("mediation_late_output_ignored_total must exist");
+    assert_eq!(event.conflict_id.as_deref(), Some("conflict-Z"));
+    assert_eq!(event.labels_json["mediation_record_id"], "med-Z");
+    assert_eq!(
+        event.labels_json["reason"],
+        "mediation_terminal_or_missing"
+    );
+}
+
+/// P017 R4 / API-002: persisting per-attempt cost + transcript via
+/// `update_attempt_attribution` is reflected in `find_by_id`.
+#[tokio::test]
+async fn p017_per_attempt_cost_and_transcript_persisted() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let exec_id = domain::ids::AgentExecutionId::new();
+    let exec = domain::agent::AgentExecution {
+        id: exec_id,
+        stage_execution_id: Some(stage_execution_id),
+        agent_id: "lead-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        status: domain::agent::AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
+    };
+    let _ = run_id; // run association via stage
+    db::repos::agent_executions::insert(&pool, &exec).await.unwrap();
+
+    // First call: cost only (transcript_artifact_id stays None — no
+    // FK violation).
+    db::repos::agent_executions::update_attempt_attribution(
+        &pool,
+        exec_id,
+        Some(42),       // total_cost_cents
+        Some(100),      // input_tokens
+        Some(25),       // output_tokens
+        Some(10),       // cached_input_tokens
+        None,           // transcript_artifact_id stays None
+    )
+    .await
+    .unwrap();
+
+    let after = db::repos::agent_executions::find_by_id(&pool, exec_id)
+        .await
+        .unwrap()
+        .expect("execution must still exist");
+    assert_eq!(after.total_cost_cents, Some(42));
+    assert_eq!(after.input_tokens, Some(100));
+    assert_eq!(after.output_tokens, Some(25));
+    assert_eq!(after.cached_input_tokens, Some(10));
+    assert!(after.transcript_artifact_id.is_none());
+
+    // Second call: insert a real artifact + link it as the transcript.
+    let artifact = domain::artifact::Artifact {
+        id: domain::ids::ArtifactId::new(),
+        run_id,
+        stage_id: "state_test".into(),
+        agent_id: exec.agent_id.clone(),
+        name: "session_transcript".into(),
+        contract_id: "session_transcript".into(),
+        format: domain::artifact::ArtifactFormat::Markdown,
+        file_path: "/tmp/transcript.md".into(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: exec.provider.clone(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: Some("session_transcript".into()),
+        report_version: Some(1),
+        agent_execution_id: None,
+    };
+    let artifact_id = artifact.id.to_string();
+    db::repos::artifacts::insert(&pool, &artifact).await.unwrap();
+
+    db::repos::agent_executions::update_attempt_attribution(
+        &pool,
+        exec_id,
+        None, None, None, None,
+        Some(&artifact_id),
+    )
+    .await
+    .unwrap();
+    let after2 = db::repos::agent_executions::find_by_id(&pool, exec_id)
+        .await
+        .unwrap()
+        .expect("execution must still exist");
+    assert_eq!(
+        after2.transcript_artifact_id.as_deref(),
+        Some(artifact_id.as_str())
+    );
+    // Cost values from the first call must still be there (COALESCE).
+    assert_eq!(after2.total_cost_cents, Some(42));
+}
+
+/// P017 R5 / OPS-003: advisory_rejection_total emits per insert and
+/// also emits invalid_next_stage_hint_non_blocking_total when the
+/// graph_membership_result is `absent_from_graph`.
+#[tokio::test]
+async fn p017_advisory_rejection_metrics_emit() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let rec = advisory_rejection_record(run_id, stage_execution_id);
+    workflow_conflicts::insert_advisory_rejection(&pool, &rec)
+        .await
+        .unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let names: Vec<&str> = events.iter().map(|e| e.metric_name.as_str()).collect();
+    assert!(names.contains(&"advisory_rejection_total"));
+    assert!(names.contains(&"invalid_next_stage_hint_non_blocking_total"));
+
+    let advisory = events
+        .iter()
+        .find(|e| e.metric_name == "advisory_rejection_total")
+        .unwrap();
+    assert_eq!(
+        advisory.labels_json["graph_membership_result"],
+        "absent_from_graph"
+    );
+
+    let invalid = events
+        .iter()
+        .find(|e| e.metric_name == "invalid_next_stage_hint_non_blocking_total")
+        .unwrap();
+    assert_eq!(invalid.labels_json["advisory_next_action"], "revise_proposal");
+}
+
+/// P017 R5 / OPS-003: workflow_conflict_current_total emits per
+/// upsert with (reason, status) labels.
+#[tokio::test]
+async fn p017_workflow_conflict_current_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let rec = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-current",
+        "No declarative transition matched",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &rec)
+        .await
+        .unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "workflow_conflict_current_total")
+        .expect("workflow_conflict_current_total must exist");
+    assert_eq!(
+        event.labels_json["reason"],
+        "no_declarative_transition_matched"
+    );
+    assert_eq!(event.labels_json["status"], "unresolved");
+}
+
+/// P017 R5 / OPS-003: terminal_unverifiable_total emits when a
+/// conflict transitions to TerminalUnverifiable.
+#[tokio::test]
+async fn p017_terminal_unverifiable_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id) = seed_run_and_stage(&pool).await;
+    let rec = conflict_record(
+        run_id,
+        stage_execution_id,
+        "conflict-terminal",
+        "No declarative transition matched",
+        WorkflowConflictStatus::Unresolved,
+        0,
+    );
+    let stored = workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &rec)
+        .await
+        .unwrap();
+
+    workflow_conflicts::transition_conflict_status(
+        &pool,
+        &stored.conflict_id,
+        WorkflowConflictStatus::TerminalUnverifiable,
+        Utc::now(),
+        None,
+        Some("operator_abandoned_after_lead_failure".into()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "terminal_unverifiable_total")
+        .expect("terminal_unverifiable_total must exist");
+    assert_eq!(
+        event.labels_json["terminal_failure_reason"],
+        "operator_abandoned_after_lead_failure"
+    );
+}
+
 #[tokio::test]
 async fn p017_transition_cursor_upserts_run_settlement_boundary() {
     let pool = test_pool().await;

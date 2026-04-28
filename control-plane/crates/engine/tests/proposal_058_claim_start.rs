@@ -490,6 +490,11 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             owner_id: None,
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await
@@ -1408,6 +1413,11 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
             owner_id: None,
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await
@@ -1453,6 +1463,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1600,6 +1611,11 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
             owner_id: None,
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await
@@ -1629,6 +1645,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1657,6 +1674,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )

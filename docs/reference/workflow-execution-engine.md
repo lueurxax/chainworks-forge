@@ -115,9 +115,23 @@ A `@MainActor @Observable` per-run state machine driver. Design invariants:
 6. Advance `currentStateID` and repeat.
 
 **Run block execution**: Phases execute in declaration order. `.sequential` tasks
-run one-by-one; `.parallel` tasks run via `withTaskGroup`. Each task creates an
-`AgentExecution`, gathers input artifacts, builds an `ExecutionContext`, calls the
-executor, then persists outputs through `ArtifactManager`.
+run one-by-one; `.parallel` tasks run via `withTaskGroup`; `.dynamic_parallel`
+tasks read a typed selector artifact (e.g. `AgentSelectionPlanV1`) and materialize
+only the selected agent executions from compiled candidate bindings. Each task
+creates an `AgentExecution`, gathers input artifacts, builds an `ExecutionContext`,
+calls the executor, then persists outputs through `ArtifactManager`.
+
+### System Tasks and Routing (`proposal_review_router.rs`)
+
+The engine supports first-class `SystemTask` types that execute without provider
+invocation. The `proposal_review_router` uses `executor_mode: system.routing` to
+perform deterministic reviewer selection over proposal evidence and catalog
+metadata.
+
+- **`AgentSelectionPlanV1`** -- the authoritative plan for selected reviewers.
+- **`RoutingReceipt`** -- the terminal receipt for a routing attempt, including
+  rationale and input hashes.
+- **`SystemExecution`** -- the lifecycle record for a system task.
 
 **Approval flow**: When a state has `approval: required`, the orchestrator pauses,
 creates an `Approval` record, and publishes an `ApprovalRequest`. On resolution:
@@ -164,10 +178,11 @@ Live executor using the selected ACP runtime transport. Per-execution flow:
 1. Validate workspace boundaries.
 2. Capture pre-prompt metadata for the per-execution baseline.
 3. Create an isolated session via `RuntimeSessionBridge`.
-4. Stream execution events through `ExecutionEventBridge`.
-5. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
-7. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
+4. **Prompt Augmentation (P065)**: if an operator retry instruction is active, the executor renders a reserved engine-owned prompt section (`## Operator Retry Instruction`) before the task text.
+5. Stream execution events through `ExecutionEventBridge`.
+6. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
+7. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
+8. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
 before the transport closed, governed by the discovery settlement policy.
@@ -193,7 +208,16 @@ Nonisolated, `Sendable` disk I/O layer.
 - Path layout: `{artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}`
 - Path traversal guard: rejects any resolved path outside `workspaceRoot`.
 - Atomic writes with SHA-256 checksums.
+
+### Worktree Mutation Barrier (P064)
+
+To protect worktrees during orchestrated mutations (like main-sync), the engine uses an exclusive mutation barrier.
+- **Barrier Acquisition**: Active sync or repair tasks request an exclusive barrier.
+- **Consumer Blocking**: The scheduler prevents new read/write work items from being claimed while the barrier is active for a worktree.
+- **Read-only Reviewers**: Review agents that read directly from the implementation worktree must declare `read` access and are subject to barrier blocking.
+
 ### Transition Evaluator (`TransitionEvaluator.swift`)
+...
 
 Stateless evaluator for transition `when` clauses (ARCH-031). Supports only
 canonical patterns:

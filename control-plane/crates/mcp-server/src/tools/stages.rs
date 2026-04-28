@@ -28,7 +28,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "consume_quota_budget_now": { "type": "boolean", "description": "Allow an early retry before a persisted quota retry_after has elapsed." },
                     "legacy_discovery_override_policy": { "type": "string", "enum": ["workflow_opt_in"], "description": "Optional audited one-shot legacy discovery policy for this retry attempt." },
-                    "legacy_discovery_override_reason": { "type": "string", "description": "Required reason when legacy_discovery_override_policy is set." }
+                    "legacy_discovery_override_reason": { "type": "string", "description": "Required reason when legacy_discovery_override_policy is set." },
+                    "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." }
                 }
             }),
         },
@@ -112,6 +113,9 @@ pub async fn execute(
             let legacy_discovery_override_reason = params["legacy_discovery_override_reason"]
                 .as_str()
                 .map(String::from);
+            let operator_instruction = params["operator_instruction"]
+                .as_str()
+                .map(String::from);
 
             let caller = mcp_caller(&principal.id, &principal.class, "stages.retry");
             let cmd = Command::RetryStage(RetryStageCmd {
@@ -121,19 +125,26 @@ pub async fn execute(
                 agent_execution_id,
                 legacy_discovery_override_policy,
                 legacy_discovery_override_reason,
+                operator_instruction,
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
-            let legacy_discovery_override_id = match &commanded.result {
-                engine::command_handler::CommandResult::StageRetryScheduled {
-                    legacy_discovery_override_id,
-                    ..
-                } => legacy_discovery_override_id.clone(),
-                _ => None,
-            };
+            let (legacy_discovery_override_id, retry_instruction_binding_id) =
+                match &commanded.result {
+                    engine::command_handler::CommandResult::StageRetryScheduled {
+                        legacy_discovery_override_id,
+                        retry_instruction_binding_id,
+                        ..
+                    } => (
+                        legacy_discovery_override_id.clone(),
+                        retry_instruction_binding_id.clone(),
+                    ),
+                    _ => (None, None),
+                };
             Ok(serde_json::json!({
                 "scheduled": true,
                 "journal_id": commanded.journal_id,
                 "legacy_discovery_override_id": legacy_discovery_override_id,
+                "retry_instruction_binding_id": retry_instruction_binding_id,
             }))
         }
 

@@ -1,0 +1,42 @@
+{
+  "schema_version": "p064_dogfood_baseline_v1",
+  "proposal_id": "P064",
+  "captured_at": "2026-04-21T00:00:00Z",
+  "source": "Proposal 064 Section 1.1 dogfood evidence",
+  "baseline_incidents": [
+    {
+      "case_id": "p064-baseline-20260421-p053",
+      "branch": "cw/implement-proposal-053-bounded/4b3a582a",
+      "result": "preserved_dirty_work_then_merged_main",
+      "required_system_behavior": [
+        "preserve dirty state before sync",
+        "merge main only after preservation is durable",
+        "record clean successful sync evidence"
+      ]
+    },
+    {
+      "case_id": "p064-baseline-20260421-p051",
+      "branch": "cw/implement-proposal-051-shared/43460545",
+      "result": "preserved_dirty_work_then_conflict_abort",
+      "conflicted_file_count": 18,
+      "required_system_behavior": [
+        "record conflicted file evidence",
+        "abort failed merge back to preserved state",
+        "route conflict resolution as normal run work"
+      ]
+    },
+    {
+      "case_id": "p064-baseline-20260421-p061",
+      "branch": "cw/implement-proposal-061-sqlite/b57f18ef",
+      "result": "preserved_dirty_work_then_conflict_abort",
+      "conflicted_file_count": 16,
+      "required_system_behavior": [
+        "record conflicted file evidence",
+        "abort failed merge back to preserved state",
+        "route conflict resolution as normal run work"
+      ]
+    }
+  ],
+  "phase_0_exit_use": "This named baseline is the comparison input for later P064 sync/preservation/recovery gates.",
+  "status": "recorded"
+}

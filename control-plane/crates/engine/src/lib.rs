@@ -12,6 +12,7 @@ pub mod git_manifest;
 pub mod host_interruption;
 pub mod housekeeping;
 pub mod lifecycle_reporter;
+pub mod main_sync_fixtures;
 pub mod mcp;
 pub mod mediation;
 pub mod orchestrator;

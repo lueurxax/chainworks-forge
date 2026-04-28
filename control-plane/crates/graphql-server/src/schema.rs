@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_graphql::futures_util::StreamExt;
 use async_graphql::*;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tokio_stream::wrappers::BroadcastStream;
 
 use db::repos::{
@@ -119,12 +119,17 @@ async fn enrich_run_with_artifact_contracts(
         .await?
         .map(Into::into);
     // P017: Enrich workflow conflict with lead mediation readback if present.
+    // API-001 (P017 R2 audit): the enriched projection includes
+    // mediation-owned `execution_attempts` so operators can inspect the
+    // mediation's runtime facts, watchdog outcome, artifacts, and
+    // provider/timing details directly through the conflict surface.
     if let Some(ref mut conflict) = gql.workflow_conflict {
         if let Some(ref mediation_id) = conflict.mediation_record_id {
             if let Ok(Some(med)) =
                 db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
             {
-                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation::from(&med));
+                conflict.lead_mediation =
+                    Some(crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?);
             }
         }
     }
@@ -135,6 +140,12 @@ async fn enrich_run_with_artifact_contracts(
     } else {
         None
     };
+    gql.main_sync_readback_json = Some(async_graphql::Json(
+        proposal_064_main_sync_readback(pool, run_id).await?,
+    ));
+    gql.knowledge_capsule_readback_json = Some(async_graphql::Json(
+        proposal_064_knowledge_capsule_readback(pool, run_id).await?,
+    ));
     Ok(())
 }
 
@@ -620,12 +631,17 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         .await?
         .map(Into::into);
     // P017: Enrich workflow conflict with lead mediation readback if present.
+    // API-001 (P017 R2 audit): the enriched projection includes
+    // mediation-owned `execution_attempts` so operators can inspect the
+    // mediation's runtime facts, watchdog outcome, artifacts, and
+    // provider/timing details directly through the conflict surface.
     if let Some(ref mut conflict) = run.workflow_conflict {
         if let Some(ref mediation_id) = conflict.mediation_record_id {
             if let Ok(Some(med)) =
                 db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
             {
-                conflict.lead_mediation = Some(crate::types::run::GqlLeadMediation::from(&med));
+                conflict.lead_mediation =
+                    Some(crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?);
             }
         }
     }
@@ -637,6 +653,178 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         None
     };
     Ok(run)
+}
+
+async fn proposal_064_command_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+    command_types: &[&str],
+) -> Result<serde_json::Value> {
+    let placeholders = command_types
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, command_type, result_status, created_at, completed_at, caller_surface, caller_principal_id, caller_tool \
+         FROM command_journal \
+         WHERE run_id = ? AND command_type IN ({placeholders}) \
+         ORDER BY created_at DESC LIMIT 8"
+    );
+    let mut query = sqlx::query(&sql).bind(run_id.to_string());
+    for command_type in command_types {
+        query = query.bind(*command_type);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let commands = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.try_get::<String, _>("id").ok(),
+                "command_type": row.try_get::<String, _>("command_type").ok(),
+                "result_status": row.try_get::<String, _>("result_status").ok(),
+                "created_at": row.try_get::<String, _>("created_at").ok(),
+                "completed_at": row.try_get::<Option<String>, _>("completed_at").ok().flatten(),
+                "caller_surface": row.try_get::<Option<String>, _>("caller_surface").ok().flatten(),
+                "caller_principal_id": row.try_get::<Option<String>, _>("caller_principal_id").ok().flatten(),
+                "caller_tool": row.try_get::<Option<String>, _>("caller_tool").ok().flatten(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let pending = commands
+        .iter()
+        .filter(|command| command["result_status"] == "pending")
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "latest_commands": commands,
+        "pending_commands": pending,
+    }))
+}
+
+async fn proposal_064_main_sync_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let latest_attempt = sqlx::query(
+        "SELECT id, idempotency_key, trigger_reason, status, barrier_id, conflict_count, resolver_work_item_id, error_message, requested_by_stage_id, requested_by_work_item_id, created_at, started_at, completed_at \
+         FROM main_sync_attempts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let barrier = sqlx::query(
+        "SELECT id, owner_id, owner_kind, status, reason, acquired_at, heartbeat_at, expires_at, released_at \
+         FROM worktree_mutation_barriers WHERE run_id = ? AND status IN ('pending', 'active') ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let active_consumers = sqlx::query(
+        "SELECT id, worktree_resource_key, owner_id, worktree_access_mode, owner_kind, reason, acquired_at, expires_at, heartbeat_at \
+         FROM background_leases WHERE run_id = ? AND worktree_resource_key IS NOT NULL AND released_at IS NULL ORDER BY acquired_at DESC LIMIT 16",
+    )
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let command_readback = proposal_064_command_readback(
+        pool,
+        run_id,
+        &[
+            "MainSyncRequest",
+            "MainSyncRetry",
+            "MainSyncSetRunOverride",
+            "MainSyncRepairState",
+            "MainSyncRecordRecoveryDecision",
+        ],
+    )
+    .await?;
+
+    Ok(serde_json::json!({
+        "schema_version": "p064_main_sync_readback_v1",
+        "mode": "off",
+        "operator_tools_enabled": false,
+        "latest_attempt": latest_attempt.map(|row| serde_json::json!({
+            "id": row.try_get::<String, _>("id").ok(),
+            "idempotency_key": row.try_get::<String, _>("idempotency_key").ok(),
+            "trigger_reason": row.try_get::<String, _>("trigger_reason").ok(),
+            "status": row.try_get::<String, _>("status").ok(),
+            "barrier_id": row.try_get::<Option<String>, _>("barrier_id").ok().flatten(),
+            "conflict_count": row.try_get::<Option<i64>, _>("conflict_count").ok().flatten(),
+            "resolver_work_item_id": row.try_get::<Option<String>, _>("resolver_work_item_id").ok().flatten(),
+            "error_message": row.try_get::<Option<String>, _>("error_message").ok().flatten(),
+            "requested_by_stage_id": row.try_get::<Option<String>, _>("requested_by_stage_id").ok().flatten(),
+            "requested_by_work_item_id": row.try_get::<Option<String>, _>("requested_by_work_item_id").ok().flatten(),
+            "created_at": row.try_get::<String, _>("created_at").ok(),
+            "started_at": row.try_get::<Option<String>, _>("started_at").ok().flatten(),
+            "completed_at": row.try_get::<Option<String>, _>("completed_at").ok().flatten(),
+        })),
+        "active_barrier": barrier.map(|row| serde_json::json!({
+            "id": row.try_get::<String, _>("id").ok(),
+            "owner_id": row.try_get::<String, _>("owner_id").ok(),
+            "owner_kind": row.try_get::<String, _>("owner_kind").ok(),
+            "status": row.try_get::<String, _>("status").ok(),
+            "reason": row.try_get::<String, _>("reason").ok(),
+            "acquired_at": row.try_get::<Option<String>, _>("acquired_at").ok().flatten(),
+            "heartbeat_at": row.try_get::<Option<String>, _>("heartbeat_at").ok().flatten(),
+            "expires_at": row.try_get::<String, _>("expires_at").ok(),
+            "released_at": row.try_get::<Option<String>, _>("released_at").ok().flatten(),
+        })),
+        "active_consumers": active_consumers.into_iter().map(|row| serde_json::json!({
+            "lease_id": row.try_get::<String, _>("id").ok(),
+            "resource_key": row.try_get::<String, _>("worktree_resource_key").ok(),
+            "owner_id": row.try_get::<String, _>("owner_id").ok(),
+            "access_mode": row.try_get::<Option<String>, _>("worktree_access_mode").ok().flatten(),
+            "owner_kind": row.try_get::<Option<String>, _>("owner_kind").ok().flatten(),
+            "reason": row.try_get::<Option<String>, _>("reason").ok().flatten(),
+            "acquired_at": row.try_get::<String, _>("acquired_at").ok(),
+            "expires_at": row.try_get::<String, _>("expires_at").ok(),
+            "heartbeat_at": row.try_get::<Option<String>, _>("heartbeat_at").ok().flatten(),
+        })).collect::<Vec<_>>(),
+        "commands": command_readback,
+    }))
+}
+
+async fn proposal_064_knowledge_capsule_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let attachments = sqlx::query(
+        "SELECT a.id, a.capsule_id, a.match_rule, a.attachment_reason, a.injected, a.injected_byte_count, a.injected_token_count, a.truncated, a.stale_main, a.ignored, a.ignored_reason, a.created_at, c.source_run_id, c.source_proposal_id, c.source_status, c.status AS capsule_status \
+         FROM run_knowledge_capsule_attachments a \
+         JOIN run_knowledge_capsules c ON c.id = a.capsule_id \
+         WHERE a.target_run_id = ? ORDER BY a.created_at DESC LIMIT 16",
+    )
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let command_readback =
+        proposal_064_command_readback(pool, run_id, &["KnowledgeCapsuleIgnore"]).await?;
+
+    Ok(serde_json::json!({
+        "schema_version": "p064_knowledge_capsule_readback_v1",
+        "mode": "off",
+        "operator_tools_enabled": false,
+        "attached_capsules": attachments.into_iter().map(|row| serde_json::json!({
+            "attachment_id": row.try_get::<String, _>("id").ok(),
+            "capsule_id": row.try_get::<String, _>("capsule_id").ok(),
+            "source_run_id": row.try_get::<String, _>("source_run_id").ok(),
+            "source_proposal_id": row.try_get::<Option<String>, _>("source_proposal_id").ok().flatten(),
+            "source_status": row.try_get::<String, _>("source_status").ok(),
+            "capsule_status": row.try_get::<String, _>("capsule_status").ok(),
+            "match_rule": row.try_get::<String, _>("match_rule").ok(),
+            "attachment_reason": row.try_get::<String, _>("attachment_reason").ok(),
+            "injected": row.try_get::<i64, _>("injected").unwrap_or_default() != 0,
+            "injected_byte_count": row.try_get::<Option<i64>, _>("injected_byte_count").ok().flatten(),
+            "injected_token_count": row.try_get::<Option<i64>, _>("injected_token_count").ok().flatten(),
+            "truncated": row.try_get::<i64, _>("truncated").unwrap_or_default() != 0,
+            "stale_main": row.try_get::<i64, _>("stale_main").unwrap_or_default() != 0,
+            "ignored": row.try_get::<i64, _>("ignored").unwrap_or_default() != 0,
+            "ignored_reason": row.try_get::<Option<String>, _>("ignored_reason").ok().flatten(),
+            "created_at": row.try_get::<String, _>("created_at").ok(),
+        })).collect::<Vec<_>>(),
+        "commands": command_readback,
+    }))
 }
 
 const P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES: usize = 120_000;
@@ -1130,6 +1318,8 @@ impl MutationRoot {
                 .map(parse_legacy_broad_discovery_policy)
                 .transpose()?,
             legacy_discovery_override_reason,
+            // P065: GraphQL retry_stage remains unchanged in v1 — always None.
+            operator_instruction: None,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -1768,6 +1958,7 @@ mod tests {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(pool, &artifact).await.unwrap();
         let raw = serde_json::json!({
@@ -1874,6 +2065,11 @@ mod tests {
                 owner_id: None,
                 lead_mediation_record_id: None,
                 origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
             },
         )
         .await
@@ -2030,6 +2226,107 @@ mod tests {
             .unwrap();
 
         assert_eq!(run.delivery_configuration_json, Some(delivery_json));
+    }
+
+    #[tokio::test]
+    async fn proposal_064_run_query_exposes_sync_and_capsule_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO main_sync_attempts (id, run_id, idempotency_key, trigger_reason, status, conflict_count, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind("attempt-1")
+        .bind(run_id.to_string())
+        .bind("before-review-1")
+        .bind("before_review")
+        .bind("waiting_for_barrier")
+        .bind(0_i64)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktree_mutation_barriers (id, run_id, worktree_resource_key, owner_id, owner_kind, status, reason, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind("barrier-1")
+        .bind(run_id.to_string())
+        .bind(format!("run-worktree:{run_id}"))
+        .bind("main-sync")
+        .bind("main_sync")
+        .bind("pending")
+        .bind("active reader")
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id_string = run_id.to_string();
+        db::repos::command_journal::record(
+            &pool,
+            "journal-1",
+            "MainSyncRequest",
+            "{}",
+            Some(&run_id_string),
+            Utc::now(),
+            Some("mcp"),
+            Some("operator"),
+            Some("operator"),
+            Some("runs.main_sync.request"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    {{
+                      run(id: "{run_id}") {{
+                        mainSyncReadbackJson
+                        knowledgeCapsuleReadbackJson
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let main_sync = &json["run"]["mainSyncReadbackJson"];
+        assert_eq!(
+            main_sync["schema_version"], "p064_main_sync_readback_v1",
+            "unexpected P064 readback payload: {json}"
+        );
+        assert_eq!(main_sync["latest_attempt"]["status"], "waiting_for_barrier");
+        assert_eq!(main_sync["active_barrier"]["owner_kind"], "main_sync");
+        assert_eq!(
+            main_sync["commands"]["pending_commands"][0]["command_type"],
+            "MainSyncRequest"
+        );
+        assert_eq!(
+            json["run"]["knowledgeCapsuleReadbackJson"]["schema_version"],
+            "p064_knowledge_capsule_readback_v1"
+        );
     }
 
     #[tokio::test]
@@ -2438,6 +2735,195 @@ mod tests {
         assert!(!serialized.contains("PRIVATE rationale"));
     }
 
+    /// P017 R2 / API-001: every mediation-owned `agent_executions` row must
+    /// surface under `workflowConflict.leadMediation.executionAttempts` in
+    /// GraphQL, with owner identity, nullable stage execution ID, runtime
+    /// facts, watchdog, and per-attempt timing/status.
+    #[tokio::test]
+    async fn proposal_017_run_query_exposes_lead_mediation_execution_attempts() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let mediation_id = "mediation-p017-attempts";
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.status = WorkflowConflictStatus::OperatorConfirmationRequired;
+        conflict.mediation_record_id = Some(mediation_id.into());
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+        db::repos::lead_conflict_mediations::insert(
+            &pool,
+            &make_lead_mediation_record(run_id, &conflict, mediation_id),
+        )
+        .await
+        .unwrap();
+
+        // Insert two mediation-owned agent_executions (no stage_execution_id).
+        let exec_one = domain::agent::AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            stage_execution_id: None,
+            agent_id: "lead-agent-1".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status: domain::agent::AgentStatus::Failed,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: None,
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: Some("lead_conflict_mediation".into()),
+            owner_id: Some(mediation_id.into()),
+            lead_mediation_record_id: Some(mediation_id.into()),
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+        };
+        let exec_one_id = exec_one.id;
+        db::repos::agent_executions::insert(&pool, &exec_one)
+            .await
+            .unwrap();
+
+        let exec_two = domain::agent::AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            started_at: exec_one.started_at + chrono::Duration::seconds(1),
+            status: domain::agent::AgentStatus::Completed,
+            ..exec_one.clone()
+        };
+        let exec_two_id = exec_two.id;
+        db::repos::agent_executions::insert(&pool, &exec_two)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query P017LeadMediationAttempts {{
+                  run(id: "{run_id}") {{
+                    workflowConflict {{
+                      leadMediation {{
+                        statusUpdates {{ attemptNumber }}
+                        executionAttempts {{
+                          agentExecutionId
+                          ownerKind
+                          ownerId
+                          mediationRecordId
+                          stageExecutionId
+                          agentId
+                          provider
+                          model
+                          status
+                          startedAt
+                          completedAt
+                          attemptNumber
+                          runtimeFacts
+                          watchdog
+                          cost
+                          transcriptRef
+                          artifacts {{ id }}
+                        }}
+                      }}
+                    }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+
+        let json = response.data.into_json().unwrap();
+        let mediation = &json["run"]["workflowConflict"]["leadMediation"];
+        let attempts = mediation["executionAttempts"]
+            .as_array()
+            .expect("executionAttempts array");
+        assert_eq!(attempts.len(), 2, "two attempts expected");
+
+        for attempt in attempts {
+            assert_eq!(
+                attempt["ownerKind"],
+                serde_json::json!("lead_conflict_mediation")
+            );
+            assert_eq!(attempt["ownerId"], serde_json::json!(mediation_id));
+            assert_eq!(
+                attempt["mediationRecordId"],
+                serde_json::json!(mediation_id)
+            );
+            assert!(
+                attempt["stageExecutionId"].is_null(),
+                "mediation-owned attempt has no stage execution id"
+            );
+            assert_eq!(attempt["agentId"], serde_json::json!("lead-agent-1"));
+            assert_eq!(attempt["provider"], serde_json::json!("claude"));
+            assert!(attempt["startedAt"].is_string());
+        }
+
+        // Attempts are sorted by started_at ASC; attemptNumber is durable.
+        assert_eq!(
+            attempts[0]["agentExecutionId"],
+            serde_json::json!(exec_one_id.to_string())
+        );
+        assert_eq!(attempts[0]["attemptNumber"], serde_json::json!(1));
+        assert_eq!(attempts[0]["status"], serde_json::json!("failed"));
+        assert_eq!(
+            attempts[1]["agentExecutionId"],
+            serde_json::json!(exec_two_id.to_string())
+        );
+        assert_eq!(attempts[1]["attemptNumber"], serde_json::json!(2));
+        assert_eq!(attempts[1]["status"], serde_json::json!("completed"));
+
+        // The synthesized status_updates entry's attemptNumber reflects the
+        // durable mediation attempt count, not hard-coded 1.
+        assert_eq!(
+            mediation["statusUpdates"][0]["attemptNumber"],
+            serde_json::json!(2)
+        );
+
+        // No operator_rationale anywhere in the readback.
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("operatorRationale"));
+        assert!(!serialized.contains("operator_rationale"));
+        assert!(!serialized.contains("PRIVATE rationale"));
+    }
+
     #[tokio::test]
     async fn proposal_017_runs_query_exposes_current_workflow_conflict_summary() {
         let pool = test_pool().await;
@@ -2776,6 +3262,7 @@ mod tests {
             is_pinned: false,
             report_kind: Some("validation_failure".into()),
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
         let record =
@@ -3097,6 +3584,7 @@ mod tests {
             is_pinned: false,
             report_kind: Some("validation_failure".into()),
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
         let record =
@@ -3709,6 +4197,7 @@ mod tests {
                 is_pinned: false,
                 report_kind: Some("release".into()),
                 report_version: Some(1),
+                agent_execution_id: None,
             },
         )
         .await
@@ -3805,6 +4294,7 @@ mod tests {
                 is_pinned: false,
                 report_kind: None,
                 report_version: None,
+                agent_execution_id: None,
             },
         )
         .await
@@ -3901,6 +4391,7 @@ mod tests {
                 is_pinned: false,
                 report_kind: None,
                 report_version: None,
+                agent_execution_id: None,
             },
         )
         .await
@@ -4006,6 +4497,7 @@ mod tests {
                     is_pinned: false,
                     report_kind: None,
                     report_version: None,
+                    agent_execution_id: None,
                 },
             )
             .await
@@ -4124,6 +4616,7 @@ mod tests {
                 is_pinned: false,
                 report_kind: Some("release".into()),
                 report_version: Some(1),
+                agent_execution_id: None,
             },
         )
         .await
@@ -4376,6 +4869,7 @@ mod tests {
             is_pinned: false,
             report_kind: Some("validation_failure".into()),
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
         let record =

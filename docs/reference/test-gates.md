@@ -1230,6 +1230,37 @@ Important:
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
 - the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
 
+### `proposal-065|p065`
+
+Operator retry instruction contract gate.
+
+Scope:
+
+- `stages.retry` MCP input schema extension with `operator_instruction`
+- `RetryStageCmd` domain command extension
+- validation for 1-2000 character length and control character rejection
+- durable command-journal persistence and redaction
+- retry-attempt parent binding and child delivery persistence
+- targeted retry work-item payload injection
+- full-stage retry fan-out delivery logic
+- operator-only capability enforcement
+
+Use when:
+
+- changing retry instruction validation or persistence
+- changing orchestrator/executor instruction delivery
+- changing readback/provenance for operator instructions
+
+Host policy:
+
+- local Rust toolchain required; no UI target or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-065
+```
+
 ### `full`
 
 Expensive repo-wide sign-off gate.
@@ -1496,3 +1527,27 @@ Important:
 - query-plan assertions prove that scheduler scans do not regress to full table scans at fixture scale
 - host-interruption retries must be exempt from provider quota retry budget
 - the gate fails closed if capacity gates, fair selection, p95 latency, atomic supersession, projection parity, backpressure notifications, or host-interruption classification evidence is missing
+
+### `proposal-064|p064`
+
+P064 Phase 0 main-sync and cross-run knowledge readback contract gate.
+
+Scope:
+
+- P064 Phase 0 dogfood baseline artifact and kickoff record are present and schema-versioned
+- migration `033_p064_main_sync_and_knowledge_capsules.sql` freezes main-sync, barrier, knowledge-capsule, work-item, and background-lease storage contracts
+- `domain::main_sync` enum/value contracts round-trip
+- MCP main-sync and knowledge-capsule tools remain registered as capability ids but hidden while runtime modes are off
+- GraphQL exposes projection-backed JSON readback for main-sync status, accepted/pending command state, barriers, active consumers, and knowledge-capsule attachments
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-064
+```
+
+Important:
+
+- `p064` is accepted as an alias
+- this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
+- later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection

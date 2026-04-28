@@ -80,6 +80,13 @@ Each agent in the catalog has:
 | `id` | `id` | `String` |
 | `title` | `title` | `String` |
 | `mode` | `mode` | `String` |
+| `routingId` | `routing_id` | `String?` |
+| `capabilities` | `capabilities` | `[String]?` |
+| `stacks` | `stacks` | `[String]?` |
+| `surfaces` | `surfaces` | `[String]?` |
+| `risks` | `risks` | `[String]?` |
+| `enabledForProposalReview` | `enabled_for_proposal_review` | `Bool?` |
+| `rolloutWave` | `rollout_wave` | `String?` |
 | `backendProfile` | `backend_profile` | `String` |
 | `permissionProfile` | `permission_profile` | `String` |
 | `skillRef` | `skill_ref` | `String` |
@@ -164,7 +171,8 @@ Defines which agents execute within a state:
 
 - `sequence: [AgentTask]?` — agents run one after another
 - `parallel: [AgentTask]?` — agents run concurrently (fan-out)
-- `then: [AgentTask]?` — sequential tasks after parallel fan-out completes
+- `dynamic_parallel: [AgentTask]?` — agents materialized from a selector artifact
+- `then: [AgentTask]?` — sequential tasks after parallel blocks complete
 
 #### `AgentTask`
 

@@ -32,6 +32,12 @@ pub enum Command {
     RetryStage(RetryStageCmd),
     ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd),
     OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd),
+    MainSyncRequest(MainSyncRequestCmd),
+    MainSyncRetry(MainSyncRetryCmd),
+    MainSyncSetRunOverride(MainSyncSetRunOverrideCmd),
+    MainSyncRepairState(MainSyncRepairStateCmd),
+    MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd),
+    KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd),
     CancelRun(CancelRunCmd),
     ResetSession(ResetSessionCmd),
     RunStewardAnalysis(RunStewardAnalysisCmd),
@@ -90,6 +96,9 @@ pub struct RetryStageCmd {
     pub legacy_discovery_override_policy: Option<LegacyBroadDiscoveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_discovery_override_reason: Option<String>,
+    /// P065: Optional one-shot operator instruction for the retry-created invocation scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_instruction: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +117,105 @@ pub struct OverrideLegacyDiscoveryPolicyCmd {
     pub target_attempt_number: i64,
     pub legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy,
     pub legacy_discovery_override_reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainSyncMode {
+    Off,
+    DryRun,
+    ManualOnly,
+    Automatic,
+}
+
+impl Default for MainSyncMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeCapsulesMode {
+    Off,
+    EmitOnly,
+    AttachAndInject,
+}
+
+impl Default for KnowledgeCapsulesMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainSyncTriggerReason {
+    BeforeInitialImplementation,
+    BeforeRetry,
+    BeforeReview,
+    OperatorRequest,
+    BeforeFinalApproval,
+    StartupRepair,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MainSyncRequestCmd {
+    pub run_id: RunId,
+    pub trigger_reason: MainSyncTriggerReason,
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by_stage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by_work_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MainSyncRetryCmd {
+    pub run_id: RunId,
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MainSyncSetRunOverrideCmd {
+    pub run_id: RunId,
+    pub mode: MainSyncMode,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MainSyncRepairStateCmd {
+    pub run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_note: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainSyncRecoveryDecision {
+    RetrySync,
+    MarkRecovered,
+    Escalate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MainSyncRecordRecoveryDecisionCmd {
+    pub run_id: RunId,
+    pub decision: MainSyncRecoveryDecision,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeCapsuleIgnoreCmd {
+    pub run_id: RunId,
+    pub capsule_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,5 +367,52 @@ mod tests {
             json["delivery_configuration_json"],
             r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#
         );
+    }
+
+    #[test]
+    fn proposal_064_main_sync_command_round_trips_through_serde() {
+        let cmd = Command::MainSyncRequest(MainSyncRequestCmd {
+            run_id: RunId::new(),
+            trigger_reason: MainSyncTriggerReason::BeforeReview,
+            idempotency_key: "run:123:before-review".into(),
+            requested_by_stage_id: Some("state_8_review_started".into()),
+            requested_by_work_item_id: Some("work-item-1".into()),
+        });
+
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(
+            json["MainSyncRequest"]["trigger_reason"],
+            serde_json::Value::String("before_review".into())
+        );
+        assert_eq!(
+            json["MainSyncRequest"]["idempotency_key"],
+            serde_json::Value::String("run:123:before-review".into())
+        );
+
+        let parsed: Command = serde_json::from_value(json).unwrap();
+        match parsed {
+            Command::MainSyncRequest(parsed) => {
+                assert_eq!(parsed.trigger_reason, MainSyncTriggerReason::BeforeReview);
+                assert_eq!(
+                    parsed.requested_by_stage_id.as_deref(),
+                    Some("state_8_review_started")
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proposal_064_mode_enums_use_snake_case_contract_values() {
+        assert_eq!(
+            serde_json::to_value(MainSyncMode::ManualOnly).unwrap(),
+            serde_json::Value::String("manual_only".into())
+        );
+        assert_eq!(
+            serde_json::to_value(KnowledgeCapsulesMode::AttachAndInject).unwrap(),
+            serde_json::Value::String("attach_and_inject".into())
+        );
+        assert_eq!(MainSyncMode::default(), MainSyncMode::Off);
+        assert_eq!(KnowledgeCapsulesMode::default(), KnowledgeCapsulesMode::Off);
     }
 }

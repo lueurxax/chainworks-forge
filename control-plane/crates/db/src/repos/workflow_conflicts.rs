@@ -12,7 +12,10 @@ use domain::workflow_conflict::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowConflictMetricEvent {
     pub event_id: String,
-    pub run_id: String,
+    /// Owning run id. Nullable since migration 031 to support
+    /// daemon-level events that fire before a run row exists (e.g.
+    /// Phase C compile-fail outcome).
+    pub run_id: Option<String>,
     pub conflict_id: Option<String>,
     pub metric_name: String,
     pub labels_json: serde_json::Value,
@@ -63,6 +66,12 @@ pub async fn upsert_conflict_by_fingerprint_tx(
 
     supersede_current_blocking_conflicts_tx(tx, &stored).await?;
 
+    // OPS-003 (P017 R5): emit `workflow_conflict_current_total` per
+    // upsert keyed by (reason, status) so rollout dashboards can count
+    // current conflicts by classification. Bounded label cardinality:
+    // reason ∈ enum (8), status ∈ enum (6) ⇒ 48 unique label tuples max.
+    record_workflow_conflict_current_tx(tx, &stored, stored.updated_at).await?;
+
     Ok(stored)
 }
 
@@ -70,6 +79,7 @@ pub async fn insert_advisory_rejection(
     pool: &SqlitePool,
     record: &WorkflowAdvisoryRejectionRecord,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"INSERT INTO workflow_advisory_rejections
            (rejection_id, run_id, stage_execution_id, lineage_id, current_state_id,
@@ -92,9 +102,33 @@ pub async fn insert_advisory_rejection(
     .bind(&record.graph_membership_result)
     .bind(record.created_at.to_rfc3339())
     .bind(serde_json::to_string(record)?)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("insert workflow advisory rejection")?;
+    // OPS-003 (P017 R5): every durable advisory rejection record emits
+    // `advisory_rejection_total`. When the advisory hint was rejected
+    // because the next-stage hint was absent from the graph, also emit
+    // `invalid_next_stage_hint_non_blocking_total` so dashboards can
+    // distinguish total volume from invalid-hint volume.
+    record_advisory_rejection_tx(
+        &mut tx,
+        &record.run_id,
+        &record.current_state_id,
+        &record.graph_membership_result,
+        record.created_at,
+    )
+    .await?;
+    if record.graph_membership_result == "absent_from_graph" {
+        record_invalid_next_stage_hint_non_blocking_tx(
+            &mut tx,
+            &record.run_id,
+            &record.current_state_id,
+            record.advisory_next_action.as_deref(),
+            record.created_at,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -326,7 +360,7 @@ pub async fn record_recovery_action_chosen_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: conflict.run_id.clone(),
+            run_id: Some(conflict.run_id.clone()),
             conflict_id: Some(conflict.conflict_id.clone()),
             metric_name: "recovery_action_chosen_total".to_string(),
             labels_json: serde_json::json!({
@@ -354,12 +388,420 @@ pub async fn record_phase_c_validation_outcome_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: run_id.to_string(),
+            run_id: Some(run_id.to_string()),
             conflict_id: None,
             metric_name: "phase_c_validation_outcome_total".to_string(),
             labels_json: serde_json::json!({
                 "outcome": outcome,
                 "source": source,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-001 (P017 R2 audit): record one `lead_mediation_attempt_total`
+/// metric event per mediation-owned `agent_executions` completion.
+///
+/// `result` summarises the per-attempt outcome — one of:
+/// - `validated_awaiting_confirmation`
+/// - `lead_output_validation_failed`
+/// - `agent_failed`
+/// - `cancelled`
+/// - `other`
+///
+/// `attempt_number` is the durable count of mediation-owned executions
+/// for this mediation at the point the attempt completes (1, 2, …).
+/// `mediation_record_id` keeps attempts grouped per-mediation so the
+/// metric remains bounded label-cardinality wise.
+pub async fn record_lead_mediation_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: Option<&str>,
+    mediation_record_id: &str,
+    lead_agent_id: &str,
+    result: &str,
+    attempt_number: i64,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: conflict_id.map(|s| s.to_string()),
+            metric_name: "lead_mediation_attempt_total".to_string(),
+            labels_json: serde_json::json!({
+                "result": result,
+                "lead_agent_id": lead_agent_id,
+                "mediation_record_id": mediation_record_id,
+                "attempt_number": attempt_number,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-001 (P017 R2 audit): record one `external_catalog_warning_total`
+/// metric event per external-catalog warning decision (e.g. operator
+/// attestation that a legacy/external catalog is being kept opt-in for
+/// the warning window before Phase C fail-closed enforcement).
+///
+/// `warning_kind` is the typed warning code (e.g.
+/// `P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED`).
+/// `decision` is one of `enabled`, `waived`, or `denied`.
+/// `source_surface` indicates where the decision was recorded (e.g.
+/// `legacy_discovery_override`, `phase_c_inventory`).
+pub async fn record_external_catalog_warning_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    warning_kind: &str,
+    decision: &str,
+    source_surface: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "external_catalog_warning_total".to_string(),
+            labels_json: serde_json::json!({
+                "warning_kind": warning_kind,
+                "decision": decision,
+                "source_surface": source_surface,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002 (P017 R4 audit): emit `phase_c_validation_outcome_total` for
+/// the **fail-closed compile** path. Run id is None because this fires
+/// when `workflow::compiler::compile()` returns Err and the run row
+/// never gets inserted.
+///
+/// Migration 031 made `workflow_conflict_metric_events.run_id` NULL-able
+/// specifically to support this daemon-level event without an FK
+/// violation.
+pub async fn record_phase_c_validation_failure_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    failure_kind: &str,
+    workflow_path: Option<&str>,
+    catalog_path: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: None,
+            conflict_id: None,
+            metric_name: "phase_c_validation_outcome_total".to_string(),
+            labels_json: serde_json::json!({
+                "outcome": "fail",
+                "source": "compile",
+                "failure_kind": failure_kind,
+                "workflow_path": workflow_path,
+                "catalog_path": catalog_path,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+pub async fn record_phase_c_validation_failure(
+    pool: &SqlitePool,
+    failure_kind: &str,
+    workflow_path: Option<&str>,
+    catalog_path: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    record_phase_c_validation_failure_tx(
+        &mut tx, failure_kind, workflow_path, catalog_path, occurred_at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// OPS-002: emit `duplicate_mediation_session_total` when the
+/// orchestrator finds an existing active mediation while attempting to
+/// create a new one for the same conflict (resume idempotency).
+pub async fn record_duplicate_mediation_session_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: &str,
+    mediation_record_id: &str,
+    detection_source: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: Some(conflict_id.to_string()),
+            metric_name: "duplicate_mediation_session_total".to_string(),
+            labels_json: serde_json::json!({
+                "mediation_record_id": mediation_record_id,
+                "detection_source": detection_source,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `report_readback_completeness` to record whether a
+/// composed `workflow_conflict` readback exposes all expected fields
+/// (current conflict, history, advisory rejections, lead owner, valid
+/// action class, terminal failure reason) for a given run.
+///
+/// `value` is a ratio in [0, 1] — fraction of expected fields present.
+pub async fn record_report_readback_completeness_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: Option<&str>,
+    expected_fields: &[&str],
+    present_fields: &[&str],
+    surface: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let ratio = if expected_fields.is_empty() {
+        1.0
+    } else {
+        present_fields.len() as f64 / expected_fields.len() as f64
+    };
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: conflict_id.map(|s| s.to_string()),
+            metric_name: "report_readback_completeness".to_string(),
+            labels_json: serde_json::json!({
+                "surface": surface,
+                "expected_fields": expected_fields,
+                "present_fields": present_fields,
+            }),
+            value: ratio,
+            unit: "ratio".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `phase_c_lead_inventory_external_catalog_total` when the
+/// daemon evaluates an executable catalog's external-catalog inventory
+/// and reaches an enforcement decision.
+pub async fn record_phase_c_lead_inventory_external_catalog_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: Option<&str>,
+    inventory_result: &str,
+    enforcement_decision: &str,
+    catalog_path: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.map(|s| s.to_string()),
+            conflict_id: None,
+            metric_name: "phase_c_lead_inventory_external_catalog_total".to_string(),
+            labels_json: serde_json::json!({
+                "inventory_result": inventory_result,
+                "enforcement_decision": enforcement_decision,
+                "catalog_path": catalog_path,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `mediation_late_output_ignored_total` when a mediation
+/// completion arrives after the mediation is already terminal and the
+/// late output is ignored.
+pub async fn record_mediation_late_output_ignored_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: Option<&str>,
+    mediation_record_id: &str,
+    reason: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: conflict_id.map(|s| s.to_string()),
+            metric_name: "mediation_late_output_ignored_total".to_string(),
+            labels_json: serde_json::json!({
+                "mediation_record_id": mediation_record_id,
+                "reason": reason,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003 (P017 R5): emit `advisory_rejection_total` per durable
+/// advisory rejection record. Bounded labels: `current_state_id`,
+/// `graph_membership_result`.
+pub async fn record_advisory_rejection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    current_state_id: &str,
+    graph_membership_result: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "advisory_rejection_total".to_string(),
+            labels_json: serde_json::json!({
+                "current_state_id": current_state_id,
+                "graph_membership_result": graph_membership_result,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003: emit `invalid_next_stage_hint_non_blocking_total` when an
+/// advisory next-stage hint is rejected as non-blocking.
+pub async fn record_invalid_next_stage_hint_non_blocking_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    current_state_id: &str,
+    advisory_next_action: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "invalid_next_stage_hint_non_blocking_total".to_string(),
+            labels_json: serde_json::json!({
+                "current_state_id": current_state_id,
+                "advisory_next_action": advisory_next_action,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003: emit `workflow_conflict_current_total` per `(reason, status)`
+/// when a blocking conflict is upserted. Lets dashboards count current
+/// conflicts by reason and status.
+pub async fn record_workflow_conflict_current_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &WorkflowConflictRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(record.run_id.clone()),
+            conflict_id: Some(record.conflict_id.clone()),
+            metric_name: "workflow_conflict_current_total".to_string(),
+            labels_json: serde_json::json!({
+                "reason": record.reason.to_string(),
+                "status": record.status.to_string(),
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-003: emit `terminal_unverifiable_total` when a conflict
+/// transitions to `TerminalUnverifiable`, labeled by failure reason.
+pub async fn record_terminal_unverifiable_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    conflict_id: &str,
+    terminal_failure_reason: Option<&str>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: Some(conflict_id.to_string()),
+            metric_name: "terminal_unverifiable_total".to_string(),
+            labels_json: serde_json::json!({
+                "terminal_failure_reason": terminal_failure_reason,
+            }),
+            value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-002: emit `mediation_retry_budget_exhausted_total` when an
+/// owner-aware retry budget for a mediation is exhausted.
+pub async fn record_mediation_retry_budget_exhausted_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    mediation_record_id: &str,
+    provider_profile_id: Option<&str>,
+    conflict_reason: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: Some(run_id.to_string()),
+            conflict_id: None,
+            metric_name: "mediation_retry_budget_exhausted_total".to_string(),
+            labels_json: serde_json::json!({
+                "mediation_record_id": mediation_record_id,
+                "provider_profile_id": provider_profile_id,
+                "conflict_reason": conflict_reason,
             }),
             value: 1.0,
             unit: "count".to_string(),
@@ -622,6 +1064,20 @@ async fn record_terminal_metric_events_tx(
         return Ok(());
     }
 
+    // OPS-003 (P017 R5): emit `terminal_unverifiable_total` whenever a
+    // conflict transitions into the terminal-unverifiable state, with
+    // bounded `terminal_failure_reason` label.
+    if matches!(record.status, WorkflowConflictStatus::TerminalUnverifiable) {
+        record_terminal_unverifiable_tx(
+            tx,
+            &record.run_id,
+            &record.conflict_id,
+            record.terminal_failure_reason.as_deref(),
+            occurred_at,
+        )
+        .await?;
+    }
+
     let resolution_mode = resolution_mode(record);
     let action_class = action_class(record);
     let elapsed_seconds =
@@ -631,7 +1087,7 @@ async fn record_terminal_metric_events_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: record.run_id.clone(),
+            run_id: Some(record.run_id.clone()),
             conflict_id: Some(record.conflict_id.clone()),
             metric_name: "workflow_conflict_time_to_resolution_seconds".to_string(),
             labels_json: serde_json::json!({
@@ -649,7 +1105,7 @@ async fn record_terminal_metric_events_tx(
         tx,
         &WorkflowConflictMetricEvent {
             event_id: Uuid::new_v4().to_string(),
-            run_id: record.run_id.clone(),
+            run_id: Some(record.run_id.clone()),
             conflict_id: Some(record.conflict_id.clone()),
             metric_name: "conflict_reason_to_action_outcome_total".to_string(),
             labels_json: serde_json::json!({

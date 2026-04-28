@@ -55,4 +55,13 @@ pub struct Artifact {
     pub is_pinned: bool,
     pub report_kind: Option<String>,
     pub report_version: Option<i64>,
+    /// P017 R5 / API-003: direct FK to the `AgentExecution` attempt
+    /// that produced this artifact. Used by MCP/GraphQL
+    /// `execution_attempts.artifacts` to attribute artifacts per
+    /// mediation attempt without `agent_id` correlation. Nullable for
+    /// backwards compatibility — pre-R5 artifacts and stage-owned
+    /// artifacts that don't need attempt-level attribution may leave
+    /// it as None.
+    #[serde(default)]
+    pub agent_execution_id: Option<String>,
 }

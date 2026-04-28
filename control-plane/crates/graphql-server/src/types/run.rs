@@ -56,6 +56,8 @@ pub struct GqlRun {
     pub implementation_handoff_status_json: Option<Json<serde_json::Value>>,
     pub legacy_discovery_overrides_json: Option<String>,
     pub implementation_self_assessment_summary: Option<GqlImplementationSelfAssessmentSummary>,
+    pub main_sync_readback_json: Option<Json<serde_json::Value>>,
+    pub knowledge_capsule_readback_json: Option<Json<serde_json::Value>>,
 }
 
 impl From<Run> for GqlRun {
@@ -100,6 +102,8 @@ impl From<Run> for GqlRun {
             implementation_handoff_status_json: None,
             legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
+            main_sync_readback_json: None,
+            knowledge_capsule_readback_json: None,
         }
     }
 }
@@ -164,6 +168,8 @@ impl From<RunProjectionRow> for GqlRun {
             implementation_handoff_status_json: None,
             legacy_discovery_overrides_json: None,
             implementation_self_assessment_summary: None,
+            main_sync_readback_json: None,
+            knowledge_capsule_readback_json: None,
         }
     }
 }
@@ -212,6 +218,11 @@ pub struct GqlLeadMediation {
     pub confirmation_subject_id: Option<String>,
     pub superseded_by_event_ref: Option<String>,
     pub cost_summary: Option<Json<serde_json::Value>>,
+    /// API-001 (P017 R2 audit): one entry per mediation-owned `agent_executions`
+    /// row, ordered by `started_at`. Lets operators inspect the mediation's
+    /// runtime facts, watchdog outcome, artifacts, and provider/timing details
+    /// scoped to the workflow conflict.
+    pub execution_attempts: Vec<GqlMediationExecutionAttempt>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -222,7 +233,49 @@ pub struct GqlLeadMediationStatusUpdate {
     pub attempt_number: i32,
 }
 
+/// P017 R2 / API-001: owner-aware mediation execution attempt projected
+/// directly from `agent_executions`. `stage_execution_id` is nullable
+/// because mediation-owned executions have no stage by design.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlMediationExecutionAttempt {
+    pub agent_execution_id: ID,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub mediation_record_id: ID,
+    pub stage_execution_id: Option<ID>,
+    pub agent_id: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub attempt_number: i32,
+    pub runtime_facts: Option<Json<serde_json::Value>>,
+    pub watchdog: Option<Json<serde_json::Value>>,
+    /// Per-attempt cost is null until cost rollup lands on `agent_executions`
+    /// (audit OPS-001 follow-up). Aggregate cost is on `cost_summary`.
+    pub cost: Option<Json<serde_json::Value>>,
+    /// Transcript ref placeholder — populated when the transcript-artifact
+    /// linkage lands on `AgentExecution`.
+    pub transcript_ref: Option<Json<serde_json::Value>>,
+    pub artifacts: Vec<GqlMediationAttemptArtifact>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlMediationAttemptArtifact {
+    pub id: ID,
+    pub name: String,
+    pub format: String,
+    pub file_path: String,
+    pub report_kind: Option<String>,
+    pub is_pinned: bool,
+}
+
 impl From<&LeadConflictMediationRecord> for GqlLeadMediation {
+    /// Synchronous projection used as a fallback / initial constructor.
+    /// Always returns `execution_attempts: vec![]` and `attempt_number: 1`
+    /// for the synthetic status update. Async builders below populate the
+    /// owner-aware fields when a SqlitePool is available.
     fn from(record: &LeadConflictMediationRecord) -> Self {
         GqlLeadMediation {
             id: ID(record.id.clone()),
@@ -252,8 +305,200 @@ impl From<&LeadConflictMediationRecord> for GqlLeadMediation {
                 .as_ref()
                 .and_then(|json| serde_json::from_str(json).ok())
                 .map(Json),
+            execution_attempts: Vec::new(),
         }
     }
+}
+
+impl GqlLeadMediation {
+    /// API-001 (P017 R2 audit): build the GraphQL projection enriched with
+    /// mediation-owned execution attempts.
+    ///
+    /// Pulls every `agent_executions` row owned by this mediation, joins
+    /// runtime facts, and projects them under `execution_attempts`. The
+    /// synthetic single status update's `attempt_number` is replaced with
+    /// the durable count of mediation-owned executions (was hard-coded `1`).
+    pub async fn build_with_attempts(
+        pool: &sqlx::SqlitePool,
+        record: &LeadConflictMediationRecord,
+    ) -> anyhow::Result<Self> {
+        let mut projection = GqlLeadMediation::from(record);
+        let attempts = build_mediation_execution_attempts(pool, record).await?;
+        if !attempts.is_empty() {
+            // Sync attempt_number on the status_updates entry to the durable count.
+            if let Some(latest) = projection.status_updates.first_mut() {
+                latest.attempt_number = attempts.len() as i32;
+            }
+        }
+        projection.execution_attempts = attempts;
+        Ok(projection)
+    }
+}
+
+async fn build_mediation_execution_attempts(
+    pool: &sqlx::SqlitePool,
+    record: &LeadConflictMediationRecord,
+) -> anyhow::Result<Vec<GqlMediationExecutionAttempt>> {
+    let executions =
+        db::repos::agent_executions::list_by_mediation_id(pool, &record.id).await?;
+    let run_artifacts: Vec<domain::artifact::Artifact> = match record
+        .run_id
+        .parse::<domain::ids::RunId>()
+    {
+        Ok(run_id) => db::repos::artifacts::list_by_run(pool, run_id)
+            .await
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    let mut attempts = Vec::with_capacity(executions.len());
+    for (idx, execution) in executions.iter().enumerate() {
+        let attempt_number = (idx + 1) as i32;
+        let runtime_facts =
+            db::repos::agent_execution_runtime_facts::find_by_execution_id(pool, execution.id)
+                .await?;
+
+        let runtime_facts_json = runtime_facts.as_ref().map(|f| {
+            Json(serde_json::json!({
+                "valid_required_outputs": f.valid_required_outputs,
+                "failure_kind": f.failure_kind.as_ref().map(|k| k.to_string()),
+                "failure_message_redacted": f.failure_message_redacted,
+                "output_settlement": format!("{:?}", f.output_settlement).to_lowercase(),
+                "late_output_count": f.late_output_count,
+                "ignored_late_output_count": f.ignored_late_output_count,
+                "operator_action_hint": f.operator_action_hint.as_ref().map(|h| format!("{:?}", h).to_lowercase()),
+            }))
+        });
+        let watchdog_json = runtime_facts.as_ref().map(|f| {
+            Json(serde_json::json!({
+                "supervision_classification": f.supervision_classification,
+                "provider_exit_status": f.provider_exit_status,
+                "transport_error_code": f.transport_error_code,
+                "retry_after": f.retry_after.map(|t| t.to_rfc3339()),
+            }))
+        });
+        // P017 R5 / API-003: tiered artifact attribution — see MCP
+        // mirror for the full rationale. Tier 1: direct transcript
+        // artifact. Tier 2: direct execution-attempt FK
+        // (`artifacts.agent_execution_id`) — cross-retry isolation.
+        // Tier 3: legacy `agent_id` correlation only as fallback for
+        // pre-R5 attempts with no direct linkage at all.
+        let mut seen_artifact_ids: std::collections::HashSet<String> = Default::default();
+        let mut artifact_refs: Vec<GqlMediationAttemptArtifact> = Vec::new();
+        let transcript_artifact = if let Some(ref tid) = execution.transcript_artifact_id {
+            if let Ok(parsed_id) = tid.parse::<domain::ids::ArtifactId>() {
+                let found = db::repos::artifacts::find_by_id(pool, parsed_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(ref a) = found {
+                    seen_artifact_ids.insert(a.id.to_string());
+                    artifact_refs.push(GqlMediationAttemptArtifact {
+                        id: ID(a.id.to_string()),
+                        name: a.name.clone(),
+                        format: format!("{:?}", a.format).to_lowercase(),
+                        file_path: a.file_path.clone(),
+                        report_kind: a.report_kind.clone(),
+                        is_pinned: a.is_pinned,
+                    });
+                }
+                found
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Tier 2: direct execution-attempt FK linkage.
+        let direct_artifacts =
+            db::repos::artifacts::list_by_agent_execution(pool, &execution.id.to_string())
+                .await
+                .unwrap_or_default();
+        let attempt_has_direct_link = !direct_artifacts.is_empty();
+        for a in direct_artifacts.iter() {
+            if !seen_artifact_ids.insert(a.id.to_string()) {
+                continue;
+            }
+            artifact_refs.push(GqlMediationAttemptArtifact {
+                id: ID(a.id.to_string()),
+                name: a.name.clone(),
+                format: format!("{:?}", a.format).to_lowercase(),
+                file_path: a.file_path.clone(),
+                report_kind: a.report_kind.clone(),
+                is_pinned: a.is_pinned,
+            });
+        }
+        // Tier 3: legacy fallback (only when no direct linkage exists).
+        if !attempt_has_direct_link && transcript_artifact.is_none() {
+            for a in run_artifacts.iter() {
+                if !seen_artifact_ids.insert(a.id.to_string()) {
+                    continue;
+                }
+                if a.agent_id != execution.agent_id {
+                    continue;
+                }
+                artifact_refs.push(GqlMediationAttemptArtifact {
+                    id: ID(a.id.to_string()),
+                    name: a.name.clone(),
+                    format: format!("{:?}", a.format).to_lowercase(),
+                    file_path: a.file_path.clone(),
+                    report_kind: a.report_kind.clone(),
+                    is_pinned: a.is_pinned,
+                });
+            }
+        }
+
+        // P017 R4 / API-002: cost + transcript_ref now populated from
+        // per-execution columns when present.
+        let cost_json = match (
+            execution.total_cost_cents,
+            execution.input_tokens,
+            execution.output_tokens,
+            execution.cached_input_tokens,
+        ) {
+            (None, None, None, None) => None,
+            (cents, input, output, cached) => Some(Json(serde_json::json!({
+                "total_cost_cents": cents,
+                "input_tokens": input,
+                "output_tokens": output,
+                "cached_input_tokens": cached,
+            }))),
+        };
+        let transcript_json = transcript_artifact.as_ref().map(|a| {
+            Json(serde_json::json!({
+                "artifact_id": a.id.to_string(),
+                "file_path": a.file_path,
+                "format": format!("{:?}", a.format).to_lowercase(),
+            }))
+        });
+
+        attempts.push(GqlMediationExecutionAttempt {
+            agent_execution_id: ID(execution.id.to_string()),
+            owner_kind: execution
+                .owner_kind
+                .clone()
+                .unwrap_or_else(|| "lead_conflict_mediation".to_string()),
+            owner_id: execution
+                .owner_id
+                .clone()
+                .unwrap_or_else(|| record.id.clone()),
+            mediation_record_id: ID(record.id.clone()),
+            stage_execution_id: execution.stage_execution_id.map(|id| ID(id.to_string())),
+            agent_id: execution.agent_id.clone(),
+            provider: execution.provider.clone(),
+            model: execution.model.clone(),
+            status: execution.status.to_string(),
+            started_at: execution.started_at.to_rfc3339(),
+            completed_at: execution.completed_at.map(|t| t.to_rfc3339()),
+            attempt_number,
+            runtime_facts: runtime_facts_json,
+            watchdog: watchdog_json,
+            cost: cost_json,
+            transcript_ref: transcript_json,
+            artifacts: artifact_refs,
+        });
+    }
+    Ok(attempts)
 }
 
 #[derive(SimpleObject, Clone, Debug)]

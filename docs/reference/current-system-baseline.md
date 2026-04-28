@@ -40,6 +40,8 @@ At the current baseline, the product includes:
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
 - repo-backed full delivery with dedicated worktrees and manual release,
+- worktree mutation barrier protecting concurrent read/write and orchestrated sync (Proposal 064),
+- run worktree main sync and cross-run knowledge capsules (Proposal 064 Phase 0 contract freeze),
 - implementation completeness and handoff contract with structured status and verification truth,
 - rejected implementation approval loopback to proposal refinement,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
