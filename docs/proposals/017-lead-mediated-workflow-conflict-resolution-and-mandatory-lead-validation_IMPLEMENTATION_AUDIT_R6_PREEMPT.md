@@ -158,6 +158,13 @@ Presence checks:
 - GraphQL cross-attempt isolation test name present in `schema.rs`.
 - MCP cross-attempt isolation test name present in `reports.rs`.
 - REL-002 atomicity proof test name present in `proposal_017_workflow_conflict_persistence.rs`.
+- REL-002 structural awk-proximity guard: within 40 lines of the
+  `mediation.complete_with_attribution` tx label in `executor.rs`,
+  the file must contain `update_completed_tx`,
+  `update_attempt_attribution_tx`, and `completion_tx.commit()`.
+  Defends against a future refactor that moves one of the writes
+  outside the tx — the original R5 guard checked the strings
+  independently anywhere in the file and would have missed this.
 
 Cargo invocations (the original P017 gate filtered on `proposal_017_`
 prefix only, which would not have matched the new `p017_…` test

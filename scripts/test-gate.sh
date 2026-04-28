@@ -2104,6 +2104,22 @@ PY
         "$OPS_001_DB_PATH"; then
       die "P017 R6 preempt: REL-002 atomicity proof test missing"
     fi
+    # Stronger structural guard: within 40 lines of the
+    # `mediation.complete_with_attribution` tx label, the executor
+    # must call BOTH `update_completed_tx` and
+    # `update_attempt_attribution_tx`, then `completion_tx.commit()`.
+    # Defends against a future refactor that moves one of the writes
+    # outside the tx — the existing R5 guard would still pass in
+    # that case because it only checks for the strings in isolation
+    # anywhere in the file.
+    if ! awk '/"mediation\.complete_with_attribution"/{w=NR}
+              w && NR-w<=40 && /update_completed_tx/{c=1}
+              w && NR-w<=40 && /update_attempt_attribution_tx/{a=1}
+              w && NR-w<=40 && /completion_tx\.commit/{x=1}
+              END{exit !(c && a && x)}' \
+        "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R6 preempt: executor.rs mediation.complete_with_attribution block must call update_completed_tx + update_attempt_attribution_tx + completion_tx.commit() within 40 lines of the tx label"
+    fi
 
     log "Proposal 017 gate passed"
     ;;
