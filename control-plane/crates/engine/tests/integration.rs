@@ -112,6 +112,7 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     }
 }
 
@@ -252,11 +253,11 @@ fn make_agent_execution(
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     }
 }
 
@@ -3031,6 +3032,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: delivery_configuration_json.clone(),
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -3836,6 +3838,7 @@ async fn delivery_preflight_success_persists_run_owned_result() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -3889,6 +3892,7 @@ async fn delivery_preflight_failure_blocks_before_run_creation() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -3927,6 +3931,7 @@ async fn release_workflow_without_delivery_configuration_blocks_before_run_creat
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: None,
+                review_routing_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -4461,6 +4466,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -4755,6 +4761,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -4908,6 +4915,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -5087,6 +5095,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                     .to_string_lossy()
                     .into_owned(),
             ),
+            review_routing_json: None,
         },
     )
     .await
@@ -5287,6 +5296,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                     .to_string_lossy()
                     .into_owned(),
             ),
+            review_routing_json: None,
         },
     )
     .await
@@ -5511,6 +5521,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -5961,6 +5972,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6383,6 +6395,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6640,6 +6653,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6856,6 +6870,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -6945,11 +6960,11 @@ sys.exit(0)
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -7371,6 +7386,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -7773,6 +7789,7 @@ sys.exit(0)
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -8778,6 +8795,7 @@ async fn test_state_11_to_state_12_happy_path() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -9516,6 +9534,7 @@ fn test_runs_start_does_not_accept_chainworks_meta_root_override() {
         workflow_yaml_path: "/tmp/wf.yaml".into(),
         agent_catalog_yaml_path: "/tmp/cat.yaml".into(),
         delivery_configuration_json: None,
+        review_routing_json: None,
     };
     // If this compiles, StartRunCmd has no chainworks_meta_root field — the daemon owns it.
     let _ = cmd;
@@ -9731,11 +9750,11 @@ async fn p017_mediation_cancel_run_cascade() {
         owner_id: Some(mediation_id.clone()),
         lead_mediation_record_id: Some(mediation_id.clone()),
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &mediation_execution)
         .await
@@ -9815,11 +9834,10 @@ async fn p017_mediation_cancel_run_cascade() {
     engine::cancellation::begin_settlement(&pool, run_id, now)
         .await
         .expect("idempotent begin_settlement");
-    let mediation_again =
-        db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
-            .await
-            .expect("find mediation")
-            .expect("mediation row");
+    let mediation_again = db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+        .await
+        .expect("find mediation")
+        .expect("mediation row");
     assert_eq!(
         mediation_again.status,
         domain::mediation::LeadMediationStatus::Canceled,
@@ -9835,7 +9853,7 @@ async fn p017_mediation_cancel_run_cascade() {
 /// columns the audit named — across cancellation, readback, and
 /// idempotency operations.
 ///
-/// See `docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md`
+/// See `docs/reference/workflow-conflict-evidence/phase-b-mediation-execution-fields-equivalence.md`
 /// for the full rationale; this test is the executable proof.
 #[tokio::test]
 async fn p017_mediation_execution_fields_equivalence() {
@@ -9917,13 +9935,12 @@ async fn p017_mediation_execution_fields_equivalence() {
 
     // ── Property 1: direct identity ─────────────────────────────────────
     // For stage-owned execution, run_id is recoverable via stage_executions.
-    let stage_run_id_via_join = sqlx::query_scalar::<_, String>(
-        "SELECT run_id FROM stage_executions WHERE id = ?",
-    )
-    .bind(stage_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("query stage run_id");
+    let stage_run_id_via_join =
+        sqlx::query_scalar::<_, String>("SELECT run_id FROM stage_executions WHERE id = ?")
+            .bind(stage_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("query stage run_id");
     assert_eq!(
         stage_run_id_via_join,
         run_id.to_string(),
@@ -9932,13 +9949,12 @@ async fn p017_mediation_execution_fields_equivalence() {
 
     // For mediation-owned execution(s), run_id is recoverable via
     // lead_conflict_mediations.run_id keyed on lead_mediation_record_id.
-    let med_run_id_via_join = sqlx::query_scalar::<_, String>(
-        "SELECT run_id FROM lead_conflict_mediations WHERE id = ?",
-    )
-    .bind(&mediation_id)
-    .fetch_one(&pool)
-    .await
-    .expect("query mediation run_id");
+    let med_run_id_via_join =
+        sqlx::query_scalar::<_, String>("SELECT run_id FROM lead_conflict_mediations WHERE id = ?")
+            .bind(&mediation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query mediation run_id");
     assert_eq!(
         med_run_id_via_join,
         run_id.to_string(),
@@ -9967,12 +9983,10 @@ async fn p017_mediation_execution_fields_equivalence() {
             );
         }
     }
-    let mediation_after =
-        db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
-            .await
-            .expect("find mediation")
-            .expect("mediation row")
-            ;
+    let mediation_after = db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+        .await
+        .expect("find mediation")
+        .expect("mediation row");
     assert_eq!(
         mediation_after.status,
         domain::mediation::LeadMediationStatus::Canceled,
@@ -10236,7 +10250,7 @@ fn p017_phase_b_checked_in_lead_resolver_resolves_bundled_workflows() {
     use engine::mediation::lead_resolver::*;
 
     let resolver_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json");
+        .join("../../../docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json");
     let resolver = PhaseBLeadResolver::load_from_file(&resolver_path.to_string_lossy())
         .expect("checked-in Phase B resolver loads");
 

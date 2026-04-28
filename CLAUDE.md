@@ -69,7 +69,7 @@ Key engine pieces (under `Chainworks Forge/Engine/`):
 - `RunPlanCompiler.swift` — compiles idea + YAML → frozen `RunPlan` with resolved agent bindings
 - `WorkflowOrchestrator.swift` — state machine driver, lazy stage creation, fan-out via `TaskGroup`, transition authority resolver
 - `TransitionEvaluator.swift` — canonical `when:` expression evaluator (ARCH-031): `exists()`, comparisons, `vars.*`, `artifact.field`, `and/or`
-- `RuntimeAgentExecutor.swift` — single-agent execution with retries, watchdog, owner-aware execution identity (P017)
+- `RuntimeAgentExecutor.swift` — single-agent execution with retries, watchdog, owner-aware execution identity
 - `AgentSessionManager.swift` — per-run session lineage, reuse scopes, generation tracking
 - `ExecutionService.swift` — top-level coordinator, transport factory
 - `RecoveryCoordinator.swift` / `ResumeManager.swift` — startup repair, drift handling

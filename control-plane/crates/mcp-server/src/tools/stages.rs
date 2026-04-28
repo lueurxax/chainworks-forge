@@ -113,9 +113,7 @@ pub async fn execute(
             let legacy_discovery_override_reason = params["legacy_discovery_override_reason"]
                 .as_str()
                 .map(String::from);
-            let operator_instruction = params["operator_instruction"]
-                .as_str()
-                .map(String::from);
+            let operator_instruction = params["operator_instruction"].as_str().map(String::from);
 
             let caller = mcp_caller(&principal.id, &principal.class, "stages.retry");
             let cmd = Command::RetryStage(RetryStageCmd {

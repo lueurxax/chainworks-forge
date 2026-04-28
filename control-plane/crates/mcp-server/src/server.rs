@@ -1204,6 +1204,7 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         }
     }
 

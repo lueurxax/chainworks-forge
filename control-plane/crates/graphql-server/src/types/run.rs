@@ -347,17 +347,14 @@ async fn build_mediation_execution_attempts(
     pool: &sqlx::SqlitePool,
     record: &LeadConflictMediationRecord,
 ) -> anyhow::Result<Vec<GqlMediationExecutionAttempt>> {
-    let executions =
-        db::repos::agent_executions::list_by_mediation_id(pool, &record.id).await?;
-    let run_artifacts: Vec<domain::artifact::Artifact> = match record
-        .run_id
-        .parse::<domain::ids::RunId>()
-    {
-        Ok(run_id) => db::repos::artifacts::list_by_run(pool, run_id)
-            .await
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    let executions = db::repos::agent_executions::list_by_mediation_id(pool, &record.id).await?;
+    let run_artifacts: Vec<domain::artifact::Artifact> =
+        match record.run_id.parse::<domain::ids::RunId>() {
+            Ok(run_id) => db::repos::artifacts::list_by_run(pool, run_id)
+                .await
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
 
     let mut attempts = Vec::with_capacity(executions.len());
     for (idx, execution) in executions.iter().enumerate() {

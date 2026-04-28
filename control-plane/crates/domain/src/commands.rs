@@ -62,6 +62,10 @@ pub struct StartRunCmd {
     /// Required by active run-start ingress when deterministic Steward snapshot truth is enabled.
     /// Path to the agent catalog YAML file.
     pub agent_catalog_yaml_path: String,
+    /// P060: Frozen review routing options JSON (ReviewRoutingOptions).
+    /// When present, controls how proposal reviewers are selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_routing_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -355,6 +359,7 @@ mod tests {
             delivery_configuration_json: Some(
                 r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#.into(),
             ),
+            review_routing_json: None,
         };
 
         let json = serde_json::to_value(&cmd).unwrap();

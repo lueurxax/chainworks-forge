@@ -1,0 +1,74 @@
+{
+  "manifest_seeded_at": "2026-04-24T10:00:00Z",
+  "artifacts": [
+    {
+      "artifact_id": "phase-0-approval-mediation-contract",
+      "path": "docs/reference/workflow-conflict-evidence/phase-0-approval-mediation-contract.json",
+      "owner": "workflow conflict contract maintainers",
+      "reviewer": "architect",
+      "reviewed_at": "2026-04-24T12:00:00Z",
+      "proposal_revision_id": "6ad4e80a-2026-04-24-r12",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-0-mediation-execution-identity-contract",
+      "path": "docs/reference/workflow-conflict-evidence/phase-0-mediation-execution-identity-contract.md",
+      "owner": "workflow conflict contract maintainers",
+      "reviewer": "architect",
+      "reviewed_at": "2026-04-24T12:00:00Z",
+      "proposal_revision_id": "6ad4e80a-2026-04-24-r12",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-0-work-item-execution-owner-contract",
+      "path": "docs/reference/workflow-conflict-evidence/phase-0-work-item-execution-owner-contract.json",
+      "owner": "workflow conflict contract maintainers",
+      "reviewer": "architect",
+      "reviewed_at": "2026-04-24T12:00:00Z",
+      "proposal_revision_id": "6ad4e80a-2026-04-24-r12",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-0-phase-b-lead-resolver",
+      "path": "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json",
+      "owner": "workflow conflict contract maintainers",
+      "reviewer": "architect",
+      "reviewed_at": "2026-04-24T12:00:00Z",
+      "proposal_revision_id": "6ad4e80a-2026-04-24-r12",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-0-settlement-service-boundary",
+      "path": "docs/reference/workflow-conflict-evidence/phase-0-settlement-service-boundary.md",
+      "owner": "workflow conflict contract maintainers",
+      "reviewer": "architect",
+      "reviewed_at": "2026-04-24T12:00:00Z",
+      "proposal_revision_id": "6ad4e80a-2026-04-24-r12",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-a-known-issues-migration-records",
+      "path": "docs/reference/workflow-conflict-evidence/phase-a-known-issues-migration-records.json",
+      "owner": "workflow conflict contract maintainers",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-c-external-catalog-enforcement-inventory",
+      "path": "docs/reference/workflow-conflict-evidence/phase-c-external-catalog-enforcement-inventory.json",
+      "owner": "workflow conflict contract maintainers",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-b-dogfood-exit-record",
+      "path": "docs/reference/workflow-conflict-evidence/phase-b-dogfood-exit-record.json",
+      "owner": "workflow conflict contract maintainers",
+      "status": "approved"
+    },
+    {
+      "artifact_id": "phase-b-mediation-execution-fields-equivalence",
+      "path": "docs/reference/workflow-conflict-evidence/phase-b-mediation-execution-fields-equivalence.md",
+      "owner": "workflow conflict contract maintainers",
+      "status": "approved"
+    }
+  ]
+}

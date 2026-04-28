@@ -170,12 +170,7 @@ pub(crate) async fn workflow_conflict_json(
             let present: Vec<&str> = expected
                 .iter()
                 .copied()
-                .filter(|key| {
-                    value
-                        .get(*key)
-                        .map(|v| !v.is_null())
-                        .unwrap_or(false)
-                })
+                .filter(|key| value.get(*key).map(|v| !v.is_null()).unwrap_or(false))
                 .collect();
             let now = chrono::Utc::now();
             let mut tx = pool.begin().await?;
@@ -218,8 +213,7 @@ async fn lead_mediation_readback_json(
     // through the workflow conflict surface that P017 designates as
     // authoritative. Without this, runtime facts, transcript refs,
     // watchdog outcome, and cost are not grouped with the conflict.
-    let execution_attempts =
-        mediation_execution_attempts_json(pool, mediation_id, &record).await?;
+    let execution_attempts = mediation_execution_attempts_json(pool, mediation_id, &record).await?;
     let attempt_count = execution_attempts.len();
 
     // The synthetic single status_updates entry below is preserved for
@@ -292,7 +286,9 @@ async fn mediation_execution_attempts_json(
     // Best-effort artifact correlation by agent_id. Parsing run_id from the
     // mediation record (string form) keeps this query scoped.
     let run_artifacts = match record.run_id.parse::<RunId>() {
-        Ok(run_id) => artifacts::list_by_run(pool, run_id).await.unwrap_or_default(),
+        Ok(run_id) => artifacts::list_by_run(pool, run_id)
+            .await
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -370,10 +366,9 @@ async fn mediation_execution_attempts_json(
         };
 
         // Tier 2: direct execution-attempt FK linkage.
-        let direct_artifacts =
-            artifacts::list_by_agent_execution(pool, &execution.id.to_string())
-                .await
-                .unwrap_or_default();
+        let direct_artifacts = artifacts::list_by_agent_execution(pool, &execution.id.to_string())
+            .await
+            .unwrap_or_default();
         let attempt_has_direct_link = !direct_artifacts.is_empty();
         for a in direct_artifacts.iter() {
             if !seen_artifact_ids.insert(a.id.to_string()) {
@@ -1220,6 +1215,7 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         }
     }
 
@@ -1747,14 +1743,16 @@ mod tests {
             agent_execution_id: None,
         };
         let transcript_artifact_id = transcript_artifact.id.to_string();
-        artifacts::insert(&pool, &transcript_artifact).await.unwrap();
+        artifacts::insert(&pool, &transcript_artifact)
+            .await
+            .unwrap();
         db::repos::agent_executions::update_attempt_attribution(
             &pool,
             exec_two_id,
-            Some(123),  // total_cost_cents
-            Some(500),  // input_tokens
-            Some(75),   // output_tokens
-            Some(40),   // cached_input_tokens
+            Some(123), // total_cost_cents
+            Some(500), // input_tokens
+            Some(75),  // output_tokens
+            Some(40),  // cached_input_tokens
             Some(&transcript_artifact_id),
         )
         .await

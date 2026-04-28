@@ -105,7 +105,7 @@ This document records the key architecture decisions made during the foundation 
 
 ## ARCH-037: Owner-aware execution identity
 
-**Context:** Agent executions traditionally assumed stage-ownership. Proposal 017 requires lead-mediated conflicts to own agent executions without creating synthetic stages.
+**Context:** Agent executions traditionally assumed stage-ownership. Lead-mediated conflicts require their own agent executions without creating synthetic stages.
 
 **Decision:** Migrate `AgentExecution` to a general owner model with `ownerKind` and `ownerID`. Support `stage_execution` and `lead_conflict_mediation` owners.
 

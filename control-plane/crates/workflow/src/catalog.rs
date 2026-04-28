@@ -136,6 +136,34 @@ pub struct AgentEntry {
     pub xcode_shim_injection_signal: Option<bool>,
     #[serde(default)]
     pub requires_xcode_host_execution: Option<bool>,
+    /// P060: Routing metadata for deterministic reviewer selection.
+    #[serde(default)]
+    pub routing: Option<RoutingMetadataYaml>,
+}
+
+/// P060: Routing metadata block on an agent catalog entry.
+/// Tags are lowercase ASCII kebab-case.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RoutingMetadataYaml {
+    pub routing_id: String,
+    pub family: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub stacks: Vec<String>,
+    #[serde(default)]
+    pub surfaces: Vec<String>,
+    #[serde(default)]
+    pub risks: Vec<String>,
+    #[serde(default)]
+    pub enabled_for_proposal_review: bool,
+    pub rollout_wave: Option<String>,
+    #[serde(default)]
+    pub mandatory_when: Vec<String>,
+    #[serde(default)]
+    pub usually_pair_with: Vec<String>,
+    #[serde(default)]
+    pub close_alternatives: Vec<String>,
 }
 
 /// Validate that an executable catalog has exactly one system lead with the

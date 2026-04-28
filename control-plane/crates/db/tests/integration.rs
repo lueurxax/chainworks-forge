@@ -79,6 +79,7 @@ async fn insert_p017_run(pool: &sqlx::SqlitePool) -> RunId {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(pool, &run).await.unwrap();
     run.id
@@ -130,6 +131,7 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(pool, &run).await.unwrap();
 
@@ -189,11 +191,11 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
@@ -237,11 +239,11 @@ async fn p017_mediation_owned_agent_execution_does_not_require_stage_execution()
         owner_id: Some("mediation-001".into()),
         lead_mediation_record_id: Some("mediation-001".into()),
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
 
     agent_executions::insert(&pool, &execution)
@@ -299,11 +301,11 @@ async fn p017_mediation_owned_retry_budget_and_artifact_claims_are_owner_keyed()
         owner_id: Some("mediation-claim-001".into()),
         lead_mediation_record_id: Some("mediation-claim-001".into()),
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -451,6 +453,7 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -590,6 +593,7 @@ async fn steward_run_metadata_and_project_key_roundtrip() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -704,6 +708,7 @@ async fn steward_analysis_schema_roundtrips_p049_contract() {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await
@@ -809,6 +814,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -867,11 +873,11 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -962,6 +968,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1125,6 +1132,7 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1183,11 +1191,11 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1524,6 +1532,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -1603,11 +1612,11 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -1642,11 +1651,11 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await
@@ -1807,6 +1816,7 @@ async fn test_run_insert_and_find() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     let found = runs::find_by_id(&pool, run.id).await.unwrap();
@@ -1861,6 +1871,7 @@ async fn test_run_status_update() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     runs::update_status(&pool, run.id, RunStatus::Running)
@@ -1925,6 +1936,7 @@ async fn test_projection_parity_after_rebuild() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2071,6 +2083,7 @@ async fn test_projection_status_uses_canonical_run_when_summary_lags() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
     projections::rebuild_all_for_run(&pool, run.id)
@@ -2274,6 +2287,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         };
         runs::insert(&pool, &run).await.unwrap();
 
@@ -2441,6 +2455,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2643,6 +2658,7 @@ async fn test_projection_list_before_rebuild_returns_run_with_zero_counts() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2728,6 +2744,7 @@ async fn run_projection_derives_cancellation_settlement_summary_from_canonical_l
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2793,6 +2810,7 @@ async fn rebuild_all_for_run_refreshes_run_state_projection_status() {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -2882,6 +2900,7 @@ async fn test_approval_inbox_projection_parity_vs_canonical() {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         },
     )
     .await

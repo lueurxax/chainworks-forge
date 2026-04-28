@@ -147,4 +147,9 @@ pub struct Run {
     /// resolve to this path instead of the shared `.chainworks/`.
     /// NULL for legacy pre-P050 runs (fallback to template default).
     pub chainworks_meta_root: Option<String>,
+    // ── P060: Frozen review routing options ─────────────────────────────
+    /// JSON-encoded `ReviewRoutingOptions` frozen at run start.
+    /// Controls how proposal reviewers are selected for this run.
+    /// NULL for runs that use legacy fixed routing.
+    pub review_routing_json: Option<String>,
 }

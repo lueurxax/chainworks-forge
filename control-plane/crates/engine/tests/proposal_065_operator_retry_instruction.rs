@@ -11,9 +11,7 @@
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{
-    agent_executions, ideas, retry_operator_instructions, runs, stages, work_items,
-};
+use db::repos::{agent_executions, ideas, retry_operator_instructions, runs, stages, work_items};
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentStatus};
 use domain::commands::{CallerContext, CallerSurface, Command, PrincipalClass, RetryStageCmd};
@@ -60,6 +58,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     }
 }
 
@@ -103,7 +102,9 @@ async fn setup_failed_stage(pool: &sqlx::SqlitePool) -> (RunId, IdeaId, StageExe
     )
     .await
     .unwrap();
-    runs::insert(pool, &make_run(run_id, idea_id)).await.unwrap();
+    runs::insert(pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
     stages::insert(
         pool,
         &StageExecution {
@@ -169,7 +170,10 @@ async fn p065_full_stage_retry_with_operator_instruction_creates_binding() {
         } => retry_instruction_binding_id
             .as_ref()
             .expect("binding id must be present for instructed retry"),
-        other => panic!("Expected StageRetryScheduled, got {:?}", std::mem::discriminant(other)),
+        other => panic!(
+            "Expected StageRetryScheduled, got {:?}",
+            std::mem::discriminant(other)
+        ),
     };
 
     // Verify binding row persisted
@@ -191,10 +195,9 @@ async fn p065_full_stage_retry_with_operator_instruction_creates_binding() {
     assert!(bindings[0].target_agent_execution_id.is_none());
 
     // Child delivery rows are deferred to orchestrator for full-stage retry
-    let deliveries =
-        retry_operator_instructions::list_deliveries_by_binding(&pool, binding_id)
-            .await
-            .unwrap();
+    let deliveries = retry_operator_instructions::list_deliveries_by_binding(&pool, binding_id)
+        .await
+        .unwrap();
     assert_eq!(
         deliveries.len(),
         0,
@@ -288,7 +291,11 @@ async fn p065_validation_failure_rejects_empty_instruction() {
     let bindings = retry_operator_instructions::list_by_run(&pool, run_id)
         .await
         .unwrap();
-    assert_eq!(bindings.len(), 0, "validation failure must leave no bindings");
+    assert_eq!(
+        bindings.len(),
+        0,
+        "validation failure must leave no bindings"
+    );
 }
 
 #[tokio::test]
@@ -419,7 +426,10 @@ async fn p065_retry_without_instruction_from_agent_still_works() {
         )
         .await;
 
-    assert!(result.is_ok(), "agent retry without instruction must succeed");
+    assert!(
+        result.is_ok(),
+        "agent retry without instruction must succeed"
+    );
 }
 
 // ── Domain validation unit tests (already in domain crate; this confirms integration) ──
@@ -583,10 +593,9 @@ async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery
     assert!(bindings[0].target_agent_execution_id.is_some());
 
     // Targeted retry creates child delivery immediately
-    let deliveries =
-        retry_operator_instructions::list_deliveries_by_binding(&pool, binding_id)
-            .await
-            .unwrap();
+    let deliveries = retry_operator_instructions::list_deliveries_by_binding(&pool, binding_id)
+        .await
+        .unwrap();
     assert_eq!(
         deliveries.len(),
         1,
@@ -673,13 +682,12 @@ async fn p065_repo_helpers_round_trip() {
     assert_eq!(binding.instruction_sha256.len(), 64);
 
     // List by retry stage execution
-    let listed =
-        retry_operator_instructions::list_by_retry_stage_execution_id_tx(
-            &mut tx,
-            new_stage_execution_id,
-        )
-        .await
-        .unwrap();
+    let listed = retry_operator_instructions::list_by_retry_stage_execution_id_tx(
+        &mut tx,
+        new_stage_execution_id,
+    )
+    .await
+    .unwrap();
     assert_eq!(listed.len(), 1);
 
     // Create delivery

@@ -393,7 +393,7 @@ language-specific scheduler capacity dimensions.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `028_p017_phase_b_mediation.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `028_p017_phase_b_mediation.sql`; retained historical alias):
 
 | Table | Purpose |
 |---|---|
@@ -532,7 +532,7 @@ The command handler at `crates/engine/src/command_handler.rs` processes eleven c
 | `ResetSession` | Resets stage to Pending, enqueues StartupRepair. |
 | `RunStewardAnalysis` | Triggers a Steward system-health analysis. |
 | `OverrideArtifactContract` | Applies a manual operator override to an artifact contract's status. |
-| `ResolveLeadMediationConfirmation` | Resolves a lead mediation confirmation (P017 Phase B) via the engine-owned settlement boundary. |
+| `ResolveLeadMediationConfirmation` | Resolves a lead mediation confirmation via the engine-owned settlement boundary. |
 | `MainSyncRequest` | P064: Queue or dedupe a main-sync request (Phase 0 contract only). |
 | `MainSyncRetry` | P064: Retry a failed sync attempt (Phase 0 contract only). |
 | `MainSyncSetRunOverride` | P064: Set per-run main-sync mode override (Phase 0 contract only). |

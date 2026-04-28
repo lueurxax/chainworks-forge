@@ -101,6 +101,36 @@ pub struct RunBlock {
     pub parallel: Option<Vec<AgentTask>>,
     /// Tasks to run sequentially after parallel tasks complete.
     pub then: Option<Vec<AgentTask>>,
+    /// P060: Dynamic parallel — materializes selected reviewers from a typed
+    /// selector artifact (AgentSelectionPlanV1). Additive sibling to
+    /// sequence/parallel/then.
+    #[serde(default)]
+    pub dynamic_parallel: Option<DynamicParallelDef>,
+    /// P060: System task — executed in-process without a provider.
+    /// Used for system.routing (proposal_review_router).
+    #[serde(default)]
+    pub system_task: Option<SystemTaskDef>,
+}
+
+/// P060: Definition for a dynamic_parallel block.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DynamicParallelDef {
+    /// The selector artifact to read (e.g. "agent_selection_plan_v1").
+    pub selector_artifact: String,
+    /// The output contract each materialized reviewer must produce.
+    pub output_contract: String,
+    /// Inputs passed to each materialized reviewer.
+    #[serde(default)]
+    pub inputs: Vec<String>,
+}
+
+/// P060: Definition for a system task block.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SystemTaskDef {
+    /// Task type identifier (e.g. "proposal_review_router").
+    pub task_type: String,
+    /// Executor mode (e.g. "system.routing").
+    pub executor_mode: String,
 }
 
 /// A single agent invocation within a run block.
@@ -112,6 +142,20 @@ pub struct AgentTask {
     pub outputs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_policies: Option<HashMap<String, OutputPolicyDef>>,
+    /// P060: selected_outputs_from declaration for aggregation tasks.
+    /// When present, the task receives only artifacts from dynamically
+    /// selected reviewers rather than all artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_outputs_from: Option<SelectedOutputsFromDef>,
+}
+
+/// P060: Declaration for selected_outputs_from on aggregation tasks.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SelectedOutputsFromDef {
+    /// The selector plan type (e.g. "agent_selection_plan_v1").
+    pub source_plan: String,
+    /// The output contract to filter by (e.g. "proposal_review_v1").
+    pub output_contract: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

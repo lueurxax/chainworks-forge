@@ -1733,3 +1733,297 @@ agents:
     assert_eq!(versioned.machine_format.as_deref(), Some("json"));
     assert_eq!(hyphen_versioned.machine_format.as_deref(), Some("json"));
 }
+
+// ── P060: Dynamic candidate bindings ────────────────────────────────
+
+#[test]
+fn p060_dynamic_candidate_bindings_from_routing_metadata() {
+    let catalog_yaml = r#"
+schema_version: 1
+backend_profiles:
+  claude_opus:
+    provider: claude_acp
+    model: claude-opus-4-6
+    effort: high
+agents:
+  - id: proposal_reviewer_security
+    backend_profile: claude_opus
+    prompt: "Review for security"
+    output_contract: proposal_review_v1
+    routing:
+      routing_id: security
+      family: proposal_reviewer
+      capabilities: [security-audit, threat-modeling]
+      stacks: []
+      surfaces: []
+      risks: [security, authentication, authorization]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [security]
+  - id: proposal_reviewer_rust_architect
+    backend_profile: claude_opus
+    prompt: "Review for Rust architecture"
+    output_contract: proposal_review_v1
+    routing:
+      routing_id: rust_arch
+      family: proposal_reviewer
+      capabilities: [rust-architecture]
+      stacks: [rust]
+      surfaces: [control-plane]
+      risks: [retry, resume, recovery]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+  - id: proposal_reviewer_ios
+    backend_profile: claude_opus
+    prompt: "Review for iOS"
+    output_contract: proposal_review_v1
+    routing:
+      routing_id: ios
+      family: proposal_reviewer
+      capabilities: [ios-review]
+      stacks: [swift]
+      surfaces: [ios]
+      risks: []
+      enabled_for_proposal_review: false
+      rollout_wave: later_wave
+  - id: lead_orchestrator
+    backend_profile: claude_opus
+    prompt: "Orchestrate"
+"#;
+    let catalog_path = write_temp_fixture("p060_agents.yaml", catalog_yaml);
+    let bindings = compiler::compile_dynamic_candidate_bindings_from_paths(&catalog_path).unwrap();
+
+    // Only agents with routing metadata should produce bindings.
+    assert_eq!(bindings.len(), 3, "expected 3 agents with routing metadata");
+
+    // Check security reviewer binding.
+    let security = bindings.iter().find(|b| b.agent_id == "proposal_reviewer_security").unwrap();
+    assert!(security.enabled_for_proposal_review);
+    assert_eq!(security.rollout_wave, "phase_3_core");
+    assert_eq!(security.routing_metadata.routing_id, "security");
+    assert!(security.routing_metadata.risks.contains(&"security".to_string()));
+    assert_eq!(security.routing_metadata.mandatory_when, vec!["security".to_string()]);
+    assert_eq!(security.output_contracts, vec!["proposal_review_v1".to_string()]);
+
+    // Check iOS reviewer is disabled.
+    let ios = bindings.iter().find(|b| b.agent_id == "proposal_reviewer_ios").unwrap();
+    assert!(!ios.enabled_for_proposal_review);
+    assert_eq!(ios.rollout_wave, "later_wave");
+
+    // lead_orchestrator has no routing metadata — no binding.
+    assert!(bindings.iter().all(|b| b.agent_id != "lead_orchestrator"));
+}
+
+#[test]
+fn p060_plan_contains_dynamic_candidate_bindings() {
+    let workflow_yaml = r#"workflow:
+  id: test_routing
+  family: test
+  stack: rust
+initial_state: s1
+states:
+  s1:
+    label: Start
+    type: start
+    owner: lead
+    transitions:
+      - to: s2
+        when: "true"
+  s2:
+    label: End
+    type: end
+    owner: lead
+"#;
+    let catalog_yaml = r#"
+schema_version: 1
+backend_profiles:
+  claude_opus:
+    provider: claude_acp
+    model: claude-opus-4-6
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_opus
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    prompt: "Orchestrate"
+  - id: reviewer
+    backend_profile: claude_opus
+    prompt: "Review"
+    routing:
+      routing_id: test_reviewer
+      family: proposal_reviewer
+      capabilities: [test]
+      stacks: [rust]
+      surfaces: []
+      risks: []
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+"#;
+    let plan = compile_result_from_strings(workflow_yaml, catalog_yaml).unwrap();
+    assert_eq!(plan.dynamic_candidate_bindings.len(), 1);
+    assert_eq!(plan.dynamic_candidate_bindings[0].agent_id, "reviewer");
+    assert_eq!(plan.dynamic_candidate_bindings[0].routing_metadata.routing_id, "test_reviewer");
+}
+
+#[test]
+fn p060_dynamic_parallel_definition_compiles() {
+    let workflow_yaml = r#"workflow:
+  id: test_dynamic_parallel
+  family: test
+  stack: rust
+initial_state: s1
+states:
+  s1:
+    label: Start
+    type: start
+    owner: lead
+    run:
+      system_task:
+        task_type: proposal_review_router
+        executor_mode: system.routing
+      dynamic_parallel:
+        selector_artifact: agent_selection_plan_v1
+        output_contract: proposal_review_v1
+        inputs:
+          - proposal_current
+          - idea_brief
+    transitions:
+      - to: s2
+        when: "true"
+  s2:
+    label: End
+    type: end
+    owner: lead
+"#;
+    let catalog_yaml = r#"
+schema_version: 1
+backend_profiles:
+  claude_opus:
+    provider: claude_acp
+    model: claude-opus-4-6
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_opus
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    prompt: "Orchestrate"
+  - id: reviewer
+    backend_profile: claude_opus
+    prompt: "Review"
+"#;
+    let plan = compile_result_from_strings(workflow_yaml, catalog_yaml).unwrap();
+    let state = plan.states.get("s1").unwrap();
+
+    // Check system_task was compiled.
+    let sys = state.system_task.as_ref().expect("should have system_task");
+    assert_eq!(sys.task_type, "proposal_review_router");
+    assert_eq!(sys.executor_mode, "system.routing");
+
+    // Check dynamic_parallel was compiled.
+    let dp = state.dynamic_parallel.as_ref().expect("should have dynamic_parallel");
+    assert_eq!(dp.selector_artifact, "agent_selection_plan_v1");
+    assert_eq!(dp.output_contract, "proposal_review_v1");
+    assert_eq!(dp.inputs, vec!["proposal_current", "idea_brief"]);
+}
+
+#[test]
+fn p060_selected_outputs_from_compiles_on_then_task() {
+    let workflow_yaml = r#"workflow:
+  id: test_selected_outputs
+  family: test
+  stack: rust
+initial_state: s1
+states:
+  s1:
+    label: Route and Review
+    type: start
+    owner: lead
+    run:
+      parallel:
+        - agent: reviewer
+          task: review_security
+          outputs:
+            - proposal_review_security
+        - agent: reviewer
+          task: review_rust
+          outputs:
+            - proposal_review_rust
+      then:
+        - agent: aggregator
+          task: aggregate_reviews
+          inputs:
+            - proposal_review_security
+            - proposal_review_rust
+          outputs:
+            - review_aggregate
+          selected_outputs_from:
+            source_plan: agent_selection_plan_v1
+            output_contract: proposal_review_v1
+    transitions:
+      - to: s2
+        when: "true"
+  s2:
+    label: End
+    type: end
+    owner: lead
+"#;
+    let catalog_yaml = r#"
+schema_version: 1
+backend_profiles:
+  claude_opus:
+    provider: claude_acp
+    model: claude-opus-4-6
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: claude_opus
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    prompt: "Orchestrate"
+  - id: reviewer
+    backend_profile: claude_opus
+    prompt: "Review"
+  - id: aggregator
+    backend_profile: claude_opus
+    prompt: "Aggregate"
+"#;
+    let plan = compile_result_from_strings(workflow_yaml, catalog_yaml).unwrap();
+    let state = plan.states.get("s1").unwrap();
+
+    // The then-task (aggregator) should have selected_outputs_from compiled.
+    let then_tasks: Vec<_> = state.tasks.iter().filter(|t| t.phase > 0).collect();
+    assert_eq!(then_tasks.len(), 1);
+    let agg = &then_tasks[0];
+    assert_eq!(agg.task_name, "aggregate_reviews");
+    let sof = agg.selected_outputs_from.as_ref()
+        .expect("then-task should have selected_outputs_from");
+    assert_eq!(sof.source_plan, "agent_selection_plan_v1");
+    assert_eq!(sof.output_contract, "proposal_review_v1");
+
+    // Parallel tasks should NOT have selected_outputs_from.
+    let par_tasks: Vec<_> = state.tasks.iter().filter(|t| t.phase == 0).collect();
+    assert!(par_tasks.iter().all(|t| t.selected_outputs_from.is_none()));
+}

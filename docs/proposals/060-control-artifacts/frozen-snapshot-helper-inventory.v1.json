@@ -1,0 +1,10 @@
+{
+  "schema": "frozen_snapshot_helper_inventory_v1",
+  "proposal_revision_id": "P060-r16-2026-04-22",
+  "source_commit": "7ac5f7854",
+  "repo_search_evidence": "rg workflow catalog readers",
+  "readers": [
+    { "reader": "post_start workflow reader", "surface": "workflow", "status": "snapshot_backed", "workflow_snapshot": true },
+    { "reader": "post_start catalog reader", "surface": "catalog", "status": "legacy_fallback", "catalog_snapshot": true }
+  ]
+}

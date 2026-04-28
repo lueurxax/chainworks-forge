@@ -6,9 +6,10 @@ use async_graphql::futures_util::StreamExt;
 use async_graphql::*;
 use sqlx::{Row, SqlitePool};
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, ideas, projections, runs, steward as steward_repo,
+    approvals, artifact_contracts, artifacts, ideas, projections, runs, steward as steward_repo,
     workflow_conflicts,
 };
 use domain::commands::{
@@ -17,7 +18,7 @@ use domain::commands::{
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::events::DomainEvent;
-use domain::ids::{IdeaId, RunId, StageExecutionId};
+use domain::ids::{ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::lifecycle::DaemonStatus;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
@@ -128,8 +129,9 @@ async fn enrich_run_with_artifact_contracts(
             if let Ok(Some(med)) =
                 db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
             {
-                conflict.lead_mediation =
-                    Some(crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?);
+                conflict.lead_mediation = Some(
+                    crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?,
+                );
             }
         }
     }
@@ -244,20 +246,78 @@ impl QueryRoot {
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let run = runs::find_by_id(pool, parsed_run_id).await?;
         let items = projections::list_artifacts_projection(pool, run_id.as_str()).await?;
+        let should_attach_payload = ctx.look_ahead().field("payloadText").exists();
+        debug!(
+            run_id = %run_id.as_str(),
+            artifact_count = items.len(),
+            payload_requested = should_attach_payload,
+            "P031 artifacts query"
+        );
+        if should_attach_payload {
+            info!(
+                run_id = %run_id.as_str(),
+                artifact_count = items.len(),
+                "P031 bulk artifact payload requested"
+            );
+        }
         let mut bulk_preview_budget_remaining = P031_ARTIFACT_PAYLOAD_BULK_PREVIEW_MAX_BYTES;
         Ok(items
             .into_iter()
             .map(|row| {
                 let mut artifact = GqlArtifact::from(row.clone());
-                attach_p031_artifact_payload(
-                    &row,
-                    run.as_ref(),
-                    &mut artifact,
-                    &mut bulk_preview_budget_remaining,
-                );
+                if should_attach_payload {
+                    attach_p031_artifact_payload(
+                        &row,
+                        run.as_ref(),
+                        &mut artifact,
+                        &mut bulk_preview_budget_remaining,
+                    );
+                }
                 artifact
             })
             .collect())
+    }
+
+    async fn artifact(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlArtifact>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let artifact_id: ArtifactId = id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let Some(row) = artifacts::find_by_id(pool, artifact_id).await? else {
+            debug!(artifact_id = %id.as_str(), "P031 selected artifact query missed");
+            return Ok(None);
+        };
+        let run = runs::find_by_id(pool, row.run_id).await?;
+        let format = row.format.to_string();
+        let mut artifact = GqlArtifact::from(row.clone());
+        let should_attach_payload = ctx.look_ahead().field("payloadText").exists();
+        debug!(
+            artifact_id = %id.as_str(),
+            run_id = %row.run_id,
+            payload_requested = should_attach_payload,
+            "P031 selected artifact query"
+        );
+        if should_attach_payload {
+            let mut preview_budget = P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES;
+            attach_p031_artifact_payload_from_metadata(
+                &format,
+                row.report_kind.as_deref(),
+                row.size_bytes,
+                &row.file_path,
+                run.as_ref(),
+                &mut artifact,
+                &mut preview_budget,
+            );
+        }
+        debug!(
+            artifact_id = %artifact.id.as_str(),
+            payload_state = ?artifact.payload_availability_state,
+            has_payload = artifact.payload_text.as_ref().is_some_and(|text| !text.is_empty()),
+            "P031 selected artifact response"
+        );
+        Ok(Some(artifact))
     }
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
@@ -640,8 +700,9 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
             if let Ok(Some(med)) =
                 db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
             {
-                conflict.lead_mediation =
-                    Some(crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?);
+                conflict.lead_mediation = Some(
+                    crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?,
+                );
             }
         }
     }
@@ -842,17 +903,42 @@ fn attach_p031_artifact_payload(
     artifact: &mut GqlArtifact,
     bulk_preview_budget_remaining: &mut usize,
 ) {
-    if artifact.report_kind.is_some() || row.format == "report" {
+    attach_p031_artifact_payload_from_metadata(
+        &row.format,
+        row.report_kind.as_deref(),
+        row.size_bytes,
+        &row.file_path,
+        run,
+        artifact,
+        bulk_preview_budget_remaining,
+    );
+}
+
+fn attach_p031_artifact_payload_from_metadata(
+    format: &str,
+    report_kind: Option<&str>,
+    size_bytes: Option<i64>,
+    file_path: &str,
+    run: Option<&domain::run::Run>,
+    artifact: &mut GqlArtifact,
+    bulk_preview_budget_remaining: &mut usize,
+) {
+    if report_kind.is_some() || format == "report" {
         return;
     }
 
-    let estimated_preview_bytes = row
-        .size_bytes
+    let estimated_preview_bytes = size_bytes
         .and_then(|size| usize::try_from(size).ok())
         .filter(|size| *size > 0)
         .map(|size| size.min(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES))
         .unwrap_or(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES);
     if estimated_preview_bytes > *bulk_preview_budget_remaining {
+        warn!(
+            artifact_id = %artifact.id.as_str(),
+            estimated_preview_bytes,
+            bulk_preview_budget_remaining = *bulk_preview_budget_remaining,
+            "P031 artifact payload deferred before read: preview budget exhausted"
+        );
         mark_payload_deferred(
             artifact,
             "Artifact payload preview deferred because the bulk artifact list reached its payload preview budget",
@@ -861,6 +947,10 @@ fn attach_p031_artifact_payload(
     }
 
     let Some(run) = run else {
+        warn!(
+            artifact_id = %artifact.id.as_str(),
+            "P031 artifact payload unavailable: missing run metadata"
+        );
         mark_payload_unavailable(
             artifact,
             "Run metadata was unavailable for artifact readback",
@@ -868,7 +958,11 @@ fn attach_p031_artifact_payload(
         return;
     };
 
-    let Some(path) = resolve_server_owned_artifact_path(&row.file_path, run) else {
+    let Some(path) = resolve_server_owned_artifact_path(file_path, run) else {
+        warn!(
+            artifact_id = %artifact.id.as_str(),
+            "P031 artifact payload unavailable: path outside run-owned roots"
+        );
         mark_payload_unavailable(
             artifact,
             "Artifact path is outside the selected run's server-owned roots",
@@ -884,6 +978,12 @@ fn attach_p031_artifact_payload(
                     .min(P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES),
             );
             if consumed_preview_bytes > *bulk_preview_budget_remaining {
+                warn!(
+                    artifact_id = %artifact.id.as_str(),
+                    consumed_preview_bytes,
+                    bulk_preview_budget_remaining = *bulk_preview_budget_remaining,
+                    "P031 artifact payload deferred after read: preview budget exhausted"
+                );
                 mark_payload_deferred(
                     artifact,
                     "Artifact payload preview deferred because the bulk artifact list reached its payload preview budget",
@@ -901,8 +1001,21 @@ fn attach_p031_artifact_payload(
                     P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES
                 )
             });
+            debug!(
+                artifact_id = %artifact.id.as_str(),
+                consumed_preview_bytes,
+                bytes_read = preview.bytes_read,
+                truncated = preview.truncated,
+                bulk_preview_budget_remaining = *bulk_preview_budget_remaining,
+                "P031 artifact payload preview attached"
+            );
         }
         Err(err) => {
+            warn!(
+                artifact_id = %artifact.id.as_str(),
+                error = %err,
+                "P031 artifact payload readback failed"
+            );
             mark_payload_unavailable(
                 artifact,
                 &format!("Artifact payload readback failed: {err}"),
@@ -1161,6 +1274,7 @@ impl MutationRoot {
             delivery_configuration_json,
             workflow_yaml_path,
             agent_catalog_yaml_path,
+            review_routing_json: None,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -1448,7 +1562,8 @@ impl SubscriptionRoot {
                     | DomainEvent::ApprovalRequested { run_id, .. }
                     | DomainEvent::ArtifactCreated { run_id, .. }
                     | DomainEvent::RuntimeStatusChanged { run_id, .. }
-                    | DomainEvent::MediationConfirmationResolved { run_id, .. } => Some(run_id),
+                    | DomainEvent::MediationConfirmationResolved { run_id, .. }
+                    | DomainEvent::RoutingCompleted { run_id, .. } => Some(run_id),
                     DomainEvent::ApprovalResolved { approval_id, .. } => {
                         approvals::find_by_id(&pool, approval_id)
                             .await
@@ -1797,6 +1912,7 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         }
     }
 
@@ -4669,6 +4785,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_031_artifact_query_reads_selected_payload_only() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let artifact_root =
+            std::env::temp_dir().join(format!("p031-selected-artifact-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let artifact_path = artifact_root.join("selected.md");
+        fs::write(&artifact_path, "# Selected\n\nOnly this artifact").unwrap();
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "proposal".into(),
+                agent_id: "proposal_writer".into(),
+                name: "selected.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: artifact_path.to_string_lossy().into_owned(),
+                checksum_sha256: None,
+                size_bytes: Some(29),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031SelectedArtifactPayload {{
+                      artifact(id: "{artifact_id}") {{
+                        id
+                        payloadAvailabilityState
+                        payloadText
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 selected artifact payload query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifact = &json["artifact"];
+        assert_eq!(artifact["id"], serde_json::json!(artifact_id.to_string()));
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            artifact["payloadText"],
+            serde_json::json!("# Selected\n\nOnly this artifact")
+        );
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
     async fn proposal_031_artifact_payload_text_is_capped_for_bulk_readback() {
         let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
@@ -4884,6 +5085,99 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("bulk artifact list reached its payload preview budget")
+        }));
+
+        let _ = fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
+    async fn proposal_031_artifact_metadata_query_does_not_consume_payload_budget() {
+        let pool = p043_test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let artifact_root = std::env::temp_dir().join(format!(
+            "p031-artifact-metadata-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&artifact_root).unwrap();
+        let payload = "metadata-only artifact preview line\n"
+            .repeat((P031_ARTIFACT_PAYLOAD_PREVIEW_MAX_BYTES / 36) + 8);
+
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.workspace_root = artifact_root.to_string_lossy().into_owned();
+        runs::insert(&pool, &run).await.unwrap();
+
+        for index in 0..10 {
+            let artifact_id = ArtifactId::new();
+            let artifact_path = artifact_root.join(format!("metadata-{index}.md"));
+            fs::write(&artifact_path, &payload).unwrap();
+            artifacts::insert(
+                &pool,
+                &Artifact {
+                    id: artifact_id,
+                    run_id,
+                    stage_id: "proposal".into(),
+                    agent_id: "proposal_writer".into(),
+                    name: format!("metadata-{index}.md"),
+                    contract_id: "proposal_markdown_v1".into(),
+                    format: ArtifactFormat::Markdown,
+                    file_path: artifact_path.to_string_lossy().into_owned(),
+                    checksum_sha256: None,
+                    size_bytes: Some(payload.len() as i64),
+                    provider: "test".into(),
+                    model: None,
+                    created_at: Utc::now(),
+                    is_pinned: false,
+                    report_kind: None,
+                    report_version: None,
+                    agent_execution_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P031ArtifactMetadataList {{
+                      artifacts(runId: "{run_id}") {{
+                        id
+                        payloadAvailabilityState
+                        payloadUnavailableReasonCode
+                        serverDebugDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P031 artifact metadata query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let artifacts = json["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 10);
+        assert!(artifacts.iter().all(|artifact| {
+            artifact["payloadAvailabilityState"] == serde_json::json!("available")
+                && artifact["payloadUnavailableReasonCode"].is_null()
+                && artifact["serverDebugDetail"].is_null()
         }));
 
         let _ = fs::remove_dir_all(&artifact_root);

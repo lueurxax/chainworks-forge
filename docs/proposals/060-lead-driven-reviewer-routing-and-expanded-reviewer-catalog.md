@@ -5,7 +5,7 @@
 | Date | 2026-04-19 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md), [047-yaml-validation-and-definition-inspection-api.md](047-yaml-validation-and-definition-inspection-api.md) |
+| Depends on | [workflow-execution-engine.md](../reference/workflow-execution-engine.md), [047-yaml-validation-and-definition-inspection-api.md](047-yaml-validation-and-definition-inspection-api.md) |
 | Scope | Replace the fixed 4-reviewer fan-out in `state_4_proposal_reviewed` with lead-driven reviewer routing: the lead reads the proposal, fingerprints it, and selects 2–4 reviewers from an expanded catalog. |
 | Goal | Every proposal gets the right specialist lenses (no more, no less), saving review budget on targeted changes and adding missing specialist coverage (reliability, performance, security, api-contract) that the current fixed set lacks. |
 
