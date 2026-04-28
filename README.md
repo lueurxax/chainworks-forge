@@ -35,6 +35,7 @@ Goose still matters as legacy and compatibility infrastructure, but it is no lon
 
 - captures ideas as units of engineering work
 - executes YAML-defined workflows instead of hardcoded chat flows
+- routes proposal reviews deterministically based on evidence and specialist catalog (P060)
 - binds specialized agents to providers, models, permissions, and output contracts
 - preserves run state, stage history, approvals, and artifact metadata in the backend (read by the UI via GraphQL projections)
 - stores generated artifacts on disk instead of hiding execution inside chat history
@@ -91,16 +92,17 @@ The current MVP provider set is:
 
 The repository is past the scaffold stage. The implemented system now includes:
 
-- lead-mediated workflow conflict resolution and mandatory lead validation (Proposal 017 Phase B/C)
+- lead-mediated workflow conflict resolution and mandatory lead validation
 - thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
-- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017 Phase A)
+- declarative workflow authority, typed workflow conflicts, and advisory rejection history
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
+- deterministic reviewer routing and expanded proposal reviewer catalog (Proposal 060)
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
@@ -109,7 +111,6 @@ Active proposal work is currently concentrated in:
 
 - [`docs/proposals/032-polish-stabilization-and-productization-backlog.md`](docs/proposals/032-polish-stabilization-and-productization-backlog.md)
 - [`docs/proposals/036-ux-consolidation-and-navigation-simplification.md`](docs/proposals/036-ux-consolidation-and-navigation-simplification.md)
-- [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
 The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). New UI proposals should build on that reference rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.

@@ -115,9 +115,44 @@ A `@MainActor @Observable` per-run state machine driver. Design invariants:
 6. Advance `currentStateID` and repeat.
 
 **Run block execution**: Phases execute in declaration order. `.sequential` tasks
-run one-by-one; `.parallel` tasks run via `withTaskGroup`. Each task creates an
-`AgentExecution`, gathers input artifacts, builds an `ExecutionContext`, calls the
-executor, then persists outputs through `ArtifactManager`.
+run one-by-one; `.parallel` tasks run via `withTaskGroup`; `.dynamic_parallel`
+tasks read a typed selector artifact (e.g. `AgentSelectionPlanV1`) and materialize
+only the selected agent executions from compiled candidate bindings. Each task
+creates an `AgentExecution`, gathers input artifacts, builds an `ExecutionContext`,
+calls the executor, then persists outputs through `ArtifactManager`.
+
+### System Tasks and Routing (`proposal_review_router.rs`)
+
+The engine supports first-class `SystemTask` types that execute without provider
+invocation. The `proposal_review_router` uses `executor_mode: system.routing` to
+perform deterministic reviewer selection over proposal evidence and catalog
+metadata.
+
+**Deterministic Routing (P060):**
+Replaces fixed proposal-review fan-out with a scoring-based model that selects
+2-5 specialists from an expanded catalog.
+- **Scoring**: Based on force-includes, stack/surface/risk matches, strong keywords,
+  repo signals, and cross-stack dependencies, with an overlap penalty.
+- **Specialists**: Launches with seven core specialists (macOS, Apple architecture,
+  Rust architecture, reliability, security, API contract, and observability/rollout)
+  while cataloging others as disabled until a golden-output gate is passed.
+- **Determinism**: The same inputs must produce identical selected order, evidence
+  IDs, and plan hashes across Swift and Rust implementations.
+
+**Key Artifacts:**
+- **`AgentSelectionPlanV1`** -- the authoritative plan for selected reviewers,
+  referencing compiler-owned materialization bindings.
+- **`RoutingReceipt`** -- the terminal receipt for every routing outcome, including
+  rationale, status, and input snapshot hashes.
+- **`SystemExecution`** -- the lifecycle record for the system task, owning the
+  task status and timestamps.
+
+**Routing Conflicts and Fallbacks:**
+- **Under-specified Selection**: If no specialists qualify, falls back to
+  `product_owner` plus `architect` with a caution warning.
+- **Mandatory Overflow**: If more than 5 mandatory reviewers match, blocks with a
+  `Routing conflict` and requires operator intervention (e.g., cloning with
+  overrides).
 
 **Approval flow**: When a state has `approval: required`, the orchestrator pauses,
 creates an `Approval` record, and publishes an `ApprovalRequest`. On resolution:
@@ -306,8 +341,8 @@ falling back to manual intervention.
 6. **Resolution**: Once confirmed or auto-settled, the mediation outcome resolves
     the conflict, enabling the orchestrator to advance the transition cursor.
 
-**Phase B Lead Resolver:**
-During Phase B, lead resolution uses a **versioned JSON compatibility map** (`docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`) as the sole machine-authoritative source for lead selection. This map defines exact matches between workflow/catalog pairs and their designated system lead. Fail-closed rules apply if no match or multiple matches exist.
+**Compatibility Lead Resolver:**
+Lead resolution uses a **versioned JSON compatibility map** (`docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json`) as the sole machine-authoritative source for lead selection until static catalog validation fully owns every executable workflow/catalog pair. This map defines exact matches between workflow/catalog pairs and their designated system lead. Fail-closed rules apply if no match or multiple matches exist.
 
 **Validation and Preflight**:
 Mandatory static validation and runtime preflight ensure exactly-one lead
@@ -315,8 +350,8 @@ resolution and `LeadResolutionContract` coverage. Failure to resolve a valid
 lead results in a `terminal_unverifiable` conflict.
 
 **Observability**:
-P017 records workflow-conflict rollout metrics in durable
-`workflow_conflict_metric_events` rows. Phase C adds
+Workflow-conflict rollout metrics are recorded in durable
+`workflow_conflict_metric_events` rows. Lead-validation rollout adds
 `phase_c_validation_outcome_total` for lead validation outcomes
 (`static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`), while
 conflict resolution records `workflow_conflict_time_to_resolution_seconds`,

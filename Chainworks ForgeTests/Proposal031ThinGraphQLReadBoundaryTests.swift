@@ -529,12 +529,41 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       ])
   }
 
+  @Test("Bulk artifact read documents do not request payload text")
+  func bulkArtifactReadDocumentsDoNotRequestPayloadText() {
+    #expect(!P031GraphQLDocuments.runDetail.contains("payloadText"))
+    #expect(!P031GraphQLDocuments.artifacts.contains("payloadText"))
+    #expect(P031GraphQLDocuments.artifactPayload.contains("payloadText"))
+  }
+
+  @Test("Workflow read store fetches selected artifact payload separately")
+  func workflowReadStoreFetchesSelectedArtifactPayloadSeparately() async throws {
+    let readTransport = CapturingP031ReadTransport(
+      responses: [
+        "P031ArtifactPayload": Data(
+          """
+          {"data":{"artifact":{"id":"artifact-1","runId":"run-1","stageId":"state_1","agentId":"agent","name":"summary","contractId":"summary","format":"json","isPinned":false,"reportKind":null,"reportVersion":null,"outputSettlement":null,"sourceGenerationVerified":true,"freshnessState":"live","payloadAvailabilityState":"available","payloadUnavailableReasonCode":null,"payloadText":"{\\\"status\\\":\\\"ready\\\"}","diagnosticId":null,"serverDebugDetail":null}}}
+          """.utf8)
+      ])
+    let store = P031GraphQLWorkflowReadStore(
+      readTransport: readTransport,
+      subscriptionTransport: CapturingP031SubscriptionTransport()
+    )
+
+    let artifact = try await store.fetchArtifactPayload(artifactID: "artifact-1")
+
+    #expect(artifact.id == "artifact-1")
+    #expect(artifact.payloadText == #"{"status":"ready"}"#)
+    #expect(readTransport.requests.map(\.operationName) == ["P031ArtifactPayload"])
+    #expect(readTransport.requests.first?.variables == ["artifactId": "artifact-1"])
+  }
+
   @Test("Workflow read store surfaces artifact schema mismatch without fallback")
   func workflowReadStoreSurfacesArtifactSchemaMismatchWithoutFallback() async throws {
     let mismatchMessage = "Unknown field \"payloadText\" on type \"GqlArtifact\"."
     let readTransport = CapturingP031ReadTransport(
       responses: [
-        "P031RunDetail": Data(
+        "P031ArtifactPayload": Data(
           """
           {"errors":[{"message":"Unknown field \\"payloadText\\" on type \\"GqlArtifact\\"."}]}
           """.utf8),
@@ -545,16 +574,10 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
 
     await #expect(throws: P031GraphQLReadBoundaryError.graphqlErrors([mismatchMessage])) {
-      _ = try await store.fetchRunDetail(runID: "run-1")
+      _ = try await store.fetchArtifactPayload(artifactID: "artifact-1")
     }
 
-    let presentation = await P031ThinWorkflowScreenCoordinator(store: store).loadRunDetail(
-      runID: "run-1",
-      currentFreshness: P031FreshnessSnapshot(state: .live)
-    )
-
-    #expect(readTransport.requests.map(\.operationName) == ["P031RunDetail", "P031RunDetail"])
-    #expect(presentation.errorDescription?.contains("Daemon schema mismatch") == true)
+    #expect(readTransport.requests.map(\.operationName) == ["P031ArtifactPayload"])
   }
 
   @Test("Dashboard surfaces schema mismatch and restarts daemon only on explicit action")
@@ -636,6 +659,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       stages: P031GraphQLDocuments.stages,
       approvalInbox: P031GraphQLDocuments.approvalInbox,
       artifacts: P031GraphQLDocuments.artifacts,
+      artifactPayload: P031GraphQLDocuments.artifactPayload,
       reportMetadata: P031GraphQLDocuments.reportMetadata,
       daemonStatus: P031GraphQLDocuments.daemonStatus,
       ideaTitle: P031GraphQLDocuments.ideaTitle,
@@ -1950,6 +1974,29 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(presentation.preparedPreview?.previewNotice?.renderedAsRawText == true)
   }
 
+  @Test("Artifact viewer renders deferred payload preview when GraphQL supplies partial text")
+  func artifactViewerRendersDeferredPayloadPreviewWhenGraphQLSuppliesPartialText() {
+    let previewLines = (1...200).map { "line \($0)" }
+    let payload = previewLines.joined(separator: "\n")
+    let artifact = makeArtifact(
+      id: "artifact-deferred-preview",
+      name: "orchestrator_summary",
+      format: "json",
+      payloadAvailabilityState: .metadataOnly,
+      payloadUnavailableReasonCode: .payloadDeferredByP031,
+      diagnosticID: "artifact-deferred-preview",
+      payloadText: payload
+    )
+
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+
+    #expect(presentation.renderMode == .plainText)
+    #expect(presentation.payloadState == .metadataOnly)
+    #expect(presentation.preparedPreview?.content == payload)
+    #expect(presentation.preparedPreview?.content.split(separator: "\n").count == 200)
+    #expect(presentation.unavailableReason == nil)
+  }
+
   @Test("P031 artifact viewer keeps artifact list and preview in independent scroll panes")
   func artifactViewerUsesIndependentScrollPanes() throws {
     let repoRoot = URL(fileURLWithPath: #filePath)
@@ -2477,6 +2524,10 @@ private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
   }
 
   func fetchArtifacts(runID: String) async throws -> [P031ArtifactReadModel] {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
+  func fetchArtifactPayload(artifactID: String) async throws -> P031ArtifactReadModel {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
 

@@ -27,6 +27,7 @@ Recommended status sets:
 - **Run**: `pending`, `ready`, `running`, `waiting_approval`, `blocked`, `completed`, `failed`, `cancelled`
 - **Stage**: `pending`, `ready`, `running`, `waiting_approval`, `blocked`, `completed`, `failed`, `skipped`
 - **Agent execution**: `pending`, `ready`, `running`, `completed`, `failed`, `cancelled`, `skipped`
+- **System execution**: `queued`, `running`, `succeeded`, `blocked`, `failed`
 - **Approval**: `pending`, `requested`, `granted`, `rejected`, `expired`
 - **Side effect**: `pending`, `armed`, `running`, `completed`, `failed`, `blocked`
 
@@ -40,6 +41,8 @@ Examples:
 
 - `idea.md`
 - `proposal.md`
+- `agent_selection_plan.v1.json`
+- `routing_receipt.v1.json`
 - `review.json`
 - `audit.md`
 - `patch.diff`

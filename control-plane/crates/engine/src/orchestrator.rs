@@ -329,12 +329,22 @@ impl Orchestrator {
 
                             // Determine the current (just-completed) phase from
                             // the work items that were enqueued.
+                            // P060: dynamic_parallel work items carry an explicit
+                            // p060_dynamic_phase field; use it when present instead
+                            // of looking up through the effective task list.
                             let current_phase: u32 = stage_invokes
                                 .iter()
                                 .filter_map(|w| {
-                                    serde_json::from_str::<serde_json::Value>(&w.payload_json)
-                                        .ok()
-                                        .and_then(|v| v.get("task_index")?.as_u64())
+                                    let v = serde_json::from_str::<serde_json::Value>(
+                                        &w.payload_json,
+                                    )
+                                    .ok()?;
+                                    // P060: explicit dynamic phase takes precedence.
+                                    if let Some(dp) = v.get("p060_dynamic_phase").and_then(|p| p.as_u64()) {
+                                        return Some(dp as u32);
+                                    }
+                                    v.get("task_index")?
+                                        .as_u64()
                                         .and_then(|idx| {
                                             effective.get(idx as usize).map(|t| t.phase)
                                         })
@@ -350,11 +360,23 @@ impl Orchestrator {
                                 .min();
 
                             // Check if any tasks from the next phase are already enqueued.
+                            // P060: also check p060_dynamic_phase for dynamic work items.
                             let next_phase_already_enqueued = next_phase.map_or(true, |np| {
                                 stage_invokes.iter().any(|w| {
-                                    serde_json::from_str::<serde_json::Value>(&w.payload_json)
-                                        .ok()
-                                        .and_then(|v| v.get("task_index")?.as_u64())
+                                    let v = serde_json::from_str::<serde_json::Value>(
+                                        &w.payload_json,
+                                    )
+                                    .ok();
+                                    let v = match v {
+                                        Some(v) => v,
+                                        None => return false,
+                                    };
+                                    // P060: check explicit dynamic phase.
+                                    if let Some(dp) = v.get("p060_dynamic_phase").and_then(|p| p.as_u64()) {
+                                        return dp as u32 == np;
+                                    }
+                                    v.get("task_index")
+                                        .and_then(|ti| ti.as_u64())
                                         .map(|idx| {
                                             effective
                                                 .get(idx as usize)
@@ -413,7 +435,7 @@ impl Orchestrator {
                                             {
                                                 return Ok(());
                                             }
-                                            let prompt = build_task_prompt(
+                                            let mut prompt = build_task_prompt(
                                                 task,
                                                 &plan,
                                                 run,
@@ -421,6 +443,25 @@ impl Orchestrator {
                                                 None,
                                                 approval_rejection_context.as_deref(),
                                             );
+                                            // P060: If the then-task declares selected_outputs_from,
+                                            // resolve selected reviewer artifacts and inject paths.
+                                            if task.selected_outputs_from.is_some() {
+                                                if let Ok(Some((_bundle, file_paths))) = self
+                                                    .resolve_selected_outputs_for_task(
+                                                        run_id, run, stage, task,
+                                                    )
+                                                    .await
+                                                {
+                                                    if !file_paths.is_empty() {
+                                                        prompt.push_str("\n\n### Selected Reviewer Artifacts\n");
+                                                        prompt.push_str("The following reviewer outputs were selected by the routing algorithm. ");
+                                                        prompt.push_str("Aggregate only these artifacts:\n");
+                                                        for path in &file_paths {
+                                                            prompt.push_str(&format!("- `{}`\n", path));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             self.enqueue_invoke_agent(
                                                 run_id,
                                                 stage,
@@ -930,6 +971,64 @@ impl Orchestrator {
         } else {
             None
         };
+
+        // P060: Execute system routing before dispatching agent tasks.
+        // If routing is applicable and was executed (success or handled failure),
+        // the routing outcome is persisted. On failure, the stage is settled and
+        // we return early. On success, we continue with normal task dispatch.
+        if self
+            .execute_system_routing_if_applicable(run_id, &run, &stage, &plan)
+            .await?
+        {
+            // Check if routing failed (stage settled as Failed/Blocked).
+            let updated_stage = stages::list_by_run(&self.pool, run_id)
+                .await?
+                .into_iter()
+                .find(|s| s.id == stage.id);
+            if let Some(ref s) = updated_stage {
+                if matches!(s.status, StageStatus::Failed | StageStatus::Blocked) {
+                    return Ok(());
+                }
+            }
+            // Routing succeeded — continue with normal task dispatch.
+        }
+
+        // P060: If routing succeeded and the state has dynamic_parallel,
+        // materialize selected reviewers instead of dispatching static phase 0 tasks.
+        if state.dynamic_parallel.is_some() {
+            if let Some(ref dp) = state.dynamic_parallel {
+                // Check if the AgentSelectionPlanV1 artifact exists (routing must have run).
+                let artifact_path = format!(
+                    "{}/routing/agent-selection-plan.v1.json",
+                    run.artifact_root.trim_end_matches('/')
+                );
+                if std::path::Path::new(&artifact_path).exists() {
+                    let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    let enqueued = self
+                        .materialize_dynamic_parallel(
+                            run_id,
+                            &run,
+                            &stage,
+                            &plan,
+                            dp,
+                            idea_opt.as_ref(),
+                        )
+                        .await?;
+                    if enqueued > 0 {
+                        return Ok(());
+                    }
+                    // If enqueued == 0, all tasks were already materialized (resume).
+                    // Fall through — the phase advancement logic will handle completion
+                    // checks and then-block dispatch.
+                    return Ok(());
+                }
+                // No artifact yet — routing hasn't run or failed. Fall through to
+                // normal dispatch (which may include the system.routing task).
+            }
+        }
 
         if state.tasks.is_empty() {
             // No tasks defined — run the owner agent as a single task
@@ -1699,6 +1798,695 @@ impl Orchestrator {
         }
     }
 
+    /// P060: Execute the deterministic proposal review routing algorithm.
+    ///
+    /// Runs in-process (no agent/provider invocation), persists a SystemExecution
+    /// and RoutingReceipt, and writes an AgentSelectionPlanV1 artifact on success
+    /// or sets stage validation failure JSON on failure.
+    ///
+    /// Returns `Ok(true)` if routing was executed (success or failure handled),
+    /// `Ok(false)` if routing was not applicable (legacy mode or no bindings),
+    /// and `Err` on infrastructure failure.
+    async fn execute_system_routing_if_applicable(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<bool> {
+        // Check if dynamic routing is requested.
+        let routing_options: domain::routing::ReviewRoutingOptions = match &run.review_routing_json {
+            Some(json) => match serde_json::from_str(json) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    warn!(run_id = %run_id, error = %e, "Invalid review_routing_json — using legacy mode");
+                    return Ok(false);
+                }
+            },
+            None => return Ok(false),
+        };
+
+        // P060 Phase 3 / OPS-001: feature-flag cutover.
+        // `domain::routing::resolve_effective_routing_mode` consults the
+        // daemon-level `CHAINWORKS_P060_ROUTING_MODE_OVERRIDE` env var so
+        // operators can force every run into a specific mode for staged
+        // rollout / emergency rollback.
+        let resolution =
+            domain::routing::resolve_effective_routing_mode(&routing_options.mode);
+        match &resolution {
+            domain::routing::EffectiveRoutingModeResolution::OverriddenByEnv { from, to } => {
+                info!(
+                    run_id = %run_id,
+                    run_mode = %from,
+                    override_mode = %to,
+                    "P060 cutover flag: overriding per-run routing mode"
+                );
+            }
+            domain::routing::EffectiveRoutingModeResolution::OverrideUnrecognized {
+                raw,
+                per_run,
+            } => {
+                warn!(
+                    run_id = %run_id,
+                    raw = %raw,
+                    per_run = %per_run,
+                    "P060 cutover flag: unrecognized value, falling back to per-run mode"
+                );
+            }
+            domain::routing::EffectiveRoutingModeResolution::UsedPerRunMode(_) => {}
+        }
+        let effective_mode = resolution.effective();
+
+        // Legacy fixed mode skips routing entirely.
+        if effective_mode == domain::routing::ReviewRoutingMode::LegacyFixed {
+            info!(
+                run_id = %run_id,
+                "P060: Legacy fixed mode — skipping system routing"
+            );
+            return Ok(false);
+        }
+
+        // Shadow dynamic mode: run the algorithm, persist evidence, but
+        // DO NOT take over dispatch. The legacy fixed quartet still
+        // drives reviewer invocations. This lets operators A/B compare
+        // the dynamic plan against actual fixed output before cutover.
+        let is_shadow = effective_mode == domain::routing::ReviewRoutingMode::ShadowDynamic;
+
+        // Check if the plan has dynamic candidate bindings.
+        if plan.dynamic_candidate_bindings.is_empty() {
+            info!(run_id = %run_id, "P060: No dynamic candidate bindings in plan — skipping routing");
+            return Ok(false);
+        }
+
+        info!(
+            run_id = %run_id,
+            stage = %stage.stage_id,
+            mode = %effective_mode,
+            shadow = is_shadow,
+            candidates = plan.dynamic_candidate_bindings.len(),
+            "P060: Executing system routing for proposal review"
+        );
+
+        // Build proposal fingerprint from plan metadata.
+        let fingerprint = self.build_proposal_fingerprint(run, plan).await;
+
+        // Build input snapshot hashes.
+        let routing_metadata_hash = {
+            let mut hasher = Sha256::new();
+            for b in &plan.dynamic_candidate_bindings {
+                hasher.update(b.routing_metadata_hash.as_bytes());
+            }
+            format!("{:x}", hasher.finalize())
+        };
+        let candidate_binding_hash = {
+            let mut hasher = Sha256::new();
+            for b in &plan.dynamic_candidate_bindings {
+                hasher.update(b.binding_id.as_bytes());
+                hasher.update(b.agent_id.as_bytes());
+            }
+            format!("{:x}", hasher.finalize())
+        };
+        let evidence_hash = {
+            let mut hasher = Sha256::new();
+            for er in &fingerprint.evidence_refs {
+                hasher.update(er.hash.as_bytes());
+            }
+            format!("{:x}", hasher.finalize())
+        };
+        let override_hash = if routing_options.force_include.is_empty()
+            && routing_options.force_exclude.is_empty()
+        {
+            None
+        } else {
+            let mut hasher = Sha256::new();
+            for inc in &routing_options.force_include {
+                hasher.update(inc.as_bytes());
+            }
+            for exc in &routing_options.force_exclude {
+                hasher.update(exc.as_bytes());
+            }
+            Some(format!("{:x}", hasher.finalize()))
+        };
+
+        let input_hashes = domain::routing::InputSnapshotHashes {
+            workflow_snapshot_hash: plan.workflow_snapshot_hash.clone(),
+            catalog_snapshot_hash: plan.catalog_snapshot_hash.clone(),
+            routing_metadata_hash,
+            candidate_binding_hash,
+            evidence_hash,
+            override_hash,
+        };
+
+        // Execute the routing algorithm.
+        let outcome = crate::proposal_review_router::route_proposal_reviewers(
+            run_id,
+            &stage.stage_id,
+            stage.attempt_number,
+            &plan.dynamic_candidate_bindings,
+            &fingerprint,
+            &routing_options,
+            &input_hashes,
+        );
+
+        match outcome {
+            crate::proposal_review_router::RoutingOutcome::Success {
+                plan: selection_plan,
+                receipt,
+                system_execution,
+            } => {
+                info!(
+                    run_id = %run_id,
+                    selected = selection_plan.selected_agents.len(),
+                    plan_hash = %selection_plan.plan_hash,
+                    "P060: Routing succeeded"
+                );
+
+                // Persist system execution and routing receipt.
+                db::repos::system_executions::insert(&self.pool, &system_execution).await?;
+                db::repos::routing_receipts::insert(&self.pool, &receipt).await?;
+
+                // Write the AgentSelectionPlanV1 as an artifact to disk.
+                let artifact_path = format!(
+                    "{}/routing/agent-selection-plan.v1.json",
+                    run.artifact_root.trim_end_matches('/')
+                );
+                if let Some(parent) = std::path::Path::new(&artifact_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let plan_json = serde_json::to_vec_pretty(&selection_plan)?;
+                std::fs::write(&artifact_path, &plan_json)?;
+
+                // Create an artifact record.
+                let artifact = domain::artifact::Artifact {
+                    id: domain::ids::ArtifactId::new(),
+                    run_id,
+                    stage_id: stage.stage_id.clone(),
+                    agent_id: "proposal_review_router".to_string(),
+                    name: "agent_selection_plan_v1".to_string(),
+                    contract_id: "agent_selection_plan_v1".to_string(),
+                    format: domain::artifact::ArtifactFormat::Json,
+                    file_path: artifact_path,
+                    checksum_sha256: None,
+                    size_bytes: Some(plan_json.len() as i64),
+                    provider: "system.routing".to_string(),
+                    model: None,
+                    created_at: Utc::now(),
+                    is_pinned: false,
+                    report_kind: None,
+                    report_version: None,
+                    agent_execution_id: None,
+                };
+                artifacts::insert(&self.pool, &artifact).await?;
+
+                // Emit routing completed event. The status label
+                // distinguishes a real production routing run from a
+                // shadow comparison so operators can filter dashboards.
+                let event_status = if is_shadow {
+                    "shadow_succeeded".to_string()
+                } else {
+                    "succeeded".to_string()
+                };
+                let _ = self.events.send(DomainEvent::RoutingCompleted {
+                    run_id,
+                    stage_id: stage.stage_id.clone(),
+                    system_execution_id: system_execution.id,
+                    receipt_id: receipt.receipt_id,
+                    status: event_status,
+                    plan_hash: Some(selection_plan.plan_hash),
+                });
+
+                // Phase 3 shadow mode: even though the routing succeeded,
+                // do NOT take over dispatch. Returning `false` lets the
+                // orchestrator fall through to the legacy fixed-quartet
+                // task dispatch, while the artifact + DB rows above are
+                // available for operator A/B comparison.
+                if is_shadow {
+                    info!(
+                        run_id = %run_id,
+                        plan_hash = %system_execution.id,
+                        "P060: Shadow routing recorded — yielding dispatch to legacy fixed quartet"
+                    );
+                    return Ok(false);
+                }
+
+                Ok(true)
+            }
+            crate::proposal_review_router::RoutingOutcome::Failure {
+                failure_kind,
+                receipt,
+                system_execution,
+                validation_failure_json,
+            } => {
+                warn!(
+                    run_id = %run_id,
+                    failure = %failure_kind,
+                    shadow = is_shadow,
+                    "P060: Routing failed"
+                );
+
+                // Persist system execution and routing receipt regardless
+                // of mode — operators need the diagnostic in shadow runs too.
+                db::repos::system_executions::insert(&self.pool, &system_execution).await?;
+                db::repos::routing_receipts::insert(&self.pool, &receipt).await?;
+
+                // P060 Phase 3: in shadow mode, a routing failure must NOT
+                // block the run — the legacy fixed quartet still drives
+                // dispatch and the failure is recorded as observational
+                // evidence only. Emit a shadow_failed event and yield.
+                if is_shadow {
+                    let _ = self.events.send(DomainEvent::RoutingCompleted {
+                        run_id,
+                        stage_id: stage.stage_id.clone(),
+                        system_execution_id: system_execution.id,
+                        receipt_id: receipt.receipt_id,
+                        status: "shadow_failed".to_string(),
+                        plan_hash: None,
+                    });
+                    info!(
+                        run_id = %run_id,
+                        failure = %failure_kind,
+                        "P060: Shadow routing failure recorded — yielding dispatch to legacy fixed quartet"
+                    );
+                    return Ok(false);
+                }
+
+                // Production dynamic mode: the routing failure is a
+                // hard stage-level conflict. Set validation failure JSON
+                // and block the run.
+                stages::update_validation_failure_json(
+                    &self.pool,
+                    stage.id,
+                    &validation_failure_json,
+                )
+                .await?;
+
+                let now = Utc::now();
+                stages::settle(
+                    &self.pool,
+                    stage.id,
+                    domain::stage::StageSettlementKind::Failed,
+                    now,
+                )
+                .await?;
+                let _ = self.events.send(DomainEvent::StageStatusChanged {
+                    run_id,
+                    stage_execution_id: stage.id,
+                    status: StageStatus::Failed,
+                });
+                runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Blocked,
+                });
+
+                Ok(true)
+            }
+        }
+    }
+
+    /// P060: Build a ProposalFingerprint from the run context and plan metadata.
+    async fn build_proposal_fingerprint(
+        &self,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> crate::proposal_review_router::ProposalFingerprint {
+        // Try to read the proposal artifact to compute MD5 and extract evidence.
+        let proposal_md5 = if let Some(template) = plan.artifact_paths.get("proposal_current") {
+            let path = resolve_path_template(
+                template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            );
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let digest = Sha256::digest(&bytes);
+                    format!("{:x}", digest)
+                }
+                Err(_) => "unavailable".to_string(),
+            }
+        } else {
+            "unavailable".to_string()
+        };
+
+        // Extract stacks, surfaces, and risks from plan metadata.
+        let stacks = plan
+            .stack
+            .as_ref()
+            .map(|s| vec![s.clone()])
+            .unwrap_or_default();
+
+        // Derive surfaces from workflow family and risk class.
+        let mut surfaces = Vec::new();
+        if let Some(ref family) = plan.workflow_family {
+            // Common surface names derived from workflow family.
+            if family.contains("macos") || family.contains("swift") {
+                surfaces.push("macos".to_string());
+            }
+            if family.contains("swiftui") {
+                surfaces.push("swiftui".to_string());
+            }
+        }
+
+        let risks = plan
+            .risk_class
+            .as_ref()
+            .filter(|r| *r != "standard")
+            .map(|r| vec![r.clone()])
+            .unwrap_or_default();
+
+        crate::proposal_review_router::ProposalFingerprint {
+            proposal_md5,
+            stacks,
+            surfaces,
+            risks,
+            strong_keywords: Vec::new(),
+            repo_signals: Vec::new(),
+            cross_stack_dependencies: Vec::new(),
+            baseline_gaps: Vec::new(),
+            evidence_refs: Vec::new(),
+        }
+    }
+
+    /// P060: Materialize dynamic_parallel reviewers from an AgentSelectionPlanV1
+    /// artifact. For each selected agent, looks up the corresponding
+    /// CompiledDynamicAgentBinding, deserializes the frozen ResolvedAgent, and
+    /// enqueues an InvokeAgent work item. Uses DynamicMaterializationRecord for
+    /// idempotency — duplicate resume/retry cannot create duplicate reviewer
+    /// executions.
+    ///
+    /// Returns the number of dynamic tasks enqueued (0 if all were already
+    /// materialized from a prior attempt).
+    async fn materialize_dynamic_parallel(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+        plan: &workflow::plan::RunPlan,
+        dynamic_parallel: &workflow::plan::CompiledDynamicParallel,
+        idea_opt: Option<&domain::idea::Idea>,
+    ) -> Result<usize> {
+        // Read the AgentSelectionPlanV1 artifact from disk.
+        let artifact_path = format!(
+            "{}/routing/agent-selection-plan.v1.json",
+            run.artifact_root.trim_end_matches('/')
+        );
+        let plan_bytes = std::fs::read(&artifact_path).context(
+            "P060: Failed to read AgentSelectionPlanV1 artifact for dynamic_parallel materialization",
+        )?;
+        let selection_plan: domain::routing::AgentSelectionPlanV1 =
+            serde_json::from_slice(&plan_bytes)
+                .context("P060: Failed to parse AgentSelectionPlanV1 artifact")?;
+
+        // Build a lookup from agent_id → CompiledDynamicAgentBinding.
+        let binding_map: std::collections::HashMap<&str, &domain::routing::CompiledDynamicAgentBinding> =
+            plan.dynamic_candidate_bindings
+                .iter()
+                .map(|b| (b.agent_id.as_str(), b))
+                .collect();
+
+        let total_selected = selection_plan.selected_agents.len();
+        // Total tasks = dynamic reviewers + then-block tasks from state.tasks.
+        let then_task_count = plan
+            .states
+            .get(&stage.stage_id)
+            .map(|s| s.tasks.iter().filter(|t| t.phase > 0).count())
+            .unwrap_or(0);
+        let total_tasks = total_selected + then_task_count;
+        let mut enqueued = 0;
+
+        for (idx, selected_agent) in selection_plan.selected_agents.iter().enumerate() {
+            let binding = match binding_map.get(selected_agent.agent_id.as_str()) {
+                Some(b) => *b,
+                None => {
+                    warn!(
+                        run_id = %run_id,
+                        agent_id = %selected_agent.agent_id,
+                        "P060: Selected agent not found in dynamic candidate bindings — skipping"
+                    );
+                    continue;
+                }
+            };
+
+            // Check idempotency — skip if already materialized.
+            if db::repos::dynamic_materialization::is_materialized(
+                &self.pool,
+                run_id,
+                &stage.stage_id,
+                stage.attempt_number,
+                &selection_plan.plan_hash,
+                &binding.binding_id,
+            )
+            .await?
+            {
+                info!(
+                    run_id = %run_id,
+                    agent_id = %selected_agent.agent_id,
+                    binding_id = %binding.binding_id,
+                    "P060: Already materialized — skipping (idempotent)"
+                );
+                continue;
+            }
+
+            // Deserialize the frozen ResolvedAgent from the binding.
+            let resolved_agent: workflow::plan::ResolvedAgent =
+                serde_json::from_str(&binding.resolved_agent_snapshot_json).context(format!(
+                    "P060: Failed to deserialize ResolvedAgent for {}",
+                    selected_agent.agent_id
+                ))?;
+
+            // Build a CompiledTask for this dynamic reviewer.
+            let task = workflow::plan::CompiledTask {
+                agent: resolved_agent,
+                task_name: format!("dynamic_review_{}", selected_agent.agent_id),
+                inputs: dynamic_parallel.inputs.clone(),
+                outputs: vec![dynamic_parallel.output_contract.clone()],
+                output_policies: std::collections::HashMap::new(),
+                output_schemas: std::collections::HashMap::new(),
+                parallel: true,
+                phase: 0,
+                selected_outputs_from: None,
+            };
+
+            // Build prompt for this reviewer.
+            let prompt = build_task_prompt(&task, plan, run, idea_opt, None, None);
+
+            // Record materialization for idempotency.
+            let work_item_id = format!("p060-dynamic:{}:{}:{}", stage.id, selection_plan.plan_hash, idx);
+            let mat_record = domain::routing::DynamicMaterializationRecord {
+                id: domain::ids::DynamicMaterializationId::new(),
+                run_id,
+                stage_id: stage.stage_id.clone(),
+                attempt_id: stage.attempt_number,
+                phase_id: "dynamic_parallel".into(),
+                plan_hash: selection_plan.plan_hash.clone(),
+                binding_id: binding.binding_id.clone(),
+                agent_execution_id: work_item_id.clone(),
+                idempotency_key: format!(
+                    "{}:{}:{}:{}:dynamic_parallel:{}:{}",
+                    run_id,
+                    stage.stage_id,
+                    stage.attempt_number,
+                    selection_plan.plan_hash,
+                    binding.binding_id,
+                    idx,
+                ),
+                created_at: Utc::now(),
+            };
+            db::repos::dynamic_materialization::insert_idempotent(&self.pool, &mat_record).await?;
+
+            info!(
+                run_id = %run_id,
+                agent_id = %selected_agent.agent_id,
+                provider = %task.agent.provider,
+                score = selected_agent.score,
+                mandatory = selected_agent.mandatory,
+                index = idx,
+                total = total_selected,
+                "P060: Materializing dynamic reviewer (phase 0)"
+            );
+
+            // Enqueue via the standard InvokeAgent path, with a p060_dynamic_phase
+            // marker in the payload so phase advancement logic recognizes these.
+            let declared_outputs = build_declared_outputs(&task, plan, run);
+            self.work_queue
+                .enqueue_with_id(
+                    work_item_id,
+                    WorkItemKind::InvokeAgent,
+                    Some(run_id),
+                    Some(stage.stage_id.clone()),
+                    serde_json::json!({
+                        "run_id": run_id.to_string(),
+                        "stage_id": stage.stage_id,
+                        "stage_execution_id": stage.id.to_string(),
+                        "task_name": task.task_name,
+                        "task_inputs": task.inputs,
+                        "task_outputs": task.outputs,
+                        "agent_id": task.agent.agent_id,
+                        "backend_profile_id": task.agent.backend_profile_id,
+                        "provider": task.agent.provider,
+                        "model": task.agent.model,
+                        "effort": task.agent.effort,
+                        "max_turns": task.agent.max_turns,
+                        "temperature": task.agent.temperature,
+                        "permission_profile": task.agent.permission_profile,
+                        "skill_ref": task.agent.skill_ref,
+                        "skill_role": task.agent.skill_role,
+                        "skill_snapshot_hash": task.agent.skill_snapshot_hash,
+                        "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
+                        "xcode_broker_required": task.agent.xcode_broker_required,
+                        "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
+                        "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
+                        "output_contract": task.agent.output_contract,
+                        "prompt": prompt,
+                        "task_index": idx,
+                        "total_tasks": total_tasks,
+                        "worktree_write_enabled": task.agent.worktree_write_enabled,
+                        "worktree_strategy": task.agent.worktree_strategy,
+                        "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
+                        "session_reuse_scope": task.agent.session_reuse_scope,
+                        "session_family_id": task.agent.session_family_id,
+                        "declared_outputs": declared_outputs,
+                        "p060_dynamic_phase": 0,
+                        "p060_plan_hash": selection_plan.plan_hash,
+                        "p060_binding_id": binding.binding_id,
+                    }),
+                )
+                .await?;
+
+            enqueued += 1;
+        }
+
+        info!(
+            run_id = %run_id,
+            stage = %stage.stage_id,
+            enqueued = enqueued,
+            total_selected = total_selected,
+            "P060: Dynamic parallel materialization complete"
+        );
+
+        Ok(enqueued)
+    }
+
+    /// P060: Resolve selected reviewer outputs for a then-task that declares
+    /// `selected_outputs_from`. Reads the AgentSelectionPlanV1 artifact,
+    /// queries stage artifacts, filters to selected reviewers, and returns
+    /// a `ReviewCorpusBundleV2` and the resolved artifact file paths.
+    ///
+    /// Returns `None` if the task doesn't declare `selected_outputs_from`
+    /// or the selection plan artifact doesn't exist.
+    async fn resolve_selected_outputs_for_task(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+        task: &workflow::plan::CompiledTask,
+    ) -> Result<Option<(domain::routing::ReviewCorpusBundleV2, Vec<String>)>> {
+        let sof = match &task.selected_outputs_from {
+            Some(sof) => sof,
+            None => return Ok(None),
+        };
+
+        // Read the AgentSelectionPlanV1 artifact from disk.
+        let artifact_path = format!(
+            "{}/routing/agent-selection-plan.v1.json",
+            run.artifact_root.trim_end_matches('/')
+        );
+        let plan_bytes = match std::fs::read(&artifact_path) {
+            Ok(b) => b,
+            Err(_) => {
+                warn!(
+                    run_id = %run_id,
+                    "P060: AgentSelectionPlanV1 artifact not found — cannot resolve selected_outputs_from"
+                );
+                return Ok(None);
+            }
+        };
+        let selection_plan: domain::routing::AgentSelectionPlanV1 =
+            serde_json::from_slice(&plan_bytes)
+                .context("P060: Failed to parse AgentSelectionPlanV1 for selected_outputs_from")?;
+
+        // Query stage artifacts from the DB.
+        let stage_artifacts = artifacts::list_by_stage(&self.pool, run_id, &stage.stage_id).await?;
+
+        // Convert to AvailableArtifact for the resolver.
+        let available: Vec<crate::proposal_review_router::AvailableArtifact> = stage_artifacts
+            .iter()
+            .map(|a| crate::proposal_review_router::AvailableArtifact {
+                artifact_id: a.id.to_string(),
+                agent_id: a.agent_id.clone(),
+                contract_id: a.contract_id.clone(),
+                file_path: a.file_path.clone(),
+            })
+            .collect();
+
+        let result = crate::proposal_review_router::resolve_selected_outputs(
+            &selection_plan,
+            &available,
+            &sof.output_contract,
+        );
+
+        let file_paths: Vec<String> = result
+            .selected_review_artifacts
+            .iter()
+            .map(|a| a.file_path.clone())
+            .collect();
+
+        let bundle = domain::routing::ReviewCorpusBundleV2 {
+            selected_review_artifacts: result
+                .selected_review_artifacts
+                .iter()
+                .map(|a| a.artifact_id.clone())
+                .collect(),
+            selected_reviewer_ids: result.selected_reviewer_ids,
+            reviewer_count: result.reviewer_count,
+            selection_plan_hash: result.selection_plan_hash,
+            legacy_fixed_mode: result.legacy_fixed_mode,
+        };
+
+        info!(
+            run_id = %run_id,
+            stage = %stage.stage_id,
+            selected_count = bundle.reviewer_count,
+            plan_hash = %bundle.selection_plan_hash,
+            ignored = result.ignored_artifacts.len(),
+            "P060: Resolved selected_outputs_from for aggregation"
+        );
+
+        // Write the ReviewCorpusBundleV2 as a metadata artifact.
+        let bundle_path = format!(
+            "{}/routing/review-corpus-bundle.v2.json",
+            run.artifact_root.trim_end_matches('/')
+        );
+        if let Some(parent) = std::path::Path::new(&bundle_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bundle_json = serde_json::to_vec_pretty(&bundle)?;
+        std::fs::write(&bundle_path, &bundle_json)?;
+
+        let bundle_artifact = domain::artifact::Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id,
+            stage_id: stage.stage_id.clone(),
+            agent_id: "system.aggregation".to_string(),
+            name: "review_corpus_bundle_v2".to_string(),
+            contract_id: "review_corpus_bundle_v2".to_string(),
+            format: domain::artifact::ArtifactFormat::Json,
+            file_path: bundle_path,
+            checksum_sha256: None,
+            size_bytes: Some(bundle_json.len() as i64),
+            provider: "system".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        };
+        artifacts::insert(&self.pool, &bundle_artifact).await?;
+
+        Ok(Some((bundle, file_paths)))
+    }
+
     /// Create a StageExecution for the given state.
     async fn create_stage_for_state(
         &self,
@@ -2124,7 +2912,7 @@ impl Orchestrator {
 
         // Attempt Phase B lead resolution from the versioned compatibility map.
         // If the map file doesn't exist or no match is found, resolution fails closed.
-        let resolver_path = "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json";
+        let resolver_path = "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
         let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
             Ok(r) => r,
             Err(e) => {
@@ -4722,6 +5510,7 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: Some(format!(".chainworks/runs/{run_id}")),
+            review_routing_json: None,
         }
     }
 
@@ -4744,6 +5533,7 @@ mod tests {
             catalog_snapshot_hash: "catalog".into(),
             workflow_snapshot_json: "{}".into(),
             catalog_snapshot_json: "{}".into(),
+            dynamic_candidate_bindings: Vec::new(),
         }
     }
 
@@ -4796,6 +5586,7 @@ mod tests {
             output_schemas,
             parallel: true,
             phase: 0,
+            selected_outputs_from: None,
         }
     }
 
@@ -4817,6 +5608,8 @@ mod tests {
             transitions,
             loop_config: None,
             degraded_output_policy: DegradedOutputPolicy::default(),
+            dynamic_parallel: None,
+            system_task: None,
         }
     }
 

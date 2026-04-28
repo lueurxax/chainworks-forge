@@ -1,6 +1,6 @@
 {
   "artifact_id": "phase_0_work_item_execution_owner_contract",
-  "path": "docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json",
+  "path": "docs/reference/workflow-conflict-evidence/phase-0-work-item-execution-owner-contract.json",
   "schema_version": "phase_0_work_item_execution_owner_contract_v1",
   "canonical_payload_fields": [
     "run_id",

@@ -7,8 +7,8 @@
       "catalog_source_path": "examples/agents/agents.yaml",
       "lead_agent_id": "lead_orchestrator",
       "lead_resolution_contract_ref": "LeadResolutionContract",
-      "mapping_owner": "P017 implementation lead",
-      "entry_attested_by": "P017 implementation lead",
+      "mapping_owner": "workflow conflict contract maintainers",
+      "entry_attested_by": "workflow conflict contract maintainers",
       "reviewed_at": "2026-04-26",
       "phase_c_removal_condition": "Phase C static catalog validation is authoritative for this workflow/catalog pair."
     },
@@ -17,8 +17,8 @@
       "catalog_source_path": "examples/agents/agents.yaml",
       "lead_agent_id": "lead_orchestrator",
       "lead_resolution_contract_ref": "LeadResolutionContract",
-      "mapping_owner": "P017 implementation lead",
-      "entry_attested_by": "P017 implementation lead",
+      "mapping_owner": "workflow conflict contract maintainers",
+      "entry_attested_by": "workflow conflict contract maintainers",
       "reviewed_at": "2026-04-26",
       "phase_c_removal_condition": "Phase C static catalog validation is authoritative for this workflow/catalog pair."
     },
@@ -27,13 +27,13 @@
       "catalog_source_path": "examples/agents/agents.yaml",
       "lead_agent_id": "lead_orchestrator",
       "lead_resolution_contract_ref": "LeadResolutionContract",
-      "mapping_owner": "P017 implementation lead",
-      "entry_attested_by": "P017 implementation lead",
+      "mapping_owner": "workflow conflict contract maintainers",
+      "entry_attested_by": "workflow conflict contract maintainers",
       "reviewed_at": "2026-04-26",
       "phase_c_removal_condition": "Phase C static catalog validation is authoritative for this workflow/catalog pair."
     }
   ],
-  "mapping_owner": "P017 implementation lead",
+  "mapping_owner": "workflow conflict contract maintainers",
   "entry_attestation_rule": "architect-reviewed",
   "staleness_review_trigger": "Phase C slip",
   "fail_closed_behavior": "REJECT_CLONE_MANUAL",

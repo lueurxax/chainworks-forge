@@ -1624,7 +1624,7 @@ Available gates:
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-015    Proposal 015 skill resolution and runtime injection gate
-  proposal-017    Proposal 017 Phase A/B/C workflow authority, conflict truth, and lead mediation gate
+  proposal-017    Workflow authority, conflict truth, and lead mediation gate (retained alias)
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
@@ -1814,25 +1814,25 @@ case "$GATE" in
     run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
     ;;
   proposal-017|p017)
-    log "Proposal 017 gate: Phase A/B/C workflow authority, conflict truth, and lead mediation"
+    log "Workflow conflict gate: workflow authority, conflict truth, and lead mediation"
     check_idle_environment allow_app
 
     # Phase 0 Contract Freeze: verify existence of required backend artifacts
     log "Verifying Phase 0 backend contract artifacts..."
     required_artifacts=(
-      "docs/proposals/017-evidence/phase-0-approval-mediation-contract.json"
-      "docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md"
-      "docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json"
-      "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json"
-      "docs/proposals/017-evidence/phase-0-settlement-service-boundary.md"
-      "docs/proposals/017-evidence/phase-0-artifact-manifest.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-approval-mediation-contract.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-mediation-execution-identity-contract.md"
+      "docs/reference/workflow-conflict-evidence/phase-0-work-item-execution-owner-contract.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-settlement-service-boundary.md"
+      "docs/reference/workflow-conflict-evidence/phase-0-artifact-manifest.json"
     )
     for art in "${required_artifacts[@]}"; do
       if [[ ! -f "$ROOT_DIR/$art" ]]; then
         die "Missing required Phase 0 artifact: $art"
       fi
     done
-    python3 - "$ROOT_DIR/docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json" <<'PY'
+    python3 - "$ROOT_DIR/docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json" <<'PY'
 import json
 import sys
 
@@ -1915,7 +1915,7 @@ PY
     fi
 
     # ARCH-001: equivalence record + proof test must both be present.
-    ARCH_001_DOC="docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md"
+    ARCH_001_DOC="docs/reference/workflow-conflict-evidence/phase-b-mediation-execution-fields-equivalence.md"
     ARCH_001_TEST="p017_mediation_execution_fields_equivalence"
     if [[ ! -f "$ROOT_DIR/$ARCH_001_DOC" ]]; then
       die "P017 ARCH-001: missing equivalence record at $ARCH_001_DOC"
@@ -1975,6 +1975,8 @@ PY
       "record_phase_c_lead_inventory_external_catalog_tx"
       "record_mediation_late_output_ignored_tx"
       "record_mediation_retry_budget_exhausted_tx"
+      "record_phase_b_dogfood_mediation_completion_rate_tx"
+      "record_phase_b_dogfood_operator_guidance_sufficient_tx"
     )
     for h in "${P017_R4_HELPERS[@]}"; do
       if ! grep -q "$h" "$ROOT_DIR/control-plane/crates/db/src/repos/workflow_conflicts.rs"; then
@@ -1987,6 +1989,9 @@ PY
       "p017_report_readback_completeness_metric_emits"
       "p017_phase_c_lead_inventory_external_catalog_metric_emits"
       "p017_mediation_late_output_ignored_metric_emits"
+      "p017_mediation_retry_budget_exhausted_metric_emits"
+      "p017_phase_b_dogfood_mediation_completion_rate_metric_emits"
+      "p017_phase_b_dogfood_operator_guidance_sufficient_metric_emits"
     )
     for t in "${P017_R4_TESTS[@]}"; do
       if ! grep -q "$t" "$OPS_001_DB_PATH"; then
@@ -2009,8 +2014,71 @@ PY
     if ! grep -q "record_mediation_late_output_ignored_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
       die "P017 R4 OPS-002: mediation_late_output_ignored_total has no production caller"
     fi
+    if ! grep -q "record_mediation_retry_budget_exhausted_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R6 OPS-001: mediation_retry_budget_exhausted_total has no production caller"
+    fi
+    if ! grep -q "record_phase_b_dogfood_mediation_completion_rate_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R6 OPS-001: phase_b_dogfood_mediation_completion_rate has no production caller"
+    fi
+    if ! grep -q "record_phase_b_dogfood_operator_guidance_sufficient_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R6 OPS-001: phase_b_dogfood_operator_guidance_sufficient_total has no production caller"
+    fi
 
-    log "Proposal 017 gate passed"
+    # ── R5 closure guards (API-003 + REL-002 + OPS-003) ────────────────
+    # API-003: per-attempt artifact direct linkage.
+    P017_R5_ARTIFACT_MIGRATION="$ROOT_DIR/control-plane/crates/db/migrations/032_p017_per_attempt_artifact_linkage.sql"
+    if [[ ! -f "$P017_R5_ARTIFACT_MIGRATION" ]]; then
+      die "P017 R5 API-003: missing migration 032_p017_per_attempt_artifact_linkage.sql"
+    fi
+    if ! grep -q "agent_execution_id" "$P017_R5_ARTIFACT_MIGRATION"; then
+      die "P017 R5 API-003: migration 032 must add artifacts.agent_execution_id column"
+    fi
+    if ! grep -q "list_by_agent_execution" "$ROOT_DIR/control-plane/crates/db/src/repos/artifacts.rs"; then
+      die "P017 R5 API-003: artifacts repo missing list_by_agent_execution"
+    fi
+    if ! grep -q "list_by_agent_execution" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 R5 API-003: MCP execution_attempts.artifacts must use list_by_agent_execution"
+    fi
+    if ! grep -q "list_by_agent_execution" "$ROOT_DIR/control-plane/crates/graphql-server/src/types/run.rs"; then
+      die "P017 R5 API-003: GraphQL execution_attempts.artifacts must use list_by_agent_execution"
+    fi
+    if ! grep -q "execution_id_direct" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 R5 API-003: MCP must label tier-2 artifacts as execution_id_direct"
+    fi
+    # REL-002: attribution + completion atomic in single transaction.
+    if ! grep -q "mediation.complete_with_attribution" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R5 REL-002: executor must commit completion+attribution in a single transaction"
+    fi
+    if ! grep -q "update_attempt_attribution_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R5 REL-002: executor must call update_attempt_attribution_tx (transactional variant)"
+    fi
+    if ! grep -q "artifacts::insert_tx(&mut completion_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R6 REL-001: mediation transcript artifact row must be inserted inside mediation.complete_with_attribution tx"
+    fi
+    # OPS-003: 4 new metric helpers + production callers + tests.
+    P017_R5_HELPERS=(
+      "record_advisory_rejection_tx"
+      "record_invalid_next_stage_hint_non_blocking_tx"
+      "record_workflow_conflict_current_tx"
+      "record_terminal_unverifiable_tx"
+    )
+    for h in "${P017_R5_HELPERS[@]}"; do
+      if ! grep -q "$h" "$ROOT_DIR/control-plane/crates/db/src/repos/workflow_conflicts.rs"; then
+        die "P017 R5 OPS-003: missing helper $h"
+      fi
+    done
+    P017_R5_TESTS=(
+      "p017_advisory_rejection_metrics_emit"
+      "p017_workflow_conflict_current_metric_emits"
+      "p017_terminal_unverifiable_metric_emits"
+    )
+    for t in "${P017_R5_TESTS[@]}"; do
+      if ! grep -q "$t" "$OPS_001_DB_PATH"; then
+        die "P017 R5 OPS-003: missing metric emit test $t"
+      fi
+    done
+
+    log "Workflow conflict gate passed"
     ;;
   proposal-018|p018)
     check_idle_environment allow_app
@@ -2986,6 +3054,63 @@ PY
     ;;
   proposal-060|p060)
     run_proposal060_all_control_artifacts
+    log "Proposal 060 Rust gate: Phase 1 + Phase 2 + Phase 3 focused tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-060-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain --lib routing -- --test-threads=1 --nocapture
+      cargo test -p engine --lib proposal_review_router -- --test-threads=1 --nocapture
+      cargo test -p workflow --test integration p060 -- --test-threads=1 --nocapture
+    )
+
+    # Phase 3 closure guards (audit ARCH/OPS-style).
+    # These die before the gate exits if any of the Phase 3 contracts
+    # have been removed even if a copycat test still passes structurally.
+    log "Verifying P060 Phase 3 closure surfaces..."
+    P060_AUTHORIZER_FILE="$ROOT_DIR/control-plane/crates/domain/src/routing.rs"
+    P060_ORCHESTRATOR_FILE="$ROOT_DIR/control-plane/crates/engine/src/orchestrator.rs"
+    if ! grep -q "RoutingEvidenceProjectionAuthorizer" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: missing RoutingEvidenceProjectionAuthorizer in domain::routing"
+    fi
+    if ! grep -q "PrincipalClassDebugRoutingHook" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: missing PrincipalClassDebugRoutingHook trait in domain::routing"
+    fi
+    if ! grep -q "CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: authorizer missing CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE env gate"
+    fi
+    if ! grep -q "resolve_effective_routing_mode" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: missing resolve_effective_routing_mode in domain::routing"
+    fi
+    if ! grep -q "CHAINWORKS_P060_ROUTING_MODE_OVERRIDE" "$P060_AUTHORIZER_FILE"; then
+      die "P060 Phase 3: feature-flag env name CHAINWORKS_P060_ROUTING_MODE_OVERRIDE missing"
+    fi
+    if ! grep -q "is_shadow" "$P060_ORCHESTRATOR_FILE"; then
+      die "P060 Phase 3: orchestrator missing shadow-mode dispatch handling"
+    fi
+    if ! grep -q "shadow_succeeded\|shadow_failed" "$P060_ORCHESTRATOR_FILE"; then
+      die "P060 Phase 3: orchestrator missing shadow_succeeded/shadow_failed RoutingCompleted labels"
+    fi
+    if ! grep -q "resolve_effective_routing_mode" "$P060_ORCHESTRATOR_FILE"; then
+      die "P060 Phase 3: orchestrator does not consult resolve_effective_routing_mode"
+    fi
+    # Phase 3 closure tests: at least one test name per contract must exist.
+    P060_DOMAIN_TEST_PATTERNS=(
+      "routing_evidence_projection_authorizer_default_is_redacted"
+      "routing_evidence_projection_authorizer_full_preserves_fields"
+      "routing_evidence_projection_authorizer_redacts_for_non_operators"
+      "routing_evidence_projection_authorizer_grants_operator_with_env"
+      "resolve_effective_routing_mode_no_env_returns_per_run_mode"
+      "resolve_effective_routing_mode_env_legacy_overrides_dynamic"
+      "resolve_effective_routing_mode_env_shadow_overrides_legacy"
+      "resolve_effective_routing_mode_unrecognized_env_falls_back_to_per_run"
+    )
+    for t in "${P060_DOMAIN_TEST_PATTERNS[@]}"; do
+      if ! grep -q "$t" "$P060_AUTHORIZER_FILE"; then
+        die "P060 Phase 3: closure test '$t' missing from domain::routing tests"
+      fi
+    done
+    log "Proposal 060 gate passed"
     ;;
   proposal-060-baseline|p060-baseline|proposal-060-storage|p060-storage|proposal-060-router-fixtures|p060-router-fixtures|proposal-060-snapshot-inventory|p060-snapshot-inventory|proposal-060-fixed-quartet|p060-fixed-quartet|proposal-060-ticket-map|p060-ticket-map|proposal-060-calibration|p060-calibration)
     run_proposal060_control_artifact_gate "$GATE"

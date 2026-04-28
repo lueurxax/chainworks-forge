@@ -216,6 +216,7 @@ pub async fn execute(
                 delivery_configuration_json,
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
+                review_routing_json: None,
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let run_id = match &commanded.result {
@@ -628,6 +629,7 @@ mod tests {
             drift_detected_at: None,
             drift_details_json: None,
             chainworks_meta_root: None,
+            review_routing_json: None,
         }
     }
 

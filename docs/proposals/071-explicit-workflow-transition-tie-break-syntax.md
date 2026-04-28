@@ -5,7 +5,7 @@
 | Date | 2026-04-24 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md), [workflow-execution-engine.md](../reference/workflow-execution-engine.md), [yaml-dsl-parser.md](../reference/yaml-dsl-parser.md) |
+| Depends on | [workflow-execution-engine.md](../reference/workflow-execution-engine.md), [yaml-dsl-parser.md](../reference/yaml-dsl-parser.md) |
 | Scope | Add an explicit, compiled, auditable transition tie-break mechanism for workflow states whose declarative transition conditions can intentionally overlap. |
 | Goal | Let workflow authors resolve intentional multi-match transitions without returning to implicit first-match behavior, agent-authored routing hints, or hidden YAML ordering semantics. |
 
@@ -15,7 +15,7 @@
 
 ## 1. Context
 
-P017 makes the compiled workflow graph authoritative and fail-closed. Under P017, when multiple declarative transitions from the same state match at runtime, the engine persists `multiple_declarative_transitions_matched_without_tie_break` and blocks the run. That is the correct default because implicit first-match behavior can hide workflow bugs.
+The current workflow engine makes the compiled workflow graph authoritative and fail-closed. When multiple declarative transitions from the same state match at runtime, the engine persists `multiple_declarative_transitions_matched_without_tie_break` and blocks the run. That is the correct default because implicit first-match behavior can hide workflow bugs.
 
 Some workflows still need intentional overlap. Common examples:
 
@@ -30,7 +30,7 @@ P071 adds a deliberate syntax for those cases. The syntax must make the author d
 
 ## 2. Non-Negotiable Rules
 
-- P017 remains the default: multi-match without an explicit tie-break blocks with a typed workflow conflict.
+- The current graph-authority contract remains the default: multi-match without an explicit tie-break blocks with a typed workflow conflict.
 - YAML list order is never a tie-break.
 - Agent-authored `next_stage`, `next_action`, run_state artifacts, and narrative hints are never tie-break inputs.
 - A tie-break may select only among already-matched compiled transitions.
@@ -65,7 +65,7 @@ states:
 
 Selection rule:
 
-- Evaluate all transitions exactly as P017 defines.
+- Evaluate all transitions exactly as the workflow-execution engine defines.
 - If zero transitions match, keep existing no-match behavior.
 - If one transition matches, select it.
 - If multiple transitions match:
@@ -140,7 +140,7 @@ The selected transition cursor must record:
 
 P071 changes only the branch where more than one transition matched.
 
-Current P017 behavior:
+Current behavior:
 
 ```text
 matched_count > 1 -> workflow_conflict
@@ -181,12 +181,12 @@ No hidden reasoning, prompts, or agent rationale is involved. This is workflow g
 P071 does not require editing every workflow immediately.
 
 - Existing workflows without multi-match continue to behave as before.
-- Existing workflows with accidental multi-match continue to block under P017 until explicitly re-authored.
+- Existing workflows with accidental multi-match continue to block until explicitly re-authored.
 - Bundled workflows known to rely on implicit first-match behavior must either:
   - be re-authored with mutually-exclusive conditions;
   - add explicit `id` and `selection_priority`; or
   - remain covered by a known-issues migration record until re-authored.
-- External legacy catalogs follow the P017 Phase C warning-window policy before fail-closed enforcement.
+- External legacy catalogs follow the lead-validation warning-window policy before fail-closed enforcement.
 
 ---
 

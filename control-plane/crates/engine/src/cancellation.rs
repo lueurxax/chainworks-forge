@@ -106,12 +106,9 @@ pub async fn begin_settlement_tx(
     // `running` / `operator_confirmation_required`, splitting durable
     // mediation truth across two tables and breaking late-output,
     // resume, and operator readback invariants.
-    let canceled_mediations = lead_conflict_mediations::cancel_active_by_run_tx(
-        tx,
-        &run_id.to_string(),
-        requested_at,
-    )
-    .await?;
+    let canceled_mediations =
+        lead_conflict_mediations::cancel_active_by_run_tx(tx, &run_id.to_string(), requested_at)
+            .await?;
     if canceled_mediations > 0 {
         tracing::info!(
             run_id = %run_id,

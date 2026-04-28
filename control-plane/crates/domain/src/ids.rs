@@ -51,3 +51,8 @@ define_id!(StageExecutionId);
 define_id!(AgentExecutionId);
 define_id!(ApprovalId);
 define_id!(ArtifactId);
+
+// P060: Deterministic reviewer routing IDs.
+define_id!(SystemExecutionId);
+define_id!(RoutingReceiptId);
+define_id!(DynamicMaterializationId);

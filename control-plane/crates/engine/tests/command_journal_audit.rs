@@ -84,6 +84,7 @@ fn start_run_cmd() -> Command {
         delivery_configuration_json: None,
         workflow_yaml_path: workflow.to_string_lossy().into_owned(),
         agent_catalog_yaml_path: catalog.to_string_lossy().into_owned(),
+        review_routing_json: None,
     })
 }
 

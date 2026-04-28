@@ -245,6 +245,7 @@ mod tests {
             xcode_broker_required: None,
             xcode_shim_injection_signal: None,
             requires_xcode_host_execution: None,
+            routing: None,
         }];
         let catalog = workflow::catalog::AgentCatalogFile {
             schema_version: None,

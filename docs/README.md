@@ -25,7 +25,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Execution engine
 
-- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, and conflict resolution / lead mediation (Proposal 017)
+- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, and conflict resolution / lead mediation
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, and startup recovery progress

@@ -75,23 +75,30 @@ AgentCatalog
 
 Each agent in the catalog has:
 
-| Field | YAML Key | Type |
-|---|---|---|
-| `id` | `id` | `String` |
-| `title` | `title` | `String` |
-| `mode` | `mode` | `String` |
-| `backendProfile` | `backend_profile` | `String` |
-| `permissionProfile` | `permission_profile` | `String` |
-| `skillRef` | `skill_ref` | `String` |
-| `skillRole` | `skill_role` | `String?` |
-| `worktreePolicy` | `worktree_policy` | `WorktreePolicy?` |
-| `requiredTools` | `required_tools` | `[String]?` |
-| `inputs` | `inputs` | `[String]` |
-| `outputs` | `outputs` | `[String]` |
-| `outputContract` | `output_contract` | `String?` |
-| `requiresHumanApproval` | `requires_human_approval` | `Bool` |
-| `prompt` | `prompt` | `String` |
-| `notes` | `notes` | `String?` |
+| Field | YAML Key | Type | Description |
+|---|---|---|---|
+| `id` | `id` | `String` | Unique agent identifier |
+| `title` | `title` | `String` | Human-readable name |
+| `mode` | `mode` | `String` | Execution mode |
+| `routingId` | `routing_id` | `String?` | Stable identifier for routing rules |
+| `capabilities` | `capabilities` | `[String]?` | Functional tags (e.g. `security`, `reliability`) |
+| `stacks` | `stacks` | `[String]?` | Tech stack tags (e.g. `rust`, `macos`, `ios`) |
+| `surfaces` | `surfaces` | `[String]?` | App surface tags (e.g. `api`, `ui`, `persistence`) |
+| `risks` | `risks` | `[String]?` | Risk category tags (e.g. `breaking_change`) |
+| `enabledForProposalReview` | `enabled_for_proposal_review` | `Bool?` | Active routing candidate if true |
+| `rolloutWave` | `rollout_wave` | `String?` | Rollout wave (e.g. `phase_3_core`) |
+| `backendProfile` | `backend_profile` | `String` | Reference to backend profile |
+| `permissionProfile` | `permission_profile` | `String` | Reference to permission profile |
+| `skillRef` | `skill_ref` | `String` | Reference to skill |
+| `skillRole` | `skill_role` | `String?` | Optional skill role |
+| `worktreePolicy` | `worktree_policy` | `WorktreePolicy?` | Worktree isolation rules |
+| `requiredTools` | `required_tools` | `[String]?` | List of host tools required |
+| `inputs` | `inputs` | `[String]` | Input artifact names |
+| `outputs` | `outputs` | `[String]` | Output artifact names |
+| `outputContract` | `output_contract` | `String?` | Reference to output contract |
+| `requiresHumanApproval` | `requires_human_approval` | `Bool` | Whether a gate is required |
+| `prompt` | `prompt` | `String` | The system prompt template |
+| `notes` | `notes` | `String?` | Implementation notes |
 
 #### `BackendProfile`
 
@@ -164,7 +171,8 @@ Defines which agents execute within a state:
 
 - `sequence: [AgentTask]?` — agents run one after another
 - `parallel: [AgentTask]?` — agents run concurrently (fan-out)
-- `then: [AgentTask]?` — sequential tasks after parallel fan-out completes
+- `dynamic_parallel: [AgentTask]?` — agents materialized from a selector artifact
+- `then: [AgentTask]?` — sequential tasks after parallel blocks complete
 
 #### `AgentTask`
 
