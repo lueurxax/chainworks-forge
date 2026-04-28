@@ -257,6 +257,46 @@ pub async fn update_status_tx(
     Ok(rows)
 }
 
+/// Transition every non-terminal mediation for `run_id` to `canceled`.
+///
+/// REL-001 (P017 R2 audit): the run cancellation cascade must keep
+/// `lead_conflict_mediations` truth synchronized with `agent_executions`
+/// when a run is cancelled. Otherwise a mediation can linger in
+/// `queued` / `running` / `operator_confirmation_required` while the
+/// owning `agent_execution` is already `canceled`, which splits durable
+/// truth between the two tables and corrupts late-output, resume, and
+/// operator readback semantics.
+///
+/// Runs in the same transaction as `agent_executions::cancel_running_by_run_tx`
+/// so the two updates are atomic.
+///
+/// Idempotent: rows already in a terminal state are skipped by the
+/// `status NOT IN (...)` guard. Returns the number of mediations that
+/// were transitioned (0 = nothing was active).
+pub async fn cancel_active_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let now_str = now.to_rfc3339();
+    let result = sqlx::query(
+        r#"UPDATE lead_conflict_mediations
+           SET status = 'canceled',
+               settlement_result = COALESCE(settlement_result, 'cancelled'),
+               recovery_action = COALESCE(recovery_action, 'run_cancelled'),
+               updated_at = ?1,
+               settled_at = ?1
+           WHERE run_id = ?2
+             AND status NOT IN ('settled', 'terminal_unverifiable', 'canceled', 'superseded')"#,
+    )
+    .bind(&now_str)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await
+    .context("cancel active mediations by run (tx)")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn update_after_lead_output_tx(
     tx: &mut Transaction<'_, Sqlite>,
     id: &str,

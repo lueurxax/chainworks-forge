@@ -29,6 +29,7 @@ async fn handle_xcode_mcp_post(
 ) -> Response {
     let _ = pool.cleanup_first_connect_timeouts().await;
     let _ = pool.cleanup_pid_drift().await;
+    let _ = pool.cleanup_idle_active_leases().await;
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());

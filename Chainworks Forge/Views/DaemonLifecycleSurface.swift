@@ -201,9 +201,12 @@ struct DaemonLifecycleBanner: View {
         let persistence = health.observationPersistenceFailures > 0
             ? ", \(health.observationPersistenceFailures) observation write failures"
             : ""
+        let helperCleanup = health.staleLeaseCount > 0 || health.helperCleanupReapedLeasesTotal > 0
+            ? ", \(health.staleLeaseCount) stale, \(health.backendSessionCount) backend sessions, \(health.helperCleanupReapedLeasesTotal) cleaned"
+            : ""
         let acquisition = health.canAcquireNewXcodeLeases ? "leases available" : "leases blocked"
         let message = health.operatorMessage.isEmpty ? nil : health.operatorMessage
-        let suffix = "\(leases), \(queue), \(backend), \(acquisition)\(persistence)"
+        let suffix = "\(leases), \(queue), \(backend), \(acquisition)\(persistence)\(helperCleanup)"
         switch health.state {
         case .disabled:
             return ("pause.circle.fill", .gray, "\(message ?? "Xcode Broker disabled") — \(suffix)")

@@ -164,10 +164,11 @@ Live executor using the selected ACP runtime transport. Per-execution flow:
 1. Validate workspace boundaries.
 2. Capture pre-prompt metadata for the per-execution baseline.
 3. Create an isolated session via `RuntimeSessionBridge`.
-4. Stream execution events through `ExecutionEventBridge`.
-5. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-6. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
-7. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
+4. **Prompt Augmentation (P065)**: if an operator retry instruction is active, the executor renders a reserved engine-owned prompt section (`## Operator Retry Instruction`) before the task text.
+5. Stream execution events through `ExecutionEventBridge`.
+6. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
+7. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
+8. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
 before the transport closed, governed by the discovery settlement policy.
@@ -193,7 +194,16 @@ Nonisolated, `Sendable` disk I/O layer.
 - Path layout: `{artifactRoot}/{stageID}.{iteration}/{agentID}/{attemptNumber}/{name}`
 - Path traversal guard: rejects any resolved path outside `workspaceRoot`.
 - Atomic writes with SHA-256 checksums.
+
+### Worktree Mutation Barrier (P064)
+
+To protect worktrees during orchestrated mutations (like main-sync), the engine uses an exclusive mutation barrier.
+- **Barrier Acquisition**: Active sync or repair tasks request an exclusive barrier.
+- **Consumer Blocking**: The scheduler prevents new read/write work items from being claimed while the barrier is active for a worktree.
+- **Read-only Reviewers**: Review agents that read directly from the implementation worktree must declare `read` access and are subject to barrier blocking.
+
 ### Transition Evaluator (`TransitionEvaluator.swift`)
+...
 
 Stateless evaluator for transition `when` clauses (ARCH-031). Supports only
 canonical patterns:

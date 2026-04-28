@@ -9,13 +9,19 @@ pub mod steward;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 16] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 22] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
         CapabilityToolId::RunsStart,
         CapabilityToolId::RunsList,
         CapabilityToolId::RunsGet,
+        CapabilityToolId::RunsMainSyncRequest,
+        CapabilityToolId::RunsMainSyncRetry,
+        CapabilityToolId::RunsMainSyncSetOverride,
+        CapabilityToolId::RunsMainSyncRepairState,
+        CapabilityToolId::RunsMainSyncRecordRecoveryDecision,
+        CapabilityToolId::RunsKnowledgeCapsuleIgnore,
         CapabilityToolId::RunsCancel,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
@@ -30,6 +36,18 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 16] {
     ]
 }
 
+pub fn p064_operator_tool_enabled(tool_name: &str) -> bool {
+    !matches!(
+        tool_name,
+        "runs.main_sync.request"
+            | "runs.main_sync.retry"
+            | "runs.main_sync.set_override"
+            | "runs.main_sync.repair_state"
+            | "runs.main_sync.record_recovery_decision"
+            | "runs.knowledge_capsule.ignore"
+    )
+}
+
 pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
     match tool_name {
         "ideas.create" => Some(CapabilityToolId::IdeasCreate),
@@ -37,6 +55,14 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "runs.start" => Some(CapabilityToolId::RunsStart),
         "runs.list" => Some(CapabilityToolId::RunsList),
         "runs.get" => Some(CapabilityToolId::RunsGet),
+        "runs.main_sync.request" => Some(CapabilityToolId::RunsMainSyncRequest),
+        "runs.main_sync.retry" => Some(CapabilityToolId::RunsMainSyncRetry),
+        "runs.main_sync.set_override" => Some(CapabilityToolId::RunsMainSyncSetOverride),
+        "runs.main_sync.repair_state" => Some(CapabilityToolId::RunsMainSyncRepairState),
+        "runs.main_sync.record_recovery_decision" => {
+            Some(CapabilityToolId::RunsMainSyncRecordRecoveryDecision)
+        }
+        "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
@@ -59,6 +85,25 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::RunsStart => tool_spec_by_name(runs::tool_specs(), "runs.start"),
         CapabilityToolId::RunsList => tool_spec_by_name(runs::tool_specs(), "runs.list"),
         CapabilityToolId::RunsGet => tool_spec_by_name(runs::tool_specs(), "runs.get"),
+        CapabilityToolId::RunsMainSyncRequest => {
+            tool_spec_by_name(runs::tool_specs(), "runs.main_sync.request")
+        }
+        CapabilityToolId::RunsMainSyncRetry => {
+            tool_spec_by_name(runs::tool_specs(), "runs.main_sync.retry")
+        }
+        CapabilityToolId::RunsMainSyncSetOverride => {
+            tool_spec_by_name(runs::tool_specs(), "runs.main_sync.set_override")
+        }
+        CapabilityToolId::RunsMainSyncRepairState => {
+            tool_spec_by_name(runs::tool_specs(), "runs.main_sync.repair_state")
+        }
+        CapabilityToolId::RunsMainSyncRecordRecoveryDecision => tool_spec_by_name(
+            runs::tool_specs(),
+            "runs.main_sync.record_recovery_decision",
+        ),
+        CapabilityToolId::RunsKnowledgeCapsuleIgnore => {
+            tool_spec_by_name(runs::tool_specs(), "runs.knowledge_capsule.ignore")
+        }
         CapabilityToolId::RunsCancel => tool_spec_by_name(runs::tool_specs(), "runs.cancel"),
         CapabilityToolId::ApprovalsList => {
             tool_spec_by_name(approvals::tool_specs(), "approvals.list")
@@ -123,6 +168,14 @@ mod tests {
             Some(CapabilityToolId::StewardRunAnalysis)
         );
         assert_eq!(
+            super::capability_id_for("runs.main_sync.request"),
+            Some(CapabilityToolId::RunsMainSyncRequest)
+        );
+        assert_eq!(
+            super::mcp_tool_for(CapabilityToolId::RunsKnowledgeCapsuleIgnore).name,
+            "runs.knowledge_capsule.ignore"
+        );
+        assert_eq!(
             super::capability_id_for("legacy_discovery_override_create"),
             Some(CapabilityToolId::LegacyDiscoveryOverrideCreate)
         );
@@ -143,5 +196,22 @@ mod tests {
             "workflow_conflicts.resolve"
         );
         assert_eq!(super::capability_id_for("missing.tool"), None);
+    }
+
+    #[test]
+    fn p064_operator_tools_are_registered_but_hidden_until_modes_enable_runtime() {
+        assert_eq!(
+            super::capability_id_for("runs.main_sync.request"),
+            Some(CapabilityToolId::RunsMainSyncRequest)
+        );
+        assert_eq!(
+            super::capability_id_for("runs.knowledge_capsule.ignore"),
+            Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore)
+        );
+        assert!(!super::p064_operator_tool_enabled("runs.main_sync.request"));
+        assert!(!super::p064_operator_tool_enabled(
+            "runs.knowledge_capsule.ignore"
+        ));
+        assert!(super::p064_operator_tool_enabled("runs.get"));
     }
 }

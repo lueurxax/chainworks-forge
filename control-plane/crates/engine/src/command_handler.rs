@@ -8,8 +8,8 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
-    ideas, legacy_discovery_overrides, projections, runs, scheduler, sessions, stages, work_items,
-    workflow_conflicts,
+    ideas, legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
+    sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::approval::ApprovalDecision;
@@ -57,6 +57,8 @@ pub enum CommandResult {
         run_id: RunId,
         stage_id: String,
         legacy_discovery_override_id: Option<String>,
+        /// P065: binding id when operator instruction was attached.
+        retry_instruction_binding_id: Option<String>,
     },
     WorkflowConflictTransitionSelected {
         run_id: RunId,
@@ -128,6 +130,12 @@ impl CommandJournalEntry {
             Command::RetryStage(_) => "RetryStage",
             Command::ResolveWorkflowConflictTransition(_) => "ResolveWorkflowConflictTransition",
             Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
+            Command::MainSyncRequest(_) => "MainSyncRequest",
+            Command::MainSyncRetry(_) => "MainSyncRetry",
+            Command::MainSyncSetRunOverride(_) => "MainSyncSetRunOverride",
+            Command::MainSyncRepairState(_) => "MainSyncRepairState",
+            Command::MainSyncRecordRecoveryDecision(_) => "MainSyncRecordRecoveryDecision",
+            Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
@@ -143,6 +151,12 @@ impl CommandJournalEntry {
             Command::RetryStage(c) => Some(c.run_id.to_string()),
             Command::ResolveWorkflowConflictTransition(c) => Some(c.run_id.to_string()),
             Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRequest(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRetry(c) => Some(c.run_id.to_string()),
+            Command::MainSyncSetRunOverride(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRepairState(c) => Some(c.run_id.to_string()),
+            Command::MainSyncRecordRecoveryDecision(c) => Some(c.run_id.to_string()),
+            Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
@@ -222,6 +236,29 @@ fn find_source_invoke_work_item<'a>(
             matches.then_some(item)
         })
         .max_by_key(|item| item.created_at)
+}
+
+/// OPS-002 (P017 R4): classify the workflow-compile error so the
+/// `phase_c_validation_outcome_total` fail-path metric carries a
+/// bounded `failure_kind` label.
+///
+/// The classifier matches on the typed prefix the compile error emits
+/// (`lead_missing`, `lead_ambiguous`, `lead_backend_profile_missing`,
+/// `lead_permission_profile_missing`, `lead_resolution_contract_missing`)
+/// and falls back to `other_compile_failure` so cardinality stays bounded.
+fn classify_phase_c_failure_kind(error_message: &str) -> String {
+    for kind in [
+        "lead_missing",
+        "lead_ambiguous",
+        "lead_backend_profile_missing",
+        "lead_permission_profile_missing",
+        "lead_resolution_contract_missing",
+    ] {
+        if error_message.contains(kind) {
+            return kind.to_string();
+        }
+    }
+    "other_compile_failure".to_string()
 }
 
 fn frozen_legacy_broad_discovery_policy(run: &Run) -> Result<LegacyBroadDiscoveryPolicy> {
@@ -362,6 +399,16 @@ impl CommandHandler {
                 "forbidden: RetryStage legacy_discovery_override_policy requires operator principal"
             );
         }
+        // P065: operator_instruction requires operator principal
+        if matches!(
+            &cmd,
+            Command::RetryStage(c) if c.operator_instruction.is_some()
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!(
+                "forbidden: RetryStage operator_instruction requires operator principal"
+            );
+        }
         if matches!(&cmd, Command::ResolveWorkflowConflictTransition(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -373,6 +420,18 @@ impl CommandHandler {
             && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: OverrideLegacyDiscoveryPolicy requires operator principal");
+        }
+        if matches!(
+            &cmd,
+            Command::MainSyncRequest(_)
+                | Command::MainSyncRetry(_)
+                | Command::MainSyncSetRunOverride(_)
+                | Command::MainSyncRepairState(_)
+                | Command::MainSyncRecordRecoveryDecision(_)
+                | Command::KnowledgeCapsuleIgnore(_)
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
         }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
@@ -450,6 +509,18 @@ impl CommandHandler {
                     Ok(plan) => plan,
                     Err(error) => {
                         let message = error.to_string();
+                        // OPS-002 (P017 R4): emit phase_c_validation_outcome_total
+                        // for the FAIL-CLOSED compile path. Run id is None
+                        // because the run row never gets inserted.
+                        let failure_kind = classify_phase_c_failure_kind(&message);
+                        let _ = db::repos::workflow_conflicts::record_phase_c_validation_failure(
+                            &self.pool,
+                            &failure_kind,
+                            Some(c.workflow_yaml_path.as_str()),
+                            Some(c.agent_catalog_yaml_path.as_str()),
+                            now,
+                        )
+                        .await;
                         self.record_failed_command_transaction(
                             journal,
                             "command.StartRun",
@@ -564,8 +635,8 @@ impl CommandHandler {
                     cancellation_settled_at: None,
                     cancellation_settlement_log: None,
                     current_state: Some(plan.initial_state),
-                    workflow_yaml_path: Some(c.workflow_yaml_path),
-                    agent_catalog_yaml_path: Some(c.agent_catalog_yaml_path),
+                    workflow_yaml_path: Some(c.workflow_yaml_path.clone()),
+                    agent_catalog_yaml_path: Some(c.agent_catalog_yaml_path.clone()),
                     // Worktree fields — provisioned later by the orchestrator
                     // when the first write-enabled implementation state is entered.
                     worktree_root: None,
@@ -589,6 +660,35 @@ impl CommandHandler {
                     chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
                 };
                 runs::insert_tx(&mut tx, &run).await?;
+                // OPS-001 (P017 R2 audit): the workflow compiler ran
+                // Phase C lead-validation as part of `compile()`. Reaching
+                // this point means it passed; record the outcome so the
+                // metric has at least one production caller per run start.
+                db::repos::workflow_conflicts::record_phase_c_validation_outcome_tx(
+                    &mut tx,
+                    run_id,
+                    "pass",
+                    "compile",
+                    now,
+                )
+                .await?;
+                // OPS-002 (P017 R4): emit phase_c_lead_inventory_external_catalog_total
+                // per-run with the inventory result observed at compile time.
+                // For the bundled-only catalog path (the local operator's
+                // current evidence inventory says zero active externals),
+                // this is `inventory_result=zero_active_externals` +
+                // `enforcement_decision=waive_warning_window` per the
+                // attested evidence at
+                // docs/proposals/017-evidence/phase-c-external-catalog-enforcement-inventory.json.
+                db::repos::workflow_conflicts::record_phase_c_lead_inventory_external_catalog_tx(
+                    &mut tx,
+                    Some(&run_id.to_string()),
+                    "zero_active_externals",
+                    "waive_warning_window",
+                    Some(c.agent_catalog_yaml_path.as_str()),
+                    now,
+                )
+                .await?;
                 // Activate the idea when its first run starts.
                 db::repos::ideas::update_status_tx(
                     &mut tx,
@@ -653,6 +753,30 @@ impl CommandHandler {
                 .await?;
                 Ok(CommandResult::ArtifactContractOverrideCreated { override_id })
             }
+
+            Command::MainSyncRequest(_) => Err(anyhow!(
+                "not implemented: MainSyncRequest is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncRetry(_) => Err(anyhow!(
+                "not implemented: MainSyncRetry is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncSetRunOverride(_) => Err(anyhow!(
+                "not implemented: MainSyncSetRunOverride is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncRepairState(_) => Err(anyhow!(
+                "not implemented: MainSyncRepairState is frozen in Phase 0 only"
+            )),
+
+            Command::MainSyncRecordRecoveryDecision(_) => Err(anyhow!(
+                "not implemented: MainSyncRecordRecoveryDecision is frozen in Phase 0 only"
+            )),
+
+            Command::KnowledgeCapsuleIgnore(_) => Err(anyhow!(
+                "not implemented: KnowledgeCapsuleIgnore is frozen in Phase 0 only"
+            )),
 
             Command::ApproveStage(c) => {
                 let now = Utc::now();
@@ -912,6 +1036,16 @@ impl CommandHandler {
             }
 
             Command::RetryStage(c) => {
+                // P065: validate operator_instruction early (before any DB writes)
+                let validated_instruction = if let Some(ref raw) = c.operator_instruction {
+                    Some(
+                        domain::retry_instruction::validate_operator_instruction(raw)
+                            .map_err(|e| anyhow!("operator_instruction validation: {e}"))?,
+                    )
+                } else {
+                    None
+                };
+
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
                         anyhow::bail!(
@@ -925,6 +1059,9 @@ impl CommandHandler {
                             agent_execution_id,
                             c.consume_quota_budget_now,
                             journal_id,
+                            journal,
+                            validated_instruction.as_deref(),
+                            &caller,
                         )
                         .await;
                 }
@@ -1105,17 +1242,58 @@ impl CommandHandler {
                 self.maybe_inject_retry_stage_failure("supersede_workflow_conflict")?;
                 let legacy_discovery_override_id =
                     if let Some(input) = legacy_discovery_override_input.as_ref() {
-                        Some(
+                        let override_record =
                             legacy_discovery_overrides::create_for_pending_retry_tx(
                                 &mut retry_tx,
                                 input,
                             )
-                            .await?
-                            .override_id,
+                            .await?;
+                        // OPS-001 (P017 R2 audit): an operator-attested
+                        // legacy/external catalog override is the canonical
+                        // external-catalog warning decision point. Emit one
+                        // metric event per override so rollout dashboards can
+                        // track override volume + decision class.
+                        let _ = db::repos::workflow_conflicts::record_external_catalog_warning_tx(
+                            &mut retry_tx,
+                            &c.run_id.to_string(),
+                            "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED",
+                            "enabled",
+                            "legacy_discovery_override",
+                            now,
                         )
+                        .await;
+                        Some(override_record.override_id)
                     } else {
                         None
                     };
+                // P065: create parent binding for operator instruction (full-stage retry).
+                // Child delivery rows are deferred to the orchestrator's fanout.
+                let retry_instruction_binding_id =
+                    if let Some(ref instruction_text) = validated_instruction {
+                        let binding =
+                            retry_operator_instructions::create_for_retry_attempt_tx(
+                                &mut retry_tx,
+                                &domain::retry_instruction::RetryInstructionBindingInput {
+                                    journal_id: journal_id.to_string(),
+                                    run_id: c.run_id,
+                                    stage_id: c.stage_id.clone(),
+                                    source_stage_execution_id: old_stage.id,
+                                    retry_stage_execution_id: new_stage.id,
+                                    retry_attempt_number: next_attempt_number,
+                                    target_agent_execution_id: None,
+                                    scope_kind: domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry,
+                                    instruction_text: instruction_text.clone(),
+                                    created_by_principal_id: caller.principal_id.clone(),
+                                    created_by_principal_class: caller.principal_class.to_string(),
+                                },
+                            )
+                            .await?;
+                        Some(binding.binding_id)
+                    } else {
+                        None
+                    };
+                self.maybe_inject_retry_stage_failure("create_retry_instruction_binding")?;
+
                 artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
                     &mut retry_tx,
                     c.run_id,
@@ -1169,6 +1347,7 @@ impl CommandHandler {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
                     legacy_discovery_override_id,
+                    retry_instruction_binding_id,
                 })
             }
 
@@ -1989,7 +2168,10 @@ impl CommandHandler {
         stage_id: &str,
         consume_quota_budget_now: bool,
         journal_id: &str,
+        journal: &CommandJournalEntry,
         retry_reason: &str,
+        validated_instruction: Option<&str>,
+        caller: &CallerContext,
     ) -> Result<CommandResult> {
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
@@ -2054,6 +2236,21 @@ impl CommandHandler {
         let retry_tx_started = Instant::now();
         let mut retry_tx =
             db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
+        command_journal::record_tx(
+            &mut retry_tx,
+            &journal.id,
+            journal.command_type,
+            &journal.payload_json,
+            journal.run_id.as_deref(),
+            journal.created_at,
+            journal.caller_surface.as_deref(),
+            journal.caller_principal_id.as_deref(),
+            journal.caller_principal_class.as_deref(),
+            journal.caller_tool.as_deref(),
+            journal.request_id.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -2092,6 +2289,35 @@ impl CommandHandler {
             journal_id,
         )
         .await?;
+        // P065: create binding for fallback full-stage retry path
+        let retry_instruction_binding_id =
+            if let Some(instruction_text) = validated_instruction {
+                let scope_kind = if retry_reason == "operator_retry_stale_targeted_retry" {
+                    domain::retry_instruction::RetryInstructionScopeKind::TargetedRetryFallbackFullStage
+                } else {
+                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry
+                };
+                let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                    &mut retry_tx,
+                    &domain::retry_instruction::RetryInstructionBindingInput {
+                        journal_id: journal_id.to_string(),
+                        run_id,
+                        stage_id: stage_id.to_string(),
+                        source_stage_execution_id: old_stage.id,
+                        retry_stage_execution_id: new_stage.id,
+                        retry_attempt_number: next_attempt_number,
+                        target_agent_execution_id: None,
+                        scope_kind,
+                        instruction_text: instruction_text.to_string(),
+                        created_by_principal_id: caller.principal_id.clone(),
+                        created_by_principal_class: caller.principal_class.to_string(),
+                    },
+                )
+                .await?;
+                Some(binding.binding_id)
+            } else {
+                None
+            };
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2112,6 +2338,7 @@ impl CommandHandler {
             },
         )
         .await?;
+        command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
         retry_tx.commit().await?;
         db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
 
@@ -2122,6 +2349,7 @@ impl CommandHandler {
             run_id,
             stage_id: stage_id.to_string(),
             legacy_discovery_override_id: None,
+            retry_instruction_binding_id,
         })
     }
 
@@ -2132,6 +2360,9 @@ impl CommandHandler {
         agent_execution_id: domain::ids::AgentExecutionId,
         consume_quota_budget_now: bool,
         journal_id: &str,
+        journal: &CommandJournalEntry,
+        validated_instruction: Option<&str>,
+        caller: &CallerContext,
     ) -> Result<CommandResult> {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
@@ -2246,7 +2477,10 @@ impl CommandHandler {
                         stage_id,
                         consume_quota_budget_now,
                         journal_id,
+                        journal,
                         "operator_retry_stale_targeted_retry",
+                        validated_instruction,
+                        caller,
                     )
                     .await;
             }
@@ -2319,6 +2553,21 @@ impl CommandHandler {
         let retry_tx_started = Instant::now();
         let mut retry_tx =
             db::pool::begin_immediate_with_retry(&self.pool, "command.RetryAgentExecution").await?;
+        command_journal::record_tx(
+            &mut retry_tx,
+            &journal.id,
+            journal.command_type,
+            &journal.payload_json,
+            journal.run_id.as_deref(),
+            journal.created_at,
+            journal.caller_surface.as_deref(),
+            journal.caller_principal_id.as_deref(),
+            journal.caller_principal_class.as_deref(),
+            journal.caller_tool.as_deref(),
+            journal.request_id.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -2341,6 +2590,52 @@ impl CommandHandler {
             .bind(run_id.to_string())
             .execute(&mut *retry_tx)
             .await?;
+        // P065: create parent binding + child delivery for targeted retry
+        let retry_instruction_binding_id =
+            if let Some(instruction_text) = validated_instruction {
+                let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                    &mut retry_tx,
+                    &domain::retry_instruction::RetryInstructionBindingInput {
+                        journal_id: journal_id.to_string(),
+                        run_id,
+                        stage_id: stage_id.to_string(),
+                        source_stage_execution_id: old_stage.id,
+                        retry_stage_execution_id: new_stage.id,
+                        retry_attempt_number: next_attempt_number,
+                        target_agent_execution_id: Some(agent_execution_id),
+                        scope_kind:
+                            domain::retry_instruction::RetryInstructionScopeKind::TargetedRetry,
+                        instruction_text: instruction_text.to_string(),
+                        created_by_principal_id: caller.principal_id.clone(),
+                        created_by_principal_class: caller.principal_class.to_string(),
+                    },
+                )
+                .await?;
+                // For targeted retry, the work item is known now — create child delivery row.
+                retry_operator_instructions::create_for_work_item_tx(
+                    &mut retry_tx,
+                    &binding.binding_id,
+                    Some(&retry_work_item_id),
+                    None,
+                )
+                .await?;
+                // Inject metadata into the payload so executor can find it.
+                if let Some(object) = retry_payload.as_object_mut() {
+                    object.insert(
+                        "operator_retry_instruction".into(),
+                        serde_json::json!({
+                            "binding_id": binding.binding_id,
+                            "journal_id": binding.journal_id,
+                            "scope_kind": binding.scope_kind.to_string(),
+                            "instruction": binding.instruction_text,
+                            "instruction_sha256": binding.instruction_sha256,
+                        }),
+                    );
+                }
+                Some(binding.binding_id)
+            } else {
+                None
+            };
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2357,6 +2652,7 @@ impl CommandHandler {
             },
         )
         .await?;
+        command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
         retry_tx.commit().await?;
         db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
 
@@ -2381,6 +2677,7 @@ impl CommandHandler {
             run_id,
             stage_id: stage_id.to_string(),
             legacy_discovery_override_id: None,
+            retry_instruction_binding_id,
         })
     }
 

@@ -252,6 +252,11 @@ fn make_agent_execution(
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     }
 }
 
@@ -1449,6 +1454,7 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1525,6 +1531,7 @@ async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no
                 agent_execution_id: None,
                 legacy_discovery_override_policy: Some(LegacyBroadDiscoveryPolicy::WorkflowOptIn),
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1661,6 +1668,7 @@ async fn test_retry_stage_targets_latest_matching_attempt() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1715,6 +1723,7 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1809,6 +1818,7 @@ async fn test_retry_stage_supersedes_workflow_conflict_cursor() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1915,6 +1925,7 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
                 agent_execution_id: Some(failed_lead_id),
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2040,6 +2051,7 @@ async fn test_retry_stage_with_dead_target_generation_falls_back_to_stage_retry(
                 agent_execution_id: Some(failed_lead_id),
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2189,6 +2201,7 @@ async fn test_retry_stage_rejects_active_latest_attempt() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2266,6 +2279,7 @@ agents:
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -2425,6 +2439,7 @@ agents:
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let raw: serde_json::Value =
@@ -2922,6 +2937,7 @@ agents:
             is_pinned: true,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         },
     )
     .await
@@ -5618,6 +5634,7 @@ async fn malformed_implementation_self_assessment_import_persists_invalid_active
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
 
@@ -5726,6 +5743,7 @@ async fn blocked_implementation_assessment_synthesizes_release_hold_review_summa
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let summary = parse_implementation_self_assessment_v2(
@@ -6927,6 +6945,11 @@ sys.exit(0)
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -7062,6 +7085,7 @@ async fn implementation_status_transitions_use_active_contract_summary() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let active_summary = parse_implementation_self_assessment_v2(
@@ -7173,6 +7197,7 @@ async fn implementation_loop_budget_exhaustion_still_allows_complete_exit() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
     let active_summary = parse_implementation_self_assessment_v2(
@@ -7963,6 +7988,7 @@ async fn test_daemon_vs_swift_report_behavioral_parity() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &art).await.unwrap();
     }
@@ -8496,6 +8522,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -8845,6 +8872,7 @@ async fn test_state_11_to_state_12_happy_path() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     db::repos::artifacts::insert(&pool, &git_push_artifact)
         .await
@@ -8911,6 +8939,7 @@ async fn test_state_11_to_state_12_happy_path() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     db::repos::artifacts::insert(&pool, &rbm_artifact)
         .await
@@ -8933,6 +8962,7 @@ async fn test_state_11_to_state_12_happy_path() {
         is_pinned: false,
         report_kind: None,
         report_version: None,
+        agent_execution_id: None,
     };
     db::repos::artifacts::insert(&pool, &cur_artifact)
         .await
@@ -9040,6 +9070,7 @@ async fn test_state_11_to_state_12_happy_path() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         db::repos::artifacts::insert(&pool, &art).await.unwrap();
     }
@@ -9636,6 +9667,373 @@ async fn p017_mediation_record_lifecycle() {
     assert!(
         no_active.is_none(),
         "settled mediation should not be active"
+    );
+}
+
+/// P017 R2 / REL-001: Run cancellation must atomically transition every
+/// active `lead_conflict_mediations` row for the run into `canceled`,
+/// alongside `agent_executions::cancel_running_by_run_tx`.
+///
+/// Without this cascade, a mediation-owned `AgentExecution` ends up
+/// `canceled` while its `LeadConflictMediationRecord` lingers in
+/// `queued` / `running` / `operator_confirmation_required`, splitting
+/// durable mediation truth across two tables and corrupting late-output,
+/// resume, and operator readback semantics.
+#[tokio::test]
+async fn p017_mediation_cancel_run_cascade() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    // ── Arrange: idea + run + mediation-owned AgentExecution + active mediation ──
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+
+    let run_id = RunId::new();
+    let run = make_run(run_id, idea_id, RunStatus::Running);
+    runs::insert(&pool, &run).await.expect("insert run");
+
+    // Mediation-owned execution: stage_execution_id is None (the entire point
+    // of P017's owner-aware model).
+    let mediation_id = "med-cancel-001".to_string();
+    let agent_exec_id = AgentExecutionId::new();
+    let mediation_execution = AgentExecution {
+        id: agent_exec_id,
+        stage_execution_id: None,
+        agent_id: "lead_agent".into(),
+        provider: "claude".into(),
+        model: None,
+        started_at: now,
+        completed_at: None,
+        status: AgentStatus::Running,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: None,
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+        owner_kind: Some("lead_conflict_mediation".into()),
+        owner_id: Some(mediation_id.clone()),
+        lead_mediation_record_id: Some(mediation_id.clone()),
+        origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+    };
+    agent_executions::insert(&pool, &mediation_execution)
+        .await
+        .expect("insert mediation-owned agent_execution");
+
+    // Active mediation in `running` status, linked to the agent_execution.
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: mediation_id.clone(),
+        run_id: run_id.to_string(),
+        conflict_id: "conflict-cancel-001".into(),
+        conflict_fingerprint: "fp-cancel-001".into(),
+        lead_agent_id: "lead_agent".into(),
+        status: domain::mediation::LeadMediationStatus::Running,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: Some("Lead is mediating".into()),
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: Some(agent_exec_id.to_string()),
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert active mediation");
+
+    // ── Act: cancel the run via the canonical settlement entry-point ──
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("begin_settlement");
+
+    // ── Assert: the mediation-owned agent_execution is canceled ──
+    let exec_after = agent_executions::find_by_id(&pool, agent_exec_id)
+        .await
+        .expect("find agent_execution")
+        .expect("agent_execution row");
+    assert_eq!(
+        exec_after.status,
+        AgentStatus::Cancelled,
+        "mediation-owned agent_execution must be cancelled"
+    );
+
+    // ── Assert: the linked mediation record is also canceled ──
+    let mediation_after = db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+        .await
+        .expect("find mediation")
+        .expect("mediation row");
+    assert_eq!(
+        mediation_after.status,
+        domain::mediation::LeadMediationStatus::Canceled,
+        "linked mediation must be cancelled in the same cascade (REL-001)"
+    );
+    assert!(
+        mediation_after.settled_at.is_some(),
+        "cancelled mediation must record settled_at"
+    );
+    assert_eq!(
+        mediation_after.settlement_result.as_deref(),
+        Some("cancelled"),
+        "cascade should record settlement_result=cancelled"
+    );
+    assert_eq!(
+        mediation_after.recovery_action.as_deref(),
+        Some("run_cancelled"),
+        "cascade should record recovery_action=run_cancelled"
+    );
+
+    // ── Assert: idempotency — re-running cancellation is a no-op for the mediation ──
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("idempotent begin_settlement");
+    let mediation_again =
+        db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+            .await
+            .expect("find mediation")
+            .expect("mediation row");
+    assert_eq!(
+        mediation_again.status,
+        domain::mediation::LeadMediationStatus::Canceled,
+        "second cancellation must not change terminal mediation"
+    );
+}
+
+/// P017 R2 / ARCH-001 equivalence proof: prove that the substitute fields
+/// (join via `stage_executions.run_id` for stage-owned executions, join
+/// via `lead_conflict_mediations.run_id` for mediation-owned executions,
+/// and `lead_mediation_record_id` as the stable mediation_owner_token)
+/// behave identically to the literal `run_id` and `mediation_owner_token`
+/// columns the audit named — across cancellation, readback, and
+/// idempotency operations.
+///
+/// See `docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md`
+/// for the full rationale; this test is the executable proof.
+#[tokio::test]
+async fn p017_mediation_execution_fields_equivalence() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    // ── Arrange: idea + run + stage-owned + mediation-owned (attempt 1 + retry) ──
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+    let run_id = RunId::new();
+    let run = make_run(run_id, idea_id, RunStatus::Running);
+    runs::insert(&pool, &run).await.expect("insert run");
+
+    // Stage-owned execution
+    let stage_id = StageExecutionId::new();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running))
+        .await
+        .expect("insert stage");
+    let stage_exec = make_agent_execution(stage_id, AgentStatus::Running);
+    let stage_exec_id = stage_exec.id;
+    agent_executions::insert(&pool, &stage_exec)
+        .await
+        .expect("insert stage exec");
+
+    // Mediation + two mediation-owned executions (an attempt and a retry).
+    let mediation_id = "med-equiv-001".to_string();
+    let mediation = domain::mediation::LeadConflictMediationRecord {
+        id: mediation_id.clone(),
+        run_id: run_id.to_string(),
+        conflict_id: "conflict-equiv-001".into(),
+        conflict_fingerprint: "fp-equiv-001".into(),
+        lead_agent_id: "lead_agent".into(),
+        status: domain::mediation::LeadMediationStatus::Running,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: None,
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    db::repos::lead_conflict_mediations::insert(&pool, &mediation)
+        .await
+        .expect("insert mediation");
+
+    let mut med_exec_one = make_agent_execution(stage_id, AgentStatus::Failed);
+    med_exec_one.stage_execution_id = None;
+    med_exec_one.owner_kind = Some("lead_conflict_mediation".into());
+    med_exec_one.owner_id = Some(mediation_id.clone());
+    med_exec_one.lead_mediation_record_id = Some(mediation_id.clone());
+    med_exec_one.completed_at = Some(now);
+    let med_exec_one_id = med_exec_one.id;
+    agent_executions::insert(&pool, &med_exec_one)
+        .await
+        .expect("insert mediation exec 1");
+
+    let mut med_exec_two = make_agent_execution(stage_id, AgentStatus::Running);
+    med_exec_two.id = AgentExecutionId::new();
+    med_exec_two.stage_execution_id = None;
+    med_exec_two.owner_kind = Some("lead_conflict_mediation".into());
+    med_exec_two.owner_id = Some(mediation_id.clone());
+    med_exec_two.lead_mediation_record_id = Some(mediation_id.clone());
+    med_exec_two.started_at = now + chrono::Duration::seconds(1);
+    let med_exec_two_id = med_exec_two.id;
+    agent_executions::insert(&pool, &med_exec_two)
+        .await
+        .expect("insert mediation exec 2 (retry)");
+
+    // ── Property 1: direct identity ─────────────────────────────────────
+    // For stage-owned execution, run_id is recoverable via stage_executions.
+    let stage_run_id_via_join = sqlx::query_scalar::<_, String>(
+        "SELECT run_id FROM stage_executions WHERE id = ?",
+    )
+    .bind(stage_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query stage run_id");
+    assert_eq!(
+        stage_run_id_via_join,
+        run_id.to_string(),
+        "stage-owned exec: stage_executions.run_id must resolve to the owning run id"
+    );
+
+    // For mediation-owned execution(s), run_id is recoverable via
+    // lead_conflict_mediations.run_id keyed on lead_mediation_record_id.
+    let med_run_id_via_join = sqlx::query_scalar::<_, String>(
+        "SELECT run_id FROM lead_conflict_mediations WHERE id = ?",
+    )
+    .bind(&mediation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query mediation run_id");
+    assert_eq!(
+        med_run_id_via_join,
+        run_id.to_string(),
+        "mediation-owned exec: lead_conflict_mediations.run_id must resolve to the owning run id"
+    );
+
+    // ── Property 2: cancellation cascade visits both owner kinds ────────
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("begin_settlement");
+    for exec_id in [stage_exec_id, med_exec_one_id, med_exec_two_id] {
+        let after = agent_executions::find_by_id(&pool, exec_id)
+            .await
+            .expect("find exec")
+            .expect("exec exists");
+        // Only Running rows are cancelled; Failed terminal rows stay Failed.
+        let exec_was_running = matches!(
+            (exec_id == stage_exec_id, exec_id == med_exec_two_id),
+            (true, _) | (_, true)
+        );
+        if exec_was_running {
+            assert_eq!(
+                after.status,
+                AgentStatus::Cancelled,
+                "running exec {exec_id} must be cancelled by the cascade"
+            );
+        }
+    }
+    let mediation_after =
+        db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+            .await
+            .expect("find mediation")
+            .expect("mediation row")
+            ;
+    assert_eq!(
+        mediation_after.status,
+        domain::mediation::LeadMediationStatus::Canceled,
+        "mediation must be cancelled in same transaction (REL-001 cross-link)"
+    );
+
+    // ── Property 3: readback works for both owner kinds ─────────────────
+    let by_run = agent_executions::list_by_run(&pool, run_id)
+        .await
+        .expect("list_by_run");
+    let by_run_ids: std::collections::HashSet<_> = by_run.iter().map(|e| e.id).collect();
+    for exec_id in [stage_exec_id, med_exec_one_id, med_exec_two_id] {
+        assert!(
+            by_run_ids.contains(&exec_id),
+            "list_by_run must include {exec_id} regardless of owner kind"
+        );
+    }
+
+    // list_by_mediation_id returns only the mediation-owned rows ordered
+    // by started_at ASC. Both share the same lead_mediation_record_id
+    // (the mediation_owner_token equivalent).
+    let by_mediation = db::repos::agent_executions::list_by_mediation_id(&pool, &mediation_id)
+        .await
+        .expect("list_by_mediation_id");
+    assert_eq!(
+        by_mediation.len(),
+        2,
+        "list_by_mediation_id must return only the mediation-owned rows"
+    );
+    assert_eq!(
+        by_mediation[0].id, med_exec_one_id,
+        "ordered by started_at ASC: attempt 1 first"
+    );
+    assert_eq!(
+        by_mediation[1].id, med_exec_two_id,
+        "ordered by started_at ASC: attempt 2 (retry) second"
+    );
+    for exec in &by_mediation {
+        assert_eq!(
+            exec.lead_mediation_record_id.as_deref(),
+            Some(mediation_id.as_str()),
+            "lead_mediation_record_id is the stable mediation_owner_token across attempts"
+        );
+    }
+
+    // ── Property 4: idempotency — second cancel is a no-op ──────────────
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("idempotent cancel");
+    let mediation_again = db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+        .await
+        .expect("find mediation")
+        .expect("mediation row");
+    assert_eq!(
+        mediation_again.status,
+        domain::mediation::LeadMediationStatus::Canceled,
+        "second cancel must not change terminal mediation"
+    );
+    assert_eq!(
+        mediation_again.settled_at, mediation_after.settled_at,
+        "settled_at must not be overwritten on idempotent re-cancel"
     );
 }
 

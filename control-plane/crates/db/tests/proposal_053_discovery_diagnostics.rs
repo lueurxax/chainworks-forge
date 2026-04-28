@@ -109,7 +109,7 @@ async fn seed_execution(pool: &sqlx::SqlitePool) -> (RunId, AgentExecutionId) {
         pool,
         &AgentExecution {
             id: agent_execution_id,
-            stage_execution_id,
+            stage_execution_id: Some(stage_execution_id),
             agent_id: "code_writer".into(),
             provider: "claude".into(),
             model: Some("sonnet".into()),
@@ -140,6 +140,11 @@ async fn seed_execution(pool: &sqlx::SqlitePool) -> (RunId, AgentExecutionId) {
             owner_id: None,
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await

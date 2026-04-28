@@ -454,6 +454,13 @@ PROPOSAL_061_TESTS=(
   "stale_unreferenced_acp_home_is_removed"
 )
 
+PROPOSAL_065_TESTS=(
+  "domain retry_instruction"
+  "engine command_journal_redact"
+  "engine proposal_065_operator_retry_instruction"
+  "mcp-server tools::stages"
+)
+
 PROPOSAL_029_MCP_TESTS=(
   # Principal table bootstrap (auth/tests/principals_bootstrap.rs)
   "auth test_principals_file_created_with_owner_only_permissions"
@@ -1665,6 +1672,8 @@ Available gates:
   proposal-060-calibration|p060-calibration
                   Proposal 060 routing calibration control artifact gate
   proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
+  proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
+  proposal-065|p065  Proposal 065 operator retry instruction contract gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -1874,6 +1883,133 @@ PY
       cargo test -p engine proposal_017_ -- --test-threads=1 --nocapture
       cargo test -p engine p017_mediation_ -- --test-threads=1 --nocapture
     )
+
+    # P017 R2 audit closures: REL-001 (cancel-cascade) + API-001
+    # (execution_attempts readback). These checks fail the gate if the
+    # specific tests that prove the closure are absent. They are the
+    # canonical readiness signals the audit asked for under READY-001.
+    log "Verifying P017 R2 audit closure tests are present..."
+    REL_001_TEST="p017_mediation_cancel_run_cascade"
+    API_001_MCP_TEST="proposal_017_workflow_conflict_lead_mediation_execution_attempts"
+    API_001_GQL_TEST="proposal_017_run_query_exposes_lead_mediation_execution_attempts"
+    if ! grep -q "$REL_001_TEST" "$ROOT_DIR/control-plane/crates/engine/tests/integration.rs"; then
+      die "P017 REL-001 closure missing: expected test $REL_001_TEST in engine integration tests"
+    fi
+    if ! grep -q "$API_001_MCP_TEST" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 API-001 closure missing: expected MCP test $API_001_MCP_TEST"
+    fi
+    if ! grep -q "$API_001_GQL_TEST" "$ROOT_DIR/control-plane/crates/graphql-server/src/schema.rs"; then
+      die "P017 API-001 closure missing: expected GraphQL test $API_001_GQL_TEST"
+    fi
+    # Also assert the source-level contracts: execution_attempts must be
+    # named in both readback projections (catches accidental removal even
+    # if a copycat test still passes).
+    if ! grep -q "execution_attempts" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 API-001: MCP lead_mediation_readback_json missing 'execution_attempts'"
+    fi
+    if ! grep -q "execution_attempts" "$ROOT_DIR/control-plane/crates/graphql-server/src/types/run.rs"; then
+      die "P017 API-001: GraphQL GqlLeadMediation missing 'execution_attempts'"
+    fi
+    if ! grep -q "cancel_active_by_run_tx" "$ROOT_DIR/control-plane/crates/engine/src/cancellation.rs"; then
+      die "P017 REL-001: cancellation.rs does not invoke cancel_active_by_run_tx for lead_conflict_mediations"
+    fi
+
+    # ARCH-001: equivalence record + proof test must both be present.
+    ARCH_001_DOC="docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md"
+    ARCH_001_TEST="p017_mediation_execution_fields_equivalence"
+    if [[ ! -f "$ROOT_DIR/$ARCH_001_DOC" ]]; then
+      die "P017 ARCH-001: missing equivalence record at $ARCH_001_DOC"
+    fi
+    if ! grep -q "$ARCH_001_TEST" "$ROOT_DIR/control-plane/crates/engine/tests/integration.rs"; then
+      die "P017 ARCH-001: missing equivalence proof test $ARCH_001_TEST"
+    fi
+
+    # OPS-001: every committed P017 metric name must have at least one
+    # production caller (not just the existing tx-helper) AND a unit test
+    # that proves it inserts a metric_event row with the right labels.
+    OPS_001_PHASE_C_TEST="p017_phase_c_validation_outcome_metric_emits"
+    OPS_001_ATTEMPT_TEST="p017_lead_mediation_attempt_metric_emits"
+    OPS_001_EXTERNAL_TEST="p017_external_catalog_warning_metric_emits"
+    OPS_001_DB_PATH="$ROOT_DIR/control-plane/crates/db/tests/proposal_017_workflow_conflict_persistence.rs"
+    for t in "$OPS_001_PHASE_C_TEST" "$OPS_001_ATTEMPT_TEST" "$OPS_001_EXTERNAL_TEST"; do
+      if ! grep -q "$t" "$OPS_001_DB_PATH"; then
+        die "P017 OPS-001: missing metric emit test $t in $OPS_001_DB_PATH"
+      fi
+    done
+    # Production caller presence: all three helpers must be invoked outside
+    # the helper definition itself (so the metric actually fires in real runs).
+    if ! grep -q "record_phase_c_validation_outcome_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 OPS-001: phase_c_validation_outcome_total has no production caller in command_handler.rs"
+    fi
+    if ! grep -q "record_lead_mediation_attempt_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 OPS-001: lead_mediation_attempt_total has no production caller in executor.rs"
+    fi
+    if ! grep -q "record_external_catalog_warning_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 OPS-001: external_catalog_warning_total has no production caller in command_handler.rs"
+    fi
+
+    # ── R4 closure guards (API-002 + OPS-002) ──────────────────────────
+    # API-002: per-attempt cost + transcript_ref populated by executor.
+    if ! grep -q "update_attempt_attribution" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R4 API-002: executor must call update_attempt_attribution for mediation completions"
+    fi
+    if ! grep -q "p017_per_attempt_cost_and_transcript_persisted" \
+        "$ROOT_DIR/control-plane/crates/db/tests/proposal_017_workflow_conflict_persistence.rs"; then
+      die "P017 R4 API-002: missing per-attempt cost+transcript persistence test"
+    fi
+    P017_R4_MIGRATION="$ROOT_DIR/control-plane/crates/db/migrations/031_p017_metric_inventory_and_attempt_attribution.sql"
+    if [[ ! -f "$P017_R4_MIGRATION" ]]; then
+      die "P017 R4 API-002/OPS-002: missing migration 031_p017_metric_inventory_and_attempt_attribution.sql"
+    fi
+    for col in transcript_artifact_id total_cost_cents input_tokens output_tokens; do
+      if ! grep -q "$col" "$P017_R4_MIGRATION"; then
+        die "P017 R4 API-002: migration 031 must add $col column"
+      fi
+    done
+
+    # OPS-002: 6 new metric helpers (5 audit-named + Phase C fail path).
+    P017_R4_HELPERS=(
+      "record_phase_c_validation_failure_tx"
+      "record_duplicate_mediation_session_tx"
+      "record_report_readback_completeness_tx"
+      "record_phase_c_lead_inventory_external_catalog_tx"
+      "record_mediation_late_output_ignored_tx"
+      "record_mediation_retry_budget_exhausted_tx"
+    )
+    for h in "${P017_R4_HELPERS[@]}"; do
+      if ! grep -q "$h" "$ROOT_DIR/control-plane/crates/db/src/repos/workflow_conflicts.rs"; then
+        die "P017 R4 OPS-002: missing helper $h in workflow_conflicts.rs"
+      fi
+    done
+    P017_R4_TESTS=(
+      "p017_phase_c_validation_failure_metric_emits_without_run"
+      "p017_duplicate_mediation_session_metric_emits"
+      "p017_report_readback_completeness_metric_emits"
+      "p017_phase_c_lead_inventory_external_catalog_metric_emits"
+      "p017_mediation_late_output_ignored_metric_emits"
+    )
+    for t in "${P017_R4_TESTS[@]}"; do
+      if ! grep -q "$t" "$OPS_001_DB_PATH"; then
+        die "P017 R4 OPS-002: missing metric emit test $t"
+      fi
+    done
+    # Production callers for the new emissions.
+    if ! grep -q "record_phase_c_validation_failure" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R4 OPS-002: phase_c_validation_outcome_total fail path has no production caller"
+    fi
+    if ! grep -q "record_phase_c_lead_inventory_external_catalog_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R4 OPS-002: phase_c_lead_inventory_external_catalog_total has no production caller"
+    fi
+    if ! grep -q "record_duplicate_mediation_session_tx" "$ROOT_DIR/control-plane/crates/engine/src/orchestrator.rs"; then
+      die "P017 R4 OPS-002: duplicate_mediation_session_total has no production caller"
+    fi
+    if ! grep -q "record_report_readback_completeness_tx" "$ROOT_DIR/control-plane/crates/mcp-server/src/tools/reports.rs"; then
+      die "P017 R4 OPS-002: report_readback_completeness has no production caller"
+    fi
+    if ! grep -q "record_mediation_late_output_ignored_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R4 OPS-002: mediation_late_output_ignored_total has no production caller"
+    fi
+
     log "Proposal 017 gate passed"
     ;;
   proposal-018|p018)
@@ -2868,6 +3004,69 @@ PY
       cargo test -p mcp-server proposal_061 -- --nocapture
     )
     log "Proposal 061 control-plane gate passed"
+    ;;
+  proposal-064|p064)
+    log "Proposal 064 Phase 0 gate: main-sync and knowledge readback contracts"
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+required = {
+    "docs/proposals/064-control-artifacts/dogfood-baseline-20260421.v1.json": "p064_dogfood_baseline_v1",
+    "docs/proposals/064-control-artifacts/phase-0-kickoff.v1.json": "p064_phase_0_kickoff_v1",
+}
+for rel, schema in required.items():
+    path = root / rel
+    if not path.exists():
+        raise SystemExit(f"proposal-064: missing {rel}")
+    data = json.loads(path.read_text())
+    if data.get("schema_version") != schema:
+        raise SystemExit(f"proposal-064: {rel} schema_version must be {schema}")
+    if data.get("status") != "recorded":
+        raise SystemExit(f"proposal-064: {rel} status must be recorded")
+
+migration = (root / "control-plane/crates/db/migrations/033_p064_main_sync_and_knowledge_capsules.sql").read_text()
+for needle in [
+    "main_sync_attempts",
+    "worktree_mutation_barriers",
+    "run_knowledge_capsules",
+    "run_knowledge_capsule_attachments",
+    "ALTER TABLE work_items ADD COLUMN worktree_access_mode",
+    "ALTER TABLE background_leases ADD COLUMN worktree_resource_key",
+    "idx_background_leases_worktree_owner",
+]:
+    if needle not in migration:
+        raise SystemExit(f"proposal-064: migration missing {needle}")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      export CARGO_TARGET_DIR=target/proposal-064-gate
+      export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+      cargo test -p domain main_sync -- --nocapture &&
+      cargo test -p engine main_sync_fixtures -- --nocapture &&
+      cargo test -p mcp-server p064_operator_tools_are_registered_but_hidden_until_modes_enable_runtime -- --nocapture &&
+      cargo test -p mcp-server test_mcp_tools_call_denied_returns_method_not_found -- --nocapture &&
+      cargo test -p graphql-server proposal_064_run_query_exposes_sync_and_capsule_readback -- --nocapture
+    )
+    log "Proposal 064 Phase 0 gate passed"
+    ;;
+  proposal-065|p065)
+    log "Proposal 065 control-plane gate: operator retry instruction contract"
+    (
+      cd "$ROOT_DIR/control-plane"
+      # R11 speed-up: per-crate batching
+      for spec in "${PROPOSAL_065_TESTS[@]}"; do
+        crate="${spec%% *}"
+        test_name="${spec#* }"
+        log "proposal-065: focused crate=$crate test=$test_name"
+        if ! cargo test -p "$crate" "$test_name" -- --nocapture; then
+          echo "proposal-065: FAIL — $crate::$test_name returned a non-zero exit"
+          exit 1
+        fi
+      done
+    )
+    log "Proposal 065 control-plane gate passed"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"

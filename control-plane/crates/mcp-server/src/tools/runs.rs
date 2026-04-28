@@ -2,7 +2,12 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::{artifact_contracts, legacy_discovery_overrides, projections, runs};
-use domain::commands::{CancelRunCmd, Command, StartRunCmd};
+use domain::commands::{
+    CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
+    MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
+    MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
+    StartRunCmd,
+};
 use domain::ids::{IdeaId, RunId};
 use engine::command_handler::CommandHandler;
 
@@ -56,6 +61,103 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "required": ["run_id"],
                 "properties": {
                     "run_id": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.main_sync.request".to_string(),
+            description: "Queue or dedupe a main-sync request for a run".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "trigger_reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "trigger_reason": {
+                        "type": "string",
+                        "enum": [
+                            "before_initial_implementation",
+                            "before_retry",
+                            "before_review",
+                            "operator_request",
+                            "before_final_approval",
+                            "startup_repair"
+                        ]
+                    },
+                    "idempotency_key": { "type": "string" },
+                    "requested_by_stage_id": { "type": "string" },
+                    "requested_by_work_item_id": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.main_sync.retry".to_string(),
+            description: "Retry a previously failed or blocked main-sync request".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "idempotency_key": { "type": "string" },
+                    "failed_attempt_id": { "type": "string" },
+                    "reason": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.main_sync.set_override".to_string(),
+            description: "Set the per-run main-sync mode override".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "mode", "reason"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["off", "dry_run", "manual_only", "automatic"]
+                    },
+                    "reason": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.main_sync.repair_state".to_string(),
+            description: "Reconcile a run stuck in main-sync recovery".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "attempt_id": { "type": "string" },
+                    "recovery_note": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.main_sync.record_recovery_decision".to_string(),
+            description: "Record an operator recovery decision for main-sync".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "decision", "summary"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["retry_sync", "mark_recovered", "escalate"]
+                    },
+                    "summary": { "type": "string" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.knowledge_capsule.ignore".to_string(),
+            description: "Ignore a matched knowledge capsule for the current run".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "capsule_id", "reason"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "capsule_id": { "type": "string" },
+                    "reason": { "type": "string" }
                 }
             }),
         },
@@ -212,7 +314,210 @@ pub async fn execute(
             }))
         }
 
+        "runs.main_sync.request" => {
+            let run_id = parse_run_id(&params)?;
+            let trigger_reason = parse_main_sync_trigger_reason(
+                params["trigger_reason"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'trigger_reason'"))?,
+            )?;
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(&principal.id, &principal.class, "runs.main_sync.request");
+            cmd_handler
+                .handle(
+                    Command::MainSyncRequest(MainSyncRequestCmd {
+                        run_id,
+                        trigger_reason,
+                        idempotency_key,
+                        requested_by_stage_id: params["requested_by_stage_id"]
+                            .as_str()
+                            .map(String::from),
+                        requested_by_work_item_id: params["requested_by_work_item_id"]
+                            .as_str()
+                            .map(String::from),
+                    }),
+                    caller,
+                )
+                .await?;
+            unreachable!("MainSyncRequest is contract-only and should not return success yet");
+        }
+
+        "runs.main_sync.retry" => {
+            let run_id = parse_run_id(&params)?;
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(&principal.id, &principal.class, "runs.main_sync.retry");
+            cmd_handler
+                .handle(
+                    Command::MainSyncRetry(MainSyncRetryCmd {
+                        run_id,
+                        idempotency_key,
+                        failed_attempt_id: params["failed_attempt_id"].as_str().map(String::from),
+                        reason: params["reason"].as_str().map(String::from),
+                    }),
+                    caller,
+                )
+                .await?;
+            unreachable!("MainSyncRetry is contract-only and should not return success yet");
+        }
+
+        "runs.main_sync.set_override" => {
+            let run_id = parse_run_id(&params)?;
+            let mode = parse_main_sync_mode(
+                params["mode"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'mode'"))?,
+            )?;
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let caller = mcp_caller(
+                &principal.id,
+                &principal.class,
+                "runs.main_sync.set_override",
+            );
+            cmd_handler
+                .handle(
+                    Command::MainSyncSetRunOverride(MainSyncSetRunOverrideCmd {
+                        run_id,
+                        mode,
+                        reason,
+                    }),
+                    caller,
+                )
+                .await?;
+            unreachable!(
+                "MainSyncSetRunOverride is contract-only and should not return success yet"
+            );
+        }
+
+        "runs.main_sync.repair_state" => {
+            let run_id = parse_run_id(&params)?;
+            let caller = mcp_caller(
+                &principal.id,
+                &principal.class,
+                "runs.main_sync.repair_state",
+            );
+            cmd_handler
+                .handle(
+                    Command::MainSyncRepairState(MainSyncRepairStateCmd {
+                        run_id,
+                        attempt_id: params["attempt_id"].as_str().map(String::from),
+                        recovery_note: params["recovery_note"].as_str().map(String::from),
+                    }),
+                    caller,
+                )
+                .await?;
+            unreachable!("MainSyncRepairState is contract-only and should not return success yet");
+        }
+
+        "runs.main_sync.record_recovery_decision" => {
+            let run_id = parse_run_id(&params)?;
+            let decision = parse_main_sync_recovery_decision(
+                params["decision"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?,
+            )?;
+            let summary = params["summary"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'summary'"))?
+                .to_string();
+            let caller = mcp_caller(
+                &principal.id,
+                &principal.class,
+                "runs.main_sync.record_recovery_decision",
+            );
+            cmd_handler
+                .handle(
+                    Command::MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd {
+                        run_id,
+                        decision,
+                        summary,
+                    }),
+                    caller,
+                )
+                .await?;
+            unreachable!(
+                "MainSyncRecordRecoveryDecision is contract-only and should not return success yet"
+            );
+        }
+
+        "runs.knowledge_capsule.ignore" => {
+            let run_id = parse_run_id(&params)?;
+            let capsule_id = params["capsule_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'capsule_id'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let caller = mcp_caller(
+                &principal.id,
+                &principal.class,
+                "runs.knowledge_capsule.ignore",
+            );
+            cmd_handler
+                .handle(
+                    Command::KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd {
+                        run_id,
+                        capsule_id,
+                        reason,
+                    }),
+                    caller,
+                )
+                .await?;
+            unreachable!(
+                "KnowledgeCapsuleIgnore is contract-only and should not return success yet"
+            );
+        }
+
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+    }
+}
+
+fn parse_run_id(params: &serde_json::Value) -> Result<RunId> {
+    params["run_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+        .parse()
+        .map_err(Into::into)
+}
+
+fn parse_main_sync_trigger_reason(value: &str) -> Result<MainSyncTriggerReason> {
+    match value {
+        "before_initial_implementation" => Ok(MainSyncTriggerReason::BeforeInitialImplementation),
+        "before_retry" => Ok(MainSyncTriggerReason::BeforeRetry),
+        "before_review" => Ok(MainSyncTriggerReason::BeforeReview),
+        "operator_request" => Ok(MainSyncTriggerReason::OperatorRequest),
+        "before_final_approval" => Ok(MainSyncTriggerReason::BeforeFinalApproval),
+        "startup_repair" => Ok(MainSyncTriggerReason::StartupRepair),
+        _ => anyhow::bail!("unknown trigger_reason: {value}"),
+    }
+}
+
+fn parse_main_sync_mode(value: &str) -> Result<MainSyncMode> {
+    match value {
+        "off" => Ok(MainSyncMode::Off),
+        "dry_run" => Ok(MainSyncMode::DryRun),
+        "manual_only" => Ok(MainSyncMode::ManualOnly),
+        "automatic" => Ok(MainSyncMode::Automatic),
+        _ => anyhow::bail!("unknown main_sync mode: {value}"),
+    }
+}
+
+fn parse_main_sync_recovery_decision(value: &str) -> Result<MainSyncRecoveryDecision> {
+    match value {
+        "retry_sync" => Ok(MainSyncRecoveryDecision::RetrySync),
+        "mark_recovered" => Ok(MainSyncRecoveryDecision::MarkRecovered),
+        "escalate" => Ok(MainSyncRecoveryDecision::Escalate),
+        _ => anyhow::bail!("unknown recovery decision: {value}"),
     }
 }
 
@@ -368,6 +673,7 @@ mod tests {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(pool, &artifact).await.unwrap();
         let raw = serde_json::json!({
@@ -637,6 +943,22 @@ mod tests {
         assert_eq!(
             item["implementation_self_assessment_summary"]["status"],
             serde_json::json!("blocked")
+        );
+    }
+
+    #[test]
+    fn proposal_064_parsers_accept_frozen_contract_values() {
+        assert_eq!(
+            parse_main_sync_trigger_reason("before_review").unwrap(),
+            MainSyncTriggerReason::BeforeReview
+        );
+        assert_eq!(
+            parse_main_sync_mode("manual_only").unwrap(),
+            MainSyncMode::ManualOnly
+        );
+        assert_eq!(
+            parse_main_sync_recovery_decision("retry_sync").unwrap(),
+            MainSyncRecoveryDecision::RetrySync
         );
     }
 }

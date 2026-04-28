@@ -531,6 +531,11 @@ async fn claim_invoke_agent_work_item_with_start(
             owner_id: Some(stage_execution_id.to_string()),
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await?;
@@ -3238,6 +3243,14 @@ impl BackgroundExecutor {
                         },
                         lead_mediation_record_id: mediation_record_id.clone(),
                         origin_stage_execution_id: origin_stage_execution_id.clone(),
+                        // P017 R4 / API-002: cost & transcript filled in by
+                        // update_attempt_attribution_tx after the provider
+                        // returns; insertion-time row holds None.
+                        total_cost_cents: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                        transcript_artifact_id: None,
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
                 }
@@ -3726,6 +3739,23 @@ impl BackgroundExecutor {
                         completed_at,
                     )
                     .await?;
+                    // OPS-002 (P017 R4): emit mediation_late_output_ignored_total
+                    // per ignored late output so dashboards can detect
+                    // unexpected provider lag against superseded/canceled
+                    // mediations.
+                    if let Some(ref med_id) = mediation_record_id {
+                        let mut metric_tx = self.pool.begin().await?;
+                        let _ = db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
+                            &mut metric_tx,
+                            &run_id.to_string(),
+                            None,
+                            med_id,
+                            "mediation_terminal_or_missing",
+                            completed_at,
+                        )
+                        .await;
+                        let _ = metric_tx.commit().await;
+                    }
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     return Ok(());
                 }
@@ -3787,6 +3817,23 @@ impl BackgroundExecutor {
                         completed_at,
                     )
                     .await?;
+                    // OPS-002 (P017 R4): emit mediation_late_output_ignored_total
+                    // per ignored late output so dashboards can detect
+                    // unexpected provider lag against superseded/canceled
+                    // mediations.
+                    if let Some(ref med_id) = mediation_record_id {
+                        let mut metric_tx = self.pool.begin().await?;
+                        let _ = db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
+                            &mut metric_tx,
+                            &run_id.to_string(),
+                            None,
+                            med_id,
+                            "mediation_terminal_or_missing",
+                            completed_at,
+                        )
+                        .await;
+                        let _ = metric_tx.commit().await;
+                    }
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
                     return Ok(());
                 }
@@ -4077,13 +4124,68 @@ impl BackgroundExecutor {
 
                 let completed_at = chrono::Utc::now();
                 if is_mediation_owned {
-                    agent_executions::update_completed(
+                    // P017 R5 / REL-002: completion + attribution +
+                    // transcript persistence are now atomic in a single
+                    // transaction. Either the entire mediation
+                    // completion lands (with cost, transcript, and
+                    // attempt attribution intact) or none of it does
+                    // and the orchestrator can re-drive the work item.
+                    //
+                    // The transcript artifact must be persisted to disk
+                    // BEFORE the tx (filesystem write is not
+                    // transactional), but the artifact row insert + the
+                    // agent_execution status update + the attribution
+                    // write are bundled into one tx so a partial state
+                    // is impossible.
+                    let mediation_transcript_artifact = self
+                        .persist_transcript_artifact_if_present(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            agent_exec_id,
+                            completed_at,
+                            result.transcript_text.as_deref(),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                    let mediation_transcript_artifact_id = mediation_transcript_artifact
+                        .as_ref()
+                        .map(|artifact| artifact.id.to_string());
+                    let usage_cost_cents = result
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.cost_cents)
+                        .or(result.cost_cents);
+                    let usage_input_tokens = result.usage.as_ref().and_then(|u| u.input_tokens);
+                    let usage_output_tokens = result.usage.as_ref().and_then(|u| u.output_tokens);
+                    let usage_cached_input_tokens =
+                        result.usage.as_ref().and_then(|u| u.cached_input_tokens);
+                    let mut completion_tx = db::pool::begin_immediate_with_retry(
                         &self.pool,
+                        "mediation.complete_with_attribution",
+                    )
+                    .await?;
+                    agent_executions::update_completed_tx(
+                        &mut completion_tx,
                         agent_exec_id,
                         result.status.clone(),
                         completed_at,
                     )
                     .await?;
+                    agent_executions::update_attempt_attribution_tx(
+                        &mut completion_tx,
+                        agent_exec_id,
+                        usage_cost_cents,
+                        usage_input_tokens,
+                        usage_output_tokens,
+                        usage_cached_input_tokens,
+                        mediation_transcript_artifact_id.as_deref(),
+                    )
+                    .await?;
+                    completion_tx.commit().await?;
                     if let Some(med_id) = mediation_record_id.as_deref() {
                         let mut tx = db::pool::begin_immediate_with_retry(
                             &self.pool,
@@ -4266,6 +4368,58 @@ impl BackgroundExecutor {
                                     .await?;
                                 }
                             }
+
+                            // OPS-001 (P017 R2 audit): emit one
+                            // `lead_mediation_attempt_total` per mediation-owned
+                            // execution completion, labeled by per-attempt result.
+                            // Attempt number is the durable count of mediation-owned
+                            // executions for this mediation observed before this row
+                            // was committed (so this completion is attempt N+1).
+                            let attempt_number = sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM agent_executions
+                                 WHERE owner_kind = 'lead_conflict_mediation'
+                                   AND lead_mediation_record_id = ?",
+                            )
+                            .bind(med_id)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .unwrap_or(1);
+                            let attempt_result = match result.status {
+                                AgentStatus::Completed => {
+                                    // Distinguishing happy path vs validation failure
+                                    // requires re-reading the just-written status.
+                                    match db::repos::lead_conflict_mediations::find_by_id_tx(
+                                        &mut tx, med_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(med)) => match med.settlement_result.as_deref() {
+                                            Some("lead_output_validation_failed") => {
+                                                "lead_output_validation_failed"
+                                            }
+                                            Some("lead_output_validated") => {
+                                                "validated_awaiting_confirmation"
+                                            }
+                                            _ => "other",
+                                        },
+                                        _ => "other",
+                                    }
+                                }
+                                AgentStatus::Failed => "agent_failed",
+                                AgentStatus::Cancelled => "cancelled",
+                                _ => "other",
+                            };
+                            let _ = db::repos::workflow_conflicts::record_lead_mediation_attempt_tx(
+                                &mut tx,
+                                &mediation.run_id,
+                                Some(&mediation.conflict_id),
+                                med_id,
+                                &mediation.lead_agent_id,
+                                attempt_result,
+                                attempt_number,
+                                completed_at,
+                            )
+                            .await;
                         }
                         tx.commit().await?;
                     }
@@ -4316,7 +4470,7 @@ impl BackgroundExecutor {
                 if let Some(artifact) = transcript_artifact {
                     persisted_artifacts.push(artifact);
                 }
-                let declared_artifacts = self.prepare_declared_output_artifacts(
+                let mut declared_artifacts = self.prepare_declared_output_artifacts(
                     &declared_outputs,
                     declared_output_settlement
                         .as_ref()
@@ -4329,6 +4483,15 @@ impl BackgroundExecutor {
                     completed_at,
                     &mut persisted_paths,
                 )?;
+                // P017 R5 / API-003: stamp the direct execution-attempt FK
+                // on every declared output artifact so MCP/GraphQL
+                // `execution_attempts.artifacts` can attribute outputs
+                // per attempt without falling back to `agent_id`
+                // correlation. Required for cross-retry isolation under
+                // mediation-owned executions; harmless for stage-owned.
+                for artifact in declared_artifacts.iter_mut() {
+                    artifact.agent_execution_id = Some(agent_exec_id.to_string());
+                }
                 persisted_artifacts.extend(declared_artifacts.clone());
 
                 let undeclared_artifacts = self
@@ -5433,6 +5596,7 @@ impl BackgroundExecutor {
                 is_pinned: false,
                 report_kind: None,
                 report_version: None,
+                agent_execution_id: None,
             };
             artifacts::insert(&self.pool, &artifact).await?;
             let _ = self
@@ -5504,6 +5668,11 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: Some("agent_transcript".to_string()),
             report_version: Some(1),
+            // P017 R5 / API-003: stamp the direct execution-attempt FK
+            // so MCP/GraphQL `execution_attempts.artifacts` can attribute
+            // this transcript to the exact attempt that produced it
+            // (cross-retry isolation).
+            agent_execution_id: Some(agent_execution_id.to_string()),
         };
         artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
@@ -5596,6 +5765,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: report_kind.map(str::to_string),
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         if domain::artifact_contracts::known_contract_id(contract_id) {
@@ -5666,6 +5836,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: report_kind.map(str::to_string),
             report_version: None,
+            agent_execution_id: None,
         };
         Ok(Some(artifact))
     }
@@ -5747,6 +5918,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: Some("session_checkpoint".into()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
@@ -5802,6 +5974,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: Some("validation_failure".to_string()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         validation::insert(&self.pool, &record).await?;
@@ -5871,6 +6044,7 @@ impl BackgroundExecutor {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         let _ = self

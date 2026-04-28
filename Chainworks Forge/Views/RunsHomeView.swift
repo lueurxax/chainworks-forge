@@ -180,6 +180,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadRunDetailAction: @Sendable (String, P031FreshnessSnapshot) async -> P031RunDetailPresentation
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
+    private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
     private let restartDaemonAction: @MainActor @Sendable () async -> String?
     private let bundledDaemonBuildSHAAction: @Sendable () -> String?
 
@@ -189,6 +190,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private var runDetailFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var approvalFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var daemonFreshness = P031FreshnessSnapshot(state: .refreshing)
+    private var runStatusSubscriptionTask: Task<Void, Never>?
+    private var subscribedRunID: String?
 
     var canCopyWritePathGuideReference: Bool {
         writePathGuideReference != nil
@@ -246,6 +249,17 @@ final class P031ThinReadDashboardModel: ObservableObject {
         loadDaemonLifecycleAction = { currentFreshness in
             await coordinator.loadDaemonLifecycle(currentFreshness: currentFreshness)
         }
+        let subscriptionCoordinator = P031ThinWorkflowSubscriptionCoordinator(store: coordinator.store)
+        subscribeRunStatusAction = { runID, currentFreshness in
+            try subscriptionCoordinator.runStatusPresentations(
+                runID: runID,
+                currentFreshness: currentFreshness
+            )
+        }
+    }
+
+    deinit {
+        runStatusSubscriptionTask?.cancel()
     }
 
     static func bootstrap() -> P031ThinReadDashboardModel {
@@ -295,18 +309,22 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let availableRunIDs = runsPresentation.rows.map { $0.runID }
         if let selectedRunID, availableRunIDs.contains(selectedRunID) {
             await loadRunDetail(for: selectedRunID)
+            startRunStatusSubscription(for: selectedRunID)
         } else if let firstRunID = availableRunIDs.first {
             selectedRunID = firstRunID
             await loadRunDetail(for: firstRunID)
+            startRunStatusSubscription(for: firstRunID)
         } else {
             selectedRunID = nil
             runDetail = nil
+            stopRunStatusSubscription()
         }
     }
 
     func selectRun(_ runID: String) {
         guard selectedRunID != runID else { return }
         selectedRunID = runID
+        startRunStatusSubscription(for: runID)
         Task { await loadRunDetail(for: runID) }
     }
 
@@ -346,6 +364,53 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
         runDetail = presentation
+    }
+
+    private func startRunStatusSubscription(for runID: String) {
+        guard subscribedRunID != runID else { return }
+        runStatusSubscriptionTask?.cancel()
+        subscribedRunID = runID
+        let freshness = runDetailFreshness
+        runStatusSubscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let stream = try self.subscribeRunStatusAction(runID, freshness)
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    await self.refreshSelectedRunAfterSubscriptionEvent(runID: event.runID)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                await self.refreshSelectedRunAfterSubscriptionEvent(runID: runID)
+            }
+        }
+    }
+
+    private func stopRunStatusSubscription() {
+        runStatusSubscriptionTask?.cancel()
+        runStatusSubscriptionTask = nil
+        subscribedRunID = nil
+    }
+
+    private func refreshSelectedRunAfterSubscriptionEvent(runID: String) async {
+        guard selectedRunID == runID else { return }
+
+        async let runsTask = loadRunsHomeAction(runsFreshness, !orientationDismissed)
+        async let approvalsTask = loadApprovalInboxAction(approvalFreshness)
+        async let detailTask = loadRunDetailAction(runID, runDetailFreshness)
+
+        let runsPresentation = await runsTask
+        let approvalsPresentation = await approvalsTask
+        let detailPresentation = await detailTask
+
+        guard selectedRunID == runID else { return }
+        runsFreshness = runsPresentation.freshness
+        approvalFreshness = approvalsPresentation.freshness
+        runDetailFreshness = detailPresentation.freshness
+        runsHome = runsPresentation
+        approvalInbox = approvalsPresentation
+        runDetail = detailPresentation
     }
 
     private static func restartPackagedDaemon() async -> String? {

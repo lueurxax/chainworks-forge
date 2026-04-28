@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
@@ -18,7 +18,9 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
                 actual_xcode_runtime_observation_json,
                 mcp_session_startup_latency_ms,
-                owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id"#;
+                owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id,
+                total_cost_cents, input_tokens, output_tokens, cached_input_tokens,
+                transcript_artifact_id"#;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningAgentExecution {
@@ -392,6 +394,33 @@ pub async fn list_by_run_tx(
     rows.iter().map(parse_agent_execution_row).collect()
 }
 
+/// List every `agent_executions` row owned by the given mediation record,
+/// ordered by `started_at` ASC (so callers can index attempts as 1..N).
+///
+/// API-001 (P017 R2 audit): the workflow-conflict mediation readback must
+/// expose conflict-scoped execution attempts. This focused query avoids
+/// the joinful `list_by_run` and returns only mediation-owned rows for a
+/// single mediation, letting MCP/GraphQL build `execution_attempts`
+/// without scanning the whole run.
+pub async fn list_by_mediation_id(
+    pool: &SqlitePool,
+    mediation_id: &str,
+) -> Result<Vec<AgentExecution>> {
+    let query = format!(
+        "SELECT {SELECT_COLS}
+         FROM agent_executions
+         WHERE owner_kind = 'lead_conflict_mediation'
+           AND lead_mediation_record_id = ?
+         ORDER BY started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(mediation_id)
+        .fetch_all(pool)
+        .await
+        .context("list agent_executions by mediation_id")?;
+    rows.iter().map(parse_agent_execution_row).collect()
+}
+
 pub async fn cancel_running_by_run(
     pool: &SqlitePool,
     run_id: RunId,
@@ -579,5 +608,74 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         owner_id: row.get("owner_id"),
         lead_mediation_record_id: row.get("lead_mediation_record_id"),
         origin_stage_execution_id: row.get("origin_stage_execution_id"),
+        // P017 R4 / API-002: per-attempt cost & transcript attribution.
+        // Migration 031 added these columns NULLABLE so existing rows
+        // backfill as None and only freshly-completed attempts populate.
+        total_cost_cents: row.get("total_cost_cents"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cached_input_tokens: row.get("cached_input_tokens"),
+        transcript_artifact_id: row.get("transcript_artifact_id"),
     })
+}
+
+/// P017 R4 / API-002: persist per-attempt cost and transcript attribution
+/// for a completed `agent_executions` row. Used by the executor's
+/// mediation-completion path so MCP/GraphQL `execution_attempts.cost`
+/// and `transcript_ref` resolve to non-null values.
+///
+/// Idempotent at the row level — re-running with the same values
+/// produces the same result. Stage-owned executions can also call this
+/// when usage data is available.
+pub async fn update_attempt_attribution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: AgentExecutionId,
+    total_cost_cents: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    transcript_artifact_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_executions
+         SET total_cost_cents = COALESCE(?, total_cost_cents),
+             input_tokens = COALESCE(?, input_tokens),
+             output_tokens = COALESCE(?, output_tokens),
+             cached_input_tokens = COALESCE(?, cached_input_tokens),
+             transcript_artifact_id = COALESCE(?, transcript_artifact_id)
+         WHERE id = ?",
+    )
+    .bind(total_cost_cents)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cached_input_tokens)
+    .bind(transcript_artifact_id)
+    .bind(id.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_attempt_attribution(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    total_cost_cents: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    transcript_artifact_id: Option<&str>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    update_attempt_attribution_tx(
+        &mut tx,
+        id,
+        total_cost_cents,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        transcript_artifact_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }

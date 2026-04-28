@@ -246,13 +246,51 @@ A separate store for operator sign-off on mediation outcomes. These are unioned 
 | `conflictID` | `String` | Conflict ID |
 | `conflictFingerprint`| `String` | Fingerprint to validate against stale outcomes |
 | `status` | `ConfirmationStatus` | `pending` · `resolved` · `superseded` · `expired` · `canceled` |
-| `suggestedAction` | `String` | The lead's recommendation for the operator |
+| `suggestedAction` | The lead's recommendation for the operator |
 | `requestedAt` | `Date` | When the confirmation was requested |
 | `deadlineAt` | `Date?` | Expiration window; engine-owned watchdog settles fail-closed on expiry |
 | `readbackRef` | `String?` | Reference for report or GraphQL awareness navigation |
 | `idempotencyScopeKey`| `String?` | Prevents duplicate resolutions |
 | `resolvedAt` | `Date?` | Resolution timestamp |
 | `resolvedByPrincipalID`| `String?` | Identity of the resolving operator |
+
+### `RetryOperatorInstructionBinding`
+
+Durable parent binding for operator-guided retries (P065).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `journalID` | `String` | Linked command journal ID |
+| `runID` | `String` | Run ID |
+| `stageID` | `String` | Stage ID |
+| `sourceStageExecutionID`| `String` | Original failed/blocked attempt |
+| `retryStageExecutionID` | `String` | The new retry attempt |
+| `retryAttemptNumber` | `Int` | Incrementing attempt |
+| `targetAgentExecutionID`| `String?` | Null for full-stage retry |
+| `scopeKind` | `String` | `full_stage_retry` · `targeted_retry` · `targeted_retry_fallback_full_stage` |
+| `instructionText` | `String` | The 1-2000 character instruction |
+| `instructionSHA256` | `String` | Content hash for fingerprinting |
+| `createdAt` | `Date` | Creation timestamp |
+| `createdByPrincipalID` | `String` | Identity of the operator |
+| `createdByPrincipalClass`| `String` | Principal class (operator) |
+
+### `RetryOperatorInstructionDelivery`
+
+Per-work-item delivery record for retry instructions (P065).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `bindingID` | `String` | Linked parent binding |
+| `workItemID` | `String?` | Linked InvokeAgent work item |
+| `agentExecutionID` | `String?` | Linked agent execution |
+| `status` | `String` | `pending` · `delivered` · `failed` |
+| `failureReason` | `String?` | e.g. `no_invoke_agent_work_items` |
+| `createdAt` | `Date` | Creation timestamp |
+| `updatedAt` | `Date` | Last update |
+| `deliveredAt` | `Date?` | When prompt augmentation succeeded |
+
 
 ## Status enums
 

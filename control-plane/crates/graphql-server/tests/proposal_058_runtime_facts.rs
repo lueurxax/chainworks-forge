@@ -155,6 +155,11 @@ async fn seed_execution(
             owner_id: None,
             lead_mediation_record_id: None,
             origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
         },
     )
     .await
@@ -753,6 +758,7 @@ async fn proposal_058_artifact_projection_populates_source_generation_fields() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         },
     )
     .await

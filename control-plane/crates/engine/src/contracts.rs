@@ -10,6 +10,7 @@ use domain::artifact_contracts::{
     ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
+use domain::commands::{KnowledgeCapsulesMode, MainSyncMode};
 use domain::discovery::{
     AuthorizedRoot, ExpectedOutputRole, ExpectedOutputSpec, OutputDiscoveryDecision,
     OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass, SourceGenerationOwner,
@@ -45,6 +46,42 @@ pub struct CapturedOutput {
 
 const DEFAULT_EXPECTED_OUTPUT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_AGGREGATE_ACCEPTANCE_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Proposal064RuntimeConfig {
+    #[serde(default)]
+    pub main_sync: MainSyncRuntimeSection,
+    #[serde(default)]
+    pub knowledge_capsules: KnowledgeCapsulesRuntimeSection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MainSyncRuntimeSection {
+    #[serde(default)]
+    pub mode: MainSyncMode,
+}
+
+impl Default for MainSyncRuntimeSection {
+    fn default() -> Self {
+        Self {
+            mode: MainSyncMode::Off,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeCapsulesRuntimeSection {
+    #[serde(default)]
+    pub mode: KnowledgeCapsulesMode,
+}
+
+impl Default for KnowledgeCapsulesRuntimeSection {
+    fn default() -> Self {
+        Self {
+            mode: KnowledgeCapsulesMode::Off,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TaskValidationSummary {
@@ -599,6 +636,7 @@ pub fn declared_output_paths(declared_outputs: &[DeclaredOutput]) -> HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::commands::{KnowledgeCapsulesMode, MainSyncMode};
 
     fn structured_schema() -> OutputSchema {
         OutputSchema {
@@ -611,6 +649,28 @@ mod tests {
             raw_artifact_name: Some("proposal_review_raw".to_string()),
             required_fields: vec!["summary".to_string(), "status".to_string()],
         }
+    }
+
+    #[test]
+    fn proposal_064_runtime_config_defaults_modes_to_off() {
+        let parsed: Proposal064RuntimeConfig =
+            serde_json::from_value(serde_json::json!({})).expect("empty config should parse");
+        assert_eq!(parsed.main_sync.mode, MainSyncMode::Off);
+        assert_eq!(parsed.knowledge_capsules.mode, KnowledgeCapsulesMode::Off);
+    }
+
+    #[test]
+    fn proposal_064_runtime_config_parses_frozen_mode_values() {
+        let parsed: Proposal064RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "main_sync": { "mode": "manual_only" },
+            "knowledge_capsules": { "mode": "emit_only" }
+        }))
+        .expect("explicit modes should parse");
+        assert_eq!(parsed.main_sync.mode, MainSyncMode::ManualOnly);
+        assert_eq!(
+            parsed.knowledge_capsules.mode,
+            KnowledgeCapsulesMode::EmitOnly
+        );
     }
 
     #[test]
@@ -663,6 +723,39 @@ mod tests {
             ValidationStatus::Failed,
             "runtime output validation should require canonical status values, not legacy aliases"
         );
+    }
+
+    #[test]
+    fn validate_output_rejects_prepush_status_alias_before_settlement() {
+        let schema = OutputSchema {
+            contract_id: "prepush_review_v1".to_string(),
+            format: "json".to_string(),
+            human_format: None,
+            machine_format: Some("json".to_string()),
+            validation_mode: Some("strict_structured".to_string()),
+            normalized_artifact_name: Some("prepush_review_report".to_string()),
+            raw_artifact_name: None,
+            required_fields: vec![
+                "status".to_string(),
+                "major_concerns".to_string(),
+                "cleanup_items".to_string(),
+                "test_coverage_notes".to_string(),
+                "release_note".to_string(),
+            ],
+        };
+
+        let result = validate_output(
+            "prepush_review_report",
+            br#"{"status":"pass_with_notes","major_concerns":[],"cleanup_items":[],"test_coverage_notes":[],"release_note":"ok"}"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Failed);
+        assert!(result
+            .validation_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("allowed values for status"));
     }
 
     #[test]

@@ -189,6 +189,11 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
@@ -232,6 +237,11 @@ async fn p017_mediation_owned_agent_execution_does_not_require_stage_execution()
         owner_id: Some("mediation-001".into()),
         lead_mediation_record_id: Some("mediation-001".into()),
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
 
     agent_executions::insert(&pool, &execution)
@@ -289,6 +299,11 @@ async fn p017_mediation_owned_retry_budget_and_artifact_claims_are_owner_keyed()
         owner_id: Some("mediation-claim-001".into()),
         lead_mediation_record_id: Some("mediation-claim-001".into()),
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -852,6 +867,11 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1002,6 +1022,11 @@ async fn proposal_048_persistence_fields_round_trip() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1158,6 +1183,11 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1573,6 +1603,11 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -1607,6 +1642,11 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await
@@ -1632,6 +1672,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         is_pinned: false,
         report_kind: Some("validation_failure".into()),
         report_version: Some(1),
+        agent_execution_id: None,
     };
     artifacts::insert(&pool, &artifact).await.unwrap();
 
@@ -2061,6 +2102,108 @@ async fn test_projection_status_uses_canonical_run_when_summary_lags() {
     assert!(found.projection_lag);
 }
 
+/// Northbound run summaries must expose canonical pending approval counts even
+/// when the denormalized run summary has not caught up yet.
+#[tokio::test]
+async fn test_projection_pending_approvals_uses_canonical_approvals_when_summary_lags() {
+    let pool = test_pool().await;
+
+    let idea = Idea {
+        id: IdeaId::new(),
+        title: "Lagging approval summary idea".into(),
+        body: "body".into(),
+        workspace_root_path: None,
+        project_key: None,
+        status: IdeaStatus::Active,
+        created_at: Utc::now(),
+        archived_at: None,
+    };
+    ideas::insert(&pool, &idea).await.unwrap();
+
+    let run = Run {
+        id: RunId::new(),
+        idea_id: idea.id,
+        status: RunStatus::WaitingApproval,
+        workflow_id: "wf-approval-lag".into(),
+        workflow_title: "Approval Lag Workflow".into(),
+        workspace_root: "/tmp/approval-lag".into(),
+        artifact_root: "/tmp/approval-lag/art".into(),
+        started_at: Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: Some("manual_gate".into()),
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+    };
+    runs::insert(&pool, &run).await.unwrap();
+
+    let requested_at = Utc::now();
+    let approval = Approval {
+        id: ApprovalId::new(),
+        run_id: run.id,
+        stage_id: "manual_gate".into(),
+        decision: ApprovalDecision::Requested,
+        requested_at,
+        decided_at: None,
+        comment: None,
+        expires_at: None,
+    };
+    approvals::insert(&pool, &approval).await.unwrap();
+    projections::rebuild_all_for_run(&pool, run.id)
+        .await
+        .unwrap();
+
+    approvals::resolve(
+        &pool,
+        approval.id,
+        ApprovalDecision::Granted,
+        Utc::now(),
+        Some("approved".into()),
+    )
+    .await
+    .unwrap();
+
+    let active = projections::list_active_projection(&pool).await.unwrap();
+    let active_row = active
+        .iter()
+        .find(|row| row.id == run.id.to_string())
+        .expect("active projection row");
+    assert_eq!(active_row.pending_approvals, 0);
+    assert!(active_row.projection_lag);
+
+    let by_idea = projections::list_by_idea_projection(&pool, &idea.id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(by_idea[0].pending_approvals, 0);
+    assert!(by_idea[0].projection_lag);
+
+    let found = projections::find_run_projection(&pool, &run.id.to_string())
+        .await
+        .unwrap()
+        .expect("run projection");
+    assert_eq!(found.pending_approvals, 0);
+    assert!(found.projection_lag);
+}
+
 // ---------------------------------------------------------------------------
 // File-backed SQLite durability proof (REQ-002 / READY-001)
 //
@@ -2173,6 +2316,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
             is_pinned: false,
             report_kind: Some("execution_report".into()),
             report_version: Some(1),
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &artifact).await.unwrap();
         projections::rebuild_all_for_run(&pool, run_id)
@@ -2362,6 +2506,7 @@ async fn test_projection_parity_matches_canonical_repo_values() {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&pool, &art).await.unwrap();
     }

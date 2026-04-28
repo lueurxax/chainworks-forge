@@ -156,6 +156,7 @@ pub async fn build_and_persist_failed_stage_evidence(
         is_pinned: false,
         report_kind: Some("failed_stage_evidence".to_string()),
         report_version: Some(1),
+        agent_execution_id: None,
     };
     artifacts::insert(pool, &artifact).await?;
     Ok(artifact)
@@ -321,6 +322,11 @@ mod tests {
                 owner_id: None,
                 lead_mediation_record_id: None,
                 origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
             },
         )
         .await

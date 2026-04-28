@@ -92,6 +92,7 @@ Binding fingerprint is a SHA-256 of sorted canonical binding components:
 
 - `agent_id`, `provider`, `model`, `effort`,
 - full system prompt text,
+- `retry_instruction_sha256` (when P065 guided retry is active),
 - working directory, workspace mode,
 - worktree write policy / strategy,
 - inputs/outputs inventory,

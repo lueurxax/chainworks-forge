@@ -25,8 +25,15 @@
 //! | `ApproveStage`       | `comment`                      | **redact** |
 //! | `RejectStage`        | `run_id`, `stage_id`           | preserve   |
 //! | `RejectStage`        | `comment`                      | **redact** |
-//! | `RetryStage`         | all fields                     | preserve   |
+//! | `RetryStage`         | `run_id`, `stage_id`, etc.     | preserve   |
+//! | `RetryStage`         | `operator_instruction`         | **redact** |
 //! | `OverrideLegacyDiscoveryPolicy` | all fields            | preserve   |
+//! | `MainSyncRequest`    | all fields                     | preserve   |
+//! | `MainSyncRetry`      | all fields                     | preserve   |
+//! | `MainSyncSetRunOverride` | all fields                 | preserve   |
+//! | `MainSyncRepairState` | all fields                    | preserve   |
+//! | `MainSyncRecordRecoveryDecision` | all fields          | preserve   |
+//! | `KnowledgeCapsuleIgnore` | all fields                 | preserve   |
 //! | `CancelRun`          | all fields                     | preserve   |
 //! | `ResetSession`       | all fields                     | preserve   |
 //! | `RunStewardAnalysis` | `reason`, `artifact_base`      | preserve   |
@@ -84,13 +91,35 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
             }
         }
         Command::RetryStage(_) => {
-            // §8.1: preserve all fields.
+            // §8.1: preserve identity/structural fields. P065: redact free-form
+            // operator_instruction text (same rationale as ApproveStage.comment).
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "operator_instruction");
+            }
         }
         Command::ResolveWorkflowConflictTransition(_) => {
             // Operator conflict-resolution selections are audit material.
         }
         Command::OverrideLegacyDiscoveryPolicy(_) => {
             // P053: preserve typed override fields for operator audit.
+        }
+        Command::MainSyncRequest(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncRetry(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncSetRunOverride(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncRepairState(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::MainSyncRecordRecoveryDecision(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
+        }
+        Command::KnowledgeCapsuleIgnore(_) => {
+            // P064 Phase 0: preserve all frozen contract fields.
         }
         Command::CancelRun(_) => {
             // §8.1: preserve all fields.
@@ -147,9 +176,12 @@ fn redact_field_if_present(obj: &mut serde_json::Map<String, Value>, field: &str
 mod tests {
     use super::*;
     use domain::commands::{
-        ApproveStageCmd, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
-        ResetSessionCmd, ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd,
-        RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+        ApproveStageCmd, CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
+        MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
+        MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
+        OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
+        ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+        RunStewardAnalysisCmd, StartRunCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -298,11 +330,11 @@ mod tests {
         assert_eq!(inner["stage_id"], Value::String("state_4".into()));
     }
 
-    // ── RetryStage / CancelRun / ResetSession / RunStewardAnalysis ──
-    //    (preserve-all variants — every field must survive round-trip)
+    // ── RetryStage ────────────────────────────────────────────────────
+    //    P065: operator_instruction is redacted; all other fields preserved.
 
     #[test]
-    fn test_redact_retry_stage_preserves_all_fields() {
+    fn test_redact_retry_stage_preserves_structural_fields_without_instruction() {
         let run_id = RunId::new();
         let cmd = Command::RetryStage(RetryStageCmd {
             run_id,
@@ -311,14 +343,44 @@ mod tests {
             agent_execution_id: None,
             legacy_discovery_override_policy: None,
             legacy_discovery_override_reason: None,
+            operator_instruction: None,
         });
         let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         let redacted = round_trip(&cmd);
         assert_eq!(
             original, redacted,
-            "RetryStage must be preserved field-for-field"
+            "RetryStage without instruction must be preserved field-for-field"
         );
     }
+
+    #[test]
+    fn test_redact_retry_stage_redacts_operator_instruction() {
+        let run_id = RunId::new();
+        let cmd = Command::RetryStage(RetryStageCmd {
+            run_id,
+            stage_id: "state_7".into(),
+            consume_quota_budget_now: false,
+            agent_execution_id: None,
+            legacy_discovery_override_policy: None,
+            legacy_discovery_override_reason: None,
+            operator_instruction: Some("Focus only on the GraphQL scheduler slice".into()),
+        });
+        let v = round_trip(&cmd);
+        let inner = inner(&v);
+        assert_eq!(
+            inner["operator_instruction"],
+            Value::String(REDACTED.to_string()),
+            "operator_instruction must be replaced by [REDACTED]"
+        );
+        let serialized = serde_json::to_string(&v).unwrap();
+        assert!(!serialized.contains("GraphQL scheduler slice"));
+        // structural fields still preserved
+        assert_eq!(inner["run_id"], serde_json::json!(run_id));
+        assert_eq!(inner["stage_id"], Value::String("state_7".into()));
+    }
+
+    // ── CancelRun / ResetSession / RunStewardAnalysis ────────────────
+    //    (preserve-all variants)
 
     #[test]
     fn test_redact_cancel_run_preserves_run_id() {
@@ -403,6 +465,16 @@ mod tests {
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            Command::RetryStage(RetryStageCmd {
+                run_id: RunId::new(),
+                stage_id: "s".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: Some("Focus on X".into()),
             }),
             Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
                 run_id: RunId::new(),
@@ -417,6 +489,39 @@ mod tests {
                 target_attempt_number: 2,
                 legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy::WorkflowOptIn,
                 legacy_discovery_override_reason: "operator override".into(),
+            }),
+            Command::MainSyncRequest(MainSyncRequestCmd {
+                run_id: RunId::new(),
+                trigger_reason: MainSyncTriggerReason::BeforeReview,
+                idempotency_key: "run-1:before-review".into(),
+                requested_by_stage_id: Some("state_8".into()),
+                requested_by_work_item_id: Some("work-item-1".into()),
+            }),
+            Command::MainSyncRetry(MainSyncRetryCmd {
+                run_id: RunId::new(),
+                idempotency_key: "run-1:retry".into(),
+                failed_attempt_id: Some("attempt-1".into()),
+                reason: Some("operator retry".into()),
+            }),
+            Command::MainSyncSetRunOverride(MainSyncSetRunOverrideCmd {
+                run_id: RunId::new(),
+                mode: MainSyncMode::ManualOnly,
+                reason: "freeze automatic sync".into(),
+            }),
+            Command::MainSyncRepairState(MainSyncRepairStateCmd {
+                run_id: RunId::new(),
+                attempt_id: Some("attempt-1".into()),
+                recovery_note: Some("repair barrier lease".into()),
+            }),
+            Command::MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd {
+                run_id: RunId::new(),
+                decision: MainSyncRecoveryDecision::RetrySync,
+                summary: "retry after repair".into(),
+            }),
+            Command::KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd {
+                run_id: RunId::new(),
+                capsule_id: "capsule-1".into(),
+                reason: "irrelevant to current subsystem".into(),
             }),
             Command::CancelRun(CancelRunCmd {
                 run_id: RunId::new(),
@@ -460,6 +565,12 @@ mod tests {
                 Command::RetryStage(_) => {}
                 Command::ResolveWorkflowConflictTransition(_) => {}
                 Command::OverrideLegacyDiscoveryPolicy(_) => {}
+                Command::MainSyncRequest(_) => {}
+                Command::MainSyncRetry(_) => {}
+                Command::MainSyncSetRunOverride(_) => {}
+                Command::MainSyncRepairState(_) => {}
+                Command::MainSyncRecordRecoveryDecision(_) => {}
+                Command::KnowledgeCapsuleIgnore(_) => {}
                 Command::CancelRun(_) => {}
                 Command::ResetSession(_) => {}
                 Command::RunStewardAnalysis(_) => {}

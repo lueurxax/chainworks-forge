@@ -1083,6 +1083,7 @@ impl Orchestrator {
             is_pinned: false,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         artifact_contracts::upsert_generation_and_rebuild(
@@ -1391,6 +1392,7 @@ impl Orchestrator {
             is_pinned: true,
             report_kind: None,
             report_version: None,
+            agent_execution_id: None,
         };
         artifacts::insert(&self.pool, &artifact).await?;
         Ok(Some(artifact))
@@ -2167,7 +2169,23 @@ impl Orchestrator {
         )
         .await?
         {
-            // Existing active mediation — tx not needed, drop it.
+            // OPS-002 (P017 R4): emit duplicate_mediation_session_total when
+            // resume / retry / orchestrator-replay attempts to create a new
+            // mediation for a conflict that already has an active one.
+            // Detection source `try_initiate` distinguishes this from
+            // settlement-side or readback-side detections that may exist
+            // in future production callers.
+            let now = Utc::now();
+            let _ = db::repos::workflow_conflicts::record_duplicate_mediation_session_tx(
+                &mut tx,
+                &run_id.to_string(),
+                &conflict.conflict_id,
+                &existing.id,
+                "try_initiate",
+                now,
+            )
+            .await;
+            tx.commit().await.ok();
             return Ok(Some(existing.id));
         }
 
