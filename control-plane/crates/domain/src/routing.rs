@@ -8,9 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{
-    DynamicMaterializationId, RoutingReceiptId, RunId, StageExecutionId, SystemExecutionId,
-};
+use crate::ids::{DynamicMaterializationId, RoutingReceiptId, RunId, SystemExecutionId};
 
 // ── SystemExecution ──────────────────────────────────────────────────
 
