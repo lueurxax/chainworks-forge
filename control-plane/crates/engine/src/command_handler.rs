@@ -2,6 +2,7 @@ use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -119,6 +120,13 @@ struct CommandJournalEntry {
     caller_principal_class: Option<String>,
     caller_tool: Option<String>,
     request_id: Option<String>,
+}
+
+struct PhaseBDogfoodMetricSnapshot {
+    completion_rate: f64,
+    sample_size: i64,
+    guidance_sufficient_count: i64,
+    evidence_source: String,
 }
 
 impl CommandJournalEntry {
@@ -405,9 +413,7 @@ impl CommandHandler {
             Command::RetryStage(c) if c.operator_instruction.is_some()
         ) && caller.principal_class != PrincipalClass::Operator
         {
-            anyhow::bail!(
-                "forbidden: RetryStage operator_instruction requires operator principal"
-            );
+            anyhow::bail!("forbidden: RetryStage operator_instruction requires operator principal");
         }
         if matches!(&cmd, Command::ResolveWorkflowConflictTransition(_))
             && caller.principal_class != PrincipalClass::Operator
@@ -617,6 +623,8 @@ impl CommandHandler {
                     } else {
                         None
                     };
+                let phase_b_dogfood_snapshot =
+                    phase_b_dogfood_exit_metric_snapshot(&c.workspace_root);
                 let tx_started = Instant::now();
                 let mut tx =
                     db::pool::begin_immediate_with_retry(&self.pool, "command.StartRun").await?;
@@ -704,11 +712,7 @@ impl CommandHandler {
                 // this point means it passed; record the outcome so the
                 // metric has at least one production caller per run start.
                 db::repos::workflow_conflicts::record_phase_c_validation_outcome_tx(
-                    &mut tx,
-                    run_id,
-                    "pass",
-                    "compile",
-                    now,
+                    &mut tx, run_id, "pass", "compile", now,
                 )
                 .await?;
                 // OPS-002 (P017 R4): emit phase_c_lead_inventory_external_catalog_total
@@ -728,6 +732,33 @@ impl CommandHandler {
                     now,
                 )
                 .await?;
+                // P017 R6 / OPS-001: keep the Phase B dogfood exit evidence
+                // visible in the same runtime metric stream as other P017
+                // operational metrics. These are snapshot emissions from the
+                // signed dogfood exit record, not live mediation counters.
+                if let Some(snapshot) = phase_b_dogfood_snapshot.as_ref() {
+                    db::repos::workflow_conflicts::record_phase_b_dogfood_mediation_completion_rate_tx(
+                        &mut tx,
+                        Some(&run_id.to_string()),
+                        run.workflow_id.as_str(),
+                        "all_phase_b_dogfood_conflicts",
+                        snapshot.completion_rate,
+                        snapshot.sample_size,
+                        snapshot.evidence_source.as_str(),
+                        now,
+                    )
+                    .await?;
+                    db::repos::workflow_conflicts::record_phase_b_dogfood_operator_guidance_sufficient_tx(
+                        &mut tx,
+                        Some(&run_id.to_string()),
+                        "lead_mediation_guidance",
+                        "sufficient",
+                        snapshot.guidance_sufficient_count,
+                        snapshot.evidence_source.as_str(),
+                        now,
+                    )
+                    .await?;
+                }
                 // Activate the idea when its first run starts.
                 db::repos::ideas::update_status_tx(
                     &mut tx,
@@ -1279,37 +1310,38 @@ impl CommandHandler {
                 )
                 .await?;
                 self.maybe_inject_retry_stage_failure("supersede_workflow_conflict")?;
-                let legacy_discovery_override_id =
-                    if let Some(input) = legacy_discovery_override_input.as_ref() {
-                        let override_record =
-                            legacy_discovery_overrides::create_for_pending_retry_tx(
-                                &mut retry_tx,
-                                input,
-                            )
-                            .await?;
-                        // OPS-001 (P017 R2 audit): an operator-attested
-                        // legacy/external catalog override is the canonical
-                        // external-catalog warning decision point. Emit one
-                        // metric event per override so rollout dashboards can
-                        // track override volume + decision class.
-                        let _ = db::repos::workflow_conflicts::record_external_catalog_warning_tx(
-                            &mut retry_tx,
-                            &c.run_id.to_string(),
-                            "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED",
-                            "enabled",
-                            "legacy_discovery_override",
-                            now,
-                        )
-                        .await;
-                        Some(override_record.override_id)
-                    } else {
-                        None
-                    };
+                let legacy_discovery_override_id = if let Some(input) =
+                    legacy_discovery_override_input.as_ref()
+                {
+                    let override_record = legacy_discovery_overrides::create_for_pending_retry_tx(
+                        &mut retry_tx,
+                        input,
+                    )
+                    .await?;
+                    // OPS-001 (P017 R2 audit): an operator-attested
+                    // legacy/external catalog override is the canonical
+                    // external-catalog warning decision point. Emit one
+                    // metric event per override so rollout dashboards can
+                    // track override volume + decision class.
+                    let _ = db::repos::workflow_conflicts::record_external_catalog_warning_tx(
+                        &mut retry_tx,
+                        &c.run_id.to_string(),
+                        "P017_PHASE_C_EXTERNAL_CATALOG_UNDISCOVERED",
+                        "enabled",
+                        "legacy_discovery_override",
+                        now,
+                    )
+                    .await;
+                    Some(override_record.override_id)
+                } else {
+                    None
+                };
                 // P065: create parent binding for operator instruction (full-stage retry).
                 // Child delivery rows are deferred to the orchestrator's fanout.
-                let retry_instruction_binding_id =
-                    if let Some(ref instruction_text) = validated_instruction {
-                        let binding =
+                let retry_instruction_binding_id = if let Some(ref instruction_text) =
+                    validated_instruction
+                {
+                    let binding =
                             retry_operator_instructions::create_for_retry_attempt_tx(
                                 &mut retry_tx,
                                 &domain::retry_instruction::RetryInstructionBindingInput {
@@ -1327,10 +1359,10 @@ impl CommandHandler {
                                 },
                             )
                             .await?;
-                        Some(binding.binding_id)
-                    } else {
-                        None
-                    };
+                    Some(binding.binding_id)
+                } else {
+                    None
+                };
                 self.maybe_inject_retry_stage_failure("create_retry_instruction_binding")?;
 
                 artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
@@ -2329,34 +2361,33 @@ impl CommandHandler {
         )
         .await?;
         // P065: create binding for fallback full-stage retry path
-        let retry_instruction_binding_id =
-            if let Some(instruction_text) = validated_instruction {
-                let scope_kind = if retry_reason == "operator_retry_stale_targeted_retry" {
-                    domain::retry_instruction::RetryInstructionScopeKind::TargetedRetryFallbackFullStage
-                } else {
-                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry
-                };
-                let binding = retry_operator_instructions::create_for_retry_attempt_tx(
-                    &mut retry_tx,
-                    &domain::retry_instruction::RetryInstructionBindingInput {
-                        journal_id: journal_id.to_string(),
-                        run_id,
-                        stage_id: stage_id.to_string(),
-                        source_stage_execution_id: old_stage.id,
-                        retry_stage_execution_id: new_stage.id,
-                        retry_attempt_number: next_attempt_number,
-                        target_agent_execution_id: None,
-                        scope_kind,
-                        instruction_text: instruction_text.to_string(),
-                        created_by_principal_id: caller.principal_id.clone(),
-                        created_by_principal_class: caller.principal_class.to_string(),
-                    },
-                )
-                .await?;
-                Some(binding.binding_id)
+        let retry_instruction_binding_id = if let Some(instruction_text) = validated_instruction {
+            let scope_kind = if retry_reason == "operator_retry_stale_targeted_retry" {
+                domain::retry_instruction::RetryInstructionScopeKind::TargetedRetryFallbackFullStage
             } else {
-                None
+                domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry
             };
+            let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                &mut retry_tx,
+                &domain::retry_instruction::RetryInstructionBindingInput {
+                    journal_id: journal_id.to_string(),
+                    run_id,
+                    stage_id: stage_id.to_string(),
+                    source_stage_execution_id: old_stage.id,
+                    retry_stage_execution_id: new_stage.id,
+                    retry_attempt_number: next_attempt_number,
+                    target_agent_execution_id: None,
+                    scope_kind,
+                    instruction_text: instruction_text.to_string(),
+                    created_by_principal_id: caller.principal_id.clone(),
+                    created_by_principal_class: caller.principal_class.to_string(),
+                },
+            )
+            .await?;
+            Some(binding.binding_id)
+        } else {
+            None
+        };
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2630,51 +2661,49 @@ impl CommandHandler {
             .execute(&mut *retry_tx)
             .await?;
         // P065: create parent binding + child delivery for targeted retry
-        let retry_instruction_binding_id =
-            if let Some(instruction_text) = validated_instruction {
-                let binding = retry_operator_instructions::create_for_retry_attempt_tx(
-                    &mut retry_tx,
-                    &domain::retry_instruction::RetryInstructionBindingInput {
-                        journal_id: journal_id.to_string(),
-                        run_id,
-                        stage_id: stage_id.to_string(),
-                        source_stage_execution_id: old_stage.id,
-                        retry_stage_execution_id: new_stage.id,
-                        retry_attempt_number: next_attempt_number,
-                        target_agent_execution_id: Some(agent_execution_id),
-                        scope_kind:
-                            domain::retry_instruction::RetryInstructionScopeKind::TargetedRetry,
-                        instruction_text: instruction_text.to_string(),
-                        created_by_principal_id: caller.principal_id.clone(),
-                        created_by_principal_class: caller.principal_class.to_string(),
-                    },
-                )
-                .await?;
-                // For targeted retry, the work item is known now — create child delivery row.
-                retry_operator_instructions::create_for_work_item_tx(
-                    &mut retry_tx,
-                    &binding.binding_id,
-                    Some(&retry_work_item_id),
-                    None,
-                )
-                .await?;
-                // Inject metadata into the payload so executor can find it.
-                if let Some(object) = retry_payload.as_object_mut() {
-                    object.insert(
-                        "operator_retry_instruction".into(),
-                        serde_json::json!({
-                            "binding_id": binding.binding_id,
-                            "journal_id": binding.journal_id,
-                            "scope_kind": binding.scope_kind.to_string(),
-                            "instruction": binding.instruction_text,
-                            "instruction_sha256": binding.instruction_sha256,
-                        }),
-                    );
-                }
-                Some(binding.binding_id)
-            } else {
-                None
-            };
+        let retry_instruction_binding_id = if let Some(instruction_text) = validated_instruction {
+            let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                &mut retry_tx,
+                &domain::retry_instruction::RetryInstructionBindingInput {
+                    journal_id: journal_id.to_string(),
+                    run_id,
+                    stage_id: stage_id.to_string(),
+                    source_stage_execution_id: old_stage.id,
+                    retry_stage_execution_id: new_stage.id,
+                    retry_attempt_number: next_attempt_number,
+                    target_agent_execution_id: Some(agent_execution_id),
+                    scope_kind: domain::retry_instruction::RetryInstructionScopeKind::TargetedRetry,
+                    instruction_text: instruction_text.to_string(),
+                    created_by_principal_id: caller.principal_id.clone(),
+                    created_by_principal_class: caller.principal_class.to_string(),
+                },
+            )
+            .await?;
+            // For targeted retry, the work item is known now — create child delivery row.
+            retry_operator_instructions::create_for_work_item_tx(
+                &mut retry_tx,
+                &binding.binding_id,
+                Some(&retry_work_item_id),
+                None,
+            )
+            .await?;
+            // Inject metadata into the payload so executor can find it.
+            if let Some(object) = retry_payload.as_object_mut() {
+                object.insert(
+                    "operator_retry_instruction".into(),
+                    serde_json::json!({
+                        "binding_id": binding.binding_id,
+                        "journal_id": binding.journal_id,
+                        "scope_kind": binding.scope_kind.to_string(),
+                        "instruction": binding.instruction_text,
+                        "instruction_sha256": binding.instruction_sha256,
+                    }),
+                );
+            }
+            Some(binding.binding_id)
+        } else {
+            None
+        };
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
@@ -2862,6 +2891,33 @@ async fn apply_quota_retry_budget_for_stage_tx(
     Ok(())
 }
 
+fn phase_b_dogfood_exit_metric_snapshot(
+    workspace_root: &str,
+) -> Option<PhaseBDogfoodMetricSnapshot> {
+    let path = Path::new(workspace_root)
+        .join("docs/proposals/017-evidence/phase-b-dogfood-exit-record.json");
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let gate_results = payload.get("gate_results")?;
+    let sample_size = gate_results.get("sample_size")?.as_i64()?;
+    let completion_rate = gate_results.get("completion_rate_observed")?.as_f64()?;
+    let guidance_rate = gate_results
+        .get("operator_guidance_sufficient_rate")?
+        .as_f64()?;
+    let evidence_source = payload
+        .get("record_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("phase_b_dogfood_exit_record")
+        .to_string();
+
+    Some(PhaseBDogfoodMetricSnapshot {
+        completion_rate,
+        sample_size,
+        guidance_sufficient_count: (guidance_rate * sample_size as f64).round() as i64,
+        evidence_source,
+    })
+}
+
 async fn supersede_current_workflow_conflict_for_stage_retry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -2913,4 +2969,24 @@ async fn supersede_current_workflow_conflict_for_stage_retry_tx(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p017_phase_b_dogfood_metric_snapshot_reads_evidence_record() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let snapshot = phase_b_dogfood_exit_metric_snapshot(&workspace_root.to_string_lossy())
+            .expect("P017 Phase B dogfood evidence snapshot should parse");
+
+        assert_eq!(snapshot.sample_size, 10);
+        assert!((snapshot.completion_rate - 1.0).abs() < 1e-6);
+        assert_eq!(snapshot.guidance_sufficient_count, 10);
+        assert_eq!(
+            snapshot.evidence_source,
+            "p017-phase-b-dogfood-exit-2026-04-26"
+        );
+    }
 }

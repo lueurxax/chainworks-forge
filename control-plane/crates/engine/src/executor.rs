@@ -22,7 +22,7 @@ use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
     agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, legacy_discovery_overrides,
-    projections, scheduler, sessions, stages, validation, work_items,
+    projections, scheduler, sessions, stages, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{
@@ -3745,15 +3745,16 @@ impl BackgroundExecutor {
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
                         let mut metric_tx = self.pool.begin().await?;
-                        let _ = db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
-                            &mut metric_tx,
-                            &run_id.to_string(),
-                            None,
-                            med_id,
-                            "mediation_terminal_or_missing",
-                            completed_at,
-                        )
-                        .await;
+                        let _ =
+                            db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
+                                &mut metric_tx,
+                                &run_id.to_string(),
+                                None,
+                                med_id,
+                                "mediation_terminal_or_missing",
+                                completed_at,
+                            )
+                            .await;
                         let _ = metric_tx.commit().await;
                     }
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
@@ -3823,15 +3824,16 @@ impl BackgroundExecutor {
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
                         let mut metric_tx = self.pool.begin().await?;
-                        let _ = db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
-                            &mut metric_tx,
-                            &run_id.to_string(),
-                            None,
-                            med_id,
-                            "mediation_terminal_or_missing",
-                            completed_at,
-                        )
-                        .await;
+                        let _ =
+                            db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
+                                &mut metric_tx,
+                                &run_id.to_string(),
+                                None,
+                                med_id,
+                                "mediation_terminal_or_missing",
+                                completed_at,
+                            )
+                            .await;
                         let _ = metric_tx.commit().await;
                     }
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
@@ -4131,14 +4133,13 @@ impl BackgroundExecutor {
                     // attempt attribution intact) or none of it does
                     // and the orchestrator can re-drive the work item.
                     //
-                    // The transcript artifact must be persisted to disk
-                    // BEFORE the tx (filesystem write is not
-                    // transactional), but the artifact row insert + the
-                    // agent_execution status update + the attribution
-                    // write are bundled into one tx so a partial state
-                    // is impossible.
+                    // The transcript artifact file is written BEFORE the tx
+                    // (filesystem write is not transactional), but the
+                    // artifact row insert + the agent_execution status update
+                    // + the attribution write are bundled into one tx so a
+                    // partial database state is impossible.
                     let mediation_transcript_artifact = self
-                        .persist_transcript_artifact_if_present(
+                        .build_transcript_artifact_if_present(
                             &run,
                             &stage_id,
                             &agent_id,
@@ -4168,6 +4169,9 @@ impl BackgroundExecutor {
                         "mediation.complete_with_attribution",
                     )
                     .await?;
+                    if let Some(artifact) = mediation_transcript_artifact.as_ref() {
+                        artifacts::insert_tx(&mut completion_tx, artifact).await?;
+                    }
                     agent_executions::update_completed_tx(
                         &mut completion_tx,
                         agent_exec_id,
@@ -4186,6 +4190,14 @@ impl BackgroundExecutor {
                     )
                     .await?;
                     completion_tx.commit().await?;
+                    if let Some(artifact) = mediation_transcript_artifact.as_ref() {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::ArtifactCreated {
+                                run_id: run.id,
+                                artifact_id: artifact.id,
+                            });
+                    }
                     if let Some(med_id) = mediation_record_id.as_deref() {
                         let mut tx = db::pool::begin_immediate_with_retry(
                             &self.pool,
@@ -4409,17 +4421,18 @@ impl BackgroundExecutor {
                                 AgentStatus::Cancelled => "cancelled",
                                 _ => "other",
                             };
-                            let _ = db::repos::workflow_conflicts::record_lead_mediation_attempt_tx(
-                                &mut tx,
-                                &mediation.run_id,
-                                Some(&mediation.conflict_id),
-                                med_id,
-                                &mediation.lead_agent_id,
-                                attempt_result,
-                                attempt_number,
-                                completed_at,
-                            )
-                            .await;
+                            let _ =
+                                db::repos::workflow_conflicts::record_lead_mediation_attempt_tx(
+                                    &mut tx,
+                                    &mediation.run_id,
+                                    Some(&mediation.conflict_id),
+                                    med_id,
+                                    &mediation.lead_agent_id,
+                                    attempt_result,
+                                    attempt_number,
+                                    completed_at,
+                                )
+                                .await;
                         }
                         tx.commit().await?;
                     }
@@ -5494,14 +5507,29 @@ impl BackgroundExecutor {
                 .await?;
         }
         if runtime_facts.failure_kind == Some(AgentFailureKind::ProviderQuota) {
-            let ledger = agent_retry_budget_ledger::upsert_quota_failure_tx(
+            let ledger = agent_retry_budget_ledger::upsert_quota_failure_for_owner_tx(
                 &mut tx,
                 artifact_claim_key.run_id,
-                stage_execution_id,
+                artifact_claim_key.owner_kind.clone(),
+                artifact_claim_key.owner_id.clone(),
+                artifact_claim_key.stage_execution_id,
                 agent_exec_id,
                 runtime_facts.retry_after,
             )
             .await?;
+            if artifact_claim_key.owner_kind == domain::mediation::OwnerKind::LeadConflictMediation
+                && ledger.normal_budget_consumed
+            {
+                workflow_conflicts::record_mediation_retry_budget_exhausted_tx(
+                    &mut tx,
+                    &artifact_claim_key.run_id.to_string(),
+                    &artifact_claim_key.owner_id,
+                    None,
+                    "provider_quota",
+                    chrono::Utc::now(),
+                )
+                .await?;
+            }
             runtime_facts.quota_ledger_id = Some(ledger.id);
         }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
@@ -5622,6 +5650,41 @@ impl BackgroundExecutor {
         created_at: chrono::DateTime<chrono::Utc>,
         transcript_text: Option<&str>,
     ) -> Result<Option<domain::artifact::Artifact>> {
+        let artifact = self
+            .build_transcript_artifact_if_present(
+                run,
+                stage_id,
+                agent_id,
+                provider,
+                model,
+                agent_execution_id,
+                created_at,
+                transcript_text,
+            )
+            .await?;
+        if let Some(artifact) = artifact.as_ref() {
+            artifacts::insert(&self.pool, artifact).await?;
+            let _ = self
+                .events
+                .send(domain::events::DomainEvent::ArtifactCreated {
+                    run_id: run.id,
+                    artifact_id: artifact.id,
+                });
+        }
+        Ok(artifact)
+    }
+
+    async fn build_transcript_artifact_if_present(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        created_at: chrono::DateTime<chrono::Utc>,
+        transcript_text: Option<&str>,
+    ) -> Result<Option<domain::artifact::Artifact>> {
         if std::env::var("CHAINWORKS_PERSIST_ACP_TRANSCRIPTS")
             .ok()
             .as_deref()
@@ -5674,13 +5737,6 @@ impl BackgroundExecutor {
             // (cross-retry isolation).
             agent_execution_id: Some(agent_execution_id.to_string()),
         };
-        artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
         Ok(Some(artifact))
     }
 

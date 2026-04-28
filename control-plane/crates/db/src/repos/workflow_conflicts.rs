@@ -532,7 +532,11 @@ pub async fn record_phase_c_validation_failure(
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     record_phase_c_validation_failure_tx(
-        &mut tx, failure_kind, workflow_path, catalog_path, occurred_at,
+        &mut tx,
+        failure_kind,
+        workflow_path,
+        catalog_path,
+        occurred_at,
     )
     .await?;
     tx.commit().await?;
@@ -804,6 +808,70 @@ pub async fn record_mediation_retry_budget_exhausted_tx(
                 "conflict_reason": conflict_reason,
             }),
             value: 1.0,
+            unit: "count".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-001: emit the Phase B dogfood mediation completion rate as a runtime
+/// metric event, keyed by the workflow/conflict dimensions promised by P017.
+pub async fn record_phase_b_dogfood_mediation_completion_rate_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: Option<&str>,
+    workflow_id: &str,
+    conflict_reason: &str,
+    completion_rate: f64,
+    sample_size: i64,
+    evidence_source: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.map(ToString::to_string),
+            conflict_id: None,
+            metric_name: "phase_b_dogfood_mediation_completion_rate".to_string(),
+            labels_json: serde_json::json!({
+                "workflow_id": workflow_id,
+                "conflict_reason": conflict_reason,
+                "sample_size": sample_size,
+                "evidence_source": evidence_source,
+            }),
+            value: completion_rate,
+            unit: "ratio".to_string(),
+            occurred_at,
+        },
+    )
+    .await
+}
+
+/// OPS-001: emit the Phase B dogfood operator-guidance sufficiency total as
+/// a runtime metric event, keyed by the action/result dimensions in P017.
+pub async fn record_phase_b_dogfood_operator_guidance_sufficient_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: Option<&str>,
+    action_class: &str,
+    result: &str,
+    sufficient_count: i64,
+    evidence_source: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    insert_metric_event_tx(
+        tx,
+        &WorkflowConflictMetricEvent {
+            event_id: Uuid::new_v4().to_string(),
+            run_id: run_id.map(ToString::to_string),
+            conflict_id: None,
+            metric_name: "phase_b_dogfood_operator_guidance_sufficient_total".to_string(),
+            labels_json: serde_json::json!({
+                "action_class": action_class,
+                "result": result,
+                "evidence_source": evidence_source,
+            }),
+            value: sufficient_count as f64,
             unit: "count".to_string(),
             occurred_at,
         },

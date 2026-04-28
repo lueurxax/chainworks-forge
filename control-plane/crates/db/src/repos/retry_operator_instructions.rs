@@ -7,8 +7,8 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::retry_instruction::{
-    RetryInstructionBindingInput, RetryInstructionDeliveryStatus,
-    RetryOperatorInstructionBinding, RetryOperatorInstructionDelivery,
+    RetryInstructionBindingInput, RetryInstructionDeliveryStatus, RetryOperatorInstructionBinding,
+    RetryOperatorInstructionDelivery,
 };
 
 // ── Parent binding ────────────────────────────────────────────────────
@@ -20,8 +20,7 @@ pub async fn create_for_retry_attempt_tx(
 ) -> Result<RetryOperatorInstructionBinding> {
     let now = Utc::now();
     let binding_id = uuid::Uuid::new_v4().to_string();
-    let instruction_sha256 =
-        domain::retry_instruction::instruction_sha256(&input.instruction_text);
+    let instruction_sha256 = domain::retry_instruction::instruction_sha256(&input.instruction_text);
 
     sqlx::query(
         r#"INSERT INTO retry_operator_instruction_bindings
@@ -129,10 +128,7 @@ pub async fn create_for_work_item_tx(
 }
 
 /// Mark a pending delivery as delivered.
-pub async fn mark_delivered_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    delivery_id: &str,
-) -> Result<()> {
+pub async fn mark_delivered_tx(tx: &mut Transaction<'_, Sqlite>, delivery_id: &str) -> Result<()> {
     let now = Utc::now();
     let rows = sqlx::query(
         r#"UPDATE retry_operator_instruction_deliveries
@@ -276,9 +272,7 @@ pub async fn find_binding_by_id_tx(
 
 /// Startup repair: fail all stale pending deliveries whose retry stage execution
 /// is in a terminal state (failed/completed/skipped).
-pub async fn fail_stale_pending_deliveries_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-) -> Result<u64> {
+pub async fn fail_stale_pending_deliveries_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<u64> {
     let now = Utc::now();
     let result = sqlx::query(
         r#"UPDATE retry_operator_instruction_deliveries
