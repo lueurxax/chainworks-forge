@@ -2097,6 +2097,13 @@ PY
         "$P017_R6_MCP_REPORTS"; then
       die "P017 R6 preempt: MCP cross-attempt isolation test missing"
     fi
+    # REL-002 atomic-transaction proof — the R5 closure shipped the
+    # `mediation.complete_with_attribution` tx in the executor but
+    # had no test directly exercising the transactional boundary.
+    if ! grep -q "p017_mediation_complete_with_attribution_is_atomic" \
+        "$OPS_001_DB_PATH"; then
+      die "P017 R6 preempt: REL-002 atomicity proof test missing"
+    fi
 
     log "Proposal 017 gate passed"
     ;;

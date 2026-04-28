@@ -6,7 +6,7 @@
 | Closure mode | **Preemptive** — gaps identified in the R5 verification log are closed before the R6 audit runs |
 | Addendum date | 2026-04-28 |
 | Branch | `claude/bold-lichterman` (synchronized with `main`) |
-| Scope | Two anticipated R6 findings: GraphQL evidence parity for per-attempt cost/transcript (named explicitly in R5 verification log) + cross-retry artifact isolation acceptance tests (named in R5 API-003 acceptance criteria) |
+| Scope | Three anticipated R6 findings: GraphQL evidence parity for per-attempt cost/transcript (named explicitly in R5 verification log), cross-retry artifact isolation acceptance tests (named in R5 API-003 acceptance criteria), and a direct transactional-boundary proof for REL-002 (R5 atomicity claim was source-only) |
 
 ## Anticipated R6 findings closed
 
@@ -78,6 +78,36 @@ Each test does the following:
    `agent_id_correlation` tier-3 fallback (proving tier-2 dominates
    when direct linkage exists).
 
+### REL-002-ATOMIC-PROOF — Direct transactional-boundary proof test
+
+**Status: Closed (preempt).**
+
+The R5 closure shipped the executor's
+`mediation.complete_with_attribution` transaction wrapping
+`update_completed_tx` + `update_attempt_attribution_tx`, but R5
+verification could only inspect the **source** for the atomic
+boundary. No test directly exercised the boundary. R6 audit could
+plausibly note this as evidence-only-by-source.
+
+A new persistence test
+`p017_mediation_complete_with_attribution_is_atomic`
+(in `crates/db/tests/proposal_017_workflow_conflict_persistence.rs`)
+closes that evidence gap by exercising the boundary directly:
+
+1. Seeds a Running mediation-owned `agent_executions` row.
+2. Opens a transaction; calls **both** `update_completed_tx` and
+   `update_attempt_attribution_tx` with sentinel cost values.
+3. **Rolls back** by dropping `tx` without committing — sqlx auto-rolls.
+4. Re-fetches and asserts every column reverted: `status =
+   Running`, `completed_at = None`, `total_cost_cents = None`,
+   `input_tokens = None`, `transcript_artifact_id = None`. This
+   proves no partial state escaped — neither write half-leaked.
+5. Re-runs the same two writes inside a **committed** tx; asserts
+   every column landed. This proves the happy path of the same
+   atomic boundary — both writes visible together.
+
+Two branches together prove all-or-nothing at the row level.
+
 ### GQL-LINKAGE-001 — GraphQL artifact projection exposes `linkage`
 
 **Status: Closed (preempt).**
@@ -127,6 +157,7 @@ Presence checks:
   string (locks in the GQL-PARITY-001 closure).
 - GraphQL cross-attempt isolation test name present in `schema.rs`.
 - MCP cross-attempt isolation test name present in `reports.rs`.
+- REL-002 atomicity proof test name present in `proposal_017_workflow_conflict_persistence.rs`.
 
 Cargo invocations (the original P017 gate filtered on `proposal_017_`
 prefix only, which would not have matched the new `p017_…` test
