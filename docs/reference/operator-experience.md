@@ -62,6 +62,15 @@ Each row shows:
 - runtime provenance,
 - **Freshness state** (Live, Refreshing, Stale, etc.).
 
+### Proposal Review Routing (P060)
+
+The Proposal Reviewed stage card includes detailed routing information:
+- **Routing Progress**: Spinner and label ("Selecting reviewers...") during selection.
+- **Reviewer Rows**: 2-5 dynamic rows showing agent name, mandatory/optional status, score, rationale, and evidence IDs.
+- **Timeline Popovers**: Detailed routing rationale, score terms, evidence IDs, and materialization status are visible for each reviewer row.
+- **Advanced Routing Disclosure**: Optional view for rejected alternatives and ineligible candidates.
+- **Under-specified Selection**: Caution banner when falling back to fixed reviewers.
+
 **Actions are diagnostic-only:**
 - `Open` is available for drill-down.
 - Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
@@ -85,16 +94,28 @@ Surfaces for backpressure visibility:
 
 ### Workflow Conflict Details
 
-When a run blocks due to a workflow conflict, a dedicated **Conflict Details** 
+When a run blocks due to a workflow conflict, a dedicated **Conflict Details**
 GroupBox appears immediately after the Blocker Summary. It provides:
 
-- **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step") 
+- **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step")
   plus status capsule.
+- **Routing Conflict**: Specifically for deterministic routing failures (P060),
+  showing matching mandatory reviewers, overflow rationale, and evidence IDs.
 - **Current State**: The authoritative graph state where the run is anchored.
-- **Lead & Mediation**: The system lead agent assigned to the conflict and 
+- **Lead & Mediation**: The system lead agent assigned to the conflict and
   active mediation progress.
 - **Advisory Suggestion**: Redacted summary of the rejected agent hint.
 - **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
+
+### Evidence Projection (P060)
+
+Repo-backed evidence references (path, symbol, span) in routing rationale default
+to hash-only projection for privacy and security.
+- **Raw Projection**: Requires the `operator_debug_routing_evidence` capability.
+- **Authenticated Access**: Raw evidence is visible only in authenticated operator
+  sessions (CLI/MCP/App Debug).
+- **Restricted Readback**: Unauthenticated, unknown, or report/export readers
+  always receive hash-only evidence.
 
 If a run belongs to an archived idea, that archived parent state remains visible in the row/detail context even though the idea is hidden from the default active ideas list.
 
@@ -173,12 +194,12 @@ Diagnostic guidance is provided for:
 4. `Clone Run`
 
 **Workflow Conflict Actions (Read-Only):**
-- **Mediation Progress**: View sanitized live status updates (queued, 
+- **Mediation Progress**: View sanitized live status updates (queued,
   running, validating) while mediation is active.
-- **Diagnostic Details**: For terminal conflicts, provides `run_id` and conflict 
+- **Diagnostic Details**: For terminal conflicts, provides `run_id` and conflict
   identifiers for use in external resolution workflows.
-- **Manual Resolution Guidance**: In-app actions like `Clone Run` or `Open editable 
-  recovery artifact` are replaced with diagnostic identifiers and suggested 
+- **Manual Resolution Guidance**: In-app actions like `Clone Run` or `Open editable
+  recovery artifact` are replaced with diagnostic identifiers and suggested
   external commands.
 
 `RecoverySheet` and diagnostic banners show:

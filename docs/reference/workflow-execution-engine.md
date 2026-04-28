@@ -128,10 +128,31 @@ invocation. The `proposal_review_router` uses `executor_mode: system.routing` to
 perform deterministic reviewer selection over proposal evidence and catalog
 metadata.
 
-- **`AgentSelectionPlanV1`** -- the authoritative plan for selected reviewers.
-- **`RoutingReceipt`** -- the terminal receipt for a routing attempt, including
-  rationale and input hashes.
-- **`SystemExecution`** -- the lifecycle record for a system task.
+**Deterministic Routing (P060):**
+Replaces fixed proposal-review fan-out with a scoring-based model that selects
+2-5 specialists from an expanded catalog.
+- **Scoring**: Based on force-includes, stack/surface/risk matches, strong keywords,
+  repo signals, and cross-stack dependencies, with an overlap penalty.
+- **Specialists**: Launches with seven core specialists (macOS, Apple architecture,
+  Rust architecture, reliability, security, API contract, and observability/rollout)
+  while cataloging others as disabled until a golden-output gate is passed.
+- **Determinism**: The same inputs must produce identical selected order, evidence
+  IDs, and plan hashes across Swift and Rust implementations.
+
+**Key Artifacts:**
+- **`AgentSelectionPlanV1`** -- the authoritative plan for selected reviewers,
+  referencing compiler-owned materialization bindings.
+- **`RoutingReceipt`** -- the terminal receipt for every routing outcome, including
+  rationale, status, and input snapshot hashes.
+- **`SystemExecution`** -- the lifecycle record for the system task, owning the
+  task status and timestamps.
+
+**Routing Conflicts and Fallbacks:**
+- **Under-specified Selection**: If no specialists qualify, falls back to
+  `product_owner` plus `architect` with a caution warning.
+- **Mandatory Overflow**: If more than 5 mandatory reviewers match, blocks with a
+  `Routing conflict` and requires operator intervention (e.g., cloning with
+  overrides).
 
 **Approval flow**: When a state has `approval: required`, the orchestrator pauses,
 creates an `Approval` record, and publishes an `ApprovalRequest`. On resolution:

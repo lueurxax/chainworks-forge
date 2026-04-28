@@ -254,7 +254,60 @@ A separate store for operator sign-off on mediation outcomes. These are unioned 
 | `resolvedAt` | `Date?` | Resolution timestamp |
 | `resolvedByPrincipalID`| `String?` | Identity of the resolving operator |
 
-### `RetryOperatorInstructionBinding`
+### `SystemExecution` (Rust-only)
+
+The lifecycle record for a first-class `SystemTask` (e.g., `system.routing`).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `runID` | `String` | Run ID |
+| `stageID` | `String` | Stage ID |
+| `attemptID` | `Int` | Attempt number |
+| `taskID` | `String` | Task identifier |
+| `taskType` | `String` | `proposal_review_router` |
+| `status` | `SystemStatus` | `queued` · `running` · `succeeded` · `blocked` · `failed` |
+| `startedAt` | `Date` | When the task started |
+| `completedAt` | `Date?` | When the task finished |
+| `receiptID` | `String?` | Linked `RoutingReceipt` ID |
+| `planHash` | `String?` | Hash of the resulting `AgentSelectionPlanV1` |
+| `failureKind` | `String?` | e.g., `mandatory_overflow` |
+
+### `RoutingReceipt` (Rust-only)
+
+The authoritative result of a deterministic routing attempt.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `runID` | `String` | Run ID |
+| `stageID` | `String` | Stage ID |
+| `attemptID` | `Int` | Attempt number |
+| `systemExecutionID` | `String` | Linked `SystemExecution` ID |
+| `status` | `String` | `succeeded` · `failed` · `under_specified` |
+| `failureKind` | `String?` | e.g., `mandatory_overflow`, `invalid_override` |
+| `planHash` | `String?` | Hash of the resulting plan |
+| `inputSnapshotHashes`| `String` | JSON hashes of proposal, catalog, and rules |
+| `operatorActions` | `String?` | Overrides applied by the operator |
+| `createdAt` | `Date` | Creation timestamp |
+
+### `DynamicMaterializationRecord` (Rust-only)
+
+Tracks the materialization of selected agents in a `dynamic_parallel` block.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `runID` | `String` | Run ID |
+| `stageID` | `String` | Stage ID |
+| `attemptID` | `Int` | Attempt number |
+| `phaseID` | `String` | Workflow phase ID |
+| `planHash` | `String` | Linked `AgentSelectionPlanV1` hash |
+| `bindingID` | `String` | Selected agent binding ID |
+| `agentExecutionID` | `String` | Created `AgentExecution` ID |
+| `idempotencyKey` | `String` | Prevents duplicate materialization |
+
+### `RetryOperatorInstructionBinding` (Rust-only)
 
 Durable parent binding for operator-guided retries (P065).
 

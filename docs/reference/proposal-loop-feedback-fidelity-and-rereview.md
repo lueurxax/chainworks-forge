@@ -19,7 +19,7 @@ This document is the stable contract for:
 
 This reference covers:
 
-- the proposal-review quartet plus aggregate summary as one canonical refine-handoff unit,
+- the selected proposal-review artifacts plus aggregate summary as one canonical refine-handoff unit,
 - backlog normalization and carry-forward semantics for score-limiting issues,
 - merge-provenance visibility for collapsed or combined issues,
 - writer coverage records and unresolved/deferred/disputed truth,
@@ -40,15 +40,17 @@ It does not introduce:
 
 `proposal_review_summary` is not a standalone refine authority.
 
-The canonical refine-handoff owner is `ReviewCorpusBundle`, which persists:
+The canonical refine-handoff owner is `ReviewCorpusBundle` (V2), which persists:
 
 - `review_pass_id`,
 - `review_iteration_id`,
 - `source_proposal_artifact`,
-- the raw quartet review artifact names,
+- `selected_reviewer_ids` (P060 dynamic set),
+- `selected_review_artifacts` (2-5 specialist artifacts),
+- `selection_plan_hash` (linked to `AgentSelectionPlanV1`),
 - and the aggregate summary artifact name.
 
-Writers may still consume the raw quartet and summary directly, but the persisted bundle is the canonical read surface that proves the full review corpus was present.
+Writers may still consume the raw reviewer artifacts and summary directly, but the persisted bundle is the canonical read surface that proves the full review corpus was present.
 
 ### Score-limiting issues must survive aggregation explicitly
 
@@ -122,11 +124,9 @@ The canonical artifact names for this slice are:
 - `proposal_fact_digest`
 - `reviewer_scope_plan`
 - `proposal_review_summary`
-- raw quartet review artifacts:
-  - `proposal_review_po`
-  - `proposal_review_ux`
-  - `proposal_review_ui`
-  - `proposal_review_architect`
+- selected reviewer artifacts (P060):
+  - 2-5 artifacts from the specialist catalog (e.g. `proposal_review_macos`, `proposal_review_security`)
+  - legacy `proposal_review_po`, `proposal_review_ux`, `proposal_review_ui`, `proposal_review_architect` when selected or in legacy mode
 
 The aggregate-review stage owns:
 
