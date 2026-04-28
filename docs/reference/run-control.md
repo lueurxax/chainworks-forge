@@ -50,7 +50,7 @@ Stopping an active idea means:
 - the active run stops advancing its state machine,
 - in-flight agent executions receive cooperative cancellation,
 - active runtime sessions are closed where available,
-- linked `LeadConflictMediationRecord`s are transitioned to `canceled` (Proposal 017),
+- linked `LeadConflictMediationRecord`s are transitioned to `canceled`,
 - the run remains visibly `cancelling` until settlement is confirmed,
 - only then does the run become terminal `cancelled`.
 

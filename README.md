@@ -92,10 +92,10 @@ The current MVP provider set is:
 
 The repository is past the scaffold stage. The implemented system now includes:
 
-- lead-mediated workflow conflict resolution and mandatory lead validation (Proposal 017 Phase B/C)
+- lead-mediated workflow conflict resolution and mandatory lead validation
 - thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
-- declarative workflow authority, typed workflow conflicts, and advisory rejection history (Proposal 017 Phase A)
+- declarative workflow authority, typed workflow conflicts, and advisory rejection history
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
@@ -111,7 +111,6 @@ Active proposal work is currently concentrated in:
 
 - [`docs/proposals/032-polish-stabilization-and-productization-backlog.md`](docs/proposals/032-polish-stabilization-and-productization-backlog.md)
 - [`docs/proposals/036-ux-consolidation-and-navigation-simplification.md`](docs/proposals/036-ux-consolidation-and-navigation-simplification.md)
-- [`docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md`](docs/proposals/017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
 The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). New UI proposals should build on that reference rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.

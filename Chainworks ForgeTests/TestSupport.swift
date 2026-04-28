@@ -300,13 +300,19 @@ func writePortableWorkflowCopy(from sourceURL: URL, to destinationURL: URL) thro
 
 /// Loads the canonical workflow fixture from the test bundle.
 func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
+    if let bundledURL = Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml") {
+        let portableURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("examples/workflows", isDirectory: true)
+            .appendingPathComponent("chainworks-test-workflow-\(UUID().uuidString).yaml")
+        try writePortableWorkflowCopy(from: bundledURL, to: portableURL)
+        return try YAMLParser.loadWorkflow(from: portableURL)
+    }
+
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/workflow.yaml")
-    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
-        ? repoURL
-        : try #require(
-            Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml"),
-            "workflow.yaml fixture must be bundled with tests"
-        )
+    let url = try #require(
+        FileManager.default.isReadableFile(atPath: repoURL.path) ? repoURL : nil,
+        "workflow.yaml fixture must be bundled with tests or readable from the repository"
+    )
     let portableURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("examples/workflows", isDirectory: true)
         .appendingPathComponent("chainworks-test-workflow-\(UUID().uuidString).yaml")
@@ -317,13 +323,19 @@ func loadTestCanonicalWorkflow() throws -> WorkflowDefinition {
 /// Loads the canonical agent catalog fixture from the test bundle.
 func loadTestCanonicalCatalog() throws -> AgentCatalog {
     _ = installPortableMCPRegistryFixtureIfNeeded()
+    if let bundledURL = Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml") {
+        let portableURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("examples/agents", isDirectory: true)
+            .appendingPathComponent("chainworks-test-catalog-\(UUID().uuidString).yaml")
+        try writePortableCatalogCopy(from: bundledURL, to: portableURL)
+        return try YAMLParser.loadAgentCatalog(from: portableURL)
+    }
+
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml")
-    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
-        ? repoURL
-        : try #require(
-            Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml"),
-            "agents.yaml fixture must be bundled with tests"
-        )
+    let url = try #require(
+        FileManager.default.isReadableFile(atPath: repoURL.path) ? repoURL : nil,
+        "agents.yaml fixture must be bundled with tests or readable from the repository"
+    )
     let portableURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("examples/agents", isDirectory: true)
         .appendingPathComponent("chainworks-test-catalog-\(UUID().uuidString).yaml")
@@ -343,13 +355,18 @@ func loadTestStewardConfig() throws -> StewardConfig {
 /// Loads the live proposal loop workflow fixture from the test bundle.
 func loadTestLiveWorkflow() throws -> WorkflowDefinition {
     _ = installPortableMCPRegistryFixtureIfNeeded()
+    if let bundledURL = Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml") {
+        let portableURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chainworks-test-proposal-loop-live-\(UUID().uuidString).yaml")
+        try writePortableWorkflowCopy(from: bundledURL, to: portableURL)
+        return try YAMLParser.loadWorkflow(from: portableURL)
+    }
+
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/proposal-loop-live.yaml")
-    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
-        ? repoURL
-        : try #require(
-            Bundle(for: TestBundleMarker.self).url(forResource: "proposal-loop-live", withExtension: "yaml"),
-            "proposal-loop-live.yaml fixture must be bundled with tests"
-        )
+    let url = try #require(
+        FileManager.default.isReadableFile(atPath: repoURL.path) ? repoURL : nil,
+        "proposal-loop-live.yaml fixture must be bundled with tests or readable from the repository"
+    )
     let portableURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("chainworks-test-proposal-loop-live-\(UUID().uuidString).yaml")
     try writePortableWorkflowCopy(from: url, to: portableURL)
@@ -359,13 +376,18 @@ func loadTestLiveWorkflow() throws -> WorkflowDefinition {
 /// Loads the full MVP live workflow fixture from the test bundle.
 func loadTestFullMVPLiveWorkflow() throws -> WorkflowDefinition {
     _ = installPortableMCPRegistryFixtureIfNeeded()
+    if let bundledURL = Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml") {
+        let portableURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chainworks-test-full-mvp-live-\(UUID().uuidString).yaml")
+        try writePortableWorkflowCopy(from: bundledURL, to: portableURL)
+        return try YAMLParser.loadWorkflow(from: portableURL)
+    }
+
     let repoURL = testRepositoryRootURL().appendingPathComponent("examples/workflows/full-mvp-live.yaml")
-    let url = FileManager.default.isReadableFile(atPath: repoURL.path)
-        ? repoURL
-        : try #require(
-            Bundle(for: TestBundleMarker.self).url(forResource: "full-mvp-live", withExtension: "yaml"),
-            "full-mvp-live.yaml fixture must be bundled with tests"
-        )
+    let url = try #require(
+        FileManager.default.isReadableFile(atPath: repoURL.path) ? repoURL : nil,
+        "full-mvp-live.yaml fixture must be bundled with tests or readable from the repository"
+    )
     let portableURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("chainworks-test-full-mvp-live-\(UUID().uuidString).yaml")
     try writePortableWorkflowCopy(from: url, to: portableURL)

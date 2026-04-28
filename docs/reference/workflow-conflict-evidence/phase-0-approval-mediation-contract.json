@@ -1,6 +1,6 @@
 {
   "artifact_id": "phase_0_approval_mediation_contract",
-  "path": "docs/proposals/017-evidence/phase-0-approval-mediation-contract.json",
+  "path": "docs/reference/workflow-conflict-evidence/phase-0-approval-mediation-contract.json",
   "mediation_confirmation_store": {
     "table": "lead_mediation_confirmations",
     "projection": "lead_mediation_confirmation_inbox",

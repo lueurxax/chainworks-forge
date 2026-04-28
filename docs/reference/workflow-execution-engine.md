@@ -341,8 +341,8 @@ falling back to manual intervention.
 6. **Resolution**: Once confirmed or auto-settled, the mediation outcome resolves
     the conflict, enabling the orchestrator to advance the transition cursor.
 
-**Phase B Lead Resolver:**
-During Phase B, lead resolution uses a **versioned JSON compatibility map** (`docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`) as the sole machine-authoritative source for lead selection. This map defines exact matches between workflow/catalog pairs and their designated system lead. Fail-closed rules apply if no match or multiple matches exist.
+**Compatibility Lead Resolver:**
+Lead resolution uses a **versioned JSON compatibility map** (`docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json`) as the sole machine-authoritative source for lead selection until static catalog validation fully owns every executable workflow/catalog pair. This map defines exact matches between workflow/catalog pairs and their designated system lead. Fail-closed rules apply if no match or multiple matches exist.
 
 **Validation and Preflight**:
 Mandatory static validation and runtime preflight ensure exactly-one lead
@@ -350,8 +350,8 @@ resolution and `LeadResolutionContract` coverage. Failure to resolve a valid
 lead results in a `terminal_unverifiable` conflict.
 
 **Observability**:
-P017 records workflow-conflict rollout metrics in durable
-`workflow_conflict_metric_events` rows. Phase C adds
+Workflow-conflict rollout metrics are recorded in durable
+`workflow_conflict_metric_events` rows. Lead-validation rollout adds
 `phase_c_validation_outcome_total` for lead validation outcomes
 (`static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`), while
 conflict resolution records `workflow_conflict_time_to_resolution_seconds`,

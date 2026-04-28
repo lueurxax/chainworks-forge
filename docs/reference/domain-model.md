@@ -145,7 +145,7 @@ owner model (ARCH-037) to support lead-mediated conflicts.
 | `costCents` | `Int64?` | Cost in minor units |
 | `logSnippet` | `String?` | Last N lines of log |
 | `runtimeSessionID` | `String?` | Runtime session tracking |
-| `leadMediationRecordID` | `UUID?` | Linked mediation record (P017) |
+| `leadMediationRecordID` | `UUID?` | Linked mediation record |
 | `originStageID` | `String?` | Origin stage lineage |
 | `originStageExecutionID`| `UUID?` | Origin stage execution lineage |
 | `stageExecutionID` | `UUID?` | Compatibility stage-execution ID (null for mediation) |

@@ -9853,7 +9853,7 @@ async fn p017_mediation_cancel_run_cascade() {
 /// columns the audit named — across cancellation, readback, and
 /// idempotency operations.
 ///
-/// See `docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md`
+/// See `docs/reference/workflow-conflict-evidence/phase-b-mediation-execution-fields-equivalence.md`
 /// for the full rationale; this test is the executable proof.
 #[tokio::test]
 async fn p017_mediation_execution_fields_equivalence() {
@@ -10250,7 +10250,7 @@ fn p017_phase_b_checked_in_lead_resolver_resolves_bundled_workflows() {
     use engine::mediation::lead_resolver::*;
 
     let resolver_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json");
+        .join("../../../docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json");
     let resolver = PhaseBLeadResolver::load_from_file(&resolver_path.to_string_lossy())
         .expect("checked-in Phase B resolver loads");
 

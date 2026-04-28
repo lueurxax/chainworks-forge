@@ -722,7 +722,7 @@ impl CommandHandler {
                 // this is `inventory_result=zero_active_externals` +
                 // `enforcement_decision=waive_warning_window` per the
                 // attested evidence at
-                // docs/proposals/017-evidence/phase-c-external-catalog-enforcement-inventory.json.
+                // docs/reference/workflow-conflict-evidence/phase-c-external-catalog-enforcement-inventory.json.
                 db::repos::workflow_conflicts::record_phase_c_lead_inventory_external_catalog_tx(
                     &mut tx,
                     Some(&run_id.to_string()),
@@ -2895,7 +2895,7 @@ fn phase_b_dogfood_exit_metric_snapshot(
     workspace_root: &str,
 ) -> Option<PhaseBDogfoodMetricSnapshot> {
     let path = Path::new(workspace_root)
-        .join("docs/proposals/017-evidence/phase-b-dogfood-exit-record.json");
+        .join("docs/reference/workflow-conflict-evidence/phase-b-dogfood-exit-record.json");
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let gate_results = payload.get("gate_results")?;

@@ -1624,7 +1624,7 @@ Available gates:
   proposal-013    Proposal 013 contract/evidence/recovery gate
   proposal-014    Proposal 014 design-system and brand adoption gate
   proposal-015    Proposal 015 skill resolution and runtime injection gate
-  proposal-017    Proposal 017 Phase A/B/C workflow authority, conflict truth, and lead mediation gate
+  proposal-017    Workflow authority, conflict truth, and lead mediation gate (retained alias)
   proposal-018    Proposal 018 session lineage reuse and operator reset gate
   proposal-019    Proposal 019 context-strategy framework gate
   proposal-022    Proposal 022 feedback fidelity score lift and rereview proof gate
@@ -1814,25 +1814,25 @@ case "$GATE" in
     run_proposal015_app_proof "$LAST_BUILD_DERIVED_DATA_PATH"
     ;;
   proposal-017|p017)
-    log "Proposal 017 gate: Phase A/B/C workflow authority, conflict truth, and lead mediation"
+    log "Workflow conflict gate: workflow authority, conflict truth, and lead mediation"
     check_idle_environment allow_app
 
     # Phase 0 Contract Freeze: verify existence of required backend artifacts
     log "Verifying Phase 0 backend contract artifacts..."
     required_artifacts=(
-      "docs/proposals/017-evidence/phase-0-approval-mediation-contract.json"
-      "docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md"
-      "docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json"
-      "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json"
-      "docs/proposals/017-evidence/phase-0-settlement-service-boundary.md"
-      "docs/proposals/017-evidence/phase-0-artifact-manifest.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-approval-mediation-contract.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-mediation-execution-identity-contract.md"
+      "docs/reference/workflow-conflict-evidence/phase-0-work-item-execution-owner-contract.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json"
+      "docs/reference/workflow-conflict-evidence/phase-0-settlement-service-boundary.md"
+      "docs/reference/workflow-conflict-evidence/phase-0-artifact-manifest.json"
     )
     for art in "${required_artifacts[@]}"; do
       if [[ ! -f "$ROOT_DIR/$art" ]]; then
         die "Missing required Phase 0 artifact: $art"
       fi
     done
-    python3 - "$ROOT_DIR/docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json" <<'PY'
+    python3 - "$ROOT_DIR/docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json" <<'PY'
 import json
 import sys
 
@@ -1915,7 +1915,7 @@ PY
     fi
 
     # ARCH-001: equivalence record + proof test must both be present.
-    ARCH_001_DOC="docs/proposals/017-evidence/phase-b-mediation-execution-fields-equivalence.md"
+    ARCH_001_DOC="docs/reference/workflow-conflict-evidence/phase-b-mediation-execution-fields-equivalence.md"
     ARCH_001_TEST="p017_mediation_execution_fields_equivalence"
     if [[ ! -f "$ROOT_DIR/$ARCH_001_DOC" ]]; then
       die "P017 ARCH-001: missing equivalence record at $ARCH_001_DOC"
@@ -2078,7 +2078,7 @@ PY
       fi
     done
 
-    log "Proposal 017 gate passed"
+    log "Workflow conflict gate passed"
     ;;
   proposal-018|p018)
     check_idle_environment allow_app

@@ -251,9 +251,9 @@ Important:
 - the gate keeps its historical proposal label for reproducibility
 - the documentation source of truth for the slice is now [design-system-and-brand-application.md](design-system-and-brand-application.md), not the old proposal file
 
-### `proposal-017`
+### `proposal-017` Retained Historical Alias
 
-Proposal 017 Phase A/B/C workflow-authority, conflict-truth, and lead-mediation gate.
+Retained gate alias for workflow-authority, conflict-truth, and lead-mediation behavior.
 
 Scope:
 
@@ -288,30 +288,30 @@ Host policy:
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-017
+./scripts/test-gate.sh proposal-017 # retained historical alias
 ```
 
 Important:
 
 - this gate is the canonical proof path for [workflow-execution-engine.md](workflow-execution-engine.md) (authority/conflict/mediation) and [execution-truth-and-recovery.md](execution-truth-and-recovery.md) (conflict recovery/handoff)
 - it validates that agent-authored `next_stage` cannot override the compiled graph
-- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the full P017 slice
+- it validates the implemented D4F404B7-class replay outcome across Swift and Rust for the full workflow-conflict slice
 - it proves Rust `agent_executions` owner-kind migration, lead mediation runtime, and lead-validation requirements
-- it verifies the P017 evidence bundle under `docs/proposals/017-evidence/`,
+- it verifies the workflow-conflict evidence bundle under `docs/reference/workflow-conflict-evidence/`,
   including flag-gated dogfood closeout and external catalog attestation
 
 ### Phase 0 Contract Freeze
 
-The `proposal-017` gate verifies the existence and approval status of required Phase 0 backend contract artifacts before implementation proceeds. These artifacts are the canonical sources of truth for major migration seams:
+The `proposal-017` retained historical alias verifies the existence and approval status of retained backend contract artifacts before the gate proceeds. These artifacts are the canonical sources of truth for major migration seams:
 
-- **Approval Mediation**: `docs/proposals/017-evidence/phase-0-approval-mediation-contract.json`
-- **Execution Identity**: `docs/proposals/017-evidence/phase-0-mediation-execution-identity-contract.md`
-- **Work Item Owner**: `docs/proposals/017-evidence/phase-0-work-item-execution-owner-contract.json`
-- **Lead Resolver**: `docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json`
-- **Settlement Boundary**: `docs/proposals/017-evidence/phase-0-settlement-service-boundary.md`
-- **Dogfood Exit Record**: `docs/proposals/017-evidence/phase-b-dogfood-exit-record.json`
-- **Phase C Inventory**: `docs/proposals/017-evidence/phase-c-external-catalog-enforcement-inventory.json`
-- **Known Issues Migration Records**: `docs/proposals/017-evidence/phase-a-known-issues-migration-records.json`
+- **Approval Mediation**: `docs/reference/workflow-conflict-evidence/phase-0-approval-mediation-contract.json`
+- **Execution Identity**: `docs/reference/workflow-conflict-evidence/phase-0-mediation-execution-identity-contract.md`
+- **Work Item Owner**: `docs/reference/workflow-conflict-evidence/phase-0-work-item-execution-owner-contract.json`
+- **Lead Resolver**: `docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json`
+- **Settlement Boundary**: `docs/reference/workflow-conflict-evidence/phase-0-settlement-service-boundary.md`
+- **Dogfood Exit Record**: `docs/reference/workflow-conflict-evidence/phase-b-dogfood-exit-record.json`
+- **Phase C Inventory**: `docs/reference/workflow-conflict-evidence/phase-c-external-catalog-enforcement-inventory.json`
+- **Known Issues Migration Records**: `docs/reference/workflow-conflict-evidence/phase-a-known-issues-migration-records.json`
 
 ### `proposal-019`
 
@@ -520,7 +520,7 @@ Command:
 Important:
 
 - this gate hard-depends on `proposal-029`
-- `proposal-033` is the repo-owned proof lane for [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](../reference/033-remove-goose-from-canonical-transport-and-simplify-runtime.md)
+- `proposal-033` is the repo-owned proof lane for [acp-runtime-transport.md](acp-runtime-transport.md)
 
 ### `proposal-037`
 

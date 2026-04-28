@@ -2912,7 +2912,7 @@ impl Orchestrator {
 
         // Attempt Phase B lead resolution from the versioned compatibility map.
         // If the map file doesn't exist or no match is found, resolution fails closed.
-        let resolver_path = "docs/proposals/017-evidence/phase-0-phase-b-lead-resolver.json";
+        let resolver_path = "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
         let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
             Ok(r) => r,
             Err(e) => {

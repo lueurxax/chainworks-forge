@@ -8,7 +8,7 @@ use domain::ids::{RoutingReceiptId, SystemExecutionId};
 use domain::routing::{
     AgentSelectionPlanV1, CompiledDynamicAgentBinding, IneligibleCandidate, InputSnapshotHashes,
     RejectedAlternative, ReviewRoutingMode, ReviewRoutingOptions, RoutingEvidenceRef,
-    RoutingFailureKind, RoutingReceipt, RoutingReceiptStatus, RoutingMetadata, ScoreTerms,
+    RoutingFailureKind, RoutingReceipt, RoutingReceiptStatus, ScoreTerms,
     SelectedAgent, SystemExecution, SystemExecutionStatus,
 };
 use sha2::{Digest, Sha256};
@@ -626,6 +626,7 @@ pub struct SelectedOutputsResult {
 mod tests {
     use super::*;
     use domain::ids::RunId;
+    use domain::routing::RoutingMetadata;
 
     fn make_binding(
         agent_id: &str,

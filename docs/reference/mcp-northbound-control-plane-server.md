@@ -149,7 +149,7 @@ plane:
 - timestamps and active session-generation matching fields
 
 **Workflow Conflict:**
-The report also includes the `workflow_conflict` object (Proposal 017) containing
+The report also includes the `workflow_conflict` object containing
 current blocking conflicts, conflict history, and advisory rejection records.
 
 Readback rules:

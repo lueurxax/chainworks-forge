@@ -1,27 +1,20 @@
-# P017 ARCH-001 — Mediation Execution Owner Schema Equivalence Record
+# Mediation Execution Owner Schema Equivalence Record
 
 | Field | Value |
 |---|---|
-| Audit reference | `017-...-AUDIT_R2.md`, ARCH-001 |
-| Closure addendum | `017-...-AUDIT_R2_ADDENDUM.md` |
-| Schema migration of record | `control-plane/crates/db/migrations/029_p017_nullable_mediation_stage_execution.sql` |
-| CHECK constraint of record | `control-plane/crates/db/migrations/029_p017_nullable_mediation_stage_execution.sql:42-46` |
-| Equivalence test | `control-plane/crates/engine/tests/integration.rs::p017_mediation_execution_fields_equivalence` |
+| Retained historical alias | `proposal-017` |
+| Schema migration of record | `control-plane/crates/db/migrations/029_p017_nullable_mediation_stage_execution.sql` (retained historical alias) |
+| CHECK constraint of record | `control-plane/crates/db/migrations/029_p017_nullable_mediation_stage_execution.sql:42-46` (retained historical alias) |
+| Equivalence test | `control-plane/crates/engine/tests/integration.rs::p017_mediation_execution_fields_equivalence` (retained historical alias) |
 
-## Audit's choice
+## Recorded Design Decision
 
-Quoting the audit (ARCH-001):
+The owner-kind schema deliberately keeps run ownership derivable from canonical
+parent records instead of duplicating it on every `agent_executions` row. This
+record is paired with an executable proof test that exercises cancellation,
+readback, and idempotency through the substitute fields and the existing schema.
 
-> Either add the named fields and fixtures or record a deliberate design
-> deviation explaining the substitute fields and proving equivalent
-> cancellation, readback, and idempotency behavior.
-
-This document is the deliberate design deviation. It is paired with an
-executable proof test that exercises **all three** properties — cancellation,
-readback, and idempotency — through the substitute fields and the existing
-schema.
-
-## What the audit asked for
+## Rejected Literal-Column Shape
 
 Two literal columns on `agent_executions`:
 
@@ -33,7 +26,7 @@ Two literal columns on `agent_executions`:
 
 ### `run_id` is unambiguously derivable from existing fields
 
-Migration `029_p017_nullable_mediation_stage_execution.sql:42-46` enforces:
+Migration `029_p017_nullable_mediation_stage_execution.sql:42-46` (retained historical alias) enforces:
 
 ```sql
 CHECK (
@@ -77,9 +70,9 @@ strictly redundant.
 
 ### `mediation_owner_token` is satisfied by `lead_mediation_record_id`
 
-The audit's `mediation_owner_token` is described as "a stable token for
-the mediation owner across attempts." The current schema already has such
-a token: `lead_mediation_record_id` (TEXT, foreign key to
+The rejected `mediation_owner_token` field is a stable token for the mediation
+owner across attempts. The current schema already has such a token:
+`lead_mediation_record_id` (TEXT, foreign key to
 `lead_conflict_mediations.id`). It is:
 
 - **Stable**: `lead_conflict_mediations.id` is assigned on creation and
@@ -97,7 +90,7 @@ without behavior delta. We document it here instead.
 
 ## What we proved
 
-The integration test `p017_mediation_execution_fields_equivalence` (in
+The integration test `p017_mediation_execution_fields_equivalence` (retained historical alias, in
 `control-plane/crates/engine/tests/integration.rs`) constructs:
 
 - A stage-owned `agent_executions` row.
@@ -126,13 +119,13 @@ The integration test `p017_mediation_execution_fields_equivalence` (in
 
 All four assertions pass against the current schema **without** the literal
 columns. Running the test under the canonical gate
-(`./scripts/test-gate.sh proposal-017`) is part of the closure proof.
+(`./scripts/test-gate.sh proposal-017`, retained historical alias) is part of the closure proof.
 
 ## Why this is not "kicking the can"
 
 A future schema migration may add `run_id` as a denormalised column for
-performance reasons unrelated to P017. If/when that happens, the migration
-should:
+performance reasons unrelated to owner-kind correctness. If/when that happens,
+the migration should:
 
 - Backfill via the same JOIN paths documented above.
 - Add a CHECK or trigger to keep the denormalised value in sync with the
@@ -140,12 +133,12 @@ should:
 - Update `cancel_running_by_run_tx` and `list_by_run` to use the column
   directly.
 
-That migration is **not** an audit blocker because it is a pure
-performance optimisation, not a correctness fix. The correctness story is
-proven equivalent today.
+That migration is not required for correctness because it is a pure performance
+optimisation. The correctness story is proven equivalent today.
 
 ## Status
 
-ARCH-001 is closed by this equivalence record + the
-`p017_mediation_execution_fields_equivalence` proof test, both of which
-the canonical P017 gate now requires.
+The owner-kind equivalence is covered by this record and the
+`p017_mediation_execution_fields_equivalence` proof test (retained historical
+alias), both of which are required by the retained historical alias
+`proposal-017` gate.

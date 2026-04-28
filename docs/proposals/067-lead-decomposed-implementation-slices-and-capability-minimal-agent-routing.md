@@ -5,7 +5,7 @@
 | Date | 2026-04-22 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md](017-lead-mediated-workflow-conflict-resolution-and-mandatory-lead-validation.md), [060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md](060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md), [xcode-mcp-bridge-pool.md](../reference/xcode-mcp-bridge-pool.md), [rust-control-plane.md#capacity-aware-scheduling-and-backpressure](../reference/rust-control-plane.md#capacity-aware-scheduling-and-backpressure) |
+| Depends on | [workflow-execution-engine.md](../reference/workflow-execution-engine.md), [060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md](060-lead-driven-reviewer-routing-and-expanded-reviewer-catalog.md), [xcode-mcp-bridge-pool.md](../reference/xcode-mcp-bridge-pool.md), [rust-control-plane.md#capacity-aware-scheduling-and-backpressure](../reference/rust-control-plane.md#capacity-aware-scheduling-and-backpressure) |
 | Scope | Split implementation work into lead-owned slices and route each slice to the minimal agent profile and MCP capability set needed for that slice. |
 | Goal | Avoid one-size-fits-all implementation agents by letting the lead describe multiple concrete work slices while the orchestrator selects safe, capability-minimal agent profiles per slice. |
 
@@ -88,7 +88,7 @@ P067 does not include:
 - new GraphQL write paths beyond existing approval/retry/cancel semantics;
 - removing Xcode MCP from agents that legitimately need it;
 - hardcoding language-specific behavior into the scheduler;
-- replacing P060 reviewer routing or P017 lead validation.
+- replacing P060 reviewer routing or current lead validation.
 
 ---
 
@@ -249,7 +249,7 @@ Retry operates at slice granularity:
 6. The run artifact index records `selected_agent_profile`, `selection_reason`, `requested_mcp_extensions`, and `actual_mcp_extensions` per slice.
 7. Disjoint write scopes can run concurrently; overlapping write scopes are serialized or routed back through lead mediation.
 8. Slice-level retry can restart one failed slice without discarding completed slice artifacts.
-9. Existing P060 reviewer routing and P017 lead validation remain compatible.
+9. Existing P060 reviewer routing and current lead validation remain compatible.
 10. UI read paths remain GraphQL-only, and this proposal adds no UI MCP usage.
 
 ---

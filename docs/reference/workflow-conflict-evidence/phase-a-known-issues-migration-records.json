@@ -6,7 +6,7 @@
   "recorded_at": "2026-04-26T10:25:00Z",
   "purpose": "Operator-approved schema and validation evidence for shipping with bundled simultaneous-transition findings. The current bundled workflow scan has zero findings, so no exception records are present.",
   "schema": {
-    "storage": "docs/proposals/017-evidence/phase-a-known-issues-migration-records.json",
+    "storage": "docs/reference/workflow-conflict-evidence/phase-a-known-issues-migration-records.json",
     "required_fields": [
       "record_id",
       "workflow_path",
