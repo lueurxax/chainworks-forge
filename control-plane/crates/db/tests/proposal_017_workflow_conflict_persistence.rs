@@ -475,11 +475,7 @@ async fn p017_phase_c_validation_outcome_metric_emits() {
 
     let mut tx = pool.begin().await.unwrap();
     workflow_conflicts::record_phase_c_validation_outcome_tx(
-        &mut tx,
-        run_id,
-        "pass",
-        "compile",
-        now,
+        &mut tx, run_id, "pass", "compile", now,
     )
     .await
     .unwrap();
@@ -679,10 +675,7 @@ async fn p017_report_readback_completeness_metric_emits() {
         "ratio should be 3/4 = 0.75; got {}",
         event.value
     );
-    assert_eq!(
-        event.labels_json["surface"],
-        "mcp.workflow_conflict_json"
-    );
+    assert_eq!(event.labels_json["surface"], "mcp.workflow_conflict_json");
 }
 
 /// P017 R4 / OPS-002: phase_c_lead_inventory_external_catalog_total
@@ -751,10 +744,110 @@ async fn p017_mediation_late_output_ignored_metric_emits() {
         .expect("mediation_late_output_ignored_total must exist");
     assert_eq!(event.conflict_id.as_deref(), Some("conflict-Z"));
     assert_eq!(event.labels_json["mediation_record_id"], "med-Z");
-    assert_eq!(
-        event.labels_json["reason"],
-        "mediation_terminal_or_missing"
-    );
+    assert_eq!(event.labels_json["reason"], "mediation_terminal_or_missing");
+}
+
+/// P017 R6 / OPS-001: mediation_retry_budget_exhausted_total must have
+/// a focused metric-emission test, not only a helper definition.
+#[tokio::test]
+async fn p017_mediation_retry_budget_exhausted_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_mediation_retry_budget_exhausted_tx(
+        &mut tx,
+        &run_id.to_string(),
+        "mediation-1",
+        Some("codex-default"),
+        "provider_quota",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "mediation_retry_budget_exhausted_total")
+        .expect("mediation_retry_budget_exhausted_total must exist");
+    assert_eq!(event.unit, "count");
+    assert_eq!(event.labels_json["mediation_record_id"], "mediation-1");
+    assert_eq!(event.labels_json["provider_profile_id"], "codex-default");
+    assert_eq!(event.labels_json["conflict_reason"], "provider_quota");
+}
+
+/// P017 R6 / OPS-001: phase_b_dogfood_mediation_completion_rate
+/// must be emitted as a runtime metric event with workflow/conflict labels.
+#[tokio::test]
+async fn p017_phase_b_dogfood_mediation_completion_rate_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_phase_b_dogfood_mediation_completion_rate_tx(
+        &mut tx,
+        Some(&run_id.to_string()),
+        "full-mvp-live",
+        "same_run_continue",
+        1.0,
+        10,
+        "phase_b_dogfood_exit_record",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "phase_b_dogfood_mediation_completion_rate")
+        .expect("phase_b_dogfood_mediation_completion_rate must exist");
+    assert_eq!(event.unit, "ratio");
+    assert!((event.value - 1.0).abs() < 1e-6);
+    assert_eq!(event.labels_json["workflow_id"], "full-mvp-live");
+    assert_eq!(event.labels_json["conflict_reason"], "same_run_continue");
+    assert_eq!(event.labels_json["sample_size"], 10);
+}
+
+/// P017 R6 / OPS-001: phase_b_dogfood_operator_guidance_sufficient_total
+/// must be emitted as a runtime metric event with action/result labels.
+#[tokio::test]
+async fn p017_phase_b_dogfood_operator_guidance_sufficient_metric_emits() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id) = seed_run_and_stage(&pool).await;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.unwrap();
+    workflow_conflicts::record_phase_b_dogfood_operator_guidance_sufficient_tx(
+        &mut tx,
+        Some(&run_id.to_string()),
+        "lead_mediation_guidance",
+        "sufficient",
+        10,
+        "phase_b_dogfood_exit_record",
+        now,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let events = workflow_conflicts::list_metric_events_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.metric_name == "phase_b_dogfood_operator_guidance_sufficient_total")
+        .expect("phase_b_dogfood_operator_guidance_sufficient_total must exist");
+    assert_eq!(event.unit, "count");
+    assert_eq!(event.value, 10.0);
+    assert_eq!(event.labels_json["action_class"], "lead_mediation_guidance");
+    assert_eq!(event.labels_json["result"], "sufficient");
 }
 
 /// P017 R4 / API-002: persisting per-attempt cost + transcript via
@@ -804,18 +897,20 @@ async fn p017_per_attempt_cost_and_transcript_persisted() {
         transcript_artifact_id: None,
     };
     let _ = run_id; // run association via stage
-    db::repos::agent_executions::insert(&pool, &exec).await.unwrap();
+    db::repos::agent_executions::insert(&pool, &exec)
+        .await
+        .unwrap();
 
     // First call: cost only (transcript_artifact_id stays None — no
     // FK violation).
     db::repos::agent_executions::update_attempt_attribution(
         &pool,
         exec_id,
-        Some(42),       // total_cost_cents
-        Some(100),      // input_tokens
-        Some(25),       // output_tokens
-        Some(10),       // cached_input_tokens
-        None,           // transcript_artifact_id stays None
+        Some(42),  // total_cost_cents
+        Some(100), // input_tokens
+        Some(25),  // output_tokens
+        Some(10),  // cached_input_tokens
+        None,      // transcript_artifact_id stays None
     )
     .await
     .unwrap();
@@ -851,12 +946,17 @@ async fn p017_per_attempt_cost_and_transcript_persisted() {
         agent_execution_id: None,
     };
     let artifact_id = artifact.id.to_string();
-    db::repos::artifacts::insert(&pool, &artifact).await.unwrap();
+    db::repos::artifacts::insert(&pool, &artifact)
+        .await
+        .unwrap();
 
     db::repos::agent_executions::update_attempt_attribution(
         &pool,
         exec_id,
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
         Some(&artifact_id),
     )
     .await
@@ -905,7 +1005,10 @@ async fn p017_advisory_rejection_metrics_emit() {
         .iter()
         .find(|e| e.metric_name == "invalid_next_stage_hint_non_blocking_total")
         .unwrap();
-    assert_eq!(invalid.labels_json["advisory_next_action"], "revise_proposal");
+    assert_eq!(
+        invalid.labels_json["advisory_next_action"],
+        "revise_proposal"
+    );
 }
 
 /// P017 R5 / OPS-003: workflow_conflict_current_total emits per

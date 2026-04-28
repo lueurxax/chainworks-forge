@@ -16,6 +16,10 @@ DerivedDataCodex/
 # Generated documentation/export bundles
 /docs.zip
 
+# Local orchestration scratch reports
+/known-issues.md
+/auto-retry-blocked-runs-known-issues.md
+
 # Swift Package Manager
 .build/
 control-plane/target/

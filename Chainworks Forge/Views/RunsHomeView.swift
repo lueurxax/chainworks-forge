@@ -142,7 +142,10 @@ struct RunsHomeView: View {
                     P031RunDetailSummaryCard(presentation: runDetail)
                     P031IdeaContextCard(presentation: runDetail.ideaContext)
                     P031StageTransitionMapCard(rows: runDetail.stageTransitions)
-                    P031ArtifactViewerCard(rows: runDetail.artifactViewerRows)
+                    P031ArtifactViewerCard(
+                        rows: runDetail.artifactViewerRows,
+                        loadArtifactPreview: model.loadArtifactPreview
+                    )
                     P031CatalogContextCard(presentation: runDetail.catalogContext)
                     P031ApprovalInboxCard(presentation: model.approvalInbox)
                     P031ReportMetadataCard(rows: runDetail.reportRows)
@@ -178,6 +181,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let writePathGuideReference: String?
     private let loadRunsHomeAction: @Sendable (P031FreshnessSnapshot, Bool) async -> P031RunsHomePresentation
     private let loadRunDetailAction: @Sendable (String, P031FreshnessSnapshot) async -> P031RunDetailPresentation
+    private let loadArtifactPreviewAction: (String) async -> P031ArtifactViewerPresentation?
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
     private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
@@ -242,6 +246,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
         }
         loadRunDetailAction = { runID, currentFreshness in
             await coordinator.loadRunDetail(runID: runID, currentFreshness: currentFreshness)
+        }
+        loadArtifactPreviewAction = { artifactID in
+            await coordinator.loadArtifactPreview(artifactID: artifactID)
         }
         loadApprovalInboxAction = { currentFreshness in
             await coordinator.loadApprovalInbox(currentFreshness: currentFreshness)
@@ -326,6 +333,10 @@ final class P031ThinReadDashboardModel: ObservableObject {
         selectedRunID = runID
         startRunStatusSubscription(for: runID)
         Task { await loadRunDetail(for: runID) }
+    }
+
+    func loadArtifactPreview(artifactID: String) async -> P031ArtifactViewerPresentation? {
+        await loadArtifactPreviewAction(artifactID)
     }
 
     func dismissOrientation() async {
@@ -894,7 +905,10 @@ private struct P031ArtifactListCard: View {
 
 private struct P031ArtifactViewerCard: View {
     let rows: [P031ArtifactViewerPresentation]
+    let loadArtifactPreview: (String) async -> P031ArtifactViewerPresentation?
     @State private var selectedArtifactID: String?
+    @State private var previewRowsByArtifactID: [String: P031ArtifactViewerPresentation] = [:]
+    @State private var loadingPreviewArtifactID: String?
     @State private var artifactSearchText = ""
     @State private var selectedStageID = P031ArtifactViewerCard.allFilterID
     @State private var selectedAgentID = P031ArtifactViewerCard.allFilterID
@@ -910,7 +924,7 @@ private struct P031ArtifactViewerCard: View {
            let row = visibleRows.first(where: { $0.artifactID == selectedArtifactID }) {
             return row
         }
-        return visibleRows.first
+        return nil
     }
 
     private var visibleRows: [P031ArtifactViewerPresentation] {
@@ -963,9 +977,12 @@ private struct P031ArtifactViewerCard: View {
 
     var body: some View {
         let visibleRows = visibleRows
-        let selectedRow = selectedRow(in: visibleRows)
+        let selectedListRow = selectedRow(in: visibleRows)
+        let selectedRow = selectedListRow.flatMap { row in
+            previewRowsByArtifactID[row.artifactID] ?? row
+        }
         let groupedRows = groupedRows(from: visibleRows)
-        let selectedRowID = selectedRow?.artifactID
+        let selectedRowID = selectedListRow?.artifactID
 
         VStack(alignment: .leading, spacing: 12) {
             Text("Artifacts")
@@ -986,7 +1003,7 @@ private struct P031ArtifactViewerCard: View {
 
                         Divider()
 
-                        artifactPreviewScroll(selectedRow: selectedRow)
+                        artifactPreviewScroll(selectedRow: selectedRow, selectedListRow: selectedListRow)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
                     .frame(height: artifactViewerPaneHeight)
@@ -1115,6 +1132,9 @@ private struct P031ArtifactViewerCard: View {
 
     private func artifactListRow(for row: P031ArtifactViewerPresentation, selectedRowID: String?) -> some View {
         Button {
+            ForgeLogger.ui.info(
+                "P031 artifact selected artifactID=\(row.artifactID) title=\(row.title) payloadState=\(row.payloadState.rawValue) renderMode=\(String(describing: row.renderMode)) hasCachedPreview=\((previewRowsByArtifactID[row.artifactID] != nil)) listReason=\(row.unavailableReason ?? "nil")"
+            )
             selectedArtifactID = row.artifactID
         } label: {
             VStack(alignment: .leading, spacing: 5) {
@@ -1155,7 +1175,10 @@ private struct P031ArtifactViewerCard: View {
         .accessibilityLabel(row.accessibilityLabel)
     }
 
-    private func artifactPreviewScroll(selectedRow: P031ArtifactViewerPresentation?) -> some View {
+    private func artifactPreviewScroll(
+        selectedRow: P031ArtifactViewerPresentation?,
+        selectedListRow: P031ArtifactViewerPresentation?
+    ) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 Color.clear
@@ -1168,6 +1191,9 @@ private struct P031ArtifactViewerCard: View {
             .accessibilityIdentifier("p031-artifact-preview-scroll")
             .onChange(of: selectedRow?.artifactID) { _, _ in
                 proxy.scrollTo(artifactPreviewTopAnchorID, anchor: .top)
+            }
+            .task(id: selectedListRow?.artifactID) {
+                await loadPreviewIfNeeded(for: selectedListRow)
             }
         }
     }
@@ -1184,7 +1210,11 @@ private struct P031ArtifactViewerCard: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
-                if let preparedPreview = selectedRow.preparedPreview,
+                if loadingPreviewArtifactID == selectedRow.artifactID,
+                   selectedRow.preparedPreview == nil {
+                    ProgressView("Loading artifact preview")
+                        .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
+                } else if let preparedPreview = selectedRow.preparedPreview,
                    let context = renderContext(for: selectedRow) {
                     ArtifactContentRenderer(preparedPreview: preparedPreview, context: context)
                         .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
@@ -1199,8 +1229,46 @@ private struct P031ArtifactViewerCard: View {
         } else if !rows.isEmpty {
             P031EmptySectionRow(
                 title: "No artifact selected",
-                detail: "Adjust artifact filters to select a renderable artifact."
+                detail: "Select an artifact to load its preview."
             )
+        }
+    }
+
+    private func loadPreviewIfNeeded(for row: P031ArtifactViewerPresentation?) async {
+        guard let row else {
+            ForgeLogger.ui.debug("P031 artifact preview skipped: no selected row")
+            return
+        }
+        guard previewRowsByArtifactID[row.artifactID] == nil else {
+            ForgeLogger.ui.debug("P031 artifact preview skipped: cached artifactID=\(row.artifactID)")
+            return
+        }
+        ForgeLogger.ui.info(
+            "P031 artifact preview request starting artifactID=\(row.artifactID) listPayloadState=\(row.payloadState.rawValue) listRenderMode=\(String(describing: row.renderMode)) listHasPreview=\((row.preparedPreview != nil)) listReason=\(row.unavailableReason ?? "nil")"
+        )
+        loadingPreviewArtifactID = row.artifactID
+        let preview = await loadArtifactPreview(row.artifactID)
+        guard selectedArtifactID == row.artifactID else {
+            ForgeLogger.ui.info(
+                "P031 artifact preview ignored stale response artifactID=\(row.artifactID) currentSelection=\(selectedArtifactID ?? "nil")"
+            )
+            if loadingPreviewArtifactID == row.artifactID {
+                loadingPreviewArtifactID = nil
+            }
+            return
+        }
+        if let preview {
+            ForgeLogger.ui.info(
+                "P031 artifact preview received artifactID=\(row.artifactID) payloadState=\(preview.payloadState.rawValue) renderMode=\(String(describing: preview.renderMode)) hasPreview=\((preview.preparedPreview != nil)) previewChars=\(preview.preparedPreview?.content.count ?? 0) reason=\(preview.unavailableReason ?? "nil")"
+            )
+            previewRowsByArtifactID[row.artifactID] = preview
+        } else {
+            ForgeLogger.ui.error(
+                "P031 artifact preview loader returned nil artifactID=\(row.artifactID)"
+            )
+        }
+        if loadingPreviewArtifactID == row.artifactID {
+            loadingPreviewArtifactID = nil
         }
     }
 

@@ -1497,6 +1497,7 @@ protocol P031WorkflowReadStore: Sendable {
   func fetchStages(runID: String) async throws -> [P031StageReadModel]
   func fetchApprovalInbox() async throws -> [P031ApprovalReadModel]
   func fetchArtifacts(runID: String) async throws -> [P031ArtifactReadModel]
+  func fetchArtifactPayload(artifactID: String) async throws -> P031ArtifactReadModel
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel]
   func fetchDaemonStatus() async throws -> P031DaemonStatusReadModel
   nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
@@ -1512,6 +1513,7 @@ struct P031GraphQLDocumentSet: Equatable, Sendable {
   let stages: String
   let approvalInbox: String
   let artifacts: String
+  let artifactPayload: String
   let reportMetadata: String
   let daemonStatus: String
   let ideaTitle: String
@@ -1590,7 +1592,6 @@ enum P031GraphQLDocuments {
         freshnessState
         payloadAvailabilityState
         payloadUnavailableReasonCode
-        payloadText
         diagnosticId
         serverDebugDetail
       }
@@ -1686,6 +1687,30 @@ enum P031GraphQLDocuments {
         freshnessState
         payloadAvailabilityState
         payloadUnavailableReasonCode
+        diagnosticId
+        serverDebugDetail
+      }
+    }
+    """
+
+  static let artifactPayload = """
+    query P031ArtifactPayload($artifactId: ID!) {
+      artifact(id: $artifactId) {
+        id
+        runId
+        stageId
+        agentId
+        name
+        contractId
+        format
+        isPinned
+        reportKind
+        reportVersion
+        outputSettlement
+        sourceGenerationVerified
+        freshnessState
+        payloadAvailabilityState
+        payloadUnavailableReasonCode
         payloadText
         diagnosticId
         serverDebugDetail
@@ -1760,6 +1785,7 @@ enum P031GraphQLDocuments {
     stages: stages,
     approvalInbox: approvalInbox,
     artifacts: artifacts,
+    artifactPayload: artifactPayload,
     reportMetadata: reportMetadata,
     daemonStatus: daemonStatus,
     ideaTitle: ideaTitle,
@@ -1861,6 +1887,35 @@ struct P031GraphQLWorkflowReadStore<
       variables: ["runId": .string(runID)]
     )
     return payload.artifacts
+  }
+
+  func fetchArtifactPayload(artifactID: String) async throws -> P031ArtifactReadModel {
+    ForgeLogger.ui.info(
+      "P031ArtifactPayload request artifactID=\(artifactID)"
+    )
+    do {
+      let payload = try await readClient.execute(
+        ArtifactPayload.self,
+        operationName: "P031ArtifactPayload",
+        document: documents.artifactPayload,
+        variables: ["artifactId": .string(artifactID)]
+      )
+      guard let artifact = payload.artifact else {
+        ForgeLogger.ui.error(
+          "P031ArtifactPayload missing artifact artifactID=\(artifactID)"
+        )
+        throw P031GraphQLReadBoundaryError.missingData("P031ArtifactPayload")
+      }
+      ForgeLogger.ui.info(
+        "P031ArtifactPayload response artifactID=\(artifact.id) payloadState=\(artifact.payloadAvailabilityState.rawValue) hasPayload=\((artifact.payloadText?.isEmpty == false)) reason=\(artifact.payloadUnavailableReasonCode?.rawValue ?? "nil") debug=\(artifact.serverDebugDetail ?? "nil")"
+      )
+      return artifact
+    } catch {
+      ForgeLogger.ui.error(
+        "P031ArtifactPayload failed artifactID=\(artifactID) error=\(String(describing: error))"
+      )
+      throw error
+    }
   }
 
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel] {
@@ -1973,6 +2028,10 @@ struct P031GraphQLWorkflowReadStore<
     let artifacts: [P031ArtifactReadModel]
   }
 
+  private struct ArtifactPayload: Decodable {
+    let artifact: P031ArtifactReadModel?
+  }
+
   private struct ReportMetadataPayload: Decodable {
     let artifacts: [P031ReportMetadataReadModel]
   }
@@ -2059,6 +2118,20 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
 
   func fetchArtifacts(runID: String) async throws -> [P031ArtifactReadModel] {
     artifactsByRunID[runID, default: []]
+  }
+
+  func fetchArtifactPayload(artifactID: String) async throws -> P031ArtifactReadModel {
+    if let artifact = artifactsByRunID.values.lazy.flatMap({ $0 }).first(where: {
+      $0.id == artifactID
+    }) {
+      return artifact
+    }
+    if let artifact = runDetailsByRunID.values.lazy.flatMap({ $0.artifacts }).first(where: {
+      $0.id == artifactID
+    }) {
+      return artifact
+    }
+    throw P031GraphQLReadBoundaryError.missingData("P031ArtifactPayload")
   }
 
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel] {
@@ -3585,8 +3658,18 @@ enum P031ArtifactViewerPresenter {
     let preparedPreview: ArtifactPreparedPreview?
     switch artifact.payloadAvailabilityState {
     case .metadataOnly, .payloadDeferred:
-      renderMode = .metadataOnly
-      preparedPreview = nil
+      if let payloadText, hasPayload {
+        let preview = makePreparedPreview(
+          forPayload: payloadText,
+          normalizedFormat: normalizedFormat,
+          artifactName: artifact.name
+        )
+        renderMode = Self.renderMode(forIntent: preview.intent)
+        preparedPreview = preview
+      } else {
+        renderMode = .metadataOnly
+        preparedPreview = nil
+      }
     case .generating, .unavailable:
       renderMode = .unavailable
       preparedPreview = nil
@@ -4137,6 +4220,23 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
         currentFreshness: currentFreshness,
         checkedAt: checkedAt
       )
+    }
+  }
+
+  nonisolated func loadArtifactPreview(artifactID: String) async -> P031ArtifactViewerPresentation? {
+    ForgeLogger.ui.info("P031 artifact preview load start artifactID=\(artifactID)")
+    do {
+      let artifact = try await store.fetchArtifactPayload(artifactID: artifactID)
+      let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+      ForgeLogger.ui.info(
+        "P031 artifact preview load success artifactID=\(artifactID) payloadState=\(presentation.payloadState.rawValue) renderMode=\(String(describing: presentation.renderMode)) hasPreview=\((presentation.preparedPreview != nil)) reason=\(presentation.unavailableReason ?? "nil")"
+      )
+      return presentation
+    } catch {
+      ForgeLogger.ui.error(
+        "P031 artifact preview load failed artifactID=\(artifactID) error=\(String(describing: error))"
+      )
+      return nil
     }
   }
 

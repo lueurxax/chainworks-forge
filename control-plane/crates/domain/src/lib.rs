@@ -12,13 +12,13 @@ pub mod lifecycle;
 pub mod main_sync;
 pub mod mediation;
 pub mod provider;
+pub mod retry_instruction;
 pub mod run;
 pub mod session;
 pub mod stage;
 pub mod steward;
 pub mod validation;
 pub mod workflow_conflict;
-pub mod retry_instruction;
 pub mod xcode_runtime;
 
 // P029: PrincipalClass is canonically defined in domain::commands.

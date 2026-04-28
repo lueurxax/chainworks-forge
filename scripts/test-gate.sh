@@ -1975,6 +1975,8 @@ PY
       "record_phase_c_lead_inventory_external_catalog_tx"
       "record_mediation_late_output_ignored_tx"
       "record_mediation_retry_budget_exhausted_tx"
+      "record_phase_b_dogfood_mediation_completion_rate_tx"
+      "record_phase_b_dogfood_operator_guidance_sufficient_tx"
     )
     for h in "${P017_R4_HELPERS[@]}"; do
       if ! grep -q "$h" "$ROOT_DIR/control-plane/crates/db/src/repos/workflow_conflicts.rs"; then
@@ -1987,6 +1989,9 @@ PY
       "p017_report_readback_completeness_metric_emits"
       "p017_phase_c_lead_inventory_external_catalog_metric_emits"
       "p017_mediation_late_output_ignored_metric_emits"
+      "p017_mediation_retry_budget_exhausted_metric_emits"
+      "p017_phase_b_dogfood_mediation_completion_rate_metric_emits"
+      "p017_phase_b_dogfood_operator_guidance_sufficient_metric_emits"
     )
     for t in "${P017_R4_TESTS[@]}"; do
       if ! grep -q "$t" "$OPS_001_DB_PATH"; then
@@ -2008,6 +2013,15 @@ PY
     fi
     if ! grep -q "record_mediation_late_output_ignored_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
       die "P017 R4 OPS-002: mediation_late_output_ignored_total has no production caller"
+    fi
+    if ! grep -q "record_mediation_retry_budget_exhausted_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R6 OPS-001: mediation_retry_budget_exhausted_total has no production caller"
+    fi
+    if ! grep -q "record_phase_b_dogfood_mediation_completion_rate_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R6 OPS-001: phase_b_dogfood_mediation_completion_rate has no production caller"
+    fi
+    if ! grep -q "record_phase_b_dogfood_operator_guidance_sufficient_tx" "$ROOT_DIR/control-plane/crates/engine/src/command_handler.rs"; then
+      die "P017 R6 OPS-001: phase_b_dogfood_operator_guidance_sufficient_total has no production caller"
     fi
 
     # ── R5 closure guards (API-003 + REL-002 + OPS-003) ────────────────
@@ -2037,6 +2051,9 @@ PY
     fi
     if ! grep -q "update_attempt_attribution_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
       die "P017 R5 REL-002: executor must call update_attempt_attribution_tx (transactional variant)"
+    fi
+    if ! grep -q "artifacts::insert_tx(&mut completion_tx" "$ROOT_DIR/control-plane/crates/engine/src/executor.rs"; then
+      die "P017 R6 REL-001: mediation transcript artifact row must be inserted inside mediation.complete_with_attribution tx"
     fi
     # OPS-003: 4 new metric helpers + production callers + tests.
     P017_R5_HELPERS=(

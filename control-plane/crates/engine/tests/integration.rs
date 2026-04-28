@@ -252,11 +252,11 @@ fn make_agent_execution(
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     }
 }
 
@@ -6945,11 +6945,11 @@ sys.exit(0)
         owner_id: None,
         lead_mediation_record_id: None,
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -9731,11 +9731,11 @@ async fn p017_mediation_cancel_run_cascade() {
         owner_id: Some(mediation_id.clone()),
         lead_mediation_record_id: Some(mediation_id.clone()),
         origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
     };
     agent_executions::insert(&pool, &mediation_execution)
         .await
@@ -9815,11 +9815,10 @@ async fn p017_mediation_cancel_run_cascade() {
     engine::cancellation::begin_settlement(&pool, run_id, now)
         .await
         .expect("idempotent begin_settlement");
-    let mediation_again =
-        db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
-            .await
-            .expect("find mediation")
-            .expect("mediation row");
+    let mediation_again = db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+        .await
+        .expect("find mediation")
+        .expect("mediation row");
     assert_eq!(
         mediation_again.status,
         domain::mediation::LeadMediationStatus::Canceled,
@@ -9917,13 +9916,12 @@ async fn p017_mediation_execution_fields_equivalence() {
 
     // ── Property 1: direct identity ─────────────────────────────────────
     // For stage-owned execution, run_id is recoverable via stage_executions.
-    let stage_run_id_via_join = sqlx::query_scalar::<_, String>(
-        "SELECT run_id FROM stage_executions WHERE id = ?",
-    )
-    .bind(stage_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("query stage run_id");
+    let stage_run_id_via_join =
+        sqlx::query_scalar::<_, String>("SELECT run_id FROM stage_executions WHERE id = ?")
+            .bind(stage_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("query stage run_id");
     assert_eq!(
         stage_run_id_via_join,
         run_id.to_string(),
@@ -9932,13 +9930,12 @@ async fn p017_mediation_execution_fields_equivalence() {
 
     // For mediation-owned execution(s), run_id is recoverable via
     // lead_conflict_mediations.run_id keyed on lead_mediation_record_id.
-    let med_run_id_via_join = sqlx::query_scalar::<_, String>(
-        "SELECT run_id FROM lead_conflict_mediations WHERE id = ?",
-    )
-    .bind(&mediation_id)
-    .fetch_one(&pool)
-    .await
-    .expect("query mediation run_id");
+    let med_run_id_via_join =
+        sqlx::query_scalar::<_, String>("SELECT run_id FROM lead_conflict_mediations WHERE id = ?")
+            .bind(&mediation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query mediation run_id");
     assert_eq!(
         med_run_id_via_join,
         run_id.to_string(),
@@ -9967,12 +9964,10 @@ async fn p017_mediation_execution_fields_equivalence() {
             );
         }
     }
-    let mediation_after =
-        db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
-            .await
-            .expect("find mediation")
-            .expect("mediation row")
-            ;
+    let mediation_after = db::repos::lead_conflict_mediations::find_by_id(&pool, &mediation_id)
+        .await
+        .expect("find mediation")
+        .expect("mediation row");
     assert_eq!(
         mediation_after.status,
         domain::mediation::LeadMediationStatus::Canceled,
