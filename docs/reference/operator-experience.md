@@ -20,22 +20,23 @@ Related stable docs:
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
+- [ui-action-boundary.md](ui-action-boundary.md)
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 
 ## Scope
 
-This reference covers the **read-only** and repo-agnostic operator layer (per P031-r18):
+This reference covers the primarily **read-side** and repo-agnostic operator layer (per the [UI action boundary](ui-action-boundary.md)):
 
 - `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries (metadata inspection only)
-- diagnostic-only guidance for approvals and recovery
+- diagnostic-only guidance for non-approval actions; in-app resolution for approvals
 - deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does **NOT** define in-app write/recovery. Every write control (Start, Cancel, Retry, Resolve Approval) is removed or replaced with diagnostic guidance for external workflows.
+It does **NOT** define broad in-app write/recovery. Recovery, retry, reset, compact, run start/cancel, clone, experiment, runtime, and context actions remain external MCP-only actions. Approval resolution is the only exception, supported via governed GraphQL mutations.
 
 ## Runs Home
 
@@ -77,9 +78,10 @@ The macOS app keeps typed parity DTOs for these payloads and redacts raw reposit
 evidence by default. Dedicated UI affordances must consume these artifacts and
 projections; they are not the source of routing truth.
 
-**Actions are diagnostic-only:**
+**Actions are primarily diagnostic:**
 - `Open` is available for drill-down.
-- Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
+- `Open gate` is an active in-app control for resolving approvals via governed GraphQL mutations.
+- Primary buttons for `Recover` or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
 
 ## Scheduler Health and Backpressure
 
@@ -192,13 +194,17 @@ Report content includes:
 
 ### Recovery
 
-The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
+The governed thin UI does not execute non-approval recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing MCP-owned workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
 Diagnostic guidance is provided for:
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
 4. `Clone Run`
+
+Approval resolution is the exception: approval surfaces are operator-actionable
+through GraphQL approval mutations. Recovery, retry, reset, compact, run
+start/cancel, clone, and runtime/context changes remain MCP-only.
 
 **Workflow Conflict Actions (Read-Only):**
 - **Mediation Progress**: View sanitized live status updates (queued,

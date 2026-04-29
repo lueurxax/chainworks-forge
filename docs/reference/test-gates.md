@@ -651,9 +651,46 @@ Command:
 Important:
 
 - `p031` is accepted as an alias
-- the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary or if required Phase 0 artifacts are missing or invalid
+- the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary plus the approval-only mutation exception, or if required Phase 0 artifacts are missing or invalid
 - later Phase 0d / Phase 3 evidence entries may remain blocked while implementation is in progress, but the manifest must not mark blocked evidence as `ready`
 - dogfood sign-off evidence is outside this gate; this gate only requires the Phase 3 dogfood checklist artifact to exist
+
+### `proposal-072|p072`
+
+Historical gate alias for the implemented UI action boundary: approval-only GraphQL UI mutation boundary and MCP-only command routing.
+
+Scope:
+
+- composes `proposal-031`
+- Swift unit tests for the governed GraphQL request boundary, including `approveApproval` / `rejectApproval`
+- Rust domain/auth tests for the UI action routing registry and principal surface policies
+- Rust GraphQL tests proving `ui_operator` can execute only approval mutations and is denied non-approval command mutations
+- docs/inventory checks proving P031 is reconciled with the approval-only exception
+
+Use when:
+
+- changing governed SwiftUI approval actions
+- changing GraphQL mutation authorization or principal surface policies
+- changing the P031/static UI action boundary or inventory
+- changing docs that describe whether UI approvals are diagnostic-only or actionable
+
+Host policy:
+
+- Python 3, local Rust toolchain, and local macOS Swift test toolchain required
+- no live daemon, Xcode UI tests, simulator, GitHub PR review, or network access required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-072
+```
+
+Important:
+
+- `p072` is accepted as an alias; the historical gate name is retained for stable automation compatibility
+- non-approval operator commands remain MCP-only for governed UI
+- the gate intentionally does not inspect or require GitHub/Copilot PR review disposition
+- SwiftUI may use GraphQL mutations only for `approveApproval` and `rejectApproval`
 
 ### `proposal-031-readiness|p031-readiness`
 
@@ -787,12 +824,12 @@ Scope:
 - principal-table bootstrap (owner-only `0o600` file mode on Unix, one-time token log, fail-closed on empty table)
 - bearer auth on MCP HTTP (`POST /mcp`), MCP stdio (`initialize.params.clientInfo.principal_token`), GraphQL HTTP (`POST /graphql`), and GraphQL WebSocket (`/graphql/ws` via `on_connection_init`)
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`, including the Steward trio policy (`steward.run_analysis` operator-only, `steward.list_analyses` + `steward.get_analysis` operator/observer, agent excluded)
-- GraphQL mutation class policy for current legacy compatibility resolvers (`startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`) until P072 retires or quarantines them; target SwiftUI GraphQL mutations are approval-only (`approveApproval`, `rejectApproval`)
+- GraphQL mutation class policy: UI/default principals may execute only `approveApproval` and `rejectApproval`; non-approval command mutations are MCP-only
 - `command_journal` caller metadata (`caller_surface`, `caller_principal_id`, `caller_principal_class`, `caller_tool`) populated per MCP command tool and per GraphQL mutation
 - the §8.1 redaction matrix (one test per `Command` variant decision)
-- `journal_id` surfacing inside `content[0].text` on MCP command tools and as `journalId: ID!` on every GraphQL mutation payload wrapper
-- typed `DeliveryPreflight` object on blocked `startRun`
-- cross-surface parity: a GraphQL mutation and an MCP command tool targeting the same typed `Command` produce identical run outcomes
+- `journal_id` surfacing inside `content[0].text` on MCP command tools and as `journalId: ID!` on approval GraphQL mutation payload wrappers
+- typed `DeliveryPreflight` object on MCP `runs.start` blocked preflight responses
+- command write-path boundary: non-approval operator commands route through MCP, while GraphQL remains read/subscription plus approval-only mutation surface
 - dogfood `.mcp.json` / `CLAUDE.md` consistency (repo-root `.mcp.json` registers `chainworks-control-plane` with `Authorization: Bearer ${CHAINWORKS_MCP_TOKEN}`; `CLAUDE.md` documents the env var and URL)
 - full `cargo test --workspace` regression after the focused inventory
 
@@ -1263,11 +1300,6 @@ Command:
 ### `proposal-060|p060`
 
 Deterministic reviewer routing and expanded reviewer catalog gate.
-
-This retained historical gate alias validates the implemented routing contract
-documented in
-[`workflow-execution-engine.md#system-tasks-and-deterministic-proposal-review-routing`](workflow-execution-engine.md#system-tasks-and-deterministic-proposal-review-routing).
-The retired proposal file is not the operational source of truth.
 
 Scope:
 

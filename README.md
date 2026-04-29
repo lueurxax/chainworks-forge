@@ -76,7 +76,7 @@ Today the app exposes these top-level operator surfaces through the thin GraphQL
 
 - `Runs Home` for active, blocked, running, and completed runs (GraphQL-only)
 - `Ideas` for capturing and managing work (Create Idea is outside the governed thin UI write path)
-- `Approvals` for pending human decisions (diagnostic-only until a separate write transport is approved)
+- `Approvals` for pending human decisions (supported in-app via GraphQL write transport; diagnostic-only for external resolution)
 - `Agent Catalog` for inspecting the resolved agent catalog
 - `Workflow Inspector` for YAML workflow inspection and validation
 - `Pilot Readiness` for readiness and sign-off support

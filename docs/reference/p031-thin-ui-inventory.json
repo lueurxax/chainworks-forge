@@ -34,7 +34,9 @@
         "P031ReportMetadata",
         "P031RunStatusChanged",
         "P031DaemonStatus",
-        "P031DaemonStatusChanged"
+        "P031DaemonStatusChanged",
+        "P072ApproveApproval",
+        "P072RejectApproval"
       ]
     }
   ],
@@ -158,8 +160,86 @@
     {
       "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
       "group_id": "graphql_mutations",
-      "line_contains": "must not execute GraphQL mutation operation",
+      "line_contains": "must not execute forbidden GraphQL mutation operation",
       "reason": "The request validator names GraphQL mutation as a rejected operation kind."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "graphql_mutations",
+      "line_contains": "mutation P072ApproveApproval",
+      "reason": "The UI action boundary allows the governed UI to execute the approval-only approveApproval mutation."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "graphql_mutations",
+      "line_contains": "mutation P072RejectApproval",
+      "reason": "The UI action boundary allows the governed UI to execute the approval-only rejectApproval mutation."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "raw_truth_probing",
+      "line_contains": "String(contentsOf: url, encoding: .utf8)",
+      "reason": "The UI reads a bundled daemon build-sha resource, not workflow truth or run-owned artifacts."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"startRun\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"retryStage\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"cancelRun\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"resetSession\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"resumeRun\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"cloneRun\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"launchExperiment\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"runtimeHealth\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"agentReset\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
+    },
+    {
+      "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",
+      "group_id": "local_write_fallback",
+      "line_contains": "\"resetAgent\",",
+      "reason": "The UI action boundary validator enumerates forbidden GraphQL command mutation fields as rejection data."
     },
     {
       "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",

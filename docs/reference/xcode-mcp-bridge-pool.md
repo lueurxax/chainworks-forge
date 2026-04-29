@@ -4,6 +4,8 @@ Stable reference for the implemented Xcode MCP bridge pool behavior.
 
 The bridge pool is the Chainworks-owned boundary for Xcode-capable ACP agents. It keeps provider fake-home isolation intact while moving Xcode MCP and selected Xcode shell execution through daemon-owned host-user services.
 
+Status: scoped broker/readback signed off. P051 is no longer an active feature-expansion lane; broad production packaged-daemon validation belongs to the release/packaging host lane. Do not expand Xcode bridge scope from this reference without a new proposal.
+
 ## Scope
 
 This reference covers:

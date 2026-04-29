@@ -36,7 +36,6 @@ At the current baseline, the product includes:
 - an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
 - segmented run surfaces with deterministic pane routing, a focused timeline inspector, and shared hierarchical artifact browsing,
 - a proposal-loop feedback-fidelity layer with review-corpus bundling, backlog carry-forward, writer coverage, and targeted rereview,
-- deterministic proposal-review routing with selection-plan receipts, dynamic reviewer fan-out, and selected-review corpus bundling,
 - an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
@@ -80,6 +79,7 @@ Use these reference docs as the current source of truth:
 | Test strategy and gates | [test-suite-architecture.md](test-suite-architecture.md), [test-gates.md](test-gates.md), [agent-ui-test-execution.md](agent-ui-test-execution.md) |
 | Design-system adoption | [design-system-and-brand-application.md](design-system-and-brand-application.md) |
 | UI/brand design authority | [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) |
+| UI action boundary | [ui-action-boundary.md](ui-action-boundary.md) |
 | GraphQL read contract | [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) |
 
 ## Canonical product boundaries
@@ -97,25 +97,19 @@ It is an operator surface where the engineer should be able to answer:
 
 That boundary is owned by [operator-experience.md](operator-experience.md).
 
-### UI Boundary
+### UI Action Boundary
 
-Per P031, the current implemented macOS UI stop-state is a **thin read-only client** for production workflow truth.
+The macOS UI is a GraphQL-only observer and approval console.
 
-Current implemented baseline:
+Current baseline:
 
 - production workflow truth is read from GraphQL projections,
 - UI state is limited to presentation, server-derived caches, and freshness handling,
-- current P031 approval surfaces are diagnostic/read-only and use external resolution workflows,
-- governed UI screens provide diagnostic identifiers and instructions for unavailable or external workflows.
+- UI mutations are limited to `approveApproval` and `rejectApproval`,
+- all non-approval operator actions are MCP-only,
+- governed UI screens provide diagnostic identifiers and instructions for MCP-owned workflows when an action is external.
 
-Target-state action boundary:
-
-- SwiftUI remains GraphQL-only,
-- approval decisions are the only allowed SwiftUI GraphQL mutations,
-- Start, Cancel, Retry, Create Idea, reset, compaction, recovery, cloning, experiment, and other non-approval operational commands remain MCP-only,
-- P031 is not sufficient Phase 3 or release-closeout evidence for this target boundary; P072 owns the approval-only mutation contract and action-routing matrix.
-
-The read boundary is owned by [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md). The target action boundary is owned by [../proposals/072-operator-action-routing-and-ui-mutation-boundary.md](../proposals/072-operator-action-routing-and-ui-mutation-boundary.md).
+That boundary is owned by [ui-action-boundary.md](ui-action-boundary.md), with read-shape details in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
 
 ### Provider boundary
 

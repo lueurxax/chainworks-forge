@@ -5,7 +5,7 @@
 | Date | 2026-04-25 |
 | Status | Correction / Amendment |
 | Corrects | `046-session-management-graphql-api.md` |
-| Depends on | Proposal 072, Proposal 068 |
+| Depends on | [UI action boundary](../reference/ui-action-boundary.md), Proposal 068 |
 | Goal | Correct P046 so GraphQL exposes session lineage inspection, health, KPIs, and subscriptions, but does not expose session reset mutations. Reset and reset-agent-session remain MCP-only. |
 
 ---
@@ -14,7 +14,7 @@
 
 P046 currently includes an enhancement to a `resetSession` GraphQL mutation.
 
-That conflicts with the target boundary:
+That conflicts with the implemented UI action boundary:
 
 - SwiftUI uses GraphQL only,
 - SwiftUI mutations are approval-only,

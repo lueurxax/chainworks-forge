@@ -11,6 +11,7 @@ pub mod ids;
 pub mod lifecycle;
 pub mod main_sync;
 pub mod mediation;
+pub mod operator_action_routing;
 pub mod provider;
 pub mod retry_instruction;
 pub mod routing;

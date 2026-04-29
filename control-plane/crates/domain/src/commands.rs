@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::LegacyBroadDiscoveryPolicy;
-use crate::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
+use crate::ids::{AgentExecutionId, ApprovalId, IdeaId, RunId, StageExecutionId};
 use crate::mediation::MediationConfirmationDecision;
 
 // ── P029: Canonical PrincipalClass definition (owned by domain) ────────
@@ -45,6 +45,12 @@ pub enum Command {
     /// P017 Phase B: Resolve a lead mediation confirmation via the
     /// engine-owned settlement boundary.
     ResolveLeadMediationConfirmation(ResolveLeadMediationConfirmationCmd),
+    /// P072: Converged stage-approval command keyed by approval_id.
+    /// Both GraphQL (approveApproval / rejectApproval) and MCP
+    /// (approvals.resolve with subject_kind == stage_approval) route
+    /// through this command. CallerContext carries identity; the command
+    /// carries only domain data and server-resolved provenance.
+    ResolveApproval(ResolveApprovalCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -252,6 +258,51 @@ pub struct ResolveLeadMediationConfirmationCmd {
     pub comment: Option<String>,
     pub conflict_fingerprint: String,
     pub idempotency_key: String,
+}
+
+// ── P072: Converged approval resolution command ─────────────────────────
+
+/// Decision for `ResolveApprovalCmd`. Maps directly to the two GraphQL
+/// mutations: `approveApproval` → `Approved`, `rejectApproval` → `Rejected`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolutionDecision {
+    Approved,
+    Rejected,
+}
+
+impl std::fmt::Display for ApprovalResolutionDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApprovalResolutionDecision::Approved => write!(f, "approved"),
+            ApprovalResolutionDecision::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+impl std::str::FromStr for ApprovalResolutionDecision {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "approved" | "granted" => Ok(ApprovalResolutionDecision::Approved),
+            "rejected" => Ok(ApprovalResolutionDecision::Rejected),
+            other => Err(format!("Unknown ApprovalResolutionDecision: {other}")),
+        }
+    }
+}
+
+/// P072: Converged stage-approval command. `approval_id` is the canonical
+/// northbound identity; `run_id` and `stage_id` are server-resolved
+/// provenance retained for command_journal auditability.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolveApprovalCmd {
+    pub approval_id: ApprovalId,
+    pub decision: ApprovalResolutionDecision,
+    pub rationale: Option<String>,
+    /// Server-resolved from approval_id — not supplied by caller.
+    pub run_id: RunId,
+    /// Server-resolved from approval_id — not supplied by caller.
+    pub stage_id: String,
 }
 
 // ── P029: Caller identity for audit journaling ──────────────────────────

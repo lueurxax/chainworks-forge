@@ -5,7 +5,7 @@
 | Date | 2026-04-25 |
 | Status | Correction / Amendment |
 | Corrects | `038-run-compaction-artifact-governance-and-canonical-snapshot-maintenance.md` |
-| Depends on | Proposal 072 |
+| Depends on | [UI action boundary](../reference/ui-action-boundary.md) |
 | Goal | Correct P038 so launching `Compact Run` is an MCP-only operational command. SwiftUI may inspect compaction status and reports through GraphQL, but may not initiate compaction. |
 
 ---
@@ -14,7 +14,7 @@
 
 P038 currently includes a GraphQL mutation for UI compaction.
 
-That conflicts with the target boundary:
+That conflicts with the implemented UI action boundary:
 
 - SwiftUI uses GraphQL only,
 - but SwiftUI mutations are approval-only,

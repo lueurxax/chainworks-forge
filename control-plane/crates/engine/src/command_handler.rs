@@ -150,6 +150,7 @@ impl CommandJournalEntry {
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
             Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
             Command::ResolveLeadMediationConfirmation(_) => "ResolveLeadMediationConfirmation",
+            Command::ResolveApproval(_) => "ResolveApproval",
         };
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
@@ -171,6 +172,7 @@ impl CommandJournalEntry {
             Command::RunStewardAnalysis(_) => None,
             Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
             Command::ResolveLeadMediationConfirmation(c) => Some(c.run_id.to_string()),
+            Command::ResolveApproval(c) => Some(c.run_id.to_string()),
         };
         let principal_class = caller.principal_class.to_string();
 
@@ -200,6 +202,7 @@ impl CommandJournalEntry {
                 | "CancelRun"
                 | "ResetSession"
                 | "ResolveLeadMediationConfirmation"
+                | "ResolveApproval"
         )
     }
 }
@@ -610,6 +613,11 @@ impl CommandHandler {
         ) && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
+        }
+        if matches!(&cmd, Command::ResolveApproval(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ResolveApproval requires operator principal");
         }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
@@ -2381,6 +2389,222 @@ impl CommandHandler {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
                 })
+            }
+
+            // ── P072: Converged approval resolution by approval_id ──────
+            Command::ResolveApproval(c) => {
+                use domain::commands::ApprovalResolutionDecision;
+
+                let now = Utc::now();
+                let decision = match c.decision {
+                    ApprovalResolutionDecision::Approved => ApprovalDecision::Granted,
+                    ApprovalResolutionDecision::Rejected => ApprovalDecision::Rejected,
+                };
+
+                let has_post_tasks = if decision == ApprovalDecision::Granted {
+                    self.check_has_post_approval_tasks(c.run_id, &c.stage_id)
+                        .await
+                } else {
+                    false
+                };
+
+                let tx_started = Instant::now();
+                let mut tx =
+                    db::pool::begin_immediate_with_retry(&self.pool, "command.ResolveApproval")
+                        .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+
+                // Verify the approval exists and is still actionable.
+                let approval = approvals::find_by_id_tx(&mut tx, c.approval_id).await?;
+                let approval = match approval {
+                    Some(a)
+                        if matches!(
+                            a.decision,
+                            ApprovalDecision::Pending | ApprovalDecision::Requested
+                        ) =>
+                    {
+                        a
+                    }
+                    Some(_) => {
+                        let error = anyhow!(
+                            "Approval {} is not actionable (already resolved)",
+                            c.approval_id
+                        );
+                        command_journal::fail_entry_tx(
+                            &mut tx,
+                            &journal.id,
+                            Utc::now(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        return Err(error);
+                    }
+                    None => {
+                        let error = anyhow!("Approval {} not found", c.approval_id);
+                        command_journal::fail_entry_tx(
+                            &mut tx,
+                            &journal.id,
+                            Utc::now(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        return Err(error);
+                    }
+                };
+                if approval.run_id != c.run_id || approval.stage_id != c.stage_id {
+                    let error = anyhow!(
+                        "Approval {} provenance mismatch: command run/stage {}:{} but approval belongs to {}:{}",
+                        c.approval_id,
+                        c.run_id,
+                        c.stage_id,
+                        approval.run_id,
+                        approval.stage_id
+                    );
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                    return Err(error);
+                }
+                let authoritative_run_id = approval.run_id;
+                let authoritative_stage_id = approval.stage_id.clone();
+
+                approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
+                    .await?;
+
+                let mut stage_status_event = None;
+                let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
+                let run_stages = stages::list_by_run_tx(&mut tx, authoritative_run_id).await?;
+
+                if decision == ApprovalDecision::Granted {
+                    if let Some(stage) = run_stages.iter().find(|s| {
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
+                    }) {
+                        if stage.stage_type.as_deref() == Some("manual_gate") {
+                            if has_post_tasks {
+                                stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
+                                    .await?;
+                                stage_status_event = Some((stage.id, StageStatus::Running));
+                            } else {
+                                stages::settle_tx(
+                                    &mut tx,
+                                    stage.id,
+                                    StageSettlementKind::Completed,
+                                    now,
+                                )
+                                .await?;
+                                stage_status_event = Some((stage.id, StageStatus::Completed));
+                            }
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Running));
+                        }
+                    }
+                } else {
+                    // Rejection path — mirrors RejectStage logic.
+                    if let Some(stage) = run_stages.iter().find(|s| {
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
+                    }) {
+                        if stage.stage_type.as_deref() == Some("manual_gate") {
+                            stages::settle_tx(
+                                &mut tx,
+                                stage.id,
+                                StageSettlementKind::Completed,
+                                now,
+                            )
+                            .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Completed));
+                            should_enqueue_advance = true;
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Blocked));
+                        }
+                    }
+                }
+
+                if should_enqueue_advance {
+                    work_items::enqueue_tx(
+                        &mut tx,
+                        &WorkItem {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            kind: WorkItemKind::AdvanceRun,
+                            payload_json: serde_json::json!({
+                                "run_id": authoritative_run_id.to_string()
+                            })
+                            .to_string(),
+                            status: WorkItemStatus::Pending,
+                            run_id: Some(authoritative_run_id),
+                            stage_id: None,
+                            created_at: now,
+                            scheduled_at: now,
+                            attempt_count: 0,
+                            last_error: None,
+                        },
+                    )
+                    .await?;
+                }
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ResolveApproval",
+                    0,
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                self.work_queue
+                    .publish_scheduler_notification(scheduler_refresh);
+                if let Some((stage_execution_id, status)) = stage_status_event {
+                    let _ = self.events.send(DomainEvent::StageStatusChanged {
+                        run_id: authoritative_run_id,
+                        stage_execution_id,
+                        status,
+                    });
+                }
+                let _ = self.events.send(DomainEvent::ApprovalResolved {
+                    approval_id: approval.id,
+                    decision,
+                });
+                projections::rebuild_all_for_run(&self.pool, authoritative_run_id).await?;
+
+                let result = match c.decision {
+                    ApprovalResolutionDecision::Approved => CommandResult::StageApproved {
+                        approval_id: approval.id,
+                    },
+                    ApprovalResolutionDecision::Rejected => CommandResult::StageRejected {
+                        approval_id: approval.id,
+                    },
+                };
+                Ok(result)
             }
         }
     }

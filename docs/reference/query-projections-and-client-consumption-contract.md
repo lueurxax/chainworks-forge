@@ -11,30 +11,27 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 | Alias | `./scripts/test-gate.sh p043` |
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
 | Historical proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
-| Scope | Rust control-plane GraphQL **read** contract for thin macOS UI consumption. Non-approval command/control is explicitly NOT part of this contract. |
-| Current UI boundary | Current P031 stop-state: thin macOS UI read-only over server-owned projections. Target post-P072: GraphQL read/subscription plus approval-only mutations. |
+| Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. See [ui-action-boundary.md](ui-action-boundary.md). |
+| Current UI boundary | Thin macOS UI (read-side and human-gate mutation consumer over server-owned projections). |
 | Stabilization owners | P032 for release/dogfood/stabilization evidence; P036 for visual/navigation restoration over this read model. |
 
 ## Thin UI Boundary
 
-The original P043/P031 gate labels are retained for compatibility. This document remains the canonical read contract; it is not the action-routing contract for all future UI writes.
+The original P043/P031 gate labels are retained for compatibility. The active content below is the current thin UI boundary:
 
-Current implemented P031 stop-state: the macOS thin UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations.
-
-Target-state boundary after P072: SwiftUI still uses GraphQL only, but approval decisions are the sole allowed GraphQL mutations. All non-approval operational commands remain MCP-only and outside this read contract.
+The macOS thin UI is a **read-side consumer and human-gate resolver** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and resolves pending approvals via governed GraphQL mutations. The short canonical action boundary lives in [ui-action-boundary.md](ui-action-boundary.md).
 
 **PROHIBITED ACTIONS for governed macOS UI:**
 - It does **NOT** issue MCP mutations.
-- It does **NOT** use non-approval GraphQL mutations.
-- In the current P031 stop-state, it does **NOT** use any GraphQL mutations; P072 owns the approval-only exception.
+- It does **NOT** use GraphQL mutations EXCEPT for the `approveApproval` and `rejectApproval` human-gate path.
 - It does **NOT** use local workflow mutation fallback.
 - It does **NOT** probe raw truth from SwiftData or filesystem (except for authorized artifact display).
 
-MCP command/control for non-approval operations — `runs.start`, `runs.cancel`, `stages.retry`, `ideas.create`, `steward.run_analysis` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in CLI / automation / scripted clients) or by separate follow-up transport proposals. Approval resolution is currently external in the P031 stop-state; after P072, SwiftUI approval decisions are approval-only GraphQL mutations while MCP remains the external control-plane path. A client that issues non-approval MCP mutations ("command UI") is out of scope for the governed thin UI and for this reference document.
+MCP command/control — `runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `ideas.create`, `steward.run_analysis` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in CLI / automation / scripted clients) or by separate follow-up transport proposals. A client that issues MCP mutations ("command UI") is out of scope for the governed thin UI and for this reference document.
 
 Wherever this document mentions "controls", "actions", "mutations", or "command completion" it refers to the generic client / operator system, not to the governed read-only thin UI. For the current thin UI those rules apply vacuously: no mutation surfaces to enable/disable, no command-completion refresh to perform. Rules for freshness rendering, read-only evidence, subscription consumption, and projection ownership remain in force for all future UI work.
 
-Downstream proposal rule: new macOS UI features must start from this thin UI boundary. They may add server-owned GraphQL read fields, projections, subscriptions, read-side presentation state, and, only under P072, approval-only GraphQL mutations. They must not restore Swift-local workflow truth, UI MCP calls, non-approval GraphQL mutations, raw artifact scans as truth, or old local-orchestrator fallback paths unless a later approved action-routing proposal explicitly changes this boundary.
+Downstream proposal rule: new macOS UI features must start from this thin UI boundary. They may add server-owned GraphQL read fields, projections, subscriptions, and read-side presentation state. They must not restore Swift-local workflow truth, UI MCP calls, GraphQL mutations, raw artifact scans as truth, or old local-orchestrator fallback paths unless a later approved write-transport proposal explicitly changes this boundary.
 
 ## Thin UI Schema Contract
 
@@ -46,7 +43,7 @@ Every visible governed workflow field must have one named GraphQL source or one 
 | --- | --- | --- |
 | `freshnessState` | `FreshnessState` | `live`, `refreshing`, `projection_lag`, `stale`, `unavailable`, `unauthorized`. |
 | `disabledReasonCode` | `DisabledReasonCode` | `WRITE_PATH_NOT_AVAILABLE`, `MANAGED_OUTSIDE_UI`, `AMBIGUOUS_APPROVAL_IDENTITY`, `STALE_READ`, `PROJECTION_LAG`, `UNAUTHORIZED`, `UNSUPPORTED_ACTION`. |
-| `writePathState` | `WritePathState` | `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
+| `writePathState` | `WritePathState` | `available`, `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
 | `diagnosticId` | `String` | Unique identifier for the row/approval/report used for external write workflows. |
 | `payloadAvailabilityState` | `PayloadAvailabilityState` | `available`, `metadata_only`, `payload_deferred`, `generating`, `unavailable`. |
 | `payloadUnavailableReasonCode` | `PayloadUnavailableReasonCode` | `PAYLOAD_DEFERRED_BY_P031`, `GENERATING`, `NOT_INDEXED`, `NOT_AUTHORIZED`, `NOT_AVAILABLE`, `UNKNOWN`. |
@@ -89,7 +86,7 @@ The client must not infer:
 | Run detail | `run(id:)` with projection enrichment | Canonical run row enriched by `db::repos::projections::find_run_projection` | Implemented | Use projection-backed counters and summaries; show projection lag when projection truth is missing or stale. **P065 expansion**: includes compact retry-instruction provenance. |
 | Stage list / progress | `stages(runId:)` | `db::repos::projections::list_stages_projection` | Implemented | Use projection-owned decision flags; disable dependent actions when `projectionLag` is true. |
 | Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionId:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. **P065 expansion**: includes `retry_instruction` group and delivery status. |
-| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. In the current P031 stop-state, resolution is external and the thin UI renders the inbox read-only. Post-P072, approval decisions are the only allowed SwiftUI GraphQL mutations; all non-approval commands remain MCP-only. |
+| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution is supported via governed GraphQL mutations or operator-side MCP action (`approvals.resolve`). |
 | Artifact viewer | `artifacts(runId:)` | artifact index projection / `db::repos::projections::list_artifacts_projection` | Implemented | Browse the server artifact hierarchy only; direct file open/export may happen only after server selection. |
 | Scheduler health | `schedulerHealthSummary` | `scheduler_health_snapshots` projection | Implemented | Render system-wide capacity, pressure, and latency health. |
 | Startup recovery | `startupRecoverySummary` | `startup_recovery_readbacks` projection | Implemented | Render startup recovery progress, counts, and backpressure state. |
@@ -197,9 +194,9 @@ The control-plane read contract owns server-published facts. The thin macOS UI o
 | Stage list / progress | `stages(runId:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for thin UI consumption. |
 | Stage detail | `stage(id:)` returns projection-enriched decision flags and projection freshness while preserving canonical evidence/recovery payloads. | Sufficient for thin UI consumption. |
 | Missing projection rows | Missing `run_summaries` or `stage_summaries` rows surface as `projectionPresent=false` and `projectionLag=true`, not normal zero/false truth. | Sufficient for projection-lag rendering. |
-| Run status subscription | `runStatusChanged(runId:)` emits projection-enriched run summary and freshness fields. | Sufficient for thin UI event patching. |
-| Stage status subscription | `stageStatusChanged(runId:)` emits projection-enriched stage decision and freshness fields. | Sufficient for thin UI event patching. |
-| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for thin UI event patching. |
+| Run status subscription | `runStatusChanged(runId:)` emits projection-enriched run summary and freshness fields. | Sufficient for P031 event patching. |
+| Stage status subscription | `stageStatusChanged(runId:)` emits projection-enriched stage decision and freshness fields. | Sufficient for P031 event patching. |
+| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for P031 event patching. |
 | Approval inbox | `approvalInbox` is projection-backed. | Sufficient for thin UI consumption. |
 | Artifact viewer | `artifacts(runId:)` | is projection-backed. | Sufficient for thin UI consumption. |
 | Scheduler health | `schedulerHealthSummary` returns global capacity, active counts, oldest queued age, and sustained backpressure state. | Sufficient for thin UI health alerts. |
@@ -249,7 +246,7 @@ Future non-operator read expansion must be explicit in auth/capability policy an
 
 ## Thin UI Consumption Contract
 
-Governed macOS UI surfaces may ship from this contract:
+P031 may ship governed macOS UI surfaces from this contract:
 
 - Runs home;
 - Run detail;
@@ -267,14 +264,16 @@ The macOS thin UI owns the UI-side evidence for the **read-side** client contrac
 - no SwiftData / local-service fallback for workflow truth;
 - subscription patching rules from the "Refresh and subscription posture" section.
 
+Scope boundary: P031 remains a read-only consumer for workflow truth and non-approval commands. The UI action boundary adds only the approval-resolution mutation exception; it does not make P031 responsible for MCP command-control behavior, command receipts, or broad UI writes.
+
 The thin UI boundary does NOT own:
 
 - MCP command-completion refresh behavior (the governed thin UI issues no MCP mutations);
 - disabled-action rendering for destructive commands (the governed thin UI has no action surfaces);
 - "command receipt" displays (no commands);
-- any `runs.start` / `runs.cancel` / `stages.retry` / `ideas.create` UI.
+- any `runs.start` / `runs.cancel` / `approvals.resolve` / `stages.retry` / `ideas.create` UI.
 
-Non-approval command UI belongs to a future command-UI proposal or to operators invoking MCP directly. Approval resolution is read-only in the current P031 stop-state; the target SwiftUI approval decision path is governed by P072, not by this read contract.
+These belong to a future command-UI proposal or to operators invoking MCP directly.
 
 ## Gate and verification
 

@@ -13,8 +13,9 @@ use db::repos::{
     workflow_conflicts,
 };
 use domain::commands::{
-    ApproveStageCmd, CallerContext, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd,
-    RejectStageCmd, RetryStageCmd, StartRunCmd,
+    ApprovalResolutionDecision, ApproveStageCmd, CallerContext, CancelRunCmd, Command,
+    OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResolveApprovalCmd, RetryStageCmd,
+    StartRunCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::events::DomainEvent;
@@ -60,6 +61,14 @@ fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
         .map_err(|_| Error::new("unauthorized"))?;
     if principal.class != auth::PrincipalClass::Operator {
         return Err(Error::new("forbidden"));
+    }
+    // P072: enforce allow_queries surface policy when present.
+    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+        if let Some(allowed) = auth::is_query_allowed_by_surface_policy(table, &principal.id) {
+            if !allowed {
+                return Err(Error::new("forbidden"));
+            }
+        }
     }
     Ok(())
 }
@@ -1111,14 +1120,34 @@ pub enum MutationName {
     RetryStage,
     OverrideLegacyDiscoveryPolicy,
     CancelRun,
+    /// P072: Converged approval mutation by approval_id.
+    ApproveApproval,
+    /// P072: Converged rejection mutation by approval_id.
+    RejectApproval,
+}
+
+impl MutationName {
+    fn graphql_name(self) -> &'static str {
+        match self {
+            MutationName::StartRun => "startRun",
+            MutationName::ApproveStage => "approveStage",
+            MutationName::RejectStage => "rejectStage",
+            MutationName::RetryStage => "retryStage",
+            MutationName::OverrideLegacyDiscoveryPolicy => "overrideLegacyDiscoveryPolicy",
+            MutationName::CancelRun => "cancelRun",
+            MutationName::ApproveApproval => "approveApproval",
+            MutationName::RejectApproval => "rejectApproval",
+        }
+    }
 }
 
 pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     match mutation {
         MutationName::StartRun => domain::CapabilityToolId::RunsStart,
-        MutationName::ApproveStage | MutationName::RejectStage => {
-            domain::CapabilityToolId::ApprovalsResolve
-        }
+        MutationName::ApproveStage
+        | MutationName::RejectStage
+        | MutationName::ApproveApproval
+        | MutationName::RejectApproval => domain::CapabilityToolId::ApprovalsResolve,
         MutationName::RetryStage | MutationName::OverrideLegacyDiscoveryPolicy => {
             domain::CapabilityToolId::StagesRetry
         }
@@ -1126,7 +1155,24 @@ pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     }
 }
 
-fn mutation_allowed(principal: &auth::Principal, mutation: MutationName) -> bool {
+fn mutation_allowed(
+    ctx: &Context<'_>,
+    principal: &auth::Principal,
+    mutation: MutationName,
+) -> bool {
+    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+        if let Some(allowed) = auth::is_mutation_allowed_by_surface_policy(
+            table,
+            &principal.id,
+            mutation.graphql_name(),
+        ) {
+            return allowed && principal.class == auth::PrincipalClass::Operator;
+        }
+        if auth::find_principal_by_id(table, &principal.id).is_some() {
+            return false;
+        }
+    }
+
     auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1
 }
 
@@ -1233,6 +1279,20 @@ pub struct CancelRunPayload {
     pub journal_id: ID,
 }
 
+/// P072: Payload for approveApproval mutation.
+#[derive(SimpleObject)]
+pub struct ApproveApprovalPayload {
+    pub approval: GqlApproval,
+    pub journal_id: ID,
+}
+
+/// P072: Payload for rejectApproval mutation.
+#[derive(SimpleObject)]
+pub struct RejectApprovalPayload {
+    pub approval: GqlApproval,
+    pub journal_id: ID,
+}
+
 #[Object]
 impl MutationRoot {
     async fn start_run(
@@ -1256,7 +1316,7 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(&principal, MutationName::StartRun) {
+        if !mutation_allowed(ctx, &principal, MutationName::StartRun) {
             return Err(Error::new("forbidden"));
         }
 
@@ -1315,7 +1375,7 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(&principal, MutationName::ApproveStage) {
+        if !mutation_allowed(ctx, &principal, MutationName::ApproveStage) {
             return Err(Error::new("forbidden"));
         }
 
@@ -1363,7 +1423,7 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(&principal, MutationName::RejectStage) {
+        if !mutation_allowed(ctx, &principal, MutationName::RejectStage) {
             return Err(Error::new("forbidden"));
         }
 
@@ -1412,7 +1472,7 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(&principal, MutationName::RetryStage) {
+        if !mutation_allowed(ctx, &principal, MutationName::RetryStage) {
             return Err(Error::new("forbidden"));
         }
 
@@ -1470,7 +1530,7 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(&principal, MutationName::OverrideLegacyDiscoveryPolicy) {
+        if !mutation_allowed(ctx, &principal, MutationName::OverrideLegacyDiscoveryPolicy) {
             return Err(Error::new("forbidden"));
         }
 
@@ -1516,7 +1576,7 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(&principal, MutationName::CancelRun) {
+        if !mutation_allowed(ctx, &principal, MutationName::CancelRun) {
             return Err(Error::new("forbidden"));
         }
 
@@ -1531,6 +1591,112 @@ impl MutationRoot {
         Ok(CancelRunPayload {
             cancelled: true,
             journal_id: ID::from(commanded.journal_id),
+        })
+    }
+
+    /// P072: Approve a stage approval by approval_id. The resolver
+    /// server-resolves run_id and stage_id from the approval record
+    /// before constructing ResolveApprovalCmd.
+    async fn approve_approval(
+        &self,
+        ctx: &Context<'_>,
+        approval_id: ID,
+        comment: Option<String>,
+    ) -> Result<ApproveApprovalPayload> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        if !mutation_allowed(ctx, &principal, MutationName::ApproveApproval) {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller = graphql_caller_with_request_id(ctx, &principal, "approveApproval");
+
+        let aid: domain::ids::ApprovalId = approval_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+
+        // Server-resolve run_id and stage_id from the approval record.
+        let approval = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+
+        let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+            approval_id: aid,
+            decision: ApprovalResolutionDecision::Approved,
+            rationale: comment,
+            run_id: approval.run_id,
+            stage_id: approval.stage_id.clone(),
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+
+        // Re-fetch for authoritative readback.
+        let updated = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new("Approval not found after update"))?;
+
+        Ok(ApproveApprovalPayload {
+            approval: GqlApproval::from(updated),
+            journal_id: jid,
+        })
+    }
+
+    /// P072: Reject a stage approval by approval_id with a required reason.
+    async fn reject_approval(
+        &self,
+        ctx: &Context<'_>,
+        approval_id: ID,
+        reason: String,
+    ) -> Result<RejectApprovalPayload> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        if !mutation_allowed(ctx, &principal, MutationName::RejectApproval) {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller = graphql_caller_with_request_id(ctx, &principal, "rejectApproval");
+
+        let aid: domain::ids::ApprovalId = approval_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+
+        // Server-resolve run_id and stage_id from the approval record.
+        let approval = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+
+        let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+            approval_id: aid,
+            decision: ApprovalResolutionDecision::Rejected,
+            rationale: Some(reason),
+            run_id: approval.run_id,
+            stage_id: approval.stage_id.clone(),
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+
+        // Re-fetch for authoritative readback.
+        let updated = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new("Approval not found after update"))?;
+
+        Ok(RejectApprovalPayload {
+            approval: GqlApproval::from(updated),
+            journal_id: jid,
         })
     }
 }
@@ -1748,6 +1914,16 @@ impl SubscriptionRoot {
             .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
         if principal.class != auth::PrincipalClass::Operator {
             return Err(Error::new("forbidden"));
+        }
+        // P072: enforce allow_subscriptions surface policy when present.
+        if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+            if let Some(allowed) =
+                auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
+            {
+                if !allowed {
+                    return Err(Error::new("forbidden"));
+                }
+            }
         }
         let events = ctx.data::<EventSender>()?.clone();
         let rx = events.subscribe();
@@ -4025,6 +4201,7 @@ mod tests {
             &json,
             "writePath",
             &[
+                "available",
                 "read_only_diagnostic",
                 "write_path_not_available",
                 "external_transport_required",
@@ -4196,14 +4373,8 @@ mod tests {
         let json = response.data.into_json().unwrap();
         let approval = &json["approvalInbox"][0];
         assert_eq!(approval["freshnessState"], serde_json::json!("live"));
-        assert_eq!(
-            approval["disabledReasonCode"],
-            serde_json::json!("WRITE_PATH_NOT_AVAILABLE")
-        );
-        assert_eq!(
-            approval["writePathState"],
-            serde_json::json!("read_only_diagnostic")
-        );
+        assert_eq!(approval["disabledReasonCode"], serde_json::Value::Null);
+        assert_eq!(approval["writePathState"], serde_json::json!("available"));
         assert_eq!(
             approval["diagnosticId"],
             serde_json::json!(approval_id.to_string())
@@ -5738,8 +5909,115 @@ mod tests {
         }
     }
 
+    fn p072_principal_table() -> (auth::PrincipalTable, auth::Principal, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "schema_version": 2,
+              "principals": [
+                {
+                  "token": "default-token",
+                  "id": "default-operator",
+                  "class": "operator",
+                  "surface_policies": {
+                    "graphql": {
+                      "allow_queries": true,
+                      "allow_subscriptions": true,
+                      "allowed_mutations": ["approveApproval", "rejectApproval"]
+                    },
+                    "mcp": {
+                      "allowed_tools": ["runs.list", "runs.get"]
+                    }
+                  }
+                },
+                {
+                  "token": "ui-token",
+                  "id": "ui_operator",
+                  "class": "operator",
+                  "surface_policies": {
+                    "graphql": {
+                      "allow_queries": true,
+                      "allow_subscriptions": true,
+                      "allowed_mutations": ["approveApproval", "rejectApproval"]
+                    },
+                    "mcp": {
+                      "allowed_tools": []
+                    }
+                  }
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let default_operator = auth::resolve_bearer("default-token", &table).unwrap();
+        let ui_operator = auth::resolve_bearer("ui-token", &table).unwrap();
+        (table, default_operator, ui_operator)
+    }
+
     fn observer_principal() -> auth::Principal {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
+    }
+
+    fn p072_legacy_default_operator_table() -> (auth::PrincipalTable, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "principals": [
+                {
+                  "token": "legacy-default-token",
+                  "id": "default-operator",
+                  "class": "operator"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let principal = auth::resolve_bearer("legacy-default-token", &table).unwrap();
+        (table, principal)
+    }
+
+    fn p072_legacy_custom_operator_table() -> (auth::PrincipalTable, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "principals": [
+                {
+                  "token": "legacy-custom-token",
+                  "id": "custom-operator",
+                  "class": "operator"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let principal = auth::resolve_bearer("legacy-custom-token", &table).unwrap();
+        (table, principal)
+    }
+
+    fn p072_legacy_agent_table() -> (auth::PrincipalTable, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "principals": [
+                {
+                  "token": "legacy-agent-token",
+                  "id": "legacy-agent",
+                  "class": "agent"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let principal = auth::resolve_bearer("legacy-agent-token", &table).unwrap();
+        (table, principal)
     }
 
     #[tokio::test]
@@ -5920,6 +6198,495 @@ mod tests {
             .as_str()
             .expect("approveStage.journalId");
         assert!(!jid.is_empty(), "journalId on ApproveStagePayload");
+    }
+
+    #[tokio::test]
+    async fn test_graphql_approve_approval_uses_p072_ui_operator_policy() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let (principal_table, default_operator, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let allowed_with_default_operator = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{ id }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(default_operator),
+            )
+            .await;
+        assert!(
+            allowed_with_default_operator.errors.is_empty(),
+            "default-operator is the app bearer and must allow approveApproval: {allowed_with_default_operator:?}"
+        );
+
+        let ui_approval = make_approval(run_id, "state_6");
+        let ui_approval_id = ui_approval.id;
+        approvals::insert(&pool, &ui_approval).await.unwrap();
+
+        let allowed = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{
+                          id
+                          decision
+                          availableActions
+                          disabledReasonCode
+                          writePathState
+                        }}
+                        journalId
+                      }}
+                    }}"#,
+                    ui_approval.id
+                ))
+                .data(ui_operator),
+            )
+            .await;
+        assert!(
+            allowed.errors.is_empty(),
+            "ui_operator approveApproval must succeed: {allowed:?}"
+        );
+        let data = allowed.data.into_json().unwrap();
+        let approval = &data["approveApproval"]["approval"];
+        assert_eq!(
+            approval["id"],
+            serde_json::json!(ui_approval_id.to_string())
+        );
+        assert_eq!(approval["decision"], serde_json::json!("granted"));
+        assert_eq!(approval["availableActions"], serde_json::json!([]));
+        assert_eq!(
+            approval["writePathState"],
+            serde_json::json!("write_path_not_available")
+        );
+        assert_eq!(
+            approval["disabledReasonCode"],
+            serde_json::json!("UNSUPPORTED_ACTION")
+        );
+        assert!(
+            data["approveApproval"]["journalId"].is_string(),
+            "approveApproval must return journalId"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_ui_principals_denied_non_approval_mutations() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let (principal_table, default_operator, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let cases = [
+            format!(
+                r#"
+                mutation {{
+                  startRun(
+                    ideaId: "{}",
+                    workflowId: "wf-1",
+                    workflowTitle: "t",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    workflowYamlPath: "{}",
+                    agentCatalogYamlPath: "{}"
+                  ) {{
+                    ... on StartRunStartedPayload {{ journalId }}
+                    ... on StartRunBlockedPayload {{ journalId }}
+                  }}
+                }}
+                "#,
+                idea_id,
+                test_workflow_yaml_path(),
+                test_agent_catalog_yaml_path()
+            ),
+            format!(
+                r#"
+                mutation {{
+                  retryStage(runId: "{}", stageId: "state_6") {{
+                    retried
+                    journalId
+                  }}
+                }}
+                "#,
+                run_id
+            ),
+            format!(
+                r#"
+                mutation {{
+                  cancelRun(runId: "{}") {{
+                    cancelled
+                    journalId
+                  }}
+                }}
+                "#,
+                run_id
+            ),
+        ];
+
+        for principal in [default_operator, ui_operator] {
+            for query in cases.clone() {
+                let response = schema
+                    .execute(Request::new(query).data(principal.clone()))
+                    .await;
+                assert!(
+                    !response.errors.is_empty(),
+                    "P072 UI principals must be denied non-approval mutation: {response:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_graphql_legacy_default_operator_denied_non_approval_mutations() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let (principal_table, principal) = p072_legacy_default_operator_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    mutation {{
+                      startRun(
+                        ideaId: "{}",
+                        workflowId: "wf-1",
+                        workflowTitle: "t",
+                        workspaceRoot: "/tmp/ws",
+                        artifactRoot: "/tmp/art",
+                        workflowYamlPath: "{}",
+                        agentCatalogYamlPath: "{}"
+                      ) {{
+                        ... on StartRunStartedPayload {{ journalId }}
+                        ... on StartRunBlockedPayload {{ journalId }}
+                      }}
+                    }}
+                    "#,
+                    idea_id,
+                    test_workflow_yaml_path(),
+                    test_agent_catalog_yaml_path()
+                ))
+                .data(principal),
+            )
+            .await;
+
+        assert!(
+            !response.errors.is_empty(),
+            "legacy default-operator must be normalized to P072 policy and denied startRun: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_missing_graphql_surface_policy_principals_denied_non_approval_mutations()
+    {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let query = format!(
+            r#"
+            mutation {{
+              startRun(
+                ideaId: "{}",
+                workflowId: "wf-1",
+                workflowTitle: "t",
+                workspaceRoot: "/tmp/ws",
+                artifactRoot: "/tmp/art",
+                workflowYamlPath: "{}",
+                agentCatalogYamlPath: "{}"
+              ) {{
+                ... on StartRunStartedPayload {{ journalId }}
+                ... on StartRunBlockedPayload {{ journalId }}
+              }}
+            }}
+            "#,
+            idea_id,
+            test_workflow_yaml_path(),
+            test_agent_catalog_yaml_path()
+        );
+
+        for (principal_table, principal, label) in [
+            {
+                let (table, principal) = p072_legacy_custom_operator_table();
+                (table, principal, "custom operator")
+            },
+            {
+                let (table, principal) = p072_legacy_agent_table();
+                (table, principal, "agent")
+            },
+        ] {
+            let schema = build_schema(
+                pool.clone(),
+                make_command_handler(pool.clone()),
+                event_bus::new_bus(64),
+                principal_table,
+                test_reporter(),
+            );
+
+            let response = schema
+                .execute(Request::new(query.clone()).data(principal))
+                .await;
+            assert!(
+                !response.errors.is_empty(),
+                "{label} without GraphQL surface policy must be denied startRun: {response:?}"
+            );
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM command_journal WHERE command_type = 'StartRun'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 0,
+                "{label} denial must not create a command_journal row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_graphql_approve_approval_rejects_missing_or_resolved_approval() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let (principal_table, _, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let missing_id = ApprovalId::new();
+        let missing = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{ id }}
+                        journalId
+                      }}
+                    }}"#,
+                    missing_id
+                ))
+                .data(ui_operator.clone()),
+            )
+            .await;
+        assert!(
+            !missing.errors.is_empty(),
+            "missing approval must return a GraphQL error"
+        );
+
+        let first = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{ id decision }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(ui_operator.clone()),
+            )
+            .await;
+        assert!(
+            first.errors.is_empty(),
+            "first approveApproval must succeed: {first:?}"
+        );
+
+        let second = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{ id decision }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(ui_operator),
+            )
+            .await;
+        assert!(
+            !second.errors.is_empty(),
+            "already-resolved approval must return a GraphQL error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_reject_approval_uses_p072_ui_operator_policy() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let (principal_table, default_operator, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let allowed_with_default_operator = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work") {{
+                        approval {{ id }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(default_operator),
+            )
+            .await;
+        assert!(
+            allowed_with_default_operator.errors.is_empty(),
+            "default-operator is the app bearer and must allow rejectApproval: {allowed_with_default_operator:?}"
+        );
+
+        let ui_approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &ui_approval).await.unwrap();
+
+        let allowed = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work") {{
+                        approval {{ id decision }}
+                        journalId
+                      }}
+                    }}"#,
+                    ui_approval.id
+                ))
+                .data(ui_operator),
+            )
+            .await;
+        assert!(
+            allowed.errors.is_empty(),
+            "ui_operator rejectApproval must succeed: {allowed:?}"
+        );
+        let data = allowed.data.into_json().unwrap();
+        assert_eq!(
+            data["rejectApproval"]["approval"]["decision"],
+            serde_json::json!("rejected")
+        );
+        assert!(
+            data["rejectApproval"]["journalId"].is_string(),
+            "rejectApproval must return journalId"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_p072_ui_principals_allow_queries() {
+        // The app uses one operator bearer, so P072 UI principals must support
+        // read operations and approval-only mutations on the same GraphQL surface.
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let (principal_table, _, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table.clone(),
+            test_reporter(),
+        );
+
+        let ui_allowed = schema
+            .execute(
+                Request::new(format!(r#"{{ run(id: "{}") {{ id }} }}"#, run_id))
+                    .data(ui_operator.clone()),
+            )
+            .await;
+        assert!(
+            ui_allowed.errors.is_empty(),
+            "ui_operator query must succeed: {ui_allowed:?}"
+        );
+
+        let (_, default_operator, _) = p072_principal_table();
+        let allowed = schema
+            .execute(
+                Request::new(format!(r#"{{ run(id: "{}") {{ id }} }}"#, run_id))
+                    .data(default_operator),
+            )
+            .await;
+        assert!(
+            allowed.errors.is_empty(),
+            "default-operator query must succeed: {allowed:?}"
+        );
     }
 
     #[tokio::test]

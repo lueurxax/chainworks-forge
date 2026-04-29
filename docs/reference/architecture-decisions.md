@@ -118,3 +118,15 @@ This document records the key architecture decisions made during the foundation 
 **Decision:** Use `ImplementationHandoffStatus` to track engine-owned handoff truth (`ready`, `blocked_before_code`, `running`).
 
 **Consequence:** Handoff remains engine-owned and deterministic, independent of advisory agent hints.
+
+## ARCH-072: Governed GraphQL Approval Mutations
+
+**Context:** ARCH-031 established a strictly read-only macOS UI. While this ensured a clean boundary, it forced operators to use a separate terminal for every approval gate resolution, even when the UI was already the primary inspection surface.
+
+**Decision:** The thin macOS UI boundary is expanded to include a single governed mutation path for human gate resolution.
+1. SwiftUI may resolve pending stage approvals via two specific GraphQL mutations: `approveApproval` and `rejectApproval`.
+2. All other operational commands (Start, Cancel, Retry, Reset, Compact, etc.) remain prohibited in the UI and must use MCP/CLI.
+3. The server-side routing matrix is the canonical authority for which mutations are allowed for the `ui_operator` principal.
+4. The UI remains a "thin client": it renders server-published truth and performs only these governed mutations.
+
+**Consequence:** Improved operator experience for the most common human-in-the-loop action without expanding the UI into a general command-and-control plane. The thin UI boundary is now "read-side and human-gate mutation consumer".
