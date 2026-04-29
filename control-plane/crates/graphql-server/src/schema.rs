@@ -1168,6 +1168,9 @@ fn mutation_allowed(
         ) {
             return allowed && principal.class == auth::PrincipalClass::Operator;
         }
+        if auth::find_principal_by_id(table, &principal.id).is_some() {
+            return false;
+        }
     }
 
     auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1
@@ -5895,7 +5898,7 @@ mod tests {
                     "graphql": {
                       "allow_queries": true,
                       "allow_subscriptions": true,
-                      "allowed_mutations": []
+                      "allowed_mutations": ["approveApproval", "rejectApproval"]
                     },
                     "mcp": {
                       "allowed_tools": ["runs.list", "runs.get"]
@@ -5908,8 +5911,8 @@ mod tests {
                   "class": "operator",
                   "surface_policies": {
                     "graphql": {
-                      "allow_queries": false,
-                      "allow_subscriptions": false,
+                      "allow_queries": true,
+                      "allow_subscriptions": true,
                       "allowed_mutations": ["approveApproval", "rejectApproval"]
                     },
                     "mcp": {
@@ -5929,6 +5932,66 @@ mod tests {
 
     fn observer_principal() -> auth::Principal {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
+    }
+
+    fn p072_legacy_default_operator_table() -> (auth::PrincipalTable, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "principals": [
+                {
+                  "token": "legacy-default-token",
+                  "id": "default-operator",
+                  "class": "operator"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let principal = auth::resolve_bearer("legacy-default-token", &table).unwrap();
+        (table, principal)
+    }
+
+    fn p072_legacy_custom_operator_table() -> (auth::PrincipalTable, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "principals": [
+                {
+                  "token": "legacy-custom-token",
+                  "id": "custom-operator",
+                  "class": "operator"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let principal = auth::resolve_bearer("legacy-custom-token", &table).unwrap();
+        (table, principal)
+    }
+
+    fn p072_legacy_agent_table() -> (auth::PrincipalTable, auth::Principal) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "principals": [
+                {
+                  "token": "legacy-agent-token",
+                  "id": "legacy-agent",
+                  "class": "agent"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let principal = auth::resolve_bearer("legacy-agent-token", &table).unwrap();
+        (table, principal)
     }
 
     #[tokio::test]
@@ -6123,7 +6186,6 @@ mod tests {
         let stage = make_manual_gate_stage(run_id, "state_6");
         stages::insert(&pool, &stage).await.unwrap();
         let approval = make_approval(run_id, "state_6");
-        let approval_id = approval.id;
         approvals::insert(&pool, &approval).await.unwrap();
 
         let (principal_table, default_operator, ui_operator) = p072_principal_table();
@@ -6135,7 +6197,7 @@ mod tests {
             test_reporter(),
         );
 
-        let denied = schema
+        let allowed_with_default_operator = schema
             .execute(
                 Request::new(format!(
                     r#"mutation {{
@@ -6150,9 +6212,13 @@ mod tests {
             )
             .await;
         assert!(
-            !denied.errors.is_empty(),
-            "default-operator must be denied by P072 surface policy"
+            allowed_with_default_operator.errors.is_empty(),
+            "default-operator is the app bearer and must allow approveApproval: {allowed_with_default_operator:?}"
         );
+
+        let ui_approval = make_approval(run_id, "state_6");
+        let ui_approval_id = ui_approval.id;
+        approvals::insert(&pool, &ui_approval).await.unwrap();
 
         let allowed = schema
             .execute(
@@ -6169,7 +6235,7 @@ mod tests {
                         journalId
                       }}
                     }}"#,
-                    approval.id
+                    ui_approval.id
                 ))
                 .data(ui_operator),
             )
@@ -6180,7 +6246,10 @@ mod tests {
         );
         let data = allowed.data.into_json().unwrap();
         let approval = &data["approveApproval"]["approval"];
-        assert_eq!(approval["id"], serde_json::json!(approval_id.to_string()));
+        assert_eq!(
+            approval["id"],
+            serde_json::json!(ui_approval_id.to_string())
+        );
         assert_eq!(approval["decision"], serde_json::json!("granted"));
         assert_eq!(approval["availableActions"], serde_json::json!([]));
         assert_eq!(
@@ -6198,7 +6267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_graphql_ui_operator_denied_non_approval_mutations() {
+    async fn test_graphql_ui_principals_denied_non_approval_mutations() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
@@ -6209,7 +6278,7 @@ mod tests {
         let stage = make_manual_gate_stage(run_id, "state_6");
         stages::insert(&pool, &stage).await.unwrap();
 
-        let (principal_table, _default_operator, ui_operator) = p072_principal_table();
+        let (principal_table, default_operator, ui_operator) = p072_principal_table();
         let schema = build_schema(
             pool.clone(),
             make_command_handler(pool.clone()),
@@ -6264,13 +6333,131 @@ mod tests {
             ),
         ];
 
-        for query in cases {
+        for principal in [default_operator, ui_operator] {
+            for query in cases.clone() {
+                let response = schema
+                    .execute(Request::new(query).data(principal.clone()))
+                    .await;
+                assert!(
+                    !response.errors.is_empty(),
+                    "P072 UI principals must be denied non-approval mutation: {response:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_graphql_legacy_default_operator_denied_non_approval_mutations() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let (principal_table, principal) = p072_legacy_default_operator_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    mutation {{
+                      startRun(
+                        ideaId: "{}",
+                        workflowId: "wf-1",
+                        workflowTitle: "t",
+                        workspaceRoot: "/tmp/ws",
+                        artifactRoot: "/tmp/art",
+                        workflowYamlPath: "{}",
+                        agentCatalogYamlPath: "{}"
+                      ) {{
+                        ... on StartRunStartedPayload {{ journalId }}
+                        ... on StartRunBlockedPayload {{ journalId }}
+                      }}
+                    }}
+                    "#,
+                    idea_id,
+                    test_workflow_yaml_path(),
+                    test_agent_catalog_yaml_path()
+                ))
+                .data(principal),
+            )
+            .await;
+
+        assert!(
+            !response.errors.is_empty(),
+            "legacy default-operator must be normalized to P072 policy and denied startRun: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_graphql_missing_graphql_surface_policy_principals_denied_non_approval_mutations()
+    {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let query = format!(
+            r#"
+            mutation {{
+              startRun(
+                ideaId: "{}",
+                workflowId: "wf-1",
+                workflowTitle: "t",
+                workspaceRoot: "/tmp/ws",
+                artifactRoot: "/tmp/art",
+                workflowYamlPath: "{}",
+                agentCatalogYamlPath: "{}"
+              ) {{
+                ... on StartRunStartedPayload {{ journalId }}
+                ... on StartRunBlockedPayload {{ journalId }}
+              }}
+            }}
+            "#,
+            idea_id,
+            test_workflow_yaml_path(),
+            test_agent_catalog_yaml_path()
+        );
+
+        for (principal_table, principal, label) in [
+            {
+                let (table, principal) = p072_legacy_custom_operator_table();
+                (table, principal, "custom operator")
+            },
+            {
+                let (table, principal) = p072_legacy_agent_table();
+                (table, principal, "agent")
+            },
+        ] {
+            let schema = build_schema(
+                pool.clone(),
+                make_command_handler(pool.clone()),
+                event_bus::new_bus(64),
+                principal_table,
+                test_reporter(),
+            );
+
             let response = schema
-                .execute(Request::new(query).data(ui_operator.clone()))
+                .execute(Request::new(query.clone()).data(principal))
                 .await;
             assert!(
                 !response.errors.is_empty(),
-                "ui_operator must be denied non-approval mutation: {response:?}"
+                "{label} without GraphQL surface policy must be denied startRun: {response:?}"
+            );
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM command_journal WHERE command_type = 'StartRun'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 0,
+                "{label} denial must not create a command_journal row"
             );
         }
     }
@@ -6380,7 +6567,7 @@ mod tests {
             test_reporter(),
         );
 
-        let denied = schema
+        let allowed_with_default_operator = schema
             .execute(
                 Request::new(format!(
                     r#"mutation {{
@@ -6395,9 +6582,12 @@ mod tests {
             )
             .await;
         assert!(
-            !denied.errors.is_empty(),
-            "default-operator must be denied by P072 surface policy"
+            allowed_with_default_operator.errors.is_empty(),
+            "default-operator is the app bearer and must allow rejectApproval: {allowed_with_default_operator:?}"
         );
+
+        let ui_approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &ui_approval).await.unwrap();
 
         let allowed = schema
             .execute(
@@ -6408,7 +6598,7 @@ mod tests {
                         journalId
                       }}
                     }}"#,
-                    approval.id
+                    ui_approval.id
                 ))
                 .data(ui_operator),
             )
@@ -6429,9 +6619,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_p072_ui_operator_denied_queries_and_subscriptions() {
-        // ui_operator has allow_queries:false and allow_subscriptions:false —
-        // GraphQL read operations must be rejected under the P072 surface policy.
+    async fn test_p072_ui_principals_allow_queries() {
+        // The app uses one operator bearer, so P072 UI principals must support
+        // read operations and approval-only mutations on the same GraphQL surface.
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
@@ -6449,27 +6639,17 @@ mod tests {
             test_reporter(),
         );
 
-        // ui_operator must be denied a run query (allow_queries: false)
-        let denied = schema
+        let ui_allowed = schema
             .execute(
                 Request::new(format!(r#"{{ run(id: "{}") {{ id }} }}"#, run_id))
                     .data(ui_operator.clone()),
             )
             .await;
         assert!(
-            !denied.errors.is_empty(),
-            "ui_operator query must be denied: {denied:?}"
-        );
-        assert!(
-            denied
-                .errors
-                .iter()
-                .any(|e| e.message.to_lowercase().contains("forbidden")),
-            "denial must be 'forbidden', got: {:?}",
-            denied.errors
+            ui_allowed.errors.is_empty(),
+            "ui_operator query must succeed: {ui_allowed:?}"
         );
 
-        // default-operator must still be allowed queries (allow_queries: true)
         let (_, default_operator, _) = p072_principal_table();
         let allowed = schema
             .execute(

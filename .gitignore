@@ -36,6 +36,9 @@ traces/
 .forge-codex-acp/
 control-plane/chainworks-control-plane.db
 control-plane/chainworks-control-plane.db-*
+control-plane/chainworks-control-plane.db.backup-*.sqlite
+control-plane/chainworks-control-plane.db.backup-*.sqlite-shm
+control-plane/chainworks-control-plane.db.backup-*.sqlite-wal
 control-plane/crates/daemon/principals.json
 
 # Local SQLite runtime databases at repository root.

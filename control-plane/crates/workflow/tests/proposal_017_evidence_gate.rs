@@ -23,7 +23,8 @@ const KNOWN_ISSUES_REQUIRED_FIELDS: &[&str] = &[
 
 #[test]
 fn p017_phase_b_dogfood_exit_record_has_operator_approved_flag_gated_evidence() {
-    let record = read_json("docs/reference/workflow-conflict-evidence/phase-b-dogfood-exit-record.json");
+    let record =
+        read_json("docs/reference/workflow-conflict-evidence/phase-b-dogfood-exit-record.json");
 
     assert_eq!(string_at(&record, "proposal_id"), "P017");
     assert_eq!(string_at(&record, "phase"), "Phase B");
@@ -176,8 +177,9 @@ fn p017_phase_c_external_catalog_inventory_has_operator_attestation_and_warning_
 
 #[test]
 fn p017_zero_bundled_simultaneous_findings_pass_without_known_issues_records() {
-    let known_issues =
-        read_json("docs/reference/workflow-conflict-evidence/phase-a-known-issues-migration-records.json");
+    let known_issues = read_json(
+        "docs/reference/workflow-conflict-evidence/phase-a-known-issues-migration-records.json",
+    );
 
     let required_fields = array_at(&known_issues, "schema.required_fields");
     let actual_required_fields: HashSet<_> = required_fields

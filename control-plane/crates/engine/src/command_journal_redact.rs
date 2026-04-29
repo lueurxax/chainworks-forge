@@ -187,9 +187,8 @@ mod tests {
         KnowledgeCapsuleIgnoreCmd, MainSyncMode, MainSyncRecordRecoveryDecisionCmd,
         MainSyncRecoveryDecision, MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd,
         MainSyncSetRunOverrideCmd, MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd,
-        RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd,
-        ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
-        RunStewardAnalysisCmd, StartRunCmd,
+        RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
+        ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};

@@ -335,19 +335,18 @@ impl Orchestrator {
                             let current_phase: u32 = stage_invokes
                                 .iter()
                                 .filter_map(|w| {
-                                    let v = serde_json::from_str::<serde_json::Value>(
-                                        &w.payload_json,
-                                    )
-                                    .ok()?;
+                                    let v =
+                                        serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                            .ok()?;
                                     // P060: explicit dynamic phase takes precedence.
-                                    if let Some(dp) = v.get("p060_dynamic_phase").and_then(|p| p.as_u64()) {
+                                    if let Some(dp) =
+                                        v.get("p060_dynamic_phase").and_then(|p| p.as_u64())
+                                    {
                                         return Some(dp as u32);
                                     }
-                                    v.get("task_index")?
-                                        .as_u64()
-                                        .and_then(|idx| {
-                                            effective.get(idx as usize).map(|t| t.phase)
-                                        })
+                                    v.get("task_index")?.as_u64().and_then(|idx| {
+                                        effective.get(idx as usize).map(|t| t.phase)
+                                    })
                                 })
                                 .max()
                                 .unwrap_or(0);
@@ -363,16 +362,17 @@ impl Orchestrator {
                             // P060: also check p060_dynamic_phase for dynamic work items.
                             let next_phase_already_enqueued = next_phase.map_or(true, |np| {
                                 stage_invokes.iter().any(|w| {
-                                    let v = serde_json::from_str::<serde_json::Value>(
-                                        &w.payload_json,
-                                    )
-                                    .ok();
+                                    let v =
+                                        serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                            .ok();
                                     let v = match v {
                                         Some(v) => v,
                                         None => return false,
                                     };
                                     // P060: check explicit dynamic phase.
-                                    if let Some(dp) = v.get("p060_dynamic_phase").and_then(|p| p.as_u64()) {
+                                    if let Some(dp) =
+                                        v.get("p060_dynamic_phase").and_then(|p| p.as_u64())
+                                    {
                                         return dp as u32 == np;
                                     }
                                     v.get("task_index")
@@ -453,11 +453,18 @@ impl Orchestrator {
                                                     .await
                                                 {
                                                     if !file_paths.is_empty() {
-                                                        prompt.push_str("\n\n### Selected Reviewer Artifacts\n");
+                                                        prompt.push_str(
+                                                            "\n\n### Selected Reviewer Artifacts\n",
+                                                        );
                                                         prompt.push_str("The following reviewer outputs were selected by the routing algorithm. ");
-                                                        prompt.push_str("Aggregate only these artifacts:\n");
+                                                        prompt.push_str(
+                                                            "Aggregate only these artifacts:\n",
+                                                        );
                                                         for path in &file_paths {
-                                                            prompt.push_str(&format!("- `{}`\n", path));
+                                                            prompt.push_str(&format!(
+                                                                "- `{}`\n",
+                                                                path
+                                                            ));
                                                         }
                                                     }
                                                 }
@@ -1815,7 +1822,8 @@ impl Orchestrator {
         plan: &workflow::plan::RunPlan,
     ) -> Result<bool> {
         // Check if dynamic routing is requested.
-        let routing_options: domain::routing::ReviewRoutingOptions = match &run.review_routing_json {
+        let routing_options: domain::routing::ReviewRoutingOptions = match &run.review_routing_json
+        {
             Some(json) => match serde_json::from_str(json) {
                 Ok(opts) => opts,
                 Err(e) => {
@@ -1831,8 +1839,7 @@ impl Orchestrator {
         // daemon-level `CHAINWORKS_P060_ROUTING_MODE_OVERRIDE` env var so
         // operators can force every run into a specific mode for staged
         // rollout / emergency rollback.
-        let resolution =
-            domain::routing::resolve_effective_routing_mode(&routing_options.mode);
+        let resolution = domain::routing::resolve_effective_routing_mode(&routing_options.mode);
         match &resolution {
             domain::routing::EffectiveRoutingModeResolution::OverriddenByEnv { from, to } => {
                 info!(
@@ -2198,11 +2205,14 @@ impl Orchestrator {
                 .context("P060: Failed to parse AgentSelectionPlanV1 artifact")?;
 
         // Build a lookup from agent_id → CompiledDynamicAgentBinding.
-        let binding_map: std::collections::HashMap<&str, &domain::routing::CompiledDynamicAgentBinding> =
-            plan.dynamic_candidate_bindings
-                .iter()
-                .map(|b| (b.agent_id.as_str(), b))
-                .collect();
+        let binding_map: std::collections::HashMap<
+            &str,
+            &domain::routing::CompiledDynamicAgentBinding,
+        > = plan
+            .dynamic_candidate_bindings
+            .iter()
+            .map(|b| (b.agent_id.as_str(), b))
+            .collect();
 
         let total_selected = selection_plan.selected_agents.len();
         // Total tasks = dynamic reviewers + then-block tasks from state.tasks.
@@ -2271,7 +2281,10 @@ impl Orchestrator {
             let prompt = build_task_prompt(&task, plan, run, idea_opt, None, None);
 
             // Record materialization for idempotency.
-            let work_item_id = format!("p060-dynamic:{}:{}:{}", stage.id, selection_plan.plan_hash, idx);
+            let work_item_id = format!(
+                "p060-dynamic:{}:{}:{}",
+                stage.id, selection_plan.plan_hash, idx
+            );
             let mat_record = domain::routing::DynamicMaterializationRecord {
                 id: domain::ids::DynamicMaterializationId::new(),
                 run_id,
@@ -2912,7 +2925,8 @@ impl Orchestrator {
 
         // Attempt Phase B lead resolution from the versioned compatibility map.
         // If the map file doesn't exist or no match is found, resolution fails closed.
-        let resolver_path = "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
+        let resolver_path =
+            "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
         let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
             Ok(r) => r,
             Err(e) => {

@@ -20,22 +20,23 @@ Related stable docs:
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
+- [ui-action-boundary.md](ui-action-boundary.md)
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 
 ## Scope
 
-This reference covers the primarily **read-only** and repo-agnostic operator layer (per P072-r2):
+This reference covers the primarily **read-side** and repo-agnostic operator layer (per the [UI action boundary](ui-action-boundary.md)):
 
 - `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries (metadata inspection only)
-- diagnostic-only guidance for most actions; in-app resolution for approvals
+- diagnostic-only guidance for non-approval actions; in-app resolution for approvals
 - deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does **NOT** define broad in-app write/recovery. Most write controls (Start, Cancel, Retry) are removed or replaced with diagnostic guidance for external workflows. Approval resolution is the only exception, supported via governed GraphQL mutations.
+It does **NOT** define broad in-app write/recovery. Recovery, retry, reset, compact, run start/cancel, clone, experiment, runtime, and context actions remain external MCP-only actions. Approval resolution is the only exception, supported via governed GraphQL mutations.
 
 ## Runs Home
 
@@ -186,13 +187,17 @@ Report content includes:
 
 ### Recovery
 
-The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
+The governed thin UI does not execute non-approval recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing MCP-owned workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
 Diagnostic guidance is provided for:
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
 4. `Clone Run`
+
+Approval resolution is the exception: approval surfaces are operator-actionable
+through GraphQL approval mutations. Recovery, retry, reset, compact, run
+start/cancel, clone, and runtime/context changes remain MCP-only.
 
 **Workflow Conflict Actions (Read-Only):**
 - **Mediation Progress**: View sanitized live status updates (queued,

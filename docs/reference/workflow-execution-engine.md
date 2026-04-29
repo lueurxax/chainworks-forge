@@ -11,8 +11,8 @@ interruption.
 All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
 `control-plane/crates/engine/` (Rust daemon).
 
-**P072 Thin UI Boundary:**
-Per P072, the production macOS UI is a **thin client** focused on read-side truth
+**Thin UI Boundary:**
+The production macOS UI is a **thin client** focused on read-side truth
 and governed human gates. While the Swift engine remains implemented for
 parity, the governed UI is prohibited from calling most mutation paths in
 `ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and

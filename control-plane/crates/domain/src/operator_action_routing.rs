@@ -1,11 +1,9 @@
-//! P072: Typed operator-action routing registry.
+//! Typed UI action routing registry.
 //!
 //! This module defines the canonical runtime registry that enumerates
 //! operator actions, allowed northbound surfaces, principal profiles,
 //! and mutation/tool capability bindings. The registry is the single
-//! source of truth once Phase 1 lands; earlier phases used the
-//! proposal-owned fixture at
-//! `docs/proposals/072-artifacts/operator-action-routing-policy.v1.json`.
+//! source of truth; earlier proposal-owned fixtures have been retired.
 
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +53,7 @@ pub struct OperatorActionRoutingRegistry {
 }
 
 impl OperatorActionRoutingRegistry {
-    /// Build the canonical P072 registry from the compiled constant list.
+    /// Build the canonical UI action routing registry from the compiled constant list.
     pub fn build() -> Self {
         let entries = vec![
             OperatorActionEntry {

@@ -8,8 +8,8 @@ use domain::ids::{RoutingReceiptId, SystemExecutionId};
 use domain::routing::{
     AgentSelectionPlanV1, CompiledDynamicAgentBinding, IneligibleCandidate, InputSnapshotHashes,
     RejectedAlternative, ReviewRoutingMode, ReviewRoutingOptions, RoutingEvidenceRef,
-    RoutingFailureKind, RoutingReceipt, RoutingReceiptStatus, ScoreTerms,
-    SelectedAgent, SystemExecution, SystemExecutionStatus,
+    RoutingFailureKind, RoutingReceipt, RoutingReceiptStatus, ScoreTerms, SelectedAgent,
+    SystemExecution, SystemExecutionStatus,
 };
 use sha2::{Digest, Sha256};
 
@@ -581,7 +581,9 @@ pub fn resolve_selected_outputs(
     let mut ignored_artifacts = Vec::new();
 
     for artifact in available_artifacts {
-        if artifact.contract_id == output_contract && selected_ids.contains(artifact.agent_id.as_str()) {
+        if artifact.contract_id == output_contract
+            && selected_ids.contains(artifact.agent_id.as_str())
+        {
             selected_artifacts.push(artifact.clone());
         } else if artifact.contract_id == output_contract {
             ignored_artifacts.push(artifact.clone());
@@ -756,10 +758,25 @@ mod tests {
 
         match outcome {
             RoutingOutcome::Success { plan, .. } => {
-                let ids: Vec<&str> = plan.selected_agents.iter().map(|a| a.agent_id.as_str()).collect();
-                assert!(ids.contains(&"proposal_reviewer_ui"), "expected UI reviewer, got {:?}", ids);
-                assert!(ids.contains(&"proposal_reviewer_macos"), "expected macOS reviewer, got {:?}", ids);
-                assert!(!ids.contains(&"proposal_reviewer_rust_architect"), "rust_architect should not be selected for UI proposal");
+                let ids: Vec<&str> = plan
+                    .selected_agents
+                    .iter()
+                    .map(|a| a.agent_id.as_str())
+                    .collect();
+                assert!(
+                    ids.contains(&"proposal_reviewer_ui"),
+                    "expected UI reviewer, got {:?}",
+                    ids
+                );
+                assert!(
+                    ids.contains(&"proposal_reviewer_macos"),
+                    "expected macOS reviewer, got {:?}",
+                    ids
+                );
+                assert!(
+                    !ids.contains(&"proposal_reviewer_rust_architect"),
+                    "rust_architect should not be selected for UI proposal"
+                );
                 assert!(plan.selected_agents.len() >= 2);
                 assert!(plan.selected_agents.len() <= 5);
             }
@@ -844,7 +861,11 @@ mod tests {
 
         match outcome {
             RoutingOutcome::Success { plan, .. } => {
-                let ids: Vec<&str> = plan.selected_agents.iter().map(|a| a.agent_id.as_str()).collect();
+                let ids: Vec<&str> = plan
+                    .selected_agents
+                    .iter()
+                    .map(|a| a.agent_id.as_str())
+                    .collect();
                 assert!(ids.contains(&"proposal_reviewer_rust_architect"));
                 assert!(ids.contains(&"proposal_reviewer_reliability"));
                 assert!(!ids.contains(&"proposal_reviewer_ui"));
@@ -912,10 +933,20 @@ mod tests {
         match outcome {
             RoutingOutcome::Success { plan, .. } => {
                 assert_eq!(plan.ineligible_candidates.len(), 1);
-                assert_eq!(plan.ineligible_candidates[0].agent_id, "proposal_reviewer_ios");
-                assert_eq!(plan.ineligible_candidates[0].reason, "disabled_by_rollout_wave");
+                assert_eq!(
+                    plan.ineligible_candidates[0].agent_id,
+                    "proposal_reviewer_ios"
+                );
+                assert_eq!(
+                    plan.ineligible_candidates[0].reason,
+                    "disabled_by_rollout_wave"
+                );
                 // Falls back to product_owner + architect.
-                let ids: Vec<&str> = plan.selected_agents.iter().map(|a| a.agent_id.as_str()).collect();
+                let ids: Vec<&str> = plan
+                    .selected_agents
+                    .iter()
+                    .map(|a| a.agent_id.as_str())
+                    .collect();
                 assert!(ids.contains(&"proposal_reviewer_product_owner"));
                 assert!(ids.contains(&"proposal_reviewer_architect"));
             }
@@ -984,8 +1015,15 @@ mod tests {
         // The mandatory reviewer should still be selected.
         match outcome {
             RoutingOutcome::Success { plan, .. } => {
-                let ids: Vec<&str> = plan.selected_agents.iter().map(|a| a.agent_id.as_str()).collect();
-                assert!(ids.contains(&"proposal_reviewer_security"), "mandatory reviewer must survive force_exclude");
+                let ids: Vec<&str> = plan
+                    .selected_agents
+                    .iter()
+                    .map(|a| a.agent_id.as_str())
+                    .collect();
+                assert!(
+                    ids.contains(&"proposal_reviewer_security"),
+                    "mandatory reviewer must survive force_exclude"
+                );
             }
             RoutingOutcome::Failure { .. } => panic!("Expected success"),
         }
@@ -1079,10 +1117,16 @@ mod tests {
 
         match outcome {
             RoutingOutcome::Success { plan, .. } => {
-                let ids: Vec<&str> = plan.selected_agents.iter().map(|a| a.agent_id.as_str()).collect();
+                let ids: Vec<&str> = plan
+                    .selected_agents
+                    .iter()
+                    .map(|a| a.agent_id.as_str())
+                    .collect();
                 assert!(ids.contains(&"proposal_reviewer_product_owner"));
                 assert!(ids.contains(&"proposal_reviewer_architect"));
-                assert!(plan.warnings.contains(&"under_specified_selection".to_string()));
+                assert!(plan
+                    .warnings
+                    .contains(&"under_specified_selection".to_string()));
             }
             RoutingOutcome::Failure { .. } => panic!("Expected under_specified success"),
         }
@@ -1274,21 +1318,47 @@ mod tests {
 
         // Run twice with the same inputs.
         let outcome1 = route_proposal_reviewers(
-            RunId::new(), "s", 1, &bindings, &fingerprint, &options, &hashes,
+            RunId::new(),
+            "s",
+            1,
+            &bindings,
+            &fingerprint,
+            &options,
+            &hashes,
         );
         let outcome2 = route_proposal_reviewers(
-            RunId::new(), "s", 1, &bindings, &fingerprint, &options, &hashes,
+            RunId::new(),
+            "s",
+            1,
+            &bindings,
+            &fingerprint,
+            &options,
+            &hashes,
         );
 
         let (plan1, plan2) = match (outcome1, outcome2) {
-            (RoutingOutcome::Success { plan: p1, .. }, RoutingOutcome::Success { plan: p2, .. }) => (p1, p2),
+            (
+                RoutingOutcome::Success { plan: p1, .. },
+                RoutingOutcome::Success { plan: p2, .. },
+            ) => (p1, p2),
             _ => panic!("Both should succeed"),
         };
 
-        assert_eq!(plan1.plan_hash, plan2.plan_hash, "plan_hash must be deterministic");
         assert_eq!(
-            plan1.selected_agents.iter().map(|a| &a.agent_id).collect::<Vec<_>>(),
-            plan2.selected_agents.iter().map(|a| &a.agent_id).collect::<Vec<_>>(),
+            plan1.plan_hash, plan2.plan_hash,
+            "plan_hash must be deterministic"
+        );
+        assert_eq!(
+            plan1
+                .selected_agents
+                .iter()
+                .map(|a| &a.agent_id)
+                .collect::<Vec<_>>(),
+            plan2
+                .selected_agents
+                .iter()
+                .map(|a| &a.agent_id)
+                .collect::<Vec<_>>(),
             "selected order must be deterministic"
         );
     }
@@ -1360,11 +1430,13 @@ mod tests {
                 "reviewer_count for {count} selected"
             );
             assert_eq!(
-                result.selected_review_artifacts.len(), count,
+                result.selected_review_artifacts.len(),
+                count,
                 "selected artifacts for {count} selected"
             );
             assert_eq!(
-                result.ignored_artifacts.len(), 1,
+                result.ignored_artifacts.len(),
+                1,
                 "stale artifact ignored for {count} selected"
             );
             assert_eq!(result.selection_plan_hash, format!("hash_{}", count));

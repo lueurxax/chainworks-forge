@@ -1797,16 +1797,31 @@ agents:
     assert_eq!(bindings.len(), 3, "expected 3 agents with routing metadata");
 
     // Check security reviewer binding.
-    let security = bindings.iter().find(|b| b.agent_id == "proposal_reviewer_security").unwrap();
+    let security = bindings
+        .iter()
+        .find(|b| b.agent_id == "proposal_reviewer_security")
+        .unwrap();
     assert!(security.enabled_for_proposal_review);
     assert_eq!(security.rollout_wave, "phase_3_core");
     assert_eq!(security.routing_metadata.routing_id, "security");
-    assert!(security.routing_metadata.risks.contains(&"security".to_string()));
-    assert_eq!(security.routing_metadata.mandatory_when, vec!["security".to_string()]);
-    assert_eq!(security.output_contracts, vec!["proposal_review_v1".to_string()]);
+    assert!(security
+        .routing_metadata
+        .risks
+        .contains(&"security".to_string()));
+    assert_eq!(
+        security.routing_metadata.mandatory_when,
+        vec!["security".to_string()]
+    );
+    assert_eq!(
+        security.output_contracts,
+        vec!["proposal_review_v1".to_string()]
+    );
 
     // Check iOS reviewer is disabled.
-    let ios = bindings.iter().find(|b| b.agent_id == "proposal_reviewer_ios").unwrap();
+    let ios = bindings
+        .iter()
+        .find(|b| b.agent_id == "proposal_reviewer_ios")
+        .unwrap();
     assert!(!ios.enabled_for_proposal_review);
     assert_eq!(ios.rollout_wave, "later_wave");
 
@@ -1870,7 +1885,12 @@ agents:
     let plan = compile_result_from_strings(workflow_yaml, catalog_yaml).unwrap();
     assert_eq!(plan.dynamic_candidate_bindings.len(), 1);
     assert_eq!(plan.dynamic_candidate_bindings[0].agent_id, "reviewer");
-    assert_eq!(plan.dynamic_candidate_bindings[0].routing_metadata.routing_id, "test_reviewer");
+    assert_eq!(
+        plan.dynamic_candidate_bindings[0]
+            .routing_metadata
+            .routing_id,
+        "test_reviewer"
+    );
 }
 
 #[test]
@@ -1936,7 +1956,10 @@ agents:
     assert_eq!(sys.executor_mode, "system.routing");
 
     // Check dynamic_parallel was compiled.
-    let dp = state.dynamic_parallel.as_ref().expect("should have dynamic_parallel");
+    let dp = state
+        .dynamic_parallel
+        .as_ref()
+        .expect("should have dynamic_parallel");
     assert_eq!(dp.selector_artifact, "agent_selection_plan_v1");
     assert_eq!(dp.output_contract, "proposal_review_v1");
     assert_eq!(dp.inputs, vec!["proposal_current", "idea_brief"]);
@@ -2018,7 +2041,9 @@ agents:
     assert_eq!(then_tasks.len(), 1);
     let agg = &then_tasks[0];
     assert_eq!(agg.task_name, "aggregate_reviews");
-    let sof = agg.selected_outputs_from.as_ref()
+    let sof = agg
+        .selected_outputs_from
+        .as_ref()
         .expect("then-task should have selected_outputs_from");
     assert_eq!(sof.source_plan, "agent_selection_plan_v1");
     assert_eq!(sof.output_contract, "proposal_review_v1");

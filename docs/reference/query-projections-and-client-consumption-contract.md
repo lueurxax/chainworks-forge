@@ -11,7 +11,7 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 | Alias | `./scripts/test-gate.sh p043` |
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
 | Historical proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
-| Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. |
+| Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. See [ui-action-boundary.md](ui-action-boundary.md). |
 | Current UI boundary | Thin macOS UI (read-side and human-gate mutation consumer over server-owned projections). |
 | Stabilization owners | P032 for release/dogfood/stabilization evidence; P036 for visual/navigation restoration over this read model. |
 
@@ -19,7 +19,7 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 
 The original P043/P031 gate labels are retained for compatibility. The active content below is the current thin UI boundary:
 
-The macOS thin UI is a **read-side consumer and human-gate resolver** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and resolves pending approvals via governed GraphQL mutations.
+The macOS thin UI is a **read-side consumer and human-gate resolver** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and resolves pending approvals via governed GraphQL mutations. The short canonical action boundary lives in [ui-action-boundary.md](ui-action-boundary.md).
 
 **PROHIBITED ACTIONS for governed macOS UI:**
 - It does **NOT** issue MCP mutations.
@@ -264,7 +264,7 @@ The macOS thin UI owns the UI-side evidence for the **read-side** client contrac
 - no SwiftData / local-service fallback for workflow truth;
 - subscription patching rules from the "Refresh and subscription posture" section.
 
-Scope boundary (r8 correction): P031 remains a read-only consumer for workflow truth and non-approval commands. P072 adds only the approval-resolution mutation exception; it does not make P031 responsible for MCP command-control behavior, command receipts, or broad UI writes.
+Scope boundary: P031 remains a read-only consumer for workflow truth and non-approval commands. The UI action boundary adds only the approval-resolution mutation exception; it does not make P031 responsible for MCP command-control behavior, command receipts, or broad UI writes.
 
 The thin UI boundary does NOT own:
 

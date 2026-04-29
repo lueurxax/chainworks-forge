@@ -725,12 +725,13 @@ fn compile_agent_task(
     }
 
     // P060: propagate selected_outputs_from from DSL definition.
-    let selected_outputs_from = at.selected_outputs_from.as_ref().map(|sof| {
-        CompiledSelectedOutputsFrom {
-            source_plan: sof.source_plan.clone(),
-            output_contract: sof.output_contract.clone(),
-        }
-    });
+    let selected_outputs_from =
+        at.selected_outputs_from
+            .as_ref()
+            .map(|sof| CompiledSelectedOutputsFrom {
+                source_plan: sof.source_plan.clone(),
+                output_contract: sof.output_contract.clone(),
+            });
 
     Ok(CompiledTask {
         agent,
@@ -1012,8 +1013,8 @@ pub fn compile_dynamic_candidate_bindings(
             "output_contract": agent.output_contract,
         });
 
-        let resolved_agent_snapshot_json = serde_json::to_string(&resolved_snapshot)
-            .unwrap_or_else(|_| "{}".into());
+        let resolved_agent_snapshot_json =
+            serde_json::to_string(&resolved_snapshot).unwrap_or_else(|_| "{}".into());
 
         let output_contracts = agent
             .output_contract
@@ -1021,9 +1022,8 @@ pub fn compile_dynamic_candidate_bindings(
             .map(|c| vec![c.clone()])
             .unwrap_or_default();
 
-        let permission_hash = sha256_string(
-            agent.permission_profile.as_deref().unwrap_or("default"),
-        );
+        let permission_hash =
+            sha256_string(agent.permission_profile.as_deref().unwrap_or("default"));
         let worktree_hash = sha256_string(
             &agent
                 .worktree_policy
@@ -1038,11 +1038,8 @@ pub fn compile_dynamic_candidate_bindings(
                 .map(|m| m.join(","))
                 .unwrap_or_default(),
         );
-        let skill_hash = sha256_string(
-            agent.skill_ref.as_deref().unwrap_or("none"),
-        );
-        let routing_metadata_json = serde_json::to_string(routing)
-            .unwrap_or_default();
+        let skill_hash = sha256_string(agent.skill_ref.as_deref().unwrap_or("none"));
+        let routing_metadata_json = serde_json::to_string(routing).unwrap_or_default();
         let routing_metadata_hash = sha256_string(&routing_metadata_json);
 
         let binding_id = format!("bind-{}", agent.id);
@@ -1058,7 +1055,10 @@ pub fn compile_dynamic_candidate_bindings(
             skill_hash,
             routing_metadata_hash,
             enabled_for_proposal_review: routing.enabled_for_proposal_review,
-            rollout_wave: routing.rollout_wave.clone().unwrap_or_else(|| "unknown".into()),
+            rollout_wave: routing
+                .rollout_wave
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
             catalog_snapshot_hash: catalog_snapshot_hash.into(),
             routing_metadata: domain::routing::RoutingMetadata {
                 routing_id: routing.routing_id.clone(),
@@ -1068,7 +1068,10 @@ pub fn compile_dynamic_candidate_bindings(
                 surfaces: routing.surfaces.clone(),
                 risks: routing.risks.clone(),
                 enabled_for_proposal_review: routing.enabled_for_proposal_review,
-                rollout_wave: routing.rollout_wave.clone().unwrap_or_else(|| "unknown".into()),
+                rollout_wave: routing
+                    .rollout_wave
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
                 mandatory_when: routing.mandatory_when.clone(),
                 usually_pair_with: routing.usually_pair_with.clone(),
                 close_alternatives: routing.close_alternatives.clone(),
@@ -1087,7 +1090,10 @@ pub fn compile_dynamic_candidate_bindings_from_paths(
     let catalog_snapshot_json =
         canonical_json_string(&cat).context("serializing catalog snapshot for bindings")?;
     let catalog_snapshot_hash = sha256_string(&catalog_snapshot_json);
-    Ok(compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash))
+    Ok(compile_dynamic_candidate_bindings(
+        &cat,
+        &catalog_snapshot_hash,
+    ))
 }
 
 fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {

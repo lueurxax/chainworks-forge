@@ -667,18 +667,21 @@ mod tests {
 
     #[test]
     fn routing_evidence_projection_authorizer_redacts_for_non_operators() {
-        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE", "1");
-        let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
-            &crate::PrincipalClass::Agent,
-        );
+        let auth =
+            RoutingEvidenceProjectionAuthorizer::for_principal_class(&crate::PrincipalClass::Agent);
         std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
         assert_eq!(auth.projection(), RoutingEvidenceProjection::Redacted);
     }
 
     #[test]
     fn routing_evidence_projection_authorizer_requires_env_for_operator() {
-        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
         let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
             &crate::PrincipalClass::Operator,
@@ -688,7 +691,9 @@ mod tests {
 
     #[test]
     fn routing_evidence_projection_authorizer_grants_operator_with_env() {
-        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE", "1");
         let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
             &crate::PrincipalClass::Operator,
@@ -748,7 +753,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_no_env_returns_per_run_mode() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
         assert_eq!(res.effective(), ReviewRoutingMode::Dynamic);
@@ -760,7 +767,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_env_legacy_overrides_dynamic() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "legacy_fixed");
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
@@ -776,7 +785,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_env_shadow_overrides_legacy() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "shadow_dynamic");
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::LegacyFixed);
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
@@ -785,7 +796,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_unrecognized_env_falls_back_to_per_run() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "totally_made_up");
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);

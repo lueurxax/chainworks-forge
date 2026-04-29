@@ -63,6 +63,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Operator experience
 
+- [reference/ui-action-boundary.md](reference/ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
 - [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client

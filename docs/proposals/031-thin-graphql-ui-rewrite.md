@@ -4,12 +4,13 @@ Revision: `031-2026-04-24-r19-degraded-state-correction`
 Source packet: prior run `8dd01a54-0791-43e0-b526-5ed92c95b34f`, r18  
 Current run: `72409268-9dea-4ece-82f6-6ef29b4a446e`  
 Status: stopped at GraphQL-only read-boundary stabilization. Do not continue P031 as the vehicle for visual/product polish; remaining visual, dogfood, and stabilization tails are handed off to P032/P036.
+Boundary status: partially superseded by the implemented [UI action boundary](../reference/ui-action-boundary.md). P031 remains the GraphQL thin UI read/subscription migration plus the approval-only mutation stop-state. P031 is not the owner for create/start/cancel/retry/reset/compact/clone/recover/runtime/context actions.
 
 ## Executive Summary
 
 P031 cuts the macOS operator app from client-owned workflow truth to a thin, GraphQL-only read UI over server-owned projections. After P031, governed SwiftUI workflow surfaces render GraphQL read models and maintain only presentation state, server-derived caches, read-refresh state, and freshness handling.
 
-P031-owned UI must not use MCP reads, MCP writes, non-approval GraphQL mutations, local workflow mutation fallback, command payload construction, command receipts, command correlation, or broad write-path implementation. P072 supersedes the original P031 all-mutation ban with one narrow exception: governed SwiftUI may use GraphQL only for `approveApproval` and `rejectApproval`. MCP remains supported for agents, CLI/operator diagnostics, automation, and debug/control workflows outside the governed macOS UI.
+P031-owned UI must not use MCP reads, MCP writes, non-approval GraphQL mutations, local workflow mutation fallback, command payload construction, command receipts, command correlation, or broad write-path implementation. The UI action boundary supersedes the original P031 all-mutation ban with one narrow exception: governed SwiftUI may use GraphQL only for `approveApproval` and `rejectApproval`. MCP remains supported for agents, CLI/operator diagnostics, automation, and debug/control workflows outside the governed macOS UI.
 
 This restart keeps the prior r18 packet as the baseline and converts it into a single proposal document for clean aggregate re-review. It explicitly incorporates all prior reviewer feedback, including the stale r7 implementation approval rejection. The result is intentionally conservative: it does not restore UI writes, it does not add a second control plane, and it does not hide the operator trade-off that writes move outside the macOS UI until separate follow-up proposals restore approved write paths.
 
@@ -21,7 +22,7 @@ Follow-up ownership:
 
 - P032 owns stabilization, release-readiness evidence, dogfood/sign-off, degraded drills/waivers, daemon lifecycle polish, freshness evidence, and documentation cleanup.
 - P036 owns visual and navigation restoration over the GraphQL read model: richer run/stage cards, definitions/catalog ergonomics, idea/catalog surfaces, stage-transition visualization, artifact browsing ergonomics, and overall operator flow.
-- Future write-path proposals own any interactive create/start/cancel/retry behavior. P072 owns the narrow approval-only GraphQL mutation exception for `approveApproval` / `rejectApproval`; P031 does not restore any other UI writes.
+- Future write-path proposals own any interactive create/start/cancel/retry behavior. The UI action boundary owns the narrow approval-only GraphQL mutation exception for `approveApproval` / `rejectApproval`; P031 does not restore any other UI writes.
 
 The old Swift-local UI remains useful only as a visual and ergonomic reference. Mutation affordances from that UI are explicitly out of scope unless a later proposal defines an approved non-MCP, non-GraphQL-mutation transport.
 
@@ -29,7 +30,7 @@ Hard decisions:
 
 - Governed macOS UI reads workflow truth through GraphQL only.
 - Governed macOS UI has no MCP calls, no non-approval GraphQL mutations, and no local mutation fallback.
-- Approval rows are diagnostic-read-only in the original P031 stop-state, but P072 supersedes that clause: interactive approval decisions use only the `approveApproval` / `rejectApproval` GraphQL mutations.
+- Approval rows are operator-actionable only through the `approveApproval` / `rejectApproval` GraphQL mutations.
 - Full report payload rendering remains outside P031 and defaults to a P0 follow-up unless Phase 0d evidence proves metadata-only inspection is acceptable.
 - P031 does not preserve or restore the old Swift-orchestrator path. Fail-closed behavior means disabling or degrading affected thin UI surfaces while the control-plane database and GraphQL projections remain the source of truth; no local workflow writes are restored.
 - The stale r7 GraphQL+MCP implementation approval is non-authoritative. No further P031 implementation approval should be pursued unless P031 is explicitly reopened; product polish now belongs to P032/P036.
@@ -46,7 +47,7 @@ Current P031 state:
 - The app exposes read-only Runs Home, run detail, stage transitions, artifacts, catalog context, approvals diagnostics, reports metadata, and daemon lifecycle.
 - Artifact rendering now performs content-based markdown/JSON handling instead of trusting file extensions alone.
 - Artifact browsing has a first-pass GraphQL-only filter/group/detail layout.
-- Non-approval write controls remain unavailable or diagnostic-only. Approval rows may expose the P072 approval-only GraphQL actions.
+- Non-approval write controls remain unavailable or diagnostic-only. Approval rows may expose the approval-only GraphQL actions.
 
 Visual/ergonomic regressions to carry forward:
 
@@ -99,7 +100,7 @@ After P031:
 - Strictly prohibit MCP usage from P031-owned macOS UI code.
 - Remove or replace Create Idea, Start Run, Cancel Run, Stage Retry, Steward, runtime-health, session, clone, compare, experiment, and approval write affordances from governed screens.
 - Preserve operator inspection ergonomics for Runs Home, Run Detail, stages, approvals, artifacts, report metadata, daemon lifecycle, and recovery/evidence readback.
-- Render approvals as actionable only through the P072 `approveApproval` / `rejectApproval` GraphQL exception; all other write controls remain diagnostic-only guidance unless a separately approved transport exists.
+- Render approvals as actionable only through the `approveApproval` / `rejectApproval` GraphQL exception; all other write controls remain diagnostic-only guidance unless a separately approved transport exists.
 - Ship report metadata inspection with list-level payload availability indicators.
 - Reconcile P043/P031 reference and gate language so command-completion refresh, command receipts, command correlation, and MCP control rules are outside P031 UI.
 - Define concrete GraphQL fields, enum cases, nullability, redaction, Swift presenter ownership, and tests for disabled/report/approval metadata.
@@ -113,7 +114,7 @@ After P031:
 - P031 does not redefine workflow execution semantics.
 - P031 does not create a second control plane.
 - P031 does not make MCP available to the macOS UI for reads or writes.
-- P031 does not add broad GraphQL mutations or any other UI write transport. P072 supersedes this for the two approval-only GraphQL mutations.
+- P031 does not add broad GraphQL mutations or any other UI write transport. The UI action boundary supersedes this for the two approval-only GraphQL mutations.
 - P031 does not route UI actions through MCP command tools.
 - P031 does not add command journaling, CommandHandler wiring, command receipt recovery, ActionInvocationIdentity, CommandLegality, Check Status, Reissue Command, `client_command_id` command correlation, or MCP parameter mapping for UI writes.
 - P031 does not implement Create Idea, Start Run, Cancel Run, Stage Retry, reset-session, resume, clone, comparison, experiment launch, runtime-health actions, agent reset, Steward actions, or second-wave MCP tools in the UI.
@@ -151,7 +152,7 @@ Removed or diagnostic-only writes:
 - reset, resume, clone, compare, experiment launch, runtime-health, and session actions
 - local Swift recovery or execution mutation paths
 - UI MCP command paths
-- UI GraphQL mutation paths, except P072 `approveApproval` / `rejectApproval`
+- UI GraphQL mutation paths, except `approveApproval` / `rejectApproval`
 
 ## Architecture
 
@@ -163,7 +164,7 @@ Rules:
 
 - The UI may query, subscribe, and poll GraphQL read models.
 - The UI may trigger targeted read refreshes that refetch GraphQL data.
-- The UI must not use GraphQL mutations except P072 `approveApproval` / `rejectApproval`.
+- The UI must not use GraphQL mutations except `approveApproval` / `rejectApproval`.
 - The UI must not use MCP clients, MCP tools, MCP read helpers, or MCP write helpers.
 - The UI must not read workflow truth from SwiftData, local compiled plans, local recovery services, raw artifact directories, raw report files, or local execution services.
 - MCP read/control tools remain allowed for agents, CLI/operator tooling, automation, and diagnostics outside the macOS UI contract.
@@ -176,7 +177,7 @@ P031-owned UI is read-only except for read refreshes and diagnostic copy afforda
 Static guard requirements:
 
 - Fail if governed UI imports or instantiates `MCPCommandClient`, `MCPPolicyRuntime`, MCP transport, or any MCP tool wrapper.
-- Fail if governed UI contains GraphQL mutation operations, generated mutation calls, or mutation client types other than P072 `approveApproval` / `rejectApproval`.
+- Fail if governed UI contains GraphQL mutation operations, generated mutation calls, or mutation client types other than `approveApproval` / `rejectApproval`.
 - Fail if governed UI calls `ideas.create`, `runs.start`, `runs.cancel`, `stages.retry`, `approvals.resolve`, `steward.run_analysis`, session/reset, clone, compare, experiment, runtime-health, local recovery, or local execution mutation paths.
 - Fail if governed UI constructs MCP parameter dictionaries, `ActionInvocationIdentity` payloads, `client_command_id` command correlation, command receipt state, or command invocation adapters.
 
@@ -252,7 +253,7 @@ Initial governed surfaces include:
 
 Approval decisions are binary in P031:
 
-- If the P072 approval-only GraphQL transport is unavailable, approval rows render diagnostic-only guidance.
+- If the approval-only GraphQL transport is unavailable, approval rows render diagnostic-only guidance.
 - Do not render permanently disabled primary Approve or Reject buttons as the main state.
 - Render an inline diagnostic banner or terminal-styled callout.
 - Show `Execute via CLI` only when the operator write-path guide names CLI as the approved external workflow.
@@ -381,7 +382,7 @@ Required work:
 - Add one negative test per removed write control.
 - Prove any degraded/fail-closed UI code remains read-only, keeps control-plane-owned truth authoritative, and cannot restore local orchestration or local writes.
 
-Exit: P031/P072 gates fail closed for UI MCP usage, non-approval GraphQL mutations, command plumbing, local write fallback, raw truth probing, and out-of-inventory governed surfaces.
+Exit: P031 and UI action boundary gates fail closed for UI MCP usage, non-approval GraphQL mutations, command plumbing, local write fallback, raw truth probing, and out-of-inventory governed surfaces.
 
 ### Phase 0c: Swift GraphQL-Only Boundary and Test Doubles
 
@@ -560,7 +561,7 @@ Core compliance:
 - P043/P031 reconciliation: 0 P031 UI command-completion, command receipt, command correlation, or MCP control obligations remain.
 - Projection correctness: 0 parity divergences in gate runs or dogfood.
 - UI MCP usage: 0 governed UI MCP imports, clients, wrappers, tool calls, command receipts, command correlation, or MCP serializers.
-- GraphQL mutation usage: 0 non-approval GraphQL mutations defined or invoked by governed UI code; P072 `approveApproval` / `rejectApproval` are the only allowed exception.
+- GraphQL mutation usage: 0 non-approval GraphQL mutations defined or invoked by governed UI code; `approveApproval` / `rejectApproval` are the only allowed exception.
 - Removed write controls: 0 enabled removed write controls in governed screens unless a separate approved transport exists.
 
 Operator viability:
@@ -594,7 +595,7 @@ Release safety:
 | --- | --- | --- |
 | P043 reference language keeps imposing command/control obligations on P031 UI | Implementers satisfy stale docs while violating GraphQL-only scope | P043/P031 reconciliation is a Phase 0a exit gate and P031 gate requirement |
 | UI grows hidden MCP control path | App becomes a second control surface | Static guards fail on MCP imports/calls, identity mapping, receipts, correlation, and payload construction |
-| Non-approval GraphQL mutations are added to compensate for removed MCP UI writes | UI still mutates workflow truth outside P072 | P031/P072 gates fail on forbidden mutation definitions/invocations in governed UI |
+| Non-approval GraphQL mutations are added to compensate for removed MCP UI writes | UI still mutates workflow truth outside the UI action boundary | P031 and UI action boundary gates fail on forbidden mutation definitions/invocations in governed UI |
 | Static guards miss governed UI surfaces | Local truth remains reachable | Machine-readable UI inventory is gate-consumed and fail-closed |
 | Approval diagnostics look like broken primary actions | Operators stall or lose trust | Diagnostic banner/callout replaces disabled primary buttons and dogfood captures comprehension |
 | Operators cannot complete write workflows during dogfood | Dogfood validates rendering but not viability | Operator write-path guide maps every removed control and dogfood validates copied identifiers |

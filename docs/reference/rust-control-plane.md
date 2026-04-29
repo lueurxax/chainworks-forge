@@ -121,7 +121,12 @@ Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
 
-Mutations: `startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`.
+Mutations: `approveApproval`, `rejectApproval`.
+
+GraphQL is the macOS UI read/subscription surface plus the approval-gate
+settlement surface. Non-approval operator commands such as starting runs,
+retrying stages, cancelling runs, resolving workflow conflicts, and recovery
+actions are MCP-only.
 
 Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
 

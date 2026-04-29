@@ -149,9 +149,9 @@ If preflight passes:
 - the run stores `delivery_preflight_json`
 - the persisted run-owned preflight payload is readable northbound
 
-### GraphQL contract
+### MCP command contract
 
-`startRun` returns a result union with two domain outcomes:
+`runs.start` returns a result union with two domain outcomes:
 
 - started run payload
 - blocked delivery-preflight payload
@@ -278,7 +278,6 @@ Readers must use these durable fields. They must not reconstruct MCP truth from 
 
 GraphQL exposes P048 truth through:
 
-- `startRun` result union for typed delivery-preflight blocking
 - run reads for persisted `delivery_preflight_json`
 - `GqlStageExecution.executions` for execution-owned MCP truth
 - `GqlAgentExecution` fields for requested, predicted, actual, denied, blocking, observation, and latency
