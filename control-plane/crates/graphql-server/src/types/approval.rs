@@ -43,12 +43,8 @@ impl From<Approval> for GqlApproval {
         } else {
             vec![]
         };
-        // P072: disabled_reason explains why available_actions is empty.
-        let disabled_reason = if !is_actionable {
-            Some(format!("approval already {}", a.decision))
-        } else {
-            None
-        };
+        let (disabled_reason_code, write_path_state, disabled_reason) =
+            approval_actionability_fields(is_actionable, &a.decision.to_string());
         GqlApproval {
             id: ID(diagnostic_id.clone()),
             run_id: ID(a.run_id.to_string()),
@@ -59,11 +55,8 @@ impl From<Approval> for GqlApproval {
             comment: a.comment,
             expires_at: a.expires_at.map(|t| t.to_rfc3339()),
             freshness_state: GqlFreshnessState::Live,
-            // P031: write path remains unavailable until Phase 2 feature
-            // flag is enabled. This field reflects governed-UI write-path
-            // availability, not server-side actionability.
-            disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
-            write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
+            disabled_reason_code,
+            write_path_state,
             diagnostic_id: Some(diagnostic_id),
             server_debug_detail: None,
             available_actions,
@@ -83,12 +76,8 @@ impl From<ApprovalInboxRow> for GqlApproval {
         } else {
             vec![]
         };
-        // P072: disabled_reason explains why available_actions is empty.
-        let disabled_reason = if !is_actionable {
-            Some(format!("approval already {}", r.decision))
-        } else {
-            None
-        };
+        let (disabled_reason_code, write_path_state, disabled_reason) =
+            approval_actionability_fields(is_actionable, &r.decision);
         GqlApproval {
             id: ID(r.id),
             run_id: ID(r.run_id),
@@ -99,15 +88,32 @@ impl From<ApprovalInboxRow> for GqlApproval {
             comment: r.comment,
             expires_at: r.expires_at,
             freshness_state: GqlFreshnessState::Live,
-            // P031: write path remains unavailable until Phase 2 feature
-            // flag is enabled.
-            disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
-            write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
+            disabled_reason_code,
+            write_path_state,
             diagnostic_id: Some(diagnostic_id),
             server_debug_detail: None,
             available_actions,
             disabled_reason,
             settlement_version: None,
         }
+    }
+}
+
+fn approval_actionability_fields(
+    is_actionable: bool,
+    decision: &str,
+) -> (
+    Option<GqlDisabledReasonCode>,
+    GqlWritePathState,
+    Option<String>,
+) {
+    if is_actionable {
+        (None, GqlWritePathState::Available, None)
+    } else {
+        (
+            Some(GqlDisabledReasonCode::UnsupportedAction),
+            GqlWritePathState::WritePathNotAvailable,
+            Some(format!("approval already {decision}")),
+        )
     }
 }

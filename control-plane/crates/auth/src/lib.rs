@@ -29,6 +29,23 @@ impl Principal {
             resource_capabilities,
         }
     }
+
+    fn from_entry(entry: &PrincipalEntry) -> Self {
+        let mut principal = Principal::new(entry.id.clone(), entry.class.clone());
+        if let Some(mcp) = entry
+            .surface_policies
+            .as_ref()
+            .and_then(|policies| policies.mcp.as_ref())
+        {
+            principal.tool_capabilities = mcp
+                .allowed_tools
+                .iter()
+                .filter_map(|tool| capability_tool_id_for_name(tool))
+                .filter(|id| tool_allowed_for_class(&principal.class, *id))
+                .collect();
+        }
+        principal
+    }
 }
 
 // ── Auth errors ─────────────────────────────────────────────────────────
@@ -195,7 +212,7 @@ pub fn resolve_bearer(token: &str, table: &PrincipalTable) -> Result<Principal, 
         .entries
         .iter()
         .find(|e| e.token == token)
-        .map(|e| Principal::new(e.id.clone(), e.class.clone()))
+        .map(Principal::from_entry)
         .ok_or(AuthError::UnknownToken)
 }
 
@@ -277,6 +294,16 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
                         ));
                     }
                 }
+                if let Some(ref mcp) = policies.mcp {
+                    for tool in &mcp.allowed_tools {
+                        if capability_tool_id_for_name(tool).is_none() {
+                            return Err(AuthError::TableLoadFailed(format!(
+                                "unknown MCP tool '{}' in surface_policies for principal '{}'",
+                                tool, entry.id
+                            )));
+                        }
+                    }
+                }
             }
         }
 
@@ -288,9 +315,7 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
                 )
             })?;
             let graphql = policies.graphql.as_ref().ok_or_else(|| {
-                AuthError::TableLoadFailed(
-                    "ui_operator must have graphql surface_policies".into(),
-                )
+                AuthError::TableLoadFailed("ui_operator must have graphql surface_policies".into())
             })?;
             let mut sorted = graphql.allowed_mutations.clone();
             sorted.sort();
@@ -319,7 +344,7 @@ pub fn find_principal_by_id(table: &PrincipalTable, id: &str) -> Option<Principa
         .entries
         .iter()
         .find(|e| e.id == id)
-        .map(|e| Principal::new(e.id.clone(), e.class.clone()))
+        .map(Principal::from_entry)
 }
 
 /// P072: Check if a mutation is allowed for a principal based on v2 surface_policies.
@@ -755,10 +780,7 @@ mod tests {
                     graphql: Some(GraphqlPolicy {
                         allow_queries: false,
                         allow_subscriptions: false,
-                        allowed_mutations: vec![
-                            "approveApproval".into(),
-                            "rejectApproval".into(),
-                        ],
+                        allowed_mutations: vec!["approveApproval".into(), "rejectApproval".into()],
                     }),
                     mcp: Some(McpPolicy {
                         allowed_tools: vec![],
@@ -848,9 +870,7 @@ mod tests {
             }),
         }];
         let err = validate_v2_principals(&entries).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("default-operator must have empty"));
+        assert!(err.to_string().contains("default-operator must have empty"));
     }
 
     #[test]
@@ -869,9 +889,7 @@ mod tests {
             }),
         }];
         let err = validate_v2_principals(&entries).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("ui_operator must allow exactly"));
+        assert!(err.to_string().contains("ui_operator must allow exactly"));
     }
 
     #[test]
@@ -884,10 +902,7 @@ mod tests {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: false,
                     allow_subscriptions: false,
-                    allowed_mutations: vec![
-                        "approveApproval".into(),
-                        "rejectApproval".into(),
-                    ],
+                    allowed_mutations: vec!["approveApproval".into(), "rejectApproval".into()],
                 }),
                 mcp: Some(McpPolicy {
                     allowed_tools: vec!["runs.start".into()],
@@ -979,5 +994,76 @@ mod tests {
             is_mutation_allowed_by_surface_policy(&table, "nonexistent", "approveApproval"),
             None
         );
+    }
+
+    #[test]
+    fn resolve_bearer_applies_v2_mcp_surface_policy() {
+        let table = PrincipalTable {
+            entries: vec![
+                PrincipalEntry {
+                    token: "tok-read".into(),
+                    id: "default-operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: Some(SurfacePolicies {
+                        graphql: Some(GraphqlPolicy {
+                            allow_queries: true,
+                            allow_subscriptions: true,
+                            allowed_mutations: vec![],
+                        }),
+                        mcp: Some(McpPolicy {
+                            allowed_tools: vec!["runs.list".into(), "runs.get".into()],
+                        }),
+                    }),
+                },
+                PrincipalEntry {
+                    token: "tok-ui".into(),
+                    id: "ui_operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: Some(SurfacePolicies {
+                        graphql: Some(GraphqlPolicy {
+                            allow_queries: false,
+                            allow_subscriptions: false,
+                            allowed_mutations: vec![
+                                "approveApproval".into(),
+                                "rejectApproval".into(),
+                            ],
+                        }),
+                        mcp: Some(McpPolicy {
+                            allowed_tools: vec![],
+                        }),
+                    }),
+                },
+            ],
+        };
+
+        let read_principal = resolve_bearer("tok-read", &table).unwrap();
+        assert!(is_tool_allowed(&read_principal, "runs.list"));
+        assert!(is_tool_allowed(&read_principal, "runs.get"));
+        assert!(!is_tool_allowed(&read_principal, "runs.start"));
+
+        let ui_principal = resolve_bearer("tok-ui", &table).unwrap();
+        assert!(!is_tool_allowed(&ui_principal, "approvals.resolve"));
+        assert!(!is_tool_allowed(&ui_principal, "runs.list"));
+    }
+
+    #[test]
+    fn v2_rejects_unknown_mcp_tool_name() {
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "default-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec![],
+                }),
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec!["runs.lsit".into()],
+                }),
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err.to_string().contains("unknown MCP tool"));
     }
 }

@@ -43,7 +43,7 @@ Every visible governed workflow field must have one named GraphQL source or one 
 | --- | --- | --- |
 | `freshnessState` | `FreshnessState` | `live`, `refreshing`, `projection_lag`, `stale`, `unavailable`, `unauthorized`. |
 | `disabledReasonCode` | `DisabledReasonCode` | `WRITE_PATH_NOT_AVAILABLE`, `MANAGED_OUTSIDE_UI`, `AMBIGUOUS_APPROVAL_IDENTITY`, `STALE_READ`, `PROJECTION_LAG`, `UNAUTHORIZED`, `UNSUPPORTED_ACTION`. |
-| `writePathState` | `WritePathState` | `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
+| `writePathState` | `WritePathState` | `available`, `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
 | `diagnosticId` | `String` | Unique identifier for the row/approval/report used for external write workflows. |
 | `payloadAvailabilityState` | `PayloadAvailabilityState` | `available`, `metadata_only`, `payload_deferred`, `generating`, `unavailable`. |
 | `payloadUnavailableReasonCode` | `PayloadUnavailableReasonCode` | `PAYLOAD_DEFERRED_BY_P031`, `GENERATING`, `NOT_INDEXED`, `NOT_AUTHORIZED`, `NOT_AVAILABLE`, `UNKNOWN`. |

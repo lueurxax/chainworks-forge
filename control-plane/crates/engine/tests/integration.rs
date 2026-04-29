@@ -13,7 +13,8 @@ use domain::agent::{AgentExecution, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::commands::{
-    ApproveStageCmd, CallerContext, Command, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd,
+    ApprovalResolutionDecision, ApproveStageCmd, CallerContext, Command,
+    OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResolveApprovalCmd,
     ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
@@ -1333,6 +1334,126 @@ async fn test_reject_stage_resolves_approval_and_blocks_stage() {
         updated_stage.status,
         StageStatus::Blocked,
         "stage must become Blocked after approval is rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_approval_rejects_mismatched_command_provenance() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let other_run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    runs::insert(&pool, &make_run(other_run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "gated_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "gated_stage", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: approval.id,
+                decision: ApprovalResolutionDecision::Approved,
+                rationale: Some("mismatch should fail".into()),
+                run_id: other_run_id,
+                stage_id: "gated_stage".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("mismatched ResolveApproval unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("provenance mismatch"),
+        "ResolveApproval must reject command/approval run-stage mismatch: {err}"
+    );
+
+    let unresolved = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unresolved.decision,
+        ApprovalDecision::Pending,
+        "mismatched ResolveApproval must not resolve the approval"
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_approval_rejection_matches_reject_stage_semantics() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "gated_stage".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "gated_stage", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: approval.id,
+                decision: ApprovalResolutionDecision::Rejected,
+                rationale: Some("not ready".into()),
+                run_id,
+                stage_id: "gated_stage".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let resolved = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.decision, ApprovalDecision::Rejected);
+
+    let updated_stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated_stage.status,
+        StageStatus::Blocked,
+        "non-manual ResolveApproval rejection must block the stage"
+    );
+
+    let advance_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == db::work_item::WorkItemKind::AdvanceRun)
+        .count();
+    assert_eq!(
+        advance_items, 0,
+        "non-manual ResolveApproval rejection must not enqueue AdvanceRun"
     );
 }
 
@@ -10249,8 +10370,9 @@ fn p017_lead_resolver_ambiguous_match_fails_closed() {
 fn p017_phase_b_checked_in_lead_resolver_resolves_bundled_workflows() {
     use engine::mediation::lead_resolver::*;
 
-    let resolver_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json");
+    let resolver_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../../docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json",
+    );
     let resolver = PhaseBLeadResolver::load_from_file(&resolver_path.to_string_lossy())
         .expect("checked-in Phase B resolver loads");
 

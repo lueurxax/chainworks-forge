@@ -546,12 +546,16 @@ impl CommandHandler {
                 };
 
                 // P060: Validate review_routing_json if present.
-                let validated_review_routing_json = if let Some(ref json_str) = c.review_routing_json {
+                let validated_review_routing_json = if let Some(ref json_str) =
+                    c.review_routing_json
+                {
                     match serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json_str) {
                         Ok(opts) => {
                             // Basic validation: reject duplicates in force_include/force_exclude.
                             let mut seen = std::collections::HashSet::new();
-                            for agent_id in opts.force_include.iter().chain(opts.force_exclude.iter()) {
+                            for agent_id in
+                                opts.force_include.iter().chain(opts.force_exclude.iter())
+                            {
                                 if !seen.insert(agent_id.as_str()) {
                                     let error = anyhow!("review_routing_json: duplicate agent_id '{agent_id}' in force_include/force_exclude");
                                     let message = error.to_string();
@@ -2317,16 +2321,40 @@ impl CommandHandler {
                         return Err(error);
                     }
                 };
+                if approval.run_id != c.run_id || approval.stage_id != c.stage_id {
+                    let error = anyhow!(
+                        "Approval {} provenance mismatch: command run/stage {}:{} but approval belongs to {}:{}",
+                        c.approval_id,
+                        c.run_id,
+                        c.stage_id,
+                        approval.run_id,
+                        approval.stage_id
+                    );
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                    return Err(error);
+                }
+                let authoritative_run_id = approval.run_id;
+                let authoritative_stage_id = approval.stage_id.clone();
 
                 approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
                     .await?;
 
                 let mut stage_status_event = None;
-                let run_stages = stages::list_by_run_tx(&mut tx, c.run_id).await?;
+                let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
+                let run_stages = stages::list_by_run_tx(&mut tx, authoritative_run_id).await?;
 
                 if decision == ApprovalDecision::Granted {
                     if let Some(stage) = run_stages.iter().find(|s| {
-                        s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
                     }) {
                         if stage.stage_type.as_deref() == Some("manual_gate") {
                             if has_post_tasks {
@@ -2352,7 +2380,8 @@ impl CommandHandler {
                 } else {
                     // Rejection path — mirrors RejectStage logic.
                     if let Some(stage) = run_stages.iter().find(|s| {
-                        s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
                     }) {
                         if stage.stage_type.as_deref() == Some("manual_gate") {
                             stages::settle_tx(
@@ -2363,27 +2392,36 @@ impl CommandHandler {
                             )
                             .await?;
                             stage_status_event = Some((stage.id, StageStatus::Completed));
+                            should_enqueue_advance = true;
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Blocked));
                         }
                     }
                 }
 
-                work_items::enqueue_tx(
-                    &mut tx,
-                    &WorkItem {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        kind: WorkItemKind::AdvanceRun,
-                        payload_json: serde_json::json!({ "run_id": c.run_id.to_string() })
+                if should_enqueue_advance {
+                    work_items::enqueue_tx(
+                        &mut tx,
+                        &WorkItem {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            kind: WorkItemKind::AdvanceRun,
+                            payload_json: serde_json::json!({
+                                "run_id": authoritative_run_id.to_string()
+                            })
                             .to_string(),
-                        status: WorkItemStatus::Pending,
-                        run_id: Some(c.run_id),
-                        stage_id: None,
-                        created_at: now,
-                        scheduled_at: now,
-                        attempt_count: 0,
-                        last_error: None,
-                    },
-                )
-                .await?;
+                            status: WorkItemStatus::Pending,
+                            run_id: Some(authoritative_run_id),
+                            stage_id: None,
+                            created_at: now,
+                            scheduled_at: now,
+                            attempt_count: 0,
+                            last_error: None,
+                        },
+                    )
+                    .await?;
+                }
                 let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
                     &mut tx,
                     &self.capacity_config,
@@ -2399,7 +2437,7 @@ impl CommandHandler {
                     .publish_scheduler_notification(scheduler_refresh);
                 if let Some((stage_execution_id, status)) = stage_status_event {
                     let _ = self.events.send(DomainEvent::StageStatusChanged {
-                        run_id: c.run_id,
+                        run_id: authoritative_run_id,
                         stage_execution_id,
                         status,
                     });
@@ -2408,7 +2446,7 @@ impl CommandHandler {
                     approval_id: approval.id,
                     decision,
                 });
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, authoritative_run_id).await?;
 
                 let result = match c.decision {
                     ApprovalResolutionDecision::Approved => CommandResult::StageApproved {
