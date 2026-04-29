@@ -194,9 +194,9 @@ The control-plane read contract owns server-published facts. The thin macOS UI o
 | Stage list / progress | `stages(runID:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for thin UI consumption. |
 | Stage detail | `stage(id:)` returns projection-enriched decision flags and projection freshness while preserving canonical evidence/recovery payloads. | Sufficient for thin UI consumption. |
 | Missing projection rows | Missing `run_summaries` or `stage_summaries` rows surface as `projectionPresent=false` and `projectionLag=true`, not normal zero/false truth. | Sufficient for projection-lag rendering. |
-| Run status subscription | `runStatusChanged(runID:)` emits projection-enriched run summary and freshness fields. | Sufficient for thin UI event patching. |
-| Stage status subscription | `stageStatusChanged(runID:)` emits projection-enriched stage decision and freshness fields. | Sufficient for thin UI event patching. |
-| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for thin UI event patching. |
+| Run status subscription | `runStatusChanged(runID:)` emits projection-enriched run summary and freshness fields. | Sufficient for P031 event patching. |
+| Stage status subscription | `stageStatusChanged(runID:)` emits projection-enriched stage decision and freshness fields. | Sufficient for P031 event patching. |
+| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for P031 event patching. |
 | Approval inbox | `approvalInbox` is projection-backed. | Sufficient for thin UI consumption. |
 | Artifact viewer | `artifacts(runID:)` | is projection-backed. | Sufficient for thin UI consumption. |
 | Scheduler health | `schedulerHealthSummary` returns global capacity, active counts, oldest queued age, and sustained backpressure state. | Sufficient for thin UI health alerts. |
@@ -246,7 +246,7 @@ Future non-operator read expansion must be explicit in auth/capability policy an
 
 ## Thin UI Consumption Contract
 
-Governed macOS UI surfaces may ship from this contract:
+P031 may ship governed macOS UI surfaces from this contract:
 
 - Runs home;
 - Run detail;
@@ -263,6 +263,8 @@ The macOS thin UI owns the UI-side evidence for the **read-side** client contrac
 - live / refreshing_disconnected / stale / projection_lag / unavailable / unauthorized rendering on each surface (as badges or inline annotations, not disabled controls because the governed thin UI has no write controls);
 - no SwiftData / local-service fallback for workflow truth;
 - subscription patching rules from the "Refresh and subscription posture" section.
+
+Scope boundary (r8 correction): P031 remains a read-only consumer for workflow truth and non-approval commands. P072 adds only the approval-resolution mutation exception; it does not make P031 responsible for MCP command-control behavior, command receipts, or broad UI writes.
 
 The thin UI boundary does NOT own:
 

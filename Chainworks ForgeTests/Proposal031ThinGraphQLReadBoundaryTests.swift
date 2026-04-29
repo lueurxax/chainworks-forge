@@ -10,7 +10,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     let transport = CapturingP031ReadTransport()
     let client = P031GraphQLReadClient(transport: transport)
 
-    await #expect(throws: P031GraphQLReadBoundaryError.mutationOperationForbidden("P031ReadProbe"))
+    await #expect(throws: P031GraphQLReadBoundaryError.forbiddenOperationName("StartRun"))
     {
       _ = try await client.execute(
         operationName: "P031ReadProbe",
@@ -26,6 +26,62 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
     #expect(transport.requests.map(\.operationName) == ["P031RunList"])
     #expect(transport.requests.first?.operationKind == .query)
+  }
+
+  @Test("P072 approval mutation client allows only approval mutations")
+  func approvalMutationClientAllowsOnlyP072ApprovalMutations() async throws {
+    let approvalID = "approval-1"
+    let transport = CapturingP031ReadTransport(
+      responseData: Data(
+        """
+        {
+          "data": {
+            "approveApproval": {
+              "approval": {
+                "id": "approval-1",
+                "runId": "run-1",
+                "stageId": "state_11_manual_release",
+                "decision": "granted",
+                "freshnessState": "live",
+                "disabledReasonCode": "UNSUPPORTED_ACTION",
+                "writePathState": "write_path_not_available",
+                "availableActions": [],
+                "disabledReason": "approval already granted",
+                "diagnosticId": "approval-1",
+                "serverDebugDetail": null
+              },
+              "journalId": "journal-1"
+            }
+          }
+        }
+        """.utf8)
+    )
+    let client = P072ApprovalMutationClient(transport: transport)
+
+    let result = try await client.approve(approvalID: approvalID)
+
+    #expect(result.approval.id == approvalID)
+    #expect(result.journalID == "journal-1")
+    #expect(transport.requests.map(\.operationName) == ["P072ApproveApproval"])
+    #expect(transport.requests.first?.operationKind == .mutation)
+
+    let rejectRequest = try P031GraphQLReadRequest(
+      operationName: "P072RejectApproval",
+      document: P031GraphQLDocuments.rejectApproval,
+      variables: [
+        "approvalId": .string(approvalID),
+        "reason": .string("needs changes"),
+      ]
+    )
+    #expect(rejectRequest.operationKind == .mutation)
+
+    #expect(throws: P031GraphQLReadBoundaryError.forbiddenOperationName("P072ForbiddenStartRun")) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "P072ForbiddenStartRun",
+        document:
+          "mutation P072ForbiddenStartRun { startRun(ideaId: \"idea-1\") { ... on StartRunStartedPayload { journalId } } }"
+      )
+    }
   }
 
   @Test("GraphQL read request accepts subscription documents")
@@ -70,7 +126,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     let transport = CapturingP031ReadTransport()
     let client = P031GraphQLReadClient(transport: transport)
 
-    await #expect(throws: P031GraphQLReadBoundaryError.mutationOperationForbidden("P031RunList")) {
+    await #expect(throws: P031GraphQLReadBoundaryError.forbiddenOperationName("P031StartRun")) {
       _ = try await client.execute(
         operationName: "P031RunList",
         document:
@@ -367,6 +423,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       ])
     #expect(
       P031WritePathState.allCases.map(\.rawValue) == [
+        "available",
         "read_only_diagnostic",
         "write_path_not_available",
         "external_transport_required",

@@ -147,7 +147,17 @@ struct RunsHomeView: View {
                         loadArtifactPreview: model.loadArtifactPreview
                     )
                     P031CatalogContextCard(presentation: runDetail.catalogContext)
-                    P031ApprovalInboxCard(presentation: model.approvalInbox)
+                    P031ApprovalInboxCard(
+                        presentation: model.approvalInbox,
+                        actionError: model.approvalActionError,
+                        isResolving: { model.isResolvingApproval($0) },
+                        onApprove: { approvalID in
+                            Task { await model.settleApproval(approvalID, action: .approve) }
+                        },
+                        onReject: { approvalID in
+                            Task { await model.settleApproval(approvalID, action: .reject(reason: "Rejected from Chainworks Forge UI")) }
+                        }
+                    )
                     P031ReportMetadataCard(rows: runDetail.reportRows)
                 } else {
                     P031CalloutCard(
@@ -175,6 +185,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var writePathGuideSummary: P031OperatorWritePathGuideSummaryPresentation
     @Published private(set) var isLoading = false
     @Published private(set) var isRestartingDaemon = false
+    @Published private(set) var resolvingApprovalIDs: Set<String> = []
+    @Published private(set) var approvalActionError: String?
     @Published private(set) var daemonRestartError: String?
     @Published private(set) var selectedRunID: String?
 
@@ -185,6 +197,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
     private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
+    private let settleApprovalAction: @Sendable (String, P072ApprovalDecisionAction) async -> String?
     private let restartDaemonAction: @MainActor @Sendable () async -> String?
     private let bundledDaemonBuildSHAAction: @Sendable () -> String?
 
@@ -227,6 +240,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
     init<Store: P031WorkflowReadStore>(
         coordinator: P031ThinWorkflowScreenCoordinator<Store>,
         writePathGuideReference: String? = nil,
+        settleApprovalAction: @escaping @Sendable (String, P072ApprovalDecisionAction) async -> String? = { _, _ in
+            "Approval write path is unavailable in this build."
+        },
         restartDaemonAction: @escaping @MainActor @Sendable () async -> String? = {
             await P031ThinReadDashboardModel.restartPackagedDaemon()
         },
@@ -235,6 +251,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         }
     ) {
         self.writePathGuideReference = writePathGuideReference
+        self.settleApprovalAction = settleApprovalAction
         self.restartDaemonAction = restartDaemonAction
         self.bundledDaemonBuildSHAAction = bundledDaemonBuildSHAAction
         writePathGuideSummary = coordinator.loadOperatorWritePathGuideSummary()
@@ -276,13 +293,32 @@ final class P031ThinReadDashboardModel: ObservableObject {
             readTransport: P031URLSessionGraphQLReadTransport(endpoint: endpoint),
             subscriptionTransport: P031URLSessionGraphQLSubscriptionTransport(endpoint: endpoint)
         )
+        let approvalMutationClient = P072ApprovalMutationClient(
+            transport: P031URLSessionGraphQLReadTransport(endpoint: endpoint)
+        )
         let coordinator = P031ThinWorkflowScreenCoordinator(
             store: store,
             writePathGuideData: guideResource.data
         )
         return P031ThinReadDashboardModel(
             coordinator: coordinator,
-            writePathGuideReference: guideResource.url?.path
+            writePathGuideReference: guideResource.url?.path,
+            settleApprovalAction: { approvalID, action in
+                do {
+                    switch action {
+                    case .approve:
+                        _ = try await approvalMutationClient.approve(approvalID: approvalID)
+                    case .reject(let reason):
+                        _ = try await approvalMutationClient.reject(
+                            approvalID: approvalID,
+                            reason: reason
+                        )
+                    }
+                    return nil
+                } catch {
+                    return P031ReadErrorPresenter.description(for: error)
+                }
+            }
         )
     }
 
@@ -337,6 +373,23 @@ final class P031ThinReadDashboardModel: ObservableObject {
 
     func loadArtifactPreview(artifactID: String) async -> P031ArtifactViewerPresentation? {
         await loadArtifactPreviewAction(artifactID)
+    }
+
+    func isResolvingApproval(_ approvalID: String) -> Bool {
+        resolvingApprovalIDs.contains(approvalID)
+    }
+
+    func settleApproval(_ approvalID: String, action: P072ApprovalDecisionAction) async {
+        guard !resolvingApprovalIDs.contains(approvalID) else { return }
+        resolvingApprovalIDs.insert(approvalID)
+        approvalActionError = nil
+        defer { resolvingApprovalIDs.remove(approvalID) }
+
+        if let error = await settleApprovalAction(approvalID, action) {
+            approvalActionError = error
+            return
+        }
+        await refreshAll()
     }
 
     func dismissOrientation() async {
@@ -439,7 +492,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
 
     nonisolated static func bundledDaemonBuildSHA(bundle: Bundle = .main) -> String? {
         guard let url = bundle.url(forResource: "bundled-daemon-build-sha", withExtension: "txt"),
-              let raw = try? String(contentsOf: url, encoding: .utf8)
+              let data = try? Data(contentsOf: url),
+              let raw = String(data: data, encoding: .utf8)
         else {
             return nil
         }
@@ -818,6 +872,10 @@ private struct P031StageTransitionMapCard: View {
 
 private struct P031ApprovalInboxCard: View {
     let presentation: P031ApprovalInboxPresentation?
+    let actionError: String?
+    let isResolving: (String) -> Bool
+    let onApprove: (String) -> Void
+    let onReject: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -828,6 +886,11 @@ private struct P031ApprovalInboxCard: View {
                 if let presentation {
                     P031FreshnessBadge(snapshot: presentation.freshness)
                 }
+            }
+            if let actionError {
+                Text(actionError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
             if let presentation {
                 if presentation.rows.isEmpty {
@@ -843,7 +906,33 @@ private struct P031ApprovalInboxCard: View {
                             accentColor: .orange
                         ) {
                             VStack(alignment: .leading, spacing: 10) {
-                                if let actionLabel = row.actionLabel {
+                                if row.canApprove || row.canReject {
+                                    HStack(spacing: 8) {
+                                        if row.canApprove {
+                                            Button {
+                                                onApprove(row.approvalID)
+                                            } label: {
+                                                Label("Approve", systemImage: "checkmark.circle")
+                                            }
+                                            .disabled(isResolving(row.approvalID))
+                                            .controlSize(.small)
+                                        }
+                                        if row.canReject {
+                                            Button(role: .destructive) {
+                                                onReject(row.approvalID)
+                                            } label: {
+                                                Label("Reject", systemImage: "xmark.circle")
+                                            }
+                                            .disabled(isResolving(row.approvalID))
+                                            .controlSize(.small)
+                                        }
+                                        if isResolving(row.approvalID) {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                                .accessibilityLabel("Resolving approval")
+                                        }
+                                    }
+                                } else if let actionLabel = row.actionLabel {
                                     Label(actionLabel, systemImage: "terminal")
                                         .font(.caption)
                                 }

@@ -43,6 +43,8 @@ control-plane/crates/daemon/principals.json
 /*.db-shm
 /*.db-wal
 /chainworks-control-plane.db.backup-*.sqlite
+/chainworks-control-plane.db.backup-*.sqlite-shm
+/chainworks-control-plane.db.backup-*.sqlite-wal
 
 # P042 §10.5 release-host credentials (checked via example template only).
 scripts/packaging.env

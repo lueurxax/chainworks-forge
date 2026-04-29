@@ -6198,6 +6198,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_graphql_ui_operator_denied_non_approval_mutations() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let (principal_table, _default_operator, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let cases = [
+            format!(
+                r#"
+                mutation {{
+                  startRun(
+                    ideaId: "{}",
+                    workflowId: "wf-1",
+                    workflowTitle: "t",
+                    workspaceRoot: "/tmp/ws",
+                    artifactRoot: "/tmp/art",
+                    workflowYamlPath: "{}",
+                    agentCatalogYamlPath: "{}"
+                  ) {{
+                    ... on StartRunStartedPayload {{ journalId }}
+                    ... on StartRunBlockedPayload {{ journalId }}
+                  }}
+                }}
+                "#,
+                idea_id,
+                test_workflow_yaml_path(),
+                test_agent_catalog_yaml_path()
+            ),
+            format!(
+                r#"
+                mutation {{
+                  retryStage(runId: "{}", stageId: "state_6") {{
+                    retried
+                    journalId
+                  }}
+                }}
+                "#,
+                run_id
+            ),
+            format!(
+                r#"
+                mutation {{
+                  cancelRun(runId: "{}") {{
+                    cancelled
+                    journalId
+                  }}
+                }}
+                "#,
+                run_id
+            ),
+        ];
+
+        for query in cases {
+            let response = schema
+                .execute(Request::new(query).data(ui_operator.clone()))
+                .await;
+            assert!(
+                !response.errors.is_empty(),
+                "ui_operator must be denied non-approval mutation: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_graphql_approve_approval_rejects_missing_or_resolved_approval() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();

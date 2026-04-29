@@ -651,9 +651,46 @@ Command:
 Important:
 
 - `p031` is accepted as an alias
-- the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary or if required Phase 0 artifacts are missing or invalid
+- the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary plus the P072 approval-only mutation exception, or if required Phase 0 artifacts are missing or invalid
 - later Phase 0d / Phase 3 evidence entries may remain blocked while implementation is in progress, but the manifest must not mark blocked evidence as `ready`
 - dogfood sign-off evidence is outside this gate; this gate only requires the Phase 3 dogfood checklist artifact to exist
+
+### `proposal-072|p072`
+
+Proposal 072 approval-only GraphQL UI mutation boundary and MCP-only command routing gate.
+
+Scope:
+
+- composes `proposal-031`
+- Swift unit tests for the governed GraphQL request boundary, including `approveApproval` / `rejectApproval`
+- Rust domain/auth tests for the P072 routing registry and principal surface policies
+- Rust GraphQL tests proving `ui_operator` can execute only approval mutations and is denied non-approval command mutations
+- docs/inventory checks proving P031 is reconciled with the P072 approval-only exception
+
+Use when:
+
+- changing governed SwiftUI approval actions
+- changing GraphQL mutation authorization or principal surface policies
+- changing the P031/P072 static boundary or inventory
+- changing docs that describe whether UI approvals are diagnostic-only or actionable
+
+Host policy:
+
+- Python 3, local Rust toolchain, and local macOS Swift test toolchain required
+- no live daemon, Xcode UI tests, simulator, GitHub PR review, or network access required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-072
+```
+
+Important:
+
+- `p072` is accepted as an alias
+- non-approval operator commands remain MCP-only for governed UI
+- the gate intentionally does not inspect or require GitHub/Copilot PR review disposition
+- SwiftUI may use GraphQL mutations only for `approveApproval` and `rejectApproval`
 
 ### `proposal-031-readiness|p031-readiness`
 

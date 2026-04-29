@@ -1636,6 +1636,7 @@ Available gates:
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-072,p072  Proposal 072 approval-only GraphQL UI mutation boundary and MCP-only command routing gate
   proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -2533,6 +2534,56 @@ for entry in manifest.get("entries", []):
 PY
     )
     log "Proposal 031 gate passed"
+    ;;
+  proposal-072|p072)
+    log "Proposal 072 gate: approval-only GraphQL UI mutation boundary"
+    "$0" proposal-031
+
+    run_targeted_tests "proposal-072-swift" \
+      "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p domain operator_action_routing -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p auth v2_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p auth is_mutation_allowed_by_surface_policy_checks -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server approve_approval -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server reject_approval -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server ui_operator_denied_non_approval_mutations -- --test-threads=1 --nocapture
+    )
+
+    (
+      cd "$ROOT_DIR"
+      python3 - <<'PY'
+from pathlib import Path
+
+p031 = Path("docs/proposals/031-thin-graphql-ui-rewrite.md").read_text()
+required = [
+    "P072 supersedes the original P031 all-mutation ban",
+    "approveApproval",
+    "rejectApproval",
+    "0 non-approval GraphQL mutations",
+]
+for phrase in required:
+    if phrase not in p031:
+        raise SystemExit(f"proposal-072: P031 text missing P072 reconciliation phrase: {phrase}")
+
+for forbidden in [
+    "Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.",
+    "Governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.",
+    "GraphQL mutation usage: 0 GraphQL mutations defined or invoked by governed UI code.",
+]:
+    if forbidden in p031:
+        raise SystemExit(f"proposal-072: P031 still contains stale P031/P072 boundary text: {forbidden}")
+
+inventory = Path("docs/reference/p031-thin-ui-inventory.json").read_text()
+for operation in ["P072ApproveApproval", "P072RejectApproval"]:
+    if operation not in inventory:
+        raise SystemExit(f"proposal-072: P031 inventory missing allowed approval operation {operation}")
+PY
+    )
+
+    log "Proposal 072 gate passed"
     ;;
   proposal-031-readiness|p031-readiness)
     log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"
