@@ -31,27 +31,68 @@ fn write_temp_fixture(filename: &str, content: &str) -> String {
 fn catalog_with_default_system_lead(catalog_yaml: &str) -> String {
     let mut catalog: serde_yaml::Value =
         serde_yaml::from_str(catalog_yaml).expect("test catalog fixture should parse as YAML");
-    let has_system_lead = catalog
-        .get("agents")
-        .and_then(|agents| agents.as_sequence())
-        .map(|agents| {
-            agents.iter().any(|agent| {
-                agent.get("system_role").and_then(|role| role.as_str()) == Some("lead")
-            })
-        })
-        .unwrap_or(false);
-    if has_system_lead {
-        return catalog_yaml.to_string();
-    }
+    let catalog_map = catalog
+        .as_mapping_mut()
+        .expect("test catalog fixture should be a mapping");
+    catalog_map
+        .entry(serde_yaml::Value::String("permission_profiles".to_string()))
+        .or_insert_with(|| {
+            serde_yaml::from_str("ORCH: {}")
+                .expect("default test permission profile fixture should parse")
+        });
+    catalog_map
+        .entry(serde_yaml::Value::String("contracts".to_string()))
+        .or_insert_with(|| {
+            serde_yaml::from_str(
+                r#"
+LeadResolutionContract:
+  format: json
+  required_fields:
+    - resolution_mode
+    - requires_operator_confirmation
+    - recommended_action
+    - rationale_summary
+"#,
+            )
+            .expect("default test lead contract fixture should parse")
+        });
 
     if let Some(agents) = catalog
         .get_mut("agents")
         .and_then(|agents| agents.as_sequence_mut())
     {
-        if let Some(first_agent) = agents.first_mut().and_then(|agent| agent.as_mapping_mut()) {
-            first_agent.insert(
-                serde_yaml::Value::String("system_role".to_string()),
-                serde_yaml::Value::String("lead".to_string()),
+        let lead_agent = agents.iter_mut().find_map(|agent| {
+            agent.as_mapping_mut().and_then(|agent| {
+                (agent.get("system_role").and_then(|role| role.as_str()) == Some("lead"))
+                    .then_some(agent)
+            })
+        });
+        let lead_agent = match lead_agent {
+            Some(lead_agent) => Some(lead_agent),
+            None => agents.first_mut().and_then(|agent| {
+                let agent = agent.as_mapping_mut()?;
+                agent.insert(
+                    serde_yaml::Value::String("system_role".to_string()),
+                    serde_yaml::Value::String("lead".to_string()),
+                );
+                Some(agent)
+            }),
+        };
+        if let Some(lead_agent) = lead_agent {
+            lead_agent
+                .entry(serde_yaml::Value::String("system_role".to_string()))
+                .or_insert(serde_yaml::Value::String("lead".to_string()));
+            lead_agent
+                .entry(serde_yaml::Value::String("permission_profile".to_string()))
+                .or_insert(serde_yaml::Value::String("ORCH".to_string()));
+            lead_agent.insert(
+                serde_yaml::Value::String("lead_resolution_contract".to_string()),
+                lead_agent
+                    .get("lead_resolution_contract")
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        serde_yaml::Value::String("LeadResolutionContract".to_string())
+                    }),
             );
         }
     }

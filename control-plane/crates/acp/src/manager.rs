@@ -47,6 +47,10 @@ pub trait XcodeBrokerLeaseAttacher: Send + Sync {
         req: &ExecutionRequest,
     ) -> Result<BrokeredXcodeLeaseAttachment>;
 
+    async fn warm_up_brokered_xcode_leases(&self, _lease_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+
     async fn release_brokered_xcode_leases(&self, _lease_ids: &[String]) -> Result<()> {
         Ok(())
     }
@@ -368,6 +372,14 @@ impl AcpRuntimeManager {
         self.attach_xcode_shim_runtime_if_needed(&session_req, &mut launch_spec)?;
 
         if let Err(err) = adapter.reject_unconverted_broker_intents(&session_req) {
+            self.release_xcode_leases(lease_cleanup).await;
+            return Err(err);
+        }
+
+        if let Err(err) = attacher
+            .warm_up_brokered_xcode_leases(&attachment.lease_ids)
+            .await
+        {
             self.release_xcode_leases(lease_cleanup).await;
             return Err(err);
         }

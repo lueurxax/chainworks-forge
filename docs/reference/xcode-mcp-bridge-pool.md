@@ -25,7 +25,7 @@ The scoped broker/readback implementation has live dogfood sign-off recorded und
 
 Xcode MCP is represented as a broker intent until the pool reserves a lease for the execution. The intent carries the extension id, runtime id, server id, workspace/target selection hints, runtime profile, permission profile, resolved tool allowlist hash, and the requirement that the provider support HTTP MCP.
 
-Before provider launch, the runtime attaches brokered leases and replaces broker intents with provider-facing HTTP MCP entries. The ACP `session/new` wire payload uses canonical HTTP server shape:
+Before provider launch, the runtime attaches brokered leases, warms the shared Xcode MCP backend, and only then replaces broker intents with provider-facing HTTP MCP entries in the ACP `session/new` payload. Warmup performs the MCP handshake against the daemon-owned backend (`initialize`, `notifications/initialized`, `tools/list`) so provider startup does not race Xcode consent or backend tool discovery. The provider-facing wire payload uses canonical HTTP server shape:
 
 ```json
 {
@@ -61,6 +61,7 @@ The pool owns lease state, capacity, queueing, authorization, target snapshot re
 Implemented behavior:
 
 - reserved leases are attached before provider `session/new`,
+- broker warmup completes before provider `session/new` so providers only see ready HTTP MCP leases,
 - active lease and queue counts feed broker health,
 - requests over capacity fail or wait within the configured queue timeout,
 - backend initialization is serialized for a target Xcode process,
@@ -77,6 +78,12 @@ Lease isolation remains at the broker facade: each lease keeps its own bearer to
 Requests to one shared backend use an ordered stdio request pump rather than concurrent writes to the same process. Leases for different run/Xcode-target keys use independent backend processes.
 
 Provider sessions do not receive host-home access for their ordinary runtime state. Host Xcode work is routed through the broker/shim boundary.
+
+### Consent And Warmup Timeouts
+
+Xcode consent is treated as broker readiness, not as provider startup work. If Xcode requires operator approval during backend warmup, the broker emits an action-required observation after the short visibility threshold and continues waiting on the Chainworks side. The default broker initialize/backend response timeout is at least ten minutes so the operator is not racing the provider's shorter MCP startup timeout to click the Xcode modal.
+
+If warmup eventually fails, the runtime releases the reserved leases and fails before launching the provider. A retry gets a fresh broker warmup attempt. This preserves the intended operator experience: at most one Xcode consent prompt per warmed run/Xcode backend session, while sibling agent leases share the ready backend through their own bearer-token-protected HTTP lease endpoints.
 
 ## Shim Dispatch
 

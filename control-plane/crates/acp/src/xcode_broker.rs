@@ -32,6 +32,7 @@ use crate::{
 };
 
 const XCODE_MCP_ACTION_REQUIRED_AFTER: Duration = Duration::from_secs(5);
+const XCODE_MCP_HUMAN_CONSENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 const XCODE_MCP_BACKEND_SHUTDOWN_WAIT: Duration = Duration::from_millis(250);
@@ -61,7 +62,7 @@ impl Default for XcodeMcpBridgePoolConfig {
             max_active_leases: 8,
             max_queued_leases: 16,
             queue_timeout: Duration::from_secs(45),
-            spawn_init_timeout: Duration::from_secs(30),
+            spawn_init_timeout: XCODE_MCP_HUMAN_CONSENT_TIMEOUT,
             first_connect_timeout: Duration::from_secs(60),
             broker_disabled: false,
             tool_allowlists_by_hash: BTreeMap::new(),
@@ -123,7 +124,7 @@ impl Default for XcodeMcpProcessBackendConfig {
         Self {
             command: "xcrun".to_string(),
             args: vec!["mcpbridge".to_string()],
-            request_timeout: Duration::from_secs(30),
+            request_timeout: XCODE_MCP_HUMAN_CONSENT_TIMEOUT,
         }
     }
 }
@@ -1021,7 +1022,29 @@ impl XcodeMcpBridgePool {
             .unwrap_or("<missing-method>")
             .to_string();
         let started = Instant::now();
-        let response = backend.forward_json_rpc(context.clone(), request).await;
+        let response_fut = backend.forward_json_rpc(context.clone(), request);
+        tokio::pin!(response_fut);
+        let response = tokio::select! {
+            response = &mut response_fut => response,
+            _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                let wait_ms = started.elapsed().as_millis() as i64;
+                let backend_process_id = backend.backend_process_id(&context.lease_id).await;
+                let observation = self.backend_request_observation(
+                    &context,
+                    "backend_request_action_required",
+                    Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                    wait_ms,
+                    backend_process_id,
+                    format!(
+                        "Action Required: Check Xcode after waiting {} ms for brokered Xcode MCP method '{}' on lease '{}'",
+                        wait_ms, method, context.lease_id
+                    ),
+                );
+                self.record_observation(context.agent_execution_id, observation)
+                    .await;
+                response_fut.await
+            }
+        };
         let latency_ms = started.elapsed().as_millis() as i64;
         let backend_process_id = backend.backend_process_id(&context.lease_id).await;
         let observation = match &response {
@@ -1051,6 +1074,67 @@ impl XcodeMcpBridgePool {
         self.record_observation(context.agent_execution_id, observation)
             .await;
         response
+    }
+
+    pub async fn warm_up_brokered_xcode_leases(&self, lease_ids: &[String]) -> Result<()> {
+        for lease_id in lease_ids {
+            self.forward_json_rpc_request(
+                lease_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("chainworks-xcode-warmup-initialize-{lease_id}"),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "chainworks-xcode-broker",
+                            "version": "1"
+                        }
+                    }
+                }),
+            )
+            .await
+            .with_context(|| format!("xcode_mcp_warmup_failed: initialize lease '{lease_id}'"))?;
+            self.forward_json_rpc_request(
+                lease_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                }),
+            )
+            .await
+            .with_context(|| {
+                format!("xcode_mcp_warmup_failed: notifications/initialized lease '{lease_id}'")
+            })?;
+            self.forward_json_rpc_request(
+                lease_id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("chainworks-xcode-warmup-tools-list-{lease_id}"),
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            )
+            .await
+            .with_context(|| format!("xcode_mcp_warmup_failed: tools/list lease '{lease_id}'"))?;
+            self.refresh_reserved_first_connect_deadline(lease_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_reserved_first_connect_deadline(&self, lease_id: &str) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let Some(lease) = state.leases.get_mut(lease_id) else {
+            bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
+        };
+        if lease.state == XcodeMcpLeaseState::Reserved {
+            lease.first_connect_deadline = Instant::now() + self.config.first_connect_timeout;
+            lease.last_activity_at = Instant::now();
+        }
+        Ok(())
     }
 
     async fn initialize_lock_for(&self, lock_key: &str) -> Arc<Mutex<()>> {
@@ -1875,6 +1959,10 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
         }
 
         Ok(())
+    }
+
+    async fn warm_up_brokered_xcode_leases(&self, lease_ids: &[String]) -> Result<()> {
+        XcodeMcpBridgePool::warm_up_brokered_xcode_leases(self, lease_ids).await
     }
 }
 
