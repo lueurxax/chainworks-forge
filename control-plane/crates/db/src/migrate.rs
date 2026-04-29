@@ -44,6 +44,12 @@ const P058_LEGACY_CHECKSUM: &[u8] = &[
     0x7d, 0x69, 0x03, 0x8b, 0x16, 0xa3, 0xfa, 0xac, 0xf5, 0x88, 0xce, 0x71, 0x49, 0xae, 0xd2, 0x53,
     0xd0, 0x9e, 0xba, 0x38, 0x7b, 0x24, 0x7b, 0x5c, 0x54, 0x17, 0x87, 0x4a, 0xa2, 0xe7, 0x80, 0xe4,
 ];
+const P017_MIGRATION_029_VERSION: i64 = 29;
+const P017_MIGRATION_029_LEGACY_CHECKSUM: &[u8] = &[
+    0x6f, 0xe7, 0x12, 0xd7, 0xdb, 0x30, 0x35, 0x01, 0x86, 0x3e, 0xf4, 0x72, 0x60, 0xf5, 0xed, 0xeb,
+    0x35, 0x12, 0xd8, 0xa3, 0x30, 0x9d, 0xb4, 0x2d, 0xad, 0xd2, 0xa8, 0x96, 0x87, 0xdb, 0x99, 0x72,
+    0x0c, 0xcc, 0x3b, 0x51, 0x79, 0x0a, 0x40, 0xf7, 0xe3, 0xa5, 0xd0, 0xc5, 0x98, 0x30, 0x2a, 0x4b,
+];
 
 /// Classification of a SQLite target at startup time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +370,11 @@ async fn apply_under_exclusive_lock(pool: &SqlitePool) -> Result<(), MigrationEr
 async fn reconcile_known_applied_migration_checksums(
     pool: &SqlitePool,
 ) -> Result<(), MigrationError> {
+    reconcile_p058_checksum(pool).await?;
+    reconcile_p017_migration_029_checksum(pool).await
+}
+
+async fn reconcile_p058_checksum(pool: &SqlitePool) -> Result<(), MigrationError> {
     let Some(current_checksum) = MIGRATOR
         .iter()
         .find(|migration| migration.version == P058_MIGRATION_VERSION)
@@ -401,6 +412,87 @@ async fn reconcile_known_applied_migration_checksums(
         .await
         .map_err(|e| MigrationError::IoError(format!("repair migration 16 checksum: {e}")))?;
     Ok(())
+}
+
+async fn reconcile_p017_migration_029_checksum(pool: &SqlitePool) -> Result<(), MigrationError> {
+    let Some(current_checksum) = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == P017_MIGRATION_029_VERSION)
+        .map(|migration| migration.checksum.as_ref().to_vec())
+    else {
+        return Ok(());
+    };
+
+    let row =
+        sqlx::query("SELECT checksum FROM _sqlx_migrations WHERE version = ?1 AND success = 1")
+            .bind(P017_MIGRATION_029_VERSION)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MigrationError::IoError(format!("read migration 29 checksum: {e}")))?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let checksum = row
+        .try_get::<Vec<u8>, _>("checksum")
+        .map_err(|e| MigrationError::IoError(format!("parse migration 29 checksum: {e}")))?;
+    if checksum == current_checksum {
+        return Ok(());
+    }
+    if checksum.as_slice() != P017_MIGRATION_029_LEGACY_CHECKSUM {
+        return Ok(());
+    }
+    if !p017_migration_029_schema_shape_matches(pool).await? {
+        return Ok(());
+    }
+
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2 AND success = 1")
+        .bind(current_checksum)
+        .bind(P017_MIGRATION_029_VERSION)
+        .execute(pool)
+        .await
+        .map_err(|e| MigrationError::IoError(format!("repair migration 29 checksum: {e}")))?;
+    Ok(())
+}
+
+async fn p017_migration_029_schema_shape_matches(
+    pool: &SqlitePool,
+) -> Result<bool, MigrationError> {
+    if !table_contains_columns(
+        pool,
+        "agent_executions",
+        &[
+            "stage_execution_id",
+            "owner_kind",
+            "owner_id",
+            "lead_mediation_record_id",
+            "origin_stage_execution_id",
+        ],
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    if !table_column_is_nullable(pool, "agent_executions", "stage_execution_id").await? {
+        return Ok(false);
+    }
+    for table in [
+        "agent_retry_budget_ledger",
+        "artifact_source_generation_claims",
+    ] {
+        if !table_contains_columns(
+            pool,
+            table,
+            &["owner_kind", "owner_id", "stage_execution_id"],
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        if !table_column_is_nullable(pool, table, "stage_execution_id").await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn p058_schema_shape_matches(pool: &SqlitePool) -> Result<bool, MigrationError> {
@@ -485,6 +577,28 @@ async fn p058_schema_shape_matches(pool: &SqlitePool) -> Result<bool, MigrationE
         }
     }
     Ok(true)
+}
+
+async fn table_column_is_nullable(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+) -> Result<bool, MigrationError> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MigrationError::IoError(format!("inspect {table} column nullability: {e}")))?;
+    let Some(row) = rows.into_iter().find(|row| {
+        row.try_get::<String, _>("name")
+            .map(|name| name == column)
+            .unwrap_or(false)
+    }) else {
+        return Ok(false);
+    };
+    let notnull = row
+        .try_get::<i64, _>("notnull")
+        .map_err(|e| MigrationError::IoError(format!("parse {table}.{column} nullability: {e}")))?;
+    Ok(notnull == 0)
 }
 
 async fn table_contains_columns(
@@ -755,6 +869,40 @@ mod tests {
         let expected = MIGRATOR
             .iter()
             .find(|migration| migration.version == P058_MIGRATION_VERSION)
+            .unwrap()
+            .checksum
+            .as_ref()
+            .to_vec();
+        assert_eq!(repaired, expected);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconciles_legacy_p017_migration_029_checksum_when_schema_shape_matches() {
+        let (_dir, _path, url) = new_tmp_db().await;
+        run_preflight(&url, None).await.unwrap();
+
+        let pool = open_pool(&url).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+            .bind(P017_MIGRATION_029_LEGACY_CHECKSUM)
+            .bind(P017_MIGRATION_029_VERSION)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reconcile_known_applied_migration_checksums(&pool)
+            .await
+            .unwrap();
+
+        let repaired: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?1")
+                .bind(P017_MIGRATION_029_VERSION)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let expected = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == P017_MIGRATION_029_VERSION)
             .unwrap()
             .checksum
             .as_ref()

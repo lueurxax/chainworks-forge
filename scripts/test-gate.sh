@@ -3061,8 +3061,14 @@ PY
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
       cargo test -p domain --lib routing -- --test-threads=1 --nocapture
       cargo test -p engine --lib proposal_review_router -- --test-threads=1 --nocapture
+      cargo test -p engine --lib command_handler::tests::p060 -- --test-threads=1 --nocapture
+      cargo test -p engine --test integration test_start_run_persists_delivery_configuration_json -- --test-threads=1 --nocapture
+      cargo test -p engine --test integration p060_legacy_and_shadow_modes_dispatch_fixed_quartet_on_dynamic_workflow -- --test-threads=1 --nocapture
+      cargo test -p graphql-server --lib start_run_accepts_delivery_configuration_json -- --test-threads=1 --nocapture
+      cargo test -p mcp-server --lib runs_start_persists_delivery_configuration_json -- --test-threads=1 --nocapture
       cargo test -p workflow --test integration p060 -- --test-threads=1 --nocapture
     )
+    xcodebuild test -project "$ROOT_DIR/Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" -only-testing:"Chainworks ForgeTests/ProposalReviewRoutingTests" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
 
     # Phase 3 closure guards (audit ARCH/OPS-style).
     # These die before the gate exits if any of the Phase 3 contracts

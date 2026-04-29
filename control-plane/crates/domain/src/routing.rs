@@ -138,6 +138,35 @@ pub struct AgentSelectionPlanV1 {
     pub input_snapshot_hashes: InputSnapshotHashes,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScoreWeights {
+    pub force_include: i64,
+    pub stack_matches: i64,
+    pub surface_matches: i64,
+    pub risk_matches: i64,
+    pub strong_keyword_matches: i64,
+    pub repo_signal_matches: i64,
+    pub cross_stack_dependency_matches: i64,
+    pub baseline_gap_matches: i64,
+    pub overlap_penalty: i64,
+}
+
+impl Default for ScoreWeights {
+    fn default() -> Self {
+        Self {
+            force_include: 5,
+            stack_matches: 4,
+            surface_matches: 3,
+            risk_matches: 3,
+            strong_keyword_matches: 2,
+            repo_signal_matches: 2,
+            cross_stack_dependency_matches: 2,
+            baseline_gap_matches: 1,
+            overlap_penalty: 3,
+        }
+    }
+}
+
 /// A reviewer selected by the routing algorithm.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SelectedAgent {
@@ -169,15 +198,19 @@ pub struct ScoreTerms {
 impl ScoreTerms {
     /// Compute the total score from the formula in P060 §5.
     pub fn total(&self) -> i64 {
-        self.force_include * 5
-            + self.stack_matches * 4
-            + self.surface_matches * 3
-            + self.risk_matches * 3
-            + self.strong_keyword_matches * 2
-            + self.repo_signal_matches * 2
-            + self.cross_stack_dependency_matches * 2
-            + self.baseline_gap_matches * 1
-            - self.overlap_penalty * 3
+        self.total_with_weights(&ScoreWeights::default())
+    }
+
+    pub fn total_with_weights(&self, weights: &ScoreWeights) -> i64 {
+        self.force_include * weights.force_include
+            + self.stack_matches * weights.stack_matches
+            + self.surface_matches * weights.surface_matches
+            + self.risk_matches * weights.risk_matches
+            + self.strong_keyword_matches * weights.strong_keyword_matches
+            + self.repo_signal_matches * weights.repo_signal_matches
+            + self.cross_stack_dependency_matches * weights.cross_stack_dependency_matches
+            + self.baseline_gap_matches * weights.baseline_gap_matches
+            - self.overlap_penalty * weights.overlap_penalty
     }
 }
 
@@ -376,7 +409,7 @@ pub enum ReviewRoutingMode {
 
 impl Default for ReviewRoutingMode {
     fn default() -> Self {
-        Self::LegacyFixed
+        Self::Dynamic
     }
 }
 
@@ -501,6 +534,14 @@ pub struct RoutingMetadata {
     pub usually_pair_with: Vec<String>,
     #[serde(default)]
     pub close_alternatives: Vec<String>,
+    #[serde(default)]
+    pub strong_proposal_keywords: Vec<String>,
+    #[serde(default)]
+    pub strong_repo_files: Vec<String>,
+    #[serde(default)]
+    pub strong_repo_symbols: Vec<String>,
+    #[serde(default)]
+    pub score_weights: ScoreWeights,
 }
 
 /// A compiled candidate binding for dynamic reviewer materialization.
@@ -556,6 +597,8 @@ pub struct ReviewCorpusBundleV2 {
     pub reviewer_count: usize,
     /// plan_hash from the AgentSelectionPlanV1 that drove selection.
     pub selection_plan_hash: String,
+    /// Full selection plan snapshot used for aggregation/readback.
+    pub selection_plan: AgentSelectionPlanV1,
     /// True when the run used legacy fixed mode (no dynamic routing).
     pub legacy_fixed_mode: bool,
 }
@@ -667,18 +710,21 @@ mod tests {
 
     #[test]
     fn routing_evidence_projection_authorizer_redacts_for_non_operators() {
-        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE", "1");
-        let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
-            &crate::PrincipalClass::Agent,
-        );
+        let auth =
+            RoutingEvidenceProjectionAuthorizer::for_principal_class(&crate::PrincipalClass::Agent);
         std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
         assert_eq!(auth.projection(), RoutingEvidenceProjection::Redacted);
     }
 
     #[test]
     fn routing_evidence_projection_authorizer_requires_env_for_operator() {
-        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE");
         let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
             &crate::PrincipalClass::Operator,
@@ -688,7 +734,9 @@ mod tests {
 
     #[test]
     fn routing_evidence_projection_authorizer_grants_operator_with_env() {
-        let _guard = ROUTING_EVIDENCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_EVIDENCE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CHAINWORKS_OPERATOR_DEBUG_ROUTING_EVIDENCE", "1");
         let auth = RoutingEvidenceProjectionAuthorizer::for_principal_class(
             &crate::PrincipalClass::Operator,
@@ -748,7 +796,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_no_env_returns_per_run_mode() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
         assert_eq!(res.effective(), ReviewRoutingMode::Dynamic);
@@ -760,7 +810,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_env_legacy_overrides_dynamic() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "legacy_fixed");
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
@@ -776,7 +828,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_env_shadow_overrides_legacy() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "shadow_dynamic");
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::LegacyFixed);
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
@@ -785,7 +839,9 @@ mod tests {
 
     #[test]
     fn resolve_effective_routing_mode_unrecognized_env_falls_back_to_per_run() {
-        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ROUTING_MODE_OVERRIDE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ROUTING_MODE_OVERRIDE_ENV, "totally_made_up");
         let res = resolve_effective_routing_mode(&ReviewRoutingMode::Dynamic);
         std::env::remove_var(ROUTING_MODE_OVERRIDE_ENV);
@@ -832,7 +888,7 @@ mod tests {
     #[test]
     fn review_routing_options_defaults() {
         let opts = ReviewRoutingOptions::default();
-        assert_eq!(opts.mode, ReviewRoutingMode::LegacyFixed);
+        assert_eq!(opts.mode, ReviewRoutingMode::Dynamic);
         assert!(opts.force_include.is_empty());
         assert!(opts.force_exclude.is_empty());
     }
@@ -870,6 +926,19 @@ mod tests {
 
     #[test]
     fn review_corpus_bundle_v2_serialization_roundtrip() {
+        let selection_plan = AgentSelectionPlanV1 {
+            schema_version: "1".into(),
+            routing_rules_version: "1".into(),
+            proposal_md5: "abc".into(),
+            plan_hash: "abc123hash".into(),
+            mode: ReviewRoutingMode::Dynamic,
+            fingerprint: vec!["rust".into()],
+            selected_agents: vec![],
+            rejected_alternatives: vec![],
+            ineligible_candidates: vec![],
+            warnings: vec![],
+            input_snapshot_hashes: InputSnapshotHashes::default(),
+        };
         let bundle = ReviewCorpusBundleV2 {
             selected_review_artifacts: vec!["a1".into(), "a2".into(), "a3".into()],
             selected_reviewer_ids: vec![
@@ -879,6 +948,7 @@ mod tests {
             ],
             reviewer_count: 3,
             selection_plan_hash: "abc123hash".into(),
+            selection_plan: selection_plan.clone(),
             legacy_fixed_mode: false,
         };
         let json = serde_json::to_string(&bundle).unwrap();
@@ -886,12 +956,26 @@ mod tests {
         assert_eq!(round.reviewer_count, 3);
         assert_eq!(round.selected_reviewer_ids.len(), 3);
         assert_eq!(round.selection_plan_hash, "abc123hash");
+        assert_eq!(round.selection_plan.plan_hash, selection_plan.plan_hash);
         assert!(!round.legacy_fixed_mode);
         assert_eq!(round.selected_review_artifacts.len(), 3);
     }
 
     #[test]
     fn review_corpus_bundle_v2_legacy_fixed_mode() {
+        let selection_plan = AgentSelectionPlanV1 {
+            schema_version: "1".into(),
+            routing_rules_version: "1".into(),
+            proposal_md5: "legacy".into(),
+            plan_hash: "legacy_hash".into(),
+            mode: ReviewRoutingMode::LegacyFixed,
+            fingerprint: vec![],
+            selected_agents: vec![],
+            rejected_alternatives: vec![],
+            ineligible_candidates: vec![],
+            warnings: vec![],
+            input_snapshot_hashes: InputSnapshotHashes::default(),
+        };
         let bundle = ReviewCorpusBundleV2 {
             selected_review_artifacts: vec!["a1".into(), "a2".into(), "a3".into(), "a4".into()],
             selected_reviewer_ids: vec![
@@ -902,11 +986,13 @@ mod tests {
             ],
             reviewer_count: 4,
             selection_plan_hash: "legacy_hash".into(),
+            selection_plan,
             legacy_fixed_mode: true,
         };
         let json = serde_json::to_string(&bundle).unwrap();
         let round: ReviewCorpusBundleV2 = serde_json::from_str(&json).unwrap();
         assert!(round.legacy_fixed_mode);
         assert_eq!(round.reviewer_count, 4);
+        assert_eq!(round.selection_plan.mode, ReviewRoutingMode::LegacyFixed);
     }
 }

@@ -8,6 +8,8 @@ use domain::routing::DynamicMaterializationRecord;
 /// Insert a materialization record. Uses the unique idempotency index to
 /// detect duplicates — returns Ok(false) if a record already exists for
 /// the same (run_id, stage_id, attempt_id, phase_id, plan_hash, binding_id).
+/// Engine callers store a stage-execution epoch in `attempt_id`, not just the
+/// workflow attempt number, so loop re-entry can rematerialize the same plan.
 pub async fn insert_idempotent(
     pool: &SqlitePool,
     record: &DynamicMaterializationRecord,

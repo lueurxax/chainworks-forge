@@ -6,7 +6,10 @@ use tracing::warn;
 
 use crate::adapters::XcodeShimGrantCleanup;
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
-use crate::{AcpCloseDiagnostic, ExecutionRequest, ExecutionResult};
+use crate::{
+    AcpCloseDiagnostic, AcpPromptProgressSink, ExecutionRequest, ExecutionResult,
+    NoopAcpPromptProgressSink,
+};
 use domain::ids::AgentExecutionId;
 
 /// Transport-backed ACP session that can accept multiple prompt turns before
@@ -84,7 +87,17 @@ impl AcpSession {
     /// Send a prompt through the live ACP session and return the prompt
     /// result. The transport stays open for later reuse.
     pub async fn prompt(&mut self, req: &ExecutionRequest) -> Result<ExecutionResult> {
-        self.prompt_with_optional_close_signal(req, None).await
+        self.prompt_with_optional_close_signal(req, None, Arc::new(NoopAcpPromptProgressSink))
+            .await
+    }
+
+    pub async fn prompt_with_progress_sink(
+        &mut self,
+        req: &ExecutionRequest,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
+    ) -> Result<ExecutionResult> {
+        self.prompt_with_optional_close_signal(req, None, progress_sink)
+            .await
     }
 
     pub async fn prompt_with_close_signal(
@@ -92,21 +105,34 @@ impl AcpSession {
         req: &ExecutionRequest,
         close_rx: &mut watch::Receiver<bool>,
     ) -> Result<ExecutionResult> {
-        self.prompt_with_optional_close_signal(req, Some(close_rx))
-            .await
+        self.prompt_with_optional_close_signal(
+            req,
+            Some(close_rx),
+            Arc::new(NoopAcpPromptProgressSink),
+        )
+        .await
     }
 
     async fn prompt_with_optional_close_signal(
         &mut self,
         req: &ExecutionRequest,
         close_rx: Option<&mut watch::Receiver<bool>>,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
     ) -> Result<ExecutionResult> {
         self.xcode_shim_grants
             .iter()
             .for_each(|grant| grant.set_active_prompt(true));
         let prompt_result = match close_rx {
-            Some(close_rx) => self.transport.prompt_with_close_signal(req, close_rx).await,
-            None => self.transport.prompt(req).await,
+            Some(close_rx) => {
+                self.transport
+                    .prompt_with_close_signal_and_progress_sink(req, close_rx, progress_sink)
+                    .await
+            }
+            None => {
+                self.transport
+                    .prompt_with_progress_sink(req, progress_sink)
+                    .await
+            }
         };
         self.xcode_shim_grants
             .iter()
@@ -214,9 +240,21 @@ impl AcpSessionHandle {
 
     /// Send a prompt through the live session.
     pub async fn prompt(&self, req: &ExecutionRequest) -> Result<ExecutionResult> {
+        self.prompt_with_progress_sink(req, Arc::new(NoopAcpPromptProgressSink))
+            .await
+    }
+
+    /// Send a prompt through the live session and publish transport progress.
+    pub async fn prompt_with_progress_sink(
+        &self,
+        req: &ExecutionRequest,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
+    ) -> Result<ExecutionResult> {
         let mut close_rx = self.close_tx.subscribe();
         let mut session = self.inner.lock().await;
-        session.prompt_with_close_signal(req, &mut close_rx).await
+        session
+            .prompt_with_optional_close_signal(req, Some(&mut close_rx), progress_sink)
+            .await
     }
 
     /// Close the live session.

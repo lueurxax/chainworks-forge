@@ -8,11 +8,12 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
-    ideas, legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
-    sessions, stages, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
+    artifact_contracts, command_journal, ideas, legacy_discovery_overrides, projections,
+    retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
@@ -244,6 +245,177 @@ fn find_source_invoke_work_item<'a>(
             matches.then_some(item)
         })
         .max_by_key(|item| item.created_at)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetedRetryProviderFallback {
+    from_backend_profile_id: Option<String>,
+    from_provider: String,
+    backend_profile_id: String,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<i64>,
+}
+
+fn targeted_retry_provider_fallback(
+    run: &Run,
+    agent_id: &str,
+    retry_payload: &serde_json::Value,
+    runtime_facts: Option<&AgentExecutionRuntimeFacts>,
+) -> Option<TargetedRetryProviderFallback> {
+    let from_provider = retry_payload.get("provider")?.as_str()?.to_string();
+    if !matches!(
+        from_provider.as_str(),
+        "gemini" | "gemini_acp" | "claude" | "claude_acp" | "codex" | "codex_acp"
+    ) {
+        return None;
+    }
+    let output_contract = retry_payload
+        .get("output_contract")
+        .and_then(serde_json::Value::as_str);
+    let is_proposal_review = output_contract == Some("proposal_review_v1");
+    let is_proposal_review_aggregation = agent_id == "lead_orchestrator"
+        && retry_payload
+            .get("task_outputs")
+            .and_then(serde_json::Value::as_array)
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .any(|value| value.as_str() == Some("proposal_review_summary"))
+            })
+            .unwrap_or(false);
+    let is_proposal_authoring = agent_id == "proposal_writer"
+        && retry_payload
+            .get("task_outputs")
+            .and_then(serde_json::Value::as_array)
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .any(|value| value.as_str() == Some("proposal_current"))
+            })
+            .unwrap_or(false);
+    if !is_proposal_review && !is_proposal_review_aggregation && !is_proposal_authoring {
+        return None;
+    }
+    let source_failed_without_required_outputs = runtime_facts
+        .map(|facts| {
+            matches!(
+                facts.failure_kind,
+                Some(AgentFailureKind::ProviderQuota)
+                    | Some(AgentFailureKind::MissingRequiredOutputs)
+            ) || facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+        })
+        .unwrap_or(true);
+    let source_had_transient_runtime_failure = runtime_facts
+        .map(|facts| {
+            matches!(
+                facts.failure_kind,
+                Some(
+                    AgentFailureKind::ProviderTimeout
+                        | AgentFailureKind::TransportClosed
+                        | AgentFailureKind::TransportEpipe
+                        | AgentFailureKind::TransportProtocolError
+                )
+            )
+        })
+        .unwrap_or(false);
+    if matches!(
+        from_provider.as_str(),
+        "claude" | "claude_acp" | "codex" | "codex_acp"
+    ) && !source_failed_without_required_outputs
+        && !source_had_transient_runtime_failure
+    {
+        return None;
+    }
+
+    let catalog: serde_json::Value =
+        serde_json::from_str(run.catalog_snapshot_json.as_deref()?).ok()?;
+    let profiles = catalog.get("backend_profiles")?.as_object()?;
+    let fallback_id = targeted_retry_fallback_profile_id(
+        agent_id,
+        &from_provider,
+        is_proposal_review_aggregation,
+        is_proposal_authoring,
+        profiles,
+    )?;
+    let profile = profiles.get(fallback_id)?.as_object()?;
+    let provider = profile.get("provider")?.as_str()?.to_string();
+    if provider == from_provider {
+        return None;
+    }
+
+    Some(TargetedRetryProviderFallback {
+        from_backend_profile_id: retry_payload
+            .get("backend_profile_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        from_provider,
+        backend_profile_id: fallback_id.to_string(),
+        provider,
+        model: profile
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        effort: profile
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+    })
+}
+
+fn targeted_retry_fallback_profile_id<'a>(
+    agent_id: &str,
+    from_provider: &str,
+    is_proposal_review_aggregation: bool,
+    is_proposal_authoring: bool,
+    profiles: &'a serde_json::Map<String, serde_json::Value>,
+) -> Option<&'a str> {
+    if is_proposal_review_aggregation {
+        return ["codex_writer_high", "codex_architect_high"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_proposal_authoring {
+        let candidates: &[&str] = if matches!(from_provider, "codex" | "codex_acp") {
+            &["claude_writer_high", "claude_product_high"]
+        } else {
+            &["codex_writer_high", "codex_architect_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if matches!(from_provider, "claude" | "claude_acp") {
+        return ["codex_architect_high", "codex_writer_high"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if matches!(from_provider, "codex" | "codex_acp") {
+        return ["claude_product_high", "claude_design_medium"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    let design_reviewer =
+        agent_id.contains("ux") || agent_id.contains("ui") || agent_id.contains("macos");
+    let candidates: &[&str] = if design_reviewer {
+        &[
+            "claude_design_medium",
+            "claude_product_high",
+            "codex_architect_high",
+        ]
+    } else {
+        &["claude_product_high", "codex_architect_high"]
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| profiles.contains_key(*candidate))
 }
 
 /// OPS-002 (P017 R4): classify the workflow-compile error so the
@@ -537,42 +709,6 @@ impl CommandHandler {
                     }
                 };
 
-                // P060: Validate review_routing_json if present.
-                let validated_review_routing_json = if let Some(ref json_str) = c.review_routing_json {
-                    match serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json_str) {
-                        Ok(opts) => {
-                            // Basic validation: reject duplicates in force_include/force_exclude.
-                            let mut seen = std::collections::HashSet::new();
-                            for agent_id in opts.force_include.iter().chain(opts.force_exclude.iter()) {
-                                if !seen.insert(agent_id.as_str()) {
-                                    let error = anyhow!("review_routing_json: duplicate agent_id '{agent_id}' in force_include/force_exclude");
-                                    let message = error.to_string();
-                                    self.record_failed_command_transaction(
-                                        journal,
-                                        "command.StartRun",
-                                        &message,
-                                    )
-                                    .await?;
-                                    return Err(error);
-                                }
-                            }
-                            // Re-serialize for canonical storage.
-                            Some(serde_json::to_string(&opts).unwrap_or_else(|_| json_str.clone()))
-                        }
-                        Err(error) => {
-                            let message = format!("review_routing_json: {error}");
-                            self.record_failed_command_transaction(
-                                journal,
-                                "command.StartRun",
-                                &message,
-                            )
-                            .await?;
-                            return Err(anyhow!(message));
-                        }
-                    }
-                } else {
-                    None
-                };
                 let delivery_preflight_json =
                     if let Some(delivery_configuration_json) = &c.delivery_configuration_json {
                         let delivery_config: domain::run::DeliveryConfiguration =
@@ -665,6 +801,22 @@ impl CommandHandler {
                     .filter(|v| !v.is_empty())
                     .unwrap_or("untagged")
                     .to_string();
+                let validated_review_routing_json = match resolve_start_run_review_routing_json(
+                    c.review_routing_json.as_deref(),
+                    &idea.body,
+                    Some(caller.principal_id.as_str()),
+                    now,
+                ) {
+                    Ok(json) => Some(json),
+                    Err(error) => {
+                        let message = format!("review_routing_json: {error}");
+                        command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &message)
+                            .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction("command.StartRun", tx_started);
+                        return Err(anyhow!(message));
+                    }
+                };
 
                 let run = Run {
                     id: run_id,
@@ -2539,20 +2691,8 @@ impl CommandHandler {
                     generation_id = %generation_id,
                     source_work_item_id = %source_item.id,
                     source_work_item_status = %source_item.status,
-                    "Targeted retry source ACP generation is no longer live; falling back to full stage retry"
+                    "Targeted retry source ACP generation is no longer live; creating a fresh targeted retry from persisted payload"
                 );
-                return self
-                    .retry_stage_latest_attempt(
-                        run_id,
-                        stage_id,
-                        consume_quota_budget_now,
-                        journal_id,
-                        journal,
-                        "operator_retry_stale_targeted_retry",
-                        validated_instruction,
-                        caller,
-                    )
-                    .await;
             }
         }
 
@@ -2564,6 +2704,15 @@ impl CommandHandler {
                     e
                 )
             })?;
+        let runtime_facts =
+            agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
+                .await?;
+        let provider_fallback = targeted_retry_provider_fallback(
+            &run,
+            &target_exec.agent_id,
+            &retry_payload,
+            runtime_facts.as_ref(),
+        );
         let next_attempt_number = matching_stages
             .iter()
             .map(|s| s.attempt_number)
@@ -2613,6 +2762,38 @@ impl CommandHandler {
                     "reason": "operator_targeted_retry"
                 }),
             );
+            if let Some(fallback) = provider_fallback {
+                object.insert(
+                    "backend_profile_id".into(),
+                    serde_json::json!(fallback.backend_profile_id.clone()),
+                );
+                object.insert(
+                    "provider".into(),
+                    serde_json::json!(fallback.provider.clone()),
+                );
+                object.insert("model".into(), serde_json::json!(fallback.model.clone()));
+                if let Some(effort) = fallback.effort.clone() {
+                    object.insert("effort".into(), serde_json::json!(effort));
+                }
+                if let Some(max_turns) = fallback.max_turns {
+                    object.insert("max_turns".into(), serde_json::json!(max_turns));
+                }
+                if let Some(targeted_retry) = object
+                    .get_mut("targeted_retry")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    targeted_retry.insert(
+                        "provider_fallback".into(),
+                        serde_json::json!({
+                            "reason": "source_provider_failed_without_required_output",
+                            "from_backend_profile_id": fallback.from_backend_profile_id,
+                            "from_provider": fallback.from_provider,
+                            "to_backend_profile_id": fallback.backend_profile_id,
+                            "to_provider": fallback.provider,
+                        }),
+                    );
+                }
+            }
         } else {
             return Err(anyhow!(
                 "Source InvokeAgent work item {} payload is not a JSON object",
@@ -2918,6 +3099,105 @@ fn phase_b_dogfood_exit_metric_snapshot(
     })
 }
 
+fn resolve_start_run_review_routing_json(
+    explicit_json: Option<&str>,
+    idea_body: &str,
+    operator_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    if let Some(json) = explicit_json {
+        let opts: domain::routing::ReviewRoutingOptions =
+            serde_json::from_str(json).map_err(|error| anyhow!("{error}"))?;
+        validate_review_routing_options(&opts)?;
+        return Ok(serde_json::to_string(&opts).unwrap_or_else(|_| json.to_string()));
+    }
+
+    let mut opts = domain::routing::ReviewRoutingOptions::default();
+    let mut has_hint = false;
+    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(idea_body) {
+        if let Some(mode) = yaml_lookup_string(&yaml, &["idea.review_mode"])
+            .or_else(|| yaml_lookup_string(&yaml, &["idea", "review_mode"]))
+        {
+            opts.mode = mode
+                .parse::<domain::routing::ReviewRoutingMode>()
+                .map_err(|error| anyhow!("{error}"))?;
+            has_hint = true;
+        }
+
+        if let Some(override_node) = yaml_lookup(&yaml, &["reviewer_override"]) {
+            opts.force_include = yaml_lookup_string_list(override_node, &["force_include"]);
+            opts.force_exclude = yaml_lookup_string_list(override_node, &["force_exclude"]);
+            opts.override_reason = yaml_lookup_string(override_node, &["reason"]);
+            has_hint = true;
+        }
+    }
+
+    validate_review_routing_options(&opts)?;
+    if has_hint
+        && (opts.override_reason.is_some()
+            || !opts.force_include.is_empty()
+            || !opts.force_exclude.is_empty())
+    {
+        opts.operator_id = operator_id.map(str::to_string);
+        opts.created_at = Some(now);
+    }
+
+    serde_json::to_string(&opts).map_err(Into::into)
+}
+
+fn validate_review_routing_options(opts: &domain::routing::ReviewRoutingOptions) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for agent_id in opts.force_include.iter().chain(opts.force_exclude.iter()) {
+        if !seen.insert(agent_id.as_str()) {
+            return Err(anyhow!(
+                "duplicate agent_id '{agent_id}' in force_include/force_exclude"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn yaml_lookup<'a>(value: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a serde_yaml::Value> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(serde_yaml::Value::String((*key).to_string()))?;
+    }
+    Some(cursor)
+}
+
+fn yaml_lookup_string(value: &serde_yaml::Value, path: &[&str]) -> Option<String> {
+    yaml_lookup(value, path)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn yaml_lookup_string_list(value: &serde_yaml::Value, path: &[&str]) -> Vec<String> {
+    let Some(value) = yaml_lookup(value, path) else {
+        return Vec::new();
+    };
+    if let Some(sequence) = value.as_sequence() {
+        return sequence
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    value
+        .as_str()
+        .map(|item| {
+            item.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn supersede_current_workflow_conflict_for_stage_retry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -2974,6 +3254,86 @@ async fn supersede_current_workflow_conflict_for_stage_retry_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-28T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let idea_body = r#"
+idea.review_mode: legacy_fixed
+reviewer_override:
+  force_include: [proposal_reviewer_security]
+  force_exclude: [proposal_reviewer_ui]
+  reason: "Security-sensitive internal API; no UI surface."
+"#;
+
+        let json = resolve_start_run_review_routing_json(None, idea_body, Some("operator-1"), now)
+            .expect("idea-level P060 routing hints should parse");
+        let options: domain::routing::ReviewRoutingOptions =
+            serde_json::from_str(&json).expect("canonical ReviewRoutingOptions JSON");
+
+        assert_eq!(
+            options.mode,
+            domain::routing::ReviewRoutingMode::LegacyFixed
+        );
+        assert_eq!(options.force_include, vec!["proposal_reviewer_security"]);
+        assert_eq!(options.force_exclude, vec!["proposal_reviewer_ui"]);
+        assert_eq!(
+            options.override_reason.as_deref(),
+            Some("Security-sensitive internal API; no UI surface.")
+        );
+        assert_eq!(options.operator_id.as_deref(), Some("operator-1"));
+        assert_eq!(options.created_at, Some(now));
+    }
+
+    #[test]
+    fn p060_explicit_review_routing_json_wins_over_idea_body_hints() {
+        let now = Utc::now();
+        let explicit = serde_json::json!({
+            "mode": "dynamic",
+            "force_include": ["proposal_reviewer_api_contract"],
+            "override_reason": "Explicit run-start routing"
+        })
+        .to_string();
+
+        let json = resolve_start_run_review_routing_json(
+            Some(&explicit),
+            "idea.review_mode: legacy_fixed",
+            Some("operator-1"),
+            now,
+        )
+        .expect("explicit routing JSON should canonicalize");
+        let options: domain::routing::ReviewRoutingOptions =
+            serde_json::from_str(&json).expect("canonical ReviewRoutingOptions JSON");
+
+        assert_eq!(options.mode, domain::routing::ReviewRoutingMode::Dynamic);
+        assert_eq!(
+            options.force_include,
+            vec!["proposal_reviewer_api_contract"]
+        );
+        assert_eq!(
+            options.override_reason.as_deref(),
+            Some("Explicit run-start routing")
+        );
+        assert_eq!(options.operator_id, None);
+        assert_eq!(options.created_at, None);
+    }
+
+    #[test]
+    fn p060_review_routing_duplicate_override_ids_are_rejected() {
+        let now = Utc::now();
+        let duplicate = serde_json::json!({
+            "mode": "dynamic",
+            "force_include": ["proposal_reviewer_security"],
+            "force_exclude": ["proposal_reviewer_security"]
+        })
+        .to_string();
+
+        let err = resolve_start_run_review_routing_json(Some(&duplicate), "", None, now)
+            .expect_err("duplicate include/exclude IDs should fail validation");
+        assert!(err.to_string().contains("duplicate agent_id"));
+    }
 
     #[test]
     fn p017_phase_b_dogfood_metric_snapshot_reads_evidence_record() {

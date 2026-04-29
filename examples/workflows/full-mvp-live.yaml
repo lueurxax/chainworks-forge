@@ -27,7 +27,7 @@ failure_policy:
   preserve_artifacts: true
 scoring:
   proposal:
-    aggregate_formula: round((po.score + ux.score + ui.score + architect.score) / 4, 2)
+    aggregate_formula: proposal_review_summary.average_score_from_selected_reviewers
     pass_when:
       - average_score >= vars.proposal_score_target
       - min_individual_score >= vars.min_individual_proposal_score
@@ -90,64 +90,34 @@ states:
     label: Proposal reviewed
     owner: lead_orchestrator
     run:
-      parallel:
-        - agent: proposal_reviewer_product_owner
-          task: review_proposal_as_product_owner
-          inputs:
-            - idea_brief
-            - proposal_current
-            - proposal_feedback_coverage
-            - reviewer_scope_plan
-            - score_lift_backlog
-          outputs:
-            - proposal_review_po
-        - agent: proposal_reviewer_ux
-          task: review_proposal_as_ux_designer
-          inputs:
-            - idea_brief
-            - proposal_current
-            - proposal_feedback_coverage
-            - reviewer_scope_plan
-            - score_lift_backlog
-          outputs:
-            - proposal_review_ux
-        - agent: proposal_reviewer_ui
-          task: review_proposal_as_ui_designer
-          inputs:
-            - idea_brief
-            - proposal_current
-            - proposal_feedback_coverage
-            - reviewer_scope_plan
-            - score_lift_backlog
-          outputs:
-            - proposal_review_ui
-        - agent: proposal_reviewer_architect
-          task: review_proposal_as_architect
-          inputs:
-            - idea_brief
-            - proposal_current
-            - proposal_feedback_coverage
-            - reviewer_scope_plan
-            - score_lift_backlog
-          outputs:
-            - proposal_review_architect
+      system_task:
+        task_type: proposal_review_router
+        executor_mode: system.routing
+      dynamic_parallel:
+        selector_artifact: agent_selection_plan_v1
+        output_contract: proposal_review_v1
+        inputs:
+          - idea_brief
+          - proposal_current
+          - proposal_feedback_coverage
+          - reviewer_scope_plan
+          - score_lift_backlog
       then:
         - agent: lead_orchestrator
           task: aggregate_proposal_reviews
           inputs:
-            - proposal_review_po
-            - proposal_review_ux
-            - proposal_review_ui
-            - proposal_review_architect
             - proposal_current
           outputs:
             - proposal_review_summary
-            - review_corpus_bundle
+            - review_corpus_bundle_v2
             - score_lift_backlog
             - proposal_fact_digest
             - reviewer_scope_plan
             - orchestrator_summary
             - run_state
+          selected_outputs_from:
+            source_plan: agent_selection_plan_v1
+            output_contract: proposal_review_v1
     transitions:
       - to: state_5_proposal_refined
         when: proposal_review_summary.average_score < vars.proposal_score_target or proposal_review_summary.min_individual_score < vars.min_individual_proposal_score or proposal_review_summary.blocker_count > 0
@@ -164,12 +134,8 @@ states:
           inputs:
             - idea_brief
             - proposal_current
-            - proposal_review_po
-            - proposal_review_ux
-            - proposal_review_ui
-            - proposal_review_architect
             - proposal_review_summary
-            - review_corpus_bundle
+            - review_corpus_bundle_v2
             - score_lift_backlog
             - proposal_fact_digest
             - run_state

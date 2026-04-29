@@ -35,7 +35,7 @@ Goose still matters as legacy and compatibility infrastructure, but it is no lon
 
 - captures ideas as units of engineering work
 - executes YAML-defined workflows instead of hardcoded chat flows
-- routes proposal reviews deterministically based on evidence and specialist catalog (P060)
+- routes proposal reviews deterministically based on evidence and a specialist catalog
 - binds specialized agents to providers, models, permissions, and output contracts
 - preserves run state, stage history, approvals, and artifact metadata in the backend (read by the UI via GraphQL projections)
 - stores generated artifacts on disk instead of hiding execution inside chat history
@@ -102,7 +102,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
-- deterministic reviewer routing and expanded proposal reviewer catalog (Proposal 060)
+- deterministic reviewer routing and expanded proposal reviewer catalog
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)

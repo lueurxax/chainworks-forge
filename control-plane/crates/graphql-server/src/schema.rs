@@ -1244,6 +1244,7 @@ impl MutationRoot {
         workspace_root: String,
         artifact_root: String,
         delivery_configuration_json: Option<String>,
+        review_routing_json: Option<String>,
         workflow_yaml_path: String,
         agent_catalog_yaml_path: String,
     ) -> Result<StartRunPayload> {
@@ -1274,7 +1275,7 @@ impl MutationRoot {
             delivery_configuration_json,
             workflow_yaml_path,
             agent_catalog_yaml_path,
-            review_routing_json: None,
+            review_routing_json,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -2290,6 +2291,8 @@ mod tests {
             repo.path().display(),
             worktrees.path().display()
         );
+        let review_routing_json =
+            r#"{"mode":"legacy_fixed","force_include":[],"force_exclude":[]}"#.to_string();
 
         let schema = build_schema(
             pool.clone(),
@@ -2311,8 +2314,9 @@ mod tests {
                     workflowYamlPath: "WORKFLOW_YAML_PATH",
                     agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
                     deliveryConfigurationJson: DELIVERY_CONFIG
+                    reviewRoutingJson: REVIEW_ROUTING
                   ) {
-                    ... on StartRunStartedPayload { run { id } journalId }
+                    ... on StartRunStartedPayload { run { id reviewRoutingJson } journalId }
                     ... on StartRunBlockedPayload { deliveryPreflight { passed checks { id passed detail } } journalId }
                   }
                 }
@@ -2323,6 +2327,10 @@ mod tests {
                 .replace(
                     "DELIVERY_CONFIG",
                     &serde_json::to_string(&delivery_json).unwrap(),
+                )
+                .replace(
+                    "REVIEW_ROUTING",
+                    &serde_json::to_string(&review_routing_json).unwrap(),
                 ),
             ).data(test_principal()))
             .await;
@@ -2333,12 +2341,30 @@ mod tests {
         );
         let json = response.data.into_json().unwrap();
         let run_id = json["startRun"]["run"]["id"].as_str().unwrap();
+        assert_eq!(
+            json["startRun"]["run"]["reviewRoutingJson"]
+                .as_str()
+                .and_then(
+                    |json| serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json).ok()
+                )
+                .map(|opts| opts.mode),
+            Some(domain::routing::ReviewRoutingMode::LegacyFixed)
+        );
         let run = runs::find_by_id(&pool, run_id.parse().unwrap())
             .await
             .unwrap()
             .unwrap();
 
         assert_eq!(run.delivery_configuration_json, Some(delivery_json));
+        assert_eq!(
+            run.review_routing_json
+                .as_deref()
+                .and_then(
+                    |json| serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json).ok()
+                )
+                .map(|opts| opts.mode),
+            Some(domain::routing::ReviewRoutingMode::LegacyFixed)
+        );
     }
 
     #[tokio::test]

@@ -88,6 +88,70 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server that emits prompt progress, waits briefly,
+    /// and only then sends the terminal `session/prompt` response. Tests use
+    /// this to prove live prompt activity is observable before settlement.
+    pub fn create_delayed_prompt_progress_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_delayed_prompt_progress.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "result": {"protocolVersion": 1, "serverInfo": {"name": "progress-fixture", "version": "0.0.1"}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {}).get("cwd", "/tmp")
+session_id = "fixture-session-delayed-progress"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+send({"jsonrpc": "2.0", "method": "session/update",
+      "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": "working..."}}})
+time.sleep(0.5)
+
+artifact_path = os.path.join(cwd, "result.json")
+with open(artifact_path, "w") as f:
+    f.write('{"ok": true}\n')
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+
+try:
+    recv()
+except Exception:
+    pass
+
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     pub fn create_set_mode_script(
         tmpdir: &std::path::Path,
         observed_mode_path: &std::path::Path,
@@ -4800,6 +4864,105 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         .close_session(&session_generation_id)
         .await
         .expect("manager should close the reused live session");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::{
+        AcpPromptProgressKind, AcpPromptProgressSink, AcpPromptProgressUpdate, AcpRuntimeManager,
+        ExecutionRequest,
+    };
+    use anyhow::Result;
+    use domain::ids::RunId;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    struct RecordingPromptProgressSink {
+        tx: mpsc::UnboundedSender<AcpPromptProgressUpdate>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpPromptProgressSink for RecordingPromptProgressSink {
+        async fn record_acp_prompt_progress(&self, update: AcpPromptProgressUpdate) -> Result<()> {
+            self.tx.send(update).unwrap();
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_delayed_prompt_progress_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let manager = Arc::new(AcpRuntimeManager::new_with_adapters(vec![
+        Arc::new(adapter) as Arc<dyn AcpAdapter>,
+    ]));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    manager.set_prompt_progress_sink(Arc::new(RecordingPromptProgressSink { tx }));
+
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_progress".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "progress-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "stream progress before terminal response".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: Some("generation-progress".into()),
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+    };
+
+    let manager_for_task = Arc::clone(&manager);
+    let task = tokio::spawn(async move { manager_for_task.start_session(req).await });
+    let update = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("prompt progress should be reported before terminal response")
+        .expect("progress sink should receive an update");
+    assert!(
+        !task.is_finished(),
+        "progress must be observable while session/prompt is still running"
+    );
+    assert_eq!(update.stage_id, "stage_progress");
+    assert_eq!(update.agent_id, "progress-agent");
+    assert_eq!(
+        update.session_generation_id.as_deref(),
+        Some("generation-progress")
+    );
+    assert!(matches!(
+        update.kind,
+        AcpPromptProgressKind::PromptSent
+            | AcpPromptProgressKind::MessageReceived
+            | AcpPromptProgressKind::MeaningfulProgress
+    ));
+
+    let result = task
+        .await
+        .expect("prompt task should not panic")
+        .expect("prompt should finish after delayed progress");
+    assert_eq!(result.status, domain::agent::AgentStatus::Completed);
 }
 
 #[cfg(unix)]

@@ -12,11 +12,13 @@ All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
 `control-plane/crates/engine/` (Rust daemon).
 
 **P031 Thin UI Boundary:**
-Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's
-state via GraphQL projections. While the Swift engine remains implemented for
-parity, the governed UI is prohibited from calling mutation paths in
-`ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and
-Approval actions move to external CLI/MCP workflows.
+Per P031, the current production macOS UI stop-state is a **read-only consumer**
+of the engine's state via GraphQL projections. While the Swift engine remains
+implemented for parity, the governed UI is prohibited from calling mutation paths
+in `ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, Retry,
+and other non-approval operational commands are MCP-only in the target state.
+Approval resolution is external in the current P031 stop-state; P072 owns the
+target SwiftUI approval-only GraphQL mutation boundary.
 
 **Rust Daemon Implementation:**
 The Rust control-plane daemon implements the same state machine and transition
@@ -121,38 +123,49 @@ only the selected agent executions from compiled candidate bindings. Each task
 creates an `AgentExecution`, gathers input artifacts, builds an `ExecutionContext`,
 calls the executor, then persists outputs through `ArtifactManager`.
 
-### System Tasks and Routing (`proposal_review_router.rs`)
+### System Tasks and Deterministic Proposal Review Routing
 
 The engine supports first-class `SystemTask` types that execute without provider
-invocation. The `proposal_review_router` uses `executor_mode: system.routing` to
-perform deterministic reviewer selection over proposal evidence and catalog
-metadata.
+invocation. The `proposal_review_router` runs with
+`executor_mode: system.routing` before the proposal-review fan-out. It fingerprints
+proposal evidence, scores reviewer candidates from catalog routing metadata, and
+writes the selected reviewer plan without a provider call.
 
-**Deterministic Routing (P060):**
-Replaces fixed proposal-review fan-out with a scoring-based model that selects
-2-5 specialists from an expanded catalog.
-- **Scoring**: Based on force-includes, stack/surface/risk matches, strong keywords,
-  repo signals, and cross-stack dependencies, with an overlap penalty.
-- **Specialists**: Launches with seven core specialists (macOS, Apple architecture,
-  Rust architecture, reliability, security, API contract, and observability/rollout)
-  while cataloging others as disabled until a golden-output gate is passed.
-- **Determinism**: The same inputs must produce identical selected order, evidence
-  IDs, and plan hashes across Swift and Rust implementations.
+Reviewer routing selects 2-5 specialists from the enabled proposal-review catalog.
+The selector is deterministic: identical proposal evidence and catalog snapshots
+produce identical selected order, evidence IDs, and plan hashes across Swift and
+Rust implementations.
 
-**Key Artifacts:**
-- **`AgentSelectionPlanV1`** -- the authoritative plan for selected reviewers,
-  referencing compiler-owned materialization bindings.
-- **`RoutingReceipt`** -- the terminal receipt for every routing outcome, including
+Catalog routing metadata includes:
+
+- `routing_id`, `family`, and capability tags,
+- `stacks`, `surfaces`, and `risks`,
+- flat `mandatory_when` tags; any matching stack, surface, or risk tag makes the
+  candidate mandatory,
+- `strong_proposal_keywords`, `strong_repo_files`, and `strong_repo_symbols`,
+- `usually_pair_with`, `close_alternatives`, force include/exclude overrides, and
+  score weights.
+
+Key routing records:
+
+- `AgentSelectionPlanV1` is the authoritative selected/rejected/ineligible plan and
+  references compiler-owned materialization bindings.
+- `RoutingReceipt` is the terminal receipt for every routing outcome, including
   rationale, status, and input snapshot hashes.
-- **`SystemExecution`** -- the lifecycle record for the system task, owning the
-  task status and timestamps.
+- `SystemExecution` owns the system task lifecycle state and timestamps.
 
-**Routing Conflicts and Fallbacks:**
-- **Under-specified Selection**: If no specialists qualify, falls back to
-  `product_owner` plus `architect` with a caution warning.
-- **Mandatory Overflow**: If more than 5 mandatory reviewers match, blocks with a
-  `Routing conflict` and requires operator intervention (e.g., cloning with
-  overrides).
+When no specialist qualifies, routing falls back to `product_owner` plus
+`architect` with an under-specified warning. When more than five mandatory
+reviewers match, routing fails closed with a `routing_conflict` workflow conflict
+so the operator can adjust the run inputs or overrides.
+
+`dynamic_parallel` stages consume the `AgentSelectionPlanV1` selector artifact and
+materialize only the selected reviewer bindings. Downstream aggregate-review stages
+consume the selected reviewer outputs through `selected_outputs_from` and persist
+the review corpus bundle as the canonical handoff to proposal refinement.
+
+The retained validation alias for this contract is documented in
+[`test-gates.md#proposal-060p060`](test-gates.md#proposal-060p060).
 
 **Approval flow**: When a state has `approval: required`, the orchestrator pauses,
 creates an `Approval` record, and publishes an `ApprovalRequest`. On resolution:

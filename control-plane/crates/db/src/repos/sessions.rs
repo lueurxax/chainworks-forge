@@ -454,6 +454,25 @@ pub async fn update_generation_usage(
     Ok(())
 }
 
+pub async fn touch_generation_activity(
+    pool: &SqlitePool,
+    generation_id: &str,
+    last_activity_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE session_generations
+           SET last_activity_at = ?1
+           WHERE id = ?2
+             AND status = 'active'"#,
+    )
+    .bind(last_activity_at.to_rfc3339())
+    .bind(generation_id)
+    .execute(pool)
+    .await
+    .context("touch session generation activity")?;
+    Ok(())
+}
+
 pub async fn count_generation_events(
     pool: &SqlitePool,
     generation_id: &str,

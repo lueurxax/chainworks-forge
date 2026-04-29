@@ -10,6 +10,6 @@
     { "scenario": "rollout", "expected_selection": ["proposal_reviewer_observability_rollout"] },
     { "scenario": "under_specified", "expected_selection": ["proposal_reviewer_product_owner", "proposal_reviewer_architect"], "warning": "caution" },
     { "scenario": "override force_include force_exclude", "expected_selection": ["proposal_reviewer_security"] },
-    { "scenario": "mandatory_overflow", "expected_outcome": "fail_closed routing_conflict no_agentselectionplanv1" }
+    { "scenario": "mandatory_overflow", "expected_outcome": "select_top_5 warning mandatory_overflow_pruned rejected_alternatives_preserved" }
   ]
 }

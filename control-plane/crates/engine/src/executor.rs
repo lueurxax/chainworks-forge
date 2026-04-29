@@ -165,6 +165,46 @@ impl DbXcodeRuntimeObservationSink {
     }
 }
 
+struct DbAcpPromptProgressSink {
+    pool: SqlitePool,
+    events: EventSender,
+}
+
+#[async_trait::async_trait]
+impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
+    async fn record_acp_prompt_progress(&self, update: acp::AcpPromptProgressUpdate) -> Result<()> {
+        let Some(generation_id) = update.session_generation_id.as_deref() else {
+            return Ok(());
+        };
+        sessions::touch_generation_activity(&self.pool, generation_id, chrono::Utc::now()).await?;
+        if let Some(stage_execution_id) = update.stage_execution_id.as_deref() {
+            match stage_execution_id.parse::<domain::ids::StageExecutionId>() {
+                Ok(stage_execution_id) => {
+                    if let Ok(Some(stage)) =
+                        stages::find_by_id(&self.pool, stage_execution_id).await
+                    {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::StageStatusChanged {
+                                run_id: stage.run_id,
+                                stage_execution_id,
+                                status: stage.status,
+                            });
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        stage_execution_id = %stage_execution_id,
+                        error = %error,
+                        "ACP prompt progress notification skipped: invalid stage execution id"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedInvokeAgentStart {
     pub work_item_id: String,
@@ -1558,14 +1598,17 @@ fn suppress_interactive_review_xcode_mcp_for_invocation(
 ) -> bool {
     let readonly_review_permission =
         matches!(permission_profile, Some("RO_VERIFY" | "RO_PREPUSH_VERIFY"));
-    readonly_review_permission
-        && (matches!(
-            agent_id,
-            "proposal_implementation_auditor" | "prepush_code_reviewer"
-        ) || matches!(
-            backend_profile_id,
-            Some("codex_audit_high" | "claude_prepush_medium")
-        ))
+    let proposal_authoring = matches!(agent_id, "proposal_writer")
+        || matches!(permission_profile, Some("PROPOSAL_WRITE"));
+    proposal_authoring
+        || (readonly_review_permission
+            && (matches!(
+                agent_id,
+                "proposal_implementation_auditor" | "prepush_code_reviewer"
+            ) || matches!(
+                backend_profile_id,
+                Some("codex_audit_high" | "claude_prepush_medium")
+            )))
 }
 
 fn is_reused_live_session_transport_error(message: &str) -> bool {
@@ -2180,6 +2223,10 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        acp.set_prompt_progress_sink(Arc::new(DbAcpPromptProgressSink {
+            pool: pool.clone(),
+            events: events.clone(),
+        }));
         Self {
             pool,
             work_queue,
@@ -2199,6 +2246,10 @@ impl BackgroundExecutor {
         steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
     ) -> Self {
         acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
+            pool: pool.clone(),
+            events: events.clone(),
+        }));
+        acp.set_prompt_progress_sink(Arc::new(DbAcpPromptProgressSink {
             pool: pool.clone(),
             events: events.clone(),
         }));
@@ -4892,7 +4943,23 @@ impl BackgroundExecutor {
         _worktree_strategy: Option<String>,
         _payload: serde_json::Value,
     ) -> Result<()> {
-        let delivery_config = self.load_delivery_configuration(&run).await?;
+        let mut delivery_config = self.load_delivery_configuration(&run).await?;
+        if let Some(run_target_branch) = run
+            .target_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+        {
+            if delivery_config.target_branch != run_target_branch {
+                info!(
+                    run_id = %run_id,
+                    run_target_branch = %run_target_branch,
+                    delivery_target_branch = %delivery_config.target_branch,
+                    "Release target branch resolved from provisioned run worktree"
+                );
+            }
+            delivery_config.target_branch = run_target_branch.to_string();
+        }
         let worktree_root = run.worktree_root.clone().ok_or_else(|| {
             anyhow::anyhow!("Release agent requires a provisioned worktree but none is available.")
         })?;
@@ -6806,6 +6873,11 @@ mod tests {
             "prepush_code_reviewer",
             Some("claude_prepush_medium"),
             Some("RO_PREPUSH_VERIFY")
+        ));
+        assert!(suppress_interactive_review_xcode_mcp_for_invocation(
+            "proposal_writer",
+            Some("codex_writer_high"),
+            Some("PROPOSAL_WRITE")
         ));
         assert!(!suppress_interactive_review_xcode_mcp_for_invocation(
             "code_writer",

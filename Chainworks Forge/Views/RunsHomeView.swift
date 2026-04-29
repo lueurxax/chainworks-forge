@@ -943,7 +943,7 @@ private struct P031ArtifactViewerCard: View {
                 groups.append(P031ArtifactGroup(id: group.id, title: group.title, rows: [row]))
             }
         }
-        return groups
+        return selectedGrouping.sortedGroups(groups)
     }
 
     private var stageOptions: [P031ArtifactFilterOption] {
@@ -1051,7 +1051,7 @@ private struct P031ArtifactViewerCard: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 280)
+                .frame(minWidth: 360, maxWidth: 420)
                 .accessibilityIdentifier("p031-artifact-grouping-picker")
 
                 Spacer(minLength: 8)
@@ -1294,6 +1294,9 @@ private struct P031ArtifactViewerCard: View {
             row.title,
             row.subtitle,
             row.stageID,
+            row.stageLabel,
+            row.iteration.map { "Iteration \($0)" },
+            row.attemptNumber.map { "Attempt \($0)" },
             row.agentID,
             row.contractID,
             row.format,
@@ -1393,6 +1396,7 @@ private struct P031ArtifactGroup: Identifiable, Equatable {
 }
 
 private enum P031ArtifactGrouping: String, CaseIterable, Identifiable {
+    case iteration
     case stage
     case agent
     case type
@@ -1401,6 +1405,8 @@ private enum P031ArtifactGrouping: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .iteration:
+            return "Iteration"
         case .stage:
             return "Stage"
         case .agent:
@@ -1412,6 +1418,12 @@ private enum P031ArtifactGrouping: String, CaseIterable, Identifiable {
 
     func group(for row: P031ArtifactViewerPresentation) -> P031ArtifactGroup {
         switch self {
+        case .iteration:
+            return P031ArtifactGroup(
+                id: iterationGroupID(for: row),
+                title: iterationGroupTitle(for: row),
+                rows: []
+            )
         case .stage:
             return P031ArtifactGroup(id: "stage:\(row.stageID)", title: "Stage \(row.stageID)", rows: [])
         case .agent:
@@ -1422,6 +1434,52 @@ private enum P031ArtifactGrouping: String, CaseIterable, Identifiable {
             let kind = P031ArtifactTypeFilter.resolve(row)
             return P031ArtifactGroup(id: "type:\(kind.rawValue)", title: kind.title, rows: [])
         }
+    }
+
+    func sortedGroups(_ groups: [P031ArtifactGroup]) -> [P031ArtifactGroup] {
+        guard self == .iteration else {
+            return groups
+        }
+        return groups.sorted { lhs, rhs in
+            let lhsKey = iterationSortKey(for: lhs)
+            let rhsKey = iterationSortKey(for: rhs)
+            if lhsKey.iteration != rhsKey.iteration {
+                return lhsKey.iteration < rhsKey.iteration
+            }
+            if lhsKey.attempt != rhsKey.attempt {
+                return lhsKey.attempt < rhsKey.attempt
+            }
+            return lhsKey.title.localizedStandardCompare(rhsKey.title) == .orderedAscending
+        }
+    }
+
+    private func iterationGroupID(for row: P031ArtifactViewerPresentation) -> String {
+        guard let iteration = row.iteration else {
+            return "iteration:unknown"
+        }
+        let attempt = row.attemptNumber.map(String.init) ?? "unknown"
+        return "iteration:\(iteration):attempt:\(attempt)"
+    }
+
+    private func iterationGroupTitle(for row: P031ArtifactViewerPresentation) -> String {
+        guard let iteration = row.iteration else {
+            return "Unknown iteration"
+        }
+        if let attempt = row.attemptNumber {
+            return "Iteration \(iteration), attempt \(attempt)"
+        }
+        return "Iteration \(iteration)"
+    }
+
+    private func iterationSortKey(for group: P031ArtifactGroup) -> (
+        iteration: Int,
+        attempt: Int,
+        title: String
+    ) {
+        guard let row = group.rows.first, let iteration = row.iteration else {
+            return (Int.max, Int.max, group.title)
+        }
+        return (-iteration, -(row.attemptNumber ?? 0), group.title)
     }
 }
 

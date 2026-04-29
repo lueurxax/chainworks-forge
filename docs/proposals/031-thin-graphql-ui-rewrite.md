@@ -5,11 +5,17 @@ Source packet: prior run `8dd01a54-0791-43e0-b526-5ed92c95b34f`, r18
 Current run: `72409268-9dea-4ece-82f6-6ef29b4a446e`  
 Status: stopped at GraphQL-only read-boundary stabilization. Do not continue P031 as the vehicle for visual/product polish; remaining visual, dogfood, and stabilization tails are handed off to P032/P036.
 
+## Target-State Boundary Note
+
+P031 is the implemented GraphQL-only read-boundary stop-state, not the final target-state UI action contract. Its "no GraphQL mutations" language applies to the P031 stop-state and to non-approval write paths while the approval mutation boundary is still being implemented.
+
+Proposal 072 supersedes P031 for target-state action routing: SwiftUI remains GraphQL-only, approval decisions are the only allowed SwiftUI GraphQL mutations, and MCP owns all non-approval operational commands. Future documentation and release-closeout evidence must cite P031 for read-boundary compliance and P072 for the approval-only mutation boundary. Do not use P031 alone as Phase 3 or release-closeout evidence for the target UI boundary.
+
 ## Executive Summary
 
 P031 cuts the macOS operator app from client-owned workflow truth to a thin, GraphQL-only read UI over server-owned projections. After P031, governed SwiftUI workflow surfaces render GraphQL read models and maintain only presentation state, server-derived caches, read-refresh state, and freshness handling.
 
-P031-owned UI must not use MCP reads, MCP writes, GraphQL mutations, local workflow mutation fallback, command payload construction, command receipts, command correlation, or any write-path implementation. MCP remains supported for agents, CLI/operator diagnostics, automation, and debug/control workflows outside the governed macOS UI.
+For the P031 stop-state, P031-owned UI must not use MCP reads, MCP writes, GraphQL mutations, local workflow mutation fallback, command payload construction, command receipts, command correlation, or any write-path implementation. MCP remains supported for agents, CLI/operator diagnostics, automation, and debug/control workflows outside the governed macOS UI. The post-P072 target-state exception is approval-only GraphQL mutation routing; P031 does not define or validate that write path.
 
 This restart keeps the prior r18 packet as the baseline and converts it into a single proposal document for clean aggregate re-review. It explicitly incorporates all prior reviewer feedback, including the stale r7 implementation approval rejection. The result is intentionally conservative: it does not restore UI writes, it does not add a second control plane, and it does not hide the operator trade-off that writes move outside the macOS UI until separate follow-up proposals restore approved write paths.
 
@@ -28,8 +34,8 @@ The old Swift-local UI remains useful only as a visual and ergonomic reference. 
 Hard decisions:
 
 - Governed macOS UI reads workflow truth through GraphQL only.
-- Governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.
-- Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.
+- During the P031 stop-state, governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.
+- Approval rows are diagnostic-read-only in P031. Target-state interactive approval decisions are owned by P072's approval-only GraphQL mutation boundary.
 - Full report payload rendering remains outside P031 and defaults to a P0 follow-up unless Phase 0d evidence proves metadata-only inspection is acceptable.
 - P031 does not preserve or restore the old Swift-orchestrator path. Fail-closed behavior means disabling or degrading affected thin UI surfaces while the control-plane database and GraphQL projections remain the source of truth; no local workflow writes are restored.
 - The stale r7 GraphQL+MCP implementation approval is non-authoritative. No further P031 implementation approval should be pursued unless P031 is explicitly reopened; product polish now belongs to P032/P036.
@@ -163,7 +169,7 @@ Rules:
 
 - The UI may query, subscribe, and poll GraphQL read models.
 - The UI may trigger targeted read refreshes that refetch GraphQL data.
-- The UI must not use GraphQL mutations.
+- The P031 stop-state UI must not use GraphQL mutations. P072 owns the target-state approval-only GraphQL mutation exception.
 - The UI must not use MCP clients, MCP tools, MCP read helpers, or MCP write helpers.
 - The UI must not read workflow truth from SwiftData, local compiled plans, local recovery services, raw artifact directories, raw report files, or local execution services.
 - MCP read/control tools remain allowed for agents, CLI/operator tooling, automation, and diagnostics outside the macOS UI contract.
@@ -176,7 +182,7 @@ P031-owned UI is read-only except for read refreshes and diagnostic copy afforda
 Static guard requirements:
 
 - Fail if governed UI imports or instantiates `MCPCommandClient`, `MCPPolicyRuntime`, MCP transport, or any MCP tool wrapper.
-- Fail if governed UI contains GraphQL mutation operations, generated mutation calls, or mutation client types.
+- Fail if P031-governed stop-state UI contains GraphQL mutation operations, generated mutation calls, or mutation client types. P072 must update this guard before approval-only GraphQL mutations can be introduced.
 - Fail if governed UI calls `ideas.create`, `runs.start`, `runs.cancel`, `stages.retry`, `approvals.resolve`, `steward.run_analysis`, session/reset, clone, compare, experiment, runtime-health, local recovery, or local execution mutation paths.
 - Fail if governed UI constructs MCP parameter dictionaries, `ActionInvocationIdentity` payloads, `client_command_id` command correlation, command receipt state, or command invocation adapters.
 
@@ -661,7 +667,7 @@ These historical P031 follow-ups are retained for traceability. New work should 
 
 | ID | Priority | Expected Start | Description |
 | --- | --- | --- | --- |
-| `P031-FOLLOWUP-APPROVAL-WRITE-PATH` | P0 immediate next proposal | Before P031 Phase 3 flag removal decision | Define approved non-MCP, non-GraphQL-mutation approval decision transport if interactive approvals must return to macOS UI. |
+| `P031-FOLLOWUP-APPROVAL-WRITE-PATH` | Superseded by P072 | Before P031 Phase 3 flag removal decision | Do not invent a parallel transport. P072 owns the approval-only GraphQL mutation boundary for interactive approvals in SwiftUI. |
 | `P031-FOLLOWUP-UI-CONTROL-SURFACE` | P1 | Draft before restoring any in-app write affordance | Propose any future start/cancel/retry/create UI control surface with explicit transport and safety model. |
 | `P031-FOLLOWUP-REPORT-PAYLOAD` | P0 by default; downgrade only with Phase 0d evidence | Priority recorded before Phase 0d exit | Add server-owned GraphQL report payload readback and full payload UI rendering. |
 
@@ -669,7 +675,7 @@ These historical P031 follow-ups are retained for traceability. New work should 
 
 Implementation approval re-entry:
 
-- Active proposal revision states GraphQL-read-only UI with no UI MCP, GraphQL mutations, local writes, command receipts, or command correlation.
+- Active P031 stop-state revision states GraphQL-read-only UI with no UI MCP, GraphQL mutations, local writes, command receipts, or command correlation, and cross-references P072 for the target-state approval-only mutation boundary.
 - Feedback coverage includes rejected `state_6_implementation_approval` context.
 - Aggregate re-review completed against this GraphQL-only scope.
 - Any implementation approval references the new re-review decision, not stale r7 approval.
@@ -706,3 +712,4 @@ Stop P031 here. Treat the landed GraphQL-only read boundary and read-model guard
 - Separate write-path proposals: any future in-app create/start/cancel/retry/approve controls.
 
 Do not request another P031 audit to close product polish gaps. Do not restore the old local Swift-orchestrator behavior, local UI writes, UI MCP calls, or GraphQL mutations.
+Do not restore non-approval GraphQL mutations through P031. Approval-only GraphQL mutation work belongs to P072 and must update gates/reference contracts in that scope.

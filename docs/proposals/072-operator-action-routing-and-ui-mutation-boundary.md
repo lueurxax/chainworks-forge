@@ -22,7 +22,7 @@ The system is moving toward a clean target state:
 
 The current proposal set still contains drift:
 
-- Proposal 031 currently describes a fully read-only UI with no GraphQL mutations.
+- Proposal 031 implements a read-only stop-state and historically used "no GraphQL mutations" language that must not be mistaken for the final target action boundary.
 - Proposal 038 currently allows a GraphQL compaction mutation.
 - Proposal 046 currently includes a GraphQL reset mutation.
 - Proposal 068 mostly has the right boundary but still uses language that permits UI-owned GraphQL mutations without explicitly limiting them to approvals.

@@ -1885,7 +1885,8 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         payloadAvailabilityState: .available,
         payloadUnavailableReasonCode: nil,
         diagnosticID: nil,
-        payloadText: "# Proposal\n\nReady"
+        payloadText: "# Proposal\n\nReady",
+        sourceStageExecutionID: "stage-1"
       ),
       makeArtifact(
         id: "artifact-json",
@@ -1894,7 +1895,8 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         payloadAvailabilityState: .available,
         payloadUnavailableReasonCode: nil,
         diagnosticID: nil,
-        payloadText: #"{"status":"ready"}"#
+        payloadText: #"{"status":"ready"}"#,
+        sourceStageExecutionID: "stage-1"
       ),
       makeArtifact(
         id: "artifact-json-markdown",
@@ -1903,7 +1905,8 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         payloadAvailabilityState: .available,
         payloadUnavailableReasonCode: nil,
         diagnosticID: nil,
-        payloadText: "# Idea Brief\n\n## Goal\n\nFinish the proposal."
+        payloadText: "# Idea Brief\n\n## Goal\n\nFinish the proposal.",
+        sourceStageExecutionID: "stage-1"
       ),
       makeArtifact(
         id: "artifact-report",
@@ -1944,10 +1947,182 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(detail.stageTransitions.map(\.connectorState) == [.completed, .blocked, .pending])
     #expect(detail.artifactViewerRows.map(\.renderMode) == [.markdown, .json, .markdown])
     #expect(detail.artifactViewerRows.map(\.payloadState) == [.available, .available, .available])
+    #expect(detail.artifactViewerRows.map(\.iteration) == [1, 1, 1])
+    #expect(detail.artifactViewerRows.map(\.attemptNumber) == [1, 1, 1])
+    #expect(detail.artifactViewerRows.map(\.stageLabel) == [
+      "Proposal drafted",
+      "Proposal drafted",
+      "Proposal drafted",
+    ])
     #expect(detail.reportRows.map(\.title) == ["release report"])
     #expect(detail.catalogContext?.workflowID == "full_mvp")
     #expect(detail.catalogContext?.workflowSnapshotHash == "workflow-sha")
     #expect(detail.catalogContext?.catalogSnapshotHash == "catalog-sha")
+  }
+
+  @Test("Artifact viewer joins duplicate stage IDs through source stage execution ID")
+  func artifactViewerRowsUseSourceStageExecutionIDForIterationMetadata() async {
+    let run = P031RunRowReadModel(
+      id: "run-1",
+      status: "running",
+      ideaID: "idea-031",
+      projectKey: "chainworks",
+      workflowTitle: "Full MVP",
+      workflowID: "full_mvp",
+      workflowSnapshotHash: nil,
+      catalogSnapshotHash: nil,
+      freshnessState: .live,
+      totalStages: 2,
+      completedStages: 1,
+      failedStages: 0,
+      pendingApprovals: 0
+    )
+    let stages = [
+      P031StageReadModel(
+        id: "stage-exec-iteration-1",
+        runID: "run-1",
+        stageID: "state_1_idea_received",
+        label: "Idea received",
+        status: "completed",
+        iteration: 1,
+        attemptNumber: 1,
+        settlementKind: nil,
+        hasArtifacts: true,
+        hasPendingApproval: false,
+        hasValidationFailure: false,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-25T00:00:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+      P031StageReadModel(
+        id: "stage-exec-iteration-2",
+        runID: "run-1",
+        stageID: "state_1_idea_received",
+        label: "Idea received",
+        status: "running",
+        iteration: 2,
+        attemptNumber: 1,
+        settlementKind: nil,
+        hasArtifacts: true,
+        hasPendingApproval: false,
+        hasValidationFailure: false,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-25T00:01:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+    ]
+    let artifacts = [
+      makeArtifact(
+        id: "artifact-iteration-2",
+        name: "orchestrator_summary",
+        payloadAvailabilityState: .available,
+        payloadUnavailableReasonCode: nil,
+        diagnosticID: nil,
+        payloadText: "# Summary",
+        sourceStageExecutionID: "stage-exec-iteration-2"
+      )
+    ]
+
+    let detail = P031RunDetailPresenter.presentation(
+      for: P031RunDetailReadModel(run: run, stages: stages, artifacts: artifacts),
+      currentFreshness: P031FreshnessSnapshot(state: .live),
+      checkedAt: Date(timeIntervalSince1970: 59)
+    )
+
+    #expect(detail.artifactViewerRows.map(\.iteration) == [2])
+    #expect(detail.artifactViewerRows.map(\.attemptNumber) == [1])
+  }
+
+  @Test("Artifact viewer infers legacy artifact iterations from stage execution windows")
+  func artifactViewerRowsInferLegacyIterationMetadataFromArtifactTimestamps() async {
+    let run = P031RunRowReadModel(
+      id: "run-1",
+      status: "running",
+      ideaID: "idea-031",
+      projectKey: "chainworks",
+      workflowTitle: "Full MVP",
+      workflowID: "full_mvp",
+      workflowSnapshotHash: nil,
+      catalogSnapshotHash: nil,
+      freshnessState: .live,
+      totalStages: 2,
+      completedStages: 1,
+      failedStages: 0,
+      pendingApprovals: 0
+    )
+    let stages = [
+      P031StageReadModel(
+        id: "stage-exec-iteration-7",
+        runID: "run-1",
+        stageID: "state_4_proposal_reviewed",
+        label: "Proposal reviewed",
+        status: "completed",
+        iteration: 7,
+        attemptNumber: 4,
+        startedAt: "2026-04-28T07:00:00.000000+00:00",
+        completedAt: "2026-04-28T07:12:00.000000+00:00",
+        settlementKind: nil,
+        hasArtifacts: true,
+        hasPendingApproval: false,
+        hasValidationFailure: false,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-28T07:12:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+      P031StageReadModel(
+        id: "stage-exec-iteration-10",
+        runID: "run-1",
+        stageID: "state_4_proposal_reviewed",
+        label: "Proposal reviewed",
+        status: "running",
+        iteration: 10,
+        attemptNumber: 1,
+        startedAt: "2026-04-28T09:00:00.000000+00:00",
+        completedAt: nil,
+        settlementKind: nil,
+        hasArtifacts: true,
+        hasPendingApproval: false,
+        hasValidationFailure: false,
+        projectionPresent: true,
+        projectionUpdatedAt: "2026-04-28T09:05:00Z",
+        projectionLag: false,
+        freshnessState: .live
+      ),
+    ]
+    let artifacts = [
+      makeArtifact(
+        id: "artifact-iteration-7",
+        name: "proposal_review_summary",
+        stageID: "state_4_proposal_reviewed",
+        payloadAvailabilityState: .available,
+        payloadUnavailableReasonCode: nil,
+        diagnosticID: nil,
+        payloadText: #"{"summary":"old"}"#,
+        createdAt: "2026-04-28T07:05:00.000000+00:00"
+      ),
+      makeArtifact(
+        id: "artifact-iteration-10",
+        name: "proposal_review_summary",
+        stageID: "state_4_proposal_reviewed",
+        payloadAvailabilityState: .available,
+        payloadUnavailableReasonCode: nil,
+        diagnosticID: nil,
+        payloadText: #"{"summary":"new"}"#,
+        createdAt: "2026-04-28T09:03:00.000000+00:00"
+      ),
+    ]
+
+    let detail = P031RunDetailPresenter.presentation(
+      for: P031RunDetailReadModel(run: run, stages: stages, artifacts: artifacts),
+      currentFreshness: P031FreshnessSnapshot(state: .live),
+      checkedAt: Date(timeIntervalSince1970: 59)
+    )
+
+    #expect(detail.artifactViewerRows.map(\.iteration) == [7, 10])
+    #expect(detail.artifactViewerRows.map(\.attemptNumber) == [4, 1])
   }
 
   @Test("Artifact viewer presentation prepares capped payload previews before SwiftUI rendering")
@@ -2418,17 +2593,22 @@ private func makeStage(
 private func makeArtifact(
   id: String,
   name: String,
+  stageID: String = "state_1",
   format: String = "json",
   reportKind: String? = nil,
   payloadAvailabilityState: P031PayloadAvailabilityState,
   payloadUnavailableReasonCode: P031PayloadUnavailableReasonCode?,
   diagnosticID: String?,
-  payloadText: String? = nil
+  payloadText: String? = nil,
+  sourceStageExecutionID: String? = nil,
+  createdAt: String? = nil
 ) -> P031ArtifactReadModel {
   P031ArtifactReadModel(
     id: id,
     runID: "run-1",
-    stageID: "state_1",
+    stageID: stageID,
+    sourceStageExecutionID: sourceStageExecutionID,
+    createdAt: createdAt,
     agentID: "agent",
     name: name,
     contractID: "summary",

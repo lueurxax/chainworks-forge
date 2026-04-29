@@ -27,11 +27,66 @@ use crate::plan::*;
 pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
     let wf = definition::load(workflow_path).context("loading workflow definition")?;
     let cat = catalog::load(catalog_path).context("loading agent catalog")?;
-    catalog::validate_catalog_has_exactly_one_system_lead(&cat)?;
     let workflow_raw =
         load_raw_yaml_value(workflow_path).context("loading raw workflow YAML for P051 lint")?;
     let catalog_raw =
         load_raw_yaml_value(catalog_path).context("loading raw catalog YAML for P051 lint")?;
+    let catalog_base = Path::new(catalog_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    compile_loaded(wf, cat, workflow_raw, catalog_raw, &catalog_base, None)
+}
+
+/// Compile a run plan from the immutable workflow/catalog snapshots captured
+/// when the run was created.
+pub fn compile_from_snapshot_json(
+    workflow_snapshot_json: &str,
+    catalog_snapshot_json: &str,
+    catalog_path: &str,
+) -> Result<RunPlan> {
+    let wf: definition::WorkflowFile =
+        serde_json::from_str(workflow_snapshot_json).context("parsing workflow snapshot JSON")?;
+    let cat: catalog::AgentCatalogFile =
+        serde_json::from_str(catalog_snapshot_json).context("parsing catalog snapshot JSON")?;
+    let workflow_raw =
+        serde_yaml::to_value(&wf).context("building workflow snapshot value for P051 lint")?;
+    let catalog_raw =
+        serde_yaml::to_value(&cat).context("building catalog snapshot value for P051 lint")?;
+    let catalog_base = Path::new(catalog_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let snapshots = SnapshotJson {
+        workflow_json: workflow_snapshot_json.to_string(),
+        catalog_json: catalog_snapshot_json.to_string(),
+    };
+
+    compile_loaded(
+        wf,
+        cat,
+        workflow_raw,
+        catalog_raw,
+        &catalog_base,
+        Some(snapshots),
+    )
+}
+
+struct SnapshotJson {
+    workflow_json: String,
+    catalog_json: String,
+}
+
+fn compile_loaded(
+    wf: definition::WorkflowFile,
+    cat: catalog::AgentCatalogFile,
+    workflow_raw: serde_yaml::Value,
+    catalog_raw: serde_yaml::Value,
+    catalog_base: &Path,
+    snapshots: Option<SnapshotJson>,
+) -> Result<RunPlan> {
+    catalog::validate_catalog_has_exactly_one_system_lead(&cat)?;
     let direct_command_scan =
         crate::direct_command::scan_catalog(&cat, &wf, &workflow_raw, &catalog_raw);
     direct_command_scan.ensure_no_errors()?;
@@ -64,20 +119,20 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
             }
         })
         .unwrap_or_default();
-    let workflow_snapshot_json =
-        canonical_json_string(&wf).context("serializing canonical workflow snapshot")?;
-    let catalog_snapshot_json =
-        canonical_json_string(&cat).context("serializing canonical agent catalog snapshot")?;
+    let workflow_snapshot_json = match snapshots.as_ref() {
+        Some(snapshot) => snapshot.workflow_json.clone(),
+        None => canonical_json_string(&wf).context("serializing canonical workflow snapshot")?,
+    };
+    let catalog_snapshot_json = match snapshots.as_ref() {
+        Some(snapshot) => snapshot.catalog_json.clone(),
+        None => {
+            canonical_json_string(&cat).context("serializing canonical agent catalog snapshot")?
+        }
+    };
     let workflow_snapshot_hash = sha256_string(&workflow_snapshot_json);
     let catalog_snapshot_hash = sha256_string(&catalog_snapshot_json);
 
-    // Catalog base directory — used to resolve relative skill bundle paths.
-    let catalog_base = Path::new(catalog_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-
-    let agent_lookup = build_agent_lookup(&cat, &catalog_base, &direct_command_scan)?;
+    let agent_lookup = build_agent_lookup(&cat, catalog_base, &direct_command_scan)?;
     let contract_lookup = build_contract_lookup(&cat);
 
     // Convert variables from serde_yaml::Value to serde_json::Value.
@@ -446,7 +501,10 @@ fn build_agent_lookup(
 }
 
 fn suppress_interactive_review_xcode_mcp(mode: Option<&str>) -> bool {
-    matches!(mode, Some("audit" | "prepush_review"))
+    matches!(
+        mode,
+        Some("audit" | "prepush_review" | "proposal_authoring")
+    )
 }
 
 /// Normalize YAML provider names to canonical provider families.
@@ -725,12 +783,13 @@ fn compile_agent_task(
     }
 
     // P060: propagate selected_outputs_from from DSL definition.
-    let selected_outputs_from = at.selected_outputs_from.as_ref().map(|sof| {
-        CompiledSelectedOutputsFrom {
-            source_plan: sof.source_plan.clone(),
-            output_contract: sof.output_contract.clone(),
-        }
-    });
+    let selected_outputs_from =
+        at.selected_outputs_from
+            .as_ref()
+            .map(|sof| CompiledSelectedOutputsFrom {
+                source_plan: sof.source_plan.clone(),
+                output_contract: sof.output_contract.clone(),
+            });
 
     Ok(CompiledTask {
         agent,
@@ -1012,8 +1071,8 @@ pub fn compile_dynamic_candidate_bindings(
             "output_contract": agent.output_contract,
         });
 
-        let resolved_agent_snapshot_json = serde_json::to_string(&resolved_snapshot)
-            .unwrap_or_else(|_| "{}".into());
+        let resolved_agent_snapshot_json =
+            serde_json::to_string(&resolved_snapshot).unwrap_or_else(|_| "{}".into());
 
         let output_contracts = agent
             .output_contract
@@ -1021,9 +1080,8 @@ pub fn compile_dynamic_candidate_bindings(
             .map(|c| vec![c.clone()])
             .unwrap_or_default();
 
-        let permission_hash = sha256_string(
-            agent.permission_profile.as_deref().unwrap_or("default"),
-        );
+        let permission_hash =
+            sha256_string(agent.permission_profile.as_deref().unwrap_or("default"));
         let worktree_hash = sha256_string(
             &agent
                 .worktree_policy
@@ -1038,11 +1096,8 @@ pub fn compile_dynamic_candidate_bindings(
                 .map(|m| m.join(","))
                 .unwrap_or_default(),
         );
-        let skill_hash = sha256_string(
-            agent.skill_ref.as_deref().unwrap_or("none"),
-        );
-        let routing_metadata_json = serde_json::to_string(routing)
-            .unwrap_or_default();
+        let skill_hash = sha256_string(agent.skill_ref.as_deref().unwrap_or("none"));
+        let routing_metadata_json = serde_json::to_string(routing).unwrap_or_default();
         let routing_metadata_hash = sha256_string(&routing_metadata_json);
 
         let binding_id = format!("bind-{}", agent.id);
@@ -1058,7 +1113,10 @@ pub fn compile_dynamic_candidate_bindings(
             skill_hash,
             routing_metadata_hash,
             enabled_for_proposal_review: routing.enabled_for_proposal_review,
-            rollout_wave: routing.rollout_wave.clone().unwrap_or_else(|| "unknown".into()),
+            rollout_wave: routing
+                .rollout_wave
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
             catalog_snapshot_hash: catalog_snapshot_hash.into(),
             routing_metadata: domain::routing::RoutingMetadata {
                 routing_id: routing.routing_id.clone(),
@@ -1068,10 +1126,17 @@ pub fn compile_dynamic_candidate_bindings(
                 surfaces: routing.surfaces.clone(),
                 risks: routing.risks.clone(),
                 enabled_for_proposal_review: routing.enabled_for_proposal_review,
-                rollout_wave: routing.rollout_wave.clone().unwrap_or_else(|| "unknown".into()),
+                rollout_wave: routing
+                    .rollout_wave
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
                 mandatory_when: routing.mandatory_when.clone(),
                 usually_pair_with: routing.usually_pair_with.clone(),
                 close_alternatives: routing.close_alternatives.clone(),
+                strong_proposal_keywords: routing.strong_proposal_keywords.clone(),
+                strong_repo_files: routing.strong_repo_files.clone(),
+                strong_repo_symbols: routing.strong_repo_symbols.clone(),
+                score_weights: routing.score_weights.clone(),
             },
         });
     }
@@ -1087,7 +1152,10 @@ pub fn compile_dynamic_candidate_bindings_from_paths(
     let catalog_snapshot_json =
         canonical_json_string(&cat).context("serializing catalog snapshot for bindings")?;
     let catalog_snapshot_hash = sha256_string(&catalog_snapshot_json);
-    Ok(compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash))
+    Ok(compile_dynamic_candidate_bindings(
+        &cat,
+        &catalog_snapshot_hash,
+    ))
 }
 
 fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {

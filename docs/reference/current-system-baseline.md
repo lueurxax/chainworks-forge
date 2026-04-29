@@ -36,6 +36,7 @@ At the current baseline, the product includes:
 - an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
 - segmented run surfaces with deterministic pane routing, a focused timeline inspector, and shared hierarchical artifact browsing,
 - a proposal-loop feedback-fidelity layer with review-corpus bundling, backlog carry-forward, writer coverage, and targeted rereview,
+- deterministic proposal-review routing with selection-plan receipts, dynamic reviewer fan-out, and selected-review corpus bundling,
 - an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
@@ -98,16 +99,23 @@ That boundary is owned by [operator-experience.md](operator-experience.md).
 
 ### UI Boundary
 
-Per P031-r18, the macOS UI is a **thin read-only client**.
+Per P031, the current implemented macOS UI stop-state is a **thin read-only client** for production workflow truth.
 
-Current baseline:
+Current implemented baseline:
 
 - production workflow truth is read from GraphQL projections,
 - UI state is limited to presentation, server-derived caches, and freshness handling,
-- all mutation paths (Start, Cancel, Retry, Approval Resolution) move to external CLI/MCP workflows,
-- governed UI screens provide diagnostic identifiers and instructions for these external workflows.
+- current P031 approval surfaces are diagnostic/read-only and use external resolution workflows,
+- governed UI screens provide diagnostic identifiers and instructions for unavailable or external workflows.
 
-That boundary is owned by [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
+Target-state action boundary:
+
+- SwiftUI remains GraphQL-only,
+- approval decisions are the only allowed SwiftUI GraphQL mutations,
+- Start, Cancel, Retry, Create Idea, reset, compaction, recovery, cloning, experiment, and other non-approval operational commands remain MCP-only,
+- P031 is not sufficient Phase 3 or release-closeout evidence for this target boundary; P072 owns the approval-only mutation contract and action-routing matrix.
+
+The read boundary is owned by [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md). The target action boundary is owned by [../proposals/072-operator-action-routing-and-ui-mutation-boundary.md](../proposals/072-operator-action-routing-and-ui-mutation-boundary.md).
 
 ### Provider boundary
 

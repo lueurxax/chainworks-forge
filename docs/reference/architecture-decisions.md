@@ -95,13 +95,13 @@ This document records the key architecture decisions made during the foundation 
 
 **Context:** The macOS operator app traditionally read from SwiftData and issued commands through multiple paths (MCP, local services). This created ambiguity about the source of truth and allowed the UI to become a second control plane.
 
-**Decision:** The macOS UI is narrowed to a thin, GraphQL-only read client.
+**Decision:** P031 narrows the current macOS UI stop-state to a thin, GraphQL-only read client.
 1. Governed SwiftUI surfaces render workflow truth from server-owned GraphQL projections only.
-2. The UI is read-only: no MCP writes, no GraphQL mutations, no local mutation fallback.
-3. Every removed write control (Start, Cancel, Retry, Resolve Approval) is replaced with diagnostic guidance and identifiers for external CLI/MCP workflows.
+2. The P031 stop-state UI is read-only: no MCP writes, no GraphQL mutations, no local mutation fallback.
+3. Every removed write control (Start, Cancel, Retry, Resolve Approval) is replaced with diagnostic guidance and identifiers for external workflows.
 4. UI state is limited to presentation, server-derived caches, read-refresh state, and freshness handling.
 
-**Consequence:** Single authoritative read plane (GraphQL). Commands move outside the macOS UI to validated external workflows. Static guards and a machine-readable UI inventory enforce the read-only boundary.
+**Consequence:** Single authoritative read plane (GraphQL). Non-approval operational commands move outside the macOS UI to validated MCP workflows. P072 supersedes P031 for the target action boundary: SwiftUI remains GraphQL-only, approval decisions are the only allowed GraphQL mutations, and all non-approval commands remain MCP-only. Static guards and a machine-readable UI inventory enforce the P031 read-only stop-state until P072 updates that boundary.
 
 ## ARCH-037: Owner-aware execution identity
 

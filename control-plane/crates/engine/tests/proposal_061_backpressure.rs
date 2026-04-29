@@ -741,6 +741,9 @@ async fn startup_repair_blocks_stale_running_stage_enqueues_wake_and_scheduler_r
     )
     .await
     .unwrap();
+    agent_executions::insert(&pool, &make_running_execution(stage_execution_id, "claude"))
+        .await
+        .unwrap();
 
     let recovery = RecoveryService::new(
         pool.clone(),

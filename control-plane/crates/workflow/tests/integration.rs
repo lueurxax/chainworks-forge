@@ -120,12 +120,40 @@ fn test_parse_full_mvp_live_workflow() {
     let s12 = &wf.states["state_12_workflow_complete"];
     assert!(s12.is_end());
 
-    // Verify a state with parallel tasks
+    // P060: bundled full MVP proposal review must use dynamic routing, not
+    // the legacy fixed quartet.
     let s4 = &wf.states["state_4_proposal_reviewed"];
     let run = s4.run.as_ref().expect("state_4 has a run block");
-    assert!(run.parallel.is_some(), "state_4 has parallel reviewers");
-    let parallel = run.parallel.as_ref().unwrap();
-    assert_eq!(parallel.len(), 4, "4 parallel reviewers");
+    let system_task = run
+        .system_task
+        .as_ref()
+        .expect("state_4 runs proposal_review_router as a system task");
+    assert_eq!(system_task.task_type, "proposal_review_router");
+    assert_eq!(system_task.executor_mode, "system.routing");
+    let dynamic_parallel = run
+        .dynamic_parallel
+        .as_ref()
+        .expect("state_4 materializes dynamically selected reviewers");
+    assert_eq!(
+        dynamic_parallel.selector_artifact,
+        "agent_selection_plan_v1"
+    );
+    assert_eq!(dynamic_parallel.output_contract, "proposal_review_v1");
+    let aggregate = run
+        .then
+        .as_ref()
+        .and_then(|tasks| tasks.first())
+        .expect("state_4 has a proposal review aggregator");
+    let selected_outputs = aggregate
+        .selected_outputs_from
+        .as_ref()
+        .expect("aggregator consumes only dynamically selected reviewer outputs");
+    assert_eq!(selected_outputs.source_plan, "agent_selection_plan_v1");
+    assert_eq!(selected_outputs.output_contract, "proposal_review_v1");
+    assert!(
+        run.parallel.as_ref().is_none_or(Vec::is_empty),
+        "state_4 must not keep the legacy static reviewer quartet"
+    );
 
     // Verify loop config
     let s5 = &wf.states["state_5_proposal_refined"];
@@ -149,6 +177,72 @@ fn test_parse_agent_catalog() {
     assert!(agent_ids.contains(&"code_writer"));
     assert!(agent_ids.contains(&"proposal_writer"));
     assert!(agent_ids.contains(&"proposal_reviewer_ux"));
+    assert!(agent_ids.contains(&"proposal_review_router"));
+    assert!(agent_ids.contains(&"proposal_reviewer_macos"));
+    assert!(agent_ids.contains(&"proposal_reviewer_rust_architect"));
+    assert!(agent_ids.contains(&"proposal_reviewer_reliability"));
+    assert!(agent_ids.contains(&"proposal_reviewer_security"));
+    assert!(agent_ids.contains(&"proposal_reviewer_api_contract"));
+    assert!(agent_ids.contains(&"proposal_reviewer_observability_rollout"));
+
+    let contracts = cat.contracts.as_ref().expect("has contracts");
+    assert!(
+        contracts.contains_key("agent_selection_plan_v1"),
+        "bundled catalog registers the P060 selector artifact contract"
+    );
+    assert!(
+        contracts.contains_key("review_corpus_bundle_v2"),
+        "bundled catalog registers selected reviewer corpus readback"
+    );
+    for expected_core in [
+        "proposal_reviewer_macos",
+        "proposal_reviewer_apple_architect",
+        "proposal_reviewer_rust_architect",
+        "proposal_reviewer_reliability",
+        "proposal_reviewer_security",
+        "proposal_reviewer_api_contract",
+        "proposal_reviewer_observability_rollout",
+    ] {
+        let agent = agents
+            .iter()
+            .find(|agent| agent.id == expected_core)
+            .unwrap_or_else(|| panic!("missing P060 core reviewer {expected_core}"));
+        let routing = agent
+            .routing
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing routing metadata for {expected_core}"));
+        assert!(
+            routing.enabled_for_proposal_review,
+            "{expected_core} must be enabled"
+        );
+        assert_eq!(routing.rollout_wave.as_deref(), Some("phase_3_core"));
+    }
+    let performance = agents
+        .iter()
+        .find(|agent| agent.id == "proposal_reviewer_performance")
+        .expect("later-wave performance reviewer is cataloged");
+    let performance_routing = performance.routing.as_ref().expect("performance routing");
+    assert!(
+        !performance_routing.enabled_for_proposal_review,
+        "later-wave performance reviewer is cataloged but disabled until rollout"
+    );
+    assert_eq!(
+        performance_routing.rollout_wave.as_deref(),
+        Some("later_wave")
+    );
+    let routed_reviewers = agents
+        .iter()
+        .filter(|agent| {
+            agent
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.enabled_for_proposal_review)
+        })
+        .count();
+    assert!(
+        routed_reviewers >= 6,
+        "bundled catalog exposes an expanded P060 reviewer pool, got {routed_reviewers}"
+    );
 
     let lead = workflow::catalog::validate_catalog_has_exactly_one_system_lead(&cat)
         .expect("bundled catalog should declare exactly one system lead");
@@ -166,6 +260,222 @@ fn test_parse_agent_catalog() {
     assert_eq!(
         proposal_writer.session_family_id.as_deref(),
         Some("proposal_authoring_loop")
+    );
+}
+
+#[test]
+fn p060_catalog_registers_dynamic_router_and_expanded_reviewers() {
+    let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+    let cat = workflow::catalog::load(&cat_path).expect("should parse agent catalog YAML");
+    let agents = cat.agents.as_ref().expect("has agents");
+    let contracts = cat.contracts.as_ref().expect("has contracts");
+
+    for contract_id in ["agent_selection_plan_v1", "review_corpus_bundle_v2"] {
+        assert!(
+            contracts.contains_key(contract_id),
+            "P060 live catalog must register {contract_id}"
+        );
+    }
+
+    let expected_core = [
+        "proposal_review_router",
+        "proposal_reviewer_macos",
+        "proposal_reviewer_apple_architect",
+        "proposal_reviewer_rust_architect",
+        "proposal_reviewer_reliability",
+        "proposal_reviewer_security",
+        "proposal_reviewer_api_contract",
+        "proposal_reviewer_observability_rollout",
+    ];
+    for agent_id in expected_core {
+        let agent = agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .unwrap_or_else(|| panic!("missing P060 catalog agent {agent_id}"));
+        if agent_id != "proposal_review_router" {
+            let routing = agent
+                .routing
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing routing metadata for {agent_id}"));
+            assert!(
+                routing.enabled_for_proposal_review,
+                "{agent_id} must be enabled in the core P060 rollout"
+            );
+            assert_eq!(routing.rollout_wave.as_deref(), Some("phase_3_core"));
+        }
+    }
+
+    for agent_id in [
+        "proposal_reviewer_reliability",
+        "proposal_reviewer_security",
+        "proposal_reviewer_api_contract",
+        "proposal_reviewer_observability_rollout",
+    ] {
+        let routing = agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .and_then(|agent| agent.routing.as_ref())
+            .unwrap_or_else(|| panic!("missing routing metadata for {agent_id}"));
+        assert!(
+            !routing.strong_proposal_keywords.is_empty(),
+            "{agent_id} must expose strong proposal keyword routing signals"
+        );
+        assert!(
+            !routing.strong_repo_files.is_empty(),
+            "{agent_id} must expose strong repository file routing signals"
+        );
+        assert!(
+            !routing.strong_repo_symbols.is_empty(),
+            "{agent_id} must expose strong repository symbol routing signals"
+        );
+    }
+
+    let later_wave_performance = agents
+        .iter()
+        .find(|agent| agent.id == "proposal_reviewer_performance")
+        .expect("P060 performance reviewer should be cataloged for later rollout");
+    let performance_routing = later_wave_performance
+        .routing
+        .as_ref()
+        .expect("performance reviewer has routing metadata");
+    assert!(!performance_routing.enabled_for_proposal_review);
+    assert_eq!(
+        performance_routing.rollout_wave.as_deref(),
+        Some("later_wave")
+    );
+}
+
+#[test]
+fn p060_canonical_workflow_uses_dynamic_reviewer_routing() {
+    let wf_path = format!("{}/workflows/workflow.yaml", fixtures_dir());
+    let catalog_path = format!("{}/agents/agents.yaml", fixtures_dir());
+    let plan = compiler::compile(&wf_path, &catalog_path)
+        .expect("canonical workflow should compile with dynamic P060 routing");
+    let state = plan
+        .states
+        .get("state_4_proposal_reviewed")
+        .expect("canonical workflow has proposal review state");
+
+    let system_task = state
+        .system_task
+        .as_ref()
+        .expect("proposal review state runs system.routing");
+    assert_eq!(system_task.task_type, "proposal_review_router");
+    assert_eq!(system_task.executor_mode, "system.routing");
+
+    let dynamic_parallel = state
+        .dynamic_parallel
+        .as_ref()
+        .expect("proposal review state has dynamic_parallel");
+    assert_eq!(
+        dynamic_parallel.selector_artifact,
+        "agent_selection_plan_v1"
+    );
+    assert_eq!(dynamic_parallel.output_contract, "proposal_review_v1");
+
+    let phase0_static_reviewers: Vec<_> = state
+        .tasks
+        .iter()
+        .filter(|task| task.phase == 0 && task.agent.agent_id.starts_with("proposal_reviewer_"))
+        .collect();
+    assert!(
+        phase0_static_reviewers.is_empty(),
+        "canonical workflow must not enqueue static proposal reviewers when P060 routing is active"
+    );
+
+    let aggregate = state
+        .tasks
+        .iter()
+        .find(|task| task.phase > 0 && task.task_name == "aggregate_proposal_reviews")
+        .expect("aggregator remains a then task");
+    assert!(
+        aggregate
+            .outputs
+            .iter()
+            .any(|output| output == "review_corpus_bundle_v2"),
+        "P060 dynamic review aggregation must emit the v2 review corpus bundle"
+    );
+    assert!(
+        !aggregate
+            .outputs
+            .iter()
+            .any(|output| output == "review_corpus_bundle"),
+        "P060 dynamic review aggregation must not advertise the legacy review corpus bundle"
+    );
+    let selected_outputs = aggregate
+        .selected_outputs_from
+        .as_ref()
+        .expect("aggregator filters to selected reviewer artifacts");
+    assert_eq!(selected_outputs.source_plan, "agent_selection_plan_v1");
+    assert_eq!(selected_outputs.output_contract, "proposal_review_v1");
+
+    assert!(
+        plan.dynamic_candidate_bindings.len() >= 6,
+        "canonical catalog must compile an expanded reviewer candidate pool"
+    );
+}
+
+#[test]
+fn p060_full_mvp_dynamic_workflow_does_not_require_fixed_quartet_refinement_inputs() {
+    for workflow_file in ["workflow.yaml", "full-mvp-live.yaml"] {
+        let wf_path = format!("{}/workflows/{workflow_file}", fixtures_dir());
+        let wf = workflow::definition::load(&wf_path).expect("should parse workflow YAML");
+        let state = wf
+            .states
+            .get("state_5_proposal_refined")
+            .expect("workflow has proposal refinement state");
+        let run = state.run.as_ref().expect("state has run block");
+        let first_task = run
+            .sequence
+            .as_ref()
+            .and_then(|tasks| tasks.first())
+            .expect("refinement has a task");
+        let inputs = first_task.inputs.as_deref().unwrap_or(&[]);
+        for legacy_input in [
+            "proposal_review_po",
+            "proposal_review_ux",
+            "proposal_review_ui",
+            "proposal_review_architect",
+        ] {
+            assert!(
+                !inputs.iter().any(|input| input == legacy_input),
+                "{workflow_file} refinement must consume review_corpus_bundle_v2 instead of fixed quartet input {legacy_input}"
+            );
+        }
+        assert!(inputs
+            .iter()
+            .any(|input| input == "review_corpus_bundle_v2"));
+        assert!(
+            !inputs.iter().any(|input| input == "review_corpus_bundle"),
+            "{workflow_file} refinement must not depend on the legacy review corpus bundle"
+        );
+    }
+}
+
+#[test]
+fn p060_proposal_loop_live_remains_legacy_fixed_reviewer_fanout() {
+    let wf_path = format!("{}/workflows/proposal-loop-live.yaml", fixtures_dir());
+    let wf = workflow::definition::load(&wf_path).expect("should parse proposal loop workflow");
+    let state = wf
+        .states
+        .get("state_3_proposal_reviewed")
+        .expect("proposal-loop-live has proposal review state");
+    let run = state.run.as_ref().expect("review state has run block");
+    assert!(run.system_task.is_none());
+    assert!(run.dynamic_parallel.is_none());
+    let parallel = run
+        .parallel
+        .as_ref()
+        .expect("legacy fixed parallel reviewers");
+    let reviewer_ids: Vec<_> = parallel.iter().map(|task| task.agent.as_str()).collect();
+    assert_eq!(
+        reviewer_ids,
+        vec![
+            "proposal_reviewer_product_owner",
+            "proposal_reviewer_ux",
+            "proposal_reviewer_ui",
+            "proposal_reviewer_architect",
+        ]
     );
 }
 
@@ -465,8 +775,12 @@ fn test_compile_full_mvp_live_plan() {
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
     assert_eq!(
         proposal_writer.requested_mcp_server_ids,
-        vec!["xcode".to_string(), "context7".to_string()],
-        "proposal_writer MCP intent comes from codex_writer_high backend_profile"
+        vec!["context7".to_string()],
+        "proposal_writer suppresses interactive Xcode MCP while keeping non-Xcode MCP"
+    );
+    assert!(
+        !proposal_writer.xcode_broker_required,
+        "proposal_writer must not require an interactive Xcode broker lease"
     );
     assert_eq!(
         proposal_writer.session_reuse_scope.as_deref(),
@@ -973,9 +1287,21 @@ backend_profiles:
   steward_profile:
     provider: claude
     model: steward-model
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
   - id: steward
     backend_profile: steward_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
     prompt: "observe"
 "#,
     );
@@ -1000,6 +1326,76 @@ agents:
         plan.catalog_snapshot_json.contains("\"backend_profiles\""),
         "catalog snapshot must preserve parsed catalog truth"
     );
+}
+
+#[test]
+fn compile_from_snapshot_json_preserves_frozen_plan_truth() {
+    let workflow = r#"
+workflow:
+  id: steward-workflow
+  family: mvp_live
+  risk_class: high
+  stack: swiftui
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: steward
+    run:
+      sequence:
+        - agent: steward
+          task: "observe"
+"#;
+    let catalog = catalog_with_default_system_lead(
+        r#"
+backend_profiles:
+  steward_profile:
+    provider: claude
+    model: steward-model
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
+agents:
+  - id: steward
+    backend_profile: steward_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    prompt: "observe"
+"#,
+    );
+    let workflow_path = write_temp_fixture("snapshot-workflow.yaml", workflow);
+    let catalog_path = write_temp_fixture("snapshot-catalog.yaml", &catalog);
+    let plan = compiler::compile(&workflow_path, &catalog_path).expect("plan compiles");
+
+    fs::write(&workflow_path, "not: valid: yaml").expect("should corrupt workflow fixture");
+    let from_snapshot = compiler::compile_from_snapshot_json(
+        &plan.workflow_snapshot_json,
+        &plan.catalog_snapshot_json,
+        &catalog_path,
+    )
+    .expect("snapshot plan compiles");
+
+    assert_eq!(
+        from_snapshot.workflow_snapshot_hash,
+        plan.workflow_snapshot_hash
+    );
+    assert_eq!(
+        from_snapshot.catalog_snapshot_hash,
+        plan.catalog_snapshot_hash
+    );
+    assert_eq!(
+        from_snapshot.workflow_family.as_deref(),
+        plan.workflow_family.as_deref()
+    );
+    assert!(from_snapshot.states.contains_key("start"));
 }
 
 #[test]
@@ -1797,16 +2193,31 @@ agents:
     assert_eq!(bindings.len(), 3, "expected 3 agents with routing metadata");
 
     // Check security reviewer binding.
-    let security = bindings.iter().find(|b| b.agent_id == "proposal_reviewer_security").unwrap();
+    let security = bindings
+        .iter()
+        .find(|b| b.agent_id == "proposal_reviewer_security")
+        .unwrap();
     assert!(security.enabled_for_proposal_review);
     assert_eq!(security.rollout_wave, "phase_3_core");
     assert_eq!(security.routing_metadata.routing_id, "security");
-    assert!(security.routing_metadata.risks.contains(&"security".to_string()));
-    assert_eq!(security.routing_metadata.mandatory_when, vec!["security".to_string()]);
-    assert_eq!(security.output_contracts, vec!["proposal_review_v1".to_string()]);
+    assert!(security
+        .routing_metadata
+        .risks
+        .contains(&"security".to_string()));
+    assert_eq!(
+        security.routing_metadata.mandatory_when,
+        vec!["security".to_string()]
+    );
+    assert_eq!(
+        security.output_contracts,
+        vec!["proposal_review_v1".to_string()]
+    );
 
     // Check iOS reviewer is disabled.
-    let ios = bindings.iter().find(|b| b.agent_id == "proposal_reviewer_ios").unwrap();
+    let ios = bindings
+        .iter()
+        .find(|b| b.agent_id == "proposal_reviewer_ios")
+        .unwrap();
     assert!(!ios.enabled_for_proposal_review);
     assert_eq!(ios.rollout_wave, "later_wave");
 
@@ -1870,7 +2281,12 @@ agents:
     let plan = compile_result_from_strings(workflow_yaml, catalog_yaml).unwrap();
     assert_eq!(plan.dynamic_candidate_bindings.len(), 1);
     assert_eq!(plan.dynamic_candidate_bindings[0].agent_id, "reviewer");
-    assert_eq!(plan.dynamic_candidate_bindings[0].routing_metadata.routing_id, "test_reviewer");
+    assert_eq!(
+        plan.dynamic_candidate_bindings[0]
+            .routing_metadata
+            .routing_id,
+        "test_reviewer"
+    );
 }
 
 #[test]
@@ -1936,7 +2352,10 @@ agents:
     assert_eq!(sys.executor_mode, "system.routing");
 
     // Check dynamic_parallel was compiled.
-    let dp = state.dynamic_parallel.as_ref().expect("should have dynamic_parallel");
+    let dp = state
+        .dynamic_parallel
+        .as_ref()
+        .expect("should have dynamic_parallel");
     assert_eq!(dp.selector_artifact, "agent_selection_plan_v1");
     assert_eq!(dp.output_contract, "proposal_review_v1");
     assert_eq!(dp.inputs, vec!["proposal_current", "idea_brief"]);
@@ -2018,7 +2437,9 @@ agents:
     assert_eq!(then_tasks.len(), 1);
     let agg = &then_tasks[0];
     assert_eq!(agg.task_name, "aggregate_reviews");
-    let sof = agg.selected_outputs_from.as_ref()
+    let sof = agg
+        .selected_outputs_from
+        .as_ref()
         .expect("then-task should have selected_outputs_from");
     assert_eq!(sof.source_plan, "agent_selection_plan_v1");
     assert_eq!(sof.output_contract, "proposal_review_v1");

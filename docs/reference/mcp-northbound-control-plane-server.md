@@ -296,12 +296,12 @@ Rationale for the Steward trio: `run_analysis` queues compute work and drives th
 
 GraphQL is not a general-purpose operator command bus. The macOS operator UI may use GraphQL mutations only to resolve human approval gates:
 
-| Mutation | `CapabilityToolId` | Operator | Agent | Observer |
+| Target mutation | `CapabilityToolId` | Operator | Agent | Observer |
 |---|---|:-:|:-:|:-:|
-| `approveStage` | `ApprovalsResolve` | yes | no | no |
-| `rejectStage` | `ApprovalsResolve` | yes | no | no |
+| `approveApproval` | `ApprovalsResolve` | yes | no | no |
+| `rejectApproval` | `ApprovalsResolve` | yes | no | no |
 
-`approveStage` and `rejectStage` share the same capability because they differ only by `ApprovalDecision`; the class policy does not distinguish them. A mutation invoked by a principal whose class is not permitted returns `async_graphql::Error("forbidden")` and writes no `command_journal` row.
+`approveApproval` and `rejectApproval` share the same capability because they differ only by `ApprovalDecision`; the class policy does not distinguish them. A mutation invoked by a principal whose class is not permitted returns `async_graphql::Error("forbidden")` and writes no `command_journal` row.
 
 The following operations are MCP-only for agents, CLIs, automations, and operator diagnostics:
 
@@ -316,7 +316,7 @@ The following operations are MCP-only for agents, CLIs, automations, and operato
 | Override artifact contract | `artifacts.override_contract` | no |
 | Run Steward analysis | `steward.run_analysis` | no |
 
-Current Rust schema compatibility note: older non-approval GraphQL mutation resolvers may still exist while P072 is being implemented and tests are being retired. They are legacy compatibility surface, not target-state product API. SwiftUI must not call them, new UI work must not add call sites for them, and reference/gate work should drive their retirement or containment behind explicit compatibility tests.
+Current Rust schema compatibility note: older GraphQL mutation resolvers may still exist while P072 is being implemented and tests are being retired. Older non-approval resolvers such as `startRun`, `retryStage`, and `cancelRun` are legacy compatibility surface, not target-state product API. Older approval resolvers such as `approveStage` and `rejectStage` are legacy approval compatibility names until P072 lands the approval-id-based `approveApproval` / `rejectApproval` target mutations. SwiftUI must not add new call sites for legacy names, and reference/gate work should drive their retirement or containment behind explicit compatibility tests.
 
 ### Enforcement points
 
@@ -380,7 +380,7 @@ Migration `011_auth_tracking.sql` adds four nullable TEXT columns to the existin
 | `caller_surface` | `"mcp"` or `"graphql"` (serde `snake_case`) |
 | `caller_principal_id` | principal id from the auth table (e.g. `default-operator`, `observer`, `test-operator`) |
 | `caller_principal_class` | `"operator"`, `"agent"`, or `"observer"` |
-| `caller_tool` | MCP tool name (e.g. `runs.start`) or approval GraphQL mutation name (e.g. `approveStage`) |
+| `caller_tool` | MCP tool name (e.g. `runs.start`) or approval GraphQL mutation name (target `approveApproval`; legacy compatibility `approveStage`) |
 
 Columns are nullable so pre-P029 rows remain readable. Post-P029 rows written through `CommandHandler::handle` always populate all four.
 
@@ -449,16 +449,25 @@ The eight direct tools (`ideas.create`, `ideas.list`, `runs.list`, `runs.get`, `
 
 Approval mutations return dedicated payload objects so that `journalId: ID!` lives on the mutation result and does not pollute shared entity types (`Approval`) that read queries also return.
 
+Target P072 mutation names:
+
+| Mutation | Return type |
+|---|---|
+| `approveApproval` | `ApproveApprovalPayload { approval: Approval!, journalId: ID! }` |
+| `rejectApproval` | `RejectApprovalPayload { approval: Approval!, journalId: ID! }` |
+
+Legacy compatibility names that may exist in the current Rust schema until P072 implementation cleanup:
+
 | Mutation | Return type |
 |---|---|
 | `approveStage` | `ApproveStagePayload { approval: Approval!, journalId: ID! }` |
 | `rejectStage` | `RejectStagePayload { approval: Approval!, journalId: ID! }` |
 
-Clients select the field via normal GraphQL syntax:
+Clients select the target field via normal GraphQL syntax:
 
 ```graphql
 mutation {
-  approveStage(runId: "...", stageId: "...") {
+  approveApproval(approvalId: "...", comment: "approved") {
     approval { id decision decidedAt }
     journalId
   }

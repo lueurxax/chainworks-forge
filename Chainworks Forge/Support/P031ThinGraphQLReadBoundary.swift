@@ -1286,6 +1286,8 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
   let status: String
   let iteration: Int?
   let attemptNumber: Int?
+  let startedAt: String?
+  let completedAt: String?
   let settlementKind: String?
   let hasArtifacts: Bool?
   let hasPendingApproval: Bool?
@@ -1295,6 +1297,44 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
   let projectionLag: Bool
   let freshnessState: P031FreshnessState
 
+  init(
+    id: String,
+    runID: String,
+    stageID: String,
+    label: String,
+    status: String,
+    iteration: Int?,
+    attemptNumber: Int?,
+    startedAt: String? = nil,
+    completedAt: String? = nil,
+    settlementKind: String?,
+    hasArtifacts: Bool?,
+    hasPendingApproval: Bool?,
+    hasValidationFailure: Bool?,
+    projectionPresent: Bool,
+    projectionUpdatedAt: String?,
+    projectionLag: Bool,
+    freshnessState: P031FreshnessState
+  ) {
+    self.id = id
+    self.runID = runID
+    self.stageID = stageID
+    self.label = label
+    self.status = status
+    self.iteration = iteration
+    self.attemptNumber = attemptNumber
+    self.startedAt = startedAt
+    self.completedAt = completedAt
+    self.settlementKind = settlementKind
+    self.hasArtifacts = hasArtifacts
+    self.hasPendingApproval = hasPendingApproval
+    self.hasValidationFailure = hasValidationFailure
+    self.projectionPresent = projectionPresent
+    self.projectionUpdatedAt = projectionUpdatedAt
+    self.projectionLag = projectionLag
+    self.freshnessState = freshnessState
+  }
+
   enum CodingKeys: String, CodingKey {
     case id
     case runID = "runId"
@@ -1303,6 +1343,8 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
     case status
     case iteration
     case attemptNumber
+    case startedAt
+    case completedAt
     case settlementKind
     case hasArtifacts
     case hasPendingApproval
@@ -1318,6 +1360,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
   let id: String
   let runID: String
   let stageID: String
+  let sourceStageExecutionID: String?
+  let createdAt: String?
   let agentID: String?
   let name: String
   let contractID: String
@@ -1338,6 +1382,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     id: String,
     runID: String,
     stageID: String,
+    sourceStageExecutionID: String? = nil,
+    createdAt: String? = nil,
     agentID: String? = nil,
     name: String,
     contractID: String,
@@ -1357,6 +1403,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     self.id = id
     self.runID = runID
     self.stageID = stageID
+    self.sourceStageExecutionID = sourceStageExecutionID
+    self.createdAt = createdAt
     self.agentID = agentID
     self.name = name
     self.contractID = contractID
@@ -1399,6 +1447,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     case id
     case runID = "runId"
     case stageID = "stageId"
+    case sourceStageExecutionID = "sourceStageExecutionId"
+    case createdAt
     case agentID = "agentId"
     case name
     case contractID = "contractId"
@@ -1567,6 +1617,8 @@ enum P031GraphQLDocuments {
         status
         iteration
         attemptNumber
+        startedAt
+        completedAt
         settlementKind
         hasArtifacts
         hasPendingApproval
@@ -1580,6 +1632,8 @@ enum P031GraphQLDocuments {
         id
         runId
         stageId
+        sourceStageExecutionId
+        createdAt
         agentId
         name
         contractId
@@ -1619,6 +1673,8 @@ enum P031GraphQLDocuments {
         status
         iteration
         attemptNumber
+        startedAt
+        completedAt
         settlementKind
         hasArtifacts
         hasPendingApproval
@@ -1641,6 +1697,8 @@ enum P031GraphQLDocuments {
         status
         iteration
         attemptNumber
+        startedAt
+        completedAt
         settlementKind
         hasArtifacts
         hasPendingApproval
@@ -1675,6 +1733,8 @@ enum P031GraphQLDocuments {
         id
         runId
         stageId
+        sourceStageExecutionId
+        createdAt
         agentId
         name
         contractId
@@ -1699,6 +1759,8 @@ enum P031GraphQLDocuments {
         id
         runId
         stageId
+        sourceStageExecutionId
+        createdAt
         agentId
         name
         contractId
@@ -3102,6 +3164,9 @@ enum P031ArtifactRenderMode: Equatable, Sendable {
 struct P031ArtifactViewerPresentation: Equatable, Sendable {
   let artifactID: String
   let stageID: String
+  let stageLabel: String?
+  let iteration: Int?
+  let attemptNumber: Int?
   let agentID: String?
   let contractID: String
   let format: String
@@ -3404,7 +3469,15 @@ enum P031RunDetailPresenter {
       )
     }
     let artifactRows = detail.ordinaryArtifacts.map(P031ArtifactPresenter.presentation)
-    let artifactViewerRows = detail.ordinaryArtifacts.map(P031ArtifactViewerPresenter.presentation)
+    let stageByExecutionID = Dictionary(uniqueKeysWithValues: detail.stages.map { ($0.id, $0) })
+    let stageWindowsByStageID = stageExecutionWindowsByStageID(detail.stages)
+    let artifactViewerRows = detail.ordinaryArtifacts.map { artifact in
+      let sourceStage = artifact.sourceStageExecutionID.flatMap { stageByExecutionID[$0] }
+      return P031ArtifactViewerPresenter.presentation(
+        for: artifact,
+        stage: sourceStage ?? stageExecution(for: artifact, windowsByStageID: stageWindowsByStageID)
+      )
+    }
     let reportRows = detail.reportMetadata.map(ReportMetadataRowPresenter.presentation)
     let progressLabel: String?
     if let completedStages = run?.completedStages, let totalStages = run?.totalStages {
@@ -3474,6 +3547,93 @@ enum P031RunDetailPresenter {
       emptyStateTitle: nil,
       errorDescription: P031ReadErrorPresenter.description(for: error)
     )
+  }
+
+  private nonisolated static func stageExecutionWindowsByStageID(
+    _ stages: [P031StageReadModel]
+  ) -> [String: [P031StageExecutionWindow]] {
+    let stagesWithStart = stages.compactMap { stage -> (stage: P031StageReadModel, startedAt: Date)? in
+      guard let startedAt = P031ReadBoundaryDateParser.date(from: stage.startedAt) else {
+        return nil
+      }
+      return (stage, startedAt)
+    }
+    let grouped = Dictionary(grouping: stagesWithStart, by: { $0.stage.stageID })
+    return grouped.mapValues { entries in
+      let sorted = entries.sorted {
+        if $0.startedAt != $1.startedAt {
+          return $0.startedAt < $1.startedAt
+        }
+        return $0.stage.isEarlierExecution(than: $1.stage)
+      }
+      return sorted.enumerated().map { index, entry in
+        P031StageExecutionWindow(
+          stage: entry.stage,
+          startedAt: entry.startedAt,
+          nextStartedAt: sorted.indices.contains(index + 1) ? sorted[index + 1].startedAt : nil
+        )
+      }
+    }
+  }
+
+  private nonisolated static func stageExecution(
+    for artifact: P031ArtifactReadModel,
+    windowsByStageID: [String: [P031StageExecutionWindow]]
+  ) -> P031StageReadModel? {
+    guard let createdAt = P031ReadBoundaryDateParser.date(from: artifact.createdAt),
+      let windows = windowsByStageID[artifact.stageID]
+    else {
+      return nil
+    }
+    return windows.last(where: { $0.contains(createdAt) })?.stage
+  }
+}
+
+private struct P031StageExecutionWindow: Equatable, Sendable {
+  let stage: P031StageReadModel
+  let startedAt: Date
+  let nextStartedAt: Date?
+
+  nonisolated func contains(_ date: Date) -> Bool {
+    guard date >= startedAt else {
+      return false
+    }
+    if let nextStartedAt {
+      return date < nextStartedAt
+    }
+    return true
+  }
+}
+
+private enum P031ReadBoundaryDateParser {
+  nonisolated static func date(from value: String?) -> Date? {
+    guard let value, !value.isEmpty else {
+      return nil
+    }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) {
+      return date
+    }
+    let standard = ISO8601DateFormatter()
+    standard.formatOptions = [.withInternetDateTime]
+    return standard.date(from: value)
+  }
+}
+
+private extension P031StageReadModel {
+  nonisolated func isEarlierExecution(than other: P031StageReadModel) -> Bool {
+    let lhsIteration = iteration ?? Int.min
+    let rhsIteration = other.iteration ?? Int.min
+    if lhsIteration != rhsIteration {
+      return lhsIteration < rhsIteration
+    }
+    let lhsAttempt = attemptNumber ?? Int.min
+    let rhsAttempt = other.attemptNumber ?? Int.min
+    if lhsAttempt != rhsAttempt {
+      return lhsAttempt < rhsAttempt
+    }
+    return id.localizedStandardCompare(other.id) == .orderedAscending
   }
 }
 
@@ -3647,7 +3807,10 @@ enum P031StageTransitionPresenter {
 }
 
 enum P031ArtifactViewerPresenter {
-  nonisolated static func presentation(for artifact: P031ArtifactReadModel)
+  nonisolated static func presentation(
+    for artifact: P031ArtifactReadModel,
+    stage: P031StageReadModel? = nil
+  )
     -> P031ArtifactViewerPresentation
   {
     let normalizedFormat = artifact.format.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3707,6 +3870,9 @@ enum P031ArtifactViewerPresenter {
     return P031ArtifactViewerPresentation(
       artifactID: artifact.id,
       stageID: artifact.stageID,
+      stageLabel: stage?.label,
+      iteration: stage?.iteration,
+      attemptNumber: stage?.attemptNumber,
       agentID: artifact.agentID,
       contractID: artifact.contractID,
       format: artifact.format,

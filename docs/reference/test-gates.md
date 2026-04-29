@@ -787,7 +787,7 @@ Scope:
 - principal-table bootstrap (owner-only `0o600` file mode on Unix, one-time token log, fail-closed on empty table)
 - bearer auth on MCP HTTP (`POST /mcp`), MCP stdio (`initialize.params.clientInfo.principal_token`), GraphQL HTTP (`POST /graphql`), and GraphQL WebSocket (`/graphql/ws` via `on_connection_init`)
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`, including the Steward trio policy (`steward.run_analysis` operator-only, `steward.list_analyses` + `steward.get_analysis` operator/observer, agent excluded)
-- GraphQL mutation class policy for `startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`
+- GraphQL mutation class policy for current legacy compatibility resolvers (`startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`) until P072 retires or quarantines them; target SwiftUI GraphQL mutations are approval-only (`approveApproval`, `rejectApproval`)
 - `command_journal` caller metadata (`caller_surface`, `caller_principal_id`, `caller_principal_class`, `caller_tool`) populated per MCP command tool and per GraphQL mutation
 - the §8.1 redaction matrix (one test per `Command` variant decision)
 - `journal_id` surfacing inside `content[0].text` on MCP command tools and as `journalId: ID!` on every GraphQL mutation payload wrapper
@@ -1263,6 +1263,11 @@ Command:
 ### `proposal-060|p060`
 
 Deterministic reviewer routing and expanded reviewer catalog gate.
+
+This retained historical gate alias validates the implemented routing contract
+documented in
+[`workflow-execution-engine.md#system-tasks-and-deterministic-proposal-review-routing`](workflow-execution-engine.md#system-tasks-and-deterministic-proposal-review-routing).
+The retired proposal file is not the operational source of truth.
 
 Scope:
 

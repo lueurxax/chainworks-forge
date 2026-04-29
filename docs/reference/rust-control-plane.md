@@ -121,7 +121,9 @@ Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
 
-Mutations: `startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`.
+Target mutation boundary: GraphQL is the SwiftUI read/subscription surface plus approval-only human-gate mutation path. P072 target mutation names are `approveApproval` and `rejectApproval`. Non-approval operational commands such as run start, cancellation, retry, reset, compaction, recovery, cloning, and experiment control are MCP-only.
+
+Current schema compatibility: legacy GraphQL command resolvers such as `startRun`, `retryStage`, `cancelRun`, `approveStage`, and `rejectStage` may still exist until P072 implementation cleanup. They are compatibility surface, not the target SwiftUI product contract.
 
 Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
 

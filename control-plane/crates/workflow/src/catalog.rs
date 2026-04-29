@@ -164,6 +164,14 @@ pub struct RoutingMetadataYaml {
     pub usually_pair_with: Vec<String>,
     #[serde(default)]
     pub close_alternatives: Vec<String>,
+    #[serde(default)]
+    pub strong_proposal_keywords: Vec<String>,
+    #[serde(default)]
+    pub strong_repo_files: Vec<String>,
+    #[serde(default)]
+    pub strong_repo_symbols: Vec<String>,
+    #[serde(default)]
+    pub score_weights: domain::routing::ScoreWeights,
 }
 
 /// Validate that an executable catalog has exactly one system lead with the

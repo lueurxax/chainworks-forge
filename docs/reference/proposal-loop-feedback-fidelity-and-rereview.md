@@ -45,7 +45,7 @@ The canonical refine-handoff owner is `ReviewCorpusBundle` (V2), which persists:
 - `review_pass_id`,
 - `review_iteration_id`,
 - `source_proposal_artifact`,
-- `selected_reviewer_ids` (P060 dynamic set),
+- `selected_reviewer_ids` (selected dynamic reviewer set),
 - `selected_review_artifacts` (2-5 specialist artifacts),
 - `selection_plan_hash` (linked to `AgentSelectionPlanV1`),
 - and the aggregate summary artifact name.
@@ -124,7 +124,7 @@ The canonical artifact names for this slice are:
 - `proposal_fact_digest`
 - `reviewer_scope_plan`
 - `proposal_review_summary`
-- selected reviewer artifacts (P060):
+- selected reviewer artifacts:
   - 2-5 artifacts from the specialist catalog (e.g. `proposal_review_macos`, `proposal_review_security`)
   - legacy `proposal_review_po`, `proposal_review_ux`, `proposal_review_ui`, `proposal_review_architect` when selected or in legacy mode
 

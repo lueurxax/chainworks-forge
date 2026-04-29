@@ -62,14 +62,20 @@ Each row shows:
 - runtime provenance,
 - **Freshness state** (Live, Refreshing, Stale, etc.).
 
-### Proposal Review Routing (P060)
+### Proposal Review Routing
 
-The Proposal Reviewed stage card includes detailed routing information:
-- **Routing Progress**: Spinner and label ("Selecting reviewers...") during selection.
-- **Reviewer Rows**: 2-5 dynamic rows showing agent name, mandatory/optional status, score, rationale, and evidence IDs.
-- **Timeline Popovers**: Detailed routing rationale, score terms, evidence IDs, and materialization status are visible for each reviewer row.
-- **Advanced Routing Disclosure**: Optional view for rejected alternatives and ineligible candidates.
-- **Under-specified Selection**: Caution banner when falling back to fixed reviewers.
+Reviewer routing is artifact/readback truth rather than a bespoke routing dashboard.
+For dynamically routed proposal-review stages, operator surfaces read:
+
+- `agent_selection_plan_v1` for selected, rejected, and ineligible reviewers,
+- `routing_receipt` for terminal routing status, rationale, warnings, and hashes,
+- `SystemExecution` for system-task lifecycle state,
+- `ReviewCorpusBundle` for the selected reviewer outputs consumed by aggregate
+  review and proposal refinement.
+
+The macOS app keeps typed parity DTOs for these payloads and redacts raw repository
+evidence by default. Dedicated UI affordances must consume these artifacts and
+projections; they are not the source of routing truth.
 
 **Actions are diagnostic-only:**
 - `Open` is available for drill-down.
@@ -99,15 +105,16 @@ GroupBox appears immediately after the Blocker Summary. It provides:
 
 - **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step")
   plus status capsule.
-- **Routing Conflict**: Specifically for deterministic routing failures (P060),
-  showing matching mandatory reviewers, overflow rationale, and evidence IDs.
+- **Routing Evidence**: For deterministic routing, the plan shows selected
+  reviewers, rejected alternatives, warnings such as
+  `mandatory_overflow_pruned`, and the evidence IDs behind those decisions.
 - **Current State**: The authoritative graph state where the run is anchored.
 - **Lead & Mediation**: The system lead agent assigned to the conflict and
   active mediation progress.
 - **Advisory Suggestion**: Redacted summary of the rejected agent hint.
 - **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
 
-### Evidence Projection (P060)
+### Evidence Projection
 
 Repo-backed evidence references (path, symbol, span) in routing rationale default
 to hash-only projection for privacy and security.

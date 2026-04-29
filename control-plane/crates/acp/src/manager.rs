@@ -4,6 +4,7 @@ use std::sync::RwLock;
 
 use anyhow::{bail, Result};
 use domain::agent::AgentStatus;
+use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate, XcodeShimEvent,
 };
@@ -20,8 +21,8 @@ use crate::adapters::{
 };
 use crate::session::AcpSessionHandle;
 use crate::{
-    ExecutionRequest, ExecutionResult, NoopXcodeRuntimeObservationSink,
-    XcodeRuntimeObservationSink, XcodeShimGrantStore,
+    AcpPromptProgressSink, ExecutionRequest, ExecutionResult, NoopAcpPromptProgressSink,
+    NoopXcodeRuntimeObservationSink, XcodeRuntimeObservationSink, XcodeShimGrantStore,
 };
 
 #[derive(Debug)]
@@ -81,6 +82,7 @@ pub struct AcpRuntimeManager {
     live_sessions: Mutex<HashMap<String, AcpSessionHandle>>,
     live_xcode_leases: Mutex<HashMap<String, BrokeredXcodeLeaseCleanup>>,
     provider_capability_cache: ProviderCapabilityCache,
+    prompt_progress_sink: RwLock<Arc<dyn AcpPromptProgressSink>>,
     xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
     xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
     xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
@@ -91,6 +93,10 @@ struct XcodeShimRuntimeConfig {
     store: Arc<dyn XcodeShimGrantStore>,
     socket_path: String,
     shim_dir: String,
+}
+
+fn canonical_acp_provider(provider: &str) -> String {
+    ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string())
 }
 
 impl AcpRuntimeManager {
@@ -122,6 +128,7 @@ impl AcpRuntimeManager {
             live_sessions: Mutex::new(HashMap::new()),
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
+            prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -130,7 +137,8 @@ impl AcpRuntimeManager {
 
     /// Retrieve a shared reference to the adapter for the given provider name.
     pub fn get_adapter(&self, provider: &str) -> Option<Arc<dyn AcpAdapter>> {
-        self.adapters.get(provider).cloned()
+        let provider = canonical_acp_provider(provider);
+        self.adapters.get(&provider).cloned()
     }
 
     pub fn set_xcode_runtime_observation_sink(&self, sink: Arc<dyn XcodeRuntimeObservationSink>) {
@@ -139,6 +147,21 @@ impl AcpRuntimeManager {
             .write()
             .expect("xcode runtime observation sink lock poisoned");
         *guard = sink;
+    }
+
+    pub fn set_prompt_progress_sink(&self, sink: Arc<dyn AcpPromptProgressSink>) {
+        let mut guard = self
+            .prompt_progress_sink
+            .write()
+            .expect("prompt progress sink lock poisoned");
+        *guard = sink;
+    }
+
+    fn prompt_progress_sink(&self) -> Arc<dyn AcpPromptProgressSink> {
+        self.prompt_progress_sink
+            .read()
+            .expect("prompt progress sink lock poisoned")
+            .clone()
     }
 
     pub fn xcode_runtime_observation_sink(&self) -> Arc<dyn XcodeRuntimeObservationSink> {
@@ -174,8 +197,9 @@ impl AcpRuntimeManager {
     }
 
     async fn adapter_for(&self, provider: &str) -> Result<Arc<dyn AcpAdapter>> {
+        let provider = canonical_acp_provider(provider);
         self.adapters
-            .get(provider)
+            .get(&provider)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("No adapter registered for provider '{provider}'"))
     }
@@ -219,7 +243,8 @@ impl AcpRuntimeManager {
     }
 
     /// Start a fresh ACP session and keep it alive if requested.
-    pub async fn start_session(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    pub async fn start_session(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
         let adapter = self.adapter_for(&provider).await?;
         info!(
@@ -258,7 +283,10 @@ impl AcpRuntimeManager {
             }
         }
 
-        let mut result = match session.prompt(&session_req).await {
+        let mut result = match session
+            .prompt_with_progress_sink(&session_req, self.prompt_progress_sink())
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 let cleanup = match registered_generation_id.as_ref() {
@@ -448,7 +476,10 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: reusing live session"
         );
 
-        let mut result = match session.prompt(&req).await {
+        let mut result = match session
+            .prompt_with_progress_sink(&req, self.prompt_progress_sink())
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 self.live_sessions
@@ -521,7 +552,8 @@ impl AcpRuntimeManager {
     }
 
     /// Route an execution request to the matching adapter or live session.
-    pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        req.provider = canonical_acp_provider(&req.provider);
         let result = if req.reuse_existing_session {
             let session_generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -646,6 +678,7 @@ impl AcpRuntimeManager {
             live_sessions: Mutex::new(HashMap::new()),
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
+            prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -845,5 +878,14 @@ mod tests {
             Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
             None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
         }
+    }
+
+    #[test]
+    fn provider_aliases_resolve_to_registered_acp_adapters() {
+        let manager = AcpRuntimeManager::new();
+
+        assert!(manager.get_adapter("claude_acp").is_some());
+        assert!(manager.get_adapter("gemini_acp").is_some());
+        assert!(manager.get_adapter("codex_acp").is_some());
     }
 }

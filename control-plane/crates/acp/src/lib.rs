@@ -195,6 +195,39 @@ impl XcodeRuntimeObservationSink for NoopXcodeRuntimeObservationSink {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcpPromptProgressKind {
+    PromptSent,
+    MessageReceived,
+    MeaningfulProgress,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpPromptProgressUpdate {
+    pub run_id: RunId,
+    pub stage_execution_id: Option<String>,
+    pub stage_id: String,
+    pub agent_id: String,
+    pub provider: String,
+    pub session_generation_id: Option<String>,
+    pub provider_session_id: String,
+    pub kind: AcpPromptProgressKind,
+}
+
+#[async_trait::async_trait]
+pub trait AcpPromptProgressSink: Send + Sync {
+    async fn record_acp_prompt_progress(&self, update: AcpPromptProgressUpdate) -> Result<()>;
+}
+
+pub struct NoopAcpPromptProgressSink;
+
+#[async_trait::async_trait]
+impl AcpPromptProgressSink for NoopAcpPromptProgressSink {
+    async fn record_acp_prompt_progress(&self, _update: AcpPromptProgressUpdate) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub agent_execution_id: AgentExecutionId,

@@ -27,6 +27,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
@@ -35,8 +36,9 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    AcpCloseDiagnostic, AcpMcpServerPayload, DiscoveredArtifact, DiscoveredArtifactSourceKind,
-    ExecutionRequest, McpActualObservation, ResolvedMcpServerTransport, UsageSnapshot,
+    AcpCloseDiagnostic, AcpMcpServerPayload, AcpPromptProgressKind, AcpPromptProgressSink,
+    AcpPromptProgressUpdate, DiscoveredArtifact, DiscoveredArtifactSourceKind, ExecutionRequest,
+    McpActualObservation, NoopAcpPromptProgressSink, ResolvedMcpServerTransport, UsageSnapshot,
 };
 
 /// Strip ANSI escape sequences from a string for clean log output.
@@ -226,6 +228,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Max time without meaningful agent progress while the transport remains alive.
 /// Keepalive/status-only ACP messages reset transport idleness, but not progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
+const PROMPT_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
 
@@ -518,6 +521,17 @@ fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSna
 
 fn non_empty_transcript(text: String) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn transcript_with_prompt_error(mut streamed_text: String, err_msg: &str) -> Option<String> {
+    let diagnostic = format!("ACP session/prompt error: {err_msg}");
+    if streamed_text.trim().is_empty() {
+        Some(diagnostic)
+    } else {
+        streamed_text.push_str("\n\n");
+        streamed_text.push_str(&diagnostic);
+        Some(streamed_text)
+    }
 }
 
 fn truncate_string_to_byte_len(text: &mut String, max_len: usize) {
@@ -1171,6 +1185,31 @@ pub struct AcpTransportSession {
 }
 
 impl AcpTransportSession {
+    async fn record_prompt_progress(
+        &self,
+        req: &ExecutionRequest,
+        progress_sink: &Arc<dyn AcpPromptProgressSink>,
+        kind: AcpPromptProgressKind,
+    ) {
+        let update = AcpPromptProgressUpdate {
+            run_id: req.run_id,
+            stage_execution_id: req.stage_execution_id.clone(),
+            stage_id: req.stage_id.clone(),
+            agent_id: req.agent_id.clone(),
+            provider: req.provider.clone(),
+            session_generation_id: req.session_generation_id.clone(),
+            provider_session_id: self.session_id.clone(),
+            kind,
+        };
+        if let Err(error) = progress_sink.record_acp_prompt_progress(update).await {
+            warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "ACP: prompt progress sink failed"
+            );
+        }
+    }
+
     pub async fn start(
         child: Child,
         req: &ExecutionRequest,
@@ -1511,7 +1550,33 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
-        self.prompt_with_optional_close_signal(req, None).await
+        self.prompt_with_optional_close_signal(req, None, Arc::new(NoopAcpPromptProgressSink))
+            .await
+    }
+
+    pub async fn prompt_with_progress_sink(
+        &mut self,
+        req: &ExecutionRequest,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
+        self.prompt_with_optional_close_signal(req, None, progress_sink)
+            .await
     }
 
     pub async fn prompt_with_close_signal(
@@ -1535,7 +1600,37 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
-        self.prompt_with_optional_close_signal(req, Some(close_rx))
+        self.prompt_with_optional_close_signal(
+            req,
+            Some(close_rx),
+            Arc::new(NoopAcpPromptProgressSink),
+        )
+        .await
+    }
+
+    pub async fn prompt_with_close_signal_and_progress_sink(
+        &mut self,
+        req: &ExecutionRequest,
+        close_rx: &mut watch::Receiver<bool>,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
+        self.prompt_with_optional_close_signal(req, Some(close_rx), progress_sink)
             .await
     }
 
@@ -1543,6 +1638,7 @@ impl AcpTransportSession {
         &mut self,
         req: &ExecutionRequest,
         mut close_rx: Option<&mut watch::Receiver<bool>>,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
     ) -> Result<(
         AgentStatus,
         Vec<String>,
@@ -1654,10 +1750,13 @@ impl AcpTransportSession {
         )
         .await
         .context("ACP: send session/prompt")?;
+        self.record_prompt_progress(req, &progress_sink, AcpPromptProgressKind::PromptSent)
+            .await;
 
         let mut line = String::new();
         let mut last_activity = Instant::now();
         let mut last_progress = Instant::now();
+        let mut last_prompt_progress_reported = Some(Instant::now());
         let mut streamed_text = String::new();
         let mut streamed_text_truncated = false;
         let mut latest_usage_snapshot = None;
@@ -1738,6 +1837,18 @@ impl AcpTransportSession {
             };
             last_activity = Instant::now();
             debug!(msg = %trimmed, "ACP ← subprocess (stream)");
+            if last_prompt_progress_reported
+                .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
+                .unwrap_or(true)
+            {
+                self.record_prompt_progress(
+                    req,
+                    &progress_sink,
+                    AcpPromptProgressKind::MessageReceived,
+                )
+                .await;
+                last_prompt_progress_reported = Some(Instant::now());
+            }
             if let Some(snapshot) = extract_usage_snapshot(&parsed) {
                 merge_usage_snapshot(&mut latest_usage_snapshot, snapshot);
             }
@@ -1765,6 +1876,20 @@ impl AcpTransportSession {
                                     );
                                 }
                                 last_progress = Instant::now();
+                                if last_prompt_progress_reported
+                                    .map(|reported_at| {
+                                        reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    self.record_prompt_progress(
+                                        req,
+                                        &progress_sink,
+                                        AcpPromptProgressKind::MeaningfulProgress,
+                                    )
+                                    .await;
+                                    last_prompt_progress_reported = Some(Instant::now());
+                                }
                             }
                         }
                         continue;
@@ -1783,6 +1908,20 @@ impl AcpTransportSession {
                         if let Some(chunk) = extract_text_chunk(&parsed) {
                             if !strip_ansi(&chunk).trim().is_empty() {
                                 last_progress = Instant::now();
+                                if last_prompt_progress_reported
+                                    .map(|reported_at| {
+                                        reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    self.record_prompt_progress(
+                                        req,
+                                        &progress_sink,
+                                        AcpPromptProgressKind::MeaningfulProgress,
+                                    )
+                                    .await;
+                                    last_prompt_progress_reported = Some(Instant::now());
+                                }
                             }
                             push_streamed_transcript_chunk(
                                 &mut streamed_text,
@@ -1812,7 +1951,7 @@ impl AcpTransportSession {
                             vec![],
                             vec![],
                             pre_prompt_expected_outputs,
-                            non_empty_transcript(streamed_text),
+                            transcript_with_prompt_error(streamed_text, err_msg),
                             latest_usage_snapshot,
                             xcode_shim_warning_events,
                             self.acp_pre_initialize_local_latency_ms,
@@ -2347,6 +2486,27 @@ mod tests {
         let len_after_truncation = transcript.len();
         push_streamed_transcript_chunk(&mut transcript, "ignored", &mut truncated);
         assert_eq!(transcript.len(), len_after_truncation);
+    }
+
+    #[test]
+    fn prompt_error_is_returned_as_failure_transcript() {
+        let transcript = transcript_with_prompt_error(
+            String::new(),
+            "Internal error: You've hit your limit · resets 11:40pm (Asia/Nicosia)",
+        )
+        .expect("prompt error should be preserved");
+
+        assert!(transcript.contains("ACP session/prompt error"));
+        assert!(transcript.contains("hit your limit"));
+    }
+
+    #[test]
+    fn prompt_error_appends_to_existing_streamed_transcript() {
+        let transcript = transcript_with_prompt_error("partial progress".into(), "quota exceeded")
+            .expect("prompt error should be preserved");
+
+        assert!(transcript.starts_with("partial progress\n\nACP session/prompt error"));
+        assert!(transcript.ends_with("quota exceeded"));
     }
 
     #[test]

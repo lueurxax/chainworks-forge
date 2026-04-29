@@ -687,10 +687,14 @@ def require_routing_calibration_expected_selection_rows():
         if record_matches(record, (("mandatory_overflow",), ("mandatory-overflow",)))
     ]
     if overflow_records and not any(
-        any(term in normalized_payload_text(record) for term in ("fail_closed", "routing_conflict", "no_agentselectionplanv1"))
+        all(
+            term in normalized_payload_text(record)
+            for term in ("select_top_5", "mandatory_overflow_pruned")
+        )
+        and "rejected_alternatives" in normalized_payload_text(record)
         for record in overflow_records
     ):
-        missing.append("mandatory-overflow fail-closed outcome")
+        missing.append("mandatory-overflow prune-with-warning outcome")
 
     if missing:
         fail(
@@ -756,7 +760,7 @@ contract_term_groups = {
         ("validation failures", ("validation_failures", "validation failures", "validation_failure")),
         ("override conflicts", ("override_conflict", "force_include", "force_exclude")),
         ("under_specified fallback", ("under_specified",)),
-        ("mandatory overflow", ("mandatory_overflow", "mandatory overflow")),
+        ("mandatory overflow pruning", ("mandatory_overflow_pruned", "mandatory overflow")),
         ("system.routing DSL", ("system.routing",)),
         ("dynamic_parallel DSL", ("dynamic_parallel",)),
         ("selected_outputs_from selector", ("selected_outputs_from",)),

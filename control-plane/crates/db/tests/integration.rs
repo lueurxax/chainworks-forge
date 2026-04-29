@@ -537,6 +537,19 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
     assert_eq!(generation.cumulative_prompt_tokens, 12_000);
     assert_eq!(generation.cumulative_cost_cents, 17);
     assert_eq!(generation.last_activity_at, Some(last_activity_at));
+
+    let live_progress_at = last_activity_at + chrono::Duration::seconds(30);
+    db::repos::sessions::touch_generation_activity(&pool, "generation-budget", live_progress_at)
+        .await
+        .unwrap();
+    let generation = db::repos::sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("generation should still exist");
+    assert_eq!(generation.turn_count, 1);
+    assert_eq!(generation.cumulative_prompt_tokens, 12_000);
+    assert_eq!(generation.cumulative_cost_cents, 17);
+    assert_eq!(generation.last_activity_at, Some(live_progress_at));
 }
 
 #[tokio::test]
@@ -2166,6 +2179,7 @@ async fn test_projection_pending_approvals_uses_canonical_approvals_when_summary
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 

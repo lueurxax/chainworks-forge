@@ -170,6 +170,19 @@ async fn stage_has_pending_or_running_invoke_work(
     }))
 }
 
+async fn run_has_pending_or_running_work(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> Result<bool> {
+    let items = work_items::list_by_run(pool, run_id).await?;
+    Ok(items.iter().any(|item| {
+        matches!(
+            item.status,
+            WorkItemStatus::Pending | WorkItemStatus::Running
+        )
+    }))
+}
+
 impl RecoveryService {
     pub fn new(pool: SqlitePool, work_queue: WorkQueue, events: EventSender) -> Self {
         Self {
@@ -424,6 +437,33 @@ impl RecoveryService {
                 continue;
             }
 
+            let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+            if executions.is_empty() {
+                if !run_has_pending_or_running_work(&self.pool, run.id).await? {
+                    info!(
+                        run_id = %run.id,
+                        stage_id = %stage.stage_id,
+                        stage_execution_id = %stage.id,
+                        "Startup repair kickstarting empty running stage"
+                    );
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run.id),
+                            None,
+                            serde_json::json!({
+                                "run_id": run.id.to_string(),
+                                "reason": "startup_empty_running_stage_kickstart",
+                                "stage_execution_id": stage.id.to_string(),
+                                "stage_id": stage.stage_id,
+                            }),
+                        )
+                        .await?;
+                    requeued += 1;
+                }
+                continue;
+            }
+
             let provenance_suffix = self
                 .latest_execution_provenance_suffix(stage.id)
                 .await
@@ -531,17 +571,8 @@ impl RecoveryService {
             // enqueuing the follow-up AdvanceRun. Unconditionally enqueue
             // an AdvanceRun for any active run. The advance handler is
             // idempotent — if nothing needs doing, it returns Ok(()).
-            let has_pending_work = db::repos::work_items::list_by_run(&self.pool, run.id)
+            let has_pending_work = run_has_pending_or_running_work(&self.pool, run.id)
                 .await
-                .map(|items| {
-                    items.iter().any(|w| {
-                        matches!(
-                            w.status,
-                            db::work_item::WorkItemStatus::Pending
-                                | db::work_item::WorkItemStatus::Running
-                        )
-                    })
-                })
                 .unwrap_or(false);
 
             if !has_pending_work {
