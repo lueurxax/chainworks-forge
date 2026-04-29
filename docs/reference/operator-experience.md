@@ -24,18 +24,18 @@ Related stable docs:
 
 ## Scope
 
-This reference covers the **read-only** and repo-agnostic operator layer (per P031-r18):
+This reference covers the primarily **read-only** and repo-agnostic operator layer (per P072-r2):
 
 - `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries (metadata inspection only)
-- diagnostic-only guidance for approvals and recovery
+- diagnostic-only guidance for most actions; in-app resolution for approvals
 - deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does **NOT** define in-app write/recovery. Every write control (Start, Cancel, Retry, Resolve Approval) is removed or replaced with diagnostic guidance for external workflows.
+It does **NOT** define broad in-app write/recovery. Most write controls (Start, Cancel, Retry) are removed or replaced with diagnostic guidance for external workflows. Approval resolution is the only exception, supported via governed GraphQL mutations.
 
 ## Runs Home
 
@@ -71,9 +71,10 @@ The Proposal Reviewed stage card includes detailed routing information:
 - **Advanced Routing Disclosure**: Optional view for rejected alternatives and ineligible candidates.
 - **Under-specified Selection**: Caution banner when falling back to fixed reviewers.
 
-**Actions are diagnostic-only:**
+**Actions are primarily diagnostic:**
 - `Open` is available for drill-down.
-- Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
+- `Open gate` is an active in-app control for resolving approvals via governed GraphQL mutations.
+- Primary buttons for `Recover` or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
 
 ## Scheduler Health and Backpressure
 

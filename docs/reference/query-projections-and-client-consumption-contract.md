@@ -11,19 +11,19 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 | Alias | `./scripts/test-gate.sh p043` |
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
 | Historical proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
-| Scope | Rust control-plane GraphQL **read** contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract. |
-| Current UI boundary | Thin macOS UI (**read-only** consumer over server-owned projections). |
+| Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. |
+| Current UI boundary | Thin macOS UI (read-side and human-gate mutation consumer over server-owned projections). |
 | Stabilization owners | P032 for release/dogfood/stabilization evidence; P036 for visual/navigation restoration over this read model. |
 
 ## Thin UI Boundary
 
 The original P043/P031 gate labels are retained for compatibility. The active content below is the current thin UI boundary:
 
-The macOS thin UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations.
+The macOS thin UI is a **read-side consumer and human-gate resolver** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and resolves pending approvals via governed GraphQL mutations.
 
 **PROHIBITED ACTIONS for governed macOS UI:**
 - It does **NOT** issue MCP mutations.
-- It does **NOT** use GraphQL mutations.
+- It does **NOT** use GraphQL mutations EXCEPT for the `approveApproval` and `rejectApproval` human-gate path.
 - It does **NOT** use local workflow mutation fallback.
 - It does **NOT** probe raw truth from SwiftData or filesystem (except for authorized artifact display).
 
@@ -86,7 +86,7 @@ The client must not infer:
 | Run detail | `run(id:)` with projection enrichment | Canonical run row enriched by `db::repos::projections::find_run_projection` | Implemented | Use projection-backed counters and summaries; show projection lag when projection truth is missing or stale. **P065 expansion**: includes compact retry-instruction provenance. |
 | Stage list / progress | `stages(runID:)` | `db::repos::projections::list_stages_projection` | Implemented | Use projection-owned decision flags; disable dependent actions when `projectionLag` is true. |
 | Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionID:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. **P065 expansion**: includes `retry_instruction` group and delivery status. |
-| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution (`approvals.resolve`) is an operator-side MCP action on a separate surface; the thin UI renders the inbox read-only. |
+| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution is supported via governed GraphQL mutations or operator-side MCP action (`approvals.resolve`). |
 | Artifact viewer | `artifacts(runID:)` | artifact index projection / `db::repos::projections::list_artifacts_projection` | Implemented | Browse the server artifact hierarchy only; direct file open/export may happen only after server selection. |
 | Scheduler health | `schedulerHealthSummary` | `scheduler_health_snapshots` projection | Implemented | Render system-wide capacity, pressure, and latency health. |
 | Startup recovery | `startupRecoverySummary` | `startup_recovery_readbacks` projection | Implemented | Render startup recovery progress, counts, and backpressure state. |

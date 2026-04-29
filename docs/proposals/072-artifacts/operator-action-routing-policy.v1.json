@@ -1,0 +1,260 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "status": "proposal_owned_fixture",
+    "proposal": "072",
+    "revision": "p072-r6-2026-04-28",
+    "note": "Human-reviewable future-state fixture and schema anchor. NOT current-system truth. The typed Rust runtime registry becomes canonical in Phase 1."
+  },
+  "operator_actions": [
+    {
+      "action_id": "approve_stage_approval",
+      "description": "Approve a pending stage approval gate",
+      "allowed_surfaces": {
+        "graphql": {
+          "mutation_name": "approveApproval",
+          "capability": "ApprovalsResolve"
+        },
+        "mcp": {
+          "tool_name": "approvals.resolve",
+          "subject_kind": "stage_approval",
+          "capability": "ApprovalsResolve"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": true,
+          "surface": "graphql"
+        },
+        "default_operator": {
+          "allowed": false,
+          "surface": "graphql",
+          "reason": "Read-only GraphQL principal; approval writes use ui_operator"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "reject_stage_approval",
+      "description": "Reject a pending stage approval gate with reason",
+      "allowed_surfaces": {
+        "graphql": {
+          "mutation_name": "rejectApproval",
+          "capability": "ApprovalsResolve"
+        },
+        "mcp": {
+          "tool_name": "approvals.resolve",
+          "subject_kind": "stage_approval",
+          "capability": "ApprovalsResolve"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": true,
+          "surface": "graphql"
+        },
+        "default_operator": {
+          "allowed": false,
+          "surface": "graphql",
+          "reason": "Read-only GraphQL principal; approval writes use ui_operator"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "resolve_lead_mediation_confirmation",
+      "description": "Resolve a lead mediation confirmation (confirm or manual_fallback)",
+      "allowed_surfaces": {
+        "mcp": {
+          "tool_name": "approvals.resolve",
+          "subject_kind": "lead_mediation_confirmation",
+          "capability": "ApprovalsResolve"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": false,
+          "reason": "Mediation confirmations are MCP-only"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "start_run",
+      "description": "Start a new workflow run from an idea",
+      "allowed_surfaces": {
+        "graphql": {
+          "mutation_name": "startRun",
+          "capability": "RunsStart"
+        },
+        "mcp": {
+          "tool_name": "runs.start",
+          "capability": "RunsStart"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": false,
+          "reason": "Not an approval mutation"
+        },
+        "default_operator": {
+          "allowed": true,
+          "surface": "graphql"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "cancel_run",
+      "description": "Cancel an active run",
+      "allowed_surfaces": {
+        "mcp": {
+          "tool_name": "runs.cancel",
+          "capability": "RunsCancel"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": false,
+          "reason": "MCP-only operational command"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "retry_stage",
+      "description": "Retry a failed or rejected stage",
+      "allowed_surfaces": {
+        "mcp": {
+          "tool_name": "stages.retry",
+          "capability": "StagesRetry"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": false,
+          "reason": "MCP-only operational command"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "resolve_workflow_conflict",
+      "description": "Resolve a workflow conflict by selecting a transition",
+      "allowed_surfaces": {
+        "mcp": {
+          "tool_name": "workflow_conflicts.resolve",
+          "capability": "WorkflowConflictsResolve"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": false,
+          "reason": "MCP-only operational command"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    },
+    {
+      "action_id": "reset_session",
+      "description": "Reset an agent session for a stage",
+      "allowed_surfaces": {
+        "mcp": {
+          "tool_name": "sessions.reset",
+          "capability": "StagesRetry"
+        }
+      },
+      "principal_profiles": {
+        "ui_operator": {
+          "allowed": false,
+          "reason": "MCP-only session management"
+        },
+        "mcp_operator": {
+          "allowed": true,
+          "surface": "mcp"
+        }
+      }
+    }
+  ],
+  "app_principal_topology": {
+    "default_operator": {
+      "id": "default-operator",
+      "class": "operator",
+      "surface_policies": {
+        "graphql": {
+          "allow_queries": true,
+          "allow_subscriptions": true,
+          "allowed_mutations": []
+        },
+        "mcp": {
+          "allowed_tools": []
+        }
+      }
+    },
+    "ui_operator": {
+      "id": "ui_operator",
+      "class": "operator",
+      "surface_policies": {
+        "graphql": {
+          "allow_queries": false,
+          "allow_subscriptions": false,
+          "allowed_mutations": ["approveApproval", "rejectApproval"]
+        },
+        "mcp": {
+          "allowed_tools": []
+        }
+      }
+    }
+  },
+  "graphql_mutation_boundary": {
+    "allowed_mutations": ["approveApproval", "rejectApproval"],
+    "forbidden_mutations_for_ui_operator": [
+      "startRun", "retryStage", "cancelRun",
+      "overrideLegacyDiscoveryPolicy", "resetSession"
+    ],
+    "legacy_mutations_pending_removal": ["approveStage", "rejectStage"]
+  },
+  "domain_command_mapping": {
+    "approveApproval": {
+      "command": "ResolveApproval",
+      "fields": {
+        "approval_id": "required, northbound identity",
+        "decision": "approved",
+        "rationale": "optional comment",
+        "run_id": "server-resolved provenance",
+        "stage_id": "server-resolved provenance"
+      }
+    },
+    "rejectApproval": {
+      "command": "ResolveApproval",
+      "fields": {
+        "approval_id": "required, northbound identity",
+        "decision": "rejected",
+        "rationale": "required reason",
+        "run_id": "server-resolved provenance",
+        "stage_id": "server-resolved provenance"
+      }
+    }
+  }
+}

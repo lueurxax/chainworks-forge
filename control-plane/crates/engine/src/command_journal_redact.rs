@@ -139,6 +139,13 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
                 redact_field_if_present(obj, "comment");
             }
         }
+        Command::ResolveApproval(_) => {
+            // P072: redact rationale (may contain operator-submitted text).
+            // Preserve approval_id, run_id, stage_id, decision for auditability.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "rationale");
+            }
+        }
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| payload_json.to_string())
@@ -176,10 +183,11 @@ fn redact_field_if_present(obj: &mut serde_json::Map<String, Value>, field: &str
 mod tests {
     use super::*;
     use domain::commands::{
-        ApproveStageCmd, CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
-        MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
-        MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-        OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
+        ApprovalResolutionDecision, ApproveStageCmd, CancelRunCmd, Command,
+        KnowledgeCapsuleIgnoreCmd, MainSyncMode, MainSyncRecordRecoveryDecisionCmd,
+        MainSyncRecoveryDecision, MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd,
+        MainSyncSetRunOverrideCmd, MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd,
+        RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd,
         ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
         RunStewardAnalysisCmd, StartRunCmd,
     };
@@ -544,6 +552,20 @@ mod tests {
                 conflict_fingerprint: "sha256:abc".into(),
                 idempotency_key: "idem-1".into(),
             }),
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: domain::ids::ApprovalId::new(),
+                decision: ApprovalResolutionDecision::Approved,
+                rationale: Some("LGTM".into()),
+                run_id: RunId::new(),
+                stage_id: "state_6".into(),
+            }),
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: domain::ids::ApprovalId::new(),
+                decision: ApprovalResolutionDecision::Rejected,
+                rationale: Some("Needs rework".into()),
+                run_id: RunId::new(),
+                stage_id: "state_3".into(),
+            }),
         ];
 
         for cmd in &samples {
@@ -577,6 +599,7 @@ mod tests {
                 Command::RunStewardAnalysis(_) => {}
                 Command::OverrideArtifactContract(_) => {}
                 Command::ResolveLeadMediationConfirmation(_) => {}
+                Command::ResolveApproval(_) => {}
             }
         }
     }

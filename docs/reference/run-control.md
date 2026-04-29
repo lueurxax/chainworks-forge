@@ -37,11 +37,11 @@ Archive never implies stop, and stop never implies archive.
 
 An active idea must first settle its run into a terminal state before archive becomes eligible.
 
-### External Command Surface (P031-r18)
+### External Command Surface (P072)
 
-Per P031-r18, the macOS UI is a **read-only thin client**. Run control actions — `CancelRun`, `StartRun`, `RetryStage` — are **prohibited** within the governed macOS UI. 
+Per P072, the macOS UI is a **thin client** focused on read-side truth and governed human gates. Run control actions — `CancelRun`, `StartRun`, `RetryStage` — remain **prohibited** within the governed macOS UI. 
 
-Operators must use external workflows (CLI, MCP tools, or automation) to issue these commands. The macOS UI renders the resulting state transitions (`cancelling`, `cancelled`) from GraphQL projections but provides no in-app write affordances.
+Operators must use external workflows (CLI, MCP tools, or automation) to issue these commands. The macOS UI renders the resulting state transitions (`cancelling`, `cancelled`) from GraphQL projections but provides no in-app write affordances for these actions. Approval resolution is the only governed mutation path allowed in the macOS UI.
 
 ## Stop semantics
 
@@ -185,8 +185,8 @@ Rules:
 
 **Ownership:**
 - **Read-plane truth:** GraphQL projections via `GqlRun`.
-- **Governed UI (Read-only):** P031-owned SwiftUI views.
-- **Write-path:** External MCP/CLI (Governed UI has no write ownership).
+- **Governed UI (Thin client):** P072-owned SwiftUI views; includes ownership of approval mutations via GraphQL.
+- **Write-path:** External MCP/CLI for most actions (Governed UI has no write ownership for start/cancel/retry).
 
 ## Related Docs
 

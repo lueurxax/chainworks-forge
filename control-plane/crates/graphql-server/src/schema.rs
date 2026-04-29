@@ -13,8 +13,9 @@ use db::repos::{
     workflow_conflicts,
 };
 use domain::commands::{
-    ApproveStageCmd, CallerContext, CancelRunCmd, Command, OverrideLegacyDiscoveryPolicyCmd,
-    RejectStageCmd, RetryStageCmd, StartRunCmd,
+    ApprovalResolutionDecision, ApproveStageCmd, CallerContext, CancelRunCmd, Command,
+    OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResolveApprovalCmd, RetryStageCmd,
+    StartRunCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::events::DomainEvent;
@@ -1111,14 +1112,19 @@ pub enum MutationName {
     RetryStage,
     OverrideLegacyDiscoveryPolicy,
     CancelRun,
+    /// P072: Converged approval mutation by approval_id.
+    ApproveApproval,
+    /// P072: Converged rejection mutation by approval_id.
+    RejectApproval,
 }
 
 pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     match mutation {
         MutationName::StartRun => domain::CapabilityToolId::RunsStart,
-        MutationName::ApproveStage | MutationName::RejectStage => {
-            domain::CapabilityToolId::ApprovalsResolve
-        }
+        MutationName::ApproveStage
+        | MutationName::RejectStage
+        | MutationName::ApproveApproval
+        | MutationName::RejectApproval => domain::CapabilityToolId::ApprovalsResolve,
         MutationName::RetryStage | MutationName::OverrideLegacyDiscoveryPolicy => {
             domain::CapabilityToolId::StagesRetry
         }
@@ -1230,6 +1236,20 @@ pub struct OverrideLegacyDiscoveryPolicyPayload {
 #[derive(SimpleObject)]
 pub struct CancelRunPayload {
     pub cancelled: bool,
+    pub journal_id: ID,
+}
+
+/// P072: Payload for approveApproval mutation.
+#[derive(SimpleObject)]
+pub struct ApproveApprovalPayload {
+    pub approval: GqlApproval,
+    pub journal_id: ID,
+}
+
+/// P072: Payload for rejectApproval mutation.
+#[derive(SimpleObject)]
+pub struct RejectApprovalPayload {
+    pub approval: GqlApproval,
     pub journal_id: ID,
 }
 
@@ -1530,6 +1550,112 @@ impl MutationRoot {
         Ok(CancelRunPayload {
             cancelled: true,
             journal_id: ID::from(commanded.journal_id),
+        })
+    }
+
+    /// P072: Approve a stage approval by approval_id. The resolver
+    /// server-resolves run_id and stage_id from the approval record
+    /// before constructing ResolveApprovalCmd.
+    async fn approve_approval(
+        &self,
+        ctx: &Context<'_>,
+        approval_id: ID,
+        comment: Option<String>,
+    ) -> Result<ApproveApprovalPayload> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        if !mutation_allowed(&principal, MutationName::ApproveApproval) {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller = graphql_caller_with_request_id(ctx, &principal, "approveApproval");
+
+        let aid: domain::ids::ApprovalId = approval_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+
+        // Server-resolve run_id and stage_id from the approval record.
+        let approval = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+
+        let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+            approval_id: aid,
+            decision: ApprovalResolutionDecision::Approved,
+            rationale: comment,
+            run_id: approval.run_id,
+            stage_id: approval.stage_id.clone(),
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+
+        // Re-fetch for authoritative readback.
+        let updated = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new("Approval not found after update"))?;
+
+        Ok(ApproveApprovalPayload {
+            approval: GqlApproval::from(updated),
+            journal_id: jid,
+        })
+    }
+
+    /// P072: Reject a stage approval by approval_id with a required reason.
+    async fn reject_approval(
+        &self,
+        ctx: &Context<'_>,
+        approval_id: ID,
+        reason: String,
+    ) -> Result<RejectApprovalPayload> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        if !mutation_allowed(&principal, MutationName::RejectApproval) {
+            return Err(Error::new("forbidden"));
+        }
+
+        let caller = graphql_caller_with_request_id(ctx, &principal, "rejectApproval");
+
+        let aid: domain::ids::ApprovalId = approval_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+
+        // Server-resolve run_id and stage_id from the approval record.
+        let approval = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+
+        let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+            approval_id: aid,
+            decision: ApprovalResolutionDecision::Rejected,
+            rationale: Some(reason),
+            run_id: approval.run_id,
+            stage_id: approval.stage_id.clone(),
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        let jid = ID::from(commanded.journal_id);
+
+        // Re-fetch for authoritative readback.
+        let updated = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new("Approval not found after update"))?;
+
+        Ok(RejectApprovalPayload {
+            approval: GqlApproval::from(updated),
+            journal_id: jid,
         })
     }
 }

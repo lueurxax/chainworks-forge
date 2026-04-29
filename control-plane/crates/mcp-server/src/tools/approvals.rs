@@ -3,9 +3,10 @@ use sqlx::SqlitePool;
 
 use db::repos::{approvals, lead_mediation_confirmations};
 use domain::commands::{
-    ApproveStageCmd, Command, RejectStageCmd, ResolveLeadMediationConfirmationCmd,
+    ApprovalResolutionDecision, ApproveStageCmd, Command, RejectStageCmd,
+    ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
 };
-use domain::ids::RunId;
+use domain::ids::{ApprovalId, RunId};
 use domain::mediation::{ApprovalInboxItem, ApprovalSubjectKind};
 use engine::command_handler::CommandHandler;
 
@@ -35,12 +36,16 @@ pub fn tool_specs() -> Vec<McpTool> {
                         "enum": ["stage_approval", "lead_mediation_confirmation"],
                         "description": "Type of approval subject. Omit or use 'stage_approval' for legacy stage approval compatibility."
                     },
+                    "approval_id": {
+                        "type": "string",
+                        "description": "P072: Canonical approval identifier for stage approvals. Preferred over run_id+stage_id."
+                    },
                     "subject_id": {
                         "type": "string",
                         "description": "Subject identifier (confirmation id for mediation)"
                     },
-                    "run_id": { "type": "string" },
-                    "stage_id": { "type": "string", "description": "Required for stage_approval" },
+                    "run_id": { "type": "string", "description": "Deprecated compatibility hint for stage_approval; required for lead_mediation_confirmation" },
+                    "stage_id": { "type": "string", "description": "Deprecated compatibility hint for stage_approval" },
                     "decision": {
                         "type": "string",
                         "enum": ["granted", "rejected", "confirm", "manual_fallback"],
@@ -157,21 +162,71 @@ async fn resolve_stage_approval(
     cmd_handler: &CommandHandler,
     principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
-    let run_id: RunId = params["run_id"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
-        .parse()?;
-    let stage_id = params["stage_id"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
-        .to_string();
-    let decision = params["decision"]
+    let decision_str = params["decision"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
     let comment = params["comment"].as_str().map(|s| s.to_string());
-
     let caller = mcp_caller(&principal.id, &principal.class, "approvals.resolve");
-    let cmd = match decision {
+
+    // P072: Prefer approval_id-based routing through ResolveApprovalCmd.
+    if let Some(approval_id_str) = params["approval_id"].as_str() {
+        let approval_id: ApprovalId = approval_id_str
+            .parse::<uuid::Uuid>()
+            .map_err(|e| anyhow::anyhow!("Invalid approval_id: {e}"))?
+            .into();
+
+        let decision: ApprovalResolutionDecision = decision_str
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+
+        // Server-resolve run_id and stage_id from the approval record.
+        let approval = approvals::find_by_id(cmd_handler.pool(), approval_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Approval '{approval_id}' not found"))?;
+
+        // P072: If deprecated compatibility hints are supplied, reject unless
+        // they exactly match the resolved provenance.
+        if let Some(hint_run_id) = params["run_id"].as_str() {
+            if hint_run_id != approval.run_id.to_string() {
+                return Err(anyhow::anyhow!(
+                    "Compatibility hint run_id does not match resolved provenance"
+                ));
+            }
+        }
+        if let Some(hint_stage_id) = params["stage_id"].as_str() {
+            if hint_stage_id != approval.stage_id {
+                return Err(anyhow::anyhow!(
+                    "Compatibility hint stage_id does not match resolved provenance"
+                ));
+            }
+        }
+
+        let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+            approval_id,
+            decision,
+            rationale: comment,
+            run_id: approval.run_id,
+            stage_id: approval.stage_id,
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await?;
+        return Ok(serde_json::json!({
+            "resolved": true,
+            "journal_id": commanded.journal_id,
+        }));
+    }
+
+    // Legacy path: resolve by run_id + stage_id.
+    let run_id: RunId = params["run_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' (required when approval_id is absent)"))?
+        .parse()?;
+    let stage_id = params["stage_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id' (required when approval_id is absent)"))?
+        .to_string();
+
+    let cmd = match decision_str {
         "granted" => Command::ApproveStage(ApproveStageCmd {
             run_id,
             stage_id,

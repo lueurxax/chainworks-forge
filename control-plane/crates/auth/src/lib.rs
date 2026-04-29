@@ -52,10 +52,43 @@ struct PrincipalEntry {
     token: String,
     id: String,
     class: PrincipalClass,
+    /// P072 v2: Per-principal surface policies. Required for app-owned
+    /// GraphQL principals in schema_version 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    surface_policies: Option<SurfacePolicies>,
+}
+
+/// P072: Per-principal surface policies for schema_version 2.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SurfacePolicies {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<GraphqlPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpPolicy>,
+}
+
+/// P072: GraphQL-specific principal policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GraphqlPolicy {
+    #[serde(default)]
+    pub allow_queries: bool,
+    #[serde(default)]
+    pub allow_subscriptions: bool,
+    #[serde(default)]
+    pub allowed_mutations: Vec<String>,
+}
+
+/// P072: MCP-specific principal policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpPolicy {
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PrincipalTableFile {
+    #[serde(default)]
+    schema_version: Option<u32>,
     principals: Vec<PrincipalEntry>,
 }
 
@@ -74,6 +107,7 @@ impl PrincipalTable {
                 token: "test-token".into(),
                 id: "test-operator".into(),
                 class: PrincipalClass::Operator,
+                surface_policies: None,
             }],
         }
     }
@@ -92,6 +126,10 @@ impl PrincipalTable {
                     "principal table contains zero entries".into(),
                 ));
             }
+            // P072: Validate v2 schema constraints if present.
+            if file.schema_version == Some(2) {
+                validate_v2_principals(&file.principals)?;
+            }
             Ok(PrincipalTable {
                 entries: file.principals,
             })
@@ -102,8 +140,10 @@ impl PrincipalTable {
                 token: token.clone(),
                 id: "default-operator".into(),
                 class: PrincipalClass::Operator,
+                surface_policies: None,
             };
             let file = PrincipalTableFile {
+                schema_version: None,
                 principals: vec![entry.clone()],
             };
             if let Some(parent) = path.parent() {
@@ -172,6 +212,130 @@ pub fn extract_bearer_token(header_value: &str) -> Result<&str, AuthError> {
     } else {
         Err(AuthError::MalformedHeader)
     }
+}
+
+// ── P072: v2 principal table validation ────────────────────────────────
+
+/// Validate P072 schema_version 2 constraints on app-owned principals.
+fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
+    use std::collections::HashSet;
+
+    // Duplicate id check.
+    let mut ids = HashSet::new();
+    for entry in entries {
+        if !ids.insert(&entry.id) {
+            return Err(AuthError::TableLoadFailed(format!(
+                "duplicate principal id: {}",
+                entry.id
+            )));
+        }
+    }
+
+    // Duplicate token check.
+    let mut tokens = HashSet::new();
+    for entry in entries {
+        if !tokens.insert(&entry.token) {
+            return Err(AuthError::TableLoadFailed(
+                "duplicate token in principal table".into(),
+            ));
+        }
+    }
+
+    // Validate known app-owned principals.
+    for entry in entries {
+        if let Some(ref policies) = entry.surface_policies {
+            if let Some(ref graphql) = policies.graphql {
+                // Validate known mutation names.
+                let known_mutations = [
+                    "startRun",
+                    "approveStage",
+                    "rejectStage",
+                    "retryStage",
+                    "overrideLegacyDiscoveryPolicy",
+                    "cancelRun",
+                    "approveApproval",
+                    "rejectApproval",
+                ];
+                for mutation in &graphql.allowed_mutations {
+                    if !known_mutations.contains(&mutation.as_str()) {
+                        return Err(AuthError::TableLoadFailed(format!(
+                            "unknown mutation '{}' in surface_policies for principal '{}'",
+                            mutation, entry.id
+                        )));
+                    }
+                }
+            }
+        }
+
+        // P072: default-operator must have empty allowed_mutations.
+        if entry.id == "default-operator" {
+            if let Some(ref policies) = entry.surface_policies {
+                if let Some(ref graphql) = policies.graphql {
+                    if !graphql.allowed_mutations.is_empty() {
+                        return Err(AuthError::TableLoadFailed(
+                            "default-operator must have empty GraphQL allowed_mutations".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // P072: ui_operator must allow exactly approveApproval and rejectApproval.
+        if entry.id == "ui_operator" {
+            let policies = entry.surface_policies.as_ref().ok_or_else(|| {
+                AuthError::TableLoadFailed(
+                    "ui_operator must have surface_policies in schema_version 2".into(),
+                )
+            })?;
+            let graphql = policies.graphql.as_ref().ok_or_else(|| {
+                AuthError::TableLoadFailed(
+                    "ui_operator must have graphql surface_policies".into(),
+                )
+            })?;
+            let mut sorted = graphql.allowed_mutations.clone();
+            sorted.sort();
+            if sorted != vec!["approveApproval", "rejectApproval"] {
+                return Err(AuthError::TableLoadFailed(
+                    "ui_operator must allow exactly approveApproval and rejectApproval".into(),
+                ));
+            }
+            // ui_operator must not have MCP tools.
+            if let Some(ref mcp) = policies.mcp {
+                if !mcp.allowed_tools.is_empty() {
+                    return Err(AuthError::TableLoadFailed(
+                        "ui_operator must not allow MCP tools".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// P072: Look up a principal by exact id.
+pub fn find_principal_by_id(table: &PrincipalTable, id: &str) -> Option<Principal> {
+    table
+        .entries
+        .iter()
+        .find(|e| e.id == id)
+        .map(|e| Principal::new(e.id.clone(), e.class.clone()))
+}
+
+/// P072: Check if a mutation is allowed for a principal based on v2 surface_policies.
+/// Returns None if the principal has no surface_policies (v1 behavior applies).
+pub fn is_mutation_allowed_by_surface_policy(
+    table: &PrincipalTable,
+    principal_id: &str,
+    mutation_name: &str,
+) -> Option<bool> {
+    table
+        .entries
+        .iter()
+        .find(|e| e.id == principal_id)
+        .and_then(|e| e.surface_policies.as_ref())
+        .and_then(|sp| sp.graphql.as_ref())
+        .map(|graphql| graphql.allowed_mutations.iter().any(|m| m == mutation_name))
 }
 
 // ── Capability filtering ────────────────────────────────────────────────
@@ -474,6 +638,7 @@ mod tests {
                 token: "tok-123".into(),
                 id: "test-op".into(),
                 class: PrincipalClass::Operator,
+                surface_policies: None,
             }],
         };
         let p = resolve_bearer("tok-123", &table).unwrap();
@@ -560,5 +725,259 @@ mod tests {
             &ob,
             ResourceTemplateId::ChainworksRunArtifacts
         ));
+    }
+
+    // ── P072 v2 schema tests ───────────────────────────────────────────
+
+    #[test]
+    fn v2_validates_valid_dual_principal_table() {
+        let entries = vec![
+            PrincipalEntry {
+                token: "tok-read".into(),
+                id: "default-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: vec![],
+                    }),
+                    mcp: Some(McpPolicy {
+                        allowed_tools: vec![],
+                    }),
+                }),
+            },
+            PrincipalEntry {
+                token: "tok-write".into(),
+                id: "ui_operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: false,
+                        allow_subscriptions: false,
+                        allowed_mutations: vec![
+                            "approveApproval".into(),
+                            "rejectApproval".into(),
+                        ],
+                    }),
+                    mcp: Some(McpPolicy {
+                        allowed_tools: vec![],
+                    }),
+                }),
+            },
+        ];
+        assert!(validate_v2_principals(&entries).is_ok());
+    }
+
+    #[test]
+    fn v2_rejects_duplicate_ids() {
+        let entries = vec![
+            PrincipalEntry {
+                token: "tok-1".into(),
+                id: "same-id".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            },
+            PrincipalEntry {
+                token: "tok-2".into(),
+                id: "same-id".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            },
+        ];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err.to_string().contains("duplicate principal id"));
+    }
+
+    #[test]
+    fn v2_rejects_duplicate_tokens() {
+        let entries = vec![
+            PrincipalEntry {
+                token: "same-tok".into(),
+                id: "id-1".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            },
+            PrincipalEntry {
+                token: "same-tok".into(),
+                id: "id-2".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            },
+        ];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err.to_string().contains("duplicate token"));
+    }
+
+    #[test]
+    fn v2_rejects_unknown_mutation_name() {
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "ui_operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: false,
+                    allow_subscriptions: false,
+                    allowed_mutations: vec![
+                        "approveApproval".into(),
+                        "rejectApproval".into(),
+                        "deleteEverything".into(),
+                    ],
+                }),
+                mcp: None,
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err.to_string().contains("unknown mutation"));
+    }
+
+    #[test]
+    fn v2_rejects_default_operator_with_mutations() {
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "default-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec!["approveApproval".into()],
+                }),
+                mcp: None,
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("default-operator must have empty"));
+    }
+
+    #[test]
+    fn v2_rejects_ui_operator_with_wrong_mutations() {
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "ui_operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: false,
+                    allow_subscriptions: false,
+                    allowed_mutations: vec!["approveApproval".into(), "startRun".into()],
+                }),
+                mcp: None,
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("ui_operator must allow exactly"));
+    }
+
+    #[test]
+    fn v2_rejects_ui_operator_with_mcp_tools() {
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "ui_operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: false,
+                    allow_subscriptions: false,
+                    allowed_mutations: vec![
+                        "approveApproval".into(),
+                        "rejectApproval".into(),
+                    ],
+                }),
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec!["runs.start".into()],
+                }),
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(err.to_string().contains("must not allow MCP tools"));
+    }
+
+    #[test]
+    fn find_principal_by_id_returns_principal() {
+        let table = PrincipalTable {
+            entries: vec![
+                PrincipalEntry {
+                    token: "tok-1".into(),
+                    id: "default-operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: None,
+                },
+                PrincipalEntry {
+                    token: "tok-2".into(),
+                    id: "ui_operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: None,
+                },
+            ],
+        };
+        assert!(find_principal_by_id(&table, "default-operator").is_some());
+        assert!(find_principal_by_id(&table, "ui_operator").is_some());
+        assert!(find_principal_by_id(&table, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn is_mutation_allowed_by_surface_policy_checks() {
+        let table = PrincipalTable {
+            entries: vec![
+                PrincipalEntry {
+                    token: "tok-1".into(),
+                    id: "default-operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: Some(SurfacePolicies {
+                        graphql: Some(GraphqlPolicy {
+                            allow_queries: true,
+                            allow_subscriptions: true,
+                            allowed_mutations: vec![],
+                        }),
+                        mcp: None,
+                    }),
+                },
+                PrincipalEntry {
+                    token: "tok-2".into(),
+                    id: "ui_operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: Some(SurfacePolicies {
+                        graphql: Some(GraphqlPolicy {
+                            allow_queries: false,
+                            allow_subscriptions: false,
+                            allowed_mutations: vec![
+                                "approveApproval".into(),
+                                "rejectApproval".into(),
+                            ],
+                        }),
+                        mcp: None,
+                    }),
+                },
+            ],
+        };
+        // default-operator: no mutations allowed
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "default-operator", "approveApproval"),
+            Some(false)
+        );
+        // ui_operator: approval mutations allowed
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "ui_operator", "approveApproval"),
+            Some(true)
+        );
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "ui_operator", "rejectApproval"),
+            Some(true)
+        );
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "ui_operator", "startRun"),
+            Some(false)
+        );
+        // v1 principal without surface_policies
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "nonexistent", "approveApproval"),
+            None
+        );
     }
 }
