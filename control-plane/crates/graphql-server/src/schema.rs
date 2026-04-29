@@ -62,6 +62,14 @@ fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
     if principal.class != auth::PrincipalClass::Operator {
         return Err(Error::new("forbidden"));
     }
+    // P072: enforce allow_queries surface policy when present.
+    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+        if let Some(allowed) = auth::is_query_allowed_by_surface_policy(table, &principal.id) {
+            if !allowed {
+                return Err(Error::new("forbidden"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1902,6 +1910,16 @@ impl SubscriptionRoot {
             .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
         if principal.class != auth::PrincipalClass::Operator {
             return Err(Error::new("forbidden"));
+        }
+        // P072: enforce allow_subscriptions surface policy when present.
+        if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+            if let Some(allowed) =
+                auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
+            {
+                if !allowed {
+                    return Err(Error::new("forbidden"));
+                }
+            }
         }
         let events = ctx.data::<EventSender>()?.clone();
         let rx = events.subscribe();
@@ -6329,6 +6347,61 @@ mod tests {
         assert!(
             data["rejectApproval"]["journalId"].is_string(),
             "rejectApproval must return journalId"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_p072_ui_operator_denied_queries_and_subscriptions() {
+        // ui_operator has allow_queries:false and allow_subscriptions:false —
+        // GraphQL read operations must be rejected under the P072 surface policy.
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let (principal_table, _, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table.clone(),
+            test_reporter(),
+        );
+
+        // ui_operator must be denied a run query (allow_queries: false)
+        let denied = schema
+            .execute(
+                Request::new(format!(r#"{{ run(id: "{}") {{ id }} }}"#, run_id))
+                    .data(ui_operator.clone()),
+            )
+            .await;
+        assert!(
+            !denied.errors.is_empty(),
+            "ui_operator query must be denied: {denied:?}"
+        );
+        assert!(
+            denied
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("forbidden")),
+            "denial must be 'forbidden', got: {:?}",
+            denied.errors
+        );
+
+        // default-operator must still be allowed queries (allow_queries: true)
+        let (_, default_operator, _) = p072_principal_table();
+        let allowed = schema
+            .execute(
+                Request::new(format!(r#"{{ run(id: "{}") {{ id }} }}"#, run_id))
+                    .data(default_operator),
+            )
+            .await;
+        assert!(
+            allowed.errors.is_empty(),
+            "default-operator query must succeed: {allowed:?}"
         );
     }
 

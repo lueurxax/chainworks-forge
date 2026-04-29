@@ -363,6 +363,36 @@ pub fn is_mutation_allowed_by_surface_policy(
         .map(|graphql| graphql.allowed_mutations.iter().any(|m| m == mutation_name))
 }
 
+/// P072: Check if GraphQL queries are allowed for a principal based on v2 surface_policies.
+/// Returns None if the principal has no surface_policies (v1 behavior applies).
+pub fn is_query_allowed_by_surface_policy(
+    table: &PrincipalTable,
+    principal_id: &str,
+) -> Option<bool> {
+    table
+        .entries
+        .iter()
+        .find(|e| e.id == principal_id)
+        .and_then(|e| e.surface_policies.as_ref())
+        .and_then(|sp| sp.graphql.as_ref())
+        .map(|graphql| graphql.allow_queries)
+}
+
+/// P072: Check if GraphQL subscriptions are allowed for a principal based on v2 surface_policies.
+/// Returns None if the principal has no surface_policies (v1 behavior applies).
+pub fn is_subscription_allowed_by_surface_policy(
+    table: &PrincipalTable,
+    principal_id: &str,
+) -> Option<bool> {
+    table
+        .entries
+        .iter()
+        .find(|e| e.id == principal_id)
+        .and_then(|e| e.surface_policies.as_ref())
+        .and_then(|sp| sp.graphql.as_ref())
+        .map(|graphql| graphql.allow_subscriptions)
+}
+
 // ── Capability filtering ────────────────────────────────────────────────
 
 pub fn filter_tools(principal: &Principal, ids: &[CapabilityToolId]) -> Vec<CapabilityToolId> {
@@ -1065,5 +1095,77 @@ mod tests {
         }];
         let err = validate_v2_principals(&entries).unwrap_err();
         assert!(err.to_string().contains("unknown MCP tool"));
+    }
+
+    #[test]
+    fn is_query_allowed_by_surface_policy_checks() {
+        let table = PrincipalTable {
+            entries: vec![
+                PrincipalEntry {
+                    token: "tok-read".into(),
+                    id: "default-operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: Some(SurfacePolicies {
+                        graphql: Some(GraphqlPolicy {
+                            allow_queries: true,
+                            allow_subscriptions: true,
+                            allowed_mutations: vec![],
+                        }),
+                        mcp: None,
+                    }),
+                },
+                PrincipalEntry {
+                    token: "tok-ui".into(),
+                    id: "ui_operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: Some(SurfacePolicies {
+                        graphql: Some(GraphqlPolicy {
+                            allow_queries: false,
+                            allow_subscriptions: false,
+                            allowed_mutations: vec![
+                                "approveApproval".into(),
+                                "rejectApproval".into(),
+                            ],
+                        }),
+                        mcp: None,
+                    }),
+                },
+                PrincipalEntry {
+                    token: "tok-v1".into(),
+                    id: "v1-operator".into(),
+                    class: PrincipalClass::Operator,
+                    surface_policies: None,
+                },
+            ],
+        };
+        // default-operator: queries allowed
+        assert_eq!(
+            is_query_allowed_by_surface_policy(&table, "default-operator"),
+            Some(true)
+        );
+        // default-operator: subscriptions allowed
+        assert_eq!(
+            is_subscription_allowed_by_surface_policy(&table, "default-operator"),
+            Some(true)
+        );
+        // ui_operator: queries not allowed
+        assert_eq!(
+            is_query_allowed_by_surface_policy(&table, "ui_operator"),
+            Some(false)
+        );
+        // ui_operator: subscriptions not allowed
+        assert_eq!(
+            is_subscription_allowed_by_surface_policy(&table, "ui_operator"),
+            Some(false)
+        );
+        // v1 principal without surface_policies: returns None (no restriction)
+        assert_eq!(
+            is_query_allowed_by_surface_policy(&table, "v1-operator"),
+            None
+        );
+        assert_eq!(
+            is_subscription_allowed_by_surface_policy(&table, "v1-operator"),
+            None
+        );
     }
 }
