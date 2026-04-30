@@ -75,7 +75,10 @@ fn strip_ansi(s: &str) -> String {
 /// duplicating the rest of the transport logic.
 pub struct AcpSessionConfig<'a> {
     /// Model identifier for the provider's model catalog.
-    /// Claude: `"default"` / `"sonnet"` / `"haiku"` / `"opus"`.
+    /// Claude: request aliases may include `"opus"`, but current
+    /// `claude-agent-acp` advertises Opus as the `"default"` config option.
+    /// Required model selection is resolved against `session/new.configOptions`
+    /// before `session/set_config_option` is sent.
     /// Codex: base model id without effort suffix (e.g. `"gpt-5.4"`).
     ///        Reasoning effort is set separately via `config_options`.
     pub model: &'a str,
@@ -89,7 +92,7 @@ pub struct AcpSessionConfig<'a> {
     /// Claude requires `_meta.claudeCode.options`; Codex uses `None`.
     pub extra: Option<serde_json::Value>,
 
-    /// Session config options to apply after `session/new` via
+    /// Best-effort session config options to apply after `session/new` via
     /// `session/set_config_option`.
     ///
     /// Used by the Codex adapter to set `reasoning_effort` (the only reliable
@@ -101,6 +104,10 @@ pub struct AcpSessionConfig<'a> {
     /// Errors are logged but do not fail the session (providers that don't
     /// support the method respond with `Method not found`).
     pub config_options: Vec<(String, String)>,
+
+    /// Required session config options. A send or provider rejection fails
+    /// session startup instead of silently falling back to provider defaults.
+    pub required_config_options: Vec<(String, String)>,
 
     /// Some ACP providers expose a mode catalog in `session/new` but do not
     /// apply `session/new.params.mode`. For those providers, send
@@ -125,6 +132,7 @@ impl Default for AcpSessionConfig<'_> {
                 }
             })),
             config_options: Vec::new(),
+            required_config_options: Vec::new(),
             set_mode_after_session_new: false,
         }
     }
@@ -217,6 +225,113 @@ fn mcp_servers_wire_value(servers: &[AcpMcpServerPayload]) -> Result<Value> {
     }
 
     Ok(Value::Array(wire_servers))
+}
+
+#[derive(Debug)]
+struct SessionConfigOptionValue {
+    value: String,
+    name: String,
+    description: String,
+}
+
+fn resolve_session_config_option_value(
+    session_new_result: &Value,
+    config_id: &str,
+    requested: &str,
+) -> Option<String> {
+    let options = session_new_result
+        .get("configOptions")
+        .or_else(|| session_new_result.get("config_options"))?
+        .as_array()?;
+    let option = options.iter().find(|option| {
+        option
+            .get("id")
+            .or_else(|| option.get("configId"))
+            .and_then(Value::as_str)
+            == Some(config_id)
+    })?;
+
+    let mut values = Vec::new();
+    collect_session_config_option_values(option, &mut values);
+    resolve_session_config_value_from_values(&values, requested)
+}
+
+fn collect_session_config_option_values(
+    option: &Value,
+    values: &mut Vec<SessionConfigOptionValue>,
+) {
+    if let Some(value) = option.get("value").and_then(Value::as_str) {
+        values.push(SessionConfigOptionValue {
+            value: value.to_string(),
+            name: option
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            description: option
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    if let Some(children) = option.get("options").and_then(Value::as_array) {
+        for child in children {
+            collect_session_config_option_values(child, values);
+        }
+    }
+}
+
+fn resolve_session_config_value_from_values(
+    values: &[SessionConfigOptionValue],
+    requested: &str,
+) -> Option<String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    let requested_lower = requested.to_lowercase();
+    if let Some(direct) = values.iter().find(|candidate| {
+        candidate.value == requested
+            || candidate.value.to_lowercase() == requested_lower
+            || candidate.name.to_lowercase() == requested_lower
+    }) {
+        return Some(direct.value.clone());
+    }
+    if let Some(includes) = values.iter().find(|candidate| {
+        let value = candidate.value.to_lowercase();
+        let name = candidate.name.to_lowercase();
+        value.contains(&requested_lower)
+            || name.contains(&requested_lower)
+            || requested_lower.contains(&value)
+    }) {
+        return Some(includes.value.clone());
+    }
+
+    let tokens: Vec<String> = requested_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty() && *token != "claude" && *token != "default")
+        .map(ToOwned::to_owned)
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    values
+        .iter()
+        .filter_map(|candidate| {
+            let haystack = format!(
+                "{} {} {}",
+                candidate.value, candidate.name, candidate.description
+            )
+            .to_lowercase();
+            let score = tokens
+                .iter()
+                .filter(|token| haystack.contains(token.as_str()))
+                .count();
+            (score > 0).then_some((score, candidate))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, candidate)| candidate.value.clone())
 }
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -1409,6 +1524,8 @@ impl AcpTransportSession {
         }
 
         for (config_id, value) in &config.config_options {
+            let resolved_value = resolve_session_config_option_value(&sn_result, config_id, value)
+                .unwrap_or_else(|| value.to_string());
             let sco_id = next_id!();
             if let Err(e) = send_ndjson(
                 &mut stdin,
@@ -1419,7 +1536,7 @@ impl AcpTransportSession {
                     "params": {
                         "sessionId": session_id,
                         "configId": config_id,
-                        "value": value,
+                        "value": resolved_value,
                     }
                 }),
             )
@@ -1438,7 +1555,7 @@ impl AcpTransportSession {
                     debug!(
                         session_id = %session_id,
                         config_id = %config_id,
-                        value = %value,
+                        value = %resolved_value,
                         "ACP: session/set_config_option applied"
                     );
                 }
@@ -1446,11 +1563,44 @@ impl AcpTransportSession {
                     warn!(
                         session_id = %session_id,
                         config_id = %config_id,
-                        value = %value,
+                        value = %resolved_value,
                         "ACP: session/set_config_option rejected: {e}"
                     );
                 }
             }
+        }
+
+        for (config_id, value) in &config.required_config_options {
+            let resolved_value = resolve_session_config_option_value(&sn_result, config_id, value)
+                .unwrap_or_else(|| value.to_string());
+            let sco_id = next_id!();
+            send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": sco_id,
+                    "method": "session/set_config_option",
+                    "params": {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": resolved_value,
+                    }
+                }),
+            )
+            .await
+            .with_context(|| format!("ACP: send required session/set_config_option {config_id}"))?;
+
+            await_response(&mut reader, sco_id, HANDSHAKE_TIMEOUT)
+                .await
+                .with_context(|| {
+                    format!("ACP: required session/set_config_option rejected for {config_id}")
+                })?;
+            debug!(
+                session_id = %session_id,
+                config_id = %config_id,
+                value = %resolved_value,
+                "ACP: required session/set_config_option applied"
+            );
         }
 
         Ok(Self {

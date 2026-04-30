@@ -92,7 +92,17 @@ The GraphQL-only thin UI boundary is established in [query-projections-and-clien
 
 Visual baseline commit: `1cca56b9abd622ad7dc4e38304985cbf49e66780` (`2026-04-19T19:05:19+03:00`, `Add P060: lead-driven reviewer routing and expanded reviewer catalog`).
 
-This is the last pre-control-plane visual/ergonomic baseline selected for P036 restoration work. It is the parent of the first large control-plane land commit `a17b1cd04ac38f46f61111c647911f03844b4a33` from 2026-04-21. Use it only for visual/ergonomic behavior. Old Swift-local mutation operations from that baseline are not part of P036 unless a separate write-transport proposal approves them.
+This is the last pre-control-plane visual/ergonomic baseline selected for P036 comparison work. It is the parent of the first large control-plane land commit `a17b1cd04ac38f46f61111c647911f03844b4a33` from 2026-04-21. Use it only as evidence for visual/ergonomic behavior, not as the target UI. Old Swift-local mutation operations from that baseline are not part of P036 unless a separate write-transport proposal approves them.
+
+P036 must not produce "the old UI restored." The implementation target is the final P036 design over the current GraphQL read model. The old baseline is useful because it shows screens and inspection affordances that existed before the control-plane cutover, but every baseline delta must be reinterpreted through this proposal's navigation, definitions, read-only approval, and thin-client constraints.
+
+Before implementation changes, P036 must produce a short prep artifact under `docs/proposals/036-artifacts/` with this comparison sequence:
+
+1. **Current vs pre-control-plane baseline.** Compare the current UI against commit `1cca56b9abd622ad7dc4e38304985cbf49e66780` and list lost, degraded, unchanged, and intentionally removed screen affordances. This pass is descriptive only; it must not mark old affordances as automatically required.
+2. **Pre-control-plane baseline vs P036 target.** Compare the old UI against this proposal's target design and classify old affordances as `carry_forward`, `replace_with_p036_design`, `drop_as_legacy_write_path`, or `defer_until_projection_exists`.
+3. **Current UI vs P036 target.** Revisit the current-vs-old differences through the P036 target classification and produce the actual implementation backlog. Only this third pass is implementation-authoritative.
+
+The prep artifact must include file/symbol references for current screens, git references for baseline screens, and a decision rationale for every old affordance that is not carried forward. The backlog must avoid two separate visual migrations: P036 should move directly from the current UI to the final proposal-shaped UI, not first recreate the old UI and then redesign it.
 
 P036 must restore or consciously replace these P031 stop-tail surfaces:
 
@@ -112,7 +122,9 @@ Acceptance for this handoff:
 
 - The app remains GraphQL-read-only for governed workflow truth.
 - No UI MCP calls, GraphQL mutations, local workflow mutations, raw artifact directory truth, or old Swift orchestrator fallback are reintroduced.
-- Visual parity is judged against operator inspection ergonomics, not against removed write controls.
+- Visual parity is judged against operator inspection ergonomics and the P036 target design, not against pixel or layout equality with the old baseline and not against removed write controls.
+- The `docs/proposals/036-artifacts/` prep artifact exists before code changes and proves the three comparison passes above were performed.
+- Every visual change traces to the third-pass implementation backlog, not directly to the old baseline.
 - Dogfood should not be claimed until the restored P036 surfaces let an operator identify the idea, inspect run/stage state, inspect artifacts/reports, understand catalog/workflow context, and diagnose daemon/read freshness from the app.
 
 ---

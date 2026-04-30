@@ -7,7 +7,8 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    ideas, projections, runs, sessions, stages, work_items, workflow_conflicts,
+    ideas, projections, retry_operator_instructions, runs, sessions, stages, work_items,
+    workflow_conflicts,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
@@ -23,6 +24,7 @@ use domain::commands::{
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::retry_instruction::RetryInstructionScopeKind;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use domain::workflow_conflict::{
@@ -907,6 +909,7 @@ async fn proposal_017_operator_can_select_loop_budget_candidate_transition() {
                 conflict_id: conflict_id.clone(),
                 selected_transition_id: transition_id.into(),
                 resolution_reason: "operator confirmed one more implementation pass".into(),
+                operator_instruction: None,
             }),
             caller,
         )
@@ -961,6 +964,271 @@ async fn proposal_017_operator_can_select_loop_budget_candidate_transition() {
 }
 
 #[tokio::test]
+async fn proposal_017_operator_conflict_resolution_instruction_creates_retry_binding() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let completed_stage_id = StageExecutionId::new();
+    let current_state_id = "state_8_implementation_continued";
+    let transition_id = "state_8_implementation_continued__to__state_8_implementation_continued__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Completed);
+    completed_stage.stage_id = current_state_id.into();
+    completed_stage.label = "Implementation Continued".into();
+    completed_stage.iteration = 50;
+    stages::insert(&pool, &completed_stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: current_state_id.into(),
+        condition_expression_id: Some("implementation_self_assessment_needs_code_fixes".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["implementation_self_assessment_v2".into()],
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: vec!["implementation_self_assessment_v2".into()],
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some(
+            "Loop budget exhausted for implementation_progress_count: 50/50 iterations".into(),
+        ),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    let conflict_id = conflict.conflict_id.clone();
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let commanded = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator confirmed one more implementation pass".into(),
+                operator_instruction: Some("  Refine only the documented P041 blockers.  ".into()),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "workflow_conflicts.resolve",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let retry_instruction_binding_id = match commanded.result {
+        engine::command_handler::CommandResult::WorkflowConflictTransitionSelected {
+            retry_instruction_binding_id,
+            ..
+        } => retry_instruction_binding_id.expect("operator instruction must create binding"),
+        _ => panic!("unexpected command result"),
+    };
+
+    let stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let pending = stages
+        .iter()
+        .find(|stage| stage.status == StageStatus::Pending)
+        .expect("operator-selected loop transition must create pending stage");
+
+    let bindings = retry_operator_instructions::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].binding_id, retry_instruction_binding_id);
+    assert_eq!(
+        bindings[0].instruction_text,
+        "Refine only the documented P041 blockers."
+    );
+    assert_eq!(
+        bindings[0].scope_kind,
+        RetryInstructionScopeKind::FullStageRetry
+    );
+    assert_eq!(bindings[0].stage_id, current_state_id);
+    assert_eq!(bindings[0].source_stage_execution_id, completed_stage_id);
+    assert_eq!(bindings[0].retry_stage_execution_id, pending.id);
+    assert_eq!(bindings[0].retry_attempt_number, pending.attempt_number);
+    assert_eq!(bindings[0].created_by_principal_id, "operator-test");
+    assert_eq!(bindings[0].created_by_principal_class, "operator");
+
+    let deliveries =
+        retry_operator_instructions::list_deliveries_by_binding(&pool, &bindings[0].binding_id)
+            .await
+            .unwrap();
+    assert!(
+        deliveries.is_empty(),
+        "workflow conflict resolution defers full-stage delivery to orchestrator fanout"
+    );
+}
+
+#[tokio::test]
+async fn proposal_017_conflict_instruction_validation_rejects_before_state_mutation() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let completed_stage_id = StageExecutionId::new();
+    let current_state_id = "state_8_implementation_continued";
+    let transition_id = "state_8_implementation_continued__to__state_8_implementation_continued__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Completed);
+    completed_stage.stage_id = current_state_id.into();
+    completed_stage.iteration = 50;
+    stages::insert(&pool, &completed_stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: current_state_id.into(),
+        condition_expression_id: Some("implementation_self_assessment_needs_code_fixes".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["implementation_self_assessment_v2".into()],
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: vec!["implementation_self_assessment_v2".into()],
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some(
+            "Loop budget exhausted for implementation_progress_count: 50/50 iterations".into(),
+        ),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict.conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator confirmed one more implementation pass".into(),
+                operator_instruction: Some("   ".into()),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "workflow_conflicts.resolve",
+            ),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("empty operator instruction must be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("operator_instruction validation"),
+        "unexpected error: {err}"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    assert_eq!(stored_run.current_state.as_deref(), Some(current_state_id));
+    assert!(retry_operator_instructions::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn proposal_017_conflict_instruction_requires_new_retry_stage() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let current_state_id = "review";
+    let target_state_id = "complete";
+    let transition_id = "review__to__complete__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut running_target = make_stage(StageExecutionId::new(), run_id, StageStatus::Running);
+    running_target.stage_id = target_state_id.into();
+    running_target.iteration = 1;
+    stages::insert(&pool, &running_target).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: target_state_id.into(),
+        condition_expression_id: Some("ready".into()),
+        result: CandidateTransitionResult::Matched,
+        required_artifacts: Vec::new(),
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: Vec::new(),
+        source_agent_execution_id: None,
+        sanitized_diagnostic: None,
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict.conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator selected matched transition".into(),
+                operator_instruction: Some("Apply one more refine instruction.".into()),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "workflow_conflicts.resolve",
+            ),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("instruction must not be silently dropped"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("requires a newly created retry stage"),
+        "unexpected error: {err}"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    assert_eq!(stored_run.current_state.as_deref(), Some(current_state_id));
+}
+
+#[tokio::test]
 async fn proposal_017_operator_cannot_select_plain_not_matched_transition() {
     let pool = test_pool().await;
 
@@ -1010,6 +1278,7 @@ async fn proposal_017_operator_cannot_select_plain_not_matched_transition() {
                 conflict_id: conflict.conflict_id.clone(),
                 selected_transition_id: transition_id.into(),
                 resolution_reason: "try approving anyway".into(),
+                operator_instruction: None,
             }),
             caller,
         )

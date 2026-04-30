@@ -2914,6 +2914,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_017_run_query_exposes_refine_instruction_action_hint() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.reason = WorkflowConflictReason::NoDeclarativeTransitionMatched;
+        conflict.operator_label = "No declarative workflow transition matched".into();
+        conflict.candidate_transitions = vec![CandidateTransitionEvaluation {
+            transition_id: "review_to_refine".into(),
+            from_state_id: "review".into(),
+            to_state_id: "review".into(),
+            condition_expression_id: Some("proposal_needs_refine".into()),
+            result: CandidateTransitionResult::NotMatched,
+            required_artifacts: vec!["proposal_review_summary".into()],
+            missing_artifacts: vec![],
+            missing_fields: vec![],
+            source_artifact_ids: vec!["proposal_review_summary".into()],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(
+                "Loop budget exhausted for proposal_review_count: 3/3 iterations".into(),
+            ),
+        }];
+        conflict.candidate_transition_hash =
+            candidate_transition_hash(&conflict.candidate_transitions);
+        conflict.conflict_fingerprint = workflow_conflict_fingerprint(
+            &run_id.to_string(),
+            "review",
+            &conflict.reason,
+            &conflict.candidate_transition_hash,
+            &[],
+        );
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    workflowConflict {{
+                      suggestedOperatorAction
+                    }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(
+            json["run"]["workflowConflict"]["suggestedOperatorAction"],
+            serde_json::json!("choose_transition_or_provide_refine_instruction")
+        );
+    }
+
+    #[tokio::test]
     async fn proposal_017_run_query_exposes_sanitized_lead_mediation_readback() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();

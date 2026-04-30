@@ -8,7 +8,7 @@ use anyhow::{Context, Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -223,6 +223,8 @@ pub struct InvokeAgentCapacityConfig {
     pub provider_caps: std::collections::HashMap<String, usize>,
 }
 
+const MAX_ACTIVE_XCODE_MCP_INVOKE_AGENTS: i64 = 1;
+
 #[derive(Clone, Debug)]
 struct DeclaredContractImportResult {
     validation_summary: Option<TaskValidationSummary>,
@@ -243,6 +245,20 @@ impl InvokeAgentCapacityConfig {
             max_active_per_run: usize::MAX,
             provider_caps: std::collections::HashMap::new(),
         }
+    }
+}
+
+fn invoke_agent_start_capacity_from_domain(
+    capacity: &domain::provider::InvokeAgentCapacityConfig,
+) -> InvokeAgentCapacityConfig {
+    InvokeAgentCapacityConfig {
+        max_active_total: capacity.global_active_agent_executions,
+        max_active_per_run: capacity.per_run_active_agent_executions,
+        provider_caps: capacity
+            .provider_caps
+            .iter()
+            .map(|(provider, cap)| (provider.to_string(), *cap))
+            .collect(),
     }
 }
 
@@ -352,6 +368,12 @@ async fn invoke_item_has_start_capacity(
     if provider.is_empty() {
         return Ok(false);
     }
+    if invoke_payload_requires_xcode_mcp(&payload) {
+        let active_xcode = running_xcode_mcp_invoke_agent_count(pool).await?;
+        if active_xcode >= MAX_ACTIVE_XCODE_MCP_INVOKE_AGENTS {
+            return Ok(false);
+        }
+    }
     let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
 
@@ -395,6 +417,52 @@ async fn invoke_item_has_start_capacity(
     }
 
     Ok(true)
+}
+
+fn invoke_payload_requires_xcode_mcp(payload: &serde_json::Value) -> bool {
+    payload
+        .get("xcode_broker_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || payload
+            .get("xcode_shim_injection_signal")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || payload
+            .get("requires_xcode_host_execution")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || payload
+            .get("requested_mcp_server_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|servers| {
+                servers
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|server| server == "xcode" || server == "xcode_broker")
+            })
+}
+
+async fn running_xcode_mcp_invoke_agent_count(pool: &SqlitePool) -> Result<i64> {
+    let rows = sqlx::query(
+        r#"SELECT payload_json
+           FROM work_items
+           WHERE kind = ?1 AND status = ?2"#,
+    )
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_all(pool)
+    .await
+    .context("load running InvokeAgent items for Xcode MCP capacity")?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let payload_json: String = row.get("payload_json");
+            serde_json::from_str::<serde_json::Value>(&payload_json).ok()
+        })
+        .filter(invoke_payload_requires_xcode_mcp)
+        .count() as i64)
 }
 
 fn scheduler_capacity_config_from_start_capacity(
@@ -1740,6 +1808,91 @@ fn runtime_facts_for_execution_result(
     facts
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequiredWorkflowConflictResolution {
+    conflict_id: String,
+    candidate_transition_hash: String,
+    selected_transition_id: Option<String>,
+    selected_next_state_id: Option<String>,
+    resolution_reason: String,
+}
+
+fn workflow_conflict_resolution_validation_message(
+    required: &RequiredWorkflowConflictResolution,
+) -> String {
+    format!(
+        "proposal_revision_summary.workflow_conflict_resolution must include conflict_id={}, \
+         candidate_transition_hash={}, resolution_reason, applied=true, and non-empty applied_changes",
+        required.conflict_id, required.candidate_transition_hash
+    )
+}
+
+fn proposal_writer_conflict_resolution_is_acknowledged(
+    captured_outputs: &[CapturedOutput],
+    required: &RequiredWorkflowConflictResolution,
+) -> bool {
+    let Some(bytes) = captured_outputs
+        .iter()
+        .find(|output| output.declared.output_name == "proposal_revision_summary")
+        .and_then(|output| output.machine_bytes.as_deref())
+    else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let Some(resolution) = value
+        .get("workflow_conflict_resolution")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+
+    let matches_identity = resolution
+        .get("conflict_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(required.conflict_id.as_str())
+        && resolution
+            .get("candidate_transition_hash")
+            .and_then(serde_json::Value::as_str)
+            == Some(required.candidate_transition_hash.as_str())
+        && resolution
+            .get("resolution_reason")
+            .and_then(serde_json::Value::as_str)
+            == Some(required.resolution_reason.as_str());
+    if !matches_identity {
+        return false;
+    }
+
+    if let Some(expected) = required.selected_transition_id.as_deref() {
+        if resolution
+            .get("selected_transition_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected)
+        {
+            return false;
+        }
+    }
+    if let Some(expected) = required.selected_next_state_id.as_deref() {
+        if resolution
+            .get("selected_next_state_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected)
+        {
+            return false;
+        }
+    }
+
+    resolution
+        .get("applied")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && resolution
+            .get("applied_changes")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|changes| !changes.is_empty())
+}
+
 struct ExecutionDiscoveryMetrics {
     acp_pre_initialize_local_latency_ms: Option<u64>,
     acp_initialize_latency_ms: Option<u64>,
@@ -2593,12 +2746,14 @@ impl BackgroundExecutor {
             return Ok(Some(item));
         }
 
-        Ok(claim_next_invoke_agent_with_start_internal(
-            &self.pool,
-            &InvokeAgentCapacityConfig::unbounded(),
+        let capacity = invoke_agent_start_capacity_from_domain(
+            &self.work_queue.invoke_agent_capacity_config(),
+        );
+        Ok(
+            claim_next_invoke_agent_with_start_internal(&self.pool, &capacity)
+                .await?
+                .map(|(_, item)| item),
         )
-        .await?
-        .map(|(_, item)| item))
     }
 
     async fn auto_requeue_active_prompt_close(
@@ -4027,7 +4182,11 @@ impl BackgroundExecutor {
                         &settlement.decisions,
                         &settlement.accepted_payloads,
                     );
-                    let validation = validate_task_outputs(&captured);
+                    let validation = self
+                        .validate_task_outputs_with_conflict_resolution_context(
+                            run_id, &stage_id, &agent_id, &captured,
+                        )
+                        .await?;
                     if validation_summary_requires_output_contract_repair(&validation) {
                         if let Some(session_generation_id) =
                             result.session_generation_id.clone().or_else(|| {
@@ -4067,8 +4226,14 @@ impl BackgroundExecutor {
                                                     &repair_settlement.decisions,
                                                     &repair_settlement.accepted_payloads,
                                                 );
-                                            let repair_validation =
-                                                validate_task_outputs(&repair_captured);
+                                            let repair_validation = self
+                                                .validate_task_outputs_with_conflict_resolution_context(
+                                                    run_id,
+                                                    &stage_id,
+                                                    &agent_id,
+                                                    &repair_captured,
+                                                )
+                                                .await?;
                                             if repair_validation.failure_class.is_none() {
                                                 merge_contract_repair_result(
                                                     &mut result,
@@ -4613,6 +4778,19 @@ impl BackgroundExecutor {
                         )
                     })
                     .unwrap_or_default();
+                let validation_summary_override = if captured_declared_outputs.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.validate_task_outputs_with_conflict_resolution_context(
+                            run_id,
+                            &stage_id,
+                            &agent_id,
+                            &captured_declared_outputs,
+                        )
+                        .await?,
+                    )
+                };
                 let (
                     acp_cap_validation_sample_size,
                     acp_cap_validation_p90_output_bytes,
@@ -4680,6 +4858,7 @@ impl BackgroundExecutor {
                         result.close_diagnostic.as_ref(),
                         discovery_diagnostics.as_ref(),
                         &stage_degraded_output_policy,
+                        validation_summary_override,
                         completed_at,
                     )
                     .await?;
@@ -5385,13 +5564,12 @@ impl BackgroundExecutor {
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
         discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
+        validation_summary_override: Option<TaskValidationSummary>,
         completed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<DeclaredContractImportResult> {
-        let validation_summary = if declared_outputs.is_empty() {
-            None
-        } else {
-            Some(validate_task_outputs(captured_outputs))
-        };
+        let validation_summary = validation_summary_override.or_else(|| {
+            (!declared_outputs.is_empty()).then(|| validate_task_outputs(captured_outputs))
+        });
         let validation_failed = validation_summary
             .as_ref()
             .and_then(|summary| summary.failure_class.as_ref())
@@ -5622,6 +5800,115 @@ impl BackgroundExecutor {
             final_agent_status,
             degraded_outputs_satisfy_stage,
         })
+    }
+
+    async fn validate_task_outputs_with_conflict_resolution_context(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        captured_outputs: &[CapturedOutput],
+    ) -> Result<TaskValidationSummary> {
+        let mut summary = validate_task_outputs(captured_outputs);
+        let Some(required) = self
+            .required_workflow_conflict_resolution_for_proposal_writer(run_id, stage_id, agent_id)
+            .await?
+        else {
+            return Ok(summary);
+        };
+
+        if proposal_writer_conflict_resolution_is_acknowledged(captured_outputs, &required) {
+            return Ok(summary);
+        }
+
+        let output_name = "proposal_revision_summary".to_string();
+        summary.raw_output_exists = captured_outputs.iter().any(|output| {
+            output.declared.output_name == output_name && output.machine_bytes.is_some()
+        });
+        summary.failure_class =
+            Some(domain::validation::ValidationFailureClass::OutputContractMismatch);
+        summary.failure_summary = Some(format!(
+            "proposal_writer output did not acknowledge resolved workflow conflict {}",
+            required.conflict_id
+        ));
+        if let Some(result) = summary
+            .output_results
+            .iter_mut()
+            .find(|result| result.output_name == output_name)
+        {
+            result.status = domain::validation::ValidationStatus::Failed;
+            result.validation_error =
+                Some(workflow_conflict_resolution_validation_message(&required));
+        } else {
+            summary
+                .output_results
+                .push(domain::validation::OutputValidationResult {
+                    output_name,
+                    contract_id: Some(
+                        "proposal_revision_summary_conflict_resolution_v1".to_string(),
+                    ),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec!["workflow_conflict_resolution".to_string()],
+                    validation_error: Some(workflow_conflict_resolution_validation_message(
+                        &required,
+                    )),
+                    raw_payload_size: 0,
+                });
+        }
+        Ok(summary)
+    }
+
+    async fn required_workflow_conflict_resolution_for_proposal_writer(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<RequiredWorkflowConflictResolution>> {
+        if agent_id != "proposal_writer" {
+            return Ok(None);
+        }
+        let Some(cursor) = workflow_conflicts::get_transition_cursor(&self.pool, run_id).await?
+        else {
+            return Ok(None);
+        };
+        if cursor.cursor_status != "operator_transition_selected"
+            || cursor.resume_policy != "continue_from_selected_transition"
+            || cursor.current_state_id != stage_id
+            || cursor.selected_next_state_id.as_deref() != Some(stage_id)
+        {
+            return Ok(None);
+        }
+        let Some(conflict_id) = cursor.conflict_id.as_deref() else {
+            return Ok(None);
+        };
+        let history = workflow_conflicts::list_conflict_history_for_run(&self.pool, run_id).await?;
+        let Some(conflict) = history
+            .iter()
+            .rev()
+            .find(|conflict| conflict.conflict_id == conflict_id)
+        else {
+            return Ok(None);
+        };
+        let resolution_reason = conflict
+            .resolution_record_json
+            .as_ref()
+            .and_then(|record| record.get("resolution_reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let Some(resolution_reason) = resolution_reason else {
+            return Ok(None);
+        };
+
+        Ok(Some(RequiredWorkflowConflictResolution {
+            conflict_id: conflict.conflict_id.clone(),
+            candidate_transition_hash: cursor
+                .candidate_transition_hash
+                .clone()
+                .unwrap_or_else(|| conflict.candidate_transition_hash.clone()),
+            selected_transition_id: cursor.selected_transition_id.clone(),
+            selected_next_state_id: cursor.selected_next_state_id.clone(),
+            resolution_reason,
+        }))
     }
 
     async fn persist_undeclared_envelope_artifacts(
@@ -6780,6 +7067,63 @@ mod tests {
         assert!(prompt.contains("required output was not produced"));
         assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
         assert!(prompt.contains("Do not redo unrelated implementation work"));
+    }
+
+    #[test]
+    fn proposal_writer_conflict_resolution_requires_machine_acknowledgement() {
+        let required = RequiredWorkflowConflictResolution {
+            conflict_id: "conflict-p041".to_string(),
+            candidate_transition_hash: "candidate-hash".to_string(),
+            selected_transition_id: Some("refine_once_more".to_string()),
+            selected_next_state_id: Some("state_5_proposal_refined".to_string()),
+            resolution_reason: "perform one more refine with the operator instruction".to_string(),
+        };
+        let declared = DeclaredOutput {
+            output_name: "proposal_revision_summary".to_string(),
+            target_path: "/workspace/.chainworks/proposals/current/revision-summary.json"
+                .to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+
+        let stale_summary = CapturedOutput {
+            declared: declared.clone(),
+            machine_bytes: Some(br#"{"proposal_revision_id":"P041-r10"}"#.to_vec()),
+            companion_bytes: None,
+        };
+        assert!(
+            !proposal_writer_conflict_resolution_is_acknowledged(&[stale_summary], &required),
+            "a formally valid but stale proposal summary must not satisfy the conflict resolution gate"
+        );
+
+        let acknowledged_summary = CapturedOutput {
+            declared,
+            machine_bytes: Some(
+                serde_json::json!({
+                    "proposal_revision_id": "P041-r11",
+                    "workflow_conflict_resolution": {
+                        "conflict_id": "conflict-p041",
+                        "candidate_transition_hash": "candidate-hash",
+                        "selected_transition_id": "refine_once_more",
+                        "selected_next_state_id": "state_5_proposal_refined",
+                        "resolution_reason": "perform one more refine with the operator instruction",
+                        "applied": true,
+                        "applied_changes": [
+                            "reflected the operator-selected refine instruction in the proposal body"
+                        ]
+                    }
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            companion_bytes: None,
+        };
+        assert!(proposal_writer_conflict_resolution_is_acknowledged(
+            &[acknowledged_summary],
+            &required
+        ));
     }
 
     #[test]

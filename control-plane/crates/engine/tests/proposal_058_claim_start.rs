@@ -22,6 +22,7 @@ use engine::executor::BackgroundExecutor;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
@@ -594,7 +595,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
 }
 
 #[tokio::test]
-async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_without_new_execution() {
+async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_execution() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -704,23 +705,171 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_without_new_ex
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, "invoke-work-item-recovery");
 
+    let payload_after_recovery: serde_json::Value =
+        serde_json::from_str(&pending[0].payload_json).unwrap();
+    assert!(
+        payload_after_recovery.get("p058_claimed").is_none(),
+        "startup recovery must clear stale claim/session ownership before retry"
+    );
+
+    let old_execution =
+        agent_executions::find_by_id(&pool, claimed_before_crash.agent_execution_id)
+            .await
+            .unwrap()
+            .expect("abandoned preclaimed execution remains auditable");
+    assert_eq!(
+        old_execution.status,
+        AgentStatus::Cancelled,
+        "startup recovery must terminalize abandoned preclaimed executions"
+    );
+    assert!(old_execution.completed_at.is_some());
+
+    let old_claim = artifact_contracts::load_source_generation_claim(
+        &pool,
+        &claimed_before_crash.artifact_claim_key,
+    )
+    .await
+    .unwrap()
+    .expect("abandoned source-generation claim remains auditable");
+    assert_eq!(
+        old_claim.claim_state,
+        ArtifactSourceClaimState::SupersededPendingRetry
+    );
+    assert_eq!(
+        old_claim.superseding_work_item_id.as_deref(),
+        Some("invoke-work-item-recovery")
+    );
+
     let claimed_after_recovery = engine::executor::claim_next_invoke_agent_with_start(&pool)
         .await
         .unwrap()
-        .expect("recovery should reclaim durable preclaimed InvokeAgent");
-    assert_eq!(
-        claimed_after_recovery.agent_execution_id,
-        claimed_before_crash.agent_execution_id
-    );
-    assert_eq!(
-        claimed_after_recovery.artifact_claim_key,
-        claimed_before_crash.artifact_claim_key
+        .expect("recovery should start a fresh InvokeAgent execution");
+    assert_ne!(
+        claimed_after_recovery.agent_execution_id, claimed_before_crash.agent_execution_id,
+        "recovery retry must not bind to the crashed ACP/session execution"
     );
     let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
         .await
         .unwrap();
-    assert_eq!(executions.len(), 1);
-    assert_eq!(executions[0].id, claimed_before_crash.agent_execution_id);
+    assert_eq!(executions.len(), 2);
+    assert!(executions.iter().any(|execution| execution.id
+        == claimed_before_crash.agent_execution_id
+        && execution.status == AgentStatus::Cancelled));
+    assert!(executions.iter().any(|execution| execution.id
+        == claimed_after_recovery.agent_execution_id
+        && execution.status == AgentStatus::Running));
+}
+
+#[tokio::test]
+async fn proposal_058_xcode_mcp_invoke_claim_is_single_flight_even_when_capacity_remains() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 Xcode single flight".into(),
+            body: "startup retry modal guard".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    for item_id in ["xcode-invoke-1", "xcode-invoke-2"] {
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: item_id.into(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "stage_id": "implementation",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_id": item_id,
+                    "provider": "claude",
+                    "model": "sonnet",
+                    "prompt": "use Xcode MCP",
+                    "task_name": item_id,
+                    "task_inputs": ["input"],
+                    "task_outputs": ["output"],
+                    "declared_outputs": [],
+                    "requested_mcp_server_ids": ["xcode"],
+                    "xcode_broker_required": true,
+                    "session_reuse_scope": "same_agent_family_within_run",
+                    "session_family_id": item_id,
+                    "worktree_write_enabled": false
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some("implementation".into()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let capacity = engine::executor::InvokeAgentCapacityConfig {
+        max_active_total: 10,
+        max_active_per_run: 10,
+        provider_caps: HashMap::from([("claude".to_string(), 10)]),
+    };
+
+    let claimed =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
+            .unwrap()
+            .expect("first Xcode MCP invocation should start");
+    assert_eq!(claimed.source_work_item_id, "xcode-invoke-1");
+
+    let second =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
+            .unwrap();
+    assert!(
+        second.is_none(),
+        "a second Xcode MCP invocation must wait while another one is active"
+    );
 }
 
 #[tokio::test]

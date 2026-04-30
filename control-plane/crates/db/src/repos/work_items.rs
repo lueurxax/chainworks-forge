@@ -348,9 +348,23 @@ pub async fn requeue_running_preclaimed_invoke_for_stage_tx(
         if !has_preclaimed || payload_stage_execution_id != Some(stage_execution_id) {
             continue;
         }
-        payload["p061_startup_recovery"] = serde_json::json!({
-            "requeued_at": Utc::now().to_rfc3339(),
-        });
+        supersede_abandoned_preclaim_for_retry_tx(
+            tx,
+            &row.get::<String, _>("id"),
+            &payload,
+            Utc::now(),
+        )
+        .await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("p058_claimed");
+            object.insert(
+                "p061_startup_recovery".to_string(),
+                serde_json::json!({
+                    "requeued_at": Utc::now().to_rfc3339(),
+                    "reason": "startup_repair_preclaimed_invoke_agent",
+                }),
+            );
+        }
         let payload_json = serde_json::to_string(&payload)
             .context("serialize startup recovery requeued InvokeAgent payload")?;
 
@@ -503,6 +517,67 @@ pub async fn settle_terminal_preclaimed_invoke_agent_executions_tx(
     Ok(settled)
 }
 
+async fn supersede_abandoned_preclaim_for_retry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    payload: &serde_json::Value,
+    settled_at: DateTime<Utc>,
+) -> Result<()> {
+    let Some(claimed) = payload.get("p058_claimed") else {
+        return Ok(());
+    };
+    let Some(agent_execution_id) = claimed
+        .get("agent_execution_id")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(());
+    };
+    let settled_at = settled_at.to_rfc3339();
+    sqlx::query(
+        r#"UPDATE agent_executions
+           SET status = ?1, completed_at = COALESCE(completed_at, ?2)
+           WHERE id = ?3 AND status = ?4"#,
+    )
+    .bind(AgentStatus::Cancelled.to_string())
+    .bind(&settled_at)
+    .bind(agent_execution_id)
+    .bind(AgentStatus::Running.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("settle abandoned preclaimed InvokeAgent execution before retry")?;
+
+    let Some(claim_key) = claimed
+        .get("artifact_claim_key")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ArtifactSourceGenerationClaimKey>(value).ok())
+    else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"UPDATE artifact_source_generation_claims
+           SET claim_state = ?1,
+               superseding_work_item_id = ?2,
+               superseded_at = ?3,
+               updated_at = ?3
+           WHERE run_id = ?4 AND owner_kind = ?5 AND owner_id = ?6 AND agent_execution_id = ?7
+             AND source_work_item_id = ?8 AND claim_state = ?9"#,
+    )
+    .bind(ArtifactSourceClaimState::SupersededPendingRetry.to_string())
+    .bind(work_item_id)
+    .bind(&settled_at)
+    .bind(claim_key.run_id.to_string())
+    .bind(claim_key.owner_kind.to_string())
+    .bind(&claim_key.owner_id)
+    .bind(agent_execution_id)
+    .bind(&claim_key.source_work_item_id)
+    .bind(ArtifactSourceClaimState::Active.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("supersede abandoned preclaimed source-generation claim before retry")?;
+
+    Ok(())
+}
+
 pub async fn requeue_running_advance_by_run(
     pool: &SqlitePool,
     run_id: RunId,
@@ -639,17 +714,24 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
 
     let pending = WorkItemStatus::Pending.to_string();
     let running = WorkItemStatus::Running.to_string();
-    let scheduled_at = scheduled_at.to_rfc3339();
+    let scheduled_at_rfc3339 = scheduled_at.to_rfc3339();
     let mut requeued = 0_u64;
     for row in rows {
         let item_id: String = row.get("id");
         let payload_json: String = row.get("payload_json");
         let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
             .unwrap_or_else(|_| serde_json::json!({}));
-        payload["p061_startup_recovery"] = serde_json::json!({
-            "requeued_at": scheduled_at.clone(),
-            "reason": reason,
-        });
+        supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("p058_claimed");
+            object.insert(
+                "p061_startup_recovery".to_string(),
+                serde_json::json!({
+                    "requeued_at": scheduled_at_rfc3339.clone(),
+                    "reason": reason,
+                }),
+            );
+        }
         let updated = sqlx::query(
             r#"UPDATE work_items
                SET status = ?1,
@@ -668,6 +750,322 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         .execute(&mut **tx)
         .await
         .context("requeue running InvokeAgent work item on startup")?
+        .rows_affected();
+        requeued += updated;
+    }
+    Ok(requeued)
+}
+
+pub async fn requeue_stale_starting_invoke_agent_sessions(
+    pool: &SqlitePool,
+    scheduled_at: DateTime<Utc>,
+    standard_stale_cutoff: DateTime<Utc>,
+    xcode_stale_cutoff: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx = begin_immediate_with_retry(
+        pool,
+        "work_items.requeue_stale_starting_invoke_agent_sessions",
+    )
+    .await?;
+    let requeued = requeue_stale_starting_invoke_agent_sessions_tx(
+        &mut tx,
+        scheduled_at,
+        standard_stale_cutoff,
+        xcode_stale_cutoff,
+        reason,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit stale ACP startup InvokeAgent requeue")?;
+    log_write_transaction(
+        "work_items.requeue_stale_starting_invoke_agent_sessions",
+        tx_started,
+    );
+    Ok(requeued)
+}
+
+pub async fn requeue_stale_pre_session_invoke_agents(
+    pool: &SqlitePool,
+    scheduled_at: DateTime<Utc>,
+    standard_stale_cutoff: DateTime<Utc>,
+    xcode_stale_cutoff: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx =
+        begin_immediate_with_retry(pool, "work_items.requeue_stale_pre_session_invoke_agents")
+            .await?;
+    let requeued = requeue_stale_pre_session_invoke_agents_tx(
+        &mut tx,
+        scheduled_at,
+        standard_stale_cutoff,
+        xcode_stale_cutoff,
+        reason,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit stale pre-session InvokeAgent requeue")?;
+    log_write_transaction(
+        "work_items.requeue_stale_pre_session_invoke_agents",
+        tx_started,
+    );
+    Ok(requeued)
+}
+
+pub async fn requeue_stale_pre_session_invoke_agents_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    scheduled_at: DateTime<Utc>,
+    standard_stale_cutoff: DateTime<Utc>,
+    xcode_stale_cutoff: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        r#"SELECT wi.id,
+                  wi.payload_json,
+                  COALESCE(wi.started_at, wi.scheduled_at) AS work_started_at
+           FROM work_items wi
+           INNER JOIN agent_executions ae
+             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+           WHERE wi.kind = ?1
+             AND wi.status = ?2
+             AND ae.status = ?3
+             AND ae.session_generation_id IS NULL
+           ORDER BY wi.scheduled_at ASC, wi.rowid ASC"#,
+    )
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(AgentStatus::Running.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .context("load stale pre-session InvokeAgent work")?;
+
+    let pending = WorkItemStatus::Pending.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    let scheduled_at_rfc3339 = scheduled_at.to_rfc3339();
+    let standard_stale_cutoff_rfc3339 = standard_stale_cutoff.to_rfc3339();
+    let xcode_stale_cutoff_rfc3339 = xcode_stale_cutoff.to_rfc3339();
+    let mut requeued = 0_u64;
+
+    for row in rows {
+        let item_id: String = row.get("id");
+        let payload_json: String = row.get("payload_json");
+        let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let xcode_required = payload
+            .get("xcode_broker_required")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || payload
+                .get("requested_mcp_server_ids")
+                .and_then(|value| value.as_array())
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .any(|server| server.as_str() == Some("xcode"))
+                })
+                .unwrap_or(false);
+        let stale_cutoff = if xcode_required {
+            xcode_stale_cutoff
+        } else {
+            standard_stale_cutoff
+        };
+        let work_started_at = row
+            .get::<Option<String>, _>("work_started_at")
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        if work_started_at.is_none_or(|started| started > stale_cutoff) {
+            continue;
+        }
+
+        supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("p058_claimed");
+            object.insert(
+                "p061_startup_recovery".to_string(),
+                serde_json::json!({
+                    "requeued_at": scheduled_at_rfc3339.clone(),
+                    "reason": reason,
+                    "stale_cutoff": stale_cutoff.to_rfc3339(),
+                    "xcode_grace_applied": xcode_required,
+                    "standard_stale_cutoff": standard_stale_cutoff_rfc3339,
+                    "xcode_stale_cutoff": xcode_stale_cutoff_rfc3339,
+                }),
+            );
+        }
+        let updated = sqlx::query(
+            r#"UPDATE work_items
+               SET status = ?1,
+                   payload_json = ?2,
+                   started_at = NULL,
+                   completed_at = NULL,
+                   failed_at = NULL,
+                   last_error = ?3
+               WHERE id = ?4 AND status = ?5"#,
+        )
+        .bind(&pending)
+        .bind(serde_json::to_string(&payload)?)
+        .bind(reason)
+        .bind(&item_id)
+        .bind(&running)
+        .execute(&mut **tx)
+        .await
+        .context("requeue stale pre-session InvokeAgent work item")?
+        .rows_affected();
+        requeued += updated;
+    }
+    Ok(requeued)
+}
+
+pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    scheduled_at: DateTime<Utc>,
+    standard_stale_cutoff: DateTime<Utc>,
+    xcode_stale_cutoff: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        r#"SELECT wi.id,
+                  wi.payload_json,
+                  COALESCE(wi.started_at, wi.scheduled_at) AS work_started_at,
+                  ae.session_generation_id AS session_generation_id,
+                  sg.lineage_id AS session_lineage_id,
+                  sg.created_at AS generation_created_at
+           FROM work_items wi
+           INNER JOIN agent_executions ae
+             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+           INNER JOIN session_generations sg
+             ON sg.id = ae.session_generation_id
+           WHERE wi.kind = ?1
+             AND wi.status = ?2
+             AND ae.status = ?3
+             AND sg.status = 'active'
+             AND sg.provider_session_id IS NULL
+             AND sg.last_activity_at IS NULL
+           ORDER BY wi.scheduled_at ASC, wi.rowid ASC"#,
+    )
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(AgentStatus::Running.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .context("load stale starting InvokeAgent sessions")?;
+
+    let pending = WorkItemStatus::Pending.to_string();
+    let running = WorkItemStatus::Running.to_string();
+    let scheduled_at_rfc3339 = scheduled_at.to_rfc3339();
+    let mut requeued = 0_u64;
+
+    for row in rows {
+        let item_id: String = row.get("id");
+        let payload_json: String = row.get("payload_json");
+        let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let xcode_required = payload
+            .get("xcode_broker_required")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || payload
+                .get("requested_mcp_server_ids")
+                .and_then(|value| value.as_array())
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .any(|server| server.as_str() == Some("xcode"))
+                })
+                .unwrap_or(false);
+        let stale_cutoff = if xcode_required {
+            xcode_stale_cutoff
+        } else {
+            standard_stale_cutoff
+        };
+        let stale_cutoff_rfc3339 = stale_cutoff.to_rfc3339();
+        let work_started_at = row
+            .get::<Option<String>, _>("work_started_at")
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let generation_created_at = row
+            .get::<Option<String>, _>("generation_created_at")
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        if work_started_at.is_none_or(|started| started > stale_cutoff)
+            || generation_created_at.is_none_or(|created| created > stale_cutoff)
+        {
+            continue;
+        }
+
+        supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
+
+        let session_generation_id: String = row.get("session_generation_id");
+        let session_lineage_id: String = row.get("session_lineage_id");
+        sqlx::query(
+            r#"UPDATE session_generations
+               SET status = 'invalidated',
+                   ended_at = ?1,
+                   end_reason = ?2
+               WHERE id = ?3
+                 AND status = 'active'
+                 AND provider_session_id IS NULL"#,
+        )
+        .bind(&scheduled_at_rfc3339)
+        .bind("stale_acp_startup_without_provider_session")
+        .bind(&session_generation_id)
+        .execute(&mut **tx)
+        .await
+        .context("invalidate stale ACP startup session generation")?;
+        sqlx::query(
+            r#"INSERT INTO session_events
+               (id, lineage_id, generation_id, event_type, recorded_at, details_json)
+               VALUES (?1, ?2, ?3, 'invalidated', ?4, ?5)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&session_lineage_id)
+        .bind(&session_generation_id)
+        .bind(&scheduled_at_rfc3339)
+        .bind(
+            serde_json::json!({
+                "reason": "stale_acp_startup_without_provider_session",
+                "stale_cutoff": stale_cutoff_rfc3339,
+                "source_work_item_id": item_id,
+            })
+            .to_string(),
+        )
+        .execute(&mut **tx)
+        .await
+        .context("insert stale ACP startup session invalidation event")?;
+
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("p058_claimed");
+            object.insert(
+                "p061_startup_recovery".to_string(),
+                serde_json::json!({
+                    "requeued_at": scheduled_at_rfc3339.clone(),
+                    "reason": reason,
+                    "stale_cutoff": stale_cutoff_rfc3339,
+                }),
+            );
+        }
+        let updated = sqlx::query(
+            r#"UPDATE work_items
+               SET status = ?1,
+                   payload_json = ?2,
+                   started_at = NULL,
+                   completed_at = NULL,
+                   failed_at = NULL,
+                   last_error = ?3
+               WHERE id = ?4 AND status = ?5"#,
+        )
+        .bind(&pending)
+        .bind(serde_json::to_string(&payload)?)
+        .bind(reason)
+        .bind(&item_id)
+        .bind(&running)
+        .execute(&mut **tx)
+        .await
+        .context("requeue stale starting InvokeAgent work item")?
         .rows_affected();
         requeued += updated;
     }
@@ -789,6 +1187,7 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
         {
             continue;
         }
+        supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
         if let Some(object) = payload.as_object_mut() {
             object.remove("p058_claimed");
             object.insert(
@@ -1631,6 +2030,79 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
             Some(stage_execution_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_requeue_strips_preclaim_so_retry_gets_new_execution() {
+        let pool = crate::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let now = Utc::now();
+        let item = WorkItem {
+            id: "invoke-startup-retry".to_string(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "p058_claimed": {
+                    "agent_execution_id": domain::ids::AgentExecutionId::new().to_string(),
+                    "session_generation_id": uuid::Uuid::new_v4().to_string()
+                }
+            })
+            .to_string(),
+            status: WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("review".to_string()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: Some("old runtime vanished".to_string()),
+        };
+        enqueue(&pool, &item)
+            .await
+            .expect("insert running work item");
+
+        let requeued = {
+            let mut tx = crate::pool::begin_immediate_with_retry(
+                &pool,
+                "test.startup_requeue_strips_preclaim",
+            )
+            .await
+            .unwrap();
+            let count = requeue_running_invoke_agent_on_startup_tx(
+                &mut tx,
+                now + Duration::seconds(5),
+                "startup_repair_abandoned_invoke_agent",
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            count
+        };
+
+        assert_eq!(requeued, 1);
+        let items = list_by_run(&pool, run_id).await.expect("list by run");
+        let requeued_item = items
+            .iter()
+            .find(|item| item.id == "invoke-startup-retry")
+            .expect("requeued item");
+        assert_eq!(requeued_item.status, WorkItemStatus::Pending);
+        assert_eq!(
+            requeued_item.last_error.as_deref(),
+            Some("startup_repair_abandoned_invoke_agent")
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&requeued_item.payload_json).expect("payload json");
+        assert!(payload.get("p058_claimed").is_none());
+        assert_eq!(
+            payload
+                .pointer("/p061_startup_recovery/reason")
+                .and_then(|value| value.as_str()),
+            Some("startup_repair_abandoned_invoke_agent")
         );
     }
 

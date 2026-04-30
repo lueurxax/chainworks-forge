@@ -67,6 +67,7 @@ pub enum CommandResult {
         conflict_id: String,
         selected_transition_id: String,
         selected_next_state_id: String,
+        retry_instruction_binding_id: Option<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -1586,6 +1587,14 @@ impl CommandHandler {
                 if c.resolution_reason.trim().is_empty() {
                     anyhow::bail!("resolution_reason is required");
                 }
+                let validated_instruction = if let Some(ref raw) = c.operator_instruction {
+                    Some(
+                        domain::retry_instruction::validate_operator_instruction(raw)
+                            .map_err(|e| anyhow!("operator_instruction validation: {e}"))?,
+                    )
+                } else {
+                    None
+                };
 
                 let now = Utc::now();
                 let tx_started = Instant::now();
@@ -1685,6 +1694,9 @@ impl CommandHandler {
                     .filter(|stage| stage.stage_id == selected_next_state_id)
                     .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at));
                 let mut enqueued_stage_id = None;
+                let mut retry_stage_execution_id = None;
+                let mut source_stage_execution_id = None;
+                let mut retry_attempt_number = None;
                 if let Some(previous) = latest_target_stage {
                     if matches!(
                         previous.status,
@@ -1714,9 +1726,52 @@ impl CommandHandler {
                             retry_reason: Some("operator_conflict_resolution".into()),
                         };
                         enqueued_stage_id = Some(next_stage.stage_id.clone());
+                        retry_stage_execution_id = Some(next_stage.id);
+                        source_stage_execution_id = Some(previous.id);
+                        retry_attempt_number = Some(next_stage.attempt_number);
                         stages::insert_tx(&mut tx, &next_stage).await?;
                     }
                 }
+                let retry_instruction_binding_id = if let Some(ref instruction_text) =
+                    validated_instruction
+                {
+                    let retry_stage_execution_id = retry_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a newly created retry stage for selected workflow transition"
+                            )
+                        })?;
+                    let source_stage_execution_id = source_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a source stage for selected workflow transition"
+                            )
+                        })?;
+                    let retry_attempt_number = retry_attempt_number.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires retry attempt metadata for selected workflow transition"
+                            )
+                        })?;
+                    let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                            &mut tx,
+                            &domain::retry_instruction::RetryInstructionBindingInput {
+                                journal_id: journal_id.to_string(),
+                                run_id: c.run_id,
+                                stage_id: selected_next_state_id.clone(),
+                                source_stage_execution_id,
+                                retry_stage_execution_id,
+                                retry_attempt_number,
+                                target_agent_execution_id: None,
+                                scope_kind:
+                                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry,
+                                instruction_text: instruction_text.clone(),
+                                created_by_principal_id: caller.principal_id.clone(),
+                                created_by_principal_class: caller.principal_class.to_string(),
+                            },
+                        )
+                        .await?;
+                    Some(binding.binding_id)
+                } else {
+                    None
+                };
 
                 sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                     .bind(RunStatus::Running.to_string())
@@ -1793,6 +1848,7 @@ impl CommandHandler {
                     conflict_id: conflict.conflict_id,
                     selected_transition_id: c.selected_transition_id,
                     selected_next_state_id,
+                    retry_instruction_binding_id,
                 })
             }
 

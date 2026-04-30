@@ -173,6 +173,12 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
     if lower.contains("xcode") && (lower.contains("permission") || lower.contains("modal")) {
         return RuntimeFailureObservation::McpPermissionModalStall;
     }
+    if lower.contains("xcode_mcp_initialize_timeout")
+        || lower.contains("xcode_mcp_warmup_failed")
+        || (lower.contains("xcode") && lower.contains("mcp") && lower.contains("timeout"))
+    {
+        return RuntimeFailureObservation::McpPermissionModalStall;
+    }
     if lower.contains("permission") && lower.contains("required") {
         return RuntimeFailureObservation::ProviderPermissionRequired;
     }
@@ -211,6 +217,11 @@ fn observation_from_typed_payload(message: &str) -> Option<RuntimeFailureObserva
     let value = serde_json::from_str::<serde_json::Value>(json_slice).ok()?;
     let observation_kind = value.get("observation_kind")?.as_str()?;
     let failure_scope = value.get("failure_scope").and_then(|value| value.as_str());
+    let server_id = value.get("server_id").and_then(|value| value.as_str());
+    let broker_used = value
+        .get("broker_used")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let host_env_error_kind = value
         .get("host_env_error_kind")
         .and_then(|value| value.as_str());
@@ -220,6 +231,11 @@ fn observation_from_typed_payload(message: &str) -> Option<RuntimeFailureObserva
             if failure_scope == Some("host_environment") || host_env_error_kind.is_some() =>
         {
             Some(RuntimeFailureObservation::XcodeHostEnvironmentError)
+        }
+        "backend_start_failed"
+            if failure_scope == Some("startup") && (server_id == Some("xcode") || broker_used) =>
+        {
+            Some(RuntimeFailureObservation::McpPermissionModalStall)
         }
         "backend_start_failed" if failure_scope == Some("startup") => {
             Some(RuntimeFailureObservation::McpStartupTimeout)
@@ -541,6 +557,12 @@ mod tests {
             observation_from_acp_error_message("ACP session closed during active prompt"),
             RuntimeFailureObservation::TransportClosed
         );
+        assert_eq!(
+            observation_from_acp_error_message(
+                "xcode_mcp_warmup_failed: initialize lease 'lease-1': xcode_mcp_initialize_timeout: timed out after 600s waiting for brokered Xcode MCP method 'initialize'"
+            ),
+            RuntimeFailureObservation::McpPermissionModalStall
+        );
     }
 
     #[test]
@@ -593,7 +615,7 @@ mod tests {
             observation_from_acp_error_message(
                 r#"{"observation_kind":"backend_start_failed","server_id":"xcode","broker_used":true,"failure_scope":"startup","elapsed_ms":30000}"#
             ),
-            RuntimeFailureObservation::McpStartupTimeout
+            RuntimeFailureObservation::McpPermissionModalStall
         );
         assert_eq!(
             observation_from_acp_error_message(
