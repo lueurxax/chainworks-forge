@@ -26,6 +26,7 @@ The macOS thin UI is a **read-side consumer and human-gate resolver** of the Gra
 - It does **NOT** use GraphQL mutations EXCEPT for the `approveApproval` and `rejectApproval` human-gate path.
 - It does **NOT** use local workflow mutation fallback.
 - It does **NOT** probe raw truth from SwiftData or filesystem (except for authorized artifact display).
+- **P041 readiness**: if parity readiness is shown in the UI, it must be consumed from a daemon-owned GraphQL read surface derived from runtime artifacts, never from direct file reads.
 
 MCP command/control — `runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `ideas.create`, `steward.run_analysis` — lives on the operator-facing MCP surface and is invoked directly by operators (via MCP tools in CLI / automation / scripted clients) or by separate follow-up transport proposals. A client that issues MCP mutations ("command UI") is out of scope for the governed thin UI and for this reference document.
 

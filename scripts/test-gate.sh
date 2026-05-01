@@ -2270,6 +2270,31 @@ PY
     done
     (
       cd "$ROOT_DIR/control-plane"
+      # Capture git provenance once before any replay work begins (Section 6.2/6.3).
+      # Exported as P041_GIT_* env vars so cargo test can embed the same provenance
+      # in per-fixture server-replay.json and behavioral-diff-report.json artifacts.
+      _p041_commit=$(git rev-parse HEAD 2>/dev/null || true)
+      _p041_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)
+      _p041_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null || true)
+      _p041_clean=$([ -z "$_p041_status" ] && echo true || echo false)
+      _p041_line_count=$(printf '%s' "$_p041_status" | grep -c . 2>/dev/null || echo 0)
+      # sha256: prefer shasum (macOS), fall back to sha256sum (Linux)
+      _p041_sha256=$(printf '%s' "$_p041_status" | shasum -a 256 2>/dev/null | cut -d' ' -f1 \
+                     || printf '%s' "$_p041_status" | sha256sum 2>/dev/null | cut -d' ' -f1 \
+                     || echo "")
+      export P041_GIT_COMMIT_SHA="$_p041_commit"
+      export P041_GIT_TREE_ID="$_p041_tree"
+      export P041_GIT_TREE_CLEAN="$_p041_clean"
+      export P041_GIT_STATUS_SNAPSHOT_LINE_COUNT="$_p041_line_count"
+      export P041_GIT_STATUS_SNAPSHOT_SHA256="$_p041_sha256"
+      # Generate a unique publication_generation_id for this gate run.
+      # Exported so all cargo test binaries embed the same generation ID in their
+      # artifacts (server-replay.json, behavioral-diff-report.json, row/detail).
+      _p041_gen_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "ts-unknown")
+      _p041_gen_rand=$(od -vAn -N4 -tx4 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-8 \
+                       || printf '%08x' $((RANDOM * RANDOM % 0xffffffff)))
+      export P041_PUBLICATION_GENERATION_ID="p041-${_p041_gen_ts}-${_p041_gen_rand}"
+      echo "[INFO] p041 generation ${P041_PUBLICATION_GENERATION_ID}"
       cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
       cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
       cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
@@ -2277,8 +2302,10 @@ PY
       cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
       cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
       cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
+      cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
       python3 - <<'PY'
 import json
+import subprocess
 from pathlib import Path
 
 fixtures = [
@@ -2363,9 +2390,254 @@ for fixture_id in fixtures:
             raise SystemExit(f"proposal-041: shadow report missing correlation key {key} in {shadow_report_path}")
     if shadow.get("fixture_or_capture_id") != fixture_id:
         raise SystemExit(f"proposal-041: shadow report fixture correlation mismatch in {shadow_report_path}")
+
+# ── Summary grid (Section 5.1): 7×6 fixture-by-surface matrix ───────────────
+# Build grid from surface_comparisons in each behavioral-diff-report.json.
+SURFACE_ORDER = [
+    "canonical_domain_state", "projections", "graphql_readback",
+    "mcp_report_readback", "artifact_identity", "operator_summary",
+]
+# status → grid token (Section 5 table)
+_STATUS_TOKEN = {"matched": "PASS", "diverged": "FAIL", "timed_out": "TIMEOUT", "missing_evidence": "MISS"}
+
+grid = {}
+for _fid in fixtures:
+    grid[_fid] = {}
+    _rp = Path("target/parity/reports") / _fid / "behavioral-diff-report.json"
+    if _rp.is_file():
+        _r = json.loads(_rp.read_text())
+        for _cmp in _r.get("surface_comparisons", []):
+            _surf = _cmp.get("surface", "")
+            _grid_tok = _STATUS_TOKEN.get(_cmp.get("status", ""), "FAIL")
+            if _surf:
+                grid[_fid][_surf] = _grid_tok
+    # Surfaces absent from surface_comparisons → MISS
+    for _surf in SURFACE_ORDER:
+        grid[_fid].setdefault(_surf, "MISS")
+
+import shutil as _shutil
+_term_w = _shutil.get_terminal_size((80, 24)).columns
+_CELL = 9  # each cell is 9 chars wide including trailing space (fits "TIMEOUT  ")
+_max_fix_len = max(len(f) for f in fixtures)
+_wide_needed = _max_fix_len + 2 + _CELL * len(SURFACE_ORDER)
+
+if _term_w >= _wide_needed:
+    # Wide grid — full fixture ids, 9-char cells
+    _surf_abbr = ["canonical", "projection", "graphql", "mcp", "artifact", "summary"]
+    _hdr = f"{'fixture':<{_max_fix_len}}  " + "".join(f"{a:<{_CELL}}" for a in _surf_abbr)
+    print(_hdr)
+    for _fid in fixtures:
+        _row = f"{_fid:<{_max_fix_len}}  " + "".join(
+            f"{grid[_fid].get(s, 'MISS'):<{_CELL}}" for s in SURFACE_ORDER
+        )
+        print(_row)
+else:
+    # Narrow-terminal fallback: two lines per fixture, single-char tokens
+    _abbrev = {
+        "canonical_domain_state": "canon", "projections": "proj",
+        "graphql_readback": "gql", "mcp_report_readback": "mcp",
+        "artifact_identity": "art", "operator_summary": "sum",
+    }
+    _TOKEN = {"PASS": "P", "FAIL": "F", "MISS": "M", "SKIP": "S", "TIMEOUT": "T"}
+    for _fid in fixtures:
+        print(_fid)
+        _g = grid[_fid]
+        _s1 = SURFACE_ORDER[:3]
+        _s2 = SURFACE_ORDER[3:]
+        print("  " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s1))
+        print("  " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s2))
+    print("Legend: P=PASS F=FAIL")
+    print("Legend: M=MISS S=SKIP T=TIMEOUT")
+
+# Compute per-fixture pass/fail counts for the final summary line.
+passed_count = sum(
+    1 for _fid in fixtures
+    if all(grid[_fid].get(s, "MISS") == "PASS" for s in SURFACE_ORDER)
+)
+failed_count = sum(
+    1 for _fid in fixtures
+    if any(grid[_fid].get(s, "MISS") not in ("PASS", "TIMEOUT") for s in SURFACE_ORDER)
+)
+missing_count = sum(
+    1 for _fid in fixtures
+    if any(grid[_fid].get(s, "MISS") == "MISS" for s in SURFACE_ORDER)
+)
+
+# Validate runtime row and detail artifacts (Phase C P031 cutover acceptance)
+row_path = Path("target/parity/publication/current/p031-phase-0-manifest-row.json")
+detail_path = Path("target/parity/publication/current/p031-p041-parity-evidence.json")
+if not row_path.is_file():
+    raise SystemExit(f"proposal-041: runtime row missing at {row_path}")
+if not detail_path.is_file():
+    raise SystemExit(f"proposal-041: runtime detail missing at {detail_path}")
+
+row = json.loads(row_path.read_text())
+detail = json.loads(detail_path.read_text())
+
+if row.get("schema_version") != "p031-phase-0-runtime-manifest-row.v1":
+    raise SystemExit(f"proposal-041: bad row schema_version: {row.get('schema_version')}")
+if detail.get("schema_version") != "p031-p041-parity-evidence.v1":
+    raise SystemExit(f"proposal-041: bad detail schema_version: {detail.get('schema_version')}")
+if row.get("id") != "p041_parity_evidence":
+    raise SystemExit(f"proposal-041: row.id must be p041_parity_evidence, got {row.get('id')}")
+if row.get("detail_schema_version") != detail.get("schema_version"):
+    raise SystemExit(
+        f"proposal-041: row.detail_schema_version {row.get('detail_schema_version')} "
+        f"!= detail.schema_version {detail.get('schema_version')}"
+    )
+if row.get("validation_status") != detail.get("overall_status"):
+    raise SystemExit(
+        f"proposal-041: row.validation_status {row.get('validation_status')} "
+        f"!= detail.overall_status {detail.get('overall_status')}"
+    )
+if row.get("publication_state") != detail.get("publication_state"):
+    raise SystemExit("proposal-041: row.publication_state != detail.publication_state")
+if row.get("publication_generation_id") != detail.get("publication_generation_id"):
+    raise SystemExit("proposal-041: row.publication_generation_id != detail.publication_generation_id")
+
+required_fixtures = [
+    "proposal-loop-basic", "implementation-refine-review", "approval-pause-resume",
+    "retry-recovery-flow", "cancelled-or-blocked-run", "terminal-report-evidence",
+    "projection-readback-surface",
+]
+required_surfaces = [
+    "canonical_domain_state", "projections", "graphql_readback",
+    "mcp_report_readback", "artifact_identity", "operator_summary",
+]
+if detail.get("required_fixtures") != required_fixtures:
+    raise SystemExit(f"proposal-041: detail.required_fixtures mismatch")
+if detail.get("required_surfaces") != required_surfaces:
+    raise SystemExit(f"proposal-041: detail.required_surfaces mismatch")
+
+# Live-checkout comparison: required when claiming ready_same_tree_verified.
+# Blocked artifacts (including schema-validation-only test artifacts) do not
+# require checkout comparison — only ready publication must match the live tree.
+# No sentinel bypass: any row claiming ready_same_tree_verified must carry real
+# provenance that matches the live HEAD or the gate fails closed.
+if row.get("validation_status") == "ready_same_tree_verified":
+    try:
+        live_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        live_tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        prov = row.get("provenance", {})
+        row_commit = prov.get("commit_sha", "")
+        row_tree = prov.get("tree_id", "")
+        if live_commit and row_commit and row_commit != live_commit:
+            raise SystemExit(
+                f"proposal-041: runtime row commit_sha {row_commit[:12]} does not match "
+                f"live HEAD {live_commit[:12]}; rerun the gate on the same clean tree"
+            )
+        if live_tree and row_tree and row_tree != live_tree:
+            raise SystemExit(
+                f"proposal-041: runtime row tree_id {row_tree[:12]} does not match "
+                f"live HEAD^{{tree}} {live_tree[:12]}; rerun the gate on the same clean tree"
+            )
+        prov_line_count = prov.get("status_snapshot_line_count", 1)
+        if not prov.get("tree_clean") or prov_line_count != 0:
+            raise SystemExit(
+                f"proposal-041: ready_same_tree_verified requires tree_clean=true and "
+                f"status_snapshot_line_count=0; got tree_clean={prov.get('tree_clean')} "
+                f"line_count={prov_line_count}"
+            )
+    except subprocess.CalledProcessError:
+        pass  # Not in a git repo; skip live-checkout comparison
+
+# Row vs detail provenance agreement (Section 6.2): required for ready publication.
+if row.get("validation_status") == "ready_same_tree_verified":
+    row_prov = row.get("provenance", {})
+    detail_prov = detail.get("provenance", {})
+    for prov_field in (
+        "commit_sha", "tree_id", "tree_clean",
+        "status_snapshot_sha256", "status_snapshot_line_count",
+    ):
+        rv, dv = row_prov.get(prov_field), detail_prov.get(prov_field)
+        if rv != dv:
+            raise SystemExit(
+                f"proposal-041: row.provenance.{prov_field} ({rv!r}) != "
+                f"detail.provenance.{prov_field} ({dv!r}); "
+                "row and detail must agree on all provenance fields for ready publication"
+            )
+
+# Explicit detail.provenance vs live checkout (Section 6.6 Decision 4).
+# Checking row.provenance against live is not sufficient — a stale detail that
+# agrees with row on status/state/generation could still carry stale provenance.
+if row.get("validation_status") == "ready_same_tree_verified":
+    detail_prov = detail.get("provenance", {})
+    try:
+        _detail_live_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        _detail_live_tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if _detail_live_commit and detail_prov.get("commit_sha") and \
+                detail_prov.get("commit_sha") != _detail_live_commit:
+            raise SystemExit(
+                f"proposal-041: detail.provenance.commit_sha "
+                f"{detail_prov.get('commit_sha', '')[:12]} does not match "
+                f"live HEAD {_detail_live_commit[:12]}; rerun the gate on the same clean tree"
+            )
+        if _detail_live_tree and detail_prov.get("tree_id") and \
+                detail_prov.get("tree_id") != _detail_live_tree:
+            raise SystemExit(
+                f"proposal-041: detail.provenance.tree_id "
+                f"{detail_prov.get('tree_id', '')[:12]} does not match "
+                f"live HEAD^{{tree}} {_detail_live_tree[:12]}; rerun the gate on the same clean tree"
+            )
+    except subprocess.CalledProcessError:
+        pass  # Not in a git repo; skip live-checkout comparison for detail
+
+# Status-to-prefix mapping per proposal Section 5 table.
+STATUS_TO_PREFIX = {
+    "ready_same_tree_verified": "PASS",
+    "blocked_missing_evidence": "FAIL",
+    "blocked_divergence": "FAIL",
+    "blocked_manual_recovery": "FAIL",
+    "blocked_dirty_tree": "WARN",
+    "blocked_timeout": "WARN",
+    "blocked_interrupted": "WARN",
+    "blocked_in_progress": "INFO",
+}
+validation_status = row.get("validation_status", "")
+prefix = STATUS_TO_PREFIX.get(validation_status, "FAIL")
+
+# Print blocking diagnostics from the runtime detail artifact (Section 5.1 / 6.2).
+# Operators see these before the final status line so they can act without opening
+# the JSON file. blocking_reasons and missing_evidence are populated by the
+# runtime publication test for every non-ready publication.
+if validation_status != "ready_same_tree_verified":
+    for reason in detail.get("blocking_reasons", []):
+        print(f"[{prefix}] blocking_reason={reason}")
+    for item in detail.get("missing_evidence", []):
+        if isinstance(item, dict):
+            print(
+                f"[{prefix}] missing_evidence"
+                f" missing_path={item.get('missing_path', 'unknown')}"
+                f" expected_producer={item.get('expected_producer', 'unknown')}"
+                f" affected_fixture_or_surface={item.get('affected_fixture_or_surface', 'unknown')}"
+                f" next_action={item.get('next_action', 'unknown')}"
+            )
+        else:
+            print(f"[{prefix}] missing_evidence={item}")
+
+# The markdown companion is not generated in the current implementation.
+# Per Section 5.1: when the markdown companion is absent, the final footer
+# must say "JSON-only evidence" before printing the detail= path.
+print(f"[{prefix}] status={validation_status} passed_fixtures={passed_count} failed_fixtures={failed_count} missing_evidence={missing_count}")
+print(f"[INFO] JSON-only evidence")
+print(f"[INFO] row={row_path}")
+print(f"[INFO] detail={detail_path}")
+if validation_status != "ready_same_tree_verified":
+    raise SystemExit(
+        f"proposal-041: gate status is {validation_status}, not ready_same_tree_verified; "
+        f"inspect runtime detail at {detail_path}"
+    )
 PY
     )
-    log "Proposal 041 control-plane gate passed"
+    log "Proposal 041 control-plane gate: ready_same_tree_verified"
     ;;
   proposal-043|p043)
     log "Proposal 043 control-plane gate: GraphQL projection read contract"
@@ -2455,8 +2727,8 @@ for freshness in [
     require_contains(freshness, f"projection freshness {freshness}")
 
 for subscription in [
-    "`runStatusChanged(runID:)`",
-    "`stageStatusChanged(runID:)`",
+    "`runStatusChanged(runId:)`",
+    "`stageStatusChanged(runId:)`",
     "`approvalRequested`",
     "`approvalResolved`",
     "`runtimeStatusChanged`",

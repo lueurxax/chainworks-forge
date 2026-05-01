@@ -5622,7 +5622,7 @@ mod tests {
                       }}
                     }}
                     "#
-                )))
+                )).data(test_principal()))
                 .await;
             assert!(
                 response.errors.is_empty(),

@@ -84,6 +84,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure
 - [reference/test-gates.md](reference/test-gates.md) — Layered fast/UI/focused/full gates
+- [reference/p041-generated-artifact-schemas.md](reference/p041-generated-artifact-schemas.md) — Versioned schemas for runtime parity artifacts, publication rows, and work products (P041)
 - [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — Agent-facing UI execution rules
 
 ### Risk analysis

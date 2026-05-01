@@ -23,6 +23,7 @@ async-trait = "0.1"
 md-5 = "0.10"
 sha2 = "0.10"
 dirs = "5"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

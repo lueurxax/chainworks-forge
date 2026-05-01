@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -55,7 +56,18 @@ REQUIRED_MANIFEST_ENTRY_IDS = {
     "report_payload_priority_decision",
     "ux_accessibility_signoff",
     "dogfood_signoff_template",
+    "p041_parity_evidence",
 }
+
+P041_RUNTIME_ROW_PATH = Path(
+    "control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json"
+)
+P041_RUNTIME_DETAIL_PATH = Path(
+    "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json"
+)
+P041_ROW_SCHEMA_VERSION = "p031-phase-0-runtime-manifest-row.v1"
+P041_DETAIL_SCHEMA_VERSION = "p031-p041-parity-evidence.v1"
+P041_READY_STATUS = "ready_same_tree_verified"
 
 EVIDENCE_BLOCKING_STATUSES = {
     "blocked",
@@ -934,11 +946,142 @@ def validate_phase0_manifest(repo_root: Path) -> GateResult:
     return GateResult(errors)
 
 
+def _git_rev(repo_root: Path, ref: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", ref],
+            cwd=str(repo_root),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def validate_p041_parity_row(repo_root: Path) -> GateResult:
+    errors: list[str] = []
+    row_path = repo_root / P041_RUNTIME_ROW_PATH
+    if not row_path.is_file():
+        errors.append(
+            f"P041 runtime row not found at {P041_RUNTIME_ROW_PATH}; "
+            "run './scripts/test-gate.sh proposal-041' on a clean tree first"
+        )
+        return GateResult(errors)
+
+    try:
+        row = json.loads(row_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        errors.append(f"P041 runtime row unreadable: {exc}")
+        return GateResult(errors)
+
+    if row.get("schema_version") != P041_ROW_SCHEMA_VERSION:
+        errors.append(
+            f"P041 runtime row schema_version mismatch: "
+            f"expected {P041_ROW_SCHEMA_VERSION}, got {row.get('schema_version')}"
+        )
+
+    if row.get("detail_schema_version") != P041_DETAIL_SCHEMA_VERSION:
+        errors.append(
+            f"P041 runtime row detail_schema_version mismatch: "
+            f"expected {P041_DETAIL_SCHEMA_VERSION}, got {row.get('detail_schema_version')}"
+        )
+
+    live_commit = _git_rev(repo_root, "HEAD")
+    live_tree = _git_rev(repo_root, "HEAD^{tree}")
+    prov = row.get("provenance", {})
+    row_commit = prov.get("commit_sha", "")
+    row_tree = prov.get("tree_id", "")
+    row_clean = prov.get("tree_clean", False)
+    row_line_count = prov.get("status_snapshot_line_count", -1)
+
+    if live_commit and row_commit and row_commit != live_commit:
+        errors.append(
+            f"P041 runtime row commit_sha {row_commit[:12]} does not match live HEAD "
+            f"{live_commit[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+    if live_tree and row_tree and row_tree != live_tree:
+        errors.append(
+            f"P041 runtime row tree_id {row_tree[:12]} does not match live HEAD^{{tree}} "
+            f"{live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+
+    if row.get("validation_status") == P041_READY_STATUS:
+        if not row_clean:
+            errors.append(
+                "P041 runtime row reports ready_same_tree_verified but tree_clean is false"
+            )
+        if row_line_count != 0:
+            errors.append(
+                f"P041 runtime row reports ready_same_tree_verified but "
+                f"status_snapshot_line_count is {row_line_count} (expected 0)"
+            )
+
+    detail_path = repo_root / P041_RUNTIME_DETAIL_PATH
+    if detail_path.is_file():
+        try:
+            detail = json.loads(detail_path.read_text())
+            if detail.get("schema_version") != P041_DETAIL_SCHEMA_VERSION:
+                errors.append(
+                    f"P041 runtime detail schema_version mismatch: "
+                    f"expected {P041_DETAIL_SCHEMA_VERSION}, got {detail.get('schema_version')}"
+                )
+            if row.get("validation_status") != detail.get("overall_status"):
+                errors.append(
+                    "P041 row.validation_status does not equal detail.overall_status: "
+                    f"{row.get('validation_status')} != {detail.get('overall_status')}"
+                )
+            if row.get("publication_state") != detail.get("publication_state"):
+                errors.append(
+                    "P041 row.publication_state does not equal detail.publication_state"
+                )
+            if row.get("publication_generation_id") != detail.get("publication_generation_id"):
+                errors.append(
+                    "P041 row.publication_generation_id does not equal detail.publication_generation_id"
+                )
+            # Section 6.2 / 6.6 Decision 4: for ready publication, detail.provenance must
+            # agree with row.provenance AND with the live checkout. Checking only row.provenance
+            # against live is insufficient — a stale detail with matching row provenance would pass.
+            if row.get("validation_status") == P041_READY_STATUS:
+                detail_prov = detail.get("provenance", {})
+                prov_fields = (
+                    "commit_sha", "tree_id", "tree_clean",
+                    "status_snapshot_sha256", "status_snapshot_line_count",
+                )
+                for pfield in prov_fields:
+                    dv = detail_prov.get(pfield)
+                    rv = prov.get(pfield)
+                    if dv != rv:
+                        errors.append(
+                            f"P041 detail.provenance.{pfield} ({dv!r}) does not match "
+                            f"row.provenance.{pfield} ({rv!r}); "
+                            "row and detail provenance must agree for ready publication"
+                        )
+                if live_commit and detail_prov.get("commit_sha") and \
+                        detail_prov.get("commit_sha") != live_commit:
+                    errors.append(
+                        f"P041 detail.provenance.commit_sha "
+                        f"{detail_prov.get('commit_sha', '')[:12]} does not match "
+                        f"live HEAD {live_commit[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+                    )
+                if live_tree and detail_prov.get("tree_id") and \
+                        detail_prov.get("tree_id") != live_tree:
+                    errors.append(
+                        f"P041 detail.provenance.tree_id "
+                        f"{detail_prov.get('tree_id', '')[:12]} does not match "
+                        f"live HEAD^{{tree}} {live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+                    )
+        except (json.JSONDecodeError, OSError) as exc:
+            errors.append(f"P041 runtime detail unreadable: {exc}")
+
+    return GateResult(errors)
+
+
 def validate_p031_contracts(repo_root: Path) -> GateResult:
     errors: list[str] = []
     errors.extend(validate_inventory(repo_root).errors)
     errors.extend(validate_write_path_guide(repo_root).errors)
     errors.extend(validate_phase0_manifest(repo_root).errors)
+    errors.extend(validate_p041_parity_row(repo_root).errors)
     return GateResult(errors)
 
 
