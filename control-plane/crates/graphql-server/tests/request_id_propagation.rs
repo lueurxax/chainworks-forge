@@ -141,11 +141,12 @@ async fn build_app(pool: SqlitePool) -> Router {
         WorkQueue::new(pool.clone()),
     ));
     let reporter = LifecycleReporter::new(0, "test", events.clone());
+    let principal_table = auth::PrincipalTable::test_fixture();
     let schema = graphql_server::schema::build_schema(
         pool,
         cmd_handler,
         events,
-        auth::PrincipalTable::test_fixture(),
+        principal_table.clone(),
         reporter.clone(),
     );
     // `start_with_extra_routes` is private; rebuild the router via the
@@ -180,15 +181,14 @@ async fn build_app(pool: SqlitePool) -> Router {
         }
         schema.execute(request).await.into()
     }
-    let pt = auth::PrincipalTable::test_fixture();
+    let auth_table = principal_table.clone();
     router
         .route("/graphql", get(playground).post(gql))
         .layer(middleware::from_fn(move |req, next| {
-            let table = pt.clone();
+            let table = auth_table.clone();
             async move { graphql_server::auth_layer::require_auth(req, next, table).await }
         }))
         .layer(Extension(schema))
-        .layer(Extension(auth::PrincipalTable::test_fixture()))
         .layer(Extension(reporter))
         .layer(middleware::from_fn(graphql_server::request_id::layer))
 }

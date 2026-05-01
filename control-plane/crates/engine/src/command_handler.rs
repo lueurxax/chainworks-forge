@@ -228,15 +228,48 @@ fn is_release_agent(agent_id: &str) -> bool {
 fn retry_requires_effect_reconciliation(
     stage: &StageExecution,
     target_agent_id: Option<&str>,
+    has_release_post_approval_tasks: bool,
 ) -> bool {
     let stage_type_requires_guard = matches!(
         stage.stage_type.as_deref(),
         Some("release" | "side_effect" | "side-effect")
     );
     stage_type_requires_guard
+        || has_release_post_approval_tasks
         || is_release_agent(&stage.stage_id)
         || stage.owner_agent.as_deref().is_some_and(is_release_agent)
         || target_agent_id.is_some_and(is_release_agent)
+}
+
+fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
+    let plan = match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json)) => {
+            workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                run.agent_catalog_yaml_path.as_deref().unwrap_or("."),
+            )?
+        }
+        _ => match (
+            run.workflow_yaml_path.as_deref(),
+            run.agent_catalog_yaml_path.as_deref(),
+        ) {
+            (Some(workflow_path), Some(catalog_path)) => {
+                workflow::compiler::compile(workflow_path, catalog_path)?
+            }
+            _ => return Ok(false),
+        },
+    };
+
+    Ok(plan.states.get(stage_id).is_some_and(|state| {
+        state
+            .post_approval_tasks
+            .iter()
+            .any(|task| is_release_agent(&task.agent.agent_id))
+    }))
 }
 
 fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error {
@@ -1456,7 +1489,24 @@ impl CommandHandler {
                     return Err(error);
                 }
 
-                if retry_requires_effect_reconciliation(old_stage, None) {
+                let has_release_post_approval_tasks =
+                    match retry_state_has_release_post_approval_tasks(&run, &old_stage.stage_id) {
+                        Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+                        Err(e) => {
+                            warn!(
+                                run_id = %c.run_id,
+                                stage_id = %old_stage.stage_id,
+                                error = %e,
+                                "RetryStage side-effect preflight could not inspect post_approval_tasks"
+                            );
+                            false
+                        }
+                    };
+                if retry_requires_effect_reconciliation(
+                    old_stage,
+                    None,
+                    has_release_post_approval_tasks,
+                ) {
                     let error = requires_effect_reconciliation_error(old_stage);
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
@@ -3050,8 +3100,34 @@ impl CommandHandler {
                 old_stage.status
             ));
         }
-        if retry_requires_effect_reconciliation(&old_stage, Some(&target_exec.agent_id)) {
-            return Err(requires_effect_reconciliation_error(&old_stage));
+        let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
+            &run,
+            &old_stage.stage_id,
+        ) {
+            Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %old_stage.stage_id,
+                    error = %e,
+                    "RetryAgentExecution side-effect preflight could not inspect post_approval_tasks"
+                );
+                false
+            }
+        };
+        if retry_requires_effect_reconciliation(
+            &old_stage,
+            Some(&target_exec.agent_id),
+            has_release_post_approval_tasks,
+        ) {
+            let error = requires_effect_reconciliation_error(&old_stage);
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
         }
 
         let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
