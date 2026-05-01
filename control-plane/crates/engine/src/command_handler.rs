@@ -1,5 +1,5 @@
 use acp::AcpRuntimeManager;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::Path;
@@ -13,6 +13,7 @@ use db::repos::{
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use domain::PrincipalClass;
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
@@ -26,12 +27,11 @@ use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
-use domain::PrincipalClass;
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
 use crate::preflight::{
-    missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
+    DeliveryPreflightResult, missing_delivery_configuration_preflight, run_delivery_preflight,
 };
 use crate::work_queue::WorkQueue;
 
@@ -299,7 +299,12 @@ fn targeted_retry_provider_fallback(
                     .any(|value| value.as_str() == Some("proposal_current"))
             })
             .unwrap_or(false);
-    if !is_proposal_review && !is_proposal_review_aggregation && !is_proposal_authoring {
+    let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
+    if !is_proposal_review
+        && !is_proposal_review_aggregation
+        && !is_proposal_authoring
+        && !is_docs_guardian
+    {
         return None;
     }
     let source_failed_without_required_outputs = runtime_facts
@@ -341,6 +346,7 @@ fn targeted_retry_provider_fallback(
         &from_provider,
         is_proposal_review_aggregation,
         is_proposal_authoring,
+        is_docs_guardian,
         profiles,
     )?;
     let profile = profiles.get(fallback_id)?.as_object()?;
@@ -374,6 +380,7 @@ fn targeted_retry_fallback_profile_id<'a>(
     from_provider: &str,
     is_proposal_review_aggregation: bool,
     is_proposal_authoring: bool,
+    is_docs_guardian: bool,
     profiles: &'a serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'a str> {
     if is_proposal_review_aggregation {
@@ -387,6 +394,25 @@ fn targeted_retry_fallback_profile_id<'a>(
             &["claude_writer_high", "claude_product_high"]
         } else {
             &["codex_writer_high", "codex_architect_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_docs_guardian {
+        let candidates: &[&str] = if matches!(from_provider, "gemini" | "gemini_acp") {
+            &[
+                "claude_docs_medium",
+                "claude_design_medium",
+                "codex_architect_high",
+            ]
+        } else {
+            &[
+                "gemini_docs_flash",
+                "claude_docs_medium",
+                "codex_architect_high",
+            ]
         };
         return candidates
             .iter()

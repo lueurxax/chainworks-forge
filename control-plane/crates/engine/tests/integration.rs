@@ -2764,6 +2764,143 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
 }
 
 #[tokio::test]
+async fn test_targeted_retry_falls_back_from_gemini_docs_guardian_backend() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("review".into());
+    run.catalog_snapshot_json = Some(
+        serde_json::json!({
+            "backend_profiles": {
+                "gemini_docs_flash": {
+                    "provider": "gemini_acp",
+                    "model": "gemini-2.5-flash",
+                    "effort": "medium",
+                    "max_turns": 12
+                },
+                "claude_docs_medium": {
+                    "provider": "claude_acp",
+                    "model": "opus",
+                    "effort": "medium",
+                    "max_turns": 12
+                }
+            }
+        })
+        .to_string(),
+    );
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "review".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_docs_guardian = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_docs_guardian.agent_id = "docs_guardian".into();
+    failed_docs_guardian.provider = "gemini_acp".into();
+    failed_docs_guardian.model = Some("gemini-2.5-flash".into());
+    failed_docs_guardian.completed_at = Some(Utc::now());
+    let failed_docs_guardian_id = failed_docs_guardian.id;
+    agent_executions::insert(&pool, &failed_docs_guardian)
+        .await
+        .unwrap();
+    agent_execution_runtime_facts::upsert(
+        &pool,
+        &AgentExecutionRuntimeFacts {
+            agent_execution_id: failed_docs_guardian_id,
+            failure_kind: Some(AgentFailureKind::ProviderTimeout),
+            output_settlement: AgentOutputSettlement::MissingRequiredOutputs,
+            ..AgentExecutionRuntimeFacts::defaults_for(failed_docs_guardian_id, Utc::now())
+        },
+    )
+    .await
+    .unwrap();
+
+    let source_work_item_id = format!("docs-guardian:{old_stage_exec_id}:attempt:1");
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "agent_id": "docs_guardian",
+                "provider": "gemini",
+                "backend_profile_id": "gemini_docs_flash",
+                "model": "gemini-2.5-flash",
+                "effort": "medium",
+                "max_turns": 12,
+                "output_contract": "docs_report_v1",
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_docs_guardian_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("review".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "review".into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: Some(failed_docs_guardian_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let retry_invokes: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(retry_invokes.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+    assert_eq!(payload["agent_id"], serde_json::json!("docs_guardian"));
+    assert_eq!(payload["provider"], serde_json::json!("claude_acp"));
+    assert_eq!(
+        payload["backend_profile_id"],
+        serde_json::json!("claude_docs_medium")
+    );
+    assert_eq!(payload["model"], serde_json::json!("opus"));
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/to_provider"),
+        Some(&serde_json::json!("claude_acp"))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/from_provider"),
+        Some(&serde_json::json!("gemini"))
+    );
+}
+
+#[tokio::test]
 async fn test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_backend() {
     let pool = test_pool().await;
 

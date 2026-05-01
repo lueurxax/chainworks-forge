@@ -173,6 +173,12 @@ loop.
 - `blocked`: code work is finished, but verification is not green (release readiness must be held).
 
 `needs_code_fixes` or `invalid` statuses keep the `code_writer` in the loop.
+The contract parser does not treat a non-blocking code tail as a reason to stay
+in the loop: if `verification_green` is true and every `remaining_code_tasks`
+entry is `blocking=false`, the summary leaves the code loop as
+`handoff_required` even when the raw artifact says `implementation_complete=false`.
+This keeps deferred rollout, evidence, and advisory cleanup from producing an
+infinite code-writer loop.
 
 **Migration and Retirement:**
 The system supports a bounded migration from the legacy `v1` (based on `seemingly_complete`) to the `v2` structured contract:

@@ -168,6 +168,13 @@ The stable status vocabulary is:
 - `complete`: implementation and verification are complete with no blocking handoff.
 - `unknown`: no valid v2 or compatible legacy truth is available yet.
 
+`needs_code_fixes` is reserved for blocking code-writer-owned source or test work.
+If `verification_green` is true and every `remaining_code_tasks` entry is
+`blocking=false`, the parser normalizes the summary out of the code loop as
+`handoff_required` even when the raw artifact says `implementation_complete=false`.
+Non-blocking code-tail notes remain visible in the summary for downstream review,
+but they do not keep scheduling `code_writer`.
+
 Workflow transitions read the active contract row, not raw files. `needs_code_fixes` keeps the run in the implementation
 loop. `complete`, `handoff_required`, and `blocked` leave the code-writer loop and route the run to the downstream
 review, release, or operator decision surfaces that own the remaining work. Legacy `implementation_self_assessment`
