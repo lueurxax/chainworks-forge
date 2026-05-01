@@ -1,5 +1,5 @@
 use acp::AcpRuntimeManager;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::Path;
@@ -13,6 +13,7 @@ use db::repos::{
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use domain::PrincipalClass;
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
@@ -26,12 +27,11 @@ use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
-use domain::PrincipalClass;
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
 use crate::preflight::{
-    missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
+    DeliveryPreflightResult, missing_delivery_configuration_preflight, run_delivery_preflight,
 };
 use crate::work_queue::WorkQueue;
 
@@ -67,6 +67,7 @@ pub enum CommandResult {
         conflict_id: String,
         selected_transition_id: String,
         selected_next_state_id: String,
+        retry_instruction_binding_id: Option<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -298,7 +299,12 @@ fn targeted_retry_provider_fallback(
                     .any(|value| value.as_str() == Some("proposal_current"))
             })
             .unwrap_or(false);
-    if !is_proposal_review && !is_proposal_review_aggregation && !is_proposal_authoring {
+    let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
+    if !is_proposal_review
+        && !is_proposal_review_aggregation
+        && !is_proposal_authoring
+        && !is_docs_guardian
+    {
         return None;
     }
     let source_failed_without_required_outputs = runtime_facts
@@ -340,6 +346,7 @@ fn targeted_retry_provider_fallback(
         &from_provider,
         is_proposal_review_aggregation,
         is_proposal_authoring,
+        is_docs_guardian,
         profiles,
     )?;
     let profile = profiles.get(fallback_id)?.as_object()?;
@@ -373,6 +380,7 @@ fn targeted_retry_fallback_profile_id<'a>(
     from_provider: &str,
     is_proposal_review_aggregation: bool,
     is_proposal_authoring: bool,
+    is_docs_guardian: bool,
     profiles: &'a serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'a str> {
     if is_proposal_review_aggregation {
@@ -386,6 +394,25 @@ fn targeted_retry_fallback_profile_id<'a>(
             &["claude_writer_high", "claude_product_high"]
         } else {
             &["codex_writer_high", "codex_architect_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_docs_guardian {
+        let candidates: &[&str] = if matches!(from_provider, "gemini" | "gemini_acp") {
+            &[
+                "claude_docs_medium",
+                "claude_design_medium",
+                "codex_architect_high",
+            ]
+        } else {
+            &[
+                "gemini_docs_flash",
+                "claude_docs_medium",
+                "codex_architect_high",
+            ]
         };
         return candidates
             .iter()
@@ -1586,6 +1613,14 @@ impl CommandHandler {
                 if c.resolution_reason.trim().is_empty() {
                     anyhow::bail!("resolution_reason is required");
                 }
+                let validated_instruction = if let Some(ref raw) = c.operator_instruction {
+                    Some(
+                        domain::retry_instruction::validate_operator_instruction(raw)
+                            .map_err(|e| anyhow!("operator_instruction validation: {e}"))?,
+                    )
+                } else {
+                    None
+                };
 
                 let now = Utc::now();
                 let tx_started = Instant::now();
@@ -1685,6 +1720,9 @@ impl CommandHandler {
                     .filter(|stage| stage.stage_id == selected_next_state_id)
                     .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at));
                 let mut enqueued_stage_id = None;
+                let mut retry_stage_execution_id = None;
+                let mut source_stage_execution_id = None;
+                let mut retry_attempt_number = None;
                 if let Some(previous) = latest_target_stage {
                     if matches!(
                         previous.status,
@@ -1714,9 +1752,52 @@ impl CommandHandler {
                             retry_reason: Some("operator_conflict_resolution".into()),
                         };
                         enqueued_stage_id = Some(next_stage.stage_id.clone());
+                        retry_stage_execution_id = Some(next_stage.id);
+                        source_stage_execution_id = Some(previous.id);
+                        retry_attempt_number = Some(next_stage.attempt_number);
                         stages::insert_tx(&mut tx, &next_stage).await?;
                     }
                 }
+                let retry_instruction_binding_id = if let Some(ref instruction_text) =
+                    validated_instruction
+                {
+                    let retry_stage_execution_id = retry_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a newly created retry stage for selected workflow transition"
+                            )
+                        })?;
+                    let source_stage_execution_id = source_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a source stage for selected workflow transition"
+                            )
+                        })?;
+                    let retry_attempt_number = retry_attempt_number.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires retry attempt metadata for selected workflow transition"
+                            )
+                        })?;
+                    let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                            &mut tx,
+                            &domain::retry_instruction::RetryInstructionBindingInput {
+                                journal_id: journal_id.to_string(),
+                                run_id: c.run_id,
+                                stage_id: selected_next_state_id.clone(),
+                                source_stage_execution_id,
+                                retry_stage_execution_id,
+                                retry_attempt_number,
+                                target_agent_execution_id: None,
+                                scope_kind:
+                                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry,
+                                instruction_text: instruction_text.clone(),
+                                created_by_principal_id: caller.principal_id.clone(),
+                                created_by_principal_class: caller.principal_class.to_string(),
+                            },
+                        )
+                        .await?;
+                    Some(binding.binding_id)
+                } else {
+                    None
+                };
 
                 sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                     .bind(RunStatus::Running.to_string())
@@ -1793,6 +1874,7 @@ impl CommandHandler {
                     conflict_id: conflict.conflict_id,
                     selected_transition_id: c.selected_transition_id,
                     selected_next_state_id,
+                    retry_instruction_binding_id,
                 })
             }
 
@@ -2541,6 +2623,24 @@ impl CommandHandler {
                             .await?;
                             stage_status_event = Some((stage.id, StageStatus::Completed));
                             should_enqueue_advance = true;
+                            if stage.stage_id == "state_11_manual_release" {
+                                sqlx::query(
+                                    "UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3",
+                                )
+                                .bind(RunStatus::Running.to_string())
+                                .bind("state_10_implementation_refined")
+                                .bind(authoritative_run_id.to_string())
+                                .execute(&mut *tx)
+                                .await?;
+                                supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+                                    &mut tx,
+                                    authoritative_run_id,
+                                    &stage.stage_id,
+                                    now,
+                                    &journal.id,
+                                )
+                                .await?;
+                            }
                         } else {
                             stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
                                 .await?;
@@ -3463,6 +3563,60 @@ async fn supersede_current_workflow_conflict_for_stage_retry_tx(
             resume_policy: "continue_from_selected_transition".to_string(),
             selected_transition_id: None,
             selected_next_state_id: Some(stage_id.to_string()),
+            conflict_id: Some(conflict.conflict_id),
+            conflict_fingerprint: Some(conflict.conflict_fingerprint),
+            candidate_transition_hash: Some(conflict.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    now: DateTime<Utc>,
+    journal_id: &str,
+) -> Result<()> {
+    let Some(conflict) = workflow_conflicts::get_current_blocking_conflict_tx(tx, run_id).await?
+    else {
+        return Ok(());
+    };
+
+    if conflict.current_state_id != stage_id {
+        return Ok(());
+    }
+
+    workflow_conflicts::transition_conflict_status_tx(
+        tx,
+        &conflict.conflict_id,
+        WorkflowConflictStatus::Superseded,
+        now,
+        Some(serde_json::json!({
+            "resolution_kind": "manual_release_rejection_loopback",
+            "from_stage_id": stage_id,
+            "selected_next_state_id": "state_10_implementation_refined",
+            "journal_id": journal_id,
+        })),
+        None,
+        None,
+    )
+    .await?;
+
+    workflow_conflicts::upsert_transition_cursor_tx(
+        tx,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: stage_id.to_string(),
+            cursor_status: "manual_release_rejection_loopback".to_string(),
+            resume_policy: "continue_from_selected_transition".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: Some("state_10_implementation_refined".to_string()),
             conflict_id: Some(conflict.conflict_id),
             conflict_fingerprint: Some(conflict.conflict_fingerprint),
             candidate_transition_hash: Some(conflict.candidate_transition_hash),

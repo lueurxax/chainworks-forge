@@ -137,8 +137,17 @@ pub(crate) async fn workflow_conflict_json(
         Some(conflict) => {
             let conflict_id = conflict.conflict_id.clone();
             let mediation_id = conflict.mediation_record_id.clone();
+            let suggested_operator_action =
+                domain::workflow_conflict::workflow_conflict_suggested_operator_action(&conflict)
+                    .map(str::to_string);
             let mut value = serde_json::to_value(conflict)?;
             if let Some(object) = value.as_object_mut() {
+                if let Some(action) = suggested_operator_action {
+                    object.insert(
+                        "suggested_operator_action".into(),
+                        serde_json::Value::String(action),
+                    );
+                }
                 let lead_mediation = match mediation_id {
                     Some(id) => lead_mediation_readback_json(pool, &id)
                         .await?
@@ -894,9 +903,8 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, runs, validation, workflow_conflicts};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        parse_implementation_self_assessment_v2, ContractParseContext,
-        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -906,9 +914,9 @@ mod tests {
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
     };
     use domain::workflow_conflict::{
-        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
-        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
-        WorkflowConflictStatus,
+        CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
+        WorkflowConflictRecord, WorkflowConflictStatus, candidate_transition_hash,
+        workflow_conflict_fingerprint,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
@@ -1566,6 +1574,69 @@ mod tests {
         assert_eq!(
             workflow_conflict["current_state_id"],
             serde_json::json!("review")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_017_reports_get_exposes_refine_instruction_action_hint() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let mut conflict = make_workflow_conflict(run_id);
+        conflict.reason = WorkflowConflictReason::NoDeclarativeTransitionMatched;
+        conflict.operator_label = "No declarative workflow transition matched".into();
+        conflict.candidate_transitions = vec![CandidateTransitionEvaluation {
+            transition_id: "review_to_refine".into(),
+            from_state_id: "review".into(),
+            to_state_id: "review".into(),
+            condition_expression_id: Some("proposal_needs_refine".into()),
+            result: CandidateTransitionResult::NotMatched,
+            required_artifacts: vec!["proposal_review_summary".into()],
+            missing_artifacts: vec![],
+            missing_fields: vec![],
+            source_artifact_ids: vec!["proposal_review_summary".into()],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(
+                "Loop budget exhausted for proposal_review_count: 3/3 iterations".into(),
+            ),
+        }];
+        conflict.candidate_transition_hash =
+            candidate_transition_hash(&conflict.candidate_transitions);
+        conflict.conflict_fingerprint = workflow_conflict_fingerprint(
+            &run_id.to_string(),
+            "review",
+            &conflict.reason,
+            &conflict.candidate_transition_hash,
+            &[],
+        );
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        assert_eq!(
+            mcp_truth["workflow_conflict"]["suggested_operator_action"],
+            serde_json::json!("choose_transition_or_provide_refine_instruction")
         );
     }
 

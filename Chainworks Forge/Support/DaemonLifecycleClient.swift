@@ -878,6 +878,7 @@ enum SchedulerHealthPresentation {
     static func reasonLabel(_ reason: String) -> String {
         switch reason {
         case "run_capacity": return "Run at agent limit"
+        case "xcode_mcp_capacity": return "Waiting for Xcode MCP slot"
         case "provider_capacity": return "Waiting for provider slot"
         case "global_capacity": return "System agent limit reached"
         case "startup_recovery_backpressure": return "Recovering queued work"

@@ -95,6 +95,10 @@ impl WorkQueue {
         work_items::claim_next_non_invoke(&self.pool).await
     }
 
+    pub fn invoke_agent_capacity_config(&self) -> InvokeAgentCapacityConfig {
+        (*self.capacity_config).clone()
+    }
+
     pub async fn complete(&self, id: &str) -> Result<()> {
         let result =
             work_items::complete_with_capacity(&self.pool, id, &self.capacity_config).await?;

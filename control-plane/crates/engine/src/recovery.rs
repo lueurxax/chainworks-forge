@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
@@ -383,6 +383,40 @@ impl RecoveryService {
                 .as_ref()
                 .and_then(|readback| readback.next_retry_or_backoff_time),
         })
+    }
+
+    pub async fn repair_stale_invoke_agent_startups(
+        &self,
+        now: DateTime<Utc>,
+        stale_after: ChronoDuration,
+    ) -> Result<u64> {
+        let stale_cutoff = now - stale_after;
+        let xcode_stale_cutoff = now - ChronoDuration::minutes(12);
+        let mut requeued = work_items::requeue_stale_starting_invoke_agent_sessions(
+            &self.pool,
+            now,
+            stale_cutoff,
+            xcode_stale_cutoff,
+            "startup_repair_stale_acp_startup",
+        )
+        .await?;
+        requeued += work_items::requeue_stale_pre_session_invoke_agents(
+            &self.pool,
+            now,
+            stale_cutoff,
+            xcode_stale_cutoff,
+            "startup_repair_stale_acp_pre_session_startup",
+        )
+        .await?;
+        if requeued > 0 {
+            self.work_queue.refresh_scheduler_projection().await?;
+            warn!(
+                requeued = requeued,
+                stale_cutoff = %stale_cutoff,
+                "Startup recovery requeued stale ACP startup InvokeAgent work items"
+            );
+        }
+        Ok(requeued)
     }
 
     async fn repair_run(&self, run: &Run) -> Result<usize> {

@@ -48,7 +48,58 @@ Normal retry is forbidden while unresolved side effects exist.
 
 ---
 
-## 3. What counts as a side effect
+## 3. Current repo truth
+
+This proposal is grounded in the current Rust control-plane implementation, not only in the desired architecture.
+
+### 3.1 P072 boundary is related but not sufficient
+
+P072 is partially implemented:
+
+- `auth` has `surface_policies`;
+- default bootstrapped operator principals allow only `approveApproval` and `rejectApproval` as GraphQL mutations;
+- v2 principal validation requires `default-operator` and `ui_operator` to expose exactly those two approval mutations.
+
+However, the GraphQL schema still exposes executable legacy/control mutations including `startRun`, `approveStage`, `rejectStage`, `retryStage`, and `cancelRun`. Those resolvers are currently gated through `mutation_allowed`, and tests/fixtures still contain broad mutation-capability principals for non-production compatibility.
+
+P078 must therefore not rely on GraphQL removal as the only safety boundary. Release retry safety must live in the command/release execution path itself. P072 remains the northbound operator-action boundary; P078 owns durable side-effect reconciliation and retry blocking.
+
+### 3.2 `RetryStage` currently has no side-effect preflight
+
+`CommandHandler::RetryStage` currently performs a large transactional rewrite:
+
+- records the command journal entry;
+- finds the latest stage attempt;
+- validates retry eligibility from stage/run status;
+- applies retry-budget handling;
+- cancels running agent executions and pending/running work items;
+- settles the old stage as skipped;
+- creates a new stage attempt;
+- updates run status/current state;
+- supersedes workflow conflicts and active artifact claims;
+- enqueues `AdvanceRun`;
+- rebuilds projections after commit.
+
+That flow is correct for ordinary retry but unsafe for stages that may already have external side effects. P078 must insert the unresolved-side-effect check before the old attempt is skipped, before pending/running work is cancelled, before artifact claims are superseded, and before the new attempt is inserted.
+
+If unresolved side effects exist for the run, stage execution, or release agent execution, `RetryStage` must fail closed with `requires_effect_reconciliation` and must leave the existing stage/work-item/evidence state intact for inspection.
+
+### 3.3 Release execution currently settles after external effects
+
+The Rust release path already bypasses ACP for release agents, but it is still post-fact from a durability perspective:
+
+- `process_release_agent` calls `GitReleaseService::commit_and_push(...)`;
+- `GitReleaseService::commit_and_push(...)` performs `git commit` and then `git push`;
+- only after successful push does the executor persist `release_manifest` and `git_push_receipt`;
+- `build_archive_and_push_connect` similarly calls `ConnectPublishService::build_and_distribute(...)` and persists `release_bundle_manifest` / `connect_upload_receipt` only after the external operation returns.
+
+The older Swift `ReleaseOpsCoordinator` has the same shape: it calls commit/push and build/distribute first, then returns `ReleaseResult` and receipts.
+
+This is the exact crash window P078 must close: external side effect completed, but durable settlement did not.
+
+---
+
+## 4. What counts as a side effect
 
 Initial side-effect kinds:
 
@@ -69,7 +120,7 @@ Future kinds may include:
 
 ---
 
-## 4. Lifecycle
+## 5. Lifecycle
 
 Canonical lifecycle:
 
@@ -108,9 +159,9 @@ prepared/executing
 
 ---
 
-## 5. Data model
+## 6. Data model
 
-## 5.1 `side_effects`
+## 6.1 `side_effects`
 
 ```sql
 CREATE TABLE side_effects (
@@ -147,7 +198,7 @@ CREATE INDEX idx_side_effects_status ON side_effects(status);
 CREATE UNIQUE INDEX idx_side_effects_idempotency_key ON side_effects(idempotency_key);
 ```
 
-## 5.2 `side_effect_attempts`
+## 6.2 `side_effect_attempts`
 
 ```sql
 CREATE TABLE side_effect_attempts (
@@ -164,7 +215,7 @@ CREATE TABLE side_effect_attempts (
 );
 ```
 
-## 5.3 `side_effect_settlements`
+## 6.3 `side_effect_settlements`
 
 ```sql
 CREATE TABLE side_effect_settlements (
@@ -180,11 +231,11 @@ CREATE TABLE side_effect_settlements (
 
 ---
 
-## 6. Persistence rules
+## 7. Persistence rules
 
 P078 must obey P075.
 
-### 6.1 Barrier writes
+### 7.1 Barrier writes
 
 These are barrier writes:
 
@@ -194,7 +245,7 @@ These are barrier writes:
 - mark needs reconciliation,
 - mark conflict/unrecoverable.
 
-### 6.2 Evidence spooling
+### 7.2 Evidence spooling
 
 These go to files, not row-by-row database writes:
 
@@ -208,7 +259,7 @@ SQLite stores paths/checksums/summaries only.
 
 ---
 
-## 7. Effect coordinator
+## 8. Effect coordinator
 
 Introduce:
 
@@ -232,7 +283,7 @@ The release coordinator must become a client of this coordinator.
 
 ---
 
-## 8. Release flow
+## 9. Release flow
 
 Current release flow should be replaced conceptually with:
 
@@ -260,9 +311,9 @@ Each step has its own idempotency key and evidence model.
 
 ---
 
-## 9. Git-specific policy
+## 10. Git-specific policy
 
-## 9.1 `git_commit`
+## 10.1 `git_commit`
 
 Idempotency key should include:
 
@@ -287,7 +338,7 @@ Before creating a new commit, reconciliation should check:
 
 If the commit already exists, do not create a second commit.
 
-## 9.2 `git_push`
+## 10.2 `git_push`
 
 Expected evidence:
 
@@ -312,7 +363,7 @@ Decision table:
 
 ---
 
-## 10. Upload / distribution policy
+## 11. Upload / distribution policy
 
 For upload/publish effects, expected evidence must include:
 
@@ -334,7 +385,7 @@ If the external system cannot prove whether upload happened, retry must remain b
 
 ---
 
-## 11. Retry policy
+## 12. Retry policy
 
 All retry commands must check unresolved side effects before executing.
 
@@ -359,7 +410,7 @@ Retry may not proceed.
 
 ---
 
-## 12. MCP tools
+## 13. MCP tools
 
 Add MCP tools:
 
@@ -376,7 +427,7 @@ Optional aliases:
 
 Canonical namespace should be `effects.*`.
 
-## 12.1 `effects.inspect`
+## 13.1 `effects.inspect`
 
 Returns:
 
@@ -390,7 +441,7 @@ Returns:
 - retry forbidden flag,
 - recommended next action.
 
-## 12.2 `effects.reconcile`
+## 13.2 `effects.reconcile`
 
 Does readback only.
 
@@ -412,7 +463,7 @@ It may:
 
 ---
 
-## 13. GraphQL projections
+## 14. GraphQL projections
 
 GraphQL is read-only for this subsystem.
 
@@ -447,7 +498,7 @@ No GraphQL mutation for reconciliation.
 
 ---
 
-## 14. Startup recovery
+## 15. Startup recovery
 
 On daemon startup:
 
@@ -459,7 +510,7 @@ On daemon startup:
 
 ---
 
-## 15. Settlement transaction
+## 16. Settlement transaction
 
 After successful effect readback, a single DB transaction should update:
 
@@ -476,7 +527,7 @@ Projection materialization may be async, but invalidation/advance must be part o
 
 ---
 
-## 16. Decision table
+## 17. Decision table
 
 | Condition | Action |
 |---|---|
@@ -489,7 +540,7 @@ Projection materialization may be async, but invalidation/advance must be part o
 
 ---
 
-## 17. Tests
+## 18. Tests
 
 Required tests:
 
@@ -505,7 +556,7 @@ Required tests:
 
 ---
 
-## 18. Acceptance criteria
+## 19. Acceptance criteria
 
 P078 is complete when:
 
@@ -520,7 +571,7 @@ P078 is complete when:
 
 ---
 
-## 19. Final recommendation
+## 20. Final recommendation
 
 This proposal is the local control-plane replacement for the most important part of Temporal-style side-effect safety.
 

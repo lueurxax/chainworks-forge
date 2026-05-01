@@ -387,8 +387,8 @@ mod tests {
             "proposal_review_summary.average_score < vars.proposal_score_target or proposal_review_summary.blocker_count > 0"
         ));
         assert!(!conditions_can_match_simultaneously(
-            "implementation_review_summary.status == vars.implementation_review_target_status and implementation_review_summary.status != 'release_evidence_blocked'",
-            "implementation_review_summary.status != vars.implementation_review_target_status or implementation_review_summary.status == 'release_evidence_blocked'"
+            "implementation_review_summary.status == vars.implementation_review_target_status or implementation_review_summary.status == 'release_evidence_blocked'",
+            "implementation_review_summary.status != vars.implementation_review_target_status and implementation_review_summary.status != 'release_evidence_blocked'"
         ));
     }
 }

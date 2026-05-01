@@ -3398,6 +3398,7 @@ enum P031ArtifactRenderMode: Equatable, Sendable {
 struct P031ArtifactViewerPresentation: Equatable, Sendable {
   let artifactID: String
   let stageID: String
+  let stageExecutionID: String?
   let stageLabel: String?
   let iteration: Int?
   let attemptNumber: Int?
@@ -4106,6 +4107,7 @@ enum P031ArtifactViewerPresenter {
     return P031ArtifactViewerPresentation(
       artifactID: artifact.id,
       stageID: artifact.stageID,
+      stageExecutionID: stage?.id ?? artifact.sourceStageExecutionID,
       stageLabel: stage?.label,
       iteration: stage?.iteration,
       attemptNumber: stage?.attemptNumber,

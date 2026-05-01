@@ -144,12 +144,11 @@ pub async fn execute(
                 "lead_mediation_confirmation" => {
                     resolve_mediation_confirmation(&params, cmd_handler, principal).await
                 }
-                "stage_approval" => {
-                    resolve_stage_approval(&params, cmd_handler, principal).await
-                }
-                unknown => {
-                    Err(anyhow::anyhow!("Unknown subject_kind: '{}'. Expected 'stage_approval' or 'lead_mediation_confirmation'", unknown))
-                }
+                "stage_approval" => resolve_stage_approval(&params, cmd_handler, principal).await,
+                unknown => Err(anyhow::anyhow!(
+                    "Unknown subject_kind: '{}'. Expected 'stage_approval' or 'lead_mediation_confirmation'",
+                    unknown
+                )),
             }
         }
 
