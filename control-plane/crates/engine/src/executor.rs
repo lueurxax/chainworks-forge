@@ -512,13 +512,19 @@ async fn claim_invoke_agent_work_item_with_start(
         .get("session_family_id")
         .and_then(|value| value.as_str())
         .map(String::from);
+    let declared_outputs_require_session_generation = payload
+        .get("declared_outputs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|outputs| !outputs.is_empty());
+    let requires_invocation_generation =
+        session_reuse_scope.is_some() || declared_outputs_require_session_generation;
 
     if let Some(existing) = payload.get("p058_claimed") {
         let mut claimed = claimed_invoke_agent_start_from_payload(&item, existing)?;
         let mut running_item = item;
         running_item.status = WorkItemStatus::Running;
         running_item.attempt_count += 1;
-        if session_reuse_scope.is_none() && claimed.session_generation_id.is_some() {
+        if !requires_invocation_generation && claimed.session_generation_id.is_some() {
             claimed.session_generation_id = None;
             if let Some(claimed_object) = payload
                 .get_mut("p058_claimed")
@@ -593,9 +599,8 @@ async fn claim_invoke_agent_work_item_with_start(
         .to_string();
     let now = chrono::Utc::now();
     let agent_execution_id = domain::ids::AgentExecutionId::new();
-    let session_generation_id = session_reuse_scope
-        .as_ref()
-        .map(|_| uuid::Uuid::new_v4().to_string());
+    let session_generation_id =
+        requires_invocation_generation.then(|| uuid::Uuid::new_v4().to_string());
     let owner_execution_lineage_id = stage_execution_id.to_string();
     let run_id_str = run_id.to_string();
     let invocation_owner_key = invocation_owner_key(&InvocationOwnerKeyInput {
@@ -3292,8 +3297,10 @@ impl BackgroundExecutor {
                     }),
                 };
 
+                let invocation_generation_required =
+                    session_reuse_scope.is_some() || !declared_outputs.is_empty();
                 let mut policy_decision: Option<SessionPolicyDecision> =
-                    if session_reuse_scope.is_some() && !xcode_shim_required {
+                    if invocation_generation_required {
                         Some(ensure_policy(&self.pool, policy_input.clone()).await?)
                     } else {
                         None

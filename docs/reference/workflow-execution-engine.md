@@ -198,7 +198,7 @@ configurable delay. Thread-safe task tracking for test assertions.
 Live executor using the selected ACP runtime transport. Per-execution flow:
 
 1. Validate workspace boundaries.
-2. **Toolchain Cache Mapping (P066)**: Prepare isolated toolchain roots (Xcode/Go) based on agent policy and session/run scope. Acquire exclusive per-run lease for Xcode work.
+2. **Toolchain Cache Mapping**: Prepare isolated toolchain roots (Xcode/Go) based on agent policy and session/run scope. Acquire exclusive per-run lease for Xcode work.
 3. Capture pre-prompt metadata for the per-execution baseline.
 4. Create an isolated session via `RuntimeSessionBridge`.
 5. **Prompt Augmentation (P065)**: if an operator retry instruction is active, the executor renders a reserved engine-owned prompt section (`## Operator Retry Instruction`) before the task text.

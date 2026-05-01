@@ -186,6 +186,8 @@ Initial P079 coverage is intentionally narrow:
 | `lead_orchestrator` | yes | yes | yes |
 | `docs_guardian` | yes | yes | follow-up |
 | `code_writer` | repair only for structured status artifacts | yes | follow-up |
+| `security_checker` | yes | yes | yes |
+| `prepush_code_reviewer` | yes | yes | yes |
 | release agents | no | no | no |
 
 Release agents are excluded because they may have external side effects. P078 owns that retry/reconciliation lane.

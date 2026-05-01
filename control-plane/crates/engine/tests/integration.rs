@@ -2902,6 +2902,138 @@ async fn test_targeted_retry_falls_back_from_gemini_docs_guardian_backend() {
 }
 
 #[tokio::test]
+async fn test_targeted_retry_falls_back_from_claude_security_checker_backend() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    run.catalog_snapshot_json = Some(
+        serde_json::json!({
+            "backend_profiles": {
+                "claude_security_high": {
+                    "provider": "claude_acp",
+                    "model": "opus",
+                    "effort": "high",
+                    "max_turns": 16
+                },
+                "codex_architect_high": {
+                    "provider": "codex_acp",
+                    "model": "gpt-5.5",
+                    "effort": "xhigh",
+                    "max_turns": 16
+                }
+            }
+        })
+        .to_string(),
+    );
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "state_9_implementation_reviewed".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_security_checker = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_security_checker.agent_id = "security_checker".into();
+    failed_security_checker.provider = "claude_acp".into();
+    failed_security_checker.model = Some("opus".into());
+    failed_security_checker.completed_at = Some(Utc::now());
+    let failed_security_checker_id = failed_security_checker.id;
+    agent_executions::insert(&pool, &failed_security_checker)
+        .await
+        .unwrap();
+    agent_execution_runtime_facts::upsert(
+        &pool,
+        &AgentExecutionRuntimeFacts {
+            agent_execution_id: failed_security_checker_id,
+            failure_kind: Some(AgentFailureKind::MissingRequiredOutputs),
+            output_settlement: AgentOutputSettlement::MissingRequiredOutputs,
+            ..AgentExecutionRuntimeFacts::defaults_for(failed_security_checker_id, Utc::now())
+        },
+    )
+    .await
+    .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: format!("security-checker:{old_stage_exec_id}:attempt:1"),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_9_implementation_reviewed",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "agent_id": "security_checker",
+                "provider": "claude_acp",
+                "backend_profile_id": "claude_security_high",
+                "model": "opus",
+                "effort": "high",
+                "max_turns": 16,
+                "output_contract": "security_report_v1",
+                "task_outputs": ["security_report"],
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_security_checker_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("state_9_implementation_reviewed".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_9_implementation_reviewed".into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: Some(failed_security_checker_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let retry_invokes: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(retry_invokes.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+    assert_eq!(payload["agent_id"], serde_json::json!("security_checker"));
+    assert_eq!(payload["provider"], serde_json::json!("codex_acp"));
+    assert_eq!(
+        payload["backend_profile_id"],
+        serde_json::json!("codex_architect_high")
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/from_provider"),
+        Some(&serde_json::json!("claude_acp"))
+    );
+}
+
+#[tokio::test]
 async fn test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_backend() {
     let pool = test_pool().await;
 
@@ -11545,6 +11677,8 @@ fn test_execution_request_carries_chainworks_meta_root() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

@@ -1090,10 +1090,13 @@ async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_cre
         .unwrap_or_default()
         .contains("session_reuse_scope"));
     let queue = WorkQueue::new(pool.clone());
-    assert!(
-        queue.claim_next().await.unwrap().is_none(),
-        "generic queue claim must not pick up InvokeAgent fallback items"
-    );
+    if let Some(non_invoke_item) = queue.claim_next().await.unwrap() {
+        assert_eq!(
+            non_invoke_item.kind,
+            WorkItemKind::AdvanceRun,
+            "generic queue claim must not pick up InvokeAgent fallback items"
+        );
+    }
     let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
         .await
         .unwrap();
@@ -1198,6 +1201,140 @@ async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
         .unwrap();
     assert_eq!(executions.len(), 1);
     assert_eq!(executions[0].session_reuse_scope, None);
+}
+
+#[tokio::test]
+async fn proposal_058_declared_output_claim_gets_durable_generation_without_reuse_scope() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 declared output lineage".into(),
+            body: "declared outputs need repair-capable session identity".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "state_9_implementation_reviewed".into(),
+            label: "Implementation reviewed".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "declared-output-null-reuse-invoke".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "state_9_implementation_reviewed",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "security_checker",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "check security",
+                "task_name": "check_implementation_security",
+                "task_inputs": ["approved_proposal", "changed_files_manifest"],
+                "task_outputs": ["security_report"],
+                "declared_outputs": [
+                    {
+                        "output_name": "security_report",
+                        "target_path": "/tmp/workspace/.chainworks/runs/run/security/report.json"
+                    }
+                ],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": null,
+                "session_family_id": null,
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("state_9_implementation_reviewed".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("declared-output invocation should be claimed");
+    let claimed_generation = claimed
+        .session_generation_id
+        .as_deref()
+        .expect("declared outputs need a durable generation for output repair");
+    assert_eq!(claimed_generation.len(), 36);
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].session_reuse_scope, None);
+    assert_eq!(
+        executions[0].session_generation_id.as_deref(),
+        Some(claimed_generation)
+    );
+
+    let claim =
+        artifact_contracts::load_source_generation_claim(&pool, &claimed.artifact_claim_key)
+            .await
+            .unwrap()
+            .expect("active artifact claim");
+    assert_eq!(
+        claim.current_session_generation_id.as_deref(),
+        Some(claimed_generation)
+    );
+
+    let persisted_work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let persisted_claimed = persisted_work_items
+        .iter()
+        .find(|item| item.id == claimed.work_item_id)
+        .expect("claimed work item persisted");
+    let persisted_payload: serde_json::Value =
+        serde_json::from_str(&persisted_claimed.payload_json).unwrap();
+    assert_eq!(
+        persisted_payload["p058_claimed"]["session_policy_decision"]["generation"]["id"],
+        claimed_generation
+    );
 }
 
 #[tokio::test]

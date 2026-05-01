@@ -300,10 +300,16 @@ fn targeted_retry_provider_fallback(
             })
             .unwrap_or(false);
     let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
+    let is_security_checker =
+        agent_id == "security_checker" && output_contract == Some("security_report_v1");
+    let is_prepush_reviewer =
+        agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1");
     if !is_proposal_review
         && !is_proposal_review_aggregation
         && !is_proposal_authoring
         && !is_docs_guardian
+        && !is_security_checker
+        && !is_prepush_reviewer
     {
         return None;
     }
@@ -347,6 +353,8 @@ fn targeted_retry_provider_fallback(
         is_proposal_review_aggregation,
         is_proposal_authoring,
         is_docs_guardian,
+        is_security_checker,
+        is_prepush_reviewer,
         profiles,
     )?;
     let profile = profiles.get(fallback_id)?.as_object()?;
@@ -381,6 +389,8 @@ fn targeted_retry_fallback_profile_id<'a>(
     is_proposal_review_aggregation: bool,
     is_proposal_authoring: bool,
     is_docs_guardian: bool,
+    is_security_checker: bool,
+    is_prepush_reviewer: bool,
     profiles: &'a serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'a str> {
     if is_proposal_review_aggregation {
@@ -413,6 +423,28 @@ fn targeted_retry_fallback_profile_id<'a>(
                 "claude_docs_medium",
                 "codex_architect_high",
             ]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_security_checker {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &["codex_architect_high", "codex_audit_high", "codex_writer_high"]
+        } else {
+            &["claude_security_high", "claude_product_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_prepush_reviewer {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &["codex_architect_high", "codex_writer_high"]
+        } else {
+            &["claude_prepush_medium", "claude_product_high"]
         };
         return candidates
             .iter()

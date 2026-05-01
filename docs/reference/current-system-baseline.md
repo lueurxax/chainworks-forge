@@ -30,7 +30,7 @@ At the current baseline, the product includes:
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
 - bounded artifact discovery and engine-owned settlement pipeline,
-- provider toolchain cache mapping (Proposal 066) for isolated Xcode and Go build roots,
+- provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,

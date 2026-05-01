@@ -5,8 +5,8 @@
 | Date | 2026-04-29 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | P075 Local Persistence Write Budget, P072 Operator Action Routing, P038 Compaction, P045/P065 Recovery MCP Tools, Rust control plane |
-| Related | P066 Provider Toolchain Cache Mapping, P076 Auto-Retry Observation Ledger |
+| Depends on | P075 Local Persistence Write Budget, [UI action boundary](../reference/ui-action-boundary.md), P038 Compaction, P045/P065 Recovery MCP Tools, Rust control plane |
+| Related | [Provider toolchain cache mapping](../reference/acp-runtime-transport.md#toolchain-cache-mapping), P076 Auto-Retry Observation Ledger |
 | Scope | Introduce a durable side-effect lifecycle for irreversible or externally visible operations so release/recovery code can reconcile incomplete settlements without repeating side effects. |
 | Goal | Prevent duplicate git pushes, duplicate uploads, repeated release operations, and unsafe retries by recording side-effect intent before execution, settling verified effects atomically, and routing incomplete settlement states to MCP reconciliation instead of blind retry. |
 
