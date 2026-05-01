@@ -345,11 +345,11 @@ pub fn validate_catalog_snapshot_format_version(
             "frozen_snapshot_contract_incompatible: catalog snapshot contains toolchain_cache_policy \
              entries but omits catalog_snapshot_format_version; mixed-version snapshot is not supported"
         ),
-        Some(v) if v > CATALOG_SNAPSHOT_FORMAT_VERSION => anyhow::bail!(
+        Some(CATALOG_SNAPSHOT_FORMAT_VERSION) => Ok(true),
+        Some(v) => anyhow::bail!(
             "frozen_snapshot_contract_incompatible: catalog snapshot requires format version {v} \
              but this reader only supports version {CATALOG_SNAPSHOT_FORMAT_VERSION}"
         ),
-        Some(_) => Ok(true),
     }
 }
 

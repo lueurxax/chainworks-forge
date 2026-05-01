@@ -87,6 +87,9 @@ fn compile_loaded(
     snapshots: Option<SnapshotJson>,
 ) -> Result<RunPlan> {
     catalog::validate_catalog_has_exactly_one_system_lead(&cat)?;
+    if snapshots.is_some() {
+        catalog::validate_catalog_snapshot_format_version(&cat)?;
+    }
     catalog::validate_toolchain_cache_policies(&cat)?;
     let direct_command_scan =
         crate::direct_command::scan_catalog(&cat, &wf, &workflow_raw, &catalog_raw);

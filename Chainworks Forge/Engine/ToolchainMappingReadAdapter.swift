@@ -68,6 +68,12 @@ struct ToolchainMappingDiagnostics: Codable, Sendable {
 /// RunComparisonService. None of these may decode AgentCatalog for
 /// toolchain-cache-policy-aware behavior via try? fallback.
 enum ToolchainMappingReadAdapter {
+    private static let policyJSONKeys: Set<String> = [
+        "version",
+        "enabled",
+        "xcode_scope",
+        "go_scope",
+    ]
 
     // MARK: - Frozen-snapshot compatibility gate
 
@@ -110,8 +116,22 @@ enum ToolchainMappingReadAdapter {
         guard let data = json.data(using: .utf8) else {
             throw ToolchainMappingDecodeError.invalidUTF8
         }
+        try rejectUnknownPolicyKeys(in: data)
         let decoder = JSONDecoder()
         return try decoder.decode(ToolchainCachePolicy.self, from: data)
+    }
+
+    private static func rejectUnknownPolicyKeys(in data: Data) throws {
+        let rawObject = try JSONSerialization.jsonObject(with: data)
+        guard let object = rawObject as? [String: Any] else {
+            return
+        }
+        let unknownKeys = object.keys
+            .filter { !policyJSONKeys.contains($0) }
+            .sorted()
+        if !unknownKeys.isEmpty {
+            throw ToolchainMappingDecodeError.unknownKeys(unknownKeys)
+        }
     }
 
     // MARK: - Diagnostics synthesis
@@ -197,4 +217,5 @@ enum ToolchainSnapshotCompatibilityError: Error, LocalizedError {
 
 enum ToolchainMappingDecodeError: Error {
     case invalidUTF8
+    case unknownKeys([String])
 }

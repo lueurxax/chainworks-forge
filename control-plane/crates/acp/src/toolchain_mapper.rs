@@ -9,7 +9,7 @@
 //! Diagnostics MUST be emitted even on setup failure (proposal §failure_contract).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use domain::toolchain::{ToolchainMappingSetupFailed, ToolchainSetupFailureReason};
@@ -149,24 +149,46 @@ pub fn validate_path_segment(seg: &str) -> Result<(), ToolchainSetupFailureReaso
 }
 
 /// Verify that `candidate` is contained under `root`.
-/// Uses string-prefix containment on the rendered paths.
+/// Uses path component containment and rejects existing symlink components
+/// below the root so new mapping directories cannot be created through an
+/// escaping link.
 pub fn validate_path_containment(
     candidate: &Path,
     root: &Path,
 ) -> Result<(), ToolchainSetupFailureReason> {
-    let candidate_str = candidate.to_string_lossy();
-    let root_str = root.to_string_lossy();
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|_| ToolchainSetupFailureReason::PathEscape)?;
+    let relative_candidate = candidate
+        .strip_prefix(root)
+        .map_err(|_| ToolchainSetupFailureReason::PathEscape)?;
 
-    // Ensure candidate starts with root, and that the next char (if any) is a separator
-    // to avoid prefix collisions like /tmp/foo vs /tmp/foobar.
-    if candidate_str == root_str {
-        return Ok(());
+    let mut checked = canonical_root.clone();
+    for component in relative_candidate.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => {
+                checked.push(segment);
+                if checked.strip_prefix(&canonical_root).is_err() {
+                    return Err(ToolchainSetupFailureReason::PathEscape);
+                }
+                if let Ok(metadata) = std::fs::symlink_metadata(&checked) {
+                    if metadata.file_type().is_symlink() {
+                        return Err(ToolchainSetupFailureReason::PathEscape);
+                    }
+                    let canonical_checked = std::fs::canonicalize(&checked)
+                        .map_err(|_| ToolchainSetupFailureReason::PathEscape)?;
+                    if canonical_checked.strip_prefix(&canonical_root).is_err() {
+                        return Err(ToolchainSetupFailureReason::PathEscape);
+                    }
+                    checked = canonical_checked;
+                }
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ToolchainSetupFailureReason::PathEscape);
+            }
+        }
     }
-    let prefix = format!("{}/", root_str);
-    if candidate_str.starts_with(prefix.as_str()) {
-        return Ok(());
-    }
-    Err(ToolchainSetupFailureReason::PathEscape)
+    Ok(())
 }
 
 // ── Free space check ─────────────────────────────────────────────────────────
@@ -275,6 +297,7 @@ pub fn prepare_toolchain_mapping(
             };
             ToolchainMappingSetupFailed::new(reason, family_str).with_detail(e.to_string())
         })?;
+        set_owner_only_permissions(&subpath, family_str)?;
         created_directories.push(subdir.to_string());
     }
 

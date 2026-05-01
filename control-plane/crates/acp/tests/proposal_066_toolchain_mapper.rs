@@ -14,11 +14,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use acp::toolchain_mapper::{
-    build_go_env_vars, prepare_toolchain_mapping, validate_path_segment,
-    DEFAULT_MIN_FREE_BYTES, ToolchainFamily,
+    build_go_env_vars, prepare_toolchain_mapping, validate_path_segment, ToolchainFamily,
 };
-use acp::{XcodeHostExecutorPlan, XcodeHostExecutorPlanInput, XcodeHostExecutorSimulatorCandidate};
-use domain::toolchain::{ToolchainMappingSetupFailed, ToolchainSetupFailureReason};
+use acp::{XcodeHostExecutorPlan, XcodeHostExecutorPlanInput};
+use domain::toolchain::ToolchainSetupFailureReason;
 
 // ── T10: Directory preparation ────────────────────────────────────────────────
 
@@ -98,6 +97,25 @@ fn p066_toolchain_mapper_go_prepares_correct_directories() {
 
     // Go env vars must be set.
     assert!(!result.env_vars.is_empty(), "go family must produce env vars");
+}
+
+#[cfg(unix)]
+#[test]
+fn p066_toolchain_mapper_sets_owner_only_permissions_on_root_and_subdirectories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let result = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-perms", 0)
+        .expect("go mapping must succeed");
+
+    let root_mode = std::fs::metadata(&result.root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(root_mode, 0o700, "mapping root must be owner-only");
+
+    for subdir in &result.created_directories {
+        let subpath = result.root.join(subdir);
+        let mode = std::fs::metadata(&subpath).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{subdir} must be owner-only");
+    }
 }
 
 #[test]
@@ -187,6 +205,41 @@ fn p066_toolchain_mapper_dot_scope_key_rejected() {
         err.reason,
         ToolchainSetupFailureReason::PathEscape,
         "'.' scope key must return PathEscape"
+    );
+}
+
+#[test]
+fn p066_toolchain_mapper_accepts_toolchain_home_with_trailing_separator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let toolchain_home = PathBuf::from(format!("{}/", tmp.path().display()));
+
+    let result = prepare_toolchain_mapping(&toolchain_home, ToolchainFamily::Go, "sess-slash", 0)
+        .expect("trailing separator on TOOLCHAIN_HOME must not fail containment");
+
+    assert!(result.root.is_dir());
+    assert!(result.root.starts_with(tmp.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn p066_toolchain_mapper_rejects_symlinked_provider_path_escape() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), tmp.path().join("providers")).unwrap();
+
+    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-symlink", 0)
+        .unwrap_err();
+
+    assert_eq!(
+        err.reason,
+        ToolchainSetupFailureReason::PathEscape,
+        "symlinked providers directory must fail closed"
+    );
+    assert!(
+        !outside.path().join("go").exists(),
+        "mapper must not create directories through an escaping symlink"
     );
 }
 

@@ -120,7 +120,7 @@ xcode_scope: global
 
 #[test]
 fn p066_catalog_without_version_or_policy_is_legacy_v0() {
-    let mut catalog = AgentCatalogFile {
+    let catalog = AgentCatalogFile {
         schema_version: None,
         catalog_snapshot_format_version: None,
         app: None,
@@ -204,6 +204,33 @@ fn p066_catalog_with_unsupported_version_fails() {
     assert!(
         result.is_err(),
         "unsupported version should fail as frozen_snapshot_contract_incompatible"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("frozen_snapshot_contract_incompatible"),
+        "error should identify as frozen_snapshot_contract_incompatible"
+    );
+}
+
+#[test]
+fn p066_catalog_with_zero_version_fails() {
+    let catalog = AgentCatalogFile {
+        schema_version: None,
+        catalog_snapshot_format_version: Some(0),
+        app: None,
+        paths: None,
+        artifacts: None,
+        skills: None,
+        contracts: None,
+        runtime_profiles: None,
+        backend_profiles: None,
+        permission_profiles: None,
+        agents: Some(vec![minimal_agent_entry("a1")]),
+    };
+    let result = validate_catalog_snapshot_format_version(&catalog);
+    assert!(
+        result.is_err(),
+        "version 0 should fail as frozen_snapshot_contract_incompatible"
     );
     let err = result.unwrap_err().to_string();
     assert!(

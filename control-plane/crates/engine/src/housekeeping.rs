@@ -97,7 +97,7 @@ pub async fn sweep_xcode_toolchain_roots(
     let now = Utc::now();
     let mut roots_pruned: i64 = 0;
     let mut prune_failures: i64 = 0;
-    let mut oldest_age_secs: Option<f64> = None;
+    let mut oldest_eligible_root_age_days: Option<f64> = None;
 
     if let Ok(entries) = fs::read_dir(&xcode_dir) {
         for entry in entries.flatten() {
@@ -129,7 +129,10 @@ pub async fn sweep_xcode_toolchain_roots(
                 if let Ok(modified) = meta.modified() {
                     if let Ok(age) = SystemTime::now().duration_since(modified) {
                         let age_days = age.as_secs_f64() / 86400.0;
-                        oldest_age_secs = Some(oldest_age_secs.map_or(age_days, |prev: f64| prev.max(age_days)));
+                        oldest_eligible_root_age_days = Some(
+                            oldest_eligible_root_age_days
+                                .map_or(age_days, |prev: f64| prev.max(age_days)),
+                        );
                     }
                 }
             }
@@ -159,7 +162,7 @@ pub async fn sweep_xcode_toolchain_roots(
         last_sweep_started_at: now,
         run_scoped_roots_pruned: roots_pruned,
         run_scoped_prune_failures: prune_failures,
-        oldest_eligible_root_age_days: oldest_age_secs,
+        oldest_eligible_root_age_days,
         disk_pressure_blocks: 0,
         quarantined_roots_created: 0,
         created_at: Utc::now(),

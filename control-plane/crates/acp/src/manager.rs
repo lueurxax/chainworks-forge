@@ -397,32 +397,40 @@ impl AcpRuntimeManager {
         // session startup failure (before resources.commit()) AND on session close
         // (via AcpSession::close → cleanup_paths).
         if req.toolchain_go_scope_enabled {
-            if let (Some(toolchain_home), Some(session_gen_id)) = (
-                req.toolchain_home.as_deref(),
-                req.session_generation_id.as_deref(),
+            let Some(toolchain_home) = req.toolchain_home.as_deref() else {
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(anyhow::anyhow!(
+                    "toolchain_mapping_setup_failed for Go session scope: missing toolchain_home"
+                ));
+            };
+            let Some(session_gen_id) = req.session_generation_id.as_deref() else {
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(anyhow::anyhow!(
+                    "toolchain_mapping_setup_failed for Go session scope: missing session_generation_id"
+                ));
+            };
+
+            match crate::toolchain_mapper::prepare_toolchain_mapping(
+                Path::new(toolchain_home),
+                crate::toolchain_mapper::ToolchainFamily::Go,
+                session_gen_id,
+                crate::toolchain_mapper::DEFAULT_MIN_FREE_BYTES,
             ) {
-                match crate::toolchain_mapper::prepare_toolchain_mapping(
-                    Path::new(toolchain_home),
-                    crate::toolchain_mapper::ToolchainFamily::Go,
-                    session_gen_id,
-                    crate::toolchain_mapper::DEFAULT_MIN_FREE_BYTES,
-                ) {
-                    Ok(result) => {
-                        // Register root for cleanup on session failure or close.
-                        resources.add_cleanup_path(result.root.clone());
-                        // Inject Go env vars into the process launch spec.
-                        for (k, v) in result.env_vars {
-                            launch_spec.env.push((k, v));
-                        }
+                Ok(result) => {
+                    // Register root for cleanup on session failure or close.
+                    resources.add_cleanup_path(result.root.clone());
+                    // Inject Go env vars into the process launch spec.
+                    for (k, v) in result.env_vars {
+                        launch_spec.env.push((k, v));
                     }
-                    Err(err) => {
-                        // Fail-closed: setup failure prevents session launch.
-                        self.release_xcode_leases(lease_cleanup).await;
-                        return Err(anyhow::anyhow!(
-                            "toolchain_mapping_setup_failed for Go session scope: {}",
-                            err.reason.as_str()
-                        ));
-                    }
+                }
+                Err(err) => {
+                    // Fail-closed: setup failure prevents session launch.
+                    self.release_xcode_leases(lease_cleanup).await;
+                    return Err(anyhow::anyhow!(
+                        "toolchain_mapping_setup_failed for Go session scope: {}",
+                        err.reason.as_str()
+                    ));
                 }
             }
         }
@@ -789,6 +797,8 @@ impl Default for AcpRuntimeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::{AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
+    use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::AgentExecutionId;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -835,6 +845,139 @@ mod tests {
             self.released.lock().await.extend_from_slice(lease_ids);
             Ok(())
         }
+    }
+
+    struct SpawnMarkerAdapter {
+        script_path: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for SpawnMarkerAdapter {
+        fn provider_name(&self) -> &str {
+            "fixture"
+        }
+
+        fn prepare_launch_spec(
+            &self,
+            _req: &ExecutionRequest,
+            _resources: &mut LaunchResourceGuard,
+        ) -> Result<AcpLaunchSpec> {
+            Ok(AcpLaunchSpec::new(&self.script_path))
+        }
+
+        fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
+            Ok(AcpSessionNewSpec::new("fixture-model", "default"))
+        }
+    }
+
+    fn request_with_go_toolchain_scope() -> ExecutionRequest {
+        ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_go".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_go".to_string(),
+            provider: "fixture".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: "/tmp/workspace".to_string(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: Some("generation-go".to_string()),
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: Some("/tmp/toolchain-home".to_string()),
+            toolchain_go_scope_enabled: true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_marker_script(tmp: &tempfile::TempDir, marker: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = tmp.path().join("spawn_marker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_toolchain_scope_enabled_without_toolchain_home_fails_before_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned.txt");
+        let adapter = Arc::new(SpawnMarkerAdapter {
+            script_path: spawn_marker_script(&tmp, &marker),
+        });
+        let manager = AcpRuntimeManager::new_with_adapters(vec![adapter]);
+        let mut req = request_with_go_toolchain_scope();
+        req.toolchain_home = None;
+
+        let err = manager
+            .start_session(req)
+            .await
+            .expect_err("missing toolchain_home must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("toolchain_mapping_setup_failed for Go session scope"),
+            "error should identify Go toolchain mapping failure: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "manager must fail before spawning provider subprocess"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_toolchain_scope_enabled_without_session_generation_id_fails_before_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned.txt");
+        let adapter = Arc::new(SpawnMarkerAdapter {
+            script_path: spawn_marker_script(&tmp, &marker),
+        });
+        let manager = AcpRuntimeManager::new_with_adapters(vec![adapter]);
+        let mut req = request_with_go_toolchain_scope();
+        req.toolchain_home = Some(tmp.path().join("toolchains").to_string_lossy().into_owned());
+        req.session_generation_id = None;
+
+        let err = manager
+            .start_session(req)
+            .await
+            .expect_err("missing session_generation_id must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("toolchain_mapping_setup_failed for Go session scope"),
+            "error should identify Go toolchain mapping failure: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "manager must fail before spawning provider subprocess"
+        );
     }
 
     #[tokio::test]
