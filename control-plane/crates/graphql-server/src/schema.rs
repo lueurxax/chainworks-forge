@@ -31,6 +31,7 @@ use crate::types::idea::GqlIdea;
 use crate::types::p031::{GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode};
 use crate::types::run::GqlRun;
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
+use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
 };
@@ -442,6 +443,30 @@ impl QueryRoot {
         require_operator_read(ctx)?;
         let reporter = ctx.data::<LifecycleReporter>()?;
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
+    }
+
+    /// P066 T17: Latest startup recovery summary including toolchainCache fields.
+    /// Returns None when no startup recovery sweep has been recorded yet.
+    async fn startup_recovery_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlStartupRecoverySummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let readback = db::repos::startup_repairs::latest_startup_recovery_readback(pool).await?;
+        Ok(readback.map(GqlStartupRecoverySummary::from))
+    }
+
+    /// P066 T18: Latest toolchain cache housekeeping summary.
+    /// Returns None before any housekeeping sweep has been recorded.
+    async fn toolchain_cache_housekeeping_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlToolchainCacheHousekeepingSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let readback = db::repos::toolchain_cache_housekeeping::latest(pool).await?;
+        Ok(readback.map(GqlToolchainCacheHousekeepingSummary::from))
     }
 }
 
@@ -2360,6 +2385,7 @@ mod tests {
                 output_tokens: None,
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
             },
         )
         .await
@@ -3117,6 +3143,7 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)

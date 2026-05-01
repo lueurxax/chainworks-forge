@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -391,6 +392,40 @@ impl AcpRuntimeManager {
                 return Err(err);
             }
         };
+        // P066 T20: Prepare Go session-scoped toolchain mapping root if enabled.
+        // The root is registered with the LaunchResourceGuard so it is removed on
+        // session startup failure (before resources.commit()) AND on session close
+        // (via AcpSession::close → cleanup_paths).
+        if req.toolchain_go_scope_enabled {
+            if let (Some(toolchain_home), Some(session_gen_id)) = (
+                req.toolchain_home.as_deref(),
+                req.session_generation_id.as_deref(),
+            ) {
+                match crate::toolchain_mapper::prepare_toolchain_mapping(
+                    Path::new(toolchain_home),
+                    crate::toolchain_mapper::ToolchainFamily::Go,
+                    session_gen_id,
+                    crate::toolchain_mapper::DEFAULT_MIN_FREE_BYTES,
+                ) {
+                    Ok(result) => {
+                        // Register root for cleanup on session failure or close.
+                        resources.add_cleanup_path(result.root.clone());
+                        // Inject Go env vars into the process launch spec.
+                        for (k, v) in result.env_vars {
+                            launch_spec.env.push((k, v));
+                        }
+                    }
+                    Err(err) => {
+                        // Fail-closed: setup failure prevents session launch.
+                        self.release_xcode_leases(lease_cleanup).await;
+                        return Err(anyhow::anyhow!(
+                            "toolchain_mapping_setup_failed for Go session scope: {}",
+                            err.reason.as_str()
+                        ));
+                    }
+                }
+            }
+        }
         launch_spec.cleanup_paths.extend(resources.commit());
         let session = match adapter
             .open_session_with_specs(&session_req, launch_spec, session_new_spec)
@@ -874,6 +909,8 @@ mod tests {
             origin_stage_id: None,
             origin_stage_execution_id: None,
             mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
         };
 
         manager

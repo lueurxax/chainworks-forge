@@ -262,6 +262,7 @@ fn make_agent_execution(
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     }
 }
 
@@ -8286,6 +8287,7 @@ sys.exit(0)
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -11190,6 +11192,7 @@ async fn p017_mediation_cancel_run_cascade() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &mediation_execution)
         .await

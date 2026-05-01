@@ -555,9 +555,49 @@ pub(crate) async fn execution_mcp_truth_json(
             "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
             "runtime_facts": runtime_facts,
             "discovery_diagnostics": discovery_diagnostics,
+            // P066: toolchain mapping diagnostics — always non-null, legacy rows synthesized.
+            "actual_toolchain_mapping_diagnostics": toolchain_mapping_diagnostics_mcp(
+                execution.actual_toolchain_mapping_diagnostics_json.as_deref()
+            ),
         }));
     }
     Ok(serde_json::Value::Array(items))
+}
+
+/// P066: Build the MCP-surface toolchain mapping diagnostics value.
+/// Synthesizes a legacy_row_unavailable sentinel when the column is NULL.
+/// Absolute paths are never exposed.
+fn toolchain_mapping_diagnostics_mcp(raw: Option<&str>) -> serde_json::Value {
+    let Some(raw) = raw else {
+        return serde_json::json!({
+            "mapping_state": "legacy_row_unavailable",
+            "mapping_enabled": false,
+            "inactive_reason": "legacy_row",
+            "policy_source": "synthesized_legacy",
+            "version": 1,
+        });
+    };
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(val) => {
+            // Return a filtered subset — no absolute paths.
+            serde_json::json!({
+                "mapping_state": val.get("mapping_state"),
+                "mapping_enabled": val.get("mapping_enabled"),
+                "inactive_reason": val.get("inactive_reason"),
+                "policy_source": val.get("policy_source"),
+                "policy_version": val.get("policy_version"),
+                "provider_family": val.get("provider_family"),
+                "version": val.get("version"),
+            })
+        }
+        Err(_) => serde_json::json!({
+            "mapping_state": "legacy_row_unavailable",
+            "mapping_enabled": false,
+            "inactive_reason": "legacy_row",
+            "policy_source": "synthesized_legacy",
+            "version": 1,
+        }),
+    }
 }
 
 fn xcode_runtime_observation_json(raw: Option<&str>) -> serde_json::Value {
@@ -1089,6 +1129,7 @@ mod tests {
                 output_tokens: None,
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
             },
         )
         .await
@@ -1704,6 +1745,7 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)

@@ -1347,6 +1347,7 @@ mod tests {
                 output_tokens: None,
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
             },
         )
         .await

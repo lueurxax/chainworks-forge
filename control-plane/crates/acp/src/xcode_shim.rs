@@ -192,6 +192,12 @@ pub struct XcodeHostExecutorPlanInput {
     pub provider_env: BTreeMap<String, String>,
     #[serde(default)]
     pub simulator_candidates: Vec<XcodeHostExecutorSimulatorCandidate>,
+    /// P066 T11: Toolchain mapping root for xcodebuild argument rewriting.
+    /// When present, `-derivedDataPath` and `-clonedSourcePackagesDirPath` are
+    /// injected into xcodebuild invocations. TMPDIR is also derived from this
+    /// root rather than from arbitrary provider env.
+    #[serde(default)]
+    pub toolchain_mapping_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,10 +523,32 @@ impl XcodeHostExecutorPlan {
 
         let (tool, host_args) = host_executor_invocation(&input.invoked_tool, &input.args)?;
         let cwd = resolve_cwd_inside_workspace(&input.cwd, &input.workspace_root)?;
-        let (argv, selected_simulator_id) =
+        let (mut argv, selected_simulator_id) =
             rewrite_destination_to_simulator_id(&host_args, &input.simulator_candidates)?;
-        let (env, env_allowlist_applied, env_dropped_from_provider) =
+        let (mut env, env_allowlist_applied, env_dropped_from_provider) =
             apply_host_executor_env_allowlist(input.provider_env);
+
+        // P066 T11: Inject toolchain mapping arguments for xcodebuild.
+        // When a toolchain_mapping_root is provided, -derivedDataPath and
+        // -clonedSourcePackagesDirPath are injected and TMPDIR is derived from
+        // the adapter-owned mapping root rather than arbitrary provider env.
+        if let Some(ref mapping_root) = input.toolchain_mapping_root {
+            if tool == "xcodebuild" {
+                let derived_data = mapping_root.join("DerivedData");
+                let source_packages = mapping_root.join("SourcePackages");
+                argv.extend_from_slice(&[
+                    "-derivedDataPath".to_string(),
+                    derived_data.to_string_lossy().to_string(),
+                    "-clonedSourcePackagesDirPath".to_string(),
+                    source_packages.to_string_lossy().to_string(),
+                ]);
+            }
+            // TMPDIR derives from adapter-owned mapping state, not provider env.
+            env.insert(
+                "TMPDIR".to_string(),
+                mapping_root.join("tmp").to_string_lossy().to_string(),
+            );
+        }
 
         Ok(Self {
             tool,
@@ -1464,6 +1492,7 @@ mod tests {
                 udid: "SIM-UUID-1".to_string(),
                 runtime: Some("iOS 17.5".to_string()),
             }],
+            toolchain_mapping_root: None,
         }
     }
 

@@ -144,6 +144,7 @@ fn make_running_execution(stage_execution_id: StageExecutionId, provider: &str) 
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     }
 }
 

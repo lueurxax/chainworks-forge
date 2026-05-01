@@ -6250,6 +6250,7 @@ mod tests {
             workflow_snapshot_json: "{}".into(),
             catalog_snapshot_json: "{}".into(),
             dynamic_candidate_bindings: Vec::new(),
+            run_plan_snapshot_format_version: None,
         }
     }
 
@@ -6313,6 +6314,7 @@ mod tests {
                 xcode_shim_injection_signal: false,
                 requires_xcode_host_execution: false,
                 xcode_prompt_lint_warnings: Vec::new(),
+                toolchain_cache_policy: None,
             },
             task_name: "review_proposal_as_product_owner".into(),
             inputs: Vec::new(),

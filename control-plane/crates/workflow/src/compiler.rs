@@ -87,6 +87,7 @@ fn compile_loaded(
     snapshots: Option<SnapshotJson>,
 ) -> Result<RunPlan> {
     catalog::validate_catalog_has_exactly_one_system_lead(&cat)?;
+    catalog::validate_toolchain_cache_policies(&cat)?;
     let direct_command_scan =
         crate::direct_command::scan_catalog(&cat, &wf, &workflow_raw, &catalog_raw);
     direct_command_scan.ensure_no_errors()?;
@@ -167,6 +168,18 @@ fn compile_loaded(
     let artifact_paths: HashMap<String, String> =
         cat.artifacts.unwrap_or_default().into_iter().collect();
 
+    // P066: Set run_plan_snapshot_format_version when any compiled agent carries
+    // a toolchain_cache_policy.
+    let has_toolchain_policy = states.values().any(|s| {
+        s.owner.toolchain_cache_policy.is_some()
+            || s.tasks.iter().any(|t| t.agent.toolchain_cache_policy.is_some())
+    });
+    let run_plan_snapshot_format_version = if has_toolchain_policy {
+        Some(crate::catalog::CATALOG_SNAPSHOT_FORMAT_VERSION)
+    } else {
+        None
+    };
+
     Ok(RunPlan {
         initial_state: wf.initial_state,
         states,
@@ -181,6 +194,7 @@ fn compile_loaded(
         workflow_snapshot_json,
         catalog_snapshot_json,
         dynamic_candidate_bindings,
+        run_plan_snapshot_format_version,
     })
 }
 
@@ -211,6 +225,8 @@ struct AgentBinding {
     xcode_shim_injection_signal: bool,
     requires_xcode_host_execution: bool,
     xcode_prompt_lint_warnings: Vec<String>,
+    /// P066: Toolchain cache policy from the catalog entry.
+    toolchain_cache_policy: Option<crate::plan::ToolchainCachePolicySnapshot>,
 }
 
 /// Lookup from output artifact name or explicit contract ID → resolved schema.
@@ -494,6 +510,21 @@ fn build_agent_lookup(
                 requires_xcode_host_execution: agent.requires_xcode_host_execution.unwrap_or(false)
                     || xcode_signals.requires_xcode_host_execution,
                 xcode_prompt_lint_warnings: xcode_signals.xcode_prompt_lint_warnings,
+                // P066: Copy catalog toolchain_cache_policy to snapshot.
+                toolchain_cache_policy: agent.toolchain_cache_policy.as_ref().map(|p| {
+                    crate::plan::ToolchainCachePolicySnapshot {
+                        version: p.version,
+                        enabled: p.enabled,
+                        xcode_scope: p.xcode_scope.map(|s| match s {
+                            crate::catalog::ToolchainCacheScope::Run => crate::plan::ToolchainCacheScopeSnapshot::Run,
+                            crate::catalog::ToolchainCacheScope::Session => crate::plan::ToolchainCacheScopeSnapshot::Session,
+                        }),
+                        go_scope: p.go_scope.map(|s| match s {
+                            crate::catalog::ToolchainCacheScope::Run => crate::plan::ToolchainCacheScopeSnapshot::Run,
+                            crate::catalog::ToolchainCacheScope::Session => crate::plan::ToolchainCacheScopeSnapshot::Session,
+                        }),
+                    }
+                }),
             },
         );
     }
@@ -678,6 +709,7 @@ fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Resu
             xcode_shim_injection_signal: binding.xcode_shim_injection_signal,
             requires_xcode_host_execution: binding.requires_xcode_host_execution,
             xcode_prompt_lint_warnings: binding.xcode_prompt_lint_warnings.clone(),
+            toolchain_cache_policy: binding.toolchain_cache_policy.clone(),
         }),
         None => {
             warn!(
@@ -708,6 +740,7 @@ fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Resu
                 xcode_shim_injection_signal: false,
                 requires_xcode_host_execution: false,
                 xcode_prompt_lint_warnings: Vec::new(),
+                toolchain_cache_policy: None,
             })
         }
     }

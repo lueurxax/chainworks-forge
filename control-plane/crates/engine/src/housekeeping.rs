@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use tracing::{debug, info, warn};
 
@@ -68,10 +69,101 @@ impl GeneratedStateHousekeeper {
 
         let candidates = load_run_cleanup_candidates(pool).await?;
         let config = config.clone();
-        tokio::task::spawn_blocking(move || prune_generated_state(candidates, config))
+        let report = tokio::task::spawn_blocking(move || prune_generated_state(candidates, config))
             .await
-            .context("join generated-state housekeeping task")?
+            .context("join generated-state housekeeping task")??;
+
+        // T19: prune terminal run-scoped Xcode roots under CHAINWORKS_TOOLCHAIN_HOME.
+        if let Ok(toolchain_home) = std::env::var("CHAINWORKS_TOOLCHAIN_HOME") {
+            let readback = sweep_xcode_toolchain_roots(pool, Path::new(&toolchain_home)).await;
+            if let Ok(readback) = readback {
+                let _ = db::repos::toolchain_cache_housekeeping::insert(pool, &readback).await;
+            }
+        }
+
+        Ok(report)
     }
+}
+
+/// T19: prune terminal run-scoped Xcode roots from `CHAINWORKS_TOOLCHAIN_HOME/providers/xcode/`.
+///
+/// Terminal run dirs (completed/failed/cancelled) are removed in full, including any quarantine
+/// subdirs left by the startup recovery sweep (T14). Active and unknown run dirs are not touched.
+pub async fn sweep_xcode_toolchain_roots(
+    pool: &SqlitePool,
+    toolchain_home: &Path,
+) -> Result<db::repos::toolchain_cache_housekeeping::ToolchainCacheHousekeepingReadback> {
+    let xcode_dir = toolchain_home.join("providers").join("xcode");
+    let now = Utc::now();
+    let mut roots_pruned: i64 = 0;
+    let mut prune_failures: i64 = 0;
+    let mut oldest_age_secs: Option<f64> = None;
+
+    if let Ok(entries) = fs::read_dir(&xcode_dir) {
+        for entry in entries.flatten() {
+            let run_dir = entry.path();
+            if !run_dir.is_dir() {
+                continue;
+            }
+            let Some(run_id_str) = run_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+                continue;
+            };
+
+            let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?1")
+                .bind(&run_id_str)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+
+            let is_terminal = status
+                .as_deref()
+                .map(|s| matches!(s, "completed" | "failed" | "cancelled"))
+                .unwrap_or(false);
+
+            if !is_terminal {
+                continue;
+            }
+
+            // Track oldest eligible root age for the readback.
+            if let Ok(meta) = fs::metadata(&run_dir) {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(age) = SystemTime::now().duration_since(modified) {
+                        let age_days = age.as_secs_f64() / 86400.0;
+                        oldest_age_secs = Some(oldest_age_secs.map_or(age_days, |prev: f64| prev.max(age_days)));
+                    }
+                }
+            }
+
+            match fs::remove_dir_all(&run_dir) {
+                Ok(()) => {
+                    roots_pruned += 1;
+                    info!(
+                        run_id = %run_id_str,
+                        "Housekeeping pruned terminal run-scoped Xcode toolchain root"
+                    );
+                }
+                Err(e) => {
+                    prune_failures += 1;
+                    warn!(
+                        run_id = %run_id_str,
+                        error = %e,
+                        "Failed to prune terminal run-scoped Xcode toolchain root"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(db::repos::toolchain_cache_housekeeping::ToolchainCacheHousekeepingReadback {
+        id: uuid::Uuid::new_v4().to_string(),
+        last_sweep_started_at: now,
+        run_scoped_roots_pruned: roots_pruned,
+        run_scoped_prune_failures: prune_failures,
+        oldest_eligible_root_age_days: oldest_age_secs,
+        disk_pressure_blocks: 0,
+        quarantined_roots_created: 0,
+        created_at: Utc::now(),
+    })
 }
 
 async fn load_run_cleanup_candidates(pool: &SqlitePool) -> Result<Vec<RunCleanupCandidate>> {
