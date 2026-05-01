@@ -915,6 +915,7 @@ struct PendingInvokeAgentWork {
     stage_execution_id: Option<String>,
     provider_family: Option<String>,
     scheduled_at: DateTime<Utc>,
+    requires_xcode_mcp: bool,
     startup_recovery_requeued: bool,
 }
 
@@ -984,6 +985,7 @@ impl SummaryAccumulator {
 #[derive(Clone, Debug, Default)]
 struct ActiveCounts {
     global: i64,
+    xcode_mcp: i64,
     by_run: BTreeMap<String, i64>,
     by_provider: BTreeMap<String, i64>,
 }
@@ -1038,6 +1040,9 @@ impl ActiveCounts {
         let mut running_work_by_provider = BTreeMap::new();
         counts.global = counts.global.max(running_work.len() as i64);
         for item in running_work {
+            if item.requires_xcode_mcp {
+                counts.xcode_mcp += 1;
+            }
             if let Some(run_id) = item.run_id {
                 *running_work_by_run.entry(run_id).or_insert(0) += 1;
             }
@@ -1106,6 +1111,9 @@ impl ActiveCounts {
         let mut running_work_by_provider = BTreeMap::new();
         counts.global = counts.global.max(running_work.len() as i64);
         for item in running_work {
+            if item.requires_xcode_mcp {
+                counts.xcode_mcp += 1;
+            }
             if let Some(run_id) = item.run_id {
                 *running_work_by_run.entry(run_id).or_insert(0) += 1;
             }
@@ -1133,6 +1141,10 @@ fn top_reason_for_item(
 ) -> String {
     if item.startup_recovery_requeued {
         return "startup_recovery_backpressure".to_string();
+    }
+
+    if item.requires_xcode_mcp && active.xcode_mcp >= capacity.xcode_mcp_active_invocations as i64 {
+        return "xcode_mcp_capacity".to_string();
     }
 
     if let Some(run_id) = item.run_id.as_deref() {
@@ -1257,6 +1269,7 @@ fn select_notification_summary(
 
 fn reason_priority(reason: &str) -> i64 {
     match reason {
+        "xcode_mcp_capacity" => 6,
         "run_capacity" => 5,
         "provider_capacity" => 4,
         "global_capacity" => 3,
@@ -1451,8 +1464,33 @@ fn parse_invoke_agent_work_row(row: sqlx::sqlite::SqliteRow) -> Result<PendingIn
         stage_execution_id,
         provider_family,
         scheduled_at,
+        requires_xcode_mcp: invoke_payload_requires_xcode_mcp(&payload),
         startup_recovery_requeued: payload.get("p061_startup_recovery").is_some(),
     })
+}
+
+fn invoke_payload_requires_xcode_mcp(payload: &serde_json::Value) -> bool {
+    payload
+        .get("xcode_broker_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || payload
+            .get("xcode_shim_injection_signal")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || payload
+            .get("requires_xcode_host_execution")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || payload
+            .get("requested_mcp_server_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|servers| {
+                servers
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|server| server == "xcode" || server == "xcode_broker")
+            })
 }
 
 fn parse_service_state_row(row: sqlx::sqlite::SqliteRow) -> Result<SchedulerServiceState> {

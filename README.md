@@ -100,6 +100,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
+- provider toolchain cache mapping ensuring isolated writable roots for Xcode and Go
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
 - bounded implementation closeout readiness gates (Proposal 077) ensuring proposal-specific proof and audit coverage before release

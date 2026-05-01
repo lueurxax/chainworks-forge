@@ -20,6 +20,7 @@ pub mod scheduler;
 pub mod sessions;
 pub mod stages;
 pub mod startup_repairs;
+pub mod toolchain_cache_housekeeping;
 pub mod steward;
 pub mod system_executions;
 pub mod validation;

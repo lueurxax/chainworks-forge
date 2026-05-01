@@ -12,14 +12,9 @@ use db::repos::{
     approvals, artifact_contracts, artifacts, closeout, ideas, projections, runs,
     steward as steward_repo, workflow_conflicts,
 };
-use domain::commands::{
-    ApprovalResolutionDecision, ApproveStageCmd, CallerContext, CancelRunCmd, Command,
-    OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResolveApprovalCmd, RetryStageCmd,
-    StartRunCmd,
-};
-use domain::discovery::LegacyBroadDiscoveryPolicy;
+use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
 use domain::events::DomainEvent;
-use domain::ids::{ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::lifecycle::DaemonStatus;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
@@ -30,6 +25,7 @@ use crate::types::artifact::GqlArtifact;
 use crate::types::idea::GqlIdea;
 use crate::types::p031::{GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode};
 use crate::types::run::GqlRun;
+use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
@@ -71,16 +67,6 @@ fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_legacy_broad_discovery_policy(value: &str) -> Result<LegacyBroadDiscoveryPolicy> {
-    match value {
-        "workflow_opt_in" => Ok(LegacyBroadDiscoveryPolicy::WorkflowOptIn),
-        "disabled" => Ok(LegacyBroadDiscoveryPolicy::Disabled),
-        _ => Err(Error::new(format!(
-            "unknown legacy_discovery_override_policy: {value}"
-        ))),
-    }
 }
 
 async fn run_from_projection_or_canonical(
@@ -460,6 +446,30 @@ impl QueryRoot {
         require_operator_read(ctx)?;
         let reporter = ctx.data::<LifecycleReporter>()?;
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
+    }
+
+    /// P066 T17: Latest startup recovery summary including toolchainCache fields.
+    /// Returns None when no startup recovery sweep has been recorded yet.
+    async fn startup_recovery_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlStartupRecoverySummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let readback = db::repos::startup_repairs::latest_startup_recovery_readback(pool).await?;
+        Ok(readback.map(GqlStartupRecoverySummary::from))
+    }
+
+    /// P066 T18: Latest toolchain cache housekeeping summary.
+    /// Returns None before any housekeeping sweep has been recorded.
+    async fn toolchain_cache_housekeeping_summary(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlToolchainCacheHousekeepingSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let readback = db::repos::toolchain_cache_housekeeping::latest(pool).await?;
+        Ok(readback.map(GqlToolchainCacheHousekeepingSummary::from))
     }
 }
 
@@ -1151,12 +1161,6 @@ pub struct MutationRoot;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationName {
-    StartRun,
-    ApproveStage,
-    RejectStage,
-    RetryStage,
-    OverrideLegacyDiscoveryPolicy,
-    CancelRun,
     /// P072: Converged approval mutation by approval_id.
     ApproveApproval,
     /// P072: Converged rejection mutation by approval_id.
@@ -1166,12 +1170,6 @@ pub enum MutationName {
 impl MutationName {
     fn graphql_name(self) -> &'static str {
         match self {
-            MutationName::StartRun => "startRun",
-            MutationName::ApproveStage => "approveStage",
-            MutationName::RejectStage => "rejectStage",
-            MutationName::RetryStage => "retryStage",
-            MutationName::OverrideLegacyDiscoveryPolicy => "overrideLegacyDiscoveryPolicy",
-            MutationName::CancelRun => "cancelRun",
             MutationName::ApproveApproval => "approveApproval",
             MutationName::RejectApproval => "rejectApproval",
         }
@@ -1180,15 +1178,9 @@ impl MutationName {
 
 pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     match mutation {
-        MutationName::StartRun => domain::CapabilityToolId::RunsStart,
-        MutationName::ApproveStage
-        | MutationName::RejectStage
-        | MutationName::ApproveApproval
-        | MutationName::RejectApproval => domain::CapabilityToolId::ApprovalsResolve,
-        MutationName::RetryStage | MutationName::OverrideLegacyDiscoveryPolicy => {
-            domain::CapabilityToolId::StagesRetry
+        MutationName::ApproveApproval | MutationName::RejectApproval => {
+            domain::CapabilityToolId::ApprovalsResolve
         }
-        MutationName::CancelRun => domain::CapabilityToolId::RunsCancel,
     }
 }
 
@@ -1229,92 +1221,9 @@ fn graphql_caller_with_request_id(
     caller
 }
 
-#[derive(SimpleObject)]
-pub struct GqlDeliveryPreflight {
-    pub passed: bool,
-    pub timestamp: String,
-    pub checks: Vec<GqlDeliveryPreflightCheck>,
-}
-
-#[derive(SimpleObject)]
-pub struct GqlDeliveryPreflightCheck {
-    pub id: String,
-    pub label: String,
-    pub passed: bool,
-    pub detail: Option<String>,
-}
-
-impl From<engine::preflight::DeliveryPreflightResult> for GqlDeliveryPreflight {
-    fn from(preflight: engine::preflight::DeliveryPreflightResult) -> Self {
-        GqlDeliveryPreflight {
-            passed: preflight.passed,
-            timestamp: preflight.timestamp.to_rfc3339(),
-            checks: preflight
-                .checks
-                .into_iter()
-                .map(|check| GqlDeliveryPreflightCheck {
-                    id: check.id,
-                    label: check.label,
-                    passed: check.passed,
-                    detail: check.detail,
-                })
-                .collect(),
-        }
-    }
-}
-
 // ── P029 payload wrappers ──────────────────────────────────────────────
 // Dedicated types for each mutation so journal_id doesn't pollute shared
 // Run/Approval types used by read queries.
-
-#[derive(SimpleObject)]
-pub struct StartRunStartedPayload {
-    pub run: GqlRun,
-    pub journal_id: ID,
-}
-
-#[derive(SimpleObject)]
-pub struct StartRunBlockedPayload {
-    pub delivery_preflight: GqlDeliveryPreflight,
-    pub journal_id: ID,
-}
-
-#[derive(Union)]
-pub enum StartRunPayload {
-    Started(StartRunStartedPayload),
-    Blocked(StartRunBlockedPayload),
-}
-
-#[derive(SimpleObject)]
-pub struct ApproveStagePayload {
-    pub approval: GqlApproval,
-    pub journal_id: ID,
-}
-
-#[derive(SimpleObject)]
-pub struct RejectStagePayload {
-    pub approval: GqlApproval,
-    pub journal_id: ID,
-}
-
-#[derive(SimpleObject)]
-pub struct RetryStagePayload {
-    pub retried: bool,
-    pub journal_id: ID,
-    pub legacy_discovery_override_id: Option<ID>,
-}
-
-#[derive(SimpleObject)]
-pub struct OverrideLegacyDiscoveryPolicyPayload {
-    pub override_id: ID,
-    pub journal_id: ID,
-}
-
-#[derive(SimpleObject)]
-pub struct CancelRunPayload {
-    pub cancelled: bool,
-    pub journal_id: ID,
-}
 
 /// P072: Payload for approveApproval mutation.
 #[derive(SimpleObject)]
@@ -1332,306 +1241,6 @@ pub struct RejectApprovalPayload {
 
 #[Object]
 impl MutationRoot {
-    async fn start_run(
-        &self,
-        ctx: &Context<'_>,
-        idea_id: ID,
-        workflow_id: String,
-        workflow_title: String,
-        workspace_root: String,
-        artifact_root: String,
-        delivery_configuration_json: Option<String>,
-        review_routing_json: Option<String>,
-        workflow_yaml_path: String,
-        agent_catalog_yaml_path: String,
-    ) -> Result<StartRunPayload> {
-        let pool = ctx.data::<SqlitePool>()?;
-        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
-
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
-            .clone();
-
-        if !mutation_allowed(ctx, &principal, MutationName::StartRun) {
-            return Err(Error::new("forbidden"));
-        }
-
-        let caller = graphql_caller_with_request_id(ctx, &principal, "startRun");
-
-        let iid: IdeaId = idea_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-
-        let cmd = Command::StartRun(StartRunCmd {
-            idea_id: iid,
-            workflow_id,
-            workflow_title,
-            workspace_root,
-            artifact_root,
-            delivery_configuration_json,
-            workflow_yaml_path,
-            agent_catalog_yaml_path,
-            review_routing_json,
-            closeout_readiness_mode: None,
-        });
-
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let jid = ID::from(commanded.journal_id);
-        match commanded.result {
-            engine::command_handler::CommandResult::RunStarted { run_id } => {
-                let run = runs::find_by_id(pool, run_id)
-                    .await?
-                    .ok_or_else(|| Error::new("Run not found after creation"))?;
-                Ok(StartRunPayload::Started(StartRunStartedPayload {
-                    run: GqlRun::from(run),
-                    journal_id: jid,
-                }))
-            }
-            engine::command_handler::CommandResult::StartRunBlockedByDeliveryPreflight(blocked) => {
-                Ok(StartRunPayload::Blocked(StartRunBlockedPayload {
-                    delivery_preflight: blocked.delivery_preflight.into(),
-                    journal_id: jid,
-                }))
-            }
-            _ => Err(Error::new("Unexpected command result")),
-        }
-    }
-
-    async fn approve_stage(
-        &self,
-        ctx: &Context<'_>,
-        run_id: ID,
-        stage_id: String,
-        comment: Option<String>,
-    ) -> Result<ApproveStagePayload> {
-        let pool = ctx.data::<SqlitePool>()?;
-        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
-
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
-            .clone();
-
-        if !mutation_allowed(ctx, &principal, MutationName::ApproveStage) {
-            return Err(Error::new("forbidden"));
-        }
-
-        let caller = graphql_caller_with_request_id(ctx, &principal, "approveStage");
-
-        let rid: RunId = run_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-
-        let cmd = Command::ApproveStage(ApproveStageCmd {
-            run_id: rid,
-            stage_id,
-            comment,
-        });
-
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let jid = ID::from(commanded.journal_id);
-        let approval_id = match commanded.result {
-            engine::command_handler::CommandResult::StageApproved { approval_id } => approval_id,
-            _ => return Err(Error::new("Unexpected command result")),
-        };
-
-        let approval = approvals::find_by_id(pool, approval_id)
-            .await?
-            .ok_or_else(|| Error::new("Approval not found after update"))?;
-
-        Ok(ApproveStagePayload {
-            approval: GqlApproval::from(approval),
-            journal_id: jid,
-        })
-    }
-
-    async fn reject_stage(
-        &self,
-        ctx: &Context<'_>,
-        run_id: ID,
-        stage_id: String,
-        comment: Option<String>,
-    ) -> Result<RejectStagePayload> {
-        let pool = ctx.data::<SqlitePool>()?;
-        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
-
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
-            .clone();
-
-        if !mutation_allowed(ctx, &principal, MutationName::RejectStage) {
-            return Err(Error::new("forbidden"));
-        }
-
-        let caller = graphql_caller_with_request_id(ctx, &principal, "rejectStage");
-
-        let rid: RunId = run_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-
-        let cmd = Command::RejectStage(RejectStageCmd {
-            run_id: rid,
-            stage_id,
-            comment,
-        });
-
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let jid = ID::from(commanded.journal_id);
-        let approval_id = match commanded.result {
-            engine::command_handler::CommandResult::StageRejected { approval_id } => approval_id,
-            _ => return Err(Error::new("Unexpected command result")),
-        };
-
-        let approval = approvals::find_by_id(pool, approval_id)
-            .await?
-            .ok_or_else(|| Error::new("Approval not found after update"))?;
-
-        Ok(RejectStagePayload {
-            approval: GqlApproval::from(approval),
-            journal_id: jid,
-        })
-    }
-
-    async fn retry_stage(
-        &self,
-        ctx: &Context<'_>,
-        run_id: ID,
-        stage_id: String,
-        consume_quota_budget_now: Option<bool>,
-        legacy_discovery_override_policy: Option<String>,
-        legacy_discovery_override_reason: Option<String>,
-    ) -> Result<RetryStagePayload> {
-        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
-
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
-            .clone();
-
-        if !mutation_allowed(ctx, &principal, MutationName::RetryStage) {
-            return Err(Error::new("forbidden"));
-        }
-
-        let caller = graphql_caller_with_request_id(ctx, &principal, "retryStage");
-
-        let rid: RunId = run_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-
-        let cmd = Command::RetryStage(RetryStageCmd {
-            run_id: rid,
-            stage_id,
-            consume_quota_budget_now: consume_quota_budget_now.unwrap_or(false),
-            agent_execution_id: None,
-            legacy_discovery_override_policy: legacy_discovery_override_policy
-                .as_deref()
-                .map(parse_legacy_broad_discovery_policy)
-                .transpose()?,
-            legacy_discovery_override_reason,
-            // P065: GraphQL retry_stage remains unchanged in v1 — always None.
-            operator_instruction: None,
-        });
-
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let legacy_discovery_override_id = match &commanded.result {
-            engine::command_handler::CommandResult::StageRetryScheduled {
-                legacy_discovery_override_id,
-                ..
-            } => legacy_discovery_override_id
-                .as_ref()
-                .map(|id| ID::from(id.clone())),
-            _ => None,
-        };
-        Ok(RetryStagePayload {
-            retried: true,
-            journal_id: ID::from(commanded.journal_id),
-            legacy_discovery_override_id,
-        })
-    }
-
-    async fn override_legacy_discovery_policy(
-        &self,
-        ctx: &Context<'_>,
-        run_id: ID,
-        stage_id: String,
-        target_stage_execution_id: ID,
-        target_attempt_number: i64,
-        legacy_discovery_override_policy: String,
-        legacy_discovery_override_reason: String,
-    ) -> Result<OverrideLegacyDiscoveryPolicyPayload> {
-        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
-
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
-            .clone();
-
-        if !mutation_allowed(ctx, &principal, MutationName::OverrideLegacyDiscoveryPolicy) {
-            return Err(Error::new("forbidden"));
-        }
-
-        let caller =
-            graphql_caller_with_request_id(ctx, &principal, "overrideLegacyDiscoveryPolicy");
-
-        let rid: RunId = run_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-        let target_stage_execution_id: StageExecutionId = target_stage_execution_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-
-        let cmd = Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
-            run_id: rid,
-            stage_id,
-            target_stage_execution_id,
-            target_attempt_number,
-            legacy_discovery_override_policy: parse_legacy_broad_discovery_policy(
-                &legacy_discovery_override_policy,
-            )?,
-            legacy_discovery_override_reason,
-        });
-
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let override_id = match commanded.result {
-            engine::command_handler::CommandResult::LegacyDiscoveryOverrideCreated {
-                override_id,
-            } => override_id,
-            _ => return Err(Error::new("Unexpected command result")),
-        };
-        Ok(OverrideLegacyDiscoveryPolicyPayload {
-            override_id: ID::from(override_id),
-            journal_id: ID::from(commanded.journal_id),
-        })
-    }
-
-    async fn cancel_run(&self, ctx: &Context<'_>, run_id: ID) -> Result<CancelRunPayload> {
-        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
-
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
-            .clone();
-
-        if !mutation_allowed(ctx, &principal, MutationName::CancelRun) {
-            return Err(Error::new("forbidden"));
-        }
-
-        let caller = graphql_caller_with_request_id(ctx, &principal, "cancelRun");
-
-        let rid: RunId = run_id
-            .parse()
-            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
-
-        let cmd = Command::CancelRun(CancelRunCmd { run_id: rid });
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        Ok(CancelRunPayload {
-            cancelled: true,
-            journal_id: ID::from(commanded.journal_id),
-        })
-    }
-
     /// P072: Approve a stage approval by approval_id. The resolver
     /// server-resolves run_id and stage_id from the approval record
     /// before constructing ResolveApprovalCmd.
@@ -2046,31 +1655,44 @@ mod tests {
     ];
 
     #[test]
-    fn mutation_name_converter_covers_command_mutations() {
+    fn mutation_name_converter_covers_approval_mutations() {
         assert_eq!(
-            capability_id_for(MutationName::StartRun),
-            domain::CapabilityToolId::RunsStart
-        );
-        assert_eq!(
-            capability_id_for(MutationName::ApproveStage),
+            capability_id_for(MutationName::ApproveApproval),
             domain::CapabilityToolId::ApprovalsResolve
         );
         assert_eq!(
-            capability_id_for(MutationName::RejectStage),
+            capability_id_for(MutationName::RejectApproval),
             domain::CapabilityToolId::ApprovalsResolve
         );
-        assert_eq!(
-            capability_id_for(MutationName::RetryStage),
-            domain::CapabilityToolId::StagesRetry
+    }
+
+    #[tokio::test]
+    async fn graphql_mutation_root_exposes_only_approval_mutations() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
         );
-        assert_eq!(
-            capability_id_for(MutationName::OverrideLegacyDiscoveryPolicy),
-            domain::CapabilityToolId::StagesRetry
-        );
-        assert_eq!(
-            capability_id_for(MutationName::CancelRun),
-            domain::CapabilityToolId::RunsCancel
-        );
+        let sdl = schema.sdl();
+
+        assert!(sdl.contains("approveApproval("));
+        assert!(sdl.contains("rejectApproval("));
+        for mutation in [
+            "startRun(",
+            "approveStage(",
+            "rejectStage(",
+            "retryStage(",
+            "overrideLegacyDiscoveryPolicy(",
+            "cancelRun(",
+        ] {
+            assert!(
+                !sdl.contains(mutation),
+                "{mutation} must not be present on GraphQL MutationRoot"
+            );
+        }
     }
 
     fn test_principal() -> auth::Principal {
@@ -2218,20 +1840,6 @@ mod tests {
             updated_at: Utc::now(),
             settled_at: None,
         }
-    }
-
-    fn test_workflow_yaml_path() -> String {
-        format!(
-            "{}/../../../examples/workflows/workflow.yaml",
-            env!("CARGO_MANIFEST_DIR")
-        )
-    }
-
-    fn test_agent_catalog_yaml_path() -> String {
-        format!(
-            "{}/../../../examples/agents/agents.yaml",
-            env!("CARGO_MANIFEST_DIR")
-        )
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -2399,6 +2007,7 @@ mod tests {
                 output_tokens: None,
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
             },
         )
         .await
@@ -2487,99 +2096,6 @@ mod tests {
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
         }
-    }
-
-    #[tokio::test]
-    async fn start_run_accepts_delivery_configuration_json() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "--initial-branch", "main"])
-            .current_dir(repo.path())
-            .output()
-            .expect("git init should run");
-        let worktrees = tempfile::tempdir().unwrap();
-        let delivery_json = format!(
-            r#"{{"repo_identifier":"repo-1","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
-            repo.path().display(),
-            worktrees.path().display()
-        );
-        let review_routing_json =
-            r#"{"mode":"legacy_fixed","force_include":[],"force_exclude":[]}"#.to_string();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(Request::new(
-                r#"
-                mutation StartRun {
-                  startRun(
-                    ideaId: "IDEA_ID",
-                    workflowId: "wf-start",
-                    workflowTitle: "Start Run",
-                    workspaceRoot: "/tmp/ws",
-                    artifactRoot: "/tmp/art",
-                    workflowYamlPath: "WORKFLOW_YAML_PATH",
-                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: DELIVERY_CONFIG
-                    reviewRoutingJson: REVIEW_ROUTING
-                  ) {
-                    ... on StartRunStartedPayload { run { id reviewRoutingJson } journalId }
-                    ... on StartRunBlockedPayload { deliveryPreflight { passed checks { id passed detail } } journalId }
-                  }
-                }
-                "#
-                .replace("IDEA_ID", &idea_id.to_string())
-                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
-                .replace(
-                    "DELIVERY_CONFIG",
-                    &serde_json::to_string(&delivery_json).unwrap(),
-                )
-                .replace(
-                    "REVIEW_ROUTING",
-                    &serde_json::to_string(&review_routing_json).unwrap(),
-                ),
-            ).data(test_principal()))
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "mutation must succeed: {response:?}"
-        );
-        let json = response.data.into_json().unwrap();
-        let run_id = json["startRun"]["run"]["id"].as_str().unwrap();
-        assert_eq!(
-            json["startRun"]["run"]["reviewRoutingJson"]
-                .as_str()
-                .and_then(
-                    |json| serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json).ok()
-                )
-                .map(|opts| opts.mode),
-            Some(domain::routing::ReviewRoutingMode::LegacyFixed)
-        );
-        let run = runs::find_by_id(&pool, run_id.parse().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(run.delivery_configuration_json, Some(delivery_json));
-        assert_eq!(
-            run.review_routing_json
-                .as_deref()
-                .and_then(
-                    |json| serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json).ok()
-                )
-                .map(|opts| opts.mode),
-            Some(domain::routing::ReviewRoutingMode::LegacyFixed)
-        );
     }
 
     #[tokio::test]
@@ -2684,72 +2200,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graphql_start_run_blocked_payload_contract_tests() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(Request::new(
-                r#"
-                mutation StartRun {
-                  startRun(
-                    ideaId: "IDEA_ID",
-                    workflowId: "wf-blocked",
-                    workflowTitle: "Blocked Run",
-                    workspaceRoot: "/tmp/ws",
-                    artifactRoot: "/tmp/art",
-                    workflowYamlPath: "WORKFLOW_YAML_PATH",
-                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: "{\"repo_identifier\":\"repo-blocked\",\"repo_root\":\"/definitely/missing/repo\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp\",\"target_branch\":\"cw/release\",\"release_target_id\":\"app-store\"}"
-                  ) {
-                    ... on StartRunStartedPayload { run { id } journalId }
-                    ... on StartRunBlockedPayload {
-                      deliveryPreflight {
-                        passed
-                        timestamp
-                        checks { id label passed detail }
-                      }
-                      journalId
-                    }
-                  }
-                }
-                "#
-                .replace("IDEA_ID", &idea_id.to_string())
-                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
-            ).data(test_principal()))
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "mutation must succeed: {response:?}"
-        );
-        let json = response.data.into_json().unwrap();
-        let preflight = &json["startRun"]["deliveryPreflight"];
-        assert_eq!(preflight["passed"], serde_json::json!(false));
-        assert!(
-            preflight["checks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|check| check["id"] == serde_json::json!("repo_root_exists")
-                    && check["passed"] == serde_json::json!(false)),
-            "typed preflight checks must include failing repo_root_exists: {preflight:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn run_query_exposes_delivery_configuration_json() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
+        let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
         let repo = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
@@ -2763,6 +2217,9 @@ mod tests {
             repo.path().display(),
             worktrees.path().display()
         );
+        let mut run = make_run(run_id, idea_id);
+        run.delivery_configuration_json = Some(delivery_json.clone());
+        runs::insert(&pool, &run).await.unwrap();
 
         let schema = build_schema(
             pool.clone(),
@@ -2771,40 +2228,6 @@ mod tests {
             auth::PrincipalTable::test_fixture(),
             test_reporter(),
         );
-        let start = schema
-            .execute(Request::new(
-                r#"
-                mutation StartRun {
-                  startRun(
-                    ideaId: "IDEA_ID",
-                    workflowId: "wf-query",
-                    workflowTitle: "Query Run",
-                    workspaceRoot: "/tmp/ws",
-                    artifactRoot: "/tmp/art",
-                    workflowYamlPath: "WORKFLOW_YAML_PATH",
-                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: DELIVERY_CONFIG
-                  ) {
-                    ... on StartRunStartedPayload { run { id } journalId }
-                    ... on StartRunBlockedPayload { deliveryPreflight { passed checks { id passed detail } } journalId }
-                  }
-                }
-                "#
-                .replace("IDEA_ID", &idea_id.to_string())
-                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
-                .replace(
-                    "DELIVERY_CONFIG",
-                    &serde_json::to_string(&delivery_json).unwrap(),
-                ),
-            ).data(test_principal()))
-            .await;
-
-        assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
-        let run_id = start.data.into_json().unwrap()["startRun"]["run"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
 
         let response = schema
             .execute(
@@ -3231,6 +2654,7 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)
@@ -3425,19 +2849,24 @@ mod tests {
     async fn delivery_preflight_graphql_readback_tests() {
         let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
+        let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "--initial-branch", "main"])
-            .current_dir(repo.path())
-            .output()
-            .expect("git init should run");
-        let worktrees = tempfile::tempdir().unwrap();
-        let delivery_json = format!(
-            r#"{{"repo_identifier":"repo-graphql-preflight","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
-            repo.path().display(),
-            worktrees.path().display()
+        let mut run = make_run(run_id, idea_id);
+        run.delivery_preflight_json = Some(
+            serde_json::json!({
+                "passed": true,
+                "checks": [
+                    {
+                        "id": "repo_root_exists",
+                        "label": "Repository root exists",
+                        "passed": true,
+                        "detail": null
+                    }
+                ]
+            })
+            .to_string(),
         );
+        runs::insert(&pool, &run).await.unwrap();
 
         let schema = build_schema(
             pool.clone(),
@@ -3446,49 +2875,10 @@ mod tests {
             auth::PrincipalTable::test_fixture(),
             test_reporter(),
         );
-        let start = schema
-            .execute(
-                Request::new(
-                    r#"
-                mutation StartRun {
-                  startRun(
-                    ideaId: "IDEA_ID",
-                    workflowId: "wf-preflight-readback",
-                    workflowTitle: "Preflight Readback",
-                    workspaceRoot: "/tmp/ws",
-                    artifactRoot: "/tmp/art",
-                    workflowYamlPath: "WORKFLOW_YAML_PATH",
-                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: DELIVERY_CONFIG
-                  ) {
-                    ... on StartRunStartedPayload { run { id deliveryPreflightJson } }
-                    ... on StartRunBlockedPayload { deliveryPreflight { passed } }
-                  }
-                }
-                "#
-                    .replace("IDEA_ID", &idea_id.to_string())
-                    .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                    .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
-                    .replace(
-                        "DELIVERY_CONFIG",
-                        &serde_json::to_string(&delivery_json).unwrap(),
-                    ),
-                )
-                .data(test_principal()),
-            )
-            .await;
-
-        assert!(start.errors.is_empty(), "mutation must succeed: {start:?}");
-        let start_json = start.data.into_json().unwrap();
-        let run_id = start_json["startRun"]["run"]["id"].as_str().unwrap();
-        assert!(start_json["startRun"]["run"]["deliveryPreflightJson"]
-            .as_str()
-            .unwrap()
-            .contains(r#""passed":true"#));
-
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -3496,7 +2886,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
         assert!(
             response.errors.is_empty(),
@@ -3528,8 +2920,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query StageExecutions {{
                   stages(runId: "{run_id}") {{
                     id
@@ -3547,7 +2940,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -5325,8 +4720,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query RunById {{
                   run(id: "{run_id}") {{
                     id
@@ -5334,7 +4730,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -5411,8 +4809,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(
-                r#"
+            .execute(
+                Request::new(
+                    r#"
                 query Runs {
                   runs {
                     id
@@ -5421,7 +4820,9 @@ mod tests {
                   }
                 }
                 "#,
-            ))
+                )
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -5490,8 +4891,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(format!(
-                r#"
+            .execute(
+                Request::new(format!(
+                    r#"
                 query Artifacts {{
                   artifacts(runId: "{run_id}") {{
                     name
@@ -5509,7 +4911,9 @@ mod tests {
                   }}
                 }}
                 "#
-            )))
+                ))
+                .data(test_principal()),
+            )
             .await;
 
         assert!(
@@ -5622,8 +5026,9 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(Request::new(
-                r#"
+            .execute(
+                Request::new(
+                    r#"
                 query Steward {
                   stewardAnalyses(limit: 10) {
                     id
@@ -5645,7 +5050,9 @@ mod tests {
                   }
                 }
                 "#,
-            ))
+                )
+                .data(test_principal()),
+            )
             .await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         assert_eq!(
@@ -5941,10 +5348,13 @@ mod tests {
             test_reporter(),
         );
         let response = schema
-            .execute(async_graphql::Request::new(format!(
-                r#"{{ run(id: "{}") {{ chainworksMetaRoot }} }}"#,
-                run_id
-            )))
+            .execute(
+                async_graphql::Request::new(format!(
+                    r#"{{ run(id: "{}") {{ chainworksMetaRoot }} }}"#,
+                    run_id
+                ))
+                .data(test_principal()),
+            )
             .await;
         assert!(
             response.errors.is_empty(),
@@ -6135,186 +5545,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_graphql_start_run_started_variant_includes_journal_id() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-
-        let repo = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "--initial-branch", "main"])
-            .current_dir(repo.path())
-            .output()
-            .expect("git init");
-        let worktrees = tempfile::tempdir().unwrap();
-        let delivery_json = format!(
-            r#"{{"repo_identifier":"repo-ok","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
-            repo.path().display(),
-            worktrees.path().display()
-        );
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(
-                Request::new(
-                    r#"
-                    mutation StartRun {
-                      startRun(
-                        ideaId: "IDEA_ID",
-                        workflowId: "wf-1",
-                        workflowTitle: "t",
-                        workspaceRoot: "/tmp/ws",
-                        artifactRoot: "/tmp/art",
-                        workflowYamlPath: "WORKFLOW_YAML_PATH",
-                        agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                        deliveryConfigurationJson: DELIVERY_CONFIG
-                      ) {
-                        ... on StartRunStartedPayload { run { id } journalId }
-                        ... on StartRunBlockedPayload { journalId }
-                      }
-                    }
-                    "#
-                    .replace("IDEA_ID", &idea_id.to_string())
-                    .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                    .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path())
-                    .replace(
-                        "DELIVERY_CONFIG",
-                        &serde_json::to_string(&delivery_json).unwrap(),
-                    ),
-                )
-                .data(test_principal()),
-            )
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "mutation must succeed: {response:?}"
-        );
-        let data = response.data.into_json().unwrap();
-        let jid = data["startRun"]["journalId"]
-            .as_str()
-            .expect("StartRunStartedPayload.journalId");
-        assert!(
-            !jid.is_empty(),
-            "journalId on StartRunStartedPayload must be a non-empty uuid"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_graphql_start_run_blocked_variant_includes_journal_id() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(Request::new(r#"
-                mutation StartRun {
-                  startRun(
-                    ideaId: "IDEA_ID",
-                    workflowId: "wf-blk",
-                    workflowTitle: "Blocked",
-                    workspaceRoot: "/tmp/ws",
-                    artifactRoot: "/tmp/art",
-                    workflowYamlPath: "WORKFLOW_YAML_PATH",
-                    agentCatalogYamlPath: "AGENT_CATALOG_YAML_PATH",
-                    deliveryConfigurationJson: "{\"repo_identifier\":\"r\",\"repo_root\":\"/definitely/missing\",\"base_branch\":\"main\",\"worktree_base_path\":\"/tmp\",\"target_branch\":\"cw/release\",\"release_target_id\":\"app-store\"}"
-                  ) {
-                    ... on StartRunStartedPayload { run { id } journalId }
-                    ... on StartRunBlockedPayload { journalId deliveryPreflight { passed } }
-                  }
-                }
-                "#
-                .replace("IDEA_ID", &idea_id.to_string())
-                .replace("WORKFLOW_YAML_PATH", &test_workflow_yaml_path())
-                .replace("AGENT_CATALOG_YAML_PATH", &test_agent_catalog_yaml_path()),
-            ).data(test_principal()))
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "blocked mutation must surface as payload, not top-level error: {response:?}"
-        );
-        let data = response.data.into_json().unwrap();
-        assert_eq!(
-            data["startRun"]["deliveryPreflight"]["passed"],
-            serde_json::json!(false),
-            "blocked variant must report preflight failure"
-        );
-        let jid = data["startRun"]["journalId"]
-            .as_str()
-            .expect("StartRunBlockedPayload.journalId");
-        assert!(
-            !jid.is_empty(),
-            "journalId must be present on the blocked variant too"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_graphql_approve_stage_returns_payload_with_approval_and_journal_id() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        let run_id = RunId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
-            .await
-            .unwrap();
-        let stage = make_manual_gate_stage(run_id, "state_6");
-        stages::insert(&pool, &stage).await.unwrap();
-        let approval = make_approval(run_id, "state_6");
-        approvals::insert(&pool, &approval).await.unwrap();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(
-                Request::new(format!(
-                    r#"mutation {{
-                      approveStage(runId: "{}", stageId: "state_6") {{
-                        approval {{ id }}
-                        journalId
-                      }}
-                    }}"#,
-                    run_id
-                ))
-                .data(test_principal()),
-            )
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "approveStage must succeed: {response:?}"
-        );
-        let data = response.data.into_json().unwrap();
-        let approval_id = data["approveStage"]["approval"]["id"]
-            .as_str()
-            .expect("approveStage.approval.id");
-        assert_eq!(approval_id, approval.id.to_string());
-
-        let jid = data["approveStage"]["journalId"]
-            .as_str()
-            .expect("approveStage.journalId");
-        assert!(!jid.is_empty(), "journalId on ApproveStagePayload");
-    }
-
-    #[tokio::test]
     async fn test_graphql_approve_approval_uses_p072_ui_operator_policy() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -6428,49 +5658,9 @@ mod tests {
         );
 
         let cases = [
-            format!(
-                r#"
-                mutation {{
-                  startRun(
-                    ideaId: "{}",
-                    workflowId: "wf-1",
-                    workflowTitle: "t",
-                    workspaceRoot: "/tmp/ws",
-                    artifactRoot: "/tmp/art",
-                    workflowYamlPath: "{}",
-                    agentCatalogYamlPath: "{}"
-                  ) {{
-                    ... on StartRunStartedPayload {{ journalId }}
-                    ... on StartRunBlockedPayload {{ journalId }}
-                  }}
-                }}
-                "#,
-                idea_id,
-                test_workflow_yaml_path(),
-                test_agent_catalog_yaml_path()
-            ),
-            format!(
-                r#"
-                mutation {{
-                  retryStage(runId: "{}", stageId: "state_6") {{
-                    retried
-                    journalId
-                  }}
-                }}
-                "#,
-                run_id
-            ),
-            format!(
-                r#"
-                mutation {{
-                  cancelRun(runId: "{}") {{
-                    cancelled
-                    journalId
-                  }}
-                }}
-                "#,
-                run_id
-            ),
+            "mutation { startRun }".to_string(),
+            "mutation { retryStage }".to_string(),
+            "mutation { cancelRun }".to_string(),
         ];
 
         for principal in [default_operator, ui_operator] {
@@ -6502,35 +5692,12 @@ mod tests {
         );
 
         let response = schema
-            .execute(
-                Request::new(format!(
-                    r#"
-                    mutation {{
-                      startRun(
-                        ideaId: "{}",
-                        workflowId: "wf-1",
-                        workflowTitle: "t",
-                        workspaceRoot: "/tmp/ws",
-                        artifactRoot: "/tmp/art",
-                        workflowYamlPath: "{}",
-                        agentCatalogYamlPath: "{}"
-                      ) {{
-                        ... on StartRunStartedPayload {{ journalId }}
-                        ... on StartRunBlockedPayload {{ journalId }}
-                      }}
-                    }}
-                    "#,
-                    idea_id,
-                    test_workflow_yaml_path(),
-                    test_agent_catalog_yaml_path()
-                ))
-                .data(principal),
-            )
+            .execute(Request::new("mutation { startRun }").data(principal))
             .await;
 
         assert!(
             !response.errors.is_empty(),
-            "legacy default-operator must be normalized to P072 policy and denied startRun: {response:?}"
+            "legacy default-operator must not see removed startRun GraphQL mutation: {response:?}"
         );
     }
 
@@ -6541,27 +5708,7 @@ mod tests {
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
-        let query = format!(
-            r#"
-            mutation {{
-              startRun(
-                ideaId: "{}",
-                workflowId: "wf-1",
-                workflowTitle: "t",
-                workspaceRoot: "/tmp/ws",
-                artifactRoot: "/tmp/art",
-                workflowYamlPath: "{}",
-                agentCatalogYamlPath: "{}"
-              ) {{
-                ... on StartRunStartedPayload {{ journalId }}
-                ... on StartRunBlockedPayload {{ journalId }}
-              }}
-            }}
-            "#,
-            idea_id,
-            test_workflow_yaml_path(),
-            test_agent_catalog_yaml_path()
-        );
+        let query = "mutation { startRun }";
 
         for (principal_table, principal, label) in [
             {
@@ -6581,12 +5728,10 @@ mod tests {
                 test_reporter(),
             );
 
-            let response = schema
-                .execute(Request::new(query.clone()).data(principal))
-                .await;
+            let response = schema.execute(Request::new(query).data(principal)).await;
             assert!(
                 !response.errors.is_empty(),
-                "{label} without GraphQL surface policy must be denied startRun: {response:?}"
+                "{label} must not see removed startRun GraphQL mutation: {response:?}"
             );
 
             let count: i64 = sqlx::query_scalar(
@@ -6801,181 +5946,6 @@ mod tests {
             allowed.errors.is_empty(),
             "default-operator query must succeed: {allowed:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_graphql_retry_stage_returns_payload_with_retried_and_journal_id() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        let run_id = RunId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
-            .await
-            .unwrap();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(
-                Request::new(format!(
-                    r#"mutation {{
-                      retryStage(runId: "{}", stageId: "state_7") {{
-                        retried
-                        journalId
-                      }}
-                    }}"#,
-                    run_id
-                ))
-                .data(test_principal()),
-            )
-            .await;
-
-        // retry_stage may succeed or fail depending on work-queue state —
-        // the contract we care about is that the payload wrapper includes
-        // journalId whenever it returns (not errors).
-        if response.errors.is_empty() {
-            let data = response.data.into_json().unwrap();
-            assert_eq!(data["retryStage"]["retried"], serde_json::json!(true));
-            let jid = data["retryStage"]["journalId"]
-                .as_str()
-                .expect("retryStage.journalId");
-            assert!(!jid.is_empty(), "journalId on RetryStagePayload");
-        } else {
-            // Even on error, the command_journal row was written. Assert
-            // that from the DB directly to prove journal_id was generated.
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(count, 1, "retryStage must still leave an audit row");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        let run_id = RunId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
-            .await
-            .unwrap();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(
-                Request::new(format!(
-                    r#"mutation {{
-                      cancelRun(runId: "{}") {{
-                        cancelled
-                        journalId
-                      }}
-                    }}"#,
-                    run_id
-                ))
-                .data(test_principal()),
-            )
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "cancelRun must succeed: {response:?}"
-        );
-        let data = response.data.into_json().unwrap();
-        assert_eq!(data["cancelRun"]["cancelled"], serde_json::json!(true));
-        let jid = data["cancelRun"]["journalId"]
-            .as_str()
-            .expect("cancelRun.journalId");
-        assert!(!jid.is_empty(), "journalId on CancelRunPayload");
-    }
-
-    #[tokio::test]
-    async fn test_response_omits_journal_id_when_capability_check_fails() {
-        // Observer class is forbidden from `startRun`. The mutation returns
-        // a GraphQL error of kind `forbidden`, and no payload — therefore
-        // no `journalId`. Proof: response.data is null/missing for the
-        // startRun field, and response.errors[0].message matches "forbidden".
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-
-        let schema = build_schema(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            event_bus::new_bus(64),
-            auth::PrincipalTable::test_fixture(),
-            test_reporter(),
-        );
-        let response = schema
-            .execute(
-                Request::new(
-                    r#"mutation {
-                      startRun(
-                        ideaId: "IDEA_ID",
-                        workflowId: "wf",
-                        workflowTitle: "t",
-                        workspaceRoot: "/tmp/ws",
-                        artifactRoot: "/tmp/art",
-                        workflowYamlPath: "WFP",
-                        agentCatalogYamlPath: "AGP"
-                      ) {
-                        ... on StartRunStartedPayload { journalId }
-                        ... on StartRunBlockedPayload { journalId }
-                      }
-                    }"#
-                    .replace("IDEA_ID", &idea_id.to_string())
-                    .replace("WFP", &test_workflow_yaml_path())
-                    .replace("AGP", &test_agent_catalog_yaml_path()),
-                )
-                .data(observer_principal()),
-            )
-            .await;
-
-        assert!(
-            !response.errors.is_empty(),
-            "observer must be denied with an error, got {response:?}"
-        );
-        assert!(
-            response
-                .errors
-                .iter()
-                .any(|e| e.message.contains("forbidden")),
-            "denial reason must mention 'forbidden', got {:?}",
-            response.errors
-        );
-
-        // Data field must not carry a journalId for the denied mutation.
-        let data = response.data.into_json().unwrap_or(serde_json::json!(null));
-        let has_jid = data
-            .get("startRun")
-            .and_then(|v| v.get("journalId"))
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
-        assert!(
-            !has_jid,
-            "denied mutation must NOT leak a journalId (got {data})"
-        );
-
-        // And there must be NO command_journal row — denied at capability
-        // check, never reaches CommandHandler::handle.
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM command_journal")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 0, "denied mutation must not write any audit row");
     }
 
     // ── P042 §5.2: daemonStatus query + daemonStatusChanged subscription ──

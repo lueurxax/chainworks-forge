@@ -5747,6 +5747,10 @@ fn is_health_fallback_eligible_task(
             && task_outputs
                 .iter()
                 .any(|output| output == "proposal_current"))
+        || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
+        || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
+        || (agent_id == "prepush_code_reviewer"
+            && output_contract == Some("prepush_review_v1"))
 }
 
 fn is_health_fallback_source_provider(provider: &str) -> bool {
@@ -5827,6 +5831,32 @@ fn run_local_health_fallback_profile_candidates(
             return vec!["claude_product_high", "claude_design_medium"];
         }
         return vec!["codex_architect_high", "codex_writer_high"];
+    }
+    if agent_id == "docs_guardian" && output_contract == Some("docs_report_v1") {
+        if matches!(source_provider, "gemini" | "gemini_acp") {
+            return vec![
+                "claude_docs_medium",
+                "claude_design_medium",
+                "codex_architect_high",
+            ];
+        }
+        return vec![
+            "gemini_docs_flash",
+            "claude_docs_medium",
+            "codex_architect_high",
+        ];
+    }
+    if agent_id == "security_checker" && output_contract == Some("security_report_v1") {
+        if matches!(source_provider, "claude" | "claude_acp") {
+            return vec!["codex_architect_high", "codex_audit_high", "codex_writer_high"];
+        }
+        return vec!["claude_security_high", "claude_product_high"];
+    }
+    if agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1") {
+        if matches!(source_provider, "claude" | "claude_acp") {
+            return vec!["codex_architect_high", "codex_writer_high"];
+        }
+        return vec!["claude_prepush_medium", "claude_product_high"];
     }
     Vec::new()
 }
@@ -6840,6 +6870,7 @@ mod tests {
             workflow_snapshot_json: "{}".into(),
             catalog_snapshot_json: "{}".into(),
             dynamic_candidate_bindings: Vec::new(),
+            run_plan_snapshot_format_version: None,
         }
     }
 
@@ -6903,6 +6934,7 @@ mod tests {
                 xcode_shim_injection_signal: false,
                 requires_xcode_host_execution: false,
                 xcode_prompt_lint_warnings: Vec::new(),
+                toolchain_cache_policy: None,
             },
             task_name: "review_proposal_as_product_owner".into(),
             inputs: Vec::new(),

@@ -221,6 +221,37 @@ fn handoff_tasks_do_not_force_code_fix_status() {
 }
 
 #[test]
+fn nonblocking_code_tail_does_not_keep_implementation_loop_open() {
+    let mut raw = valid_v2();
+    raw["implementation_complete"] = json!(false);
+    raw["remaining_code_tasks"] = json!([{
+        "summary": "defer catalog backfill until dogfood evidence is available",
+        "owner": "code_writer",
+        "blocking": false,
+        "evidence": "proposal gate is green; rollout evidence is owned downstream"
+    }]);
+    raw["handoff_tasks"] = json!([{
+        "summary": "collect dogfood evidence before catalog backfill",
+        "owner_class": "manual_evidence",
+        "target_stage": "phase_1_dogfood",
+        "blocking_review": false,
+        "evidence": "manual dogfood thresholds are not code-writer-owned"
+    }]);
+
+    let summary = parse_implementation_self_assessment_v2(&raw, context());
+
+    assert_eq!(
+        summary.status,
+        ImplementationSelfAssessmentStatus::HandoffRequired
+    );
+    assert_eq!(summary.blocking_remaining_code_task_count, Some(0));
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "suspicious_nonblocking_code_tasks_with_handoff"));
+}
+
+#[test]
 fn generic_status_normalization_accepts_handoff_required() {
     let normalized = normalize_contract_status(
         IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,

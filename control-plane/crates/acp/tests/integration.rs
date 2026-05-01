@@ -5856,6 +5856,7 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         AcpPromptProgressKind::PromptSent
             | AcpPromptProgressKind::MessageReceived
             | AcpPromptProgressKind::MeaningfulProgress
+            | AcpPromptProgressKind::ProviderLocalActivity
     ));
 
     let result = task

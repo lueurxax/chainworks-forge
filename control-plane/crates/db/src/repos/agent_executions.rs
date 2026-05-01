@@ -20,7 +20,8 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 mcp_session_startup_latency_ms,
                 owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id,
                 total_cost_cents, input_tokens, output_tokens, cached_input_tokens,
-                transcript_artifact_id"#;
+                transcript_artifact_id,
+                actual_toolchain_mapping_diagnostics_json"#;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningAgentExecution {
@@ -616,6 +617,10 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         output_tokens: row.get("output_tokens"),
         cached_input_tokens: row.get("cached_input_tokens"),
         transcript_artifact_id: row.get("transcript_artifact_id"),
+        // P066: toolchain cache mapping diagnostics (nullable; legacy rows → None)
+        actual_toolchain_mapping_diagnostics_json: row
+            .try_get("actual_toolchain_mapping_diagnostics_json")
+            .unwrap_or(None),
     })
 }
 
@@ -677,5 +682,25 @@ pub async fn update_attempt_attribution(
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// P066: Write the toolchain mapping diagnostics JSON document for a completed
+/// execution attempt. Called by the adapter/host-executor path after mapping
+/// setup completes (or fails). Idempotent — overwrites any prior value.
+pub async fn update_toolchain_mapping_diagnostics(
+    pool: &SqlitePool,
+    id: AgentExecutionId,
+    diagnostics_json: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_executions
+         SET actual_toolchain_mapping_diagnostics_json = ?
+         WHERE id = ?",
+    )
+    .bind(diagnostics_json)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
     Ok(())
 }

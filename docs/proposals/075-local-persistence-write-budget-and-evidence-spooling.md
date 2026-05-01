@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
 | Depends on | Rust control plane, SQLite persistence, artifact store, P038 run compaction, P073 stabilization freeze |
-| Related | P066 provider toolchain cache mapping, P078 durable side-effect ledger |
+| Related | [Provider toolchain cache mapping](../reference/acp-runtime-transport.md#toolchain-cache-mapping), P078 durable side-effect ledger |
 | Scope | Introduce write discipline for the local SQLite control-plane database so future durability features, including the side-effect ledger, do not turn SQLite into a high-volume event stream. |
 | Goal | Keep SQLite viable as the local canonical state database by routing all writes through a controlled writer, spooling high-volume evidence to files, coalescing non-critical updates, and making write pressure measurable before new durability layers are expanded. |
 

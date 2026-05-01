@@ -24,6 +24,8 @@ pub mod run;
 pub mod session;
 pub mod stage;
 pub mod steward;
+pub mod toolchain;
+pub mod toolchain_diagnostics;
 pub mod validation;
 pub mod workflow_conflict;
 pub mod xcode_runtime;

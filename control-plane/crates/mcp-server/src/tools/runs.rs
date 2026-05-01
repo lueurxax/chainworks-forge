@@ -747,9 +747,8 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, runs};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        parse_implementation_self_assessment_v2, ContractParseContext,
-        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -1061,10 +1060,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result["delivery_preflight_json"]
-            .as_str()
-            .unwrap()
-            .contains("repo_root_exists"));
+        assert!(
+            result["delivery_preflight_json"]
+                .as_str()
+                .unwrap()
+                .contains("repo_root_exists")
+        );
     }
 
     #[tokio::test]

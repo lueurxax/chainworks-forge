@@ -220,10 +220,9 @@ pub struct ClaimedInvokeAgentStart {
 pub struct InvokeAgentCapacityConfig {
     pub max_active_total: usize,
     pub max_active_per_run: usize,
+    pub max_active_xcode_mcp: usize,
     pub provider_caps: std::collections::HashMap<String, usize>,
 }
-
-const MAX_ACTIVE_XCODE_MCP_INVOKE_AGENTS: i64 = 1;
 
 #[derive(Clone, Debug)]
 struct DeclaredContractImportResult {
@@ -243,6 +242,7 @@ impl InvokeAgentCapacityConfig {
         Self {
             max_active_total: usize::MAX,
             max_active_per_run: usize::MAX,
+            max_active_xcode_mcp: usize::MAX,
             provider_caps: std::collections::HashMap::new(),
         }
     }
@@ -254,6 +254,7 @@ fn invoke_agent_start_capacity_from_domain(
     InvokeAgentCapacityConfig {
         max_active_total: capacity.global_active_agent_executions,
         max_active_per_run: capacity.per_run_active_agent_executions,
+        max_active_xcode_mcp: capacity.xcode_mcp_active_invocations,
         provider_caps: capacity
             .provider_caps
             .iter()
@@ -370,7 +371,7 @@ async fn invoke_item_has_start_capacity(
     }
     if invoke_payload_requires_xcode_mcp(&payload) {
         let active_xcode = running_xcode_mcp_invoke_agent_count(pool).await?;
-        if active_xcode >= MAX_ACTIVE_XCODE_MCP_INVOKE_AGENTS {
+        if active_xcode as usize >= capacity.max_active_xcode_mcp {
             return Ok(false);
         }
     }
@@ -480,6 +481,7 @@ fn scheduler_capacity_config_from_start_capacity(
     domain::provider::InvokeAgentCapacityConfig {
         global_active_agent_executions: capacity.max_active_total,
         per_run_active_agent_executions: capacity.max_active_per_run,
+        xcode_mcp_active_invocations: capacity.max_active_xcode_mcp,
         provider_caps,
     }
 }
@@ -510,13 +512,19 @@ async fn claim_invoke_agent_work_item_with_start(
         .get("session_family_id")
         .and_then(|value| value.as_str())
         .map(String::from);
+    let declared_outputs_require_session_generation = payload
+        .get("declared_outputs")
+        .and_then(|value| value.as_array())
+        .is_some_and(|outputs| !outputs.is_empty());
+    let requires_invocation_generation =
+        session_reuse_scope.is_some() || declared_outputs_require_session_generation;
 
     if let Some(existing) = payload.get("p058_claimed") {
         let mut claimed = claimed_invoke_agent_start_from_payload(&item, existing)?;
         let mut running_item = item;
         running_item.status = WorkItemStatus::Running;
         running_item.attempt_count += 1;
-        if session_reuse_scope.is_none() && claimed.session_generation_id.is_some() {
+        if !requires_invocation_generation && claimed.session_generation_id.is_some() {
             claimed.session_generation_id = None;
             if let Some(claimed_object) = payload
                 .get_mut("p058_claimed")
@@ -591,9 +599,8 @@ async fn claim_invoke_agent_work_item_with_start(
         .to_string();
     let now = chrono::Utc::now();
     let agent_execution_id = domain::ids::AgentExecutionId::new();
-    let session_generation_id = session_reuse_scope
-        .as_ref()
-        .map(|_| uuid::Uuid::new_v4().to_string());
+    let session_generation_id =
+        requires_invocation_generation.then(|| uuid::Uuid::new_v4().to_string());
     let owner_execution_lineage_id = stage_execution_id.to_string();
     let run_id_str = run_id.to_string();
     let invocation_owner_key = invocation_owner_key(&InvocationOwnerKeyInput {
@@ -644,6 +651,7 @@ async fn claim_invoke_agent_work_item_with_start(
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         },
     )
     .await?;
@@ -900,6 +908,8 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 origin_stage_id: None,
                 origin_stage_execution_id: None,
                 mediation_record_id: None,
+                toolchain_home: None,
+                toolchain_go_scope_enabled: false,
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -2527,7 +2537,9 @@ impl BackgroundExecutor {
         let disabled_interval = Duration::from_secs(interval.as_secs().saturating_mul(5).max(300));
 
         if !crate::mediation::feature_flag::is_phase_b_mediation_enabled() {
-            info!("P017 mediation expiry watchdog: Phase B not enabled, checking at reduced frequency");
+            info!(
+                "P017 mediation expiry watchdog: Phase B not enabled, checking at reduced frequency"
+            );
         }
 
         loop {
@@ -3285,8 +3297,10 @@ impl BackgroundExecutor {
                     }),
                 };
 
+                let invocation_generation_required =
+                    session_reuse_scope.is_some() || !declared_outputs.is_empty();
                 let mut policy_decision: Option<SessionPolicyDecision> =
-                    if session_reuse_scope.is_some() && !xcode_shim_required {
+                    if invocation_generation_required {
                         Some(ensure_policy(&self.pool, policy_input.clone()).await?)
                     } else {
                         None
@@ -3457,6 +3471,7 @@ impl BackgroundExecutor {
                         output_tokens: None,
                         cached_input_tokens: None,
                         transcript_artifact_id: None,
+                        actual_toolchain_mapping_diagnostics_json: None,
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
                 }
@@ -3781,6 +3796,8 @@ impl BackgroundExecutor {
                             .or_else(|| stage_execution_id.map(|id| id.to_string()))
                     },
                     mediation_record_id: mediation_record_id.clone(),
+                    toolchain_home: None,
+                    toolchain_go_scope_enabled: false,
                 };
                 // Runtime event: session starting
                 let _ = self

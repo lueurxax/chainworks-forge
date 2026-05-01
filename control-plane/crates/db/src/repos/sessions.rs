@@ -531,6 +531,25 @@ pub async fn update_generation_runtime_session(
     Ok(())
 }
 
+/// P066 T14: Return all session generation IDs that are currently live
+/// (active_generation_id IS NOT NULL AND lineage not closed).
+/// Used by startup recovery to identify orphan toolchain session-scoped roots.
+pub async fn list_live_session_generation_ids(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"SELECT active_generation_id
+           FROM session_lineages
+           WHERE active_generation_id IS NOT NULL
+             AND closed_at IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("list live session generation ids")?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 fn parse_generation_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionGeneration> {
     let status: String = row.get("status");
     let created_at: String = row.get("created_at");
