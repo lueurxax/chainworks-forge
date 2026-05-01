@@ -904,10 +904,11 @@ enum SchedulerHealthPresentation {
 }
 
 enum DaemonOperatorTokenStore {
-    /// Minimal reader for `principals.json` — the app's principals file
-    /// is a JSON list; the operator token is the first entry whose
-    /// `class == "operator"`. Returns `nil` when the file is absent,
-    /// malformed, or contains no operator.
+    /// P073: Deterministic selector for the governed-app GraphQL credential.
+    /// Resolves the single principal entry where id="forge-app-graphql" and
+    /// profile="app_graphql_readonly". Returns nil if zero or multiple matches
+    /// are found (fail-closed contract). Never falls back to the first operator
+    /// token and never auto-selects graphql_break_glass.
     static func resolveOperatorToken() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let path = home
@@ -920,16 +921,20 @@ enum DaemonOperatorTokenStore {
         else {
             return nil
         }
-        for entry in list {
-            if let cls = entry["class"] as? String,
-               cls == "operator",
-               let token = entry["token"] as? String,
-               !token.isEmpty
-            {
-                return token
-            }
+        // P073: Select exactly the forge-app-graphql app_graphql_readonly principal.
+        // Fail closed on zero or multiple matches.
+        let matches = list.filter { entry in
+            (entry["id"] as? String) == "forge-app-graphql"
+                && (entry["profile"] as? String) == "app_graphql_readonly"
+                && (entry["class"] as? String) == "operator"
         }
-        return nil
+        guard matches.count == 1,
+              let token = matches[0]["token"] as? String,
+              !token.isEmpty
+        else {
+            return nil
+        }
+        return token
     }
 }
 
@@ -1032,4 +1037,121 @@ final class DaemonStatusViewModel: ObservableObject {
         let client = DaemonLifecycleClient(endpoint: .operatorDefault())
         return DaemonStatusViewModel(client: client)
     }
+}
+
+// MARK: - Stability budget (P073-J)
+
+struct StabilityBudgetRowPayload: Decodable, Sendable, Identifiable {
+    var id: String { metricId }
+    let snapshotId: String
+    let capturedAt: String
+    let phase: String
+    let metricId: String
+    let metricClassification: String
+    let blockingMode: String
+    let measurementStatus: String
+    let currentValue: Double?
+    let baselineValue: Double?
+    let targetThreshold: String
+    let latestByInstrumentationDate: String?
+    let missingDataPolicy: String
+    let notes: String
+}
+
+struct StabilityBudgetPayload: Decodable, Sendable {
+    let snapshotWriter: String
+    let metrics: [StabilityBudgetRowPayload]
+}
+
+private struct StabilityBudgetEnvelope: Decodable {
+    let data: StabilityBudgetData?
+    let errors: [GraphQLError]?
+}
+
+private struct StabilityBudgetData: Decodable {
+    let stabilityBudget: StabilityBudgetPayload?
+}
+
+extension DaemonLifecycleClient {
+    static let stabilityBudgetQuery: String = """
+    {
+      stabilityBudget {
+        snapshotWriter
+        metrics {
+          snapshotId capturedAt phase metricId
+          metricClassification blockingMode measurementStatus
+          currentValue baselineValue targetThreshold
+          latestByInstrumentationDate missingDataPolicy notes
+        }
+      }
+    }
+    """
+
+    func fetchStabilityBudget() async throws -> StabilityBudgetPayload {
+        let body: [String: Any] = ["query": Self.stabilityBudgetQuery]
+        let data = try JSONSerialization.data(withJSONObject: body)
+        var request = URLRequest(url: endpoint.graphqlURL)
+        request.httpMethod = "POST"
+        request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(endpoint.bearerToken)", forHTTPHeaderField: "Authorization")
+        let (respData, response): (Data, URLResponse)
+        do {
+            (respData, response) = try await urlSession.data(for: request)
+        } catch {
+            throw DaemonClientError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw DaemonClientError.httpFailure(status: -1, body: "no HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = String(data: respData, encoding: .utf8) ?? "<binary>"
+            throw DaemonClientError.httpFailure(status: http.statusCode, body: body)
+        }
+        let envelope: StabilityBudgetEnvelope
+        do {
+            envelope = try JSONDecoder().decode(StabilityBudgetEnvelope.self, from: respData)
+        } catch {
+            throw DaemonClientError.decoding(error)
+        }
+        if let errors = envelope.errors, !errors.isEmpty {
+            throw DaemonClientError.graphqlErrors(errors.map { $0.message })
+        }
+        guard let budget = envelope.data?.stabilityBudget else {
+            throw DaemonClientError.decoding(NSError(
+                domain: "DaemonClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "stabilityBudget data missing"]
+            ))
+        }
+        return budget
+    }
+}
+
+@MainActor
+final class StabilityBudgetViewModel: ObservableObject {
+    @Published private(set) var budget: StabilityBudgetPayload?
+    @Published private(set) var lastError: DaemonClientError?
+
+    private let client: DaemonLifecycleClient
+
+    init(client: DaemonLifecycleClient) {
+        self.client = client
+    }
+
+    func refresh() async {
+        do {
+            budget = try await client.fetchStabilityBudget()
+            lastError = nil
+        } catch let error as DaemonClientError {
+            lastError = error
+        } catch {
+            lastError = .transport(error)
+        }
+    }
+
+    static func bootstrap() -> StabilityBudgetViewModel {
+        StabilityBudgetViewModel(client: DaemonLifecycleClient(endpoint: .operatorDefault()))
+    }
+
+    var rows: [StabilityBudgetRowPayload] { budget?.metrics ?? [] }
 }

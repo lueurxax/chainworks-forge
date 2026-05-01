@@ -132,6 +132,17 @@ Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `a
 
 Implementation: `control-plane/crates/graphql-server/src/schema.rs`.
 
+### Stability Budget (P073)
+
+The daemon is the sole authoritative owner of the **Stability Budget** system. It maintains a durable set of snapshots that track 12 regression metrics (SB-01 to SB-12) across the repository.
+
+- **Authoritative Snapshot Family**: Each row in the `stability_budget_snapshots` table represents one metric reading within a named snapshot.
+- **Metric Classifications**: Derived (control-plane owned), ServerNative (instrumented), or ClientObserved (UI side).
+- **Blocking Mode**: Metrics can be Blocking, Advisory, or AdvisoryUntilCondition (e.g. until P038 compaction).
+- **Read-Only Consumption**: GraphQL and MCP clients consume the latest snapshot only; they do not compute competing authoritative budgets.
+
+The stability budget is exposed via the `StabilityBudgetLatest` resource on MCP and the `stabilityBudget` query on GraphQL.
+
 ### MCP
 
 Two transports serve the same `McpServer` logic:
@@ -411,6 +422,7 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `lead_conflict_mediations` | Durable mediation lifecycle (id, run_id, conflict_id, status, lead_agent_id, settlement_result) |
 | `lead_mediation_confirmations` | Separate store for mediation confirmations (id, mediation_id, status, deadline_at, suggested_action) |
 | `workflow_conflict_metric_events` | Durable rollout metric events for workflow conflict recovery, mediation, Phase C validation, and dogfood decisions |
+| `stability_budget_snapshots` | P073: Autoritative durable stability metric snapshots for regression tracking |
 | `main_sync_attempts` | P064: Lifecycle of worktree sync attempts (status, preservation commit, merge commit, results) |
 | `main_sync_conflict_files` | P064: Files that conflicted during a sync attempt |
 | `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |

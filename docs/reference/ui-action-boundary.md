@@ -24,6 +24,14 @@ SwiftUI must not use:
 - Swift-local workflow truth,
 - broad GraphQL command mutations.
 
+## Enforcement (P073)
+
+The UI action boundary is enforced by the control plane's authentication layer.
+
+- **`forge-app-graphql` principal**: The default principal for governed-app GraphQL read and subscription traffic. It is restricted to the `app_graphql_readonly` profile and allows zero mutations.
+- **`default-operator` principal**: The primary app bearer, restricted to exactly the `approveApproval` and `rejectApproval` mutations on GraphQL by default.
+- **`graphql-break-glass-operator`**: A manually activated compatibility principal that allows full GraphQL write access for break-glass recovery or testing.
+
 ## Forbidden UI Mutations
 
 The governed SwiftUI app must not create, start, cancel, retry, reset, compact,

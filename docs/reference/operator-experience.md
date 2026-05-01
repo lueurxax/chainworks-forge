@@ -97,6 +97,7 @@ Surfaces for backpressure visibility:
   agents by provider and reason.
 - **Scheduler Health**: A dedicated section in PilotReadinessView showing system-wide
   capacity, write pressure, and command latency.
+- **Stability Budget (P073)**: Authoritative regression tracking visible via the `Stability Budget` surface. Displays the 12 regression metrics (SB-01 to SB-12), their classifications, and blocking/advisory status.
 - **Sustained Backpressure Alerts**: Notifications trigger when work remains queued
   longer than the configured threshold (default 5 minutes).
 

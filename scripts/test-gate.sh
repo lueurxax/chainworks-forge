@@ -1637,6 +1637,7 @@ Available gates:
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
+  proposal-073,p073  Stability freeze boundary gate: stability_budget.v1 contract, credential split, MCP resource, GraphQL readback
   proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -2581,6 +2582,75 @@ PY
     )
 
     log "UI action boundary gate passed"
+    ;;
+  proposal-073|p073)
+    log "Stability freeze boundary gate: stability_budget.v1 contract, credential split, MCP resource, GraphQL readback"
+
+    (
+      cd "$ROOT_DIR/control-plane"
+      # P073 auth contract: profile field, forge-app-graphql validation, fail-closed selector.
+      CARGO_TARGET_DIR=target/proposal-073-gate cargo test -p auth p073_ -- --nocapture
+      # P073 domain types: stability budget module compiles and metric IDs are correct.
+      CARGO_TARGET_DIR=target/proposal-073-gate cargo test -p domain stability_budget -- --nocapture
+      # P073 C3 materializer: full-recomputation writes 12 rows, idempotent baseline.
+      CARGO_TARGET_DIR=target/proposal-073-gate cargo test -p db stability_budget -- --nocapture
+      # P073-G1: forge-app-graphql profile-based mutation denial in GraphQL layer.
+      CARGO_TARGET_DIR=target/proposal-073-gate cargo test -p graphql-server test_graphql_p073_ -- --nocapture
+    )
+
+    (
+      cd "$ROOT_DIR"
+      python3 - <<'PY'
+import json
+from pathlib import Path
+
+failures = []
+
+# Verify the stability budget migration exists.
+migrations = sorted(Path("control-plane/crates/db/migrations").glob("037_*.sql"))
+if not migrations:
+    failures.append("proposal-073: DB migration 037 for stability_budget_snapshots is missing")
+
+# Verify the MCP resource URI is registered in the server.
+server_src = Path("control-plane/crates/mcp-server/src/server.rs").read_text()
+if "stability-budget://latest" not in server_src:
+    failures.append("proposal-073: stability-budget://latest resource URI not found in MCP server")
+
+# Verify the GraphQL query is registered and profile-based guard is present.
+schema_src = Path("control-plane/crates/graphql-server/src/schema.rs").read_text()
+if "stability_budget" not in schema_src:
+    failures.append("proposal-073: stabilityBudget query/subscription not found in GraphQL schema")
+if "stability_budget_changed" not in schema_src:
+    failures.append("proposal-073: stabilityBudgetChanged subscription not found in GraphQL schema")
+if "AppGraphqlReadonly" not in schema_src:
+    failures.append("proposal-073: explicit AppGraphqlReadonly profile guard missing from GraphQL mutation_allowed")
+
+# Verify the principal profile field is present.
+auth_src = Path("control-plane/crates/auth/src/lib.rs").read_text()
+if "forge-app-graphql" not in auth_src:
+    failures.append("proposal-073: forge-app-graphql principal not found in auth crate")
+if "app_graphql_readonly" not in auth_src:
+    failures.append("proposal-073: app_graphql_readonly profile not found in auth crate")
+if "find_app_graphql_principal" not in auth_src:
+    failures.append("proposal-073: find_app_graphql_principal helper not found in auth crate")
+
+# Verify DaemonLifecycleClient.swift uses deterministic forge-app-graphql selector.
+swift_src = Path("Chainworks Forge/Support/DaemonLifecycleClient.swift").read_text()
+if "forge-app-graphql" not in swift_src:
+    failures.append("proposal-073: DaemonLifecycleClient.swift does not use forge-app-graphql selector")
+if "app_graphql_readonly" not in swift_src:
+    failures.append("proposal-073: DaemonLifecycleClient.swift does not check app_graphql_readonly profile")
+
+if failures:
+    for f in failures:
+        print(f"FAIL: {f}")
+    raise SystemExit(f"proposal-073 gate failed with {len(failures)} error(s)")
+
+print("proposal-073 structural checks passed")
+PY
+    )
+
+    log "Stability freeze boundary gate passed"
     ;;
   proposal-031-readiness|p031-readiness)
     log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"

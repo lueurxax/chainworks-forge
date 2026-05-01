@@ -1624,6 +1624,41 @@ Command:
 ./scripts/test-gate.sh proposal-064
 ```
 
+### `proposal-073-stability|p073-stability`
+
+Stability freeze, regression budget, and boundary enforcement gate.
+
+Scope:
+
+- P073 Stability Budget domain/db/graphql types and `stability_budget_snapshots` persistence
+- 12 regression metrics (SB-01 to SB-12) authoritative readback
+- Refined auth principal profiles (`operator_mcp_cli`, `app_graphql_readonly`, `graphql_break_glass`)
+- Enforced UI action boundary: `app_graphql_readonly` profile allows zero mutations; `default-operator` allows only approval mutations in schema version 2
+- Forbidden UI mutations (start, cancel, retry, reset, etc.) fail closed for production-style principals
+- P073 acknowledgment banner and blocked-action panel UI visibility
+- No regression on projection lag, stale executions, or subscription connectivity
+
+Use when:
+
+- validating the P073 stability budget or refined auth profiles
+- confirming the UI action boundary is enforced at the auth level
+- checking for regressions in system stability metrics
+
+Host policy:
+
+- local Rust toolchain required; no live provider or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-073-stability
+```
+
+Important:
+
+- `p073-stability` is accepted as an alias
+- the gate fails if the stability budget snapshot is missing or if auth profiles allow forbidden UI mutations
+
 Important:
 
 - `p064` is accepted as an alias

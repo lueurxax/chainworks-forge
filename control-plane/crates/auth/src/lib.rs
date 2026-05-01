@@ -6,12 +6,40 @@ use std::path::Path;
 // Re-export here so downstream crates that use auth::PrincipalClass keep working.
 pub use domain::{CapabilityToolId, PrincipalClass, ResourceTemplateId};
 
+// ── P073: Principal profile discriminator ───────────────────────────────
+
+/// P073: Identifies the intended use of a principal entry.
+/// Additive field — entries without `profile` are treated as `operator_mcp_cli`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalProfile {
+    /// Canonical credential for MCP, CLI, and operator automation.
+    OperatorMcpCli,
+    /// Ordinary governed-app GraphQL read and subscription traffic only.
+    AppGraphqlReadonly,
+    /// Manually activated compatibility-only GraphQL path; disabled by default.
+    GraphqlBreakGlass,
+}
+
+impl PrincipalProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OperatorMcpCli => "operator_mcp_cli",
+            Self::AppGraphqlReadonly => "app_graphql_readonly",
+            Self::GraphqlBreakGlass => "graphql_break_glass",
+        }
+    }
+}
+
 // ── Principal types ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Principal {
     pub id: String,
     pub class: PrincipalClass,
+    /// P073: optional profile discriminator. None implies operator_mcp_cli.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PrincipalProfile>,
     #[serde(default)]
     pub tool_capabilities: BTreeSet<CapabilityToolId>,
     #[serde(default)]
@@ -25,6 +53,7 @@ impl Principal {
         Self {
             id: id.into(),
             class,
+            profile: None,
             tool_capabilities,
             resource_capabilities,
         }
@@ -32,6 +61,7 @@ impl Principal {
 
     fn from_entry(entry: &PrincipalEntry) -> Self {
         let mut principal = Principal::new(entry.id.clone(), entry.class.clone());
+        principal.profile = entry.profile.clone();
         if let Some(mcp) = entry
             .surface_policies
             .as_ref()
@@ -69,6 +99,9 @@ struct PrincipalEntry {
     token: String,
     id: String,
     class: PrincipalClass,
+    /// P073: optional profile discriminator. None = operator_mcp_cli for backward compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<PrincipalProfile>,
     /// P072 v2: Per-principal surface policies. Required for app-owned
     /// GraphQL principals in schema_version 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +157,7 @@ impl PrincipalTable {
                 token: "test-token".into(),
                 id: "test-operator".into(),
                 class: PrincipalClass::Operator,
+                profile: None,
                 surface_policies: Some(SurfacePolicies {
                     graphql: Some(GraphqlPolicy {
                         allow_queries: true,
@@ -167,13 +201,21 @@ impl PrincipalTable {
                 entries: principals,
             })
         } else {
-            // Bootstrap a default operator token
-            let token = uuid::Uuid::new_v4().to_string();
-            let entry = default_operator_entry(token.clone());
+            // P073: Bootstrap all three required principals.
+            let operator_token = uuid::Uuid::new_v4().to_string();
+            let app_token = uuid::Uuid::new_v4().to_string();
+            let break_glass_token = uuid::Uuid::new_v4().to_string();
+            let all_entries = vec![
+                default_operator_entry(operator_token.clone()),
+                forge_app_graphql_entry(app_token),
+                graphql_break_glass_entry(break_glass_token),
+            ];
             let file = PrincipalTableFile {
                 schema_version: Some(2),
-                principals: vec![entry.clone()],
+                principals: all_entries.clone(),
             };
+            // Keep token as the logged value (operator token for MCP/CLI startup).
+            let token = operator_token;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     AuthError::TableLoadFailed(format!("create dir {}: {e}", parent.display()))
@@ -210,7 +252,7 @@ impl PrincipalTable {
                 "Auto-bootstrapped default operator principal"
             );
             Ok(PrincipalTable {
-                entries: vec![entry],
+                entries: all_entries,
             })
         }
     }
@@ -221,11 +263,61 @@ fn default_operator_entry(token: String) -> PrincipalEntry {
         token,
         id: "default-operator".into(),
         class: PrincipalClass::Operator,
+        profile: Some(PrincipalProfile::OperatorMcpCli),
         surface_policies: Some(SurfacePolicies {
             graphql: Some(GraphqlPolicy {
                 allow_queries: true,
                 allow_subscriptions: true,
                 allowed_mutations: approval_mutations(),
+            }),
+            mcp: Some(McpPolicy {
+                allowed_tools: vec![],
+            }),
+        }),
+    }
+}
+
+/// P073: Bootstrap entry for the governed-app GraphQL read-only principal.
+fn forge_app_graphql_entry(token: String) -> PrincipalEntry {
+    PrincipalEntry {
+        token,
+        id: "forge-app-graphql".into(),
+        class: PrincipalClass::Operator,
+        profile: Some(PrincipalProfile::AppGraphqlReadonly),
+        surface_policies: Some(SurfacePolicies {
+            graphql: Some(GraphqlPolicy {
+                allow_queries: true,
+                allow_subscriptions: true,
+                allowed_mutations: vec![],
+            }),
+            mcp: Some(McpPolicy {
+                allowed_tools: vec![],
+            }),
+        }),
+    }
+}
+
+/// P073: Bootstrap entry for the break-glass GraphQL compatibility principal.
+fn graphql_break_glass_entry(token: String) -> PrincipalEntry {
+    PrincipalEntry {
+        token,
+        id: "graphql-break-glass-operator".into(),
+        class: PrincipalClass::Operator,
+        profile: Some(PrincipalProfile::GraphqlBreakGlass),
+        surface_policies: Some(SurfacePolicies {
+            graphql: Some(GraphqlPolicy {
+                allow_queries: true,
+                allow_subscriptions: true,
+                allowed_mutations: vec![
+                    "startRun".into(),
+                    "approveStage".into(),
+                    "rejectStage".into(),
+                    "retryStage".into(),
+                    "overrideLegacyDiscoveryPolicy".into(),
+                    "cancelRun".into(),
+                    "approveApproval".into(),
+                    "rejectApproval".into(),
+                ],
             }),
             mcp: Some(McpPolicy {
                 allowed_tools: vec![],
@@ -378,6 +470,38 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
             }
         }
 
+        // P073: forge-app-graphql is the governed-app read-only principal.
+        // It must have profile=app_graphql_readonly, allow queries and subscriptions,
+        // and zero mutations.
+        if entry.id == "forge-app-graphql" {
+            match entry.profile.as_ref() {
+                None | Some(PrincipalProfile::OperatorMcpCli) | Some(PrincipalProfile::GraphqlBreakGlass) => {
+                    return Err(AuthError::TableLoadFailed(
+                        "forge-app-graphql must have profile=app_graphql_readonly".into(),
+                    ));
+                }
+                Some(PrincipalProfile::AppGraphqlReadonly) => {}
+            }
+            let policies = entry.surface_policies.as_ref().ok_or_else(|| {
+                AuthError::TableLoadFailed(
+                    "forge-app-graphql must have surface_policies".into(),
+                )
+            })?;
+            let graphql = policies.graphql.as_ref().ok_or_else(|| {
+                AuthError::TableLoadFailed("forge-app-graphql must have graphql surface_policies".into())
+            })?;
+            if !graphql.allow_queries || !graphql.allow_subscriptions {
+                return Err(AuthError::TableLoadFailed(
+                    "forge-app-graphql must allow GraphQL queries and subscriptions".into(),
+                ));
+            }
+            if !graphql.allowed_mutations.is_empty() {
+                return Err(AuthError::TableLoadFailed(
+                    "forge-app-graphql must not allow any GraphQL mutations (app_graphql_readonly)".into(),
+                ));
+            }
+        }
+
         // P072: ui_operator must allow exactly approveApproval and rejectApproval.
         if entry.id == "ui_operator" {
             let policies = entry.surface_policies.as_ref().ok_or_else(|| {
@@ -412,6 +536,29 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
     }
 
     Ok(())
+}
+
+/// P073: Look up the governed-app GraphQL read-only principal.
+/// Returns Some only when exactly one entry with id=forge-app-graphql and
+/// profile=app_graphql_readonly exists. Returns None if zero or multiple match
+/// (fail-closed contract).
+pub fn find_app_graphql_principal(table: &PrincipalTable) -> Option<Principal> {
+    let mut matches: Vec<&PrincipalEntry> = table
+        .entries
+        .iter()
+        .filter(|e| {
+            e.id == "forge-app-graphql"
+                && e.profile
+                    .as_ref()
+                    .map(|p| matches!(p, PrincipalProfile::AppGraphqlReadonly))
+                    .unwrap_or(false)
+        })
+        .collect();
+    if matches.len() == 1 {
+        Some(Principal::from_entry(matches.remove(0)))
+    } else {
+        None
+    }
 }
 
 /// P072: Look up a principal by exact id.
@@ -586,7 +733,7 @@ fn default_resource_capabilities(class: &PrincipalClass) -> BTreeSet<ResourceTem
         .collect()
 }
 
-pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
+pub fn all_resource_templates() -> [ResourceTemplateId; 11] {
     [
         ResourceTemplateId::RunEntity,
         ResourceTemplateId::IdeaEntity,
@@ -598,6 +745,7 @@ pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
         ResourceTemplateId::ChainworksApprovalsInbox,
         ResourceTemplateId::ChainworksRunStages,
         ResourceTemplateId::ChainworksRunArtifacts,
+        ResourceTemplateId::StabilityBudgetLatest,
     ]
 }
 
@@ -624,6 +772,10 @@ fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) ->
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
         ResourceTemplateId::ChainworksRunArtifacts => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        // P073: stability budget is readable by operators and observers.
+        ResourceTemplateId::StabilityBudgetLatest => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
     }
@@ -769,6 +921,8 @@ mod tests {
                 token: "tok-123".into(),
                 id: "test-op".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: None,
             }],
         };
@@ -867,6 +1021,8 @@ mod tests {
                 token: "tok-read".into(),
                 id: "default-operator".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: Some(SurfacePolicies {
                     graphql: Some(GraphqlPolicy {
                         allow_queries: true,
@@ -882,6 +1038,8 @@ mod tests {
                 token: "tok-write".into(),
                 id: "ui_operator".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: Some(SurfacePolicies {
                     graphql: Some(GraphqlPolicy {
                         allow_queries: true,
@@ -941,12 +1099,16 @@ mod tests {
                 token: "tok-1".into(),
                 id: "same-id".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: None,
             },
             PrincipalEntry {
                 token: "tok-2".into(),
                 id: "same-id".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: None,
             },
         ];
@@ -961,12 +1123,16 @@ mod tests {
                 token: "same-tok".into(),
                 id: "id-1".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: None,
             },
             PrincipalEntry {
                 token: "same-tok".into(),
                 id: "id-2".into(),
                 class: PrincipalClass::Operator,
+
+                profile: None,
                 surface_policies: None,
             },
         ];
@@ -980,6 +1146,8 @@ mod tests {
             token: "tok".into(),
             id: "ui_operator".into(),
             class: PrincipalClass::Operator,
+
+            profile: None,
             surface_policies: Some(SurfacePolicies {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: true,
@@ -1003,6 +1171,8 @@ mod tests {
             token: "tok".into(),
             id: "default-operator".into(),
             class: PrincipalClass::Operator,
+
+            profile: None,
             surface_policies: Some(SurfacePolicies {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: true,
@@ -1024,6 +1194,8 @@ mod tests {
             token: "tok".into(),
             id: "ui_operator".into(),
             class: PrincipalClass::Operator,
+
+            profile: None,
             surface_policies: Some(SurfacePolicies {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: false,
@@ -1043,6 +1215,8 @@ mod tests {
             token: "tok".into(),
             id: "ui_operator".into(),
             class: PrincipalClass::Operator,
+
+            profile: None,
             surface_policies: Some(SurfacePolicies {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: true,
@@ -1066,12 +1240,16 @@ mod tests {
                     token: "tok-1".into(),
                     id: "default-operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: None,
                 },
                 PrincipalEntry {
                     token: "tok-2".into(),
                     id: "ui_operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: None,
                 },
             ],
@@ -1089,6 +1267,8 @@ mod tests {
                     token: "tok-1".into(),
                     id: "default-operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: Some(SurfacePolicies {
                         graphql: Some(GraphqlPolicy {
                             allow_queries: true,
@@ -1102,6 +1282,8 @@ mod tests {
                     token: "tok-2".into(),
                     id: "ui_operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: Some(SurfacePolicies {
                         graphql: Some(GraphqlPolicy {
                             allow_queries: true,
@@ -1150,6 +1332,8 @@ mod tests {
                     token: "tok-read".into(),
                     id: "default-operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: Some(SurfacePolicies {
                         graphql: Some(GraphqlPolicy {
                             allow_queries: true,
@@ -1165,6 +1349,8 @@ mod tests {
                     token: "tok-ui".into(),
                     id: "ui_operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: Some(SurfacePolicies {
                         graphql: Some(GraphqlPolicy {
                             allow_queries: true,
@@ -1195,6 +1381,8 @@ mod tests {
             token: "tok".into(),
             id: "default-operator".into(),
             class: PrincipalClass::Operator,
+
+            profile: None,
             surface_policies: Some(SurfacePolicies {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: true,
@@ -1218,6 +1406,8 @@ mod tests {
                     token: "tok-read".into(),
                     id: "default-operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: Some(SurfacePolicies {
                         graphql: Some(GraphqlPolicy {
                             allow_queries: true,
@@ -1231,6 +1421,8 @@ mod tests {
                     token: "tok-ui".into(),
                     id: "ui_operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: Some(SurfacePolicies {
                         graphql: Some(GraphqlPolicy {
                             allow_queries: true,
@@ -1244,6 +1436,8 @@ mod tests {
                     token: "tok-v1".into(),
                     id: "v1-operator".into(),
                     class: PrincipalClass::Operator,
+
+                    profile: None,
                     surface_policies: None,
                 },
             ],
@@ -1276,6 +1470,199 @@ mod tests {
         assert_eq!(
             is_subscription_allowed_by_surface_policy(&table, "v1-operator"),
             None
+        );
+    }
+
+    // ── P073 principal profile contract tests ─────────────────────────
+
+    #[test]
+    fn p073_forge_app_graphql_validates_with_correct_profile() {
+        let entries = vec![PrincipalEntry {
+            token: "tok-app".into(),
+            id: "forge-app-graphql".into(),
+            class: PrincipalClass::Operator,
+            profile: Some(PrincipalProfile::AppGraphqlReadonly),
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec![],
+                }),
+                mcp: None,
+            }),
+        }];
+        assert!(validate_v2_principals(&entries).is_ok());
+    }
+
+    #[test]
+    fn p073_forge_app_graphql_rejects_wrong_profile() {
+        let entries = vec![PrincipalEntry {
+            token: "tok-app".into(),
+            id: "forge-app-graphql".into(),
+            class: PrincipalClass::Operator,
+            profile: Some(PrincipalProfile::OperatorMcpCli),
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec![],
+                }),
+                mcp: None,
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(
+            err.to_string().contains("app_graphql_readonly"),
+            "error must mention app_graphql_readonly, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p073_forge_app_graphql_rejects_any_mutations() {
+        let entries = vec![PrincipalEntry {
+            token: "tok-app".into(),
+            id: "forge-app-graphql".into(),
+            class: PrincipalClass::Operator,
+            profile: Some(PrincipalProfile::AppGraphqlReadonly),
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec!["approveApproval".into()],
+                }),
+                mcp: None,
+            }),
+        }];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(
+            err.to_string().contains("must not allow any GraphQL mutations"),
+            "error must mention zero mutations, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p073_find_app_graphql_principal_returns_exactly_one_match() {
+        let table = PrincipalTable {
+            entries: vec![
+                PrincipalEntry {
+                    token: "tok-op".into(),
+                    id: "default-operator".into(),
+                    class: PrincipalClass::Operator,
+                    profile: Some(PrincipalProfile::OperatorMcpCli),
+                    surface_policies: None,
+                },
+                PrincipalEntry {
+                    token: "tok-app".into(),
+                    id: "forge-app-graphql".into(),
+                    class: PrincipalClass::Operator,
+                    profile: Some(PrincipalProfile::AppGraphqlReadonly),
+                    surface_policies: None,
+                },
+            ],
+        };
+        let principal = find_app_graphql_principal(&table);
+        assert!(principal.is_some(), "should find forge-app-graphql");
+        let p = principal.unwrap();
+        assert_eq!(p.id, "forge-app-graphql");
+        assert_eq!(p.profile, Some(PrincipalProfile::AppGraphqlReadonly));
+    }
+
+    #[test]
+    fn p073_find_app_graphql_principal_fails_closed_on_missing_entry() {
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-op".into(),
+                id: "default-operator".into(),
+                class: PrincipalClass::Operator,
+                profile: Some(PrincipalProfile::OperatorMcpCli),
+                surface_policies: None,
+            }],
+        };
+        assert!(
+            find_app_graphql_principal(&table).is_none(),
+            "should return None when forge-app-graphql is absent"
+        );
+    }
+
+    #[test]
+    fn p073_find_app_graphql_principal_fails_closed_on_wrong_profile() {
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-app".into(),
+                id: "forge-app-graphql".into(),
+                class: PrincipalClass::Operator,
+                profile: Some(PrincipalProfile::OperatorMcpCli),
+                surface_policies: None,
+            }],
+        };
+        assert!(
+            find_app_graphql_principal(&table).is_none(),
+            "should return None when profile is not app_graphql_readonly"
+        );
+    }
+
+    #[test]
+    fn p073_find_app_graphql_principal_fails_closed_on_duplicate() {
+        let table = PrincipalTable {
+            entries: vec![
+                PrincipalEntry {
+                    token: "tok-1".into(),
+                    id: "forge-app-graphql".into(),
+                    class: PrincipalClass::Operator,
+                    profile: Some(PrincipalProfile::AppGraphqlReadonly),
+                    surface_policies: None,
+                },
+                PrincipalEntry {
+                    token: "tok-2".into(),
+                    id: "forge-app-graphql".into(),
+                    class: PrincipalClass::Operator,
+                    profile: Some(PrincipalProfile::AppGraphqlReadonly),
+                    surface_policies: None,
+                },
+            ],
+        };
+        assert!(
+            find_app_graphql_principal(&table).is_none(),
+            "should return None when multiple forge-app-graphql entries exist"
+        );
+    }
+
+    #[test]
+    fn p073_bootstrap_creates_three_required_principals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("principals.json");
+        let table = PrincipalTable::load_or_bootstrap(&path).unwrap();
+
+        // All three principals must be present.
+        assert!(
+            find_principal_by_id(&table, "default-operator").is_some(),
+            "default-operator missing from bootstrap"
+        );
+        assert!(
+            find_principal_by_id(&table, "forge-app-graphql").is_some(),
+            "forge-app-graphql missing from bootstrap"
+        );
+        assert!(
+            find_principal_by_id(&table, "graphql-break-glass-operator").is_some(),
+            "graphql-break-glass-operator missing from bootstrap"
+        );
+
+        // forge-app-graphql must be selectable via the deterministic selector.
+        assert!(
+            find_app_graphql_principal(&table).is_some(),
+            "find_app_graphql_principal must succeed after bootstrap"
+        );
+
+        // forge-app-graphql must have zero mutations.
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "forge-app-graphql", "approveApproval"),
+            Some(false),
+            "forge-app-graphql must not allow approveApproval"
+        );
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "forge-app-graphql", "startRun"),
+            Some(false),
+            "forge-app-graphql must not allow startRun"
         );
     }
 }

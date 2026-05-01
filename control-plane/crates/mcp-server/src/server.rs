@@ -563,6 +563,48 @@ impl McpServer {
             }
         }
 
+        // P073: stability budget read resource — latest durable snapshot.
+        if uri == "stability-budget://latest" {
+            use sqlx::Row as _;
+            let metrics: Vec<serde_json::Value> = sqlx::query(
+                r#"
+                SELECT s.snapshot_id, s.captured_at, s.phase, s.metric_id,
+                       s.metric_classification, s.blocking_mode, s.measurement_status,
+                       s.current_value, s.baseline_value, s.target_threshold,
+                       s.latest_by_instrumentation_date, s.missing_data_policy, s.notes
+                FROM stability_budget_snapshots s
+                INNER JOIN (
+                    SELECT MAX(captured_at) AS max_captured_at
+                    FROM stability_budget_snapshots
+                ) latest ON s.captured_at = latest.max_captured_at
+                ORDER BY s.metric_id ASC
+                "#,
+            )
+            .map(|r: sqlx::sqlite::SqliteRow| {
+                serde_json::json!({
+                    "snapshot_id": r.get::<String, _>("snapshot_id"),
+                    "captured_at": r.get::<String, _>("captured_at"),
+                    "phase": r.get::<String, _>("phase"),
+                    "metric_id": r.get::<String, _>("metric_id"),
+                    "metric_classification": r.get::<String, _>("metric_classification"),
+                    "blocking_mode": r.get::<String, _>("blocking_mode"),
+                    "measurement_status": r.get::<String, _>("measurement_status"),
+                    "current_value": r.try_get::<f64, _>("current_value").ok(),
+                    "baseline_value": r.try_get::<f64, _>("baseline_value").ok(),
+                    "target_threshold": r.get::<String, _>("target_threshold"),
+                    "latest_by_instrumentation_date": r.try_get::<String, _>("latest_by_instrumentation_date").ok(),
+                    "missing_data_policy": r.get::<String, _>("missing_data_policy"),
+                    "notes": r.get::<String, _>("notes"),
+                })
+            })
+            .fetch_all(&self.pool)
+            .await?;
+            return Ok(serde_json::json!({
+                "snapshot_writer": domain::stability_budget::SNAPSHOT_WRITER,
+                "metrics": metrics
+            }));
+        }
+
         anyhow::bail!("Unknown resource URI: {}", uri)
     }
 
@@ -679,6 +721,8 @@ fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
         ResourceTemplateId::ChainworksApprovalsInbox => "chainworks://approvals/inbox",
         ResourceTemplateId::ChainworksRunStages => "chainworks://runs/{run_id}/stages",
         ResourceTemplateId::ChainworksRunArtifacts => "chainworks://runs/{run_id}/artifacts",
+        // P073: stability budget read resource.
+        ResourceTemplateId::StabilityBudgetLatest => "stability-budget://latest",
     }
 }
 
@@ -772,6 +816,13 @@ fn resource_template_value(id: ResourceTemplateId) -> serde_json::Value {
             "uri": "chainworks://runs/{run_id}/artifacts",
             "name": "Artifacts",
             "description": "Artifact list for a run (artifact_index projection)",
+            "mimeType": "application/json"
+        }),
+        // P073: stability budget read resource.
+        ResourceTemplateId::StabilityBudgetLatest => serde_json::json!({
+            "uri": "stability-budget://latest",
+            "name": "Stability Budget",
+            "description": "Latest durable stability budget snapshot (stability_budget.v1). Read-only. Authoritative source: control-plane stability-budget materializer.",
             "mimeType": "application/json"
         }),
     }

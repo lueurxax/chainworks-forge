@@ -85,6 +85,8 @@ struct DaemonLifecycleBanner: View {
     @State private var showAnomalousPidLockAlert: Bool = false
     @State private var showCrashBudgetResetResultAlert: Bool = false
     @State private var crashBudgetResetResultSummary: String = ""
+    // P073-F1: stability diagnostics host route
+    @State private var showDiagnosticsDetail: Bool = false
 
     var body: some View {
         // Kept intentionally compact so the SwiftUI type-checker can
@@ -121,6 +123,12 @@ struct DaemonLifecycleBanner: View {
             actions: { Button("OK", role: .cancel) { } },
             message: { Text(crashBudgetResetResultSummary) }
         )
+        // P073-F1: diagnostics detail sheet host route
+        .sheet(isPresented: $showDiagnosticsDetail) {
+            NavigationStack {
+                DiagnosticsDetailView()
+            }
+        }
     }
 
     @ViewBuilder
@@ -279,6 +287,12 @@ struct DaemonLifecycleBanner: View {
                 DaemonDiagnosticsExportCommand.run(status: viewModel.status)
             }
             .controlSize(.small)
+            // P073-F1: stability diagnostics deep link
+            Button("View Diagnostics") {
+                showDiagnosticsDetail = true
+            }
+            .controlSize(.small)
+            .accessibilityIdentifier("daemon-view-diagnostics-button")
         }
     }
 

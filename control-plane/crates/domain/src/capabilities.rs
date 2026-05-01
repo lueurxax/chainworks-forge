@@ -38,4 +38,6 @@ pub enum ResourceTemplateId {
     ChainworksApprovalsInbox,
     ChainworksRunStages,
     ChainworksRunArtifacts,
+    /// P073: stability-budget://latest — the authoritative durable snapshot.
+    StabilityBudgetLatest,
 }

@@ -79,6 +79,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/forge-steward.md](reference/forge-steward.md) — Forge Steward V1 observer: metrics, anomaly detection, cohorting, triggers
 - [reference/steward-analysis-system.md](reference/steward-analysis-system.md) — Rust Steward: frozen cohort owners, deterministic analysis, triggers
+- [reference/rust-control-plane.md#stability-budget-p073](reference/rust-control-plane.md#stability-budget-p073) — P073 Stability Budget: authoritative regression metrics and budget enforcement
 
 ### Testing
 

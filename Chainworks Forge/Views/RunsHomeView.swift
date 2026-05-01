@@ -446,7 +446,17 @@ final class P031ThinReadDashboardModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                // P073-K1: bounded polling fallback — up to 12 polls at 5s
+                // intervals (~60s) after a subscription failure, then stop.
+                // This keeps the run detail fresh during transient WebSocket
+                // drops without spinning indefinitely.
                 await self.refreshSelectedRunAfterSubscriptionEvent(runID: runID)
+                for _ in 0..<11 {
+                    guard !Task.isCancelled else { return }
+                    try? await Task.sleep(for: .seconds(5))
+                    guard !Task.isCancelled else { return }
+                    await self.refreshSelectedRunAfterSubscriptionEvent(runID: runID)
+                }
             }
         }
     }

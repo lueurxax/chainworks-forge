@@ -84,4 +84,10 @@ pub enum DomainEvent {
         updated_at: chrono::DateTime<chrono::Utc>,
         stale_after_ms: i64,
     },
+    /// P073: A new stability budget snapshot has been materialised.
+    /// Fired by the single-writer materializer after writing to `stability_budget_snapshots`.
+    StabilityBudgetChanged {
+        snapshot_id: String,
+        captured_at: String,
+    },
 }

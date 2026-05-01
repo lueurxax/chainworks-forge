@@ -48,6 +48,7 @@ use daemon::xcode_shim_socket::{
     spawn_xcode_shim_socket_service, XcodeShimGrantRegistry,
 };
 use db::migrate::{self, MigrationError, MigrationOutcome};
+use domain::events::DomainEvent;
 use domain::lifecycle::{
     DaemonLifecycleState, FailureKind, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
 };
@@ -286,6 +287,37 @@ async fn main() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
+    // P073-C4: Capture the first stability budget snapshot on every daemon
+    // startup.  Non-fatal: a failure is logged as a warning and never blocks
+    // the daemon from reaching `Ready`.  The `StabilityBudgetChanged` event
+    // wakes any active GraphQL subscriptions so the diagnostics grid refreshes
+    // automatically after the initial capture.
+    {
+        let pool_sb = pool.clone();
+        let events_sb = events.clone();
+        tokio::spawn(async move {
+            let captured_at = chrono::Utc::now().to_rfc3339();
+            match db::repos::stability_budget::materialize_full_snapshot(&pool_sb).await {
+                Ok(snapshot_id) => {
+                    info!(
+                        snapshot_id = %snapshot_id,
+                        "P073 startup stability budget snapshot captured"
+                    );
+                    let _ = events_sb.send(DomainEvent::StabilityBudgetChanged {
+                        snapshot_id,
+                        captured_at,
+                    });
+                }
+                Err(err) => {
+                    warn!(
+                        err = %err,
+                        "P073 startup stability budget snapshot failed (non-fatal)"
+                    );
+                }
+            }
+        });
+    }
+
     let host_interruption_service =
         HostInterruptionService::with_capacity_config_and_runtime_cleanup(
             pool.clone(),

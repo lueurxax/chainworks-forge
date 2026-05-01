@@ -18,6 +18,7 @@ pub mod runs;
 pub mod scheduler;
 pub mod sessions;
 pub mod stages;
+pub mod stability_budget;
 pub mod startup_repairs;
 pub mod steward;
 pub mod system_executions;

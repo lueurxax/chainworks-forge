@@ -124,6 +124,7 @@ The `approvals.resolve` tool supports additive evolution to handle both legacy s
 | `ChainworksApprovalsInbox` | `chainworks://approvals/inbox` |
 | `ChainworksRunStages` | `chainworks://runs/{run_id}/stages` |
 | `ChainworksRunArtifacts` | `chainworks://runs/{run_id}/artifacts` |
+| `StabilityBudgetLatest` | `chainworks://stability-budget/latest` |
 
 ### Execution-truth report readback
 
@@ -164,30 +165,71 @@ Implementation: `control-plane/crates/domain/src/capabilities.rs`, `control-plan
 
 ## Principal table
 
+### Principal Profiles (P073)
+
+The authentication system identifies the intended use of a principal entry through a `PrincipalProfile`. This discriminator ensures that credentials are used for their intended purpose and provides a layer of defense against accidental or unauthorized mutation.
+
+| Profile | Purpose |
+|---|---|
+| `operator_mcp_cli` | Canonical credential for MCP, CLI, and operator automation. Supports full tool access. |
+| `app_graphql_readonly` | Ordinary governed-app GraphQL read and subscription traffic only. Zero mutation access. |
+| `graphql_break_glass` | Manually activated compatibility-only GraphQL path. Supports legacy GraphQL command mutations. |
+
 ### File shape
 
 ```json
 {
+  "schema_version": 2,
   "principals": [
-    { "token": "<uuid>", "id": "<human-label>", "class": "operator" }
+    { 
+      "token": "<uuid>", 
+      "id": "default-operator", 
+      "class": "operator", 
+      "profile": "operator_mcp_cli",
+      "surface_policies": {
+        "graphql": {
+          "allow_queries": true,
+          "allow_subscriptions": true,
+          "allowed_mutations": ["approveApproval", "rejectApproval"]
+        },
+        "mcp": { "allowed_tools": [] }
+      }
+    },
+    {
+      "token": "<uuid>",
+      "id": "forge-app-graphql",
+      "class": "operator",
+      "profile": "app_graphql_readonly",
+      "surface_policies": {
+        "graphql": {
+          "allow_queries": true,
+          "allow_subscriptions": true,
+          "allowed_mutations": []
+        }
+      }
+    }
   ]
 }
 ```
 
-`class` is one of `operator`, `agent`, or `observer`.
+`class` remains one of `operator`, `agent`, or `observer`. `schema_version: 2` is required for per-principal `surface_policies` and profile enforcement.
 
 ### Discovery and bootstrap
 
 - **Env var:** `CHAINWORKS_AUTH_PRINCIPALS_PATH` names an absolute path to the principal table JSON.
 - **Default:** `~/.chainworks/auth/principals.json`.
-- **Empty env:** if `CHAINWORKS_AUTH_PRINCIPALS_PATH` is set to the empty string, the daemon refuses to start.
-- **Missing file:** on first start the daemon generates a random UUID token, writes a single-entry table with `class = operator` and `id = default-operator` to the discovered path, and logs the path + token at `info` level exactly once.
-- **File mode:** on Unix, bootstrap opens the file with `OpenOptions::mode(0o600)` before writing, so only the owning user can read it. On non-Unix platforms the mode is not enforced and the corresponding test is `cfg(unix)`-gated.
-- **Empty table:** if the file parses successfully but contains zero principals, the daemon refuses to start with `AuthError::TableLoadFailed("principal table contains zero entries")`. There is no silent auth-disabled mode.
+- **Missing file (P073):** on first start the daemon generates three unique principals and writes them to the discovered path:
+  1. `default-operator` (`operator_mcp_cli`): The primary app bearer. Restricted to approval mutations only on GraphQL.
+  2. `forge-app-graphql` (`app_graphql_readonly`): Governed-app read-only principal for normal UI operations.
+  3. `graphql-break-glass-operator` (`graphql_break_glass`): Compatibility principal allowing all GraphQL command mutations.
+- **Logs:** The path and the `default-operator` token are logged at `info` level exactly once during bootstrap.
+- **File mode:** on Unix, bootstrap opens the file with `OpenOptions::mode(0o600)`.
+- **Validation:** the daemon enforces `schema_version: 2` constraints during load. `default-operator` must allow exactly the approval mutations; `forge-app-graphql` must allow zero mutations. Unknown tokens or profile mismatches are rejected.
 
 ### Token resolution
 
-`auth::extract_bearer_token` parses `"Bearer <token>"` from an `Authorization` header value (trimming whitespace; rejecting an empty token with `AuthError::MalformedHeader`). `auth::resolve_bearer` looks the token up in the `PrincipalTable` and returns a fresh `Principal` whose `tool_capabilities` and `resource_capabilities` are populated from the class's default capability set.
+`auth::extract_bearer_token` parses `"Bearer <token>"` from an `Authorization` header. `auth::resolve_bearer` looks the token up in the `PrincipalTable`. For app-owned GraphQL traffic, the system prefers `find_app_graphql_principal` which enforces the `app_graphql_readonly` profile.
+
 
 ### Rotation
 

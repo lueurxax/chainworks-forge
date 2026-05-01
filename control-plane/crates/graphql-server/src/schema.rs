@@ -443,6 +443,24 @@ impl QueryRoot {
         let reporter = ctx.data::<LifecycleReporter>()?;
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
     }
+
+    /// P073: Read-only stability budget query.
+    /// Returns all metric rows from the latest durable snapshot owned by the
+    /// control-plane stability-budget materializer.  Returns an empty metrics
+    /// list when no snapshot has been captured yet.
+    async fn stability_budget(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::types::stability_budget::GqlStabilityBudget> {
+        use crate::types::stability_budget::GqlStabilityBudget;
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let rows = stability_budget_latest_rows(pool).await?;
+        Ok(GqlStabilityBudget {
+            snapshot_writer: domain::stability_budget::SNAPSHOT_WRITER.to_string(),
+            metrics: rows,
+        })
+    }
 }
 
 /// GraphQL wrapper around [`DaemonStatus`] (P042 §5.2). Every field of the
@@ -1067,6 +1085,49 @@ fn read_p031_artifact_payload_preview(path: &Path) -> io::Result<P031ArtifactPay
     }
 }
 
+/// P073: Fetch all metric rows from the latest stability budget snapshot.
+/// Returns rows ordered by metric_id. Returns empty vec when no snapshot exists.
+async fn stability_budget_latest_rows(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::types::stability_budget::GqlStabilityBudgetRow>> {
+    use crate::types::stability_budget::GqlStabilityBudgetRow;
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        r#"
+        SELECT s.snapshot_id, s.captured_at, s.phase, s.metric_id,
+               s.metric_classification, s.blocking_mode, s.measurement_status,
+               s.current_value, s.baseline_value, s.target_threshold,
+               s.latest_by_instrumentation_date, s.missing_data_policy, s.notes
+        FROM stability_budget_snapshots s
+        INNER JOIN (
+            SELECT MAX(captured_at) AS max_captured_at
+            FROM stability_budget_snapshots
+        ) latest ON s.captured_at = latest.max_captured_at
+        ORDER BY s.metric_id ASC
+        "#,
+    )
+    .map(|r: sqlx::sqlite::SqliteRow| GqlStabilityBudgetRow {
+        snapshot_id: r.get("snapshot_id"),
+        captured_at: r.get("captured_at"),
+        phase: r.get("phase"),
+        metric_id: r.get("metric_id"),
+        metric_classification: r.get("metric_classification"),
+        blocking_mode: r.get("blocking_mode"),
+        measurement_status: r.get("measurement_status"),
+        current_value: r.try_get("current_value").ok(),
+        baseline_value: r.try_get("baseline_value").ok(),
+        target_threshold: r.get("target_threshold"),
+        latest_by_instrumentation_date: r.try_get("latest_by_instrumentation_date").ok(),
+        missing_data_policy: r.get("missing_data_policy"),
+        notes: r.get("notes"),
+    })
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::new(format!("stability budget query failed: {e}")))?;
+
+    Ok(rows)
+}
+
 fn mark_payload_unavailable(artifact: &mut GqlArtifact, detail: &str) {
     artifact.payload_text = None;
     artifact.payload_availability_state = GqlPayloadAvailabilityState::Unavailable;
@@ -1160,6 +1221,20 @@ fn mutation_allowed(
     principal: &auth::Principal,
     mutation: MutationName,
 ) -> bool {
+    // P073: app_graphql_readonly profile is forbidden from all mutations at runtime.
+    // Defense-in-depth: enforced here independent of surface_policies.allowed_mutations.
+    if matches!(
+        principal.profile,
+        Some(auth::PrincipalProfile::AppGraphqlReadonly)
+    ) {
+        warn!(
+            principal_id = %principal.id,
+            mutation = mutation.graphql_name(),
+            "P073: mutation denied; app_graphql_readonly profile is forbidden from all GraphQL mutations"
+        );
+        return false;
+    }
+
     if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_mutation_allowed_by_surface_policy(
             table,
@@ -1742,6 +1817,7 @@ impl SubscriptionRoot {
                         run_id.and_then(|id| id.parse().ok())
                     }
                     DomainEvent::DaemonStatusChanged { .. } => None,
+                    DomainEvent::StabilityBudgetChanged { .. } => None,
                 }?;
                 if let Some(fid) = filter_run_id {
                     if refresh_run_id != fid {
@@ -1934,6 +2010,43 @@ impl SubscriptionRoot {
                     Some(Ok(GqlDaemonStatus::from(status)))
                 }
                 _ => None,
+            }
+        }))
+    }
+
+    /// P073: Stability budget changed subscription.
+    /// Fires when the control-plane materializer writes a new durable snapshot.
+    /// Each message carries the full latest snapshot so the client does not need
+    /// to issue a follow-up `stabilityBudget` query.
+    async fn stability_budget_changed(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<
+        impl async_graphql::futures_util::Stream<
+            Item = Result<crate::types::stability_budget::GqlStabilityBudget>,
+        >,
+    > {
+        use crate::types::stability_budget::GqlStabilityBudget;
+        require_operator_read(ctx)?;
+
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let events = ctx.data::<EventSender>()?.clone();
+
+        let rx = events.subscribe();
+        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
+            let pool = pool.clone();
+            async move {
+                let event = msg.ok()?;
+                match event {
+                    DomainEvent::StabilityBudgetChanged { .. } => {
+                        let rows = stability_budget_latest_rows(&pool).await.ok()?;
+                        Some(Ok(GqlStabilityBudget {
+                            snapshot_writer: domain::stability_budget::SNAPSHOT_WRITER.to_string(),
+                            metrics: rows,
+                        }))
+                    }
+                    _ => None,
+                }
             }
         }))
     }
@@ -6486,6 +6599,136 @@ mod tests {
                 "{label} denial must not create a command_journal row"
             );
         }
+    }
+
+    // ── P073: forge-app-graphql principal mutation denial ─────────────────
+
+    fn p073_full_principal_table() -> (
+        auth::PrincipalTable,
+        auth::Principal,
+        auth::Principal,
+        auth::Principal,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"{
+              "schema_version": 2,
+              "principals": [
+                {
+                  "token": "default-op-token",
+                  "id": "default-operator",
+                  "class": "operator",
+                  "profile": "operator_mcp_cli",
+                  "surface_policies": {
+                    "graphql": {
+                      "allow_queries": true,
+                      "allow_subscriptions": true,
+                      "allowed_mutations": ["approveApproval", "rejectApproval"]
+                    },
+                    "mcp": { "allowed_tools": [] }
+                  }
+                },
+                {
+                  "token": "forge-app-token",
+                  "id": "forge-app-graphql",
+                  "class": "operator",
+                  "profile": "app_graphql_readonly",
+                  "surface_policies": {
+                    "graphql": {
+                      "allow_queries": true,
+                      "allow_subscriptions": true,
+                      "allowed_mutations": []
+                    },
+                    "mcp": { "allowed_tools": [] }
+                  }
+                },
+                {
+                  "token": "break-glass-token",
+                  "id": "graphql-break-glass-operator",
+                  "class": "operator",
+                  "profile": "graphql_break_glass",
+                  "surface_policies": {
+                    "graphql": {
+                      "allow_queries": true,
+                      "allow_subscriptions": true,
+                      "allowed_mutations": ["approveApproval", "rejectApproval", "startRun", "cancelRun", "retryStage", "approveStage", "rejectStage", "overrideLegacyDiscoveryPolicy"]
+                    },
+                    "mcp": { "allowed_tools": [] }
+                  }
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let default_op = auth::resolve_bearer("default-op-token", &table).unwrap();
+        let forge_app = auth::resolve_bearer("forge-app-token", &table).unwrap();
+        let break_glass = auth::resolve_bearer("break-glass-token", &table).unwrap();
+        (table, default_op, forge_app, break_glass)
+    }
+
+    #[tokio::test]
+    async fn test_graphql_p073_forge_app_graphql_denied_all_mutations() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id)).await.unwrap();
+
+        let (principal_table, _, forge_app_principal, _) = p073_full_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let cases = [
+            format!(
+                r#"mutation {{ startRun(ideaId: "{}", workflowId: "wf-1", workflowTitle: "t", workspaceRoot: "/tmp/ws", artifactRoot: "/tmp/art", workflowYamlPath: "{}", agentCatalogYamlPath: "{}") {{ ... on StartRunStartedPayload {{ journalId }} ... on StartRunBlockedPayload {{ journalId }} }} }}"#,
+                idea_id,
+                test_workflow_yaml_path(),
+                test_agent_catalog_yaml_path()
+            ),
+            format!(
+                r#"mutation {{ retryStage(runId: "{}", stageId: "s1") {{ retried journalId }} }}"#,
+                run_id
+            ),
+            format!(
+                r#"mutation {{ cancelRun(runId: "{}") {{ cancelled journalId }} }}"#,
+                run_id
+            ),
+            format!(
+                r#"mutation {{ approveApproval(approvalId: "00000000-0000-0000-0000-000000000001") {{ approval {{ id }} journalId }} }}"#
+            ),
+        ];
+
+        for query in &cases {
+            let response = schema
+                .execute(Request::new(query).data(forge_app_principal.clone()))
+                .await;
+            assert!(
+                !response.errors.is_empty(),
+                "P073: forge-app-graphql must be denied mutation: {response:?}"
+            );
+            assert!(
+                response.errors.iter().any(|e| e.message.contains("forbidden")),
+                "P073: denial must mention 'forbidden', got {:?}",
+                response.errors
+            );
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count,
+            0,
+            "P073: profile-based denials must not write command_journal rows"
+        );
     }
 
     #[tokio::test]

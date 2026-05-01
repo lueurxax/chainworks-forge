@@ -25,6 +25,8 @@ At the current baseline, the product includes:
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
 - thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections,
 - lead conflict mediation for same-run resolution of workflow conflicts,
+- authoritative Stability Budget (SB-01 to SB-12) for regression tracking and budget enforcement (P073),
+- refined authentication with principal profiles (`operator_mcp_cli`, `app_graphql_readonly`, `graphql_break_glass`) and enforced UI action boundary (P073),
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
@@ -80,6 +82,7 @@ Use these reference docs as the current source of truth:
 | Design-system adoption | [design-system-and-brand-application.md](design-system-and-brand-application.md) |
 | UI/brand design authority | [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) |
 | UI action boundary | [ui-action-boundary.md](ui-action-boundary.md) |
+| Stability budget | [rust-control-plane.md](rust-control-plane.md#stability-budget-p073) |
 | GraphQL read contract | [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) |
 
 ## Canonical product boundaries
