@@ -19,11 +19,32 @@ pub struct GqlApproval {
     pub write_path_state: GqlWritePathState,
     pub diagnostic_id: Option<String>,
     pub server_debug_detail: Option<String>,
+    /// P072: Server-authored list of actions available for this approval.
+    /// Possible values: "approve", "reject". Empty when not actionable.
+    pub available_actions: Vec<String>,
+    /// P072: Reason why actions are disabled, if any.
+    pub disabled_reason: Option<String>,
+    /// P072: Monotonic version for read-your-writes settlement tracking.
+    pub settlement_version: Option<i64>,
 }
 
 impl From<Approval> for GqlApproval {
     fn from(a: Approval) -> Self {
+        use domain::approval::ApprovalDecision;
+
         let diagnostic_id = a.id.to_string();
+        let is_actionable = matches!(
+            a.decision,
+            ApprovalDecision::Pending | ApprovalDecision::Requested
+        );
+        // P072: available_actions reflects server-side actionability.
+        let available_actions = if is_actionable {
+            vec!["approve".to_string(), "reject".to_string()]
+        } else {
+            vec![]
+        };
+        let (disabled_reason_code, write_path_state, disabled_reason) =
+            approval_actionability_fields(is_actionable, &a.decision.to_string());
         GqlApproval {
             id: ID(diagnostic_id.clone()),
             run_id: ID(a.run_id.to_string()),
@@ -33,13 +54,14 @@ impl From<Approval> for GqlApproval {
             decided_at: a.decided_at.map(|t| t.to_rfc3339()),
             comment: a.comment,
             expires_at: a.expires_at.map(|t| t.to_rfc3339()),
-            // Phase 0 approval projections do not yet track per-row lag; rows are read-only diagnostic.
             freshness_state: GqlFreshnessState::Live,
-            disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
-            write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
-            // Phase 0 intentionally reuses the approval id as the diagnostic copy token.
+            disabled_reason_code,
+            write_path_state,
             diagnostic_id: Some(diagnostic_id),
             server_debug_detail: None,
+            available_actions,
+            disabled_reason,
+            settlement_version: None,
         }
     }
 }
@@ -47,6 +69,15 @@ impl From<Approval> for GqlApproval {
 impl From<ApprovalInboxRow> for GqlApproval {
     fn from(r: ApprovalInboxRow) -> Self {
         let diagnostic_id = r.id.clone();
+        let is_actionable = r.decision == "pending" || r.decision == "requested";
+        // P072: available_actions reflects server-side actionability.
+        let available_actions = if is_actionable {
+            vec!["approve".to_string(), "reject".to_string()]
+        } else {
+            vec![]
+        };
+        let (disabled_reason_code, write_path_state, disabled_reason) =
+            approval_actionability_fields(is_actionable, &r.decision);
         GqlApproval {
             id: ID(r.id),
             run_id: ID(r.run_id),
@@ -56,13 +87,33 @@ impl From<ApprovalInboxRow> for GqlApproval {
             decided_at: r.decided_at,
             comment: r.comment,
             expires_at: r.expires_at,
-            // Phase 0 approval projections do not yet track per-row lag; rows are read-only diagnostic.
             freshness_state: GqlFreshnessState::Live,
-            disabled_reason_code: Some(GqlDisabledReasonCode::WritePathNotAvailable),
-            write_path_state: GqlWritePathState::ReadOnlyDiagnostic,
-            // Phase 0 intentionally reuses the approval id as the diagnostic copy token.
+            disabled_reason_code,
+            write_path_state,
             diagnostic_id: Some(diagnostic_id),
             server_debug_detail: None,
+            available_actions,
+            disabled_reason,
+            settlement_version: None,
         }
+    }
+}
+
+fn approval_actionability_fields(
+    is_actionable: bool,
+    decision: &str,
+) -> (
+    Option<GqlDisabledReasonCode>,
+    GqlWritePathState,
+    Option<String>,
+) {
+    if is_actionable {
+        (None, GqlWritePathState::Available, None)
+    } else {
+        (
+            Some(GqlDisabledReasonCode::UnsupportedAction),
+            GqlWritePathState::WritePathNotAvailable,
+            Some(format!("approval already {decision}")),
+        )
     }
 }

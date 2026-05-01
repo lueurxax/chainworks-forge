@@ -8,11 +8,12 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_executions, agent_retry_budget_ledger, approvals, artifact_contracts, command_journal,
-    ideas, legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
-    sessions, stages, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
+    artifact_contracts, command_journal, ideas, legacy_discovery_overrides, projections,
+    retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
@@ -66,6 +67,7 @@ pub enum CommandResult {
         conflict_id: String,
         selected_transition_id: String,
         selected_next_state_id: String,
+        retry_instruction_binding_id: Option<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -149,6 +151,7 @@ impl CommandJournalEntry {
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
             Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
             Command::ResolveLeadMediationConfirmation(_) => "ResolveLeadMediationConfirmation",
+            Command::ResolveApproval(_) => "ResolveApproval",
         };
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
@@ -170,6 +173,7 @@ impl CommandJournalEntry {
             Command::RunStewardAnalysis(_) => None,
             Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
             Command::ResolveLeadMediationConfirmation(c) => Some(c.run_id.to_string()),
+            Command::ResolveApproval(c) => Some(c.run_id.to_string()),
         };
         let principal_class = caller.principal_class.to_string();
 
@@ -199,6 +203,7 @@ impl CommandJournalEntry {
                 | "CancelRun"
                 | "ResetSession"
                 | "ResolveLeadMediationConfirmation"
+                | "ResolveApproval"
         )
     }
 }
@@ -217,6 +222,61 @@ fn is_release_agent(agent_id: &str) -> bool {
     matches!(
         agent_id,
         "commit_and_push_to_github" | "build_archive_and_push_connect"
+    )
+}
+
+fn retry_requires_effect_reconciliation(
+    stage: &StageExecution,
+    target_agent_id: Option<&str>,
+    has_release_post_approval_tasks: bool,
+) -> bool {
+    let stage_type_requires_guard = matches!(
+        stage.stage_type.as_deref(),
+        Some("release" | "side_effect" | "side-effect")
+    );
+    stage_type_requires_guard
+        || has_release_post_approval_tasks
+        || is_release_agent(&stage.stage_id)
+        || stage.owner_agent.as_deref().is_some_and(is_release_agent)
+        || target_agent_id.is_some_and(is_release_agent)
+}
+
+fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
+    let plan = match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json)) => {
+            workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                run.agent_catalog_yaml_path.as_deref().unwrap_or("."),
+            )?
+        }
+        _ => match (
+            run.workflow_yaml_path.as_deref(),
+            run.agent_catalog_yaml_path.as_deref(),
+        ) {
+            (Some(workflow_path), Some(catalog_path)) => {
+                workflow::compiler::compile(workflow_path, catalog_path)?
+            }
+            _ => return Ok(false),
+        },
+    };
+
+    Ok(plan.states.get(stage_id).is_some_and(|state| {
+        state
+            .post_approval_tasks
+            .iter()
+            .any(|task| is_release_agent(&task.agent.agent_id))
+    }))
+}
+
+fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error {
+    anyhow!(
+        "requires_effect_reconciliation: retry for stage {} ({}) requires durable side-effect reconciliation before retry",
+        stage.stage_id,
+        stage.id
     )
 }
 
@@ -244,6 +304,239 @@ fn find_source_invoke_work_item<'a>(
             matches.then_some(item)
         })
         .max_by_key(|item| item.created_at)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetedRetryProviderFallback {
+    from_backend_profile_id: Option<String>,
+    from_provider: String,
+    backend_profile_id: String,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<i64>,
+}
+
+fn targeted_retry_provider_fallback(
+    run: &Run,
+    agent_id: &str,
+    retry_payload: &serde_json::Value,
+    runtime_facts: Option<&AgentExecutionRuntimeFacts>,
+) -> Option<TargetedRetryProviderFallback> {
+    let from_provider = retry_payload.get("provider")?.as_str()?.to_string();
+    if !matches!(
+        from_provider.as_str(),
+        "gemini" | "gemini_acp" | "claude" | "claude_acp" | "codex" | "codex_acp"
+    ) {
+        return None;
+    }
+    let output_contract = retry_payload
+        .get("output_contract")
+        .and_then(serde_json::Value::as_str);
+    let is_proposal_review = output_contract == Some("proposal_review_v1");
+    let is_proposal_review_aggregation = agent_id == "lead_orchestrator"
+        && retry_payload
+            .get("task_outputs")
+            .and_then(serde_json::Value::as_array)
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .any(|value| value.as_str() == Some("proposal_review_summary"))
+            })
+            .unwrap_or(false);
+    let is_proposal_authoring = agent_id == "proposal_writer"
+        && retry_payload
+            .get("task_outputs")
+            .and_then(serde_json::Value::as_array)
+            .map(|outputs| {
+                outputs
+                    .iter()
+                    .any(|value| value.as_str() == Some("proposal_current"))
+            })
+            .unwrap_or(false);
+    let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
+    let is_security_checker =
+        agent_id == "security_checker" && output_contract == Some("security_report_v1");
+    let is_prepush_reviewer =
+        agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1");
+    if !is_proposal_review
+        && !is_proposal_review_aggregation
+        && !is_proposal_authoring
+        && !is_docs_guardian
+        && !is_security_checker
+        && !is_prepush_reviewer
+    {
+        return None;
+    }
+    let source_failed_without_required_outputs = runtime_facts
+        .map(|facts| {
+            matches!(
+                facts.failure_kind,
+                Some(AgentFailureKind::ProviderQuota)
+                    | Some(AgentFailureKind::MissingRequiredOutputs)
+            ) || facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+        })
+        .unwrap_or(true);
+    let source_had_transient_runtime_failure = runtime_facts
+        .map(|facts| {
+            matches!(
+                facts.failure_kind,
+                Some(
+                    AgentFailureKind::ProviderTimeout
+                        | AgentFailureKind::TransportClosed
+                        | AgentFailureKind::TransportEpipe
+                        | AgentFailureKind::TransportProtocolError
+                )
+            )
+        })
+        .unwrap_or(false);
+    if matches!(
+        from_provider.as_str(),
+        "claude" | "claude_acp" | "codex" | "codex_acp"
+    ) && !source_failed_without_required_outputs
+        && !source_had_transient_runtime_failure
+    {
+        return None;
+    }
+
+    let catalog: serde_json::Value =
+        serde_json::from_str(run.catalog_snapshot_json.as_deref()?).ok()?;
+    let profiles = catalog.get("backend_profiles")?.as_object()?;
+    let fallback_id = targeted_retry_fallback_profile_id(
+        agent_id,
+        &from_provider,
+        is_proposal_review_aggregation,
+        is_proposal_authoring,
+        is_docs_guardian,
+        is_security_checker,
+        is_prepush_reviewer,
+        profiles,
+    )?;
+    let profile = profiles.get(fallback_id)?.as_object()?;
+    let provider = profile.get("provider")?.as_str()?.to_string();
+    if provider == from_provider {
+        return None;
+    }
+
+    Some(TargetedRetryProviderFallback {
+        from_backend_profile_id: retry_payload
+            .get("backend_profile_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        from_provider,
+        backend_profile_id: fallback_id.to_string(),
+        provider,
+        model: profile
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        effort: profile
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+    })
+}
+
+fn targeted_retry_fallback_profile_id<'a>(
+    agent_id: &str,
+    from_provider: &str,
+    is_proposal_review_aggregation: bool,
+    is_proposal_authoring: bool,
+    is_docs_guardian: bool,
+    is_security_checker: bool,
+    is_prepush_reviewer: bool,
+    profiles: &'a serde_json::Map<String, serde_json::Value>,
+) -> Option<&'a str> {
+    if is_proposal_review_aggregation {
+        return ["codex_writer_high", "codex_architect_high"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_proposal_authoring {
+        let candidates: &[&str] = if matches!(from_provider, "codex" | "codex_acp") {
+            &["claude_writer_high", "claude_product_high"]
+        } else {
+            &["codex_writer_high", "codex_architect_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_docs_guardian {
+        let candidates: &[&str] = if matches!(from_provider, "gemini" | "gemini_acp") {
+            &[
+                "claude_docs_medium",
+                "claude_design_medium",
+                "codex_architect_high",
+            ]
+        } else {
+            &[
+                "gemini_docs_flash",
+                "claude_docs_medium",
+                "codex_architect_high",
+            ]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_security_checker {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &[
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ]
+        } else {
+            &["claude_security_high", "claude_product_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_prepush_reviewer {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &["codex_architect_high", "codex_writer_high"]
+        } else {
+            &["claude_prepush_medium", "claude_product_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if matches!(from_provider, "claude" | "claude_acp") {
+        return ["codex_architect_high", "codex_writer_high"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if matches!(from_provider, "codex" | "codex_acp") {
+        return ["claude_product_high", "claude_design_medium"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    let design_reviewer =
+        agent_id.contains("ux") || agent_id.contains("ui") || agent_id.contains("macos");
+    let candidates: &[&str] = if design_reviewer {
+        &[
+            "claude_design_medium",
+            "claude_product_high",
+            "codex_architect_high",
+        ]
+    } else {
+        &["claude_product_high", "codex_architect_high"]
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| profiles.contains_key(*candidate))
 }
 
 /// OPS-002 (P017 R4): classify the workflow-compile error so the
@@ -439,6 +732,11 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
         }
+        if matches!(&cmd, Command::ResolveApproval(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ResolveApproval requires operator principal");
+        }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal = CommandJournalEntry::new(&cmd, &caller);
@@ -537,42 +835,6 @@ impl CommandHandler {
                     }
                 };
 
-                // P060: Validate review_routing_json if present.
-                let validated_review_routing_json = if let Some(ref json_str) = c.review_routing_json {
-                    match serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json_str) {
-                        Ok(opts) => {
-                            // Basic validation: reject duplicates in force_include/force_exclude.
-                            let mut seen = std::collections::HashSet::new();
-                            for agent_id in opts.force_include.iter().chain(opts.force_exclude.iter()) {
-                                if !seen.insert(agent_id.as_str()) {
-                                    let error = anyhow!("review_routing_json: duplicate agent_id '{agent_id}' in force_include/force_exclude");
-                                    let message = error.to_string();
-                                    self.record_failed_command_transaction(
-                                        journal,
-                                        "command.StartRun",
-                                        &message,
-                                    )
-                                    .await?;
-                                    return Err(error);
-                                }
-                            }
-                            // Re-serialize for canonical storage.
-                            Some(serde_json::to_string(&opts).unwrap_or_else(|_| json_str.clone()))
-                        }
-                        Err(error) => {
-                            let message = format!("review_routing_json: {error}");
-                            self.record_failed_command_transaction(
-                                journal,
-                                "command.StartRun",
-                                &message,
-                            )
-                            .await?;
-                            return Err(anyhow!(message));
-                        }
-                    }
-                } else {
-                    None
-                };
                 let delivery_preflight_json =
                     if let Some(delivery_configuration_json) = &c.delivery_configuration_json {
                         let delivery_config: domain::run::DeliveryConfiguration =
@@ -665,6 +927,22 @@ impl CommandHandler {
                     .filter(|v| !v.is_empty())
                     .unwrap_or("untagged")
                     .to_string();
+                let validated_review_routing_json = match resolve_start_run_review_routing_json(
+                    c.review_routing_json.as_deref(),
+                    &idea.body,
+                    Some(caller.principal_id.as_str()),
+                    now,
+                ) {
+                    Ok(json) => Some(json),
+                    Err(error) => {
+                        let message = format!("review_routing_json: {error}");
+                        command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &message)
+                            .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction("command.StartRun", tx_started);
+                        return Err(anyhow!(message));
+                    }
+                };
 
                 let run = Run {
                     id: run_id,
@@ -1211,6 +1489,37 @@ impl CommandHandler {
                     return Err(error);
                 }
 
+                let has_release_post_approval_tasks =
+                    match retry_state_has_release_post_approval_tasks(&run, &old_stage.stage_id) {
+                        Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+                        Err(e) => {
+                            warn!(
+                                run_id = %c.run_id,
+                                stage_id = %old_stage.stage_id,
+                                error = %e,
+                                "RetryStage side-effect preflight could not inspect post_approval_tasks"
+                            );
+                            false
+                        }
+                    };
+                if retry_requires_effect_reconciliation(
+                    old_stage,
+                    None,
+                    has_release_post_approval_tasks,
+                ) {
+                    let error = requires_effect_reconciliation_error(old_stage);
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
+
                 let next_attempt_number = matching_stages
                     .iter()
                     .map(|s| s.attempt_number)
@@ -1426,6 +1735,14 @@ impl CommandHandler {
                 if c.resolution_reason.trim().is_empty() {
                     anyhow::bail!("resolution_reason is required");
                 }
+                let validated_instruction = if let Some(ref raw) = c.operator_instruction {
+                    Some(
+                        domain::retry_instruction::validate_operator_instruction(raw)
+                            .map_err(|e| anyhow!("operator_instruction validation: {e}"))?,
+                    )
+                } else {
+                    None
+                };
 
                 let now = Utc::now();
                 let tx_started = Instant::now();
@@ -1525,6 +1842,9 @@ impl CommandHandler {
                     .filter(|stage| stage.stage_id == selected_next_state_id)
                     .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at));
                 let mut enqueued_stage_id = None;
+                let mut retry_stage_execution_id = None;
+                let mut source_stage_execution_id = None;
+                let mut retry_attempt_number = None;
                 if let Some(previous) = latest_target_stage {
                     if matches!(
                         previous.status,
@@ -1554,9 +1874,52 @@ impl CommandHandler {
                             retry_reason: Some("operator_conflict_resolution".into()),
                         };
                         enqueued_stage_id = Some(next_stage.stage_id.clone());
+                        retry_stage_execution_id = Some(next_stage.id);
+                        source_stage_execution_id = Some(previous.id);
+                        retry_attempt_number = Some(next_stage.attempt_number);
                         stages::insert_tx(&mut tx, &next_stage).await?;
                     }
                 }
+                let retry_instruction_binding_id = if let Some(ref instruction_text) =
+                    validated_instruction
+                {
+                    let retry_stage_execution_id = retry_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a newly created retry stage for selected workflow transition"
+                            )
+                        })?;
+                    let source_stage_execution_id = source_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a source stage for selected workflow transition"
+                            )
+                        })?;
+                    let retry_attempt_number = retry_attempt_number.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires retry attempt metadata for selected workflow transition"
+                            )
+                        })?;
+                    let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                            &mut tx,
+                            &domain::retry_instruction::RetryInstructionBindingInput {
+                                journal_id: journal_id.to_string(),
+                                run_id: c.run_id,
+                                stage_id: selected_next_state_id.clone(),
+                                source_stage_execution_id,
+                                retry_stage_execution_id,
+                                retry_attempt_number,
+                                target_agent_execution_id: None,
+                                scope_kind:
+                                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry,
+                                instruction_text: instruction_text.clone(),
+                                created_by_principal_id: caller.principal_id.clone(),
+                                created_by_principal_class: caller.principal_class.to_string(),
+                            },
+                        )
+                        .await?;
+                    Some(binding.binding_id)
+                } else {
+                    None
+                };
 
                 sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                     .bind(RunStatus::Running.to_string())
@@ -1633,6 +1996,7 @@ impl CommandHandler {
                     conflict_id: conflict.conflict_id,
                     selected_transition_id: c.selected_transition_id,
                     selected_next_state_id,
+                    retry_instruction_binding_id,
                 })
             }
 
@@ -2230,6 +2594,240 @@ impl CommandHandler {
                     stage_id: c.stage_id,
                 })
             }
+
+            // ── P072: Converged approval resolution by approval_id ──────
+            Command::ResolveApproval(c) => {
+                use domain::commands::ApprovalResolutionDecision;
+
+                let now = Utc::now();
+                let decision = match c.decision {
+                    ApprovalResolutionDecision::Approved => ApprovalDecision::Granted,
+                    ApprovalResolutionDecision::Rejected => ApprovalDecision::Rejected,
+                };
+
+                let has_post_tasks = if decision == ApprovalDecision::Granted {
+                    self.check_has_post_approval_tasks(c.run_id, &c.stage_id)
+                        .await
+                } else {
+                    false
+                };
+
+                let tx_started = Instant::now();
+                let mut tx =
+                    db::pool::begin_immediate_with_retry(&self.pool, "command.ResolveApproval")
+                        .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+
+                // Verify the approval exists and is still actionable.
+                let approval = approvals::find_by_id_tx(&mut tx, c.approval_id).await?;
+                let approval = match approval {
+                    Some(a)
+                        if matches!(
+                            a.decision,
+                            ApprovalDecision::Pending | ApprovalDecision::Requested
+                        ) =>
+                    {
+                        a
+                    }
+                    Some(_) => {
+                        let error = anyhow!(
+                            "Approval {} is not actionable (already resolved)",
+                            c.approval_id
+                        );
+                        command_journal::fail_entry_tx(
+                            &mut tx,
+                            &journal.id,
+                            Utc::now(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        return Err(error);
+                    }
+                    None => {
+                        let error = anyhow!("Approval {} not found", c.approval_id);
+                        command_journal::fail_entry_tx(
+                            &mut tx,
+                            &journal.id,
+                            Utc::now(),
+                            &error.to_string(),
+                        )
+                        .await?;
+                        tx.commit().await?;
+                        db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        return Err(error);
+                    }
+                };
+                if approval.run_id != c.run_id || approval.stage_id != c.stage_id {
+                    let error = anyhow!(
+                        "Approval {} provenance mismatch: command run/stage {}:{} but approval belongs to {}:{}",
+                        c.approval_id,
+                        c.run_id,
+                        c.stage_id,
+                        approval.run_id,
+                        approval.stage_id
+                    );
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                    return Err(error);
+                }
+                let authoritative_run_id = approval.run_id;
+                let authoritative_stage_id = approval.stage_id.clone();
+
+                approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
+                    .await?;
+
+                let mut stage_status_event = None;
+                let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
+                let run_stages = stages::list_by_run_tx(&mut tx, authoritative_run_id).await?;
+
+                if decision == ApprovalDecision::Granted {
+                    if let Some(stage) = run_stages.iter().find(|s| {
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
+                    }) {
+                        if stage.stage_type.as_deref() == Some("manual_gate") {
+                            if has_post_tasks {
+                                stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
+                                    .await?;
+                                stage_status_event = Some((stage.id, StageStatus::Running));
+                            } else {
+                                stages::settle_tx(
+                                    &mut tx,
+                                    stage.id,
+                                    StageSettlementKind::Completed,
+                                    now,
+                                )
+                                .await?;
+                                stage_status_event = Some((stage.id, StageStatus::Completed));
+                            }
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Running));
+                        }
+                    }
+                } else {
+                    // Rejection path — mirrors RejectStage logic.
+                    if let Some(stage) = run_stages.iter().find(|s| {
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
+                    }) {
+                        if stage.stage_type.as_deref() == Some("manual_gate") {
+                            stages::settle_tx(
+                                &mut tx,
+                                stage.id,
+                                StageSettlementKind::Completed,
+                                now,
+                            )
+                            .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Completed));
+                            should_enqueue_advance = true;
+                            if stage.stage_id == "state_11_manual_release" {
+                                sqlx::query(
+                                    "UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3",
+                                )
+                                .bind(RunStatus::Running.to_string())
+                                .bind("state_10_implementation_refined")
+                                .bind(authoritative_run_id.to_string())
+                                .execute(&mut *tx)
+                                .await?;
+                                supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+                                    &mut tx,
+                                    authoritative_run_id,
+                                    &stage.stage_id,
+                                    now,
+                                    &journal.id,
+                                )
+                                .await?;
+                            }
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Blocked));
+                        }
+                    }
+                }
+
+                if should_enqueue_advance {
+                    work_items::enqueue_tx(
+                        &mut tx,
+                        &WorkItem {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            kind: WorkItemKind::AdvanceRun,
+                            payload_json: serde_json::json!({
+                                "run_id": authoritative_run_id.to_string()
+                            })
+                            .to_string(),
+                            status: WorkItemStatus::Pending,
+                            run_id: Some(authoritative_run_id),
+                            stage_id: None,
+                            created_at: now,
+                            scheduled_at: now,
+                            attempt_count: 0,
+                            last_error: None,
+                        },
+                    )
+                    .await?;
+                }
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ResolveApproval",
+                    0,
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                self.work_queue
+                    .publish_scheduler_notification(scheduler_refresh);
+                if let Some((stage_execution_id, status)) = stage_status_event {
+                    let _ = self.events.send(DomainEvent::StageStatusChanged {
+                        run_id: authoritative_run_id,
+                        stage_execution_id,
+                        status,
+                    });
+                }
+                let _ = self.events.send(DomainEvent::ApprovalResolved {
+                    approval_id: approval.id,
+                    decision,
+                });
+                projections::rebuild_all_for_run(&self.pool, authoritative_run_id).await?;
+
+                let result = match c.decision {
+                    ApprovalResolutionDecision::Approved => CommandResult::StageApproved {
+                        approval_id: approval.id,
+                    },
+                    ApprovalResolutionDecision::Rejected => CommandResult::StageRejected {
+                        approval_id: approval.id,
+                    },
+                };
+                Ok(result)
+            }
         }
     }
 
@@ -2502,6 +3100,35 @@ impl CommandHandler {
                 old_stage.status
             ));
         }
+        let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
+            &run,
+            &old_stage.stage_id,
+        ) {
+            Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %old_stage.stage_id,
+                    error = %e,
+                    "RetryAgentExecution side-effect preflight could not inspect post_approval_tasks"
+                );
+                false
+            }
+        };
+        if retry_requires_effect_reconciliation(
+            &old_stage,
+            Some(&target_exec.agent_id),
+            has_release_post_approval_tasks,
+        ) {
+            let error = requires_effect_reconciliation_error(&old_stage);
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
+        }
 
         let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
         let source_item = find_source_invoke_work_item(
@@ -2539,20 +3166,8 @@ impl CommandHandler {
                     generation_id = %generation_id,
                     source_work_item_id = %source_item.id,
                     source_work_item_status = %source_item.status,
-                    "Targeted retry source ACP generation is no longer live; falling back to full stage retry"
+                    "Targeted retry source ACP generation is no longer live; creating a fresh targeted retry from persisted payload"
                 );
-                return self
-                    .retry_stage_latest_attempt(
-                        run_id,
-                        stage_id,
-                        consume_quota_budget_now,
-                        journal_id,
-                        journal,
-                        "operator_retry_stale_targeted_retry",
-                        validated_instruction,
-                        caller,
-                    )
-                    .await;
             }
         }
 
@@ -2564,6 +3179,15 @@ impl CommandHandler {
                     e
                 )
             })?;
+        let runtime_facts =
+            agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
+                .await?;
+        let provider_fallback = targeted_retry_provider_fallback(
+            &run,
+            &target_exec.agent_id,
+            &retry_payload,
+            runtime_facts.as_ref(),
+        );
         let next_attempt_number = matching_stages
             .iter()
             .map(|s| s.attempt_number)
@@ -2613,6 +3237,38 @@ impl CommandHandler {
                     "reason": "operator_targeted_retry"
                 }),
             );
+            if let Some(fallback) = provider_fallback {
+                object.insert(
+                    "backend_profile_id".into(),
+                    serde_json::json!(fallback.backend_profile_id.clone()),
+                );
+                object.insert(
+                    "provider".into(),
+                    serde_json::json!(fallback.provider.clone()),
+                );
+                object.insert("model".into(), serde_json::json!(fallback.model.clone()));
+                if let Some(effort) = fallback.effort.clone() {
+                    object.insert("effort".into(), serde_json::json!(effort));
+                }
+                if let Some(max_turns) = fallback.max_turns {
+                    object.insert("max_turns".into(), serde_json::json!(max_turns));
+                }
+                if let Some(targeted_retry) = object
+                    .get_mut("targeted_retry")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    targeted_retry.insert(
+                        "provider_fallback".into(),
+                        serde_json::json!({
+                            "reason": "source_provider_failed_without_required_output",
+                            "from_backend_profile_id": fallback.from_backend_profile_id,
+                            "from_provider": fallback.from_provider,
+                            "to_backend_profile_id": fallback.backend_profile_id,
+                            "to_provider": fallback.provider,
+                        }),
+                    );
+                }
+            }
         } else {
             return Err(anyhow!(
                 "Source InvokeAgent work item {} payload is not a JSON object",
@@ -2918,6 +3574,105 @@ fn phase_b_dogfood_exit_metric_snapshot(
     })
 }
 
+fn resolve_start_run_review_routing_json(
+    explicit_json: Option<&str>,
+    idea_body: &str,
+    operator_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    if let Some(json) = explicit_json {
+        let opts: domain::routing::ReviewRoutingOptions =
+            serde_json::from_str(json).map_err(|error| anyhow!("{error}"))?;
+        validate_review_routing_options(&opts)?;
+        return Ok(serde_json::to_string(&opts).unwrap_or_else(|_| json.to_string()));
+    }
+
+    let mut opts = domain::routing::ReviewRoutingOptions::default();
+    let mut has_hint = false;
+    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(idea_body) {
+        if let Some(mode) = yaml_lookup_string(&yaml, &["idea.review_mode"])
+            .or_else(|| yaml_lookup_string(&yaml, &["idea", "review_mode"]))
+        {
+            opts.mode = mode
+                .parse::<domain::routing::ReviewRoutingMode>()
+                .map_err(|error| anyhow!("{error}"))?;
+            has_hint = true;
+        }
+
+        if let Some(override_node) = yaml_lookup(&yaml, &["reviewer_override"]) {
+            opts.force_include = yaml_lookup_string_list(override_node, &["force_include"]);
+            opts.force_exclude = yaml_lookup_string_list(override_node, &["force_exclude"]);
+            opts.override_reason = yaml_lookup_string(override_node, &["reason"]);
+            has_hint = true;
+        }
+    }
+
+    validate_review_routing_options(&opts)?;
+    if has_hint
+        && (opts.override_reason.is_some()
+            || !opts.force_include.is_empty()
+            || !opts.force_exclude.is_empty())
+    {
+        opts.operator_id = operator_id.map(str::to_string);
+        opts.created_at = Some(now);
+    }
+
+    serde_json::to_string(&opts).map_err(Into::into)
+}
+
+fn validate_review_routing_options(opts: &domain::routing::ReviewRoutingOptions) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for agent_id in opts.force_include.iter().chain(opts.force_exclude.iter()) {
+        if !seen.insert(agent_id.as_str()) {
+            return Err(anyhow!(
+                "duplicate agent_id '{agent_id}' in force_include/force_exclude"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn yaml_lookup<'a>(value: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a serde_yaml::Value> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(serde_yaml::Value::String((*key).to_string()))?;
+    }
+    Some(cursor)
+}
+
+fn yaml_lookup_string(value: &serde_yaml::Value, path: &[&str]) -> Option<String> {
+    yaml_lookup(value, path)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn yaml_lookup_string_list(value: &serde_yaml::Value, path: &[&str]) -> Vec<String> {
+    let Some(value) = yaml_lookup(value, path) else {
+        return Vec::new();
+    };
+    if let Some(sequence) = value.as_sequence() {
+        return sequence
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    value
+        .as_str()
+        .map(|item| {
+            item.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn supersede_current_workflow_conflict_for_stage_retry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -2971,9 +3726,143 @@ async fn supersede_current_workflow_conflict_for_stage_retry_tx(
     Ok(())
 }
 
+async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    now: DateTime<Utc>,
+    journal_id: &str,
+) -> Result<()> {
+    let Some(conflict) = workflow_conflicts::get_current_blocking_conflict_tx(tx, run_id).await?
+    else {
+        return Ok(());
+    };
+
+    if conflict.current_state_id != stage_id {
+        return Ok(());
+    }
+
+    workflow_conflicts::transition_conflict_status_tx(
+        tx,
+        &conflict.conflict_id,
+        WorkflowConflictStatus::Superseded,
+        now,
+        Some(serde_json::json!({
+            "resolution_kind": "manual_release_rejection_loopback",
+            "from_stage_id": stage_id,
+            "selected_next_state_id": "state_10_implementation_refined",
+            "journal_id": journal_id,
+        })),
+        None,
+        None,
+    )
+    .await?;
+
+    workflow_conflicts::upsert_transition_cursor_tx(
+        tx,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: stage_id.to_string(),
+            cursor_status: "manual_release_rejection_loopback".to_string(),
+            resume_policy: "continue_from_selected_transition".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: Some("state_10_implementation_refined".to_string()),
+            conflict_id: Some(conflict.conflict_id),
+            conflict_fingerprint: Some(conflict.conflict_fingerprint),
+            candidate_transition_hash: Some(conflict.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-28T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let idea_body = r#"
+idea.review_mode: legacy_fixed
+reviewer_override:
+  force_include: [proposal_reviewer_security]
+  force_exclude: [proposal_reviewer_ui]
+  reason: "Security-sensitive internal API; no UI surface."
+"#;
+
+        let json = resolve_start_run_review_routing_json(None, idea_body, Some("operator-1"), now)
+            .expect("idea-level P060 routing hints should parse");
+        let options: domain::routing::ReviewRoutingOptions =
+            serde_json::from_str(&json).expect("canonical ReviewRoutingOptions JSON");
+
+        assert_eq!(
+            options.mode,
+            domain::routing::ReviewRoutingMode::LegacyFixed
+        );
+        assert_eq!(options.force_include, vec!["proposal_reviewer_security"]);
+        assert_eq!(options.force_exclude, vec!["proposal_reviewer_ui"]);
+        assert_eq!(
+            options.override_reason.as_deref(),
+            Some("Security-sensitive internal API; no UI surface.")
+        );
+        assert_eq!(options.operator_id.as_deref(), Some("operator-1"));
+        assert_eq!(options.created_at, Some(now));
+    }
+
+    #[test]
+    fn p060_explicit_review_routing_json_wins_over_idea_body_hints() {
+        let now = Utc::now();
+        let explicit = serde_json::json!({
+            "mode": "dynamic",
+            "force_include": ["proposal_reviewer_api_contract"],
+            "override_reason": "Explicit run-start routing"
+        })
+        .to_string();
+
+        let json = resolve_start_run_review_routing_json(
+            Some(&explicit),
+            "idea.review_mode: legacy_fixed",
+            Some("operator-1"),
+            now,
+        )
+        .expect("explicit routing JSON should canonicalize");
+        let options: domain::routing::ReviewRoutingOptions =
+            serde_json::from_str(&json).expect("canonical ReviewRoutingOptions JSON");
+
+        assert_eq!(options.mode, domain::routing::ReviewRoutingMode::Dynamic);
+        assert_eq!(
+            options.force_include,
+            vec!["proposal_reviewer_api_contract"]
+        );
+        assert_eq!(
+            options.override_reason.as_deref(),
+            Some("Explicit run-start routing")
+        );
+        assert_eq!(options.operator_id, None);
+        assert_eq!(options.created_at, None);
+    }
+
+    #[test]
+    fn p060_review_routing_duplicate_override_ids_are_rejected() {
+        let now = Utc::now();
+        let duplicate = serde_json::json!({
+            "mode": "dynamic",
+            "force_include": ["proposal_reviewer_security"],
+            "force_exclude": ["proposal_reviewer_security"]
+        })
+        .to_string();
+
+        let err = resolve_start_run_review_routing_json(Some(&duplicate), "", None, now)
+            .expect_err("duplicate include/exclude IDs should fail validation");
+        assert!(err.to_string().contains("duplicate agent_id"));
+    }
 
     #[test]
     fn p017_phase_b_dogfood_metric_snapshot_reads_evidence_record() {

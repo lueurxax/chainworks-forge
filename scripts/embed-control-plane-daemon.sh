@@ -56,8 +56,9 @@ fi
 
 # Xcode Cloud does not provide Rust/Cargo in the Xcode build phase. Its
 # repository custom scripts run before xcodebuild and can leave a compiled
-# daemon in a stable workspace path. Prefer that binary when present, then
-# fall back to a local cargo build for developer machines and proposal gates.
+# daemon in a stable workspace path. Only Xcode Cloud may auto-discover that
+# cache; local developer/proposal builds must compile the current checkout so
+# a stale `.xcode-cloud` artifact cannot silently change the GraphQL schema.
 PREBUILT_CANDIDATES=()
 append_prebuilt_candidate() {
     local candidate="$1"
@@ -75,17 +76,21 @@ append_prebuilt_candidate() {
 if [ -n "${CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON:-}" ]; then
     append_prebuilt_candidate "${CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON}"
 fi
-append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/${PROFILE_DIR}/control-plane"
-append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/release/control-plane"
-append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/control-plane"
+if [ -n "${CI_XCODE_CLOUD:-}" ]; then
+    append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/${PROFILE_DIR}/control-plane"
+    append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/release/control-plane"
+    append_prebuilt_candidate "${SRCROOT}/.xcode-cloud/control-plane/control-plane"
+fi
 
 SOURCE_BIN=""
-for candidate in "${PREBUILT_CANDIDATES[@]}"; do
-    if [ -x "${candidate}" ]; then
-        SOURCE_BIN="${candidate}"
-        break
-    fi
-done
+if [ "${#PREBUILT_CANDIDATES[@]}" -gt 0 ]; then
+    for candidate in "${PREBUILT_CANDIDATES[@]}"; do
+        if [ -x "${candidate}" ]; then
+            SOURCE_BIN="${candidate}"
+            break
+        fi
+    done
+fi
 
 # Cargo locks its `target/` directory, so a concurrent `cargo test`
 # from the terminal or test-gate.sh blocks this build phase. Redirect
@@ -135,9 +140,13 @@ else
     if ! command -v cargo >/dev/null 2>&1; then
         echo "error: cargo not found on PATH ($PATH)" >&2
         echo "       no prebuilt daemon was found in:" >&2
-        for candidate in "${PREBUILT_CANDIDATES[@]}"; do
-            echo "         - ${candidate}" >&2
-        done
+        if [ "${#PREBUILT_CANDIDATES[@]}" -gt 0 ]; then
+            for candidate in "${PREBUILT_CANDIDATES[@]}"; do
+                echo "         - ${candidate}" >&2
+            done
+        else
+            echo "         - none configured for this local build" >&2
+        fi
         echo "       Xcode Cloud should run ci_scripts/ci_post_clone.sh before xcodebuild" >&2
         echo "       local builds need Rust installed via https://rustup.rs" >&2
         exit 127

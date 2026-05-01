@@ -1,6 +1,8 @@
 pub mod adapters;
 pub mod manager;
 pub mod session;
+pub mod toolchain_lease;
+pub mod toolchain_mapper;
 pub mod transport;
 pub mod xcode_broker;
 pub mod xcode_shim;
@@ -147,6 +149,16 @@ pub struct ExecutionRequest {
     /// P017 Phase B: Mediation record id when this execution is mediation-owned.
     #[serde(default)]
     pub mediation_record_id: Option<String>,
+    /// P066 T20: TOOLCHAIN_HOME path for session-scoped Go mapping setup.
+    /// When set with toolchain_go_scope_enabled=true, the manager prepares Go
+    /// isolation directories before session handoff and registers them for
+    /// cleanup on session close or failure (DiagCleanupPlan::DeleteOnClose).
+    #[serde(default)]
+    pub toolchain_home: Option<String>,
+    /// P066 T20: Enables Go session-scoped toolchain isolation for this session.
+    /// Requires toolchain_home + session_generation_id to be set.
+    #[serde(default)]
+    pub toolchain_go_scope_enabled: bool,
 }
 
 fn default_owner_kind() -> String {
@@ -191,6 +203,40 @@ impl XcodeRuntimeObservationSink for NoopXcodeRuntimeObservationSink {
         _agent_execution_id: AgentExecutionId,
         _update: XcodeRuntimeObservationUpdate,
     ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcpPromptProgressKind {
+    PromptSent,
+    MessageReceived,
+    MeaningfulProgress,
+    ProviderLocalActivity,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpPromptProgressUpdate {
+    pub run_id: RunId,
+    pub stage_execution_id: Option<String>,
+    pub stage_id: String,
+    pub agent_id: String,
+    pub provider: String,
+    pub session_generation_id: Option<String>,
+    pub provider_session_id: String,
+    pub kind: AcpPromptProgressKind,
+}
+
+#[async_trait::async_trait]
+pub trait AcpPromptProgressSink: Send + Sync {
+    async fn record_acp_prompt_progress(&self, update: AcpPromptProgressUpdate) -> Result<()>;
+}
+
+pub struct NoopAcpPromptProgressSink;
+
+#[async_trait::async_trait]
+impl AcpPromptProgressSink for NoopAcpPromptProgressSink {
+    async fn record_acp_prompt_progress(&self, _update: AcpPromptProgressUpdate) -> Result<()> {
         Ok(())
     }
 }

@@ -59,6 +59,36 @@ pub async fn find_by_id(pool: &SqlitePool, id: ApprovalId) -> Result<Option<Appr
     .transpose()
 }
 
+/// P072: Transaction-scoped lookup by approval_id for ResolveApproval.
+pub async fn find_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: ApprovalId,
+) -> Result<Option<Approval>> {
+    let id_str = id.to_string();
+    let row = sqlx::query(
+        r#"SELECT id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at
+           FROM approvals WHERE id = ?1"#,
+    )
+    .bind(id_str)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("find approval by id (tx)")?;
+
+    row.map(|r| {
+        parse_approval_row(
+            r.get("id"),
+            r.get("run_id"),
+            r.get("stage_id"),
+            r.get("decision"),
+            r.get("requested_at"),
+            r.get("decided_at"),
+            r.get("comment"),
+            r.get("expires_at"),
+        )
+    })
+    .transpose()
+}
+
 pub async fn list_pending(pool: &SqlitePool) -> Result<Vec<Approval>> {
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at

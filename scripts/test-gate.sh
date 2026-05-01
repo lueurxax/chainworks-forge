@@ -1636,6 +1636,7 @@ Available gates:
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -1674,6 +1675,7 @@ Available gates:
   proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
   proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
   proposal-065|p065  Proposal 065 operator retry instruction contract gate
+  proposal-066|p066  Proposal 066 Phase 0 toolchain cache mapping scaffold gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -2476,16 +2478,11 @@ for phrase in [
     "Projection parity",
     "Known holds",
     "P031 may ship",
-    # r8 scope narrowing: P031 is a read-only consumer. It does NOT
-    # issue MCP mutations, so rows that reference "disabled controls"
-    # apply to a future command-UI consumer, not to P031. The gate
-    # therefore asserts the narrowing text is present (positive
-    # contract) instead of the now-obsolete "P031 must prove disabled
-    # controls" phrase. ARCH-R9-01 P031 review blocker is resolved by
-    # this edit — the reference doc no longer mis-attributes
-    # MCP-command-control behavior to P031.
+    # Scope narrowing: P031 is a read-only consumer. It does not issue
+    # MCP mutations, so rows that reference disabled controls apply to a
+    # future command-UI consumer, not to P031.
     "read-only consumer",
-    "Scope boundary (r8 correction)",
+    "Scope boundary:",
 ]:
     require_contains(phrase, phrase)
 
@@ -2533,6 +2530,58 @@ for entry in manifest.get("entries", []):
 PY
     )
     log "Proposal 031 gate passed"
+    ;;
+  proposal-072|p072)
+    log "UI action boundary gate: approval-only GraphQL UI mutation boundary"
+    "$0" proposal-031
+
+    run_targeted_tests "proposal-072-swift" \
+      "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p domain operator_action_routing -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p auth v2_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p auth is_mutation_allowed_by_surface_policy_checks -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server approve_approval -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server reject_approval -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server ui_principals_denied_non_approval_mutations -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server legacy_default_operator_denied_non_approval_mutations -- --test-threads=1 --nocapture
+      CARGO_TARGET_DIR=target/proposal-072-gate cargo test -p graphql-server missing_graphql_surface_policy_principals_denied_non_approval_mutations -- --test-threads=1 --nocapture
+    )
+
+    (
+      cd "$ROOT_DIR"
+      python3 - <<'PY'
+from pathlib import Path
+
+p031 = Path("docs/proposals/031-thin-graphql-ui-rewrite.md").read_text()
+required = [
+    "UI action boundary supersedes the original P031 all-mutation ban",
+    "approveApproval",
+    "rejectApproval",
+    "0 non-approval GraphQL mutations",
+]
+for phrase in required:
+    if phrase not in p031:
+        raise SystemExit(f"proposal-072: P031 text missing UI action boundary reconciliation phrase: {phrase}")
+
+for forbidden in [
+    "Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.",
+    "Governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.",
+    "GraphQL mutation usage: 0 GraphQL mutations defined or invoked by governed UI code.",
+]:
+    if forbidden in p031:
+        raise SystemExit(f"proposal-072: P031 still contains stale P031/UI action boundary text: {forbidden}")
+
+inventory = Path("docs/reference/p031-thin-ui-inventory.json").read_text()
+for operation in ["P072ApproveApproval", "P072RejectApproval"]:
+    if operation not in inventory:
+        raise SystemExit(f"proposal-072: P031 inventory missing allowed approval operation {operation}")
+PY
+    )
+
+    log "UI action boundary gate passed"
     ;;
   proposal-031-readiness|p031-readiness)
     log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"
@@ -3061,8 +3110,14 @@ PY
       export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
       cargo test -p domain --lib routing -- --test-threads=1 --nocapture
       cargo test -p engine --lib proposal_review_router -- --test-threads=1 --nocapture
+      cargo test -p engine --lib command_handler::tests::p060 -- --test-threads=1 --nocapture
+      cargo test -p engine --test integration test_start_run_persists_delivery_configuration_json -- --test-threads=1 --nocapture
+      cargo test -p engine --test integration p060_legacy_and_shadow_modes_dispatch_fixed_quartet_on_dynamic_workflow -- --test-threads=1 --nocapture
+      cargo test -p graphql-server --lib start_run_accepts_delivery_configuration_json -- --test-threads=1 --nocapture
+      cargo test -p mcp-server --lib runs_start_persists_delivery_configuration_json -- --test-threads=1 --nocapture
       cargo test -p workflow --test integration p060 -- --test-threads=1 --nocapture
     )
+    xcodebuild test -project "$ROOT_DIR/Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" -only-testing:"Chainworks ForgeTests/ProposalReviewRoutingTests" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
 
     # Phase 3 closure guards (audit ARCH/OPS-style).
     # These die before the gate exits if any of the Phase 3 contracts
@@ -3192,6 +3247,75 @@ PY
       done
     )
     log "Proposal 065 control-plane gate passed"
+    ;;
+  proposal-066|p066)
+    log "Proposal 066 Phase 0 gate: toolchain cache mapping scaffold"
+
+    # T06 — Swift scan guardrail: ToolchainMappingReadAdapter must exist and be the
+    # sole owner of toolchain policy decoding. Consumer files must not access
+    # .toolchainCachePolicy directly (that field is declared in AgentCatalog.swift
+    # and decoded only through ToolchainMappingReadAdapter).
+    log "P066 T06: Swift scan — ToolchainMappingReadAdapter ownership guardrail"
+    ADAPTER_FILE="$ROOT_DIR/Chainworks Forge/Engine/ToolchainMappingReadAdapter.swift"
+    if [ ! -f "$ADAPTER_FILE" ]; then
+      fail "P066 T06: ToolchainMappingReadAdapter.swift missing — must exist before Phase 1"
+    fi
+    CONSUMER_FILES=(
+      "$ROOT_DIR/Chainworks Forge/Engine/RunPlanCompiler.swift"
+      "$ROOT_DIR/Chainworks Forge/Engine/ExecutionService.swift"
+      "$ROOT_DIR/Chainworks Forge/Engine/RunReportBuilder.swift"
+      "$ROOT_DIR/Chainworks Forge/Engine/RunComparisonService.swift"
+    )
+    for f in "${CONSUMER_FILES[@]}"; do
+      if [ ! -f "$f" ]; then
+        fail "P066 T06: expected consumer file missing: $f"
+      fi
+      # Consumer files must not directly access .toolchainCachePolicy on a decoded
+      # AgentDefinition outside of ToolchainMappingReadAdapter.swift itself.
+      # The pattern to forbid is direct property access like `agent.toolchainCachePolicy`
+      # or `.toolchainCachePolicy` in these operator-facing service files.
+      if grep -qE '\.toolchainCachePolicy\b' "$f"; then
+        fail "P066 T06: $f directly accesses .toolchainCachePolicy — route through ToolchainMappingReadAdapter instead"
+      fi
+    done
+    log "P066 T06: Swift scan passed — ToolchainMappingReadAdapter is sole bridge"
+
+    (
+      cd "$ROOT_DIR/control-plane"
+      log "P066: workflow crate — YAML schema, compatibility gates, snapshot types"
+      cargo test -p workflow --test proposal_066_toolchain_cache_policy -- --nocapture
+
+      log "P066: domain crate — toolchain failure kinds"
+      cargo test -p domain --lib toolchain:: -- --nocapture
+
+      log "P066: db crate — migration 037 and diagnostics column"
+      cargo test -p db --test proposal_066_toolchain_cache_mapping -- --nocapture
+
+      log "P066: graphql-server crate — northbound synthesis (active, disabled, legacy)"
+      cargo test -p graphql-server --test proposal_066_toolchain_mapping -- --nocapture
+
+      log "P066: mcp-server crate — northbound synthesis (active, disabled, legacy)"
+      cargo test -p mcp-server --test proposal_066_toolchain_mapping -- --nocapture
+
+      log "P066 T17/T18: graphql-server — startupRecoverySummary.toolchainCache and toolchainCacheHousekeepingSummary"
+      cargo test -p graphql-server --test proposal_066_cleanup_readbacks -- --nocapture
+
+      log "P066 T22: graphql-server — migration drill (≥10 legacy NULL rows + ≥10 post-migration rows)"
+      cargo test -p graphql-server --test proposal_066_migration_drill -- --nocapture
+
+      log "P066 T10/T11/T12/T13: acp crate — toolchain mapper, host-executor rewriting, Go env, lease"
+      cargo test -p acp --test proposal_066_toolchain_mapper -- --nocapture
+
+      log "P066 T13: acp crate — per-run Xcode lease unit tests"
+      cargo test -p acp --lib toolchain_lease -- --nocapture
+
+      log "P066 T14: engine crate — startup recovery toolchain sweep (Go orphan reclaim + Xcode quarantine)"
+      cargo test -p engine --test proposal_066_toolchain_recovery -- --nocapture
+
+      log "P066 T19: engine crate — housekeeping pruning of terminal run-scoped Xcode roots"
+      cargo test -p engine --test proposal_066_toolchain_housekeeping -- --nocapture
+    )
+    log "Proposal 066 Phase 0 gate passed"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"

@@ -335,6 +335,25 @@ pub struct WorkflowConflictRecord {
     pub diagnostic_redaction_tier: String,
 }
 
+pub fn workflow_conflict_suggested_operator_action(
+    record: &WorkflowConflictRecord,
+) -> Option<&'static str> {
+    if record.reason != WorkflowConflictReason::NoDeclarativeTransitionMatched {
+        return None;
+    }
+    if record.candidate_transitions.iter().any(|candidate| {
+        candidate.result == CandidateTransitionResult::NotMatched
+            && candidate
+                .sanitized_diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("Loop budget exhausted"))
+    }) {
+        Some("choose_transition_or_provide_refine_instruction")
+    } else {
+        None
+    }
+}
+
 fn sha256_prefixed_json<T: Serialize + ?Sized>(value: &T) -> String {
     let json = serde_json::to_vec(value).expect("workflow conflict hash payload should serialize");
     let digest = Sha256::digest(json);

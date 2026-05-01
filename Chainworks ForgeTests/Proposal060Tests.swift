@@ -282,7 +282,7 @@ struct Proposal060Tests {
       ],
       "validation_guard_cases": ["force_include", "force_exclude", "mandatory_conflict", "disabled_rollout_wave", "unknown_agent", "placeholder_resolved_agent"],
       "deterministic_parity": { "same_input": true, "swift": "implementation", "rust": "implementation", "selected_order": ["a"], "evidence_ids": ["e1"], "plan_hash": "hash" },
-      "routing_metadata_required_fields": ["routing_id", "family", "capabilities", "stacks", "surfaces", "risks", "enabled_for_proposal_review", "rollout_wave"],
+      "routing_metadata_required_fields": ["routing_id", "family", "capabilities", "stacks", "surfaces", "risks", "enabled_for_proposal_review", "rollout_wave", "strong_proposal_keywords", "strong_repo_files", "strong_repo_symbols", "score_weights"],
       "catalog_launch_scope": {
         "existing": ["proposal_reviewer_product_owner", "proposal_reviewer_ux", "proposal_reviewer_ui", "proposal_reviewer_architect"],
         "phase_3_core": ["proposal_reviewer_macos", "proposal_reviewer_apple_architect", "proposal_reviewer_rust_architect", "proposal_reviewer_reliability", "proposal_reviewer_security", "proposal_reviewer_api_contract", "proposal_reviewer_observability_rollout"],

@@ -7,8 +7,9 @@ use domain::artifact_contracts::{
 use domain::mediation::LeadConflictMediationRecord;
 use domain::run::Run;
 use domain::workflow_conflict::{
-    CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
-    WorkflowConflictRecord, WorkflowConflictStatus,
+    workflow_conflict_suggested_operator_action, CandidateTransitionEvaluation,
+    CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+    WorkflowConflictStatus,
 };
 
 use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
@@ -29,6 +30,7 @@ pub struct GqlRun {
     pub cancellation_settlement_log: Option<String>,
     pub cancellation_settlement_summary: Option<String>,
     pub delivery_configuration_json: Option<String>,
+    pub review_routing_json: Option<String>,
     pub workflow_family: Option<String>,
     pub project_key: Option<String>,
     pub risk_class: Option<String>,
@@ -77,6 +79,7 @@ impl From<Run> for GqlRun {
             cancellation_settlement_log: run.cancellation_settlement_log,
             cancellation_settlement_summary: None,
             delivery_configuration_json: run.delivery_configuration_json,
+            review_routing_json: run.review_routing_json,
             delivery_preflight_json: run.delivery_preflight_json,
             workflow_family: run.workflow_family,
             project_key: run.project_key,
@@ -143,6 +146,7 @@ impl From<RunProjectionRow> for GqlRun {
             cancellation_settlement_log: None,
             cancellation_settlement_summary: r.cancellation_settlement_summary,
             delivery_configuration_json: None,
+            review_routing_json: None,
             delivery_preflight_json: None,
             workflow_family: None,
             project_key: None,
@@ -197,6 +201,7 @@ pub struct GqlWorkflowConflict {
     pub resolution_record_json: Option<Json<serde_json::Value>>,
     pub terminal_failure_reason: Option<String>,
     pub diagnostic_redaction_tier: String,
+    pub suggested_operator_action: Option<String>,
     /// P017 Phase B: Lead mediation readback (read-only, no mutations).
     pub lead_mediation: Option<GqlLeadMediation>,
 }
@@ -545,6 +550,8 @@ pub enum GqlCandidateTransitionResult {
 
 impl From<WorkflowConflictRecord> for GqlWorkflowConflict {
     fn from(record: WorkflowConflictRecord) -> Self {
+        let suggested_operator_action =
+            workflow_conflict_suggested_operator_action(&record).map(str::to_string);
         GqlWorkflowConflict {
             conflict_id: ID(record.conflict_id),
             conflict_fingerprint: record.conflict_fingerprint,
@@ -571,6 +578,7 @@ impl From<WorkflowConflictRecord> for GqlWorkflowConflict {
             resolution_record_json: record.resolution_record_json.map(Json),
             terminal_failure_reason: record.terminal_failure_reason,
             diagnostic_redaction_tier: record.diagnostic_redaction_tier,
+            suggested_operator_action,
             lead_mediation: None, // Populated by enrichment when mediation_record_id is present
         }
     }

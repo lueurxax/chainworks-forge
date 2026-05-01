@@ -48,7 +48,7 @@ MCP today forces the caller to pull 66 KB per run. That is the bug. P068 tighten
 The same 2026-04-20 inspection asked a follow-up question: "show the score trajectory across review rounds for the proposals currently in review/refine". Two live runs participated:
 
 - `8dd01a54` (P031 Thin UI Rewrite) — 14 review rounds recorded in the `artifacts` table.
-- `4c5dacfa` (P060 Reviewer Routing) — 11 review rounds recorded.
+- `4c5dacfa` (deterministic reviewer-routing run) — 11 review rounds recorded.
 
 The aggregator writes review artifacts to `.chainworks/runs/<run>/reviews/proposal/`:
 
@@ -67,7 +67,7 @@ Every file is overwritten on the next round. The `artifacts` table records one r
 What survives today:
 
 - The current round's files on disk.
-- A `summaries/orchestrator.md` human-readable snapshot with a "Score Trajectory" table. That snapshot is itself regenerated each round, so it captures only the rounds the last aggregator chose to include. Spot-check: the P031 orchestrator preserves r6 / r7 / r9 and drops r8 + r10–r14. The P060 orchestrator captures pass-3 and drops pass-4–pass-11.
+- A `summaries/orchestrator.md` human-readable snapshot with a "Score Trajectory" table. That snapshot is itself regenerated each round, so it captures only the rounds the last aggregator chose to include. Spot-check: the P031 orchestrator preserves r6 / r7 / r9 and drops r8 + r10–r14. The reviewer-routing orchestrator captures pass-3 and drops pass-4–pass-11.
 - Nothing queryable over MCP or GraphQL. An operator asking for the trajectory has to read stale markdown files by hand.
 
 This is the same class of problem as the oversized `runs.get` response: the data the operator cares about (score per round) is reachable only via heroics, while the data they don't need (per-reviewer report bodies) is what gets overwritten. Fixing only the shaping side would leave operators with the same "read a markdown snapshot" workaround for score trajectories.

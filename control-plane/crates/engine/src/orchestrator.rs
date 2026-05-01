@@ -1,15 +1,16 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use md5::Md5;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, ideas, lead_conflict_mediations, projections, runs,
-    stages, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
+    ideas, lead_conflict_mediations, projections, runs, stages, work_items, workflow_conflicts,
 };
-use db::work_item::WorkItemKind;
-use domain::agent::AgentOutputSettlement;
+use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
@@ -18,7 +19,7 @@ use domain::artifact_contracts::{
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, ArtifactId, RunId};
 use domain::run::RunStatus;
-use domain::stage::{StageExecution, StageStatus};
+use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
     candidate_transition_hash, classify_workflow_conflict_reason, workflow_conflict_fingerprint,
     AdvisoryHintExtraction, CandidateTransitionEvaluation, CandidateTransitionResult,
@@ -88,6 +89,7 @@ impl Orchestrator {
         };
 
         if run.status.is_terminal() {
+            projections::rebuild_all_for_run(&self.pool, run_id).await?;
             return Ok(());
         }
 
@@ -104,11 +106,44 @@ impl Orchestrator {
     // Workflow-driven state machine (matches Swift WorkflowOrchestrator)
     // =====================================================================
 
+    async fn mark_run_completed_and_refresh(
+        &self,
+        run_id: RunId,
+        completed_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        runs::mark_completed(&self.pool, run_id, completed_at).await?;
+        projections::rebuild_all_for_run(&self.pool, run_id).await?;
+        Ok(())
+    }
+
     async fn advance_run_workflow(&self, run_id: RunId, run: &domain::run::Run) -> Result<()> {
-        let plan = workflow::compiler::compile(
-            run.workflow_yaml_path.as_deref().unwrap(),
-            run.agent_catalog_yaml_path.as_deref().unwrap(),
-        )?;
+        let workflow_path = run.workflow_yaml_path.as_deref().unwrap();
+        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap();
+        let plan = match (
+            run.workflow_snapshot_json.as_deref(),
+            run.catalog_snapshot_json.as_deref(),
+        ) {
+            (Some(workflow_snapshot), Some(catalog_snapshot))
+                if !workflow_snapshot.trim().is_empty() && !catalog_snapshot.trim().is_empty() =>
+            {
+                match workflow::compiler::compile_from_snapshot_json(
+                    workflow_snapshot,
+                    catalog_snapshot,
+                    catalog_path,
+                ) {
+                    Ok(plan) => plan,
+                    Err(snapshot_error) => {
+                        warn!(
+                            run_id = %run_id,
+                            error = %snapshot_error,
+                            "Failed to compile workflow from frozen snapshots; falling back to workflow files"
+                        );
+                        workflow::compiler::compile(workflow_path, catalog_path)?
+                    }
+                }
+            }
+            _ => workflow::compiler::compile(workflow_path, catalog_path)?,
+        };
 
         let current_state_id = run
             .current_state
@@ -256,14 +291,23 @@ impl Orchestrator {
                             })
                             .collect();
                         let total = stage_invokes.len();
-                        let completed = stage_invokes
+                        let completed_work_items = stage_invokes
                             .iter()
                             .filter(|w| w.status == db::work_item::WorkItemStatus::Completed)
                             .count();
-                        let failed = stage_invokes
+                        let failed_work_items = stage_invokes
                             .iter()
                             .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
                             .count();
+                        let settled_work_items = completed_work_items + failed_work_items;
+                        let failed_agent_executions =
+                            db::repos::agent_executions::find_by_stage(&self.pool, stage.id)
+                                .await?
+                                .iter()
+                                .filter(|execution| execution.status == AgentStatus::Failed)
+                                .count();
+                        let failed = failed_work_items + failed_agent_executions;
+                        let completed = total.saturating_sub(failed);
 
                         // Determine if this is a post-approval context (manual_gate
                         // with a Granted approval) so we use the right task list.
@@ -278,27 +322,107 @@ impl Orchestrator {
                         };
                         let effective = effective_tasks(state, is_post_approval);
 
-                        // ── Post-approval kickstart ─────────────────────────
-                        // When a manual_gate stage transitions to Running after
-                        // approval but has zero InvokeAgent work items yet,
-                        // enqueue phase 0 from the post-approval task list.
-                        if total == 0 && is_post_approval {
+                        // ── Empty-running kickstart ─────────────────────────
+                        // Retry and approval commands can put an existing stage
+                        // execution into Running before InvokeAgent work exists.
+                        // Treat Running+0 invokes as a resumable start edge,
+                        // otherwise the scheduler waits forever for work that
+                        // was never enqueued.
+                        if total == 0 {
                             info!(
                                 run_id = %run_id,
                                 state = %current_state_id,
-                                "Enqueuing post-approval phase 0 tasks"
+                                post_approval = is_post_approval,
+                                "Kickstarting running stage with no InvokeAgent work"
                             );
+
+                            if state.dynamic_parallel.is_some() {
+                                if self
+                                    .execute_system_routing_if_applicable(run_id, run, stage, &plan)
+                                    .await?
+                                {
+                                    let updated_stage = stages::list_by_run(&self.pool, run_id)
+                                        .await?
+                                        .into_iter()
+                                        .find(|s| s.id == stage.id);
+                                    if let Some(ref s) = updated_stage {
+                                        if matches!(
+                                            s.status,
+                                            StageStatus::Failed | StageStatus::Blocked
+                                        ) {
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref dp) = state.dynamic_parallel {
+                                    let artifact_path = format!(
+                                        "{}/routing/agent-selection-plan.v1.json",
+                                        run.artifact_root.trim_end_matches('/')
+                                    );
+                                    if std::path::Path::new(&artifact_path).exists() {
+                                        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                        self.materialize_dynamic_parallel(
+                                            run_id,
+                                            run,
+                                            stage,
+                                            &plan,
+                                            dp,
+                                            idea_opt.as_ref(),
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+
                             let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
                                 .await
                                 .ok()
                                 .flatten();
                             let effective_total = effective.len();
-                            for (i, task) in
-                                effective.iter().enumerate().filter(|(_, t)| t.phase == 0)
-                            {
-                                let approval_rejection_context = self
-                                    .approval_rejection_context_for_state(run_id, &current_state_id)
-                                    .await?;
+                            if effective_total == 0 {
+                                let prompt = build_task_prompt_for_owner(
+                                    state,
+                                    &plan,
+                                    run,
+                                    idea_opt.as_ref(),
+                                );
+                                self.enqueue_invoke_agent_for_owner(
+                                    run_id,
+                                    stage,
+                                    &state.owner,
+                                    &prompt,
+                                    0,
+                                    1,
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+
+                            let approval_rejection_context = self
+                                .approval_rejection_context_for_state(run_id, &current_state_id)
+                                .await?;
+                            for (i, task) in effective.iter().enumerate() {
+                                if task.phase != 0 {
+                                    continue;
+                                }
+                                if self
+                                    .block_code_writer_handoff_if_unavailable(
+                                        run_id,
+                                        &current_state_id,
+                                        stage,
+                                        task,
+                                        &plan,
+                                        run,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
                                 let prompt = build_task_prompt(
                                     task,
                                     &plan,
@@ -322,7 +446,7 @@ impl Orchestrator {
                             return Ok(());
                         }
 
-                        if total > 0 && completed + failed == total {
+                        if total > 0 && settled_work_items == total {
                             // All enqueued tasks finished. Generalized N-phase
                             // gating: determine which phase just completed, then
                             // check if a subsequent phase exists and needs enqueuing.
@@ -335,19 +459,18 @@ impl Orchestrator {
                             let current_phase: u32 = stage_invokes
                                 .iter()
                                 .filter_map(|w| {
-                                    let v = serde_json::from_str::<serde_json::Value>(
-                                        &w.payload_json,
-                                    )
-                                    .ok()?;
+                                    let v =
+                                        serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                            .ok()?;
                                     // P060: explicit dynamic phase takes precedence.
-                                    if let Some(dp) = v.get("p060_dynamic_phase").and_then(|p| p.as_u64()) {
+                                    if let Some(dp) =
+                                        v.get("p060_dynamic_phase").and_then(|p| p.as_u64())
+                                    {
                                         return Some(dp as u32);
                                     }
-                                    v.get("task_index")?
-                                        .as_u64()
-                                        .and_then(|idx| {
-                                            effective.get(idx as usize).map(|t| t.phase)
-                                        })
+                                    v.get("task_index")?.as_u64().and_then(|idx| {
+                                        effective.get(idx as usize).map(|t| t.phase)
+                                    })
                                 })
                                 .max()
                                 .unwrap_or(0);
@@ -363,16 +486,17 @@ impl Orchestrator {
                             // P060: also check p060_dynamic_phase for dynamic work items.
                             let next_phase_already_enqueued = next_phase.map_or(true, |np| {
                                 stage_invokes.iter().any(|w| {
-                                    let v = serde_json::from_str::<serde_json::Value>(
-                                        &w.payload_json,
-                                    )
-                                    .ok();
+                                    let v =
+                                        serde_json::from_str::<serde_json::Value>(&w.payload_json)
+                                            .ok();
                                     let v = match v {
                                         Some(v) => v,
                                         None => return false,
                                     };
                                     // P060: check explicit dynamic phase.
-                                    if let Some(dp) = v.get("p060_dynamic_phase").and_then(|p| p.as_u64()) {
+                                    if let Some(dp) =
+                                        v.get("p060_dynamic_phase").and_then(|p| p.as_u64())
+                                    {
                                         return dp as u32 == np;
                                     }
                                     v.get("task_index")
@@ -453,11 +577,18 @@ impl Orchestrator {
                                                     .await
                                                 {
                                                     if !file_paths.is_empty() {
-                                                        prompt.push_str("\n\n### Selected Reviewer Artifacts\n");
+                                                        prompt.push_str(
+                                                            "\n\n### Selected Reviewer Artifacts\n",
+                                                        );
                                                         prompt.push_str("The following reviewer outputs were selected by the routing algorithm. ");
-                                                        prompt.push_str("Aggregate only these artifacts:\n");
+                                                        prompt.push_str(
+                                                            "Aggregate only these artifacts:\n",
+                                                        );
                                                         for path in &file_paths {
-                                                            prompt.push_str(&format!("- `{}`\n", path));
+                                                            prompt.push_str(&format!(
+                                                                "- `{}`\n",
+                                                                path
+                                                            ));
                                                         }
                                                     }
                                                 }
@@ -501,6 +632,14 @@ impl Orchestrator {
                                 "All tasks finished — settling stage"
                             );
                             if kind == domain::stage::StageSettlementKind::Failed {
+                                if self
+                                    .schedule_auto_contract_output_retry_for_stage(
+                                        run_id, run, stage,
+                                    )
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
                                 crate::recovery::persist_failed_stage_recovery_snapshot(
                                     &self.pool, stage.id, now,
                                 )
@@ -535,7 +674,7 @@ impl Orchestrator {
                                         state = %current_state_id,
                                         "End state with tasks complete — marking run Completed"
                                     );
-                                    runs::mark_completed(&self.pool, run_id, now).await?;
+                                    self.mark_run_completed_and_refresh(run_id, now).await?;
                                     self.enqueue_steward_analysis(Some(run_id)).await?;
                                     self.cleanup_worktree_if_needed(&run).await;
                                     let _ = self.events.send(DomainEvent::RunStatusChanged {
@@ -571,6 +710,27 @@ impl Orchestrator {
                             .await;
                     }
                     StageStatus::Failed | StageStatus::Blocked => {
+                        if state.is_end
+                            && all_stages.iter().any(|candidate| {
+                                candidate.stage_id == current_state_id
+                                    && candidate.status == StageStatus::Completed
+                            })
+                        {
+                            let now = Utc::now();
+                            info!(
+                                run_id = %run_id,
+                                state = %current_state_id,
+                                "End state has a prior completed attempt — marking run Completed despite later failed retry"
+                            );
+                            self.mark_run_completed_and_refresh(run_id, now).await?;
+                            self.enqueue_steward_analysis(Some(run_id)).await?;
+                            self.cleanup_worktree_if_needed(&run).await;
+                            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                run_id,
+                                status: RunStatus::Completed,
+                            });
+                            return Ok(());
+                        }
                         // Stage failed — update run status
                         if run.status != RunStatus::Blocked {
                             runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
@@ -677,7 +837,7 @@ impl Orchestrator {
                     now,
                 )
                 .await?;
-                runs::mark_completed(&self.pool, run_id, now).await?;
+                self.mark_run_completed_and_refresh(run_id, now).await?;
                 self.enqueue_steward_analysis(Some(run_id)).await?;
                 // Worktree cleanup on completion (Proposal 007).
                 self.cleanup_worktree_if_needed(&run).await;
@@ -1630,6 +1790,78 @@ impl Orchestrator {
         )))
     }
 
+    async fn workflow_conflict_resolution_context_for_proposal_writer(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        task: &workflow::plan::CompiledTask,
+    ) -> Result<Option<String>> {
+        if task.agent.agent_id != "proposal_writer"
+            || !task
+                .outputs
+                .iter()
+                .any(|output| output == "proposal_current")
+        {
+            return Ok(None);
+        }
+        let Some(cursor) = workflow_conflicts::get_transition_cursor(&self.pool, run_id).await?
+        else {
+            return Ok(None);
+        };
+        if cursor.cursor_status != "operator_transition_selected"
+            || cursor.resume_policy != "continue_from_selected_transition"
+            || cursor.current_state_id != stage.stage_id
+            || cursor.selected_next_state_id.as_deref() != Some(stage.stage_id.as_str())
+        {
+            return Ok(None);
+        }
+        let Some(conflict_id) = cursor.conflict_id.as_deref() else {
+            return Ok(None);
+        };
+        let history = workflow_conflicts::list_conflict_history_for_run(&self.pool, run_id).await?;
+        let Some(conflict) = history
+            .iter()
+            .rev()
+            .find(|conflict| conflict.conflict_id == conflict_id)
+        else {
+            return Ok(None);
+        };
+        let resolution_reason = conflict
+            .resolution_record_json
+            .as_ref()
+            .and_then(|record| record.get("resolution_reason"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if resolution_reason.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "\n\n### Mandatory Workflow Conflict Resolution\n\
+             A human operator explicitly selected one more proposal refinement after a workflow conflict. \
+             This instruction is authoritative for this proposal_writer turn; do not return a stale proposal revision.\n\
+             - conflict_id: `{}`\n\
+             - candidate_transition_hash: `{}`\n\
+             - selected_transition_id: `{}`\n\
+             - selected_next_state_id: `{}`\n\
+             - resolution_reason: `{}`\n\n\
+             Required machine acknowledgement in `proposal_revision_summary`:\n\
+             `workflow_conflict_resolution` must be an object with exactly this `conflict_id`, \
+             `candidate_transition_hash`, `selected_transition_id`, `selected_next_state_id`, \
+             the full `resolution_reason`, `applied: true`, and a non-empty `applied_changes` array. \
+             If you cannot apply the instruction, say so in the required output instead of reusing old revision content.",
+            conflict.conflict_id,
+            cursor
+                .candidate_transition_hash
+                .as_deref()
+                .unwrap_or(conflict.candidate_transition_hash.as_str()),
+            cursor.selected_transition_id.as_deref().unwrap_or(""),
+            cursor.selected_next_state_id.as_deref().unwrap_or(""),
+            resolution_reason
+        )))
+    }
+
     /// Enqueue a single InvokeAgent work item for a task.
     async fn enqueue_invoke_agent(
         &self,
@@ -1642,7 +1874,24 @@ impl Orchestrator {
         plan: &workflow::plan::RunPlan,
         run: &domain::run::Run,
     ) -> Result<()> {
+        let mut prompt = prompt.to_string();
+        if let Some(context) = self
+            .workflow_conflict_resolution_context_for_proposal_writer(run_id, stage, task)
+            .await?
+        {
+            prompt.push_str(&context);
+        }
         let declared_outputs = build_declared_outputs(task, plan, run);
+        let mut agent = task.agent.clone();
+        let provider_health_fallback = self
+            .apply_run_local_provider_health_fallback(
+                run_id,
+                run,
+                &mut agent,
+                &task.outputs,
+                task.agent.output_contract.as_deref(),
+            )
+            .await?;
         let work_item_id = format!("p058-invoke:{}:{}", stage.id, task_index);
         self.work_queue
             .enqueue_with_id(
@@ -1657,31 +1906,32 @@ impl Orchestrator {
                     "task_name": task.task_name,
                     "task_inputs": task.inputs,
                     "task_outputs": task.outputs,
-                    "agent_id": task.agent.agent_id,
-                    "backend_profile_id": task.agent.backend_profile_id,
-                    "provider": task.agent.provider,
-                    "model": task.agent.model,
-                    "effort": task.agent.effort,
-                    "max_turns": task.agent.max_turns,
-                    "temperature": task.agent.temperature,
-                    "permission_profile": task.agent.permission_profile,
-                    "skill_ref": task.agent.skill_ref,
-                    "skill_role": task.agent.skill_role,
-                    "skill_snapshot_hash": task.agent.skill_snapshot_hash,
-                    "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
-                    "xcode_broker_required": task.agent.xcode_broker_required,
-                    "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
-                    "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
-                    "output_contract": task.agent.output_contract,
+                    "agent_id": agent.agent_id,
+                    "backend_profile_id": agent.backend_profile_id,
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "effort": agent.effort,
+                    "max_turns": agent.max_turns,
+                    "temperature": agent.temperature,
+                    "permission_profile": agent.permission_profile,
+                    "skill_ref": agent.skill_ref,
+                    "skill_role": agent.skill_role,
+                    "skill_snapshot_hash": agent.skill_snapshot_hash,
+                    "requested_mcp_server_ids": agent.requested_mcp_server_ids,
+                    "xcode_broker_required": agent.xcode_broker_required,
+                    "xcode_shim_injection_signal": agent.xcode_shim_injection_signal,
+                    "requires_xcode_host_execution": agent.requires_xcode_host_execution,
+                    "output_contract": agent.output_contract,
                     "prompt": prompt,
                     "task_index": task_index,
                     "total_tasks": total_tasks,
-                    "worktree_write_enabled": task.agent.worktree_write_enabled,
+                    "worktree_write_enabled": agent.worktree_write_enabled,
                     "worktree_strategy": effective_worktree_strategy_for_task(task),
                     "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
-                    "session_reuse_scope": task.agent.session_reuse_scope,
-                    "session_family_id": task.agent.session_family_id,
+                    "session_reuse_scope": agent.session_reuse_scope,
+                    "session_family_id": agent.session_family_id,
                     "declared_outputs": declared_outputs,
+                    "provider_health_fallback": provider_health_fallback,
                     "stage_degraded_output_policy": plan
                         .states
                         .get(&stage.stage_id)
@@ -1694,6 +1944,401 @@ impl Orchestrator {
             self.mark_code_writer_start_status_queued(run_id).await?;
         }
         Ok(())
+    }
+
+    async fn apply_run_local_provider_health_fallback(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        agent: &mut workflow::plan::ResolvedAgent,
+        task_outputs: &[String],
+        output_contract: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        if !is_health_fallback_eligible_task(&agent.agent_id, task_outputs, output_contract)
+            || !is_health_fallback_source_provider(&agent.provider)
+        {
+            return Ok(None);
+        }
+        let source_provider = agent.provider.clone();
+
+        let executions = agent_executions::list_by_run(&self.pool, run_id).await?;
+        let runtime_facts = agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
+        let fact_by_execution: std::collections::HashMap<_, _> = runtime_facts
+            .iter()
+            .map(|facts| (facts.agent_execution_id, facts))
+            .collect();
+        let unhealthy_source = executions.iter().rev().find(|exec| {
+            exec.agent_id == agent.agent_id
+                && exec.status == AgentStatus::Failed
+                && same_provider_family_for_health_fallback(&exec.provider, &source_provider)
+                && fact_by_execution
+                    .get(&exec.id)
+                    .map(|facts| provider_health_fallback_failure(facts))
+                    .unwrap_or(false)
+        });
+        let Some(source) = unhealthy_source else {
+            return Ok(None);
+        };
+
+        let Some(catalog_json) = run.catalog_snapshot_json.as_deref() else {
+            return Ok(None);
+        };
+        let catalog: serde_json::Value = serde_json::from_str(catalog_json)
+            .context("parse catalog_snapshot_json for provider health fallback")?;
+        let Some(profiles) = catalog
+            .get("backend_profiles")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Ok(None);
+        };
+        let Some((fallback_profile_id, profile)) = run_local_health_fallback_profile_candidates(
+            &agent.agent_id,
+            task_outputs,
+            output_contract,
+            &source_provider,
+        )
+        .into_iter()
+        .find_map(|candidate| {
+            profiles
+                .get(candidate)
+                .and_then(serde_json::Value::as_object)
+                .map(|profile| (candidate, profile))
+        }) else {
+            return Ok(None);
+        };
+        let Some(provider) = profile.get("provider").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        if provider == agent.provider {
+            return Ok(None);
+        }
+
+        let from_provider = agent.provider.clone();
+        let from_backend_profile_id = agent.backend_profile_id.clone();
+        agent.backend_profile_id = Some(fallback_profile_id.to_string());
+        agent.provider = provider.to_string();
+        agent.model = profile
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        agent.effort = profile
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        agent.max_turns = profile
+            .get("max_turns")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|turns| u32::try_from(turns).ok());
+
+        warn!(
+            run_id = %run_id,
+            agent_id = %agent.agent_id,
+            failed_agent_execution_id = %source.id,
+            from_provider = %from_provider,
+            to_provider = %agent.provider,
+            to_backend_profile_id = %fallback_profile_id,
+            "Applying run-local provider health fallback after prior provider output failure"
+        );
+
+        Ok(Some(serde_json::json!({
+            "reason": "prior_run_local_provider_output_failure",
+            "failed_agent_execution_id": source.id.to_string(),
+            "from_provider": from_provider,
+            "to_provider": agent.provider,
+            "from_backend_profile_id": from_backend_profile_id,
+            "to_backend_profile_id": fallback_profile_id,
+        })))
+    }
+
+    async fn schedule_auto_contract_output_retry_for_stage(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+    ) -> Result<bool> {
+        let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+        let runtime_facts = agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
+        let facts_by_execution: std::collections::HashMap<_, _> = runtime_facts
+            .iter()
+            .map(|facts| (facts.agent_execution_id, facts))
+            .collect();
+        let work_items_for_run = work_items::list_by_run(&self.pool, run_id).await?;
+        let matching_stages = stages::list_by_run(&self.pool, run_id).await?;
+
+        for execution in executions
+            .iter()
+            .filter(|execution| execution.status == AgentStatus::Failed)
+        {
+            let Some(facts) = facts_by_execution.get(&execution.id) else {
+                continue;
+            };
+            if !provider_health_fallback_failure(facts) {
+                continue;
+            }
+
+            let retry_reason = auto_contract_output_retry_reason(&execution.agent_id);
+            if stage.retry_reason.as_deref() == Some(retry_reason.as_str())
+                || matching_stages.iter().any(|candidate| {
+                    candidate.stage_id == stage.stage_id
+                        && candidate.iteration == stage.iteration
+                        && candidate.retry_reason.as_deref() == Some(retry_reason.as_str())
+                })
+            {
+                continue;
+            }
+
+            let stage_execution_id = stage.id.to_string();
+            let agent_execution_id = execution.id.to_string();
+            let Some(source_item) = work_items_for_run
+                .iter()
+                .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+                .filter(|item| {
+                    matches!(
+                        item.status,
+                        WorkItemStatus::Completed | WorkItemStatus::Failed
+                    )
+                })
+                .find(|item| {
+                    work_item_matches_agent_execution(
+                        item,
+                        &stage_execution_id,
+                        &execution.agent_id,
+                        &agent_execution_id,
+                    )
+                })
+            else {
+                continue;
+            };
+
+            let mut retry_payload: serde_json::Value =
+                match serde_json::from_str(&source_item.payload_json) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage.stage_id,
+                            agent_id = %execution.agent_id,
+                            source_work_item_id = %source_item.id,
+                            error = %error,
+                            "Auto contract output retry skipped because source payload is invalid"
+                        );
+                        continue;
+                    }
+                };
+            let source_provider = retry_payload
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(execution.provider.as_str())
+                .to_string();
+            let task_outputs: Vec<String> = retry_payload
+                .get("task_outputs")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let output_contract = retry_payload
+                .get("output_contract")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            if !is_health_fallback_eligible_task(
+                &execution.agent_id,
+                &task_outputs,
+                output_contract.as_deref(),
+            ) || !is_health_fallback_source_provider(&source_provider)
+            {
+                continue;
+            }
+
+            let Some(catalog_json) = run.catalog_snapshot_json.as_deref() else {
+                continue;
+            };
+            let catalog: serde_json::Value = serde_json::from_str(catalog_json)
+                .context("parse catalog_snapshot_json for auto contract output retry")?;
+            let Some(profiles) = catalog
+                .get("backend_profiles")
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            let Some((fallback_profile_id, profile)) =
+                run_local_health_fallback_profile_candidates(
+                    &execution.agent_id,
+                    &task_outputs,
+                    output_contract.as_deref(),
+                    &source_provider,
+                )
+                .into_iter()
+                .find_map(|candidate| {
+                    profiles
+                        .get(candidate)
+                        .and_then(serde_json::Value::as_object)
+                        .map(|profile| (candidate, profile))
+                })
+            else {
+                continue;
+            };
+            let Some(fallback_provider) =
+                profile.get("provider").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if same_provider_family_for_health_fallback(&source_provider, fallback_provider) {
+                continue;
+            }
+
+            let next_attempt_number = matching_stages
+                .iter()
+                .filter(|candidate| candidate.stage_id == stage.stage_id)
+                .map(|candidate| candidate.attempt_number)
+                .max()
+                .unwrap_or(stage.attempt_number)
+                + 1;
+            let now = Utc::now();
+            let new_stage = StageExecution {
+                id: domain::ids::StageExecutionId::new(),
+                run_id,
+                stage_id: stage.stage_id.clone(),
+                label: stage.label.clone(),
+                status: StageStatus::Running,
+                iteration: stage.iteration,
+                attempt_number: next_attempt_number,
+                settlement_kind: None,
+                started_at: now,
+                completed_at: None,
+                owner_agent: stage.owner_agent.clone(),
+                provider: stage.provider.clone(),
+                model: stage.model.clone(),
+                stage_type: stage.stage_type.clone(),
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: Some(retry_reason.clone()),
+            };
+            let retry_work_item_id = format!(
+                "auto-contract-output-retry:{}:{}",
+                new_stage.id, execution.id
+            );
+            let from_backend_profile_id = retry_payload
+                .get("backend_profile_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+
+            let Some(object) = retry_payload.as_object_mut() else {
+                continue;
+            };
+            object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
+            object.insert("stage_id".into(), serde_json::json!(stage.stage_id));
+            object.insert(
+                "stage_execution_id".into(),
+                serde_json::json!(new_stage.id.to_string()),
+            );
+            object.remove("p058_claimed");
+            object.insert(
+                "provider".into(),
+                serde_json::json!(fallback_provider.to_string()),
+            );
+            object.insert(
+                "backend_profile_id".into(),
+                serde_json::json!(fallback_profile_id),
+            );
+            object.insert(
+                "model".into(),
+                profile
+                    .get("model")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            if let Some(effort) = profile.get("effort").cloned() {
+                object.insert("effort".into(), effort);
+            }
+            if let Some(max_turns) = profile.get("max_turns").cloned() {
+                object.insert("max_turns".into(), max_turns);
+            }
+            object.insert(
+                "targeted_retry".into(),
+                serde_json::json!({
+                    "source_stage_execution_id": stage.id.to_string(),
+                    "source_agent_execution_id": execution.id.to_string(),
+                    "source_work_item_id": source_item.id,
+                    "reason": "auto_contract_output_retry",
+                    "provider_fallback": {
+                        "reason": "source_contract_outputs_missing",
+                        "from_backend_profile_id": from_backend_profile_id,
+                        "from_provider": source_provider.clone(),
+                        "to_backend_profile_id": fallback_profile_id,
+                        "to_provider": fallback_provider,
+                    }
+                }),
+            );
+
+            let tx_started = std::time::Instant::now();
+            let mut tx = db::pool::begin_immediate_with_retry(
+                &self.pool,
+                "orchestrator.AutoContractOutputRetry",
+            )
+            .await?;
+            stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Skipped, now).await?;
+            stages::insert_tx(&mut tx, &new_stage).await?;
+            sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+                .bind(RunStatus::Running.to_string())
+                .bind(stage.stage_id.as_str())
+                .bind(run_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            work_items::enqueue_tx(
+                &mut tx,
+                &WorkItem {
+                    id: retry_work_item_id,
+                    kind: WorkItemKind::InvokeAgent,
+                    payload_json: serde_json::to_string(&retry_payload)?,
+                    status: WorkItemStatus::Pending,
+                    run_id: Some(run_id),
+                    stage_id: Some(stage.stage_id.clone()),
+                    created_at: now,
+                    scheduled_at: now,
+                    attempt_count: 0,
+                    last_error: None,
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("orchestrator.AutoContractOutputRetry", tx_started);
+
+            warn!(
+                run_id = %run_id,
+                stage_id = %stage.stage_id,
+                source_stage_execution_id = %stage.id,
+                retry_stage_execution_id = %new_stage.id,
+                agent_id = %execution.agent_id,
+                from_provider = %source_provider,
+                to_provider = %fallback_provider,
+                to_backend_profile_id = %fallback_profile_id,
+                "Scheduled auto targeted retry after missing required outputs"
+            );
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: stage.id,
+                status: StageStatus::Skipped,
+            });
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: new_stage.id,
+                status: StageStatus::Running,
+            });
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Running,
+            });
+            projections::rebuild_all_for_run(&self.pool, run_id).await?;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     async fn mark_code_writer_start_status_queued(&self, run_id: RunId) -> Result<()> {
@@ -1815,15 +2460,28 @@ impl Orchestrator {
         plan: &workflow::plan::RunPlan,
     ) -> Result<bool> {
         // Check if dynamic routing is requested.
-        let routing_options: domain::routing::ReviewRoutingOptions = match &run.review_routing_json {
+        let routing_options: domain::routing::ReviewRoutingOptions = match &run.review_routing_json
+        {
             Some(json) => match serde_json::from_str(json) {
                 Ok(opts) => opts,
                 Err(e) => {
-                    warn!(run_id = %run_id, error = %e, "Invalid review_routing_json — using legacy mode");
-                    return Ok(false);
+                    warn!(run_id = %run_id, error = %e, "Invalid review_routing_json — using legacy_fixed routing mode");
+                    domain::routing::ReviewRoutingOptions {
+                        mode: domain::routing::ReviewRoutingMode::LegacyFixed,
+                        ..Default::default()
+                    }
                 }
             },
-            None => return Ok(false),
+            None => {
+                warn!(
+                    run_id = %run_id,
+                    "Missing review_routing_json on dynamic routing workflow — using legacy_fixed routing mode"
+                );
+                domain::routing::ReviewRoutingOptions {
+                    mode: domain::routing::ReviewRoutingMode::LegacyFixed,
+                    ..Default::default()
+                }
+            }
         };
 
         // P060 Phase 3 / OPS-001: feature-flag cutover.
@@ -1831,8 +2489,7 @@ impl Orchestrator {
         // daemon-level `CHAINWORKS_P060_ROUTING_MODE_OVERRIDE` env var so
         // operators can force every run into a specific mode for staged
         // rollout / emergency rollback.
-        let resolution =
-            domain::routing::resolve_effective_routing_mode(&routing_options.mode);
+        let resolution = domain::routing::resolve_effective_routing_mode(&routing_options.mode);
         match &resolution {
             domain::routing::EffectiveRoutingModeResolution::OverriddenByEnv { from, to } => {
                 info!(
@@ -1857,14 +2514,7 @@ impl Orchestrator {
         }
         let effective_mode = resolution.effective();
 
-        // Legacy fixed mode skips routing entirely.
-        if effective_mode == domain::routing::ReviewRoutingMode::LegacyFixed {
-            info!(
-                run_id = %run_id,
-                "P060: Legacy fixed mode — skipping system routing"
-            );
-            return Ok(false);
-        }
+        let is_legacy = effective_mode == domain::routing::ReviewRoutingMode::LegacyFixed;
 
         // Shadow dynamic mode: run the algorithm, persist evidence, but
         // DO NOT take over dispatch. The legacy fixed quartet still
@@ -1937,16 +2587,28 @@ impl Orchestrator {
             override_hash,
         };
 
-        // Execute the routing algorithm.
-        let outcome = crate::proposal_review_router::route_proposal_reviewers(
-            run_id,
-            &stage.stage_id,
-            stage.attempt_number,
-            &plan.dynamic_candidate_bindings,
-            &fingerprint,
-            &routing_options,
-            &input_hashes,
-        );
+        // Execute the routing algorithm, or synthesize a fixed-quartet plan for
+        // rollback mode so dynamic workflows still dispatch reviewers.
+        let outcome = if is_legacy {
+            crate::proposal_review_router::build_legacy_fixed_routing_outcome(
+                run_id,
+                &stage.stage_id,
+                stage.attempt_number,
+                &plan.dynamic_candidate_bindings,
+                &fingerprint,
+                &input_hashes,
+            )
+        } else {
+            crate::proposal_review_router::route_proposal_reviewers(
+                run_id,
+                &stage.stage_id,
+                stage.attempt_number,
+                &plan.dynamic_candidate_bindings,
+                &fingerprint,
+                &routing_options,
+                &input_hashes,
+            )
+        };
 
         match outcome {
             crate::proposal_review_router::RoutingOutcome::Success {
@@ -1961,42 +2623,25 @@ impl Orchestrator {
                     "P060: Routing succeeded"
                 );
 
-                // Persist system execution and routing receipt.
-                db::repos::system_executions::insert(&self.pool, &system_execution).await?;
-                db::repos::routing_receipts::insert(&self.pool, &receipt).await?;
-
-                // Write the AgentSelectionPlanV1 as an artifact to disk.
-                let artifact_path = format!(
-                    "{}/routing/agent-selection-plan.v1.json",
-                    run.artifact_root.trim_end_matches('/')
-                );
-                if let Some(parent) = std::path::Path::new(&artifact_path).parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let plan_json = serde_json::to_vec_pretty(&selection_plan)?;
-                std::fs::write(&artifact_path, &plan_json)?;
-
-                // Create an artifact record.
-                let artifact = domain::artifact::Artifact {
-                    id: domain::ids::ArtifactId::new(),
+                self.persist_routing_success_artifact(
                     run_id,
-                    stage_id: stage.stage_id.clone(),
-                    agent_id: "proposal_review_router".to_string(),
-                    name: "agent_selection_plan_v1".to_string(),
-                    contract_id: "agent_selection_plan_v1".to_string(),
-                    format: domain::artifact::ArtifactFormat::Json,
-                    file_path: artifact_path,
-                    checksum_sha256: None,
-                    size_bytes: Some(plan_json.len() as i64),
-                    provider: "system.routing".to_string(),
-                    model: None,
-                    created_at: Utc::now(),
-                    is_pinned: false,
-                    report_kind: None,
-                    report_version: None,
-                    agent_execution_id: None,
-                };
-                artifacts::insert(&self.pool, &artifact).await?;
+                    run,
+                    stage,
+                    &selection_plan,
+                    &receipt,
+                    &system_execution,
+                    if is_shadow {
+                        "agent-selection-plan.shadow.v1.json"
+                    } else {
+                        "agent-selection-plan.v1.json"
+                    },
+                    if is_shadow {
+                        "agent_selection_plan_shadow_v1"
+                    } else {
+                        "agent_selection_plan_v1"
+                    },
+                )
+                .await?;
 
                 // Emit routing completed event. The status label
                 // distinguishes a real production routing run from a
@@ -2012,21 +2657,47 @@ impl Orchestrator {
                     system_execution_id: system_execution.id,
                     receipt_id: receipt.receipt_id,
                     status: event_status,
-                    plan_hash: Some(selection_plan.plan_hash),
+                    plan_hash: Some(selection_plan.plan_hash.clone()),
                 });
 
-                // Phase 3 shadow mode: even though the routing succeeded,
-                // do NOT take over dispatch. Returning `false` lets the
-                // orchestrator fall through to the legacy fixed-quartet
-                // task dispatch, while the artifact + DB rows above are
-                // available for operator A/B comparison.
                 if is_shadow {
+                    let legacy_outcome =
+                        crate::proposal_review_router::build_legacy_fixed_routing_outcome(
+                            run_id,
+                            &stage.stage_id,
+                            stage.attempt_number,
+                            &plan.dynamic_candidate_bindings,
+                            &fingerprint,
+                            &input_hashes,
+                        );
+                    let crate::proposal_review_router::RoutingOutcome::Success {
+                        plan: legacy_plan,
+                        receipt: legacy_receipt,
+                        system_execution: legacy_system_execution,
+                    } = legacy_outcome
+                    else {
+                        anyhow::bail!(
+                            "P060: shadow_dynamic failed to synthesize legacy fixed dispatch plan"
+                        );
+                    };
+                    self.persist_routing_success_artifact(
+                        run_id,
+                        run,
+                        stage,
+                        &legacy_plan,
+                        &legacy_receipt,
+                        &legacy_system_execution,
+                        "agent-selection-plan.v1.json",
+                        "agent_selection_plan_v1",
+                    )
+                    .await?;
                     info!(
                         run_id = %run_id,
-                        plan_hash = %system_execution.id,
-                        "P060: Shadow routing recorded — yielding dispatch to legacy fixed quartet"
+                        dynamic_plan_hash = %selection_plan.plan_hash,
+                        legacy_plan_hash = %legacy_plan.plan_hash,
+                        "P060: Shadow routing recorded — dispatching legacy fixed quartet"
                     );
-                    return Ok(false);
+                    return Ok(true);
                 }
 
                 Ok(true)
@@ -2050,9 +2721,9 @@ impl Orchestrator {
                 db::repos::routing_receipts::insert(&self.pool, &receipt).await?;
 
                 // P060 Phase 3: in shadow mode, a routing failure must NOT
-                // block the run — the legacy fixed quartet still drives
-                // dispatch and the failure is recorded as observational
-                // evidence only. Emit a shadow_failed event and yield.
+                // block the run. Record the dynamic failure as observational
+                // evidence, then materialize a legacy fixed plan so the
+                // migrated dynamic workflow still dispatches reviewers.
                 if is_shadow {
                     let _ = self.events.send(DomainEvent::RoutingCompleted {
                         run_id,
@@ -2062,12 +2733,43 @@ impl Orchestrator {
                         status: "shadow_failed".to_string(),
                         plan_hash: None,
                     });
+                    let legacy_outcome =
+                        crate::proposal_review_router::build_legacy_fixed_routing_outcome(
+                            run_id,
+                            &stage.stage_id,
+                            stage.attempt_number,
+                            &plan.dynamic_candidate_bindings,
+                            &fingerprint,
+                            &input_hashes,
+                        );
+                    let crate::proposal_review_router::RoutingOutcome::Success {
+                        plan: legacy_plan,
+                        receipt: legacy_receipt,
+                        system_execution: legacy_system_execution,
+                    } = legacy_outcome
+                    else {
+                        anyhow::bail!(
+                            "P060: shadow_dynamic failure fallback failed to synthesize legacy fixed dispatch plan"
+                        );
+                    };
+                    self.persist_routing_success_artifact(
+                        run_id,
+                        run,
+                        stage,
+                        &legacy_plan,
+                        &legacy_receipt,
+                        &legacy_system_execution,
+                        "agent-selection-plan.v1.json",
+                        "agent_selection_plan_v1",
+                    )
+                    .await?;
                     info!(
                         run_id = %run_id,
                         failure = %failure_kind,
-                        "P060: Shadow routing failure recorded — yielding dispatch to legacy fixed quartet"
+                        legacy_plan_hash = %legacy_plan.plan_hash,
+                        "P060: Shadow routing failure recorded — dispatching legacy fixed quartet"
                     );
-                    return Ok(false);
+                    return Ok(true);
                 }
 
                 // Production dynamic mode: the routing failure is a
@@ -2111,29 +2813,58 @@ impl Orchestrator {
         plan: &workflow::plan::RunPlan,
     ) -> crate::proposal_review_router::ProposalFingerprint {
         // Try to read the proposal artifact to compute MD5 and extract evidence.
-        let proposal_md5 = if let Some(template) = plan.artifact_paths.get("proposal_current") {
+        let proposal_text = if let Some(template) = plan.artifact_paths.get("proposal_current") {
             let path = resolve_path_template(
                 template,
                 &run.workspace_root,
                 run.chainworks_meta_root.as_deref(),
             );
             match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let digest = Sha256::digest(&bytes);
-                    format!("{:x}", digest)
-                }
-                Err(_) => "unavailable".to_string(),
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(_) => String::new(),
             }
         } else {
-            "unavailable".to_string()
+            String::new()
         };
+        let proposal_md5 = if proposal_text.is_empty() {
+            "unavailable".to_string()
+        } else {
+            format!("{:x}", Md5::digest(proposal_text.as_bytes()))
+        };
+        let proposal_lower = proposal_text.to_lowercase();
 
         // Extract stacks, surfaces, and risks from plan metadata.
-        let stacks = plan
+        let mut stacks = plan
             .stack
             .as_ref()
             .map(|s| vec![s.clone()])
             .unwrap_or_default();
+        if proposal_lower.contains(".rs")
+            || proposal_lower.contains("rust")
+            || proposal_lower.contains("cargo")
+            || proposal_lower.contains("tokio")
+            || proposal_lower.contains("control-plane")
+        {
+            stacks.push("rust-backend".to_string());
+        }
+        if proposal_lower.contains("swift")
+            || proposal_lower.contains("swiftui")
+            || proposal_lower.contains("appkit")
+            || proposal_lower.contains("macos")
+            || proposal_lower.contains("xcode")
+        {
+            stacks.push("apple-client".to_string());
+            stacks.push("macos".to_string());
+        }
+        if proposal_lower.contains("graphql")
+            || proposal_lower.contains("mcp")
+            || proposal_lower.contains("yaml")
+            || proposal_lower.contains("artifact contract")
+        {
+            stacks.push("shared-api".to_string());
+        }
+        stacks.sort();
+        stacks.dedup();
 
         // Derive surfaces from workflow family and risk class.
         let mut surfaces = Vec::new();
@@ -2146,25 +2877,179 @@ impl Orchestrator {
                 surfaces.push("swiftui".to_string());
             }
         }
+        for (needle, surface) in [
+            ("graphql", "api-contract"),
+            ("mcp", "api-contract"),
+            ("schema", "api-contract"),
+            ("yaml", "api-contract"),
+            ("migration", "migration"),
+            ("sqlite", "persistence"),
+            ("database", "persistence"),
+            ("queue", "background-work"),
+            ("worker", "background-work"),
+            ("retry", "background-work"),
+            ("cancellation", "concurrency"),
+            ("backpressure", "concurrency"),
+            ("ui", "ui"),
+            ("swiftui", "ui"),
+            ("navigation", "navigation"),
+            ("telemetry", "telemetry"),
+            ("feature flag", "feature-flag"),
+            ("rollout", "rollout"),
+        ] {
+            if proposal_lower.contains(needle) {
+                surfaces.push(surface.to_string());
+            }
+        }
+        surfaces.sort();
+        surfaces.dedup();
 
-        let risks = plan
+        let mut risks = plan
             .risk_class
             .as_ref()
             .filter(|r| *r != "standard")
             .map(|r| vec![r.clone()])
             .unwrap_or_default();
+        for (needle, risk) in [
+            ("idempot", "idempotency"),
+            ("data loss", "data-loss"),
+            ("duplicate", "idempotency"),
+            ("availability", "availability-sensitive"),
+            ("security", "security-sensitive"),
+            ("secret", "security-sensitive"),
+            ("privacy", "privacy-sensitive"),
+            ("backward", "backward-compatibility"),
+            ("compatibility", "backward-compatibility"),
+            ("operator", "operability-sensitive"),
+            ("rollback", "operability-sensitive"),
+            ("latency", "latency-sensitive"),
+        ] {
+            if proposal_lower.contains(needle) {
+                risks.push(risk.to_string());
+            }
+        }
+        risks.sort();
+        risks.dedup();
+
+        let strong_keywords = [
+            "retry",
+            "idempotency",
+            "timeout",
+            "deadline",
+            "cancellation",
+            "backpressure",
+            "queue",
+            "worker",
+            "recovery",
+            "resume",
+            "shutdown",
+            "graphql",
+            "mcp",
+            "yaml",
+            "telemetry",
+            "rollout",
+            "security",
+            "auth",
+            "swiftui",
+            "macos",
+            "rust-backend",
+        ]
+        .into_iter()
+        .filter(|keyword| proposal_lower.contains(keyword))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        let mut repo_signals = Vec::new();
+        if proposal_lower.contains("control-plane/") || proposal_lower.contains("crates/") {
+            repo_signals.push("rust-backend".to_string());
+        }
+        if proposal_lower.contains("graphql-server") || proposal_lower.contains("mcp-server") {
+            repo_signals.push("api-contract".to_string());
+        }
+        if proposal_lower.contains("chainworks forge/") {
+            repo_signals.push("macos".to_string());
+            repo_signals.push("ui".to_string());
+        }
+        repo_signals.sort();
+        repo_signals.dedup();
+
+        let mut evidence_refs = Vec::new();
+        for tag in stacks
+            .iter()
+            .chain(surfaces.iter())
+            .chain(risks.iter())
+            .chain(strong_keywords.iter())
+        {
+            evidence_refs.push(domain::routing::RoutingEvidenceRef {
+                evidence_id: format!("proposal:{}", tag),
+                evidence_type: "proposal_text_match".to_string(),
+                hash: format!("{:x}", Sha256::digest(tag.as_bytes())),
+                normalized_value: Some(tag.clone()),
+                path: Some("proposal_current".to_string()),
+                symbol: None,
+                span: None,
+            });
+        }
 
         crate::proposal_review_router::ProposalFingerprint {
             proposal_md5,
             stacks,
             surfaces,
             risks,
-            strong_keywords: Vec::new(),
-            repo_signals: Vec::new(),
+            strong_keywords,
+            repo_signals,
             cross_stack_dependencies: Vec::new(),
             baseline_gaps: Vec::new(),
-            evidence_refs: Vec::new(),
+            evidence_refs,
         }
+    }
+
+    async fn persist_routing_success_artifact(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+        selection_plan: &domain::routing::AgentSelectionPlanV1,
+        receipt: &domain::routing::RoutingReceipt,
+        system_execution: &domain::routing::SystemExecution,
+        artifact_file_name: &str,
+        artifact_name: &str,
+    ) -> Result<()> {
+        db::repos::system_executions::insert(&self.pool, system_execution).await?;
+        db::repos::routing_receipts::insert(&self.pool, receipt).await?;
+
+        let artifact_path = format!(
+            "{}/routing/{artifact_file_name}",
+            run.artifact_root.trim_end_matches('/')
+        );
+        if let Some(parent) = std::path::Path::new(&artifact_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let plan_json = serde_json::to_vec_pretty(selection_plan)?;
+        std::fs::write(&artifact_path, &plan_json)?;
+
+        let artifact = domain::artifact::Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id,
+            stage_id: stage.stage_id.clone(),
+            agent_id: "proposal_review_router".to_string(),
+            name: artifact_name.to_string(),
+            contract_id: "agent_selection_plan_v1".to_string(),
+            format: domain::artifact::ArtifactFormat::Json,
+            file_path: artifact_path,
+            checksum_sha256: None,
+            size_bytes: Some(plan_json.len() as i64),
+            provider: "system.routing".to_string(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+
+        Ok(())
     }
 
     /// P060: Materialize dynamic_parallel reviewers from an AgentSelectionPlanV1
@@ -2198,11 +3083,14 @@ impl Orchestrator {
                 .context("P060: Failed to parse AgentSelectionPlanV1 artifact")?;
 
         // Build a lookup from agent_id → CompiledDynamicAgentBinding.
-        let binding_map: std::collections::HashMap<&str, &domain::routing::CompiledDynamicAgentBinding> =
-            plan.dynamic_candidate_bindings
-                .iter()
-                .map(|b| (b.agent_id.as_str(), b))
-                .collect();
+        let binding_map: std::collections::HashMap<
+            &str,
+            &domain::routing::CompiledDynamicAgentBinding,
+        > = plan
+            .dynamic_candidate_bindings
+            .iter()
+            .map(|b| (b.agent_id.as_str(), b))
+            .collect();
 
         let total_selected = selection_plan.selected_agents.len();
         // Total tasks = dynamic reviewers + then-block tasks from state.tasks.
@@ -2228,11 +3116,12 @@ impl Orchestrator {
             };
 
             // Check idempotency — skip if already materialized.
+            let materialization_epoch = dynamic_materialization_epoch(stage);
             if db::repos::dynamic_materialization::is_materialized(
                 &self.pool,
                 run_id,
                 &stage.stage_id,
-                stage.attempt_number,
+                materialization_epoch,
                 &selection_plan.plan_hash,
                 &binding.binding_id,
             )
@@ -2255,28 +3144,47 @@ impl Orchestrator {
                 ))?;
 
             // Build a CompiledTask for this dynamic reviewer.
-            let task = workflow::plan::CompiledTask {
+            let output_name = p060_dynamic_review_output_name(&selected_agent.agent_id);
+            let mut output_schemas = std::collections::HashMap::new();
+            output_schemas.insert(
+                output_name.clone(),
+                p060_dynamic_review_output_schema(&dynamic_parallel.output_contract),
+            );
+            let mut task = workflow::plan::CompiledTask {
                 agent: resolved_agent,
                 task_name: format!("dynamic_review_{}", selected_agent.agent_id),
                 inputs: dynamic_parallel.inputs.clone(),
-                outputs: vec![dynamic_parallel.output_contract.clone()],
+                outputs: vec![output_name],
                 output_policies: std::collections::HashMap::new(),
-                output_schemas: std::collections::HashMap::new(),
+                output_schemas,
                 parallel: true,
                 phase: 0,
                 selected_outputs_from: None,
             };
+            let output_contract = task.agent.output_contract.clone();
+            let provider_health_fallback = self
+                .apply_run_local_provider_health_fallback(
+                    run_id,
+                    run,
+                    &mut task.agent,
+                    &task.outputs,
+                    output_contract.as_deref(),
+                )
+                .await?;
 
             // Build prompt for this reviewer.
             let prompt = build_task_prompt(&task, plan, run, idea_opt, None, None);
 
             // Record materialization for idempotency.
-            let work_item_id = format!("p060-dynamic:{}:{}:{}", stage.id, selection_plan.plan_hash, idx);
+            let work_item_id = format!(
+                "p060-dynamic:{}:{}:{}",
+                stage.id, selection_plan.plan_hash, idx
+            );
             let mat_record = domain::routing::DynamicMaterializationRecord {
                 id: domain::ids::DynamicMaterializationId::new(),
                 run_id,
                 stage_id: stage.stage_id.clone(),
-                attempt_id: stage.attempt_number,
+                attempt_id: materialization_epoch,
                 phase_id: "dynamic_parallel".into(),
                 plan_hash: selection_plan.plan_hash.clone(),
                 binding_id: binding.binding_id.clone(),
@@ -2285,7 +3193,7 @@ impl Orchestrator {
                     "{}:{}:{}:{}:dynamic_parallel:{}:{}",
                     run_id,
                     stage.stage_id,
-                    stage.attempt_number,
+                    materialization_epoch,
                     selection_plan.plan_hash,
                     binding.binding_id,
                     idx,
@@ -2346,7 +3254,9 @@ impl Orchestrator {
                         "session_reuse_scope": task.agent.session_reuse_scope,
                         "session_family_id": task.agent.session_family_id,
                         "declared_outputs": declared_outputs,
+                        "provider_health_fallback": provider_health_fallback,
                         "p060_dynamic_phase": 0,
+                        "p060_dispatch_mode": selection_plan.mode.to_string(),
                         "p060_plan_hash": selection_plan.plan_hash,
                         "p060_binding_id": binding.binding_id,
                     }),
@@ -2440,6 +3350,7 @@ impl Orchestrator {
             selected_reviewer_ids: result.selected_reviewer_ids,
             reviewer_count: result.reviewer_count,
             selection_plan_hash: result.selection_plan_hash,
+            selection_plan: selection_plan.clone(),
             legacy_fixed_mode: result.legacy_fixed_mode,
         };
 
@@ -2543,6 +3454,17 @@ impl Orchestrator {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+
+        if state.is_end {
+            let now = Utc::now();
+            self.mark_run_completed_and_refresh(run_id, now).await?;
+            self.enqueue_steward_analysis(Some(run_id)).await?;
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Completed,
+            });
+            return Ok(());
+        }
 
         // Evaluate transitions against compiled graph truth. P017 keeps the
         // existing transition action path, but records a typed candidate result
@@ -2724,7 +3646,7 @@ impl Orchestrator {
         // No transition matched — check if run should complete or block.
         if state.transitions.is_empty() || state.is_end {
             let now = Utc::now();
-            runs::mark_completed(&self.pool, run_id, now).await?;
+            self.mark_run_completed_and_refresh(run_id, now).await?;
             self.enqueue_steward_analysis(Some(run_id)).await?;
             let _ = self.events.send(DomainEvent::RunStatusChanged {
                 run_id,
@@ -2912,7 +3834,8 @@ impl Orchestrator {
 
         // Attempt Phase B lead resolution from the versioned compatibility map.
         // If the map file doesn't exist or no match is found, resolution fails closed.
-        let resolver_path = "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
+        let resolver_path =
+            "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
         let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
             Ok(r) => r,
             Err(e) => {
@@ -4040,7 +4963,7 @@ impl Orchestrator {
             RunEvaluation::Complete => {
                 info!(run_id = %run_id, "Run complete, marking completed");
                 let now = Utc::now();
-                runs::mark_completed(&self.pool, run_id, now).await?;
+                self.mark_run_completed_and_refresh(run_id, now).await?;
                 self.enqueue_steward_analysis(Some(run_id)).await?;
                 let _ = self.events.send(DomainEvent::RunStatusChanged {
                     run_id,
@@ -4638,6 +5561,159 @@ fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bo
         )
 }
 
+fn is_health_fallback_eligible_task(
+    agent_id: &str,
+    task_outputs: &[String],
+    output_contract: Option<&str>,
+) -> bool {
+    output_contract == Some("proposal_review_v1")
+        || (agent_id == "lead_orchestrator"
+            && task_outputs
+                .iter()
+                .any(|output| output == "proposal_review_summary"))
+        || (agent_id == "proposal_writer"
+            && task_outputs
+                .iter()
+                .any(|output| output == "proposal_current"))
+        || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
+        || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
+        || (agent_id == "prepush_code_reviewer"
+            && output_contract == Some("prepush_review_v1"))
+}
+
+fn is_health_fallback_source_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "claude" | "claude_acp" | "gemini" | "gemini_acp" | "codex" | "codex_acp"
+    )
+}
+
+fn same_provider_family_for_health_fallback(left: &str, right: &str) -> bool {
+    matches!(
+        (left, right),
+        ("claude", "claude")
+            | ("claude", "claude_acp")
+            | ("claude_acp", "claude")
+            | ("claude_acp", "claude_acp")
+            | ("gemini", "gemini")
+            | ("gemini", "gemini_acp")
+            | ("gemini_acp", "gemini")
+            | ("gemini_acp", "gemini_acp")
+    )
+}
+
+fn provider_health_fallback_failure(facts: &domain::agent::AgentExecutionRuntimeFacts) -> bool {
+    matches!(
+        facts.failure_kind.as_ref(),
+        Some(AgentFailureKind::ProviderQuota)
+            | Some(AgentFailureKind::MissingRequiredOutputs)
+            | Some(AgentFailureKind::ProviderTimeout)
+            | Some(AgentFailureKind::TransportClosed)
+            | Some(AgentFailureKind::TransportEpipe)
+            | Some(AgentFailureKind::TransportProtocolError)
+    ) || facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+}
+
+fn run_local_health_fallback_profile_candidates(
+    agent_id: &str,
+    task_outputs: &[String],
+    output_contract: Option<&str>,
+    source_provider: &str,
+) -> Vec<&'static str> {
+    if agent_id == "lead_orchestrator"
+        && task_outputs
+            .iter()
+            .any(|output| output == "proposal_review_summary")
+    {
+        return vec!["codex_writer_high", "codex_architect_high"];
+    }
+    if agent_id == "proposal_writer"
+        && task_outputs
+            .iter()
+            .any(|output| output == "proposal_current")
+    {
+        if matches!(source_provider, "codex" | "codex_acp") {
+            return vec!["claude_writer_high", "claude_product_high"];
+        }
+        return vec!["codex_writer_high", "codex_architect_high"];
+    }
+    if output_contract == Some("proposal_review_v1") {
+        if matches!(source_provider, "gemini" | "gemini_acp") {
+            let design_reviewer =
+                agent_id.contains("ui") || agent_id.contains("ux") || agent_id.contains("macos");
+            if design_reviewer {
+                return vec![
+                    "claude_design_medium",
+                    "claude_product_high",
+                    "codex_architect_high",
+                ];
+            }
+            return vec!["claude_product_high", "codex_architect_high"];
+        }
+        if matches!(source_provider, "codex" | "codex_acp") {
+            let design_reviewer =
+                agent_id.contains("ui") || agent_id.contains("ux") || agent_id.contains("macos");
+            if design_reviewer {
+                return vec!["claude_design_medium", "claude_product_high"];
+            }
+            return vec!["claude_product_high", "claude_design_medium"];
+        }
+        return vec!["codex_architect_high", "codex_writer_high"];
+    }
+    if agent_id == "docs_guardian" && output_contract == Some("docs_report_v1") {
+        if matches!(source_provider, "gemini" | "gemini_acp") {
+            return vec![
+                "claude_docs_medium",
+                "claude_design_medium",
+                "codex_architect_high",
+            ];
+        }
+        return vec![
+            "gemini_docs_flash",
+            "claude_docs_medium",
+            "codex_architect_high",
+        ];
+    }
+    if agent_id == "security_checker" && output_contract == Some("security_report_v1") {
+        if matches!(source_provider, "claude" | "claude_acp") {
+            return vec!["codex_architect_high", "codex_audit_high", "codex_writer_high"];
+        }
+        return vec!["claude_security_high", "claude_product_high"];
+    }
+    if agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1") {
+        if matches!(source_provider, "claude" | "claude_acp") {
+            return vec!["codex_architect_high", "codex_writer_high"];
+        }
+        return vec!["claude_prepush_medium", "claude_product_high"];
+    }
+    Vec::new()
+}
+
+fn auto_contract_output_retry_reason(agent_id: &str) -> String {
+    format!("auto_contract_output_retry:{agent_id}")
+}
+
+fn work_item_matches_agent_execution(
+    item: &db::work_item::WorkItem,
+    stage_execution_id: &str,
+    agent_id: &str,
+    agent_execution_id: &str,
+) -> bool {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&item.payload_json) else {
+        return false;
+    };
+    let claimed_agent_execution_id = payload
+        .pointer("/p058_claimed/agent_execution_id")
+        .and_then(serde_json::Value::as_str);
+    let payload_stage_execution_id = payload
+        .get("stage_execution_id")
+        .and_then(serde_json::Value::as_str);
+    let payload_agent_id = payload.get("agent_id").and_then(serde_json::Value::as_str);
+    claimed_agent_execution_id == Some(agent_execution_id)
+        || (payload_stage_execution_id == Some(stage_execution_id)
+            && payload_agent_id == Some(agent_id))
+}
+
 fn is_inline_runtime_input(input_name: &str) -> bool {
     matches!(input_name, "input.idea" | "idea" | "input.file" | "file")
 }
@@ -4709,7 +5785,11 @@ fn build_declared_outputs(
             } else {
                 machine_artifact_name
             };
-            let target_path = resolved_artifact_path_for_task(path_artifact_name, plan, run, task);
+            let target_path =
+                p060_dynamic_review_target_path(output_name, schema.as_ref(), plan, run, task)
+                    .unwrap_or_else(|| {
+                        resolved_artifact_path_for_task(path_artifact_name, plan, run, task)
+                    });
             let companion_output_name = schema
                 .as_ref()
                 .filter(|schema| {
@@ -4762,6 +5842,77 @@ fn build_declared_outputs(
         .collect()
 }
 
+fn dynamic_materialization_epoch(stage: &StageExecution) -> i64 {
+    stage
+        .iteration
+        .saturating_mul(1_000_000)
+        .saturating_add(stage.attempt_number)
+}
+
+fn p060_dynamic_review_output_name(agent_id: &str) -> String {
+    let suffix = agent_id
+        .strip_prefix("proposal_reviewer_")
+        .unwrap_or(agent_id)
+        .replace('-', "_");
+    format!("proposal_review_{suffix}")
+}
+
+fn p060_dynamic_review_output_schema(contract_id: &str) -> workflow::plan::OutputSchema {
+    workflow::plan::OutputSchema {
+        contract_id: contract_id.to_string(),
+        format: "json".to_string(),
+        human_format: None,
+        machine_format: Some("json".to_string()),
+        validation_mode: Some("strict_structured".to_string()),
+        normalized_artifact_name: None,
+        raw_artifact_name: None,
+        required_fields: vec![
+            "agent_id".to_string(),
+            "role".to_string(),
+            "score".to_string(),
+            "decision".to_string(),
+            "verdict".to_string(),
+            "summary".to_string(),
+            "issues".to_string(),
+            "blocking_issues".to_string(),
+            "non_blocking_issues".to_string(),
+            "suggestions".to_string(),
+            "assumptions".to_string(),
+        ],
+    }
+}
+
+fn p060_dynamic_review_target_path(
+    output_name: &str,
+    schema: Option<&workflow::plan::OutputSchema>,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    task: &workflow::plan::CompiledTask,
+) -> Option<String> {
+    if plan.artifact_paths.contains_key(output_name) {
+        return None;
+    }
+    if schema.map(|schema| schema.contract_id.as_str()) != Some("proposal_review_v1") {
+        return None;
+    }
+    let suffix = output_name.strip_prefix("proposal_review_")?;
+    if suffix.is_empty() {
+        return None;
+    }
+
+    let file_stem = suffix.replace('_', "-");
+    let template =
+        format!("${{CHAINWORKS_META_ROOT:-.chainworks}}/reviews/proposal/{file_stem}.json");
+    let resolved = resolve_path_template(
+        &template,
+        &run.workspace_root,
+        run.chainworks_meta_root.as_deref(),
+    );
+    Some(normalize_resolved_artifact_path_for_task(
+        &resolved, run, task,
+    ))
+}
+
 fn resolved_artifact_path_for_task(
     artifact_name: &str,
     plan: &workflow::plan::RunPlan,
@@ -4779,6 +5930,14 @@ fn resolved_artifact_path_for_task(
             )
         })
         .unwrap_or_else(|| format!("{}/{}", run.artifact_root, artifact_name));
+    normalize_resolved_artifact_path_for_task(&resolved, run, task)
+}
+
+fn normalize_resolved_artifact_path_for_task(
+    resolved: &str,
+    run: &domain::run::Run,
+    task: &workflow::plan::CompiledTask,
+) -> String {
     let meta_abs = run.chainworks_meta_root.as_ref().map(|mr| {
         if mr.starts_with('/') {
             mr.clone()
@@ -5467,7 +6626,11 @@ pub fn resolve_scalar_template(template: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use domain::ids::{IdeaId, RunId, StageExecutionId};
+    use db::pool::create_pool;
+    use db::repos::{agent_execution_runtime_facts, ideas, runs, stages};
+    use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind};
+    use domain::idea::{Idea, IdeaStatus};
+    use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
     use domain::stage::StageStatus;
     use std::collections::HashMap;
@@ -5534,6 +6697,26 @@ mod tests {
             workflow_snapshot_json: "{}".into(),
             catalog_snapshot_json: "{}".into(),
             dynamic_candidate_bindings: Vec::new(),
+            run_plan_snapshot_format_version: None,
+        }
+    }
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool failed")
+    }
+
+    fn test_idea(id: IdeaId) -> Idea {
+        Idea {
+            id,
+            title: "Test idea".into(),
+            body: "body".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
         }
     }
 
@@ -5578,6 +6761,7 @@ mod tests {
                 xcode_shim_injection_signal: false,
                 requires_xcode_host_execution: false,
                 xcode_prompt_lint_warnings: Vec::new(),
+                toolchain_cache_policy: None,
             },
             task_name: "review_proposal_as_product_owner".into(),
             inputs: Vec::new(),
@@ -5588,6 +6772,387 @@ mod tests {
             phase: 0,
             selected_outputs_from: None,
         }
+    }
+
+    #[tokio::test]
+    async fn run_local_provider_health_fallback_uses_codex_after_claude_output_failure() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.catalog_snapshot_json = Some(
+            serde_json::json!({
+                "backend_profiles": {
+                    "claude_product_high": {
+                        "provider": "claude_acp",
+                        "model": "opus",
+                        "effort": "high",
+                        "max_turns": 14
+                    },
+                    "codex_architect_high": {
+                        "provider": "codex_acp",
+                        "model": "gpt-5.5",
+                        "effort": "xhigh",
+                        "max_turns": 16
+                    }
+                }
+            })
+            .to_string(),
+        );
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("opus")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(failed_exec_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let task = reviewer_task();
+        let mut agent = task.agent.clone();
+        agent.backend_profile_id = Some("claude_product_high".into());
+        agent.provider = "claude_acp".into();
+        agent.model = Some("opus".into());
+        let output_contract = agent.output_contract.clone();
+
+        let fallback = orchestrator
+            .apply_run_local_provider_health_fallback(
+                run_id,
+                &run,
+                &mut agent,
+                &task.outputs,
+                output_contract.as_deref(),
+            )
+            .await
+            .unwrap()
+            .expect("provider health fallback should apply");
+
+        assert_eq!(agent.provider, "codex_acp");
+        assert_eq!(
+            agent.backend_profile_id.as_deref(),
+            Some("codex_architect_high")
+        );
+        assert_eq!(
+            fallback["reason"],
+            serde_json::json!("prior_run_local_provider_output_failure")
+        );
+        assert_eq!(
+            fallback["failed_agent_execution_id"],
+            serde_json::json!(failed_exec_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_local_provider_health_fallback_uses_design_profile_after_gemini_ui_failure() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.catalog_snapshot_json = Some(
+            serde_json::json!({
+                "backend_profiles": {
+                    "gemini_review_pro": {
+                        "provider": "gemini_acp",
+                        "model": "gemini-2.5-pro",
+                        "effort": "medium",
+                        "max_turns": 12
+                    },
+                    "claude_design_medium": {
+                        "provider": "claude_acp",
+                        "model": "opus",
+                        "effort": "medium",
+                        "max_turns": 12
+                    },
+                    "codex_architect_high": {
+                        "provider": "codex_acp",
+                        "model": "gpt-5.5",
+                        "effort": "xhigh",
+                        "max_turns": 16
+                    }
+                }
+            })
+            .to_string(),
+        );
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_ui")
+        .bind("gemini_acp")
+        .bind("gemini")
+        .bind("gemini-2.5-pro")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(failed_exec_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let mut task = reviewer_task();
+        task.agent.agent_id = "proposal_reviewer_ui".into();
+        task.agent.backend_profile_id = Some("gemini_review_pro".into());
+        task.agent.provider = "gemini_acp".into();
+        task.agent.model = Some("gemini-2.5-pro".into());
+        let output_contract = task.agent.output_contract.clone();
+
+        let fallback = orchestrator
+            .apply_run_local_provider_health_fallback(
+                run_id,
+                &run,
+                &mut task.agent,
+                &task.outputs,
+                output_contract.as_deref(),
+            )
+            .await
+            .unwrap()
+            .expect("provider health fallback should apply");
+
+        assert_eq!(task.agent.provider, "claude_acp");
+        assert_eq!(
+            task.agent.backend_profile_id.as_deref(),
+            Some("claude_design_medium")
+        );
+        assert_eq!(fallback["from_provider"], serde_json::json!("gemini_acp"));
+        assert_eq!(fallback["to_provider"], serde_json::json!("claude_acp"));
+    }
+
+    #[tokio::test]
+    async fn auto_contract_output_retry_schedules_targeted_fallback_before_stage_blocks() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.catalog_snapshot_json = Some(
+            serde_json::json!({
+                "backend_profiles": {
+                    "claude_product_high": {
+                        "provider": "claude_acp",
+                        "model": "sonnet",
+                        "effort": "medium",
+                        "max_turns": 12
+                    },
+                    "codex_architect_high": {
+                        "provider": "codex_acp",
+                        "model": "gpt-5.5",
+                        "effort": "xhigh",
+                        "max_turns": 16
+                    }
+                }
+            })
+            .to_string(),
+        );
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(failed_exec_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("p058-invoke:{stage_id}:0"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                    "stage_execution_id": stage_id.to_string(),
+                    "agent_id": "proposal_reviewer_product_owner",
+                    "provider": "claude_acp",
+                    "backend_profile_id": "claude_product_high",
+                    "model": "sonnet",
+                    "effort": "medium",
+                    "max_turns": 12,
+                    "output_contract": "proposal_review_v1",
+                    "task_outputs": ["proposal_review_po"],
+                    "p058_claimed": {
+                        "agent_execution_id": failed_exec_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Completed,
+                run_id: Some(run_id),
+                stage_id: Some("review".into()),
+                created_at: Utc::now(),
+                scheduled_at: Utc::now(),
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let scheduled = orchestrator
+            .schedule_auto_contract_output_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(scheduled);
+        let stages = stages::list_by_run(&pool, run_id).await.unwrap();
+        let retry_stage = stages
+            .iter()
+            .find(|candidate| {
+                candidate.retry_reason.as_deref().is_some_and(|reason| {
+                    reason == "auto_contract_output_retry:proposal_reviewer_product_owner"
+                })
+            })
+            .expect("auto retry stage should be created");
+        assert_eq!(retry_stage.status, StageStatus::Running);
+        let old_stage = stages
+            .iter()
+            .find(|candidate| candidate.id == stage_id)
+            .unwrap();
+        assert_eq!(old_stage.status, StageStatus::Skipped);
+
+        let retry_invokes: Vec<_> = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .collect();
+        assert_eq!(retry_invokes.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+        assert_eq!(payload["provider"], serde_json::json!("codex_acp"));
+        assert_eq!(
+            payload["backend_profile_id"],
+            serde_json::json!("codex_architect_high")
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/provider_fallback/reason"),
+            Some(&serde_json::json!("source_contract_outputs_missing"))
+        );
     }
 
     fn compiled_state(
@@ -5633,6 +7198,60 @@ mod tests {
             effective_worktree_strategy_for_task(&task).as_deref(),
             Some("shared_implementation_worktree"),
             "read-only implementation review agents must inspect the implementation worktree"
+        );
+    }
+
+    #[test]
+    fn p060_dynamic_review_outputs_are_unique_but_keep_proposal_review_contract() {
+        let output_name = p060_dynamic_review_output_name("proposal_reviewer_rust_architect");
+        assert_eq!(output_name, "proposal_review_rust_architect");
+
+        let schema = p060_dynamic_review_output_schema("proposal_review_v1");
+        assert_eq!(schema.contract_id, "proposal_review_v1");
+        assert_eq!(schema.validation_mode.as_deref(), Some("strict_structured"));
+        assert!(
+            schema.normalized_artifact_name.is_none(),
+            "dynamic reviewer outputs must not collapse to the shared proposal_review_normalized path"
+        );
+        assert!(schema
+            .required_fields
+            .iter()
+            .any(|field| field == "verdict"));
+    }
+
+    #[test]
+    fn p060_dynamic_materialization_epoch_changes_on_loop_reentry() {
+        let run_id = RunId::new();
+        let mut first_review = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_4_proposal_reviewed".into(),
+            label: "Proposal reviewed".into(),
+            status: StageStatus::Running,
+            iteration: 8,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let first_epoch = dynamic_materialization_epoch(&first_review);
+
+        first_review.id = StageExecutionId::new();
+        first_review.iteration = 10;
+        first_review.attempt_number = 1;
+
+        assert_ne!(
+            first_epoch,
+            dynamic_materialization_epoch(&first_review),
+            "re-entering the same dynamic review stage after proposal refinement must not reuse the prior materialization idempotency key"
         );
     }
 
@@ -5710,6 +7329,32 @@ mod tests {
         assert_eq!(
             declared.target_path,
             format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json")
+        );
+    }
+
+    #[test]
+    fn p060_dynamic_product_owner_output_uses_legacy_artifact_path() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let plan = test_plan();
+        let mut task = reviewer_task();
+        let output_name = p060_dynamic_review_output_name("proposal_reviewer_product_owner");
+        task.outputs = vec![output_name.clone()];
+        task.output_schemas.clear();
+        task.output_schemas.insert(
+            output_name.clone(),
+            p060_dynamic_review_output_schema("proposal_review_v1"),
+        );
+
+        let declared_outputs = build_declared_outputs(&task, &plan, &run);
+
+        assert_eq!(declared_outputs.len(), 1);
+        let declared = &declared_outputs[0];
+        assert_eq!(declared.output_name, "proposal_review_product_owner");
+        assert_eq!(
+            declared.target_path,
+            format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json"),
+            "dynamic P060 product-owner reviews must validate the artifact path written by the existing reviewer catalog"
         );
     }
 

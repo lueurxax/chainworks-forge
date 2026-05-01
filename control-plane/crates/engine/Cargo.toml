@@ -20,10 +20,12 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = "0.1"
+md-5 = "0.10"
 sha2 = "0.10"
 dirs = "5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+uuid = { workspace = true }
 acp = { path = "../acp" }

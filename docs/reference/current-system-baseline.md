@@ -30,6 +30,7 @@ At the current baseline, the product includes:
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
 - bounded artifact discovery and engine-owned settlement pipeline,
+- provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
@@ -79,6 +80,7 @@ Use these reference docs as the current source of truth:
 | Test strategy and gates | [test-suite-architecture.md](test-suite-architecture.md), [test-gates.md](test-gates.md), [agent-ui-test-execution.md](agent-ui-test-execution.md) |
 | Design-system adoption | [design-system-and-brand-application.md](design-system-and-brand-application.md) |
 | UI/brand design authority | [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) |
+| UI action boundary | [ui-action-boundary.md](ui-action-boundary.md) |
 | GraphQL read contract | [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) |
 
 ## Canonical product boundaries
@@ -96,18 +98,19 @@ It is an operator surface where the engineer should be able to answer:
 
 That boundary is owned by [operator-experience.md](operator-experience.md).
 
-### UI Boundary
+### UI Action Boundary
 
-Per P031-r18, the macOS UI is a **thin read-only client**.
+The macOS UI is a GraphQL-only observer and approval console.
 
 Current baseline:
 
 - production workflow truth is read from GraphQL projections,
 - UI state is limited to presentation, server-derived caches, and freshness handling,
-- all mutation paths (Start, Cancel, Retry, Approval Resolution) move to external CLI/MCP workflows,
-- governed UI screens provide diagnostic identifiers and instructions for these external workflows.
+- UI mutations are limited to `approveApproval` and `rejectApproval`,
+- all non-approval operator actions are MCP-only,
+- governed UI screens provide diagnostic identifiers and instructions for MCP-owned workflows when an action is external.
 
-That boundary is owned by [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
+That boundary is owned by [ui-action-boundary.md](ui-action-boundary.md), with read-shape details in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
 
 ### Provider boundary
 
@@ -166,11 +169,12 @@ The following flows should be treated as implemented system behavior:
 4. lead conflict mediation for same-run resolution of workflow conflicts,
 5. run progress, artifact inspection, and recovery from the operator shell,
 6. workflow-map rendering and fallback handling,
-7. repo-backed full delivery using dedicated worktrees and manual release,
-8. implementation self-assessment and handoff routing,
-9. rejected implementation approval loopback to proposal refinement,
-10. evidence-pack export for repo-backed runs,
-11. benchmark/sign-off evaluation and export.
+7. provider toolchain cache mapping and isolated build execution,
+8. repo-backed full delivery using dedicated worktrees and manual release,
+9. implementation self-assessment and handoff routing,
+10. rejected implementation approval loopback to proposal refinement,
+11. evidence-pack export for repo-backed runs,
+12. benchmark/sign-off evaluation and export.
 
 ## Current review posture
 

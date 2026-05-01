@@ -523,6 +523,100 @@ async fn background_executor_routes_release_agents_natively() {
 }
 
 #[tokio::test]
+async fn background_executor_release_uses_provisioned_run_branch_over_stale_delivery_config() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_dir, remote_dir) = init_release_repo_on_branch(tmp.path(), "release/actual");
+    let artifact_root = tmp.path().join("artifacts");
+    std::fs::create_dir_all(&artifact_root).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(
+        run_id,
+        idea_id,
+        &repo_dir,
+        artifact_root.to_string_lossy().as_ref(),
+    );
+    run.target_branch = Some("release/actual".into());
+    run.delivery_configuration_json = Some(
+        serde_json::to_string(&DeliveryConfiguration {
+            repo_identifier: "repo/test".into(),
+            repo_root: repo_dir.clone(),
+            base_branch: "main".into(),
+            worktree_base_path: repo_dir.clone(),
+            target_branch: "release/stale-from-start".into(),
+            release_target_id: Some("sandbox-target".into()),
+            release_mode: Some("sandbox".into()),
+        })
+        .unwrap(),
+    );
+    configure_release_plan_paths(&mut run);
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, "commit_and_push_to_github"),
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(16);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        Arc::new(acp::AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    );
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("commit_and_push_to_github".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "commit_and_push_to_github",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "commit_and_push_to_github",
+                "provider": "claude",
+                "model": "test",
+                "effort": "low",
+                "session_reuse_scope": null,
+                "total_tasks": 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
+    let receipt_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.name == "git_push_receipt")
+        .expect("git push receipt should be persisted");
+    let receipt_json = std::fs::read_to_string(&receipt_artifact.file_path).unwrap();
+    let receipt: engine::release::git::GitPushReceipt =
+        serde_json::from_str(&receipt_json).unwrap();
+    assert_eq!(receipt.branch, "release/actual");
+
+    let remote_sha = git_output(
+        Path::new(&remote_dir),
+        &["rev-parse", "refs/heads/release/actual"],
+    );
+    assert_eq!(remote_sha.trim(), receipt.commit_sha);
+}
+
+#[tokio::test]
 async fn background_executor_persists_delivery_receipt_on_git_failure() {
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();

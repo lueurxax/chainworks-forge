@@ -8,6 +8,46 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ── P066: Toolchain cache policy snapshot types ───────────────────────────────
+
+/// Toolchain scope in frozen snapshots: run or session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolchainCacheScopeSnapshot {
+    Run,
+    Session,
+}
+
+/// P066: Toolchain cache policy as stored in a frozen ResolvedAgent snapshot.
+/// Field names and shape match the YAML catalog block exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolchainCachePolicySnapshot {
+    pub version: u32,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xcode_scope: Option<ToolchainCacheScopeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_scope: Option<ToolchainCacheScopeSnapshot>,
+}
+
+impl ToolchainCachePolicySnapshot {
+    /// Effective xcode scope: explicit value, or `run` when enabled and absent.
+    pub fn effective_xcode_scope(&self) -> Option<ToolchainCacheScopeSnapshot> {
+        if !self.enabled {
+            return None;
+        }
+        Some(self.xcode_scope.unwrap_or(ToolchainCacheScopeSnapshot::Run))
+    }
+
+    /// Effective go scope: explicit value, or `session` when enabled and absent.
+    pub fn effective_go_scope(&self) -> Option<ToolchainCacheScopeSnapshot> {
+        if !self.enabled {
+            return None;
+        }
+        Some(self.go_scope.unwrap_or(ToolchainCacheScopeSnapshot::Session))
+    }
+}
+
 /// A fully compiled run plan ready for execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunPlan {
@@ -39,6 +79,10 @@ pub struct RunPlan {
     /// Compiled from catalog entries with `routing` metadata.
     #[serde(default)]
     pub dynamic_candidate_bindings: Vec<domain::routing::CompiledDynamicAgentBinding>,
+    /// P066: Frozen-snapshot format version. Set to 1 when any resolved agent
+    /// carries a toolchain_cache_policy. Absent on pre-P066 (legacy_v0) snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_plan_snapshot_format_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +180,9 @@ pub struct ResolvedAgent {
     /// P051: compile-time advisory warnings carried to execution-time observation.
     #[serde(default)]
     pub xcode_prompt_lint_warnings: Vec<String>,
+    /// P066: Frozen toolchain cache policy for this agent. None = policy_absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_cache_policy: Option<ToolchainCachePolicySnapshot>,
 }
 
 /// A resolved skill, ready for prompt injection.

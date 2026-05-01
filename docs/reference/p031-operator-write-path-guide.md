@@ -9,7 +9,7 @@ This guide maps removed macOS UI write controls to their external CLI or MCP wor
 | Create Idea | `cw-cli ideas create` | Validated |
 | Start Run | `cw-cli runs start` | Validated |
 | Stop Run | `cw-cli runs stop` | Validated |
-| Approve / Reject | `approvals.resolve` (MCP) | Validated |
+| Approve / Reject | `approveApproval` / `rejectApproval` (GraphQL) / `approvals.resolve` (MCP) | Validated |
 | Retry Stage | `cw-cli stages retry` | Validated |
 | Steward Analysis | Temporarily Unavailable | Pending |
 | Reset Session | Temporarily Unavailable | Pending |
@@ -51,12 +51,12 @@ This guide maps removed macOS UI write controls to their external CLI or MCP wor
 
 ### approvals.resolve
 - **Label:** Approve / Reject
-- **Kind:** MCP Terminal
-- **Tool:** `approvals.resolve`
+- **Kind:** GraphQL Mutation / MCP Terminal
+- **Tool:** `approveApproval`, `rejectApproval` (GraphQL) / `approvals.resolve` (MCP)
 - **Required IDs:** `approval_id`, `run_id`, `stage_id`
-- **Parameters:** `{ "approval_id": "<id>", "decision": "approve"|"reject" }`
+- **Parameters:** GraphQL: `{ "approvalId": "<id>", "comment/reason": "<text>" }`; MCP: `{ "approval_id": "<id>", "decision": "approve"|"reject" }`
 - **Expected Output:** `Approval resolved.`
-- **Notes:** Interactive approvals moved to MCP terminal.
+- **Notes:** Interactive approvals are now supported directly in the SwiftUI app via GraphQL; MCP remains the external fallback.
 
 ### stages.retry
 - **Label:** Retry Stage

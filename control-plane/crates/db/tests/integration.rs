@@ -196,6 +196,7 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
@@ -244,6 +245,7 @@ async fn p017_mediation_owned_agent_execution_does_not_require_stage_execution()
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
 
     agent_executions::insert(&pool, &execution)
@@ -306,6 +308,7 @@ async fn p017_mediation_owned_retry_budget_and_artifact_claims_are_owner_keyed()
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -537,6 +540,19 @@ async fn session_generation_usage_update_persists_budget_snapshot_fields() {
     assert_eq!(generation.cumulative_prompt_tokens, 12_000);
     assert_eq!(generation.cumulative_cost_cents, 17);
     assert_eq!(generation.last_activity_at, Some(last_activity_at));
+
+    let live_progress_at = last_activity_at + chrono::Duration::seconds(30);
+    db::repos::sessions::touch_generation_activity(&pool, "generation-budget", live_progress_at)
+        .await
+        .unwrap();
+    let generation = db::repos::sessions::find_active_generation(&pool, &lineage.id)
+        .await
+        .unwrap()
+        .expect("generation should still exist");
+    assert_eq!(generation.turn_count, 1);
+    assert_eq!(generation.cumulative_prompt_tokens, 12_000);
+    assert_eq!(generation.cumulative_cost_cents, 17);
+    assert_eq!(generation.last_activity_at, Some(live_progress_at));
 }
 
 #[tokio::test]
@@ -878,6 +894,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1034,6 +1051,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1196,6 +1214,7 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1617,6 +1636,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -1656,6 +1676,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await
@@ -2166,6 +2187,7 @@ async fn test_projection_pending_approvals_uses_canonical_approvals_when_summary
         drift_detected_at: None,
         drift_details_json: None,
         chainworks_meta_root: None,
+        review_routing_json: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 

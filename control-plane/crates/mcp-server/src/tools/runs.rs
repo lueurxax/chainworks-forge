@@ -30,7 +30,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "artifact_root": { "type": "string" },
                     "workflow_yaml_path": { "type": "string", "description": "Path to workflow YAML file (enables state-machine execution)" },
                     "agent_catalog_yaml_path": { "type": "string", "description": "Path to agent catalog YAML file" },
-                    "delivery_configuration_json": { "type": "string", "description": "Frozen delivery configuration JSON for repo-backed runs" }
+                    "delivery_configuration_json": { "type": "string", "description": "Frozen delivery configuration JSON for repo-backed runs" },
+                    "review_routing_json": { "type": "string", "description": "Review routing options JSON for P060 dynamic reviewer selection" }
                 }
             }),
         },
@@ -205,6 +206,7 @@ pub async fn execute(
             let delivery_configuration_json = params["delivery_configuration_json"]
                 .as_str()
                 .map(String::from);
+            let review_routing_json = params["review_routing_json"].as_str().map(String::from);
 
             let caller = mcp_caller(&principal.id, &principal.class, "runs.start");
             let cmd = Command::StartRun(StartRunCmd {
@@ -216,7 +218,7 @@ pub async fn execute(
                 delivery_configuration_json,
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
-                review_routing_json: None,
+                review_routing_json,
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let run_id = match &commanded.result {
@@ -564,9 +566,8 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, runs};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        parse_implementation_self_assessment_v2, ContractParseContext,
-        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -716,6 +717,16 @@ mod tests {
 
     #[tokio::test]
     async fn runs_start_persists_delivery_configuration_json() {
+        let start_schema = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "runs.start")
+            .expect("runs.start tool spec")
+            .input_schema;
+        assert_eq!(
+            start_schema["properties"]["review_routing_json"]["type"],
+            "string"
+        );
+
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
@@ -733,6 +744,8 @@ mod tests {
             repo.path().display(),
             worktrees.path().display()
         );
+        let review_routing_json =
+            r#"{"mode":"legacy_fixed","force_include":[],"force_exclude":[]}"#.to_string();
         let params = serde_json::json!({
             "idea_id": idea_id.to_string(),
             "workflow_id": "wf-start",
@@ -741,7 +754,8 @@ mod tests {
             "artifact_root": "/tmp/art",
             "workflow_yaml_path": test_workflow_yaml_path(),
             "agent_catalog_yaml_path": test_agent_catalog_yaml_path(),
-            "delivery_configuration_json": delivery_json
+            "delivery_configuration_json": delivery_json,
+            "review_routing_json": review_routing_json
         });
 
         let result = execute("runs.start", params, &pool, &handler, &test_principal())
@@ -754,6 +768,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(run.delivery_configuration_json, Some(delivery_json));
+        assert_eq!(
+            run.review_routing_json
+                .as_deref()
+                .and_then(
+                    |json| serde_json::from_str::<domain::routing::ReviewRoutingOptions>(json).ok()
+                )
+                .map(|opts| opts.mode),
+            Some(domain::routing::ReviewRoutingMode::LegacyFixed)
+        );
     }
 
     #[tokio::test]
@@ -855,10 +878,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result["delivery_preflight_json"]
-            .as_str()
-            .unwrap()
-            .contains("repo_root_exists"));
+        assert!(
+            result["delivery_preflight_json"]
+                .as_str()
+                .unwrap()
+                .contains("repo_root_exists")
+        );
     }
 
     #[tokio::test]

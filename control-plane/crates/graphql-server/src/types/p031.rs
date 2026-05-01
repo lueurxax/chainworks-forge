@@ -26,6 +26,7 @@ pub enum GqlDisabledReasonCode {
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 #[graphql(name = "WritePathState", rename_items = "snake_case")]
 pub enum GqlWritePathState {
+    Available,
     ReadOnlyDiagnostic,
     WritePathNotAvailable,
     ExternalTransportRequired,

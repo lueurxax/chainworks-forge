@@ -168,11 +168,26 @@ The stable status vocabulary is:
 - `complete`: implementation and verification are complete with no blocking handoff.
 - `unknown`: no valid v2 or compatible legacy truth is available yet.
 
+`needs_code_fixes` is reserved for blocking code-writer-owned source or test work.
+If `verification_green` is true and every `remaining_code_tasks` entry is
+`blocking=false`, the parser normalizes the summary out of the code loop as
+`handoff_required` even when the raw artifact says `implementation_complete=false`.
+Non-blocking code-tail notes remain visible in the summary for downstream review,
+but they do not keep scheduling `code_writer`.
+
 Workflow transitions read the active contract row, not raw files. `needs_code_fixes` keeps the run in the implementation
 loop. `complete`, `handoff_required`, and `blocked` leave the code-writer loop and route the run to the downstream
 review, release, or operator decision surfaces that own the remaining work. Legacy `implementation_self_assessment`
 artifacts remain readable as compatibility evidence, but `seemingly_complete` is not transition authority for new
 implementation-loop decisions.
+
+After implementation review aggregation, `implementation_review_summary_v1.status`
+is the closeout transition authority. `state_9_implementation_reviewed` must not
+advance to `state_11_manual_release` from the self-assessment's zero
+`blocking_remaining_code_tasks` alone. A canonical `needs_code_fixes` or `invalid`
+review summary routes to `state_10_implementation_refined`; `code_complete` can
+enter manual release, and `release_evidence_blocked` is preserved as a separate
+release-hold/manual decision state.
 
 GraphQL exposes a nullable `implementationSelfAssessmentSummary` field on run read models. MCP run detail/list
 responses expose the same projection as `implementation_self_assessment_summary`. `null` means no v2/v1 projection

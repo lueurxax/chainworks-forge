@@ -501,6 +501,7 @@ async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         },
     )
     .await

@@ -26,7 +26,7 @@ enum P031GraphQLReadBoundaryError: Error, Equatable, CustomStringConvertible, Lo
       return
         "P031 GraphQL subscription client requires a subscription operation, got \(operationName)"
     case .mutationOperationForbidden(let operationName):
-      return "P031 UI must not execute GraphQL mutation operation \(operationName)"
+      return "P031/P072 UI must not execute forbidden GraphQL mutation operation \(operationName)"
     case .forbiddenOperationName(let operationName):
       return
         "P031 UI read operation name looks like removed write/control plumbing: \(operationName)"
@@ -53,6 +53,7 @@ enum P031GraphQLReadBoundaryError: Error, Equatable, CustomStringConvertible, Lo
 enum P031GraphQLOperationKind: String, Codable, Equatable, Sendable {
   case query
   case subscription
+  case mutation
 }
 
 struct P031GraphQLReadRequest: Equatable, Sendable {
@@ -76,9 +77,6 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
     }
 
     let operations = try Self.operations(in: normalizedDocument)
-    if operations.contains(where: { $0.keyword == "mutation" }) {
-      throw P031GraphQLReadBoundaryError.mutationOperationForbidden(normalizedName)
-    }
     if let forbiddenDocumentOperationName = operations.compactMap(\.name).first(where: {
       Self.isForbiddenOperationName($0)
     }) {
@@ -92,6 +90,11 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
       operationKind = .query
     case "subscription":
       operationKind = .subscription
+    case "mutation":
+      guard Self.isAllowedApprovalMutationDocument(normalizedDocument) else {
+        throw P031GraphQLReadBoundaryError.mutationOperationForbidden(normalizedName)
+      }
+      operationKind = .mutation
     default:
       throw P031GraphQLReadBoundaryError.unsupportedOperation(requestedOperation.keyword)
     }
@@ -180,7 +183,7 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
     return String(document[nameStart..<index])
   }
 
-  nonisolated private static func isGraphQLNameStart(_ character: Character) -> Bool {
+  nonisolated fileprivate static func isGraphQLNameStart(_ character: Character) -> Bool {
     guard let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1 else {
       return false
     }
@@ -189,7 +192,7 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
       || (97...122).contains(scalar.value)
   }
 
-  nonisolated private static func isGraphQLNameContinue(_ character: Character) -> Bool {
+  nonisolated fileprivate static func isGraphQLNameContinue(_ character: Character) -> Bool {
     guard let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1 else {
       return false
     }
@@ -218,9 +221,52 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
       "clientcommandid",
     ].contains { lowercase.contains($0) }
   }
+
+  nonisolated private static func isAllowedApprovalMutationDocument(_ document: String) -> Bool {
+    let scanDocument = document.maskingGraphQLIgnoredTextForP031OperationScan()
+    let allowedFields = ["approveApproval", "rejectApproval"]
+    let forbiddenFields = [
+      "startRun",
+      "approveStage",
+      "rejectStage",
+      "retryStage",
+      "cancelRun",
+      "overrideLegacyDiscoveryPolicy",
+      "resetSession",
+      "resumeRun",
+      "cloneRun",
+      "compareRun",
+      "launchExperiment",
+      "runtimeHealth",
+      "agentReset",
+      "resetAgent",
+    ]
+    let allowedCount = allowedFields.reduce(0) { count, field in
+      count + (scanDocument.containsGraphQLFieldNamed(field) ? 1 : 0)
+    }
+    guard allowedCount == 1 else { return false }
+    return !forbiddenFields.contains { scanDocument.containsGraphQLFieldNamed($0) }
+  }
 }
 
 extension String {
+  nonisolated fileprivate func containsGraphQLFieldNamed(_ fieldName: String) -> Bool {
+    guard !fieldName.isEmpty else { return false }
+    var index = startIndex
+    while index < endIndex {
+      guard let range = self[index...].range(of: fieldName) else { return false }
+      let before = range.lowerBound > startIndex ? self[self.index(before: range.lowerBound)] : " "
+      let after = range.upperBound < endIndex ? self[range.upperBound] : " "
+      let beforeOK = !P031GraphQLReadRequest.isGraphQLNameContinue(before)
+      let afterOK = after == "(" || after == "{" || after.isWhitespace
+      if beforeOK && afterOK {
+        return true
+      }
+      index = range.upperBound
+    }
+    return false
+  }
+
   nonisolated fileprivate func maskingGraphQLIgnoredTextForP031OperationScan() -> String {
     var masked = ""
     masked.reserveCapacity(count)
@@ -427,6 +473,76 @@ struct P031GraphQLReadClient<Transport: P031GraphQLReadTransport>: Sendable {
       from: data,
       operationName: operationName
     )
+  }
+}
+
+enum P072ApprovalDecisionAction: Equatable, Sendable {
+  case approve
+  case reject(reason: String)
+}
+
+struct P072ApprovalMutationResult: Decodable, Equatable, Sendable {
+  let approval: P031ApprovalReadModel
+  let journalID: String
+
+  enum CodingKeys: String, CodingKey {
+    case approval
+    case journalID = "journalId"
+  }
+}
+
+struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable {
+  let transport: Transport
+
+  func approve(approvalID: String) async throws -> P072ApprovalMutationResult {
+    try await execute(
+      P072ApproveApprovalPayload.self,
+      operationName: "P072ApproveApproval",
+      document: P031GraphQLDocuments.approveApproval,
+      variables: ["approvalId": .string(approvalID)]
+    ).approveApproval
+  }
+
+  func reject(approvalID: String, reason: String) async throws -> P072ApprovalMutationResult {
+    try await execute(
+      P072RejectApprovalPayload.self,
+      operationName: "P072RejectApproval",
+      document: P031GraphQLDocuments.rejectApproval,
+      variables: [
+        "approvalId": .string(approvalID),
+        "reason": .string(reason),
+      ]
+    ).rejectApproval
+  }
+
+  private func execute<Payload: Decodable>(
+    _ payloadType: Payload.Type,
+    operationName: String,
+    document: String,
+    variables: [String: P031GraphQLVariableValue]
+  ) async throws -> Payload {
+    let request = try P031GraphQLReadRequest(
+      operationName: operationName,
+      document: document,
+      variables: variables
+    )
+    guard request.operationKind == .mutation else {
+      throw P031GraphQLReadBoundaryError.mutationOperationForbidden(operationName)
+    }
+    let data = try await transport.send(request)
+    return try P031GraphQLResponseDecoder.decode(
+      payloadType,
+      from: data,
+      operationName: operationName
+    )
+  }
+
+  private struct P072ApproveApprovalPayload: Decodable {
+    let approveApproval: P072ApprovalMutationResult
+  }
+
+  private struct P072RejectApprovalPayload: Decodable {
+    let rejectApproval: P072ApprovalMutationResult
   }
 }
 
@@ -778,6 +894,7 @@ enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable 
 }
 
 enum P031WritePathState: String, Codable, CaseIterable, Equatable, Sendable {
+  case available
   case readOnlyDiagnostic = "read_only_diagnostic"
   case writePathNotAvailable = "write_path_not_available"
   case externalTransportRequired = "external_transport_required"
@@ -1066,6 +1183,8 @@ struct P031ApprovalReadModel: Decodable, Equatable, Sendable {
   let writePathState: P031WritePathState
   let diagnosticID: String?
   let serverDebugDetail: String?
+  let availableActions: [String]
+  let disabledReason: String?
 
   enum CodingKeys: String, CodingKey {
     case id
@@ -1077,6 +1196,61 @@ struct P031ApprovalReadModel: Decodable, Equatable, Sendable {
     case writePathState
     case diagnosticID = "diagnosticId"
     case serverDebugDetail
+    case availableActions
+    case disabledReason
+  }
+
+  init(
+    id: String,
+    runID: String,
+    stageID: String,
+    decision: String?,
+    freshnessState: P031FreshnessState,
+    disabledReasonCode: P031DisabledReasonCode?,
+    writePathState: P031WritePathState,
+    diagnosticID: String?,
+    serverDebugDetail: String?,
+    availableActions: [String] = [],
+    disabledReason: String? = nil
+  ) {
+    self.id = id
+    self.runID = runID
+    self.stageID = stageID
+    self.decision = decision
+    self.freshnessState = freshnessState
+    self.disabledReasonCode = disabledReasonCode
+    self.writePathState = writePathState
+    self.diagnosticID = diagnosticID
+    self.serverDebugDetail = serverDebugDetail
+    self.availableActions = availableActions
+    self.disabledReason = disabledReason
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    runID = try container.decode(String.self, forKey: .runID)
+    stageID = try container.decode(String.self, forKey: .stageID)
+    decision = try container.decodeIfPresent(String.self, forKey: .decision)
+    freshnessState = try container.decode(P031FreshnessState.self, forKey: .freshnessState)
+    disabledReasonCode = try container.decodeIfPresent(
+      P031DisabledReasonCode.self,
+      forKey: .disabledReasonCode
+    )
+    writePathState = try container.decode(P031WritePathState.self, forKey: .writePathState)
+    diagnosticID = try container.decodeIfPresent(String.self, forKey: .diagnosticID)
+    serverDebugDetail = try container.decodeIfPresent(String.self, forKey: .serverDebugDetail)
+    availableActions =
+      try container.decodeIfPresent([String].self, forKey: .availableActions) ?? []
+    disabledReason = try container.decodeIfPresent(String.self, forKey: .disabledReason)
+  }
+
+  nonisolated var canApprove: Bool {
+    availableActions.contains("approve") && writePathState == .available
+  }
+
+  nonisolated var canReject: Bool {
+    availableActions.contains("reject") && writePathState == .available
   }
 }
 
@@ -1286,6 +1460,8 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
   let status: String
   let iteration: Int?
   let attemptNumber: Int?
+  let startedAt: String?
+  let completedAt: String?
   let settlementKind: String?
   let hasArtifacts: Bool?
   let hasPendingApproval: Bool?
@@ -1295,6 +1471,44 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
   let projectionLag: Bool
   let freshnessState: P031FreshnessState
 
+  init(
+    id: String,
+    runID: String,
+    stageID: String,
+    label: String,
+    status: String,
+    iteration: Int?,
+    attemptNumber: Int?,
+    startedAt: String? = nil,
+    completedAt: String? = nil,
+    settlementKind: String?,
+    hasArtifacts: Bool?,
+    hasPendingApproval: Bool?,
+    hasValidationFailure: Bool?,
+    projectionPresent: Bool,
+    projectionUpdatedAt: String?,
+    projectionLag: Bool,
+    freshnessState: P031FreshnessState
+  ) {
+    self.id = id
+    self.runID = runID
+    self.stageID = stageID
+    self.label = label
+    self.status = status
+    self.iteration = iteration
+    self.attemptNumber = attemptNumber
+    self.startedAt = startedAt
+    self.completedAt = completedAt
+    self.settlementKind = settlementKind
+    self.hasArtifacts = hasArtifacts
+    self.hasPendingApproval = hasPendingApproval
+    self.hasValidationFailure = hasValidationFailure
+    self.projectionPresent = projectionPresent
+    self.projectionUpdatedAt = projectionUpdatedAt
+    self.projectionLag = projectionLag
+    self.freshnessState = freshnessState
+  }
+
   enum CodingKeys: String, CodingKey {
     case id
     case runID = "runId"
@@ -1303,6 +1517,8 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
     case status
     case iteration
     case attemptNumber
+    case startedAt
+    case completedAt
     case settlementKind
     case hasArtifacts
     case hasPendingApproval
@@ -1318,6 +1534,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
   let id: String
   let runID: String
   let stageID: String
+  let sourceStageExecutionID: String?
+  let createdAt: String?
   let agentID: String?
   let name: String
   let contractID: String
@@ -1338,6 +1556,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     id: String,
     runID: String,
     stageID: String,
+    sourceStageExecutionID: String? = nil,
+    createdAt: String? = nil,
     agentID: String? = nil,
     name: String,
     contractID: String,
@@ -1357,6 +1577,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     self.id = id
     self.runID = runID
     self.stageID = stageID
+    self.sourceStageExecutionID = sourceStageExecutionID
+    self.createdAt = createdAt
     self.agentID = agentID
     self.name = name
     self.contractID = contractID
@@ -1399,6 +1621,8 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
     case id
     case runID = "runId"
     case stageID = "stageId"
+    case sourceStageExecutionID = "sourceStageExecutionId"
+    case createdAt
     case agentID = "agentId"
     case name
     case contractID = "contractId"
@@ -1567,6 +1791,8 @@ enum P031GraphQLDocuments {
         status
         iteration
         attemptNumber
+        startedAt
+        completedAt
         settlementKind
         hasArtifacts
         hasPendingApproval
@@ -1580,6 +1806,8 @@ enum P031GraphQLDocuments {
         id
         runId
         stageId
+        sourceStageExecutionId
+        createdAt
         agentId
         name
         contractId
@@ -1603,6 +1831,8 @@ enum P031GraphQLDocuments {
         freshnessState
         disabledReasonCode
         writePathState
+        availableActions
+        disabledReason
         diagnosticId
         serverDebugDetail
       }
@@ -1619,6 +1849,8 @@ enum P031GraphQLDocuments {
         status
         iteration
         attemptNumber
+        startedAt
+        completedAt
         settlementKind
         hasArtifacts
         hasPendingApproval
@@ -1641,6 +1873,8 @@ enum P031GraphQLDocuments {
         status
         iteration
         attemptNumber
+        startedAt
+        completedAt
         settlementKind
         hasArtifacts
         hasPendingApproval
@@ -1663,8 +1897,52 @@ enum P031GraphQLDocuments {
         freshnessState
         disabledReasonCode
         writePathState
+        availableActions
+        disabledReason
         diagnosticId
         serverDebugDetail
+      }
+    }
+    """
+
+  static let approveApproval = """
+    mutation P072ApproveApproval($approvalId: ID!) {
+      approveApproval(approvalId: $approvalId) {
+        approval {
+          id
+          runId
+          stageId
+          decision
+          freshnessState
+          disabledReasonCode
+          writePathState
+          availableActions
+          disabledReason
+          diagnosticId
+          serverDebugDetail
+        }
+        journalId
+      }
+    }
+    """
+
+  static let rejectApproval = """
+    mutation P072RejectApproval($approvalId: ID!, $reason: String!) {
+      rejectApproval(approvalId: $approvalId, reason: $reason) {
+        approval {
+          id
+          runId
+          stageId
+          decision
+          freshnessState
+          disabledReasonCode
+          writePathState
+          availableActions
+          disabledReason
+          diagnosticId
+          serverDebugDetail
+        }
+        journalId
       }
     }
     """
@@ -1675,6 +1953,8 @@ enum P031GraphQLDocuments {
         id
         runId
         stageId
+        sourceStageExecutionId
+        createdAt
         agentId
         name
         contractId
@@ -1699,6 +1979,8 @@ enum P031GraphQLDocuments {
         id
         runId
         stageId
+        sourceStageExecutionId
+        createdAt
         agentId
         name
         contractId
@@ -2789,6 +3071,8 @@ extension P031OperatorWritePathValidationStatus: Decodable {
 enum DisabledReasonPresenter {
   nonisolated static func title(for reason: P031DisabledReasonCode?) -> String {
     switch reason {
+    case nil:
+      return "Ready for approval"
     case .writePathNotAvailable:
       return "Write path unavailable"
     case .managedOutsideUI:
@@ -2803,8 +3087,6 @@ enum DisabledReasonPresenter {
       return "Unauthorized"
     case .unsupportedAction:
       return "Unsupported action"
-    case nil:
-      return "Read-only diagnostic"
     }
   }
 }
@@ -2814,13 +3096,20 @@ enum ApprovalDiagnosticPresenter {
     for approval: P031ApprovalReadModel,
     externalWritePathGuideState: P031ExternalWritePathGuideState = .unavailable
   ) -> P031ApprovalDiagnosticPresentation {
-    let actionLabel =
-      externalWritePathGuideState.cliWorkflowDocumented
-        && approval.writePathState == .externalTransportRequired
-      ? "Execute via CLI"
-      : nil
+    let actionLabel: String?
+    if approval.writePathState == .available {
+      actionLabel = nil
+    } else {
+      actionLabel =
+        externalWritePathGuideState.cliWorkflowDocumented
+          && approval.writePathState == .externalTransportRequired
+        ? "Execute via CLI"
+        : nil
+    }
     let followUpID =
-      externalWritePathGuideState.guideAvailable ? nil : "P031-FOLLOWUP-APPROVAL-WRITE-PATH"
+      approval.writePathState == .available || externalWritePathGuideState.guideAvailable
+      ? nil
+      : "P031-FOLLOWUP-APPROVAL-WRITE-PATH"
     let copyItems = [
       P031DiagnosticCopyItem(label: "approval_id", value: approval.id),
       P031DiagnosticCopyItem(label: "run_id", value: approval.runID),
@@ -2829,10 +3118,15 @@ enum ApprovalDiagnosticPresenter {
     ].compactMap { $0 }
 
     return P031ApprovalDiagnosticPresentation(
-      title: externalWritePathGuideState.guideAvailable
-        ? "Approval managed outside UI"
-        : "Approval write path unavailable",
-      body: DisabledReasonPresenter.title(for: approval.disabledReasonCode),
+      title: approval.writePathState == .available
+        ? "Approval ready"
+        : (
+          externalWritePathGuideState.guideAvailable
+            ? "Approval managed outside UI"
+            : "Approval write path unavailable"
+        ),
+      body: approval.disabledReason
+        ?? DisabledReasonPresenter.title(for: approval.disabledReasonCode),
       actionLabel: actionLabel,
       followUpID: followUpID,
       copyItems: copyItems
@@ -3024,6 +3318,8 @@ struct P031ApprovalInboxRowPresentation: Equatable, Sendable {
   let approvalID: String
   let title: String
   let body: String
+  let canApprove: Bool
+  let canReject: Bool
   let actionLabel: String?
   let followUpID: String?
   let copyItems: [P031DiagnosticCopyItem]
@@ -3102,6 +3398,10 @@ enum P031ArtifactRenderMode: Equatable, Sendable {
 struct P031ArtifactViewerPresentation: Equatable, Sendable {
   let artifactID: String
   let stageID: String
+  let stageExecutionID: String?
+  let stageLabel: String?
+  let iteration: Int?
+  let attemptNumber: Int?
   let agentID: String?
   let contractID: String
   let format: String
@@ -3373,6 +3673,8 @@ enum P031ApprovalInboxPresenter {
       approvalID: approval.id,
       title: diagnostic.title,
       body: diagnostic.body,
+      canApprove: approval.canApprove,
+      canReject: approval.canReject,
       actionLabel: diagnostic.actionLabel,
       followUpID: diagnostic.followUpID,
       copyItems: diagnostic.copyItems,
@@ -3404,7 +3706,15 @@ enum P031RunDetailPresenter {
       )
     }
     let artifactRows = detail.ordinaryArtifacts.map(P031ArtifactPresenter.presentation)
-    let artifactViewerRows = detail.ordinaryArtifacts.map(P031ArtifactViewerPresenter.presentation)
+    let stageByExecutionID = Dictionary(uniqueKeysWithValues: detail.stages.map { ($0.id, $0) })
+    let stageWindowsByStageID = stageExecutionWindowsByStageID(detail.stages)
+    let artifactViewerRows = detail.ordinaryArtifacts.map { artifact in
+      let sourceStage = artifact.sourceStageExecutionID.flatMap { stageByExecutionID[$0] }
+      return P031ArtifactViewerPresenter.presentation(
+        for: artifact,
+        stage: sourceStage ?? stageExecution(for: artifact, windowsByStageID: stageWindowsByStageID)
+      )
+    }
     let reportRows = detail.reportMetadata.map(ReportMetadataRowPresenter.presentation)
     let progressLabel: String?
     if let completedStages = run?.completedStages, let totalStages = run?.totalStages {
@@ -3474,6 +3784,93 @@ enum P031RunDetailPresenter {
       emptyStateTitle: nil,
       errorDescription: P031ReadErrorPresenter.description(for: error)
     )
+  }
+
+  private nonisolated static func stageExecutionWindowsByStageID(
+    _ stages: [P031StageReadModel]
+  ) -> [String: [P031StageExecutionWindow]] {
+    let stagesWithStart = stages.compactMap { stage -> (stage: P031StageReadModel, startedAt: Date)? in
+      guard let startedAt = P031ReadBoundaryDateParser.date(from: stage.startedAt) else {
+        return nil
+      }
+      return (stage, startedAt)
+    }
+    let grouped = Dictionary(grouping: stagesWithStart, by: { $0.stage.stageID })
+    return grouped.mapValues { entries in
+      let sorted = entries.sorted {
+        if $0.startedAt != $1.startedAt {
+          return $0.startedAt < $1.startedAt
+        }
+        return $0.stage.isEarlierExecution(than: $1.stage)
+      }
+      return sorted.enumerated().map { index, entry in
+        P031StageExecutionWindow(
+          stage: entry.stage,
+          startedAt: entry.startedAt,
+          nextStartedAt: sorted.indices.contains(index + 1) ? sorted[index + 1].startedAt : nil
+        )
+      }
+    }
+  }
+
+  private nonisolated static func stageExecution(
+    for artifact: P031ArtifactReadModel,
+    windowsByStageID: [String: [P031StageExecutionWindow]]
+  ) -> P031StageReadModel? {
+    guard let createdAt = P031ReadBoundaryDateParser.date(from: artifact.createdAt),
+      let windows = windowsByStageID[artifact.stageID]
+    else {
+      return nil
+    }
+    return windows.last(where: { $0.contains(createdAt) })?.stage
+  }
+}
+
+private struct P031StageExecutionWindow: Equatable, Sendable {
+  let stage: P031StageReadModel
+  let startedAt: Date
+  let nextStartedAt: Date?
+
+  nonisolated func contains(_ date: Date) -> Bool {
+    guard date >= startedAt else {
+      return false
+    }
+    if let nextStartedAt {
+      return date < nextStartedAt
+    }
+    return true
+  }
+}
+
+private enum P031ReadBoundaryDateParser {
+  nonisolated static func date(from value: String?) -> Date? {
+    guard let value, !value.isEmpty else {
+      return nil
+    }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) {
+      return date
+    }
+    let standard = ISO8601DateFormatter()
+    standard.formatOptions = [.withInternetDateTime]
+    return standard.date(from: value)
+  }
+}
+
+private extension P031StageReadModel {
+  nonisolated func isEarlierExecution(than other: P031StageReadModel) -> Bool {
+    let lhsIteration = iteration ?? Int.min
+    let rhsIteration = other.iteration ?? Int.min
+    if lhsIteration != rhsIteration {
+      return lhsIteration < rhsIteration
+    }
+    let lhsAttempt = attemptNumber ?? Int.min
+    let rhsAttempt = other.attemptNumber ?? Int.min
+    if lhsAttempt != rhsAttempt {
+      return lhsAttempt < rhsAttempt
+    }
+    return id.localizedStandardCompare(other.id) == .orderedAscending
   }
 }
 
@@ -3647,7 +4044,10 @@ enum P031StageTransitionPresenter {
 }
 
 enum P031ArtifactViewerPresenter {
-  nonisolated static func presentation(for artifact: P031ArtifactReadModel)
+  nonisolated static func presentation(
+    for artifact: P031ArtifactReadModel,
+    stage: P031StageReadModel? = nil
+  )
     -> P031ArtifactViewerPresentation
   {
     let normalizedFormat = artifact.format.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3707,6 +4107,10 @@ enum P031ArtifactViewerPresenter {
     return P031ArtifactViewerPresentation(
       artifactID: artifact.id,
       stageID: artifact.stageID,
+      stageExecutionID: stage?.id ?? artifact.sourceStageExecutionID,
+      stageLabel: stage?.label,
+      iteration: stage?.iteration,
+      attemptNumber: stage?.attemptNumber,
       agentID: artifact.agentID,
       contractID: artifact.contractID,
       format: artifact.format,
