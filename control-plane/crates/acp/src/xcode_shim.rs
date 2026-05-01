@@ -2001,6 +2001,7 @@ mod tests {
                     "should-not-leak".to_string(),
                 )]),
                 simulator_candidates: Vec::new(),
+                toolchain_mapping_root: None,
             },
         };
         let config = XcodeHostExecutorProcessConfig {
