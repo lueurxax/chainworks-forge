@@ -43,6 +43,7 @@ use domain::risk_lineage::{risks_satisfy_enter_manual_release, RiskAcceptanceLin
 
 /// Accepted latency budget for fingerprint computation per R14.
 /// Exceeding this writes closeout_fingerprint_unavailable and fails closed.
+#[allow(dead_code)]
 const FINGERPRINT_LATENCY_BUDGET_MS: u64 = 5_000;
 
 /// Inputs required by the synthesizer.
