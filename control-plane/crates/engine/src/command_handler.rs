@@ -1,5 +1,5 @@
 use acp::AcpRuntimeManager;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::Path;
@@ -13,7 +13,6 @@ use db::repos::{
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
-use domain::PrincipalClass;
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
@@ -27,11 +26,12 @@ use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
+use domain::PrincipalClass;
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
 use crate::preflight::{
-    DeliveryPreflightResult, missing_delivery_configuration_preflight, run_delivery_preflight,
+    missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
 use crate::work_queue::WorkQueue;
 
@@ -225,6 +225,61 @@ fn is_release_agent(agent_id: &str) -> bool {
     )
 }
 
+fn retry_requires_effect_reconciliation(
+    stage: &StageExecution,
+    target_agent_id: Option<&str>,
+    has_release_post_approval_tasks: bool,
+) -> bool {
+    let stage_type_requires_guard = matches!(
+        stage.stage_type.as_deref(),
+        Some("release" | "side_effect" | "side-effect")
+    );
+    stage_type_requires_guard
+        || has_release_post_approval_tasks
+        || is_release_agent(&stage.stage_id)
+        || stage.owner_agent.as_deref().is_some_and(is_release_agent)
+        || target_agent_id.is_some_and(is_release_agent)
+}
+
+fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
+    let plan = match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json)) => {
+            workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                run.agent_catalog_yaml_path.as_deref().unwrap_or("."),
+            )?
+        }
+        _ => match (
+            run.workflow_yaml_path.as_deref(),
+            run.agent_catalog_yaml_path.as_deref(),
+        ) {
+            (Some(workflow_path), Some(catalog_path)) => {
+                workflow::compiler::compile(workflow_path, catalog_path)?
+            }
+            _ => return Ok(false),
+        },
+    };
+
+    Ok(plan.states.get(stage_id).is_some_and(|state| {
+        state
+            .post_approval_tasks
+            .iter()
+            .any(|task| is_release_agent(&task.agent.agent_id))
+    }))
+}
+
+fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error {
+    anyhow!(
+        "requires_effect_reconciliation: retry for stage {} ({}) requires durable side-effect reconciliation before retry",
+        stage.stage_id,
+        stage.id
+    )
+}
+
 fn find_source_invoke_work_item<'a>(
     work_items: &'a [WorkItem],
     stage_execution_id: &str,
@@ -300,10 +355,16 @@ fn targeted_retry_provider_fallback(
             })
             .unwrap_or(false);
     let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
+    let is_security_checker =
+        agent_id == "security_checker" && output_contract == Some("security_report_v1");
+    let is_prepush_reviewer =
+        agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1");
     if !is_proposal_review
         && !is_proposal_review_aggregation
         && !is_proposal_authoring
         && !is_docs_guardian
+        && !is_security_checker
+        && !is_prepush_reviewer
     {
         return None;
     }
@@ -347,6 +408,8 @@ fn targeted_retry_provider_fallback(
         is_proposal_review_aggregation,
         is_proposal_authoring,
         is_docs_guardian,
+        is_security_checker,
+        is_prepush_reviewer,
         profiles,
     )?;
     let profile = profiles.get(fallback_id)?.as_object()?;
@@ -381,6 +444,8 @@ fn targeted_retry_fallback_profile_id<'a>(
     is_proposal_review_aggregation: bool,
     is_proposal_authoring: bool,
     is_docs_guardian: bool,
+    is_security_checker: bool,
+    is_prepush_reviewer: bool,
     profiles: &'a serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'a str> {
     if is_proposal_review_aggregation {
@@ -413,6 +478,32 @@ fn targeted_retry_fallback_profile_id<'a>(
                 "claude_docs_medium",
                 "codex_architect_high",
             ]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_security_checker {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &[
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ]
+        } else {
+            &["claude_security_high", "claude_product_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_prepush_reviewer {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &["codex_architect_high", "codex_writer_high"]
+        } else {
+            &["claude_prepush_medium", "claude_product_high"]
         };
         return candidates
             .iter()
@@ -1386,6 +1477,37 @@ impl CommandHandler {
                         c.stage_id,
                         old_stage.status
                     );
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
+
+                let has_release_post_approval_tasks =
+                    match retry_state_has_release_post_approval_tasks(&run, &old_stage.stage_id) {
+                        Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+                        Err(e) => {
+                            warn!(
+                                run_id = %c.run_id,
+                                stage_id = %old_stage.stage_id,
+                                error = %e,
+                                "RetryStage side-effect preflight could not inspect post_approval_tasks"
+                            );
+                            false
+                        }
+                    };
+                if retry_requires_effect_reconciliation(
+                    old_stage,
+                    None,
+                    has_release_post_approval_tasks,
+                ) {
+                    let error = requires_effect_reconciliation_error(old_stage);
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
@@ -2977,6 +3099,35 @@ impl CommandHandler {
                 stage_id,
                 old_stage.status
             ));
+        }
+        let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
+            &run,
+            &old_stage.stage_id,
+        ) {
+            Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %old_stage.stage_id,
+                    error = %e,
+                    "RetryAgentExecution side-effect preflight could not inspect post_approval_tasks"
+                );
+                false
+            }
+        };
+        if retry_requires_effect_reconciliation(
+            &old_stage,
+            Some(&target_exec.agent_id),
+            has_release_post_approval_tasks,
+        ) {
+            let error = requires_effect_reconciliation_error(&old_stage);
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
         }
 
         let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;

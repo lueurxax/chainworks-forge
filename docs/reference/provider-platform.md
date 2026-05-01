@@ -239,7 +239,7 @@ Per provider-backed `AgentExecution`, the system records:
 - token or billed-unit counts when available,
 - cost in cents when available,
 - latency,
-- actual toolchain mapping diagnostics (Proposal 066),
+- actual toolchain mapping diagnostics,
 - raw receipt payload for debugging.
 
 This makes cost and performance visible in operator surfaces without discarding provider-specific truth.

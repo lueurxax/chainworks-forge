@@ -156,7 +156,7 @@ Tools are namespaced:
 **Operator Retry Instruction readback (P065):**
 `runs.get` includes compact retry-instruction provenance. `reports.get` includes full binding and delivery records, including raw text for operator-class principals.
 
-**Toolchain Mapping Readback (P066):**
+**Toolchain Mapping Readback:**
 `reports.get` includes a `toolchain_mapping` summary for each execution, detailing mapping status, effective scope, and relative root suffixes.
 
 Resources follow two URI families:
@@ -414,9 +414,9 @@ The system explicitly manages the SQLite Write-Ahead Log (WAL) to prevent unboun
 
 ### Provider runtime homes and toolchain caches
 
-Provider runtime homes are isolated from writable toolchain cache roots. Each 
-agent entry in the catalog can define a `toolchain_cache_policy` (Proposal 066) 
-to control how build and toolchain caches are mapped and isolated.
+Provider runtime homes are isolated from writable toolchain cache roots. Each
+agent entry in the catalog can define a `toolchain_cache_policy` to control how
+build and toolchain caches are mapped and isolated.
 
 **Policy Scope:**
 - `run` (default for Xcode): Cache root is tied to the run ID. Preserves 
@@ -498,7 +498,7 @@ migrated to a general owner model:
 | `stage_summaries` | Materialized stage projections (status, artifacts, approvals) |
 | `scheduler_queue_summaries` | Durable aggregate readback for queued/backpressured work |
 | `scheduler_health_snapshots` | Durable health readback for counts, pressure, latency |
-| `toolchain_cache_housekeeping_readbacks` | P066: Low-churn projection for periodic toolchain cleanup health |
+| `toolchain_cache_housekeeping_readbacks` | Low-churn projection for periodic toolchain cleanup health |
 | `approval_inbox` | Pending approval projection for operator surfaces |
 | `artifact_index` | Artifact discovery projection (format, pinned, report kind) |
 | `artifact_contract_summaries` | Structured verification truth for implementation assessment |
