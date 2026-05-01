@@ -1,0 +1,40 @@
+# P075 Write operation registry.
+#
+# Maps operation_name -> { class, replay_policy, idempotency_key_kind,
+#                           duplicate_application_test_path }
+#
+# Every WriteOperation.operation_name submitted to DbWriter must have an entry here.
+# The proposal-075 gate (Phase 7, fail-closed) fails on observed operation_names
+# not present in this registry (LIFT-REL-07).
+#
+# Required fields:
+#   operation_name              - stable string constant matching WriteOperation.operation_name
+#   class                       - "A", "B", "C", or "D"
+#   replay_policy               - "natural_key", "last_writer_wins", "checksum_idempotent",
+#                                  "caller_guarded", or "telemetry_merge"
+#   idempotency_key_kind        - description of the key format (e.g. "run_id/stage_id")
+#   duplicate_application_test_path - test path proving no double-application
+#                                  (required for caller_guarded; may be empty for others)
+#
+# Phase 1: seed entries only.  Phase 2 adds the first routed producer entries.
+
+[[operations]]
+operation_name = "p075_evidence_spool_ref_insert"
+class = "C"
+replay_policy = "checksum_idempotent"
+idempotency_key_kind = "(run_id, relative_path) — UNIQUE index enforced at SQL level"
+duplicate_application_test_path = "crates/db/src/repos/evidence_spool_refs.rs::tests::insert_idempotent_same_checksum"
+
+[[operations]]
+operation_name = "p075_evidence_spool_ref_recovery_sweep"
+class = "C"
+replay_policy = "checksum_idempotent"
+idempotency_key_kind = "(run_id, relative_path) with status=recovered_orphan"
+duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "p075_storage_write_pressure_snapshot_insert"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "window_start ISO timestamp"
+duplicate_application_test_path = ""

@@ -70,6 +70,14 @@ Denylist includes:
 - `DerivedData`, `.build`, `node_modules`
 - `.chainworks/*.db.backup-*`, `.chainworks/*.sqlite`
 
+### Evidence Spooling (Proposal 075)
+
+High-volume runtime evidence such as transcripts, tool traces, and raw runtime events are spooled directly to files under the run's `chainworks_meta_root/evidence/` directory.
+
+- **SQLite Metadata**: The engine records `EvidenceSpoolRef` pointers in the `evidence_spool_refs` table.
+- **Settlement Integration**: Spooled evidence is discovered and settled via the same engine-owned pipeline as other artifacts, but with a `Class C` write priority (metadata-only DB update after file fsync).
+- **Consistency**: The fsync-before-metadata ordering ensures that if the metadata exists in the DB, the corresponding evidence file is guaranteed to be durable on disk.
+
 ### Housekeeping Policy
 
 Discovery must avoid relying on cleanup for correctness, but the system maintains a housekeeping policy to manage generated-state growth.

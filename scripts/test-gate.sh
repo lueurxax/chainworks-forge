@@ -1676,6 +1676,7 @@ Available gates:
   proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
   proposal-065|p065  Proposal 065 operator retry instruction contract gate
   proposal-066|p066  Proposal 066 Phase 0 toolchain cache mapping scaffold gate
+  proposal-075|p075  Proposal 075 Phase 1 local persistence write budget scaffold gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -3759,6 +3760,51 @@ PLIST
     )
     run_targeted_tests "proposal-054" "${PROPOSAL_054_SWIFT_TESTS[@]}"
     log "Proposal 054 gate passed"
+    ;;
+  proposal-075|p075)
+    log "Proposal 075 Phase 1 gate: local persistence write budget scaffold (inventory mode)"
+
+    # Phase 1 gate: inventory mode.
+    # Verifies that the foundational types, migrations, allowlist, and registry
+    # are present and parse correctly. Does NOT enforce fail-closed on unlisted
+    # write owners (that is Phase 7). Reports inventory findings only.
+
+    log "P075 Phase 1: db crate unit tests (write_class, writer, bypass_allowlist, operation_registry)"
+    (
+      cd "$ROOT_DIR/control-plane"
+
+      log "P075: write_class types — WriteClass, WriteOperation, WriteResult, SpoolWriteOutcome"
+      cargo test -p db write_class:: -- --nocapture
+
+      log "P075: writer — DbWriter constants, lane order, phase-1 pass-through"
+      cargo test -p db writer:: -- --nocapture
+
+      log "P075: bypass_allowlist — parser, expiry, canonical file"
+      cargo test -p db bypass_allowlist:: -- --nocapture
+
+      log "P075: operation_registry — parser, validation, canonical file"
+      cargo test -p db operation_registry:: -- --nocapture
+
+      log "P075: evidence_spool_refs — migration + repo round-trips, CHECK constraints"
+      cargo test -p db repos::evidence_spool_refs:: -- --nocapture
+
+      log "P075: db crate full regression (all db tests must pass)"
+      cargo test -p db -- --nocapture
+    )
+
+    # Inventory-mode check: verify bypass allowlist and operation registry files exist.
+    P075_ALLOWLIST="$ROOT_DIR/control-plane/crates/db/write-bypass-allowlist.toml"
+    P075_REGISTRY="$ROOT_DIR/control-plane/crates/db/write-operation-registry.toml"
+    if [ ! -f "$P075_ALLOWLIST" ]; then
+      fail "P075: write-bypass-allowlist.toml missing at $P075_ALLOWLIST"
+    fi
+    log "P075 inventory: bypass allowlist present at $P075_ALLOWLIST"
+    if [ ! -f "$P075_REGISTRY" ]; then
+      fail "P075: write-operation-registry.toml missing at $P075_REGISTRY"
+    fi
+    log "P075 inventory: operation registry present at $P075_REGISTRY"
+
+    log "Proposal 075 Phase 1 gate passed (inventory mode)"
     ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then

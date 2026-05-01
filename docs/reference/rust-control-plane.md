@@ -356,30 +356,61 @@ work rather than by adding external infrastructure:
 - Capacity pressure leaves work pending/backpressured; capacity alone must not mark work failed.
 - Capacity state is durable, visible to operators, and supports backpressure alerts via GraphQL subscriptions and MCP notifications.
 
-### SQLite write serialization
+### SQLite write serialization and gateway (DbWriter)
+
+> **Phase 1 scaffold (Phases 2–8 deferred):** The DbWriter type, write classification types (WriteClass, WriteLane, WriteOperation, WriteResult), and priority lane constants are defined. The bounded MPSC executor, admission control, coalescing, heartbeat, and storageHealth monitoring are implemented in Phases 2–6. The description below reflects the intended design; behaviors marked with † are not yet active.
 
 The engine enforces a single-writer model for all domain mutations through a dedicated
-write coordination layer:
+write coordination layer, the `DbWriter` (Proposal 075):
 
+- **Single Bounded Gateway**: All non-test runtime writes must route through `DbWriter`. This prevents direct pool-level write contention and ensures write discipline.
+- **Write Classification**: Every write operation declares a class and priority lane:
+    - **Class A (Barrier)**: Synchronous, durable, never dropped. Used for canonical state transitions and side-effect intent.
+    - **Class B (Coalesced state)**: May be merged, delayed, or replaced (last-writer-wins). Used for noisy status updates and projection invalidations.
+    - **Class C (Evidence metadata)**: File written and fsynced first; metadata pointer enqueued to DB. Used for high-volume logs and traces.
+    - **Class D (Telemetry rollup)**: Aggregated in-memory summary; droppable under pressure.
+- **Priority Lanes**: Six bounded lanes (CriticalBarrier, OperatorCommand, ProjectionInvalidation, CoalescedProjection, EvidenceMetadata, TelemetryRollup) ensure that critical transitions are not starved by noisy background work.
+- **Shutdown Protocol**: Orderly drain of Class A lanes with specific budgets (e.g., `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`) before termination.
 - **Transaction Scope**: Multi-row invariants run in a single transaction under
-  `BEGIN IMMEDIATE` with bounded retry. This covers commands like `RetryStage`,
-  `CancelRun`, and `StartupRepair` where multiple table updates must be atomic.
+  `BEGIN IMMEDIATE` with bounded retry (P061 primitive).
 - **Atomic Supersession**: Operations like `RetryStage` atomically supersede old
   stage attempts, active agent executions, work items, and artifact source claims
   to prevent stale running work.
 - **Excluded I/O**: Provider I/O, filesystem scans, and network waits never run
   inside a database transaction.
 - **Write Coordination**: The `engine` crate owns command ordering and recovery
-  semantics, while `db` exposes transaction-scoped repository methods.
+  semantics, while `db` exposes transaction-scoped repository methods and the `DbWriter` actor.
 - **Command Latency**: The system targets p95 command latency (approve, retry, cancel)
-  below 2 seconds even under saturated agent load. The retained `proposal-061` gate alias enforces
-  this under a load of 20 active fake agents.
+  below 2 seconds even under saturated agent load.
 - **Contention Monitoring**: DB write lock wait time and transaction duration are
-  instrumented and exposed via GraphQL and MCP. SQLITE_BUSY retries are logged
-  and surfaced if exhausted.
-- **Host Interruption Recovery**: Detected host sleep/wake and network migration
-  epochs classify affected executions, which are then cleaned up and requeued
-  with jitter under capacity caps. Retries are exempt from provider quota budgets.
+  instrumented. `storageHealth.writer.alive` surfaces writer-actor heartbeats.
+
+### Evidence spooling
+
+> **Phase 1 scaffold (Phase 3 deferred):** The evidence_spool_refs schema and metadata repository are present. The evidence file spool module (temp write, checksum, fsync, atomic rename, orphan sweep) is implemented in Phase 3.
+
+High-volume runtime evidence is spooled to the local filesystem instead of being inserted row-by-row into SQLite (Proposal 075):
+
+- **Metadata Pointers**: SQLite stores compact metadata (path, checksum, size, kind, owner) in the `evidence_spool_refs` table.
+- **Filesystem First**: The evidence file must be written, checksummed, and fsynced to disk **before** the Class C metadata write is enqueued to `DbWriter`.
+- **Artifact Integration**: Spooled evidence is integrated into the settlement pipeline and exposed via the `Artifact` domain model.
+- **Categories**: Transcripts, tool-traces, stdout/stderr snippets, and raw runtime events are primary candidates for spooling.
+
+### Repository boundary and guardrails
+
+The system enforces the single-writer model through a strict repository boundary. All runtime writes must be approved and registered.
+
+- **Write-Bypass Allowlist**: A checked-in TOML file at `control-plane/crates/db/write-bypass-allowlist.toml` tracks all authorized direct DB writes (migrations, tests, startup repair, and temporary rollout bypasses). Every entry requires an owner, reason, scope, retirement criteria, and an expiration phase.
+- **Write Operation Registry**: A checked-in TOML file at `control-plane/crates/db/write-operation-registry.toml` maps every `WriteOperation.operation_name` to its class, replay policy, and idempotency key kind.
+- **Gate Enforcement**: The `proposal-075` gate (Phase 7 fail-closed) fails on unlisted runtime write owners, entries missing retirement data, or operations not present in the registry.
+
+### WAL and checkpoint policy
+
+The system explicitly manages the SQLite Write-Ahead Log (WAL) to prevent unbound growth:
+
+- **PASSIVE Checkpoint**: Requested when WAL exceeds `WARN_WAL_SIZE_BYTES` (128 MiB) and no Class A write is waiting.
+- **HARD Upper Bound**: A barrier-coordinated brief checkpoint window is opened when WAL exceeds `HARD_WAL_UPPER_BOUND_BYTES` (1 GiB).
+- **Shutdown Checkpoint**: A TRUNCATE checkpoint is performed on graceful shutdown after the Class A drain.
 
 ### Provider runtime homes and toolchain caches
 
@@ -423,7 +454,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `039_p075_evidence_spool_refs.sql`, `040_p075_storage_write_pressure_snapshots.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -443,6 +474,8 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `run_knowledge_capsule_attachments` | P064: Links between matching capsules and an active run |
 | `retry_operator_instruction_bindings` | P065: Durable parent bindings for operator-guided retries (ARCH-065) |
 | `retry_operator_instruction_deliveries` | P065: Per-work-item delivery records for retry instructions (ARCH-065) |
+| `evidence_spool_refs` | P075: Compact metadata pointers to high-volume evidence files |
+| `storage_write_pressure_snapshots` | P075: Durable snapshots of writer lane depth and lock wait latency |
 | `approvals` | Approval requests with decision, timestamps, expiry |
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |

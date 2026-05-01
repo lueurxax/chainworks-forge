@@ -1629,3 +1629,34 @@ Important:
 - `p064` is accepted as an alias
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
+
+### `proposal-075|p075`
+
+Proposal 075 Phase 1 local persistence write budget scaffold gate.
+
+Scope:
+
+- `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
+- `writer`: `DbWriter` constants, lane order, phase-1 pass-through
+- `bypass_allowlist`: parser, expiry, canonical file validation
+- `operation_registry`: parser, validation, canonical file validation
+- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints
+- `storage_write_pressure_snapshots` migration and validation
+- fails closed if `write-bypass-allowlist.toml` or `write-operation-registry.toml` are missing or invalid
+
+Use when:
+
+- changing write classes, priority lanes, or `DbWriter` constants
+- updating the DB write-bypass allowlist or write-operation registry
+- changing evidence spool references or storage write-pressure snapshots
+
+Host policy:
+
+- local Rust toolchain required; no UI target or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-075
+```
+

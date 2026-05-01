@@ -1,3 +1,4 @@
+pub mod evidence_spool_refs;
 pub mod agent_execution_discovery_diagnostics;
 pub mod agent_execution_runtime_facts;
 pub mod agent_executions;
