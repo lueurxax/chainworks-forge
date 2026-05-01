@@ -1,5 +1,5 @@
 use acp::AcpRuntimeManager;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::Path;
@@ -13,7 +13,6 @@ use db::repos::{
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
-use domain::PrincipalClass;
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::commands::{CallerContext, Command};
@@ -27,11 +26,12 @@ use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
+use domain::PrincipalClass;
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
 use crate::preflight::{
-    DeliveryPreflightResult, missing_delivery_configuration_preflight, run_delivery_preflight,
+    missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
 use crate::work_queue::WorkQueue;
 
@@ -222,6 +222,28 @@ fn is_release_agent(agent_id: &str) -> bool {
     matches!(
         agent_id,
         "commit_and_push_to_github" | "build_archive_and_push_connect"
+    )
+}
+
+fn retry_requires_effect_reconciliation(
+    stage: &StageExecution,
+    target_agent_id: Option<&str>,
+) -> bool {
+    let stage_type_requires_guard = matches!(
+        stage.stage_type.as_deref(),
+        Some("release" | "side_effect" | "side-effect")
+    );
+    stage_type_requires_guard
+        || is_release_agent(&stage.stage_id)
+        || stage.owner_agent.as_deref().is_some_and(is_release_agent)
+        || target_agent_id.is_some_and(is_release_agent)
+}
+
+fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error {
+    anyhow!(
+        "requires_effect_reconciliation: retry for stage {} ({}) requires durable side-effect reconciliation before retry",
+        stage.stage_id,
+        stage.id
     )
 }
 
@@ -431,7 +453,11 @@ fn targeted_retry_fallback_profile_id<'a>(
     }
     if is_security_checker {
         let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
-            &["codex_architect_high", "codex_audit_high", "codex_writer_high"]
+            &[
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ]
         } else {
             &["claude_security_high", "claude_product_high"]
         };
@@ -1418,6 +1444,20 @@ impl CommandHandler {
                         c.stage_id,
                         old_stage.status
                     );
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
+
+                if retry_requires_effect_reconciliation(old_stage, None) {
+                    let error = requires_effect_reconciliation_error(old_stage);
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
@@ -3009,6 +3049,9 @@ impl CommandHandler {
                 stage_id,
                 old_stage.status
             ));
+        }
+        if retry_requires_effect_reconciliation(&old_stage, Some(&target_exec.agent_id)) {
+            return Err(requires_effect_reconciliation_error(&old_stage));
         }
 
         let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
