@@ -1400,6 +1400,44 @@ Command:
 ./scripts/test-gate.sh proposal-065
 ```
 
+### `proposal-066|p066`
+
+Historical gate alias for the implemented provider toolchain cache mapping contract.
+
+Scope:
+
+- Swift guardrail proving `ToolchainMappingReadAdapter` owns toolchain policy decoding for operator-facing consumers
+- workflow catalog schema and frozen snapshot compatibility checks for `toolchain_cache_policy`
+- domain failure-kind coverage for setup failure and Xcode queue timeout
+- database migration and `actual_toolchain_mapping_diagnostics_json` persistence coverage
+- GraphQL, MCP, and report readback synthesis for active, disabled, unsupported, failed, queued, and legacy mapping states
+- Xcode host-executor argument and `TMPDIR` rewriting, Go environment mapping, and per-run Xcode lease behavior
+- startup recovery and housekeeping readbacks for toolchain cache cleanup
+- migration drill coverage for legacy NULL rows and post-migration diagnostics rows
+
+Use when:
+
+- changing `toolchain_cache_policy` schema or frozen snapshot compatibility
+- changing ACP toolchain directory preparation, Xcode host-executor mapping, Go cache environment shaping, or per-run Xcode lease behavior
+- changing GraphQL/MCP/report exposure of `actualToolchainMappingDiagnostics`
+- changing startup recovery or housekeeping readbacks for toolchain cache roots
+
+Host policy:
+
+- local Rust toolchain required
+- no live provider account, simulator, daemon process, UI target, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-066
+```
+
+Important:
+
+- `p066` is accepted as an alias; the historical gate name is retained for stable automation compatibility
+- this gate proves the Phase 0 scaffold and readback contract, not dogfood promotion for Xcode or Go defaults
+
 ### `proposal-060|p060`
 
 Deterministic reviewer routing and expanded reviewer catalog gate.

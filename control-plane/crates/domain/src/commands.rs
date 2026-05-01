@@ -113,6 +113,8 @@ pub struct ResolveWorkflowConflictTransitionCmd {
     pub conflict_id: String,
     pub selected_transition_id: String,
     pub resolution_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_instruction: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

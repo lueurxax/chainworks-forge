@@ -14,8 +14,8 @@ use crate::protocol::JsonRpcRequest;
 use crate::protocol::JsonRpcResponse;
 use crate::protocol::McpTool;
 use crate::tools;
-use domain::events::DomainEvent;
 use domain::ResourceTemplateId;
+use domain::events::DomainEvent;
 
 pub struct McpServer {
     pool: SqlitePool,
@@ -315,8 +315,12 @@ impl McpServer {
                 }
 
                 let tool_params = params["arguments"].clone();
+                let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
-                match self.dispatch_tool(&tool_name, tool_params, principal).await {
+                match self
+                    .dispatch_tool(canonical_tool_name, tool_params, principal)
+                    .await
+                {
                     Ok(result) => JsonRpcResponse::success(
                         id,
                         serde_json::json!({
@@ -358,7 +362,7 @@ impl McpServer {
                             id,
                             -32602,
                             "resources/read requires a 'uri' parameter".to_string(),
-                        )
+                        );
                     }
                 };
                 if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
@@ -388,6 +392,7 @@ impl McpServer {
             .into_iter()
             .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(tools::mcp_tool_for)
+            .map(tools::codex_compatible_tool)
             .collect()
     }
 
@@ -851,6 +856,7 @@ mod p029_capability_tests {
             .into_iter()
             .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(|id| tools::mcp_tool_for(id).name)
+            .map(|name| name.replace('.', "_"))
             .collect()
     }
 
@@ -902,8 +908,9 @@ mod p029_capability_tests {
             "steward.list_analyses",
             "steward.get_analysis",
         ] {
+            let expected = expected.replace('.', "_");
             assert!(
-                names.contains(expected),
+                names.contains(&expected),
                 "operator tools/list must expose {expected}, got {names:?}"
             );
         }
@@ -923,7 +930,8 @@ mod p029_capability_tests {
             "runs.get",
             "reports.get",
         ] {
-            assert!(names.contains(expected), "agent missing {expected}");
+            let expected = expected.replace('.', "_");
+            assert!(names.contains(&expected), "agent missing {expected}");
         }
         for forbidden in [
             "runs.main_sync.request",
@@ -941,7 +949,11 @@ mod p029_capability_tests {
             "steward.list_analyses",
             "steward.get_analysis",
         ] {
-            assert!(!names.contains(forbidden), "agent must not see {forbidden}");
+            let forbidden = forbidden.replace('.', "_");
+            assert!(
+                !names.contains(&forbidden),
+                "agent must not see {forbidden}"
+            );
         }
     }
 
@@ -960,7 +972,8 @@ mod p029_capability_tests {
             "steward.list_analyses",
             "steward.get_analysis",
         ] {
-            assert!(names.contains(expected), "observer missing {expected}");
+            let expected = expected.replace('.', "_");
+            assert!(names.contains(&expected), "observer missing {expected}");
         }
         for forbidden in [
             "ideas.create",
@@ -971,8 +984,9 @@ mod p029_capability_tests {
             "legacy_discovery_override_create",
             "steward.run_analysis",
         ] {
+            let forbidden = forbidden.replace('.', "_");
             assert!(
-                !names.contains(forbidden),
+                !names.contains(&forbidden),
                 "observer must not see {forbidden}"
             );
         }
@@ -1049,9 +1063,9 @@ mod p029_capability_tests {
     fn test_mcp_tools_list_includes_steward_trio_for_operator() {
         let op = Principal::new("op", PrincipalClass::Operator);
         let names = tools_list_names_for(&op);
-        assert!(names.contains("steward.run_analysis"));
-        assert!(names.contains("steward.list_analyses"));
-        assert!(names.contains("steward.get_analysis"));
+        assert!(names.contains("steward_run_analysis"));
+        assert!(names.contains("steward_list_analyses"));
+        assert!(names.contains("steward_get_analysis"));
     }
 
     #[test]
@@ -1059,20 +1073,20 @@ mod p029_capability_tests {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         let names = tools_list_names_for(&ob);
         assert!(
-            !names.contains("steward.run_analysis"),
+            !names.contains("steward_run_analysis"),
             "observer must NOT see steward.run_analysis"
         );
-        assert!(names.contains("steward.list_analyses"));
-        assert!(names.contains("steward.get_analysis"));
+        assert!(names.contains("steward_list_analyses"));
+        assert!(names.contains("steward_get_analysis"));
     }
 
     #[test]
     fn test_mcp_tools_list_excludes_steward_entirely_for_agent() {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let names = tools_list_names_for(&ag);
-        assert!(!names.contains("steward.run_analysis"));
-        assert!(!names.contains("steward.list_analyses"));
-        assert!(!names.contains("steward.get_analysis"));
+        assert!(!names.contains("steward_run_analysis"));
+        assert!(!names.contains("steward_list_analyses"));
+        assert!(!names.contains("steward_get_analysis"));
     }
 
     #[test]
@@ -1124,9 +1138,8 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, projections, runs, steward, validation};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        parse_implementation_self_assessment_v2, ContractParseContext,
-        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -1347,6 +1360,7 @@ mod tests {
                 output_tokens: None,
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
             },
         )
         .await

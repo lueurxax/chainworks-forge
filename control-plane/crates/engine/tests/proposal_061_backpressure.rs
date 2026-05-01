@@ -6,7 +6,7 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{Duration, Utc};
 use db::pool::create_pool;
 use db::repos::{
-    agent_executions, approvals, artifact_contracts, ideas, runs, scheduler, stages,
+    agent_executions, approvals, artifact_contracts, ideas, runs, scheduler, sessions, stages,
     startup_repairs, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
@@ -27,6 +27,7 @@ use domain::provider::{
     InvokeAgentCapacityConfig as DomainInvokeAgentCapacityConfig, ProviderFamily,
 };
 use domain::run::{Run, RunStatus};
+use domain::session::{SessionGeneration, SessionGenerationStatus, SessionLineage};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use engine::command_handler::CommandHandler;
 use engine::executor::{
@@ -144,6 +145,7 @@ fn make_running_execution(stage_execution_id: StageExecutionId, provider: &str) 
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     }
 }
 
@@ -184,6 +186,34 @@ fn make_invoke_work_item(
         attempt_count: 0,
         last_error: None,
     }
+}
+
+fn make_xcode_invoke_work_item(
+    id: &str,
+    run_id: RunId,
+    stage_execution_id: StageExecutionId,
+    stage_id: &str,
+    status: WorkItemStatus,
+    scheduled_offset_seconds: i64,
+) -> WorkItem {
+    let mut item = make_invoke_work_item(
+        id,
+        run_id,
+        stage_execution_id,
+        stage_id,
+        "claude",
+        scheduled_offset_seconds,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+    payload["requested_mcp_server_ids"] = serde_json::json!(["xcode"]);
+    payload["xcode_broker_required"] = serde_json::json!(true);
+    payload["requires_xcode_host_execution"] = serde_json::json!(true);
+    item.payload_json = payload.to_string();
+    item.status = status;
+    if item.status == WorkItemStatus::Running {
+        item.attempt_count = 1;
+    }
+    item
 }
 
 fn test_workflow_yaml_path() -> String {
@@ -482,6 +512,7 @@ async fn command_handler_refreshes_scheduler_projection_with_configured_capacity
     let capacity = DomainInvokeAgentCapacityConfig {
         global_active_agent_executions: 20,
         per_run_active_agent_executions: 10,
+        xcode_mcp_active_invocations: 4,
         provider_caps: BTreeMap::from([(ProviderFamily::Codex, 1)]),
     };
     let handler = CommandHandler::new_with_capacity(
@@ -978,6 +1009,486 @@ async fn startup_repair_requeues_abandoned_running_invoke_agent() {
             .contains("startup_repair_abandoned_invoke_agent"),
         "startup recovery reason should be persisted in payload"
     );
+}
+
+#[tokio::test]
+async fn startup_repair_requeues_stale_acp_startup_without_provider_session() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    let stale_started_at = now - Duration::minutes(10);
+    let lineage_id = uuid::Uuid::new_v4().to_string();
+    let generation_id = uuid::Uuid::new_v4().to_string();
+    let invocation_owner_key = "stale-acp-startup-owner";
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 stale ACP startup".into(),
+            body: "restart recovery".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation"),
+    )
+    .await
+    .unwrap();
+    sessions::insert_lineage(
+        &pool,
+        &SessionLineage {
+            id: lineage_id.clone(),
+            run_id: run_id.to_string(),
+            agent_id: "claude_agent".into(),
+            lineage_id: invocation_owner_key.into(),
+            session_reuse_scope: "same_agent_family_within_run".into(),
+            session_family_id: Some("claude_agent".into()),
+            active_generation_id: Some(generation_id.clone()),
+            created_at: stale_started_at,
+            closed_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    sessions::insert_generation(
+        &pool,
+        &SessionGeneration {
+            id: generation_id.clone(),
+            lineage_id: lineage_id.clone(),
+            generation: 1,
+            invocation_owner_key: invocation_owner_key.into(),
+            provider_session_id: None,
+            binding_fingerprint: "binding".into(),
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: "/tmp/workspace".into(),
+            workspace_mode: "read_only".into(),
+            runtime_provider: "claude".into(),
+            runtime_model: "default".into(),
+            status: SessionGenerationStatus::Active,
+            turn_count: 0,
+            estimated_input_tokens: 0,
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at: stale_started_at,
+            last_activity_at: None,
+            ended_at: None,
+            end_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut execution = make_running_execution(stage_execution_id, "claude");
+    execution.started_at = stale_started_at;
+    execution.session_lineage_id = Some(lineage_id.clone());
+    execution.session_generation_id = Some(generation_id.clone());
+    execution.invocation_owner_key = Some(invocation_owner_key.into());
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let mut invoke = make_invoke_work_item(
+        "stale-acp-startup",
+        run_id,
+        stage_execution_id,
+        "implementation",
+        "claude",
+        -600,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["p058_claimed"] = serde_json::json!({
+        "agent_execution_id": execution_id.to_string()
+    });
+    invoke.payload_json = payload.to_string();
+    invoke.status = WorkItemStatus::Running;
+    work_items::enqueue(&pool, &invoke).await.unwrap();
+    sqlx::query("UPDATE work_items SET started_at = ?1 WHERE id = ?2")
+        .bind(stale_started_at.to_rfc3339())
+        .bind("stale-acp-startup")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let requeued = recovery
+        .repair_stale_invoke_agent_startups(now, Duration::minutes(3))
+        .await
+        .unwrap();
+
+    assert_eq!(requeued, 1);
+    let recovered = work_items::find_by_id(&pool, "stale-acp-startup")
+        .await
+        .unwrap()
+        .expect("work item remains auditable");
+    assert_eq!(recovered.status, WorkItemStatus::Pending);
+    assert!(
+        recovered
+            .payload_json
+            .contains("startup_repair_stale_acp_startup"),
+        "startup recovery reason should be persisted in payload"
+    );
+
+    let execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .expect("execution remains auditable");
+    assert_eq!(execution.status, AgentStatus::Cancelled);
+
+    let generation = sessions::find_generation_by_id(&pool, &generation_id)
+        .await
+        .unwrap()
+        .expect("generation remains auditable");
+    assert_eq!(generation.status, SessionGenerationStatus::Invalidated);
+    assert_eq!(
+        generation.end_reason.as_deref(),
+        Some("stale_acp_startup_without_provider_session")
+    );
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_events WHERE generation_id = ?1 AND event_type = ?2",
+    )
+    .bind(&generation_id)
+    .bind("invalidated")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count, 1);
+}
+
+#[tokio::test]
+async fn startup_repair_preserves_xcode_acp_startup_until_modal_grace_expires() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    let stale_started_at = now - Duration::minutes(10);
+    let lineage_id = uuid::Uuid::new_v4().to_string();
+    let generation_id = uuid::Uuid::new_v4().to_string();
+    let invocation_owner_key = "xcode-acp-startup-owner";
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 xcode ACP startup grace".into(),
+            body: "restart recovery".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation"),
+    )
+    .await
+    .unwrap();
+    sessions::insert_lineage(
+        &pool,
+        &SessionLineage {
+            id: lineage_id.clone(),
+            run_id: run_id.to_string(),
+            agent_id: "claude_agent".into(),
+            lineage_id: invocation_owner_key.into(),
+            session_reuse_scope: "same_agent_family_within_run".into(),
+            session_family_id: Some("claude_agent".into()),
+            active_generation_id: Some(generation_id.clone()),
+            created_at: stale_started_at,
+            closed_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    sessions::insert_generation(
+        &pool,
+        &SessionGeneration {
+            id: generation_id.clone(),
+            lineage_id: lineage_id.clone(),
+            generation: 1,
+            invocation_owner_key: invocation_owner_key.into(),
+            provider_session_id: None,
+            binding_fingerprint: "binding".into(),
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: "/tmp/workspace".into(),
+            workspace_mode: "read_only".into(),
+            runtime_provider: "claude".into(),
+            runtime_model: "default".into(),
+            status: SessionGenerationStatus::Active,
+            turn_count: 0,
+            estimated_input_tokens: 0,
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at: stale_started_at,
+            last_activity_at: None,
+            ended_at: None,
+            end_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut execution = make_running_execution(stage_execution_id, "claude");
+    execution.started_at = stale_started_at;
+    execution.session_lineage_id = Some(lineage_id.clone());
+    execution.session_generation_id = Some(generation_id.clone());
+    execution.invocation_owner_key = Some(invocation_owner_key.into());
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let mut invoke = make_invoke_work_item(
+        "xcode-acp-startup",
+        run_id,
+        stage_execution_id,
+        "implementation",
+        "claude",
+        -600,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["xcode_broker_required"] = serde_json::json!(true);
+    payload["requested_mcp_server_ids"] = serde_json::json!(["xcode"]);
+    payload["p058_claimed"] = serde_json::json!({
+        "agent_execution_id": execution_id.to_string()
+    });
+    invoke.payload_json = payload.to_string();
+    invoke.status = WorkItemStatus::Running;
+    work_items::enqueue(&pool, &invoke).await.unwrap();
+    sqlx::query("UPDATE work_items SET started_at = ?1 WHERE id = ?2")
+        .bind(stale_started_at.to_rfc3339())
+        .bind("xcode-acp-startup")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let requeued = recovery
+        .repair_stale_invoke_agent_startups(now, Duration::minutes(3))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        requeued, 0,
+        "Xcode ACP startup should keep waiting through the long modal grace"
+    );
+    let preserved = work_items::find_by_id(&pool, "xcode-acp-startup")
+        .await
+        .unwrap()
+        .expect("work item remains auditable");
+    assert_eq!(preserved.status, WorkItemStatus::Running);
+    let execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .expect("execution remains auditable");
+    assert_eq!(execution.status, AgentStatus::Running);
+    let generation = sessions::find_generation_by_id(&pool, &generation_id)
+        .await
+        .unwrap()
+        .expect("generation remains auditable");
+    assert_eq!(generation.status, SessionGenerationStatus::Active);
+}
+
+#[tokio::test]
+async fn startup_repair_preserves_xcode_pre_session_startup_until_modal_grace_expires() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    let started_at = now - Duration::minutes(10);
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 xcode pre-session grace".into(),
+            body: "restart recovery".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation"),
+    )
+    .await
+    .unwrap();
+
+    let mut execution = make_running_execution(stage_execution_id, "claude");
+    execution.started_at = started_at;
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let mut invoke = make_invoke_work_item(
+        "xcode-pre-session",
+        run_id,
+        stage_execution_id,
+        "implementation",
+        "claude",
+        -600,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["xcode_broker_required"] = serde_json::json!(true);
+    payload["requested_mcp_server_ids"] = serde_json::json!(["xcode"]);
+    payload["p058_claimed"] = serde_json::json!({
+        "agent_execution_id": execution_id.to_string()
+    });
+    invoke.payload_json = payload.to_string();
+    invoke.status = WorkItemStatus::Running;
+    work_items::enqueue(&pool, &invoke).await.unwrap();
+    sqlx::query("UPDATE work_items SET started_at = ?1 WHERE id = ?2")
+        .bind(started_at.to_rfc3339())
+        .bind("xcode-pre-session")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let requeued = recovery
+        .repair_stale_invoke_agent_startups(now, Duration::minutes(3))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        requeued, 0,
+        "Xcode pre-session startup should keep waiting through the long modal grace"
+    );
+    let preserved = work_items::find_by_id(&pool, "xcode-pre-session")
+        .await
+        .unwrap()
+        .expect("work item remains auditable");
+    assert_eq!(preserved.status, WorkItemStatus::Running);
+    let execution = agent_executions::find_by_id(&pool, execution_id)
+        .await
+        .unwrap()
+        .expect("execution remains auditable");
+    assert_eq!(execution.status, AgentStatus::Running);
+}
+
+#[tokio::test]
+async fn startup_repair_requeues_non_xcode_pre_session_startup_after_short_grace() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let now = Utc::now();
+    let started_at = now - Duration::minutes(10);
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061 non-xcode pre-session".into(),
+            body: "restart recovery".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(run_id, stage_execution_id, "implementation"),
+    )
+    .await
+    .unwrap();
+
+    let mut execution = make_running_execution(stage_execution_id, "claude");
+    execution.started_at = started_at;
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let mut invoke = make_invoke_work_item(
+        "non-xcode-pre-session",
+        run_id,
+        stage_execution_id,
+        "implementation",
+        "claude",
+        -600,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["p058_claimed"] = serde_json::json!({
+        "agent_execution_id": execution_id.to_string()
+    });
+    invoke.payload_json = payload.to_string();
+    invoke.status = WorkItemStatus::Running;
+    work_items::enqueue(&pool, &invoke).await.unwrap();
+    sqlx::query("UPDATE work_items SET started_at = ?1 WHERE id = ?2")
+        .bind(started_at.to_rfc3339())
+        .bind("non-xcode-pre-session")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let requeued = recovery
+        .repair_stale_invoke_agent_startups(now, Duration::minutes(3))
+        .await
+        .unwrap();
+
+    assert_eq!(requeued, 1);
+    let recovered = work_items::find_by_id(&pool, "non-xcode-pre-session")
+        .await
+        .unwrap()
+        .expect("work item remains auditable");
+    assert_eq!(recovered.status, WorkItemStatus::Pending);
+    assert!(recovered
+        .payload_json
+        .contains("startup_repair_stale_acp_pre_session_startup"));
 }
 
 #[tokio::test]
@@ -1618,6 +2129,7 @@ async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_
     let capacity = StartCapacityConfig {
         max_active_total: 6,
         max_active_per_run: 10,
+        max_active_xcode_mcp: 4,
         provider_caps: HashMap::from([("gemini".into(), 1), ("codex".into(), 3)]),
     };
 
@@ -1655,6 +2167,91 @@ async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_
                 && summary.global_queue_depth == 1
         }),
         "claim/start must refresh scheduler projection in the same write unit for remaining backpressured work: {summaries:?}"
+    );
+}
+
+#[tokio::test]
+async fn xcode_mcp_capacity_backpressure_is_reported_as_its_own_reason() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let running_xcode_stage = StageExecutionId::new();
+    let pending_xcode_stage = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061".into(),
+            body: "xcode capacity reason".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    for (stage_execution_id, stage_id) in [
+        (running_xcode_stage, "running_xcode"),
+        (pending_xcode_stage, "pending_xcode"),
+    ] {
+        stages::insert(&pool, &make_stage(run_id, stage_execution_id, stage_id))
+            .await
+            .unwrap();
+    }
+
+    work_items::enqueue(
+        &pool,
+        &make_xcode_invoke_work_item(
+            "running-xcode",
+            run_id,
+            running_xcode_stage,
+            "running_xcode",
+            WorkItemStatus::Running,
+            -2,
+        ),
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &make_xcode_invoke_work_item(
+            "pending-xcode",
+            run_id,
+            pending_xcode_stage,
+            "pending_xcode",
+            WorkItemStatus::Pending,
+            -1,
+        ),
+    )
+    .await
+    .unwrap();
+
+    scheduler::refresh_queue_summaries(
+        &pool,
+        &DomainInvokeAgentCapacityConfig {
+            global_active_agent_executions: 10,
+            per_run_active_agent_executions: 10,
+            xcode_mcp_active_invocations: 1,
+            provider_caps: BTreeMap::from([(ProviderFamily::Claude, 10)]),
+        },
+    )
+    .await
+    .unwrap();
+
+    let summaries = scheduler::list_queue_summaries(&pool).await.unwrap();
+    assert!(
+        summaries.iter().any(|summary| {
+            summary.run_id.as_deref() == Some(&run_id.to_string())
+                && summary.provider_family.as_deref() == Some("claude")
+                && summary.top_reason == "xcode_mcp_capacity"
+        }),
+        "Xcode MCP queue pressure must not be reported as generic queued/projection lag: {summaries:?}"
     );
 }
 
@@ -1704,6 +2301,7 @@ async fn invoke_agent_capacity_precheck_reports_when_all_pending_work_is_blocked
     let capacity = StartCapacityConfig {
         max_active_total: 6,
         max_active_per_run: 10,
+        max_active_xcode_mcp: 4,
         provider_caps: HashMap::from([("gemini".into(), 1), ("codex".into(), 3)]),
     };
 
@@ -1845,6 +2443,7 @@ async fn invoke_agent_claim_prefers_least_recently_served_run_within_candidate_w
         &StartCapacityConfig {
             max_active_total: usize::MAX,
             max_active_per_run: usize::MAX,
+            max_active_xcode_mcp: usize::MAX,
             provider_caps: HashMap::new(),
         },
     )
@@ -2696,7 +3295,9 @@ async fn transient_persistence_contention_requeues_running_work_without_failure_
     );
     assert_eq!(
         stored.last_error.as_deref(),
-        Some("transient_persistence_contention: error returned from database: (code: 5) database is locked")
+        Some(
+            "transient_persistence_contention: error returned from database: (code: 5) database is locked"
+        )
     );
 
     let failed_count: i64 =

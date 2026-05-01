@@ -67,6 +67,7 @@ pub enum CommandResult {
         conflict_id: String,
         selected_transition_id: String,
         selected_next_state_id: String,
+        retry_instruction_binding_id: Option<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -224,6 +225,61 @@ fn is_release_agent(agent_id: &str) -> bool {
     )
 }
 
+fn retry_requires_effect_reconciliation(
+    stage: &StageExecution,
+    target_agent_id: Option<&str>,
+    has_release_post_approval_tasks: bool,
+) -> bool {
+    let stage_type_requires_guard = matches!(
+        stage.stage_type.as_deref(),
+        Some("release" | "side_effect" | "side-effect")
+    );
+    stage_type_requires_guard
+        || has_release_post_approval_tasks
+        || is_release_agent(&stage.stage_id)
+        || stage.owner_agent.as_deref().is_some_and(is_release_agent)
+        || target_agent_id.is_some_and(is_release_agent)
+}
+
+fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
+    let plan = match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json)) => {
+            workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                run.agent_catalog_yaml_path.as_deref().unwrap_or("."),
+            )?
+        }
+        _ => match (
+            run.workflow_yaml_path.as_deref(),
+            run.agent_catalog_yaml_path.as_deref(),
+        ) {
+            (Some(workflow_path), Some(catalog_path)) => {
+                workflow::compiler::compile(workflow_path, catalog_path)?
+            }
+            _ => return Ok(false),
+        },
+    };
+
+    Ok(plan.states.get(stage_id).is_some_and(|state| {
+        state
+            .post_approval_tasks
+            .iter()
+            .any(|task| is_release_agent(&task.agent.agent_id))
+    }))
+}
+
+fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error {
+    anyhow!(
+        "requires_effect_reconciliation: retry for stage {} ({}) requires durable side-effect reconciliation before retry",
+        stage.stage_id,
+        stage.id
+    )
+}
+
 fn find_source_invoke_work_item<'a>(
     work_items: &'a [WorkItem],
     stage_execution_id: &str,
@@ -298,7 +354,18 @@ fn targeted_retry_provider_fallback(
                     .any(|value| value.as_str() == Some("proposal_current"))
             })
             .unwrap_or(false);
-    if !is_proposal_review && !is_proposal_review_aggregation && !is_proposal_authoring {
+    let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
+    let is_security_checker =
+        agent_id == "security_checker" && output_contract == Some("security_report_v1");
+    let is_prepush_reviewer =
+        agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1");
+    if !is_proposal_review
+        && !is_proposal_review_aggregation
+        && !is_proposal_authoring
+        && !is_docs_guardian
+        && !is_security_checker
+        && !is_prepush_reviewer
+    {
         return None;
     }
     let source_failed_without_required_outputs = runtime_facts
@@ -340,6 +407,9 @@ fn targeted_retry_provider_fallback(
         &from_provider,
         is_proposal_review_aggregation,
         is_proposal_authoring,
+        is_docs_guardian,
+        is_security_checker,
+        is_prepush_reviewer,
         profiles,
     )?;
     let profile = profiles.get(fallback_id)?.as_object()?;
@@ -373,6 +443,9 @@ fn targeted_retry_fallback_profile_id<'a>(
     from_provider: &str,
     is_proposal_review_aggregation: bool,
     is_proposal_authoring: bool,
+    is_docs_guardian: bool,
+    is_security_checker: bool,
+    is_prepush_reviewer: bool,
     profiles: &'a serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'a str> {
     if is_proposal_review_aggregation {
@@ -386,6 +459,51 @@ fn targeted_retry_fallback_profile_id<'a>(
             &["claude_writer_high", "claude_product_high"]
         } else {
             &["codex_writer_high", "codex_architect_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_docs_guardian {
+        let candidates: &[&str] = if matches!(from_provider, "gemini" | "gemini_acp") {
+            &[
+                "claude_docs_medium",
+                "claude_design_medium",
+                "codex_architect_high",
+            ]
+        } else {
+            &[
+                "gemini_docs_flash",
+                "claude_docs_medium",
+                "codex_architect_high",
+            ]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_security_checker {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &[
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ]
+        } else {
+            &["claude_security_high", "claude_product_high"]
+        };
+        return candidates
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
+    if is_prepush_reviewer {
+        let candidates: &[&str] = if matches!(from_provider, "claude" | "claude_acp") {
+            &["codex_architect_high", "codex_writer_high"]
+        } else {
+            &["claude_prepush_medium", "claude_product_high"]
         };
         return candidates
             .iter()
@@ -1371,6 +1489,37 @@ impl CommandHandler {
                     return Err(error);
                 }
 
+                let has_release_post_approval_tasks =
+                    match retry_state_has_release_post_approval_tasks(&run, &old_stage.stage_id) {
+                        Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+                        Err(e) => {
+                            warn!(
+                                run_id = %c.run_id,
+                                stage_id = %old_stage.stage_id,
+                                error = %e,
+                                "RetryStage side-effect preflight could not inspect post_approval_tasks"
+                            );
+                            false
+                        }
+                    };
+                if retry_requires_effect_reconciliation(
+                    old_stage,
+                    None,
+                    has_release_post_approval_tasks,
+                ) {
+                    let error = requires_effect_reconciliation_error(old_stage);
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
+
                 let next_attempt_number = matching_stages
                     .iter()
                     .map(|s| s.attempt_number)
@@ -1586,6 +1735,14 @@ impl CommandHandler {
                 if c.resolution_reason.trim().is_empty() {
                     anyhow::bail!("resolution_reason is required");
                 }
+                let validated_instruction = if let Some(ref raw) = c.operator_instruction {
+                    Some(
+                        domain::retry_instruction::validate_operator_instruction(raw)
+                            .map_err(|e| anyhow!("operator_instruction validation: {e}"))?,
+                    )
+                } else {
+                    None
+                };
 
                 let now = Utc::now();
                 let tx_started = Instant::now();
@@ -1685,6 +1842,9 @@ impl CommandHandler {
                     .filter(|stage| stage.stage_id == selected_next_state_id)
                     .max_by_key(|stage| (stage.iteration, stage.attempt_number, stage.started_at));
                 let mut enqueued_stage_id = None;
+                let mut retry_stage_execution_id = None;
+                let mut source_stage_execution_id = None;
+                let mut retry_attempt_number = None;
                 if let Some(previous) = latest_target_stage {
                     if matches!(
                         previous.status,
@@ -1714,9 +1874,52 @@ impl CommandHandler {
                             retry_reason: Some("operator_conflict_resolution".into()),
                         };
                         enqueued_stage_id = Some(next_stage.stage_id.clone());
+                        retry_stage_execution_id = Some(next_stage.id);
+                        source_stage_execution_id = Some(previous.id);
+                        retry_attempt_number = Some(next_stage.attempt_number);
                         stages::insert_tx(&mut tx, &next_stage).await?;
                     }
                 }
+                let retry_instruction_binding_id = if let Some(ref instruction_text) =
+                    validated_instruction
+                {
+                    let retry_stage_execution_id = retry_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a newly created retry stage for selected workflow transition"
+                            )
+                        })?;
+                    let source_stage_execution_id = source_stage_execution_id.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires a source stage for selected workflow transition"
+                            )
+                        })?;
+                    let retry_attempt_number = retry_attempt_number.ok_or_else(|| {
+                            anyhow!(
+                                "operator_instruction requires retry attempt metadata for selected workflow transition"
+                            )
+                        })?;
+                    let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+                            &mut tx,
+                            &domain::retry_instruction::RetryInstructionBindingInput {
+                                journal_id: journal_id.to_string(),
+                                run_id: c.run_id,
+                                stage_id: selected_next_state_id.clone(),
+                                source_stage_execution_id,
+                                retry_stage_execution_id,
+                                retry_attempt_number,
+                                target_agent_execution_id: None,
+                                scope_kind:
+                                    domain::retry_instruction::RetryInstructionScopeKind::FullStageRetry,
+                                instruction_text: instruction_text.clone(),
+                                created_by_principal_id: caller.principal_id.clone(),
+                                created_by_principal_class: caller.principal_class.to_string(),
+                            },
+                        )
+                        .await?;
+                    Some(binding.binding_id)
+                } else {
+                    None
+                };
 
                 sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                     .bind(RunStatus::Running.to_string())
@@ -1793,6 +1996,7 @@ impl CommandHandler {
                     conflict_id: conflict.conflict_id,
                     selected_transition_id: c.selected_transition_id,
                     selected_next_state_id,
+                    retry_instruction_binding_id,
                 })
             }
 
@@ -2541,6 +2745,24 @@ impl CommandHandler {
                             .await?;
                             stage_status_event = Some((stage.id, StageStatus::Completed));
                             should_enqueue_advance = true;
+                            if stage.stage_id == "state_11_manual_release" {
+                                sqlx::query(
+                                    "UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3",
+                                )
+                                .bind(RunStatus::Running.to_string())
+                                .bind("state_10_implementation_refined")
+                                .bind(authoritative_run_id.to_string())
+                                .execute(&mut *tx)
+                                .await?;
+                                supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+                                    &mut tx,
+                                    authoritative_run_id,
+                                    &stage.stage_id,
+                                    now,
+                                    &journal.id,
+                                )
+                                .await?;
+                            }
                         } else {
                             stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
                                 .await?;
@@ -2877,6 +3099,35 @@ impl CommandHandler {
                 stage_id,
                 old_stage.status
             ));
+        }
+        let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
+            &run,
+            &old_stage.stage_id,
+        ) {
+            Ok(has_release_post_approval_tasks) => has_release_post_approval_tasks,
+            Err(e) => {
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %old_stage.stage_id,
+                    error = %e,
+                    "RetryAgentExecution side-effect preflight could not inspect post_approval_tasks"
+                );
+                false
+            }
+        };
+        if retry_requires_effect_reconciliation(
+            &old_stage,
+            Some(&target_exec.agent_id),
+            has_release_post_approval_tasks,
+        ) {
+            let error = requires_effect_reconciliation_error(&old_stage);
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
         }
 
         let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
@@ -3463,6 +3714,60 @@ async fn supersede_current_workflow_conflict_for_stage_retry_tx(
             resume_policy: "continue_from_selected_transition".to_string(),
             selected_transition_id: None,
             selected_next_state_id: Some(stage_id.to_string()),
+            conflict_id: Some(conflict.conflict_id),
+            conflict_fingerprint: Some(conflict.conflict_fingerprint),
+            candidate_transition_hash: Some(conflict.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    now: DateTime<Utc>,
+    journal_id: &str,
+) -> Result<()> {
+    let Some(conflict) = workflow_conflicts::get_current_blocking_conflict_tx(tx, run_id).await?
+    else {
+        return Ok(());
+    };
+
+    if conflict.current_state_id != stage_id {
+        return Ok(());
+    }
+
+    workflow_conflicts::transition_conflict_status_tx(
+        tx,
+        &conflict.conflict_id,
+        WorkflowConflictStatus::Superseded,
+        now,
+        Some(serde_json::json!({
+            "resolution_kind": "manual_release_rejection_loopback",
+            "from_stage_id": stage_id,
+            "selected_next_state_id": "state_10_implementation_refined",
+            "journal_id": journal_id,
+        })),
+        None,
+        None,
+    )
+    .await?;
+
+    workflow_conflicts::upsert_transition_cursor_tx(
+        tx,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: stage_id.to_string(),
+            cursor_status: "manual_release_rejection_loopback".to_string(),
+            resume_policy: "continue_from_selected_transition".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: Some("state_10_implementation_refined".to_string()),
             conflict_id: Some(conflict.conflict_id),
             conflict_fingerprint: Some(conflict.conflict_fingerprint),
             candidate_transition_hash: Some(conflict.candidate_transition_hash),

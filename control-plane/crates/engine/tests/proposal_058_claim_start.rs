@@ -22,6 +22,7 @@ use engine::executor::BackgroundExecutor;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
@@ -60,6 +61,20 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
         chainworks_meta_root: None,
         review_routing_json: None,
     }
+}
+
+fn test_workflow_yaml_path() -> String {
+    format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn test_agent_catalog_yaml_path() -> String {
+    format!(
+        "{}/../../../examples/agents/agents.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 #[tokio::test]
@@ -495,6 +510,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         },
     )
     .await
@@ -594,7 +610,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
 }
 
 #[tokio::test]
-async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_without_new_execution() {
+async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_execution() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -704,23 +720,179 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_without_new_ex
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, "invoke-work-item-recovery");
 
+    let payload_after_recovery: serde_json::Value =
+        serde_json::from_str(&pending[0].payload_json).unwrap();
+    assert!(
+        payload_after_recovery.get("p058_claimed").is_none(),
+        "startup recovery must clear stale claim/session ownership before retry"
+    );
+
+    let old_execution =
+        agent_executions::find_by_id(&pool, claimed_before_crash.agent_execution_id)
+            .await
+            .unwrap()
+            .expect("abandoned preclaimed execution remains auditable");
+    assert_eq!(
+        old_execution.status,
+        AgentStatus::Cancelled,
+        "startup recovery must terminalize abandoned preclaimed executions"
+    );
+    assert!(old_execution.completed_at.is_some());
+
+    let old_claim = artifact_contracts::load_source_generation_claim(
+        &pool,
+        &claimed_before_crash.artifact_claim_key,
+    )
+    .await
+    .unwrap()
+    .expect("abandoned source-generation claim remains auditable");
+    assert_eq!(
+        old_claim.claim_state,
+        ArtifactSourceClaimState::SupersededPendingRetry
+    );
+    assert_eq!(
+        old_claim.superseding_work_item_id.as_deref(),
+        Some("invoke-work-item-recovery")
+    );
+
     let claimed_after_recovery = engine::executor::claim_next_invoke_agent_with_start(&pool)
         .await
         .unwrap()
-        .expect("recovery should reclaim durable preclaimed InvokeAgent");
-    assert_eq!(
-        claimed_after_recovery.agent_execution_id,
-        claimed_before_crash.agent_execution_id
-    );
-    assert_eq!(
-        claimed_after_recovery.artifact_claim_key,
-        claimed_before_crash.artifact_claim_key
+        .expect("recovery should start a fresh InvokeAgent execution");
+    assert_ne!(
+        claimed_after_recovery.agent_execution_id, claimed_before_crash.agent_execution_id,
+        "recovery retry must not bind to the crashed ACP/session execution"
     );
     let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
         .await
         .unwrap();
-    assert_eq!(executions.len(), 1);
-    assert_eq!(executions[0].id, claimed_before_crash.agent_execution_id);
+    assert_eq!(executions.len(), 2);
+    assert!(executions.iter().any(|execution| execution.id
+        == claimed_before_crash.agent_execution_id
+        && execution.status == AgentStatus::Cancelled));
+    assert!(executions.iter().any(|execution| execution.id
+        == claimed_after_recovery.agent_execution_id
+        && execution.status == AgentStatus::Running));
+}
+
+#[tokio::test]
+async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 Xcode single flight".into(),
+            body: "startup retry modal guard".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    for item_id in ["xcode-invoke-1", "xcode-invoke-2", "xcode-invoke-3"] {
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: item_id.into(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "stage_id": "implementation",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_id": item_id,
+                    "provider": "claude",
+                    "model": "sonnet",
+                    "prompt": "use Xcode MCP",
+                    "task_name": item_id,
+                    "task_inputs": ["input"],
+                    "task_outputs": ["output"],
+                    "declared_outputs": [],
+                    "requested_mcp_server_ids": ["xcode"],
+                    "xcode_broker_required": true,
+                    "session_reuse_scope": "same_agent_family_within_run",
+                    "session_family_id": item_id,
+                    "worktree_write_enabled": false
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some("implementation".into()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let capacity = engine::executor::InvokeAgentCapacityConfig {
+        max_active_total: 10,
+        max_active_per_run: 10,
+        max_active_xcode_mcp: 2,
+        provider_caps: HashMap::from([("claude".to_string(), 10)]),
+    };
+
+    let claimed =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
+            .unwrap()
+            .expect("first Xcode MCP invocation should start");
+    assert_eq!(claimed.source_work_item_id, "xcode-invoke-1");
+
+    let second =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
+            .unwrap()
+            .expect("second Xcode MCP invocation should start while below configured cap");
+    assert_eq!(second.source_work_item_id, "xcode-invoke-2");
+
+    let third =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
+            .unwrap();
+    assert!(
+        third.is_none(),
+        "a third Xcode MCP invocation must wait once the configured cap is reached"
+    );
 }
 
 #[tokio::test]
@@ -932,10 +1104,13 @@ async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_cre
         .unwrap_or_default()
         .contains("session_reuse_scope"));
     let queue = WorkQueue::new(pool.clone());
-    assert!(
-        queue.claim_next().await.unwrap().is_none(),
-        "generic queue claim must not pick up InvokeAgent fallback items"
-    );
+    if let Some(non_invoke_item) = queue.claim_next().await.unwrap() {
+        assert_eq!(
+            non_invoke_item.kind,
+            WorkItemKind::AdvanceRun,
+            "generic queue claim must not pick up InvokeAgent fallback items"
+        );
+    }
     let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
         .await
         .unwrap();
@@ -1040,6 +1215,140 @@ async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
         .unwrap();
     assert_eq!(executions.len(), 1);
     assert_eq!(executions[0].session_reuse_scope, None);
+}
+
+#[tokio::test]
+async fn proposal_058_declared_output_claim_gets_durable_generation_without_reuse_scope() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 declared output lineage".into(),
+            body: "declared outputs need repair-capable session identity".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "state_9_implementation_reviewed".into(),
+            label: "Implementation reviewed".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "declared-output-null-reuse-invoke".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "state_9_implementation_reviewed",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "security_checker",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "check security",
+                "task_name": "check_implementation_security",
+                "task_inputs": ["approved_proposal", "changed_files_manifest"],
+                "task_outputs": ["security_report"],
+                "declared_outputs": [
+                    {
+                        "output_name": "security_report",
+                        "target_path": "/tmp/workspace/.chainworks/runs/run/security/report.json"
+                    }
+                ],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": null,
+                "session_family_id": null,
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("state_9_implementation_reviewed".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("declared-output invocation should be claimed");
+    let claimed_generation = claimed
+        .session_generation_id
+        .as_deref()
+        .expect("declared outputs need a durable generation for output repair");
+    assert_eq!(claimed_generation.len(), 36);
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].session_reuse_scope, None);
+    assert_eq!(
+        executions[0].session_generation_id.as_deref(),
+        Some(claimed_generation)
+    );
+
+    let claim =
+        artifact_contracts::load_source_generation_claim(&pool, &claimed.artifact_claim_key)
+            .await
+            .unwrap()
+            .expect("active artifact claim");
+    assert_eq!(
+        claim.current_session_generation_id.as_deref(),
+        Some(claimed_generation)
+    );
+
+    let persisted_work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let persisted_claimed = persisted_work_items
+        .iter()
+        .find(|item| item.id == claimed.work_item_id)
+        .expect("claimed work item persisted");
+    let persisted_payload: serde_json::Value =
+        serde_json::from_str(&persisted_claimed.payload_json).unwrap();
+    assert_eq!(
+        persisted_payload["p058_claimed"]["session_policy_decision"]["generation"]["id"],
+        claimed_generation
+    );
 }
 
 #[tokio::test]
@@ -1418,6 +1727,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         },
     )
     .await
@@ -1526,6 +1836,416 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
 }
 
 #[tokio::test]
+async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_state_changes() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_execution_id = StageExecutionId::new();
+    let old_agent_execution_id = AgentExecutionId::new();
+    let source_work_item_id = "release-invoke-work-item".to_string();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P078 retry".into(),
+            body: "release guard".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: old_stage_execution_id,
+            run_id,
+            stage_id: "commit_and_push_to_github".into(),
+            label: "Commit and push".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: Some("commit_and_push_to_github".into()),
+            provider: Some("claude".into()),
+            model: Some("sonnet".into()),
+            stage_type: Some("release".into()),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: old_agent_execution_id,
+            stage_execution_id: Some(old_stage_execution_id),
+            agent_id: "commit_and_push_to_github".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_execution_lineage_id: Some(old_stage_execution_id.to_string()),
+            session_lineage_id: Some("release-lineage-1".into()),
+            session_generation_id: Some("release-generation-1".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("release-owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("commit_and_push_to_github".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let old_claim_key = ArtifactSourceGenerationClaimKey {
+        run_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: old_stage_execution_id.to_string(),
+        stage_execution_id: Some(old_stage_execution_id),
+        agent_execution_id: old_agent_execution_id,
+        source_work_item_id: source_work_item_id.clone(),
+    };
+    artifact_contracts::insert_source_generation_claim(
+        &pool,
+        ArtifactSourceGenerationClaim {
+            key: old_claim_key.clone(),
+            current_session_generation_id: Some("release-generation-1".into()),
+            claim_state: ArtifactSourceClaimState::Active,
+            superseding_work_item_id: None,
+            superseded_by_agent_execution_id: None,
+            supersession_journal_id: None,
+            superseded_at: None,
+            closed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = CommandHandler::new(
+        pool.clone(),
+        event_bus::new_bus(16),
+        WorkQueue::new(pool.clone()),
+    );
+    let result = handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "commit_and_push_to_github".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("release retry must fail closed before state changes"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("requires_effect_reconciliation"),
+        "release retry must fail closed with a typed reconciliation error: {err}"
+    );
+
+    let stages_after = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        stages_after.len(),
+        1,
+        "release retry must not create a replacement stage"
+    );
+    assert_eq!(stages_after[0].id, old_stage_execution_id);
+    assert_eq!(stages_after[0].status, StageStatus::Failed);
+
+    let claim = artifact_contracts::load_source_generation_claim(&pool, &old_claim_key)
+        .await
+        .unwrap()
+        .expect("old release claim remains addressable");
+    assert_eq!(claim.claim_state, ArtifactSourceClaimState::Active);
+    assert!(
+        claim.superseding_work_item_id.is_none(),
+        "release retry preflight must not supersede artifact claims"
+    );
+
+    let pending = work_items::list_by_status(&pool, WorkItemStatus::Pending)
+        .await
+        .unwrap();
+    assert!(
+        pending.is_empty(),
+        "release retry preflight must not enqueue retry work"
+    );
+}
+
+#[tokio::test]
+async fn proposal_078_retry_manual_release_gate_checks_post_approval_release_tasks() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P078 manual release retry".into(),
+            body: "post approval release guard".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut run = make_run(run_id, idea_id);
+    run.status = RunStatus::Blocked;
+    run.current_state = Some("state_11_manual_release".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: old_stage_execution_id,
+            run_id,
+            stage_id: "state_11_manual_release".into(),
+            label: "Manual release".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("claude".into()),
+            model: Some("sonnet".into()),
+            stage_type: Some("manual_gate".into()),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = CommandHandler::new(
+        pool.clone(),
+        event_bus::new_bus(16),
+        WorkQueue::new(pool.clone()),
+    );
+    let result = handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("manual release retry must fail closed before state changes"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("requires_effect_reconciliation"),
+        "manual release retry must be guarded by post_approval release tasks: {err}"
+    );
+    let stages_after = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        stages_after.len(),
+        1,
+        "manual release retry must not create a replacement stage"
+    );
+    assert_eq!(stages_after[0].id, old_stage_execution_id);
+    assert_eq!(stages_after[0].status, StageStatus::Failed);
+}
+
+#[tokio::test]
+async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_execution_id = StageExecutionId::new();
+    let old_agent_execution_id = AgentExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P078 targeted retry".into(),
+            body: "targeted release audit".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: old_stage_execution_id,
+            run_id,
+            stage_id: "state_11_manual_release".into(),
+            label: "Manual release".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("claude".into()),
+            model: Some("sonnet".into()),
+            stage_type: Some("manual_gate".into()),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: old_agent_execution_id,
+            stage_execution_id: Some(old_stage_execution_id),
+            agent_id: "commit_and_push_to_github".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_execution_lineage_id: Some(old_stage_execution_id.to_string()),
+            session_lineage_id: Some("release-lineage-1".into()),
+            session_generation_id: Some("release-generation-1".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("release-owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("commit_and_push_to_github".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = CommandHandler::new(
+        pool.clone(),
+        event_bus::new_bus(16),
+        WorkQueue::new(pool.clone()),
+    );
+    let result = handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(old_agent_execution_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("targeted release retry must fail closed before state changes"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("requires_effect_reconciliation"),
+        "targeted release retry must be guarded: {err}"
+    );
+    let failed_journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage' AND result_status = 'failed' AND error LIKE '%requires_effect_reconciliation%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        failed_journal_count, 1,
+        "targeted release retry denial must leave a failed command journal entry"
+    );
+}
+
+#[tokio::test]
 async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let idea_id = IdeaId::new();
@@ -1616,6 +2336,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         },
     )
     .await

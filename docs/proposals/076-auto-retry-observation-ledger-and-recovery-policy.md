@@ -217,7 +217,7 @@ Update /Users/user/.codex/automations/auto-retry/memory.md with only the latest 
 4. Add a lightweight validator for `auto-retry-observation.v1` records.
 5. Add a proposal gate or script check that validates sample records and rollup output.
 6. Route repeated signatures to existing proposals when applicable:
-   - output contract validation and same-session repair: P017/P063 follow-up lane
+   - output contract validation, same-session repair, and provider fallback: P079 lane
    - recovery/retry MCP ergonomics: P045/P065 lane
    - projection/settlement divergence: P073 / UI action boundary follow-up lane
    - native release diagnostics: P075 lane

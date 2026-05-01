@@ -579,6 +579,7 @@ pub struct AcpSessionNewSpec {
     pub mode: String,
     pub extra: Option<Value>,
     pub config_options: Vec<(String, String)>,
+    pub required_config_options: Vec<(String, String)>,
     pub set_mode_after_session_new: bool,
 }
 
@@ -589,6 +590,7 @@ impl AcpSessionNewSpec {
             mode: mode.into(),
             extra: None,
             config_options: Vec::new(),
+            required_config_options: Vec::new(),
             set_mode_after_session_new: false,
         }
     }
@@ -599,6 +601,7 @@ impl AcpSessionNewSpec {
             mode: config.mode.to_string(),
             extra: config.extra,
             config_options: config.config_options,
+            required_config_options: config.required_config_options,
             set_mode_after_session_new: config.set_mode_after_session_new,
         }
     }
@@ -609,6 +612,7 @@ impl AcpSessionNewSpec {
             mode: &self.mode,
             extra: self.extra.clone(),
             config_options: self.config_options.clone(),
+            required_config_options: self.required_config_options.clone(),
             set_mode_after_session_new: self.set_mode_after_session_new,
         }
     }
@@ -1089,6 +1093,8 @@ mod tests {
             origin_stage_id: None,
             origin_stage_execution_id: None,
             mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
         };
 
         let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());

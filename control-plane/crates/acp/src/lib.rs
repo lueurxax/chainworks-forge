@@ -1,6 +1,8 @@
 pub mod adapters;
 pub mod manager;
 pub mod session;
+pub mod toolchain_lease;
+pub mod toolchain_mapper;
 pub mod transport;
 pub mod xcode_broker;
 pub mod xcode_shim;
@@ -147,6 +149,16 @@ pub struct ExecutionRequest {
     /// P017 Phase B: Mediation record id when this execution is mediation-owned.
     #[serde(default)]
     pub mediation_record_id: Option<String>,
+    /// P066 T20: TOOLCHAIN_HOME path for session-scoped Go mapping setup.
+    /// When set with toolchain_go_scope_enabled=true, the manager prepares Go
+    /// isolation directories before session handoff and registers them for
+    /// cleanup on session close or failure (DiagCleanupPlan::DeleteOnClose).
+    #[serde(default)]
+    pub toolchain_home: Option<String>,
+    /// P066 T20: Enables Go session-scoped toolchain isolation for this session.
+    /// Requires toolchain_home + session_generation_id to be set.
+    #[serde(default)]
+    pub toolchain_go_scope_enabled: bool,
 }
 
 fn default_owner_kind() -> String {
@@ -200,6 +212,7 @@ pub enum AcpPromptProgressKind {
     PromptSent,
     MessageReceived,
     MeaningfulProgress,
+    ProviderLocalActivity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

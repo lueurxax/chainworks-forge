@@ -20,6 +20,10 @@ DerivedDataCodex/
 /known-issues.md
 /auto-retry-blocked-runs-known-issues.md
 
+# Local MCP/JSON-RPC response dumps accidentally produced at repo root
+/0
+/1
+
 # Swift Package Manager
 .build/
 control-plane/target/

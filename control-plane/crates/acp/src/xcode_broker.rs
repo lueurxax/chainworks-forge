@@ -33,6 +33,7 @@ use crate::{
 
 const XCODE_MCP_ACTION_REQUIRED_AFTER: Duration = Duration::from_secs(5);
 const XCODE_MCP_HUMAN_CONSENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const XCODE_MCP_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 const XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 const XCODE_MCP_BACKEND_SHUTDOWN_WAIT: Duration = Duration::from_millis(250);
@@ -63,7 +64,7 @@ impl Default for XcodeMcpBridgePoolConfig {
             max_queued_leases: 16,
             queue_timeout: Duration::from_secs(45),
             spawn_init_timeout: XCODE_MCP_HUMAN_CONSENT_TIMEOUT,
-            first_connect_timeout: Duration::from_secs(60),
+            first_connect_timeout: XCODE_MCP_FIRST_CONNECT_TIMEOUT,
             broker_disabled: false,
             tool_allowlists_by_hash: BTreeMap::new(),
             target_probe_context: None,
@@ -140,6 +141,7 @@ struct XcodeMcpProcessBackendRegistry {
     sessions: HashMap<String, Arc<Mutex<XcodeMcpProcessBackendSession>>>,
     lease_to_session: HashMap<String, String>,
     session_ref_counts: HashMap<String, usize>,
+    backend_process_ids: HashMap<String, i64>,
 }
 
 struct XcodeMcpProcessBackendSession {
@@ -209,6 +211,10 @@ pub trait XcodeMcpBackend: Send + Sync {
         None
     }
 
+    fn manages_request_timeout(&self) -> bool {
+        false
+    }
+
     async fn release_lease(&self, _lease_id: &str) -> Result<()> {
         Ok(())
     }
@@ -241,16 +247,21 @@ impl XcodeMcpProcessBackend {
             }
             return Ok(session.clone());
         }
-        let session = Arc::new(Mutex::new(
-            XcodeMcpProcessBackendSession::spawn(&self.config, context).await?,
-        ));
+        let session = XcodeMcpProcessBackendSession::spawn(&self.config, context).await?;
+        let backend_process_id = session.child.id().map(|pid| pid as i64);
+        let session = Arc::new(Mutex::new(session));
         registry
             .sessions
             .insert(session_key.clone(), session.clone());
         registry
             .lease_to_session
             .insert(context.lease_id.clone(), session_key.clone());
-        registry.session_ref_counts.insert(session_key, 1);
+        registry.session_ref_counts.insert(session_key.clone(), 1);
+        if let Some(backend_process_id) = backend_process_id {
+            registry
+                .backend_process_ids
+                .insert(session_key.clone(), backend_process_id);
+        }
         Ok(session)
     }
 
@@ -264,6 +275,7 @@ impl XcodeMcpProcessBackend {
                 .lease_to_session
                 .retain(|_, mapped_key| mapped_key != &session_key);
             registry.session_ref_counts.remove(&session_key);
+            registry.backend_process_ids.remove(&session_key);
             registry.sessions.remove(&session_key)
         };
         if let Some(session) = session {
@@ -299,17 +311,17 @@ impl XcodeMcpBackend for XcodeMcpProcessBackend {
     }
 
     async fn backend_process_id(&self, lease_id: &str) -> Option<i64> {
-        let session = {
-            let registry = self.registry.lock().await;
-            let session_key = registry.lease_to_session.get(lease_id)?;
-            registry.sessions.get(session_key).cloned()?
-        };
-        let session = session.lock().await;
-        session.child.id().map(|pid| pid as i64)
+        let registry = self.registry.lock().await;
+        let session_key = registry.lease_to_session.get(lease_id)?;
+        registry.backend_process_ids.get(session_key).copied()
+    }
+
+    fn manages_request_timeout(&self) -> bool {
+        true
     }
 
     async fn release_lease(&self, lease_id: &str) -> Result<()> {
-        let session = {
+        {
             let mut registry = self.registry.lock().await;
             let Some(session_key) = registry.lease_to_session.remove(lease_id) else {
                 return Ok(());
@@ -320,16 +332,10 @@ impl XcodeMcpBackend for XcodeMcpProcessBackend {
                 .copied()
                 .unwrap_or(1)
                 .saturating_sub(1);
-            if remaining > 0 {
-                registry.session_ref_counts.insert(session_key, remaining);
-                None
-            } else {
-                registry.session_ref_counts.remove(&session_key);
-                registry.sessions.remove(&session_key)
-            }
-        };
-        if let Some(session) = session {
-            session.lock().await.close().await?;
+            // Keep initialized backends warm across lease churn/retry for the
+            // same run/Xcode target. Closing the process on every lease
+            // release forces Xcode to ask for MCP consent again on each retry.
+            registry.session_ref_counts.insert(session_key, remaining);
         }
         Ok(())
     }
@@ -1022,32 +1028,91 @@ impl XcodeMcpBridgePool {
             .unwrap_or("<missing-method>")
             .to_string();
         let started = Instant::now();
+        let backend_manages_request_timeout = backend.manages_request_timeout();
         let response_fut = backend.forward_json_rpc(context.clone(), request);
         tokio::pin!(response_fut);
-        let response = tokio::select! {
-            response = &mut response_fut => response,
-            _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
-                let wait_ms = started.elapsed().as_millis() as i64;
-                let backend_process_id = backend.backend_process_id(&context.lease_id).await;
-                let observation = self.backend_request_observation(
-                    &context,
-                    "backend_request_action_required",
-                    Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
-                    wait_ms,
-                    backend_process_id,
-                    format!(
-                        "Action Required: Check Xcode after waiting {} ms for brokered Xcode MCP method '{}' on lease '{}'",
-                        wait_ms, method, context.lease_id
-                    ),
-                );
-                self.record_observation(context.agent_execution_id, observation)
-                    .await;
-                response_fut.await
+        let response = if backend_manages_request_timeout {
+            tokio::select! {
+                response = &mut response_fut => response,
+                _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                    let wait_ms = started.elapsed().as_millis() as i64;
+                    let backend_process_id = backend.backend_process_id(&context.lease_id).await;
+                    let observation = self.backend_request_observation(
+                        &context,
+                        "backend_request_action_required",
+                        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                        wait_ms,
+                        backend_process_id,
+                        format!(
+                            "Action Required: Check Xcode after waiting {} ms for brokered Xcode MCP method '{}' on lease '{}'",
+                            wait_ms, method, context.lease_id
+                        ),
+                    );
+                    self.record_observation(context.agent_execution_id, observation)
+                        .await;
+                    response_fut.await
+                }
+            }
+        } else if self.config.spawn_init_timeout <= XCODE_MCP_ACTION_REQUIRED_AFTER {
+            match tokio::time::timeout(self.config.spawn_init_timeout, &mut response_fut).await {
+                Ok(response) => response,
+                Err(_) => Err(anyhow::anyhow!(
+                    "xcode_mcp_initialize_timeout: timed out after {:?} waiting for brokered Xcode MCP method '{}' on lease '{}'",
+                    self.config.spawn_init_timeout,
+                    method,
+                    context.lease_id
+                )),
+            }
+        } else {
+            tokio::select! {
+                response = &mut response_fut => response,
+                _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                    let wait_ms = started.elapsed().as_millis() as i64;
+                    let backend_process_id = backend.backend_process_id(&context.lease_id).await;
+                    let observation = self.backend_request_observation(
+                        &context,
+                        "backend_request_action_required",
+                        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                        wait_ms,
+                        backend_process_id,
+                        format!(
+                            "Action Required: Check Xcode after waiting {} ms for brokered Xcode MCP method '{}' on lease '{}'",
+                            wait_ms, method, context.lease_id
+                        ),
+                    );
+                    self.record_observation(context.agent_execution_id, observation)
+                        .await;
+                    let remaining = self
+                        .config
+                        .spawn_init_timeout
+                        .saturating_sub(started.elapsed());
+                    match tokio::time::timeout(remaining, &mut response_fut).await {
+                        Ok(response) => response,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "xcode_mcp_initialize_timeout: timed out after {:?} waiting for brokered Xcode MCP method '{}' on lease '{}'",
+                            self.config.spawn_init_timeout,
+                            method,
+                            context.lease_id
+                        )),
+                    }
+                }
             }
         };
         let latency_ms = started.elapsed().as_millis() as i64;
         let backend_process_id = backend.backend_process_id(&context.lease_id).await;
         let observation = match &response {
+            Err(error) if error.to_string().contains("xcode_mcp_initialize_timeout") => self
+                .backend_request_observation(
+                    &context,
+                    "backend_request_timeout",
+                    Some(XcodeRuntimeFailureClass::XcodeMcpInitializeTimeout),
+                    latency_ms,
+                    backend_process_id,
+                    format!(
+                        "Brokered Xcode MCP backend timed out method '{}' for lease '{}' after {} ms: {}",
+                        method, context.lease_id, latency_ms, error
+                    ),
+                ),
             Ok(_) => self.backend_request_observation(
                 &context,
                 "backend_request_completed",
@@ -2114,8 +2179,8 @@ fn backend_session_key(context: &XcodeMcpBackendRequestContext) -> String {
         .as_ref()
         .map(|snapshot| {
             format!(
-                "run:{}:xcode-pid:{}:developer-dir:{}",
-                context.run_id, snapshot.xcode_pid, snapshot.developer_dir
+                "xcode-pid:{}:developer-dir:{}",
+                snapshot.xcode_pid, snapshot.developer_dir
             )
         })
         .unwrap_or_else(|| format!("lease:{}", context.lease_id))
@@ -2335,6 +2400,59 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_backend_pid_lookup_does_not_wait_for_hung_backend_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let request_started_path = temp.path().join("request-started");
+
+        let mut snapshot = target_snapshot(XcodeTargetSelectionConfidence::ExplicitPid);
+        snapshot.operator_home = temp.path().to_string_lossy().to_string();
+        snapshot.darwin_tmpdir = temp.path().to_string_lossy().to_string();
+        snapshot.developer_dir = "/usr".to_string();
+        let context = XcodeMcpBackendRequestContext {
+            run_id: RunId::new(),
+            lease_id: "lease-hung-backend".to_string(),
+            endpoint: "http://127.0.0.1:0/xcode-mcp/lease-hung-backend".to_string(),
+            agent_execution_id: None,
+            target_snapshot: Some(snapshot),
+        };
+        let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "while IFS= read -r _line; do printf started > {:?}; sleep 60; done",
+                    request_started_path.to_string_lossy()
+                ),
+            ],
+            request_timeout: Duration::from_secs(60),
+        }));
+
+        let forward_backend = backend.clone();
+        let forward_context = context.clone();
+        let forward = tokio::spawn(async move {
+            forward_backend
+                .forward_json_rpc(
+                    forward_context,
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                )
+                .await
+        });
+        wait_for_file(&request_started_path).await;
+
+        let pid = tokio::time::timeout(
+            Duration::from_millis(100),
+            backend.backend_process_id(&context.lease_id),
+        )
+        .await
+        .expect("backend pid lookup must not wait for the hung session mutex");
+
+        assert!(pid.is_some(), "backend pid should be known while request is hung");
+        forward.abort();
+        backend.release_lease(&context.lease_id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn stale_active_leases_degrade_broker_health_with_helper_metrics() {
         let backend = Arc::new(RecordingBackend {
@@ -2502,6 +2620,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("timed out waiting for child pid file at {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_file(path: &Path) {
+        for _ in 0..50 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for file at {}", path.display());
     }
 
     #[cfg(unix)]

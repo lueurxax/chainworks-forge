@@ -1675,6 +1675,7 @@ Available gates:
   proposal-061    Proposal 061 SQLite write serialization and scheduler backpressure gate
   proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
   proposal-065|p065  Proposal 065 operator retry instruction contract gate
+  proposal-066|p066  Proposal 066 Phase 0 toolchain cache mapping scaffold gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -3518,6 +3519,75 @@ PY
       done
     )
     log "Proposal 065 control-plane gate passed"
+    ;;
+  proposal-066|p066)
+    log "Proposal 066 Phase 0 gate: toolchain cache mapping scaffold"
+
+    # T06 — Swift scan guardrail: ToolchainMappingReadAdapter must exist and be the
+    # sole owner of toolchain policy decoding. Consumer files must not access
+    # .toolchainCachePolicy directly (that field is declared in AgentCatalog.swift
+    # and decoded only through ToolchainMappingReadAdapter).
+    log "P066 T06: Swift scan — ToolchainMappingReadAdapter ownership guardrail"
+    ADAPTER_FILE="$ROOT_DIR/Chainworks Forge/Engine/ToolchainMappingReadAdapter.swift"
+    if [ ! -f "$ADAPTER_FILE" ]; then
+      fail "P066 T06: ToolchainMappingReadAdapter.swift missing — must exist before Phase 1"
+    fi
+    CONSUMER_FILES=(
+      "$ROOT_DIR/Chainworks Forge/Engine/RunPlanCompiler.swift"
+      "$ROOT_DIR/Chainworks Forge/Engine/ExecutionService.swift"
+      "$ROOT_DIR/Chainworks Forge/Engine/RunReportBuilder.swift"
+      "$ROOT_DIR/Chainworks Forge/Engine/RunComparisonService.swift"
+    )
+    for f in "${CONSUMER_FILES[@]}"; do
+      if [ ! -f "$f" ]; then
+        fail "P066 T06: expected consumer file missing: $f"
+      fi
+      # Consumer files must not directly access .toolchainCachePolicy on a decoded
+      # AgentDefinition outside of ToolchainMappingReadAdapter.swift itself.
+      # The pattern to forbid is direct property access like `agent.toolchainCachePolicy`
+      # or `.toolchainCachePolicy` in these operator-facing service files.
+      if grep -qE '\.toolchainCachePolicy\b' "$f"; then
+        fail "P066 T06: $f directly accesses .toolchainCachePolicy — route through ToolchainMappingReadAdapter instead"
+      fi
+    done
+    log "P066 T06: Swift scan passed — ToolchainMappingReadAdapter is sole bridge"
+
+    (
+      cd "$ROOT_DIR/control-plane"
+      log "P066: workflow crate — YAML schema, compatibility gates, snapshot types"
+      cargo test -p workflow --test proposal_066_toolchain_cache_policy -- --nocapture
+
+      log "P066: domain crate — toolchain failure kinds"
+      cargo test -p domain --lib toolchain:: -- --nocapture
+
+      log "P066: db crate — migration 037 and diagnostics column"
+      cargo test -p db --test proposal_066_toolchain_cache_mapping -- --nocapture
+
+      log "P066: graphql-server crate — northbound synthesis (active, disabled, legacy)"
+      cargo test -p graphql-server --test proposal_066_toolchain_mapping -- --nocapture
+
+      log "P066: mcp-server crate — northbound synthesis (active, disabled, legacy)"
+      cargo test -p mcp-server --test proposal_066_toolchain_mapping -- --nocapture
+
+      log "P066 T17/T18: graphql-server — startupRecoverySummary.toolchainCache and toolchainCacheHousekeepingSummary"
+      cargo test -p graphql-server --test proposal_066_cleanup_readbacks -- --nocapture
+
+      log "P066 T22: graphql-server — migration drill (≥10 legacy NULL rows + ≥10 post-migration rows)"
+      cargo test -p graphql-server --test proposal_066_migration_drill -- --nocapture
+
+      log "P066 T10/T11/T12/T13: acp crate — toolchain mapper, host-executor rewriting, Go env, lease"
+      cargo test -p acp --test proposal_066_toolchain_mapper -- --nocapture
+
+      log "P066 T13: acp crate — per-run Xcode lease unit tests"
+      cargo test -p acp --lib toolchain_lease -- --nocapture
+
+      log "P066 T14: engine crate — startup recovery toolchain sweep (Go orphan reclaim + Xcode quarantine)"
+      cargo test -p engine --test proposal_066_toolchain_recovery -- --nocapture
+
+      log "P066 T19: engine crate — housekeeping pruning of terminal run-scoped Xcode roots"
+      cargo test -p engine --test proposal_066_toolchain_housekeeping -- --nocapture
+    )
+    log "Proposal 066 Phase 0 gate passed"
     ;;
   proposal-042|p042)
     log "Proposal 042 control-plane gate: Rust focused + Swift focused + workspace regression"

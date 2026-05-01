@@ -8,7 +8,7 @@ replace the reference docs.
 - P073 freeze mode.
 - UI action boundary closeout.
 - P031 corrected closeout over the GraphQL thin UI boundary.
-- P066/P075 release diagnostics and branch-mismatch infrastructure slice.
+- Provider toolchain cache mapping and P075 persistence-budget infrastructure slice.
 
 ## Next
 

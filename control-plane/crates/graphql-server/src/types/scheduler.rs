@@ -6,7 +6,8 @@ use db::repos::scheduler::{
     SchedulerBackpressureNotification, SchedulerHealthSnapshot, SchedulerProviderActiveCount,
     SchedulerQueuePositionHint, SchedulerQueueSummary,
 };
-use db::repos::startup_repairs::StartupRecoveryReadback;
+use db::repos::startup_repairs::{StartupRecoveryReadback, ToolchainCacheRecoveryReadback};
+use db::repos::toolchain_cache_housekeeping::ToolchainCacheHousekeepingReadback;
 
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlSchedulerQueueSummary {
@@ -98,6 +99,30 @@ impl From<SchedulerHealthSnapshot> for GqlSchedulerHealthSummary {
     }
 }
 
+/// P066 T17: Toolchain cache subsection of startupRecoverySummary.
+/// Fields are None when no sweep has run yet (pre-P066 rows).
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ToolchainCacheRecoverySummary", rename_fields = "camelCase")]
+pub struct GqlToolchainCacheRecoverySummary {
+    pub session_scoped_roots_seen: Option<i64>,
+    pub session_scoped_roots_reclaimed: Option<i64>,
+    pub session_scoped_cleanup_failures: Option<i64>,
+    pub orphan_threshold_minutes: Option<i64>,
+    pub last_sweep_started_at: Option<String>,
+}
+
+impl From<ToolchainCacheRecoveryReadback> for GqlToolchainCacheRecoverySummary {
+    fn from(r: ToolchainCacheRecoveryReadback) -> Self {
+        Self {
+            session_scoped_roots_seen: r.session_scoped_roots_seen,
+            session_scoped_roots_reclaimed: r.session_scoped_roots_reclaimed,
+            session_scoped_cleanup_failures: r.session_scoped_cleanup_failures,
+            orphan_threshold_minutes: r.orphan_threshold_minutes,
+            last_sweep_started_at: r.last_sweep_started_at.map(|t| t.to_rfc3339()),
+        }
+    }
+}
+
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlStartupRecoverySummary {
     pub id: ID,
@@ -109,6 +134,8 @@ pub struct GqlStartupRecoverySummary {
     pub stale_after_ms: i64,
     pub updated_at: String,
     pub is_stale: bool,
+    /// P066 T17: Toolchain cache cleanup evidence from startup recovery sweeps.
+    pub toolchain_cache: GqlToolchainCacheRecoverySummary,
 }
 
 impl From<StartupRecoveryReadback> for GqlStartupRecoverySummary {
@@ -128,6 +155,37 @@ impl From<StartupRecoveryReadback> for GqlStartupRecoverySummary {
             stale_after_ms: summary.stale_after_ms,
             updated_at: summary.updated_at.to_rfc3339(),
             is_stale,
+            toolchain_cache: GqlToolchainCacheRecoverySummary::from(summary.toolchain_cache),
+        }
+    }
+}
+
+/// P066 T18: Durable housekeeping summary for periodic run-root pruning.
+/// One row per sweep. Used as promotion gate evidence for Phase 3 catalog backfill.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ToolchainCacheHousekeepingSummary", rename_fields = "camelCase")]
+pub struct GqlToolchainCacheHousekeepingSummary {
+    pub id: ID,
+    pub last_sweep_started_at: String,
+    pub run_scoped_roots_pruned: i64,
+    pub run_scoped_prune_failures: i64,
+    pub oldest_eligible_root_age_days: Option<f64>,
+    pub disk_pressure_blocks: i64,
+    pub quarantined_roots_created: i64,
+    pub created_at: String,
+}
+
+impl From<ToolchainCacheHousekeepingReadback> for GqlToolchainCacheHousekeepingSummary {
+    fn from(r: ToolchainCacheHousekeepingReadback) -> Self {
+        Self {
+            id: ID(r.id),
+            last_sweep_started_at: r.last_sweep_started_at.to_rfc3339(),
+            run_scoped_roots_pruned: r.run_scoped_roots_pruned,
+            run_scoped_prune_failures: r.run_scoped_prune_failures,
+            oldest_eligible_root_age_days: r.oldest_eligible_root_age_days,
+            disk_pressure_blocks: r.disk_pressure_blocks,
+            quarantined_roots_created: r.quarantined_roots_created,
+            created_at: r.created_at.to_rfc3339(),
         }
     }
 }

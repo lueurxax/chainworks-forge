@@ -154,6 +154,15 @@ Shared ACP plumbing lives in:
 - `ACPSubprocessManager`
 - `ACPStreamEventMapper`
 
+#### Toolchain Cache Mapping
+
+The ACP layer manages the isolation of toolchain-specific build and cache roots, including Xcode DerivedData and Go caches. This section is the stable owner for provider-launched toolchain cache mapping behavior.
+
+- **Environment Redirection**: ACP adapters derive the appropriate toolchain root based on the agent's `toolchain_cache_policy` and session/run scope. They publish `CHAINWORKS_TOOLCHAIN_HOME` and `TOOLCHAIN_HOME` and apply family-specific redirection (e.g., `-derivedDataPath` for Xcode, `GOCACHE` for Go).
+- **Exclusive Serialization**: For run-scoped Xcode work, the host-executor path acquires an exclusive per-run lease to prevent concurrent mutation of the same DerivedData root.
+- **Diagnostics**: Adapters capture setup and mapping metadata, stored as `actualToolchainMappingDiagnostics` on the execution record.
+- **Apple Read Adapter**: Swift operator-facing consumers decode toolchain mapping truth through `ToolchainMappingReadAdapter` to ensure consistent handling of frozen-snapshot compatibility and legacy sentinels.
+
 #### Bounded Discovery and DiscoveryFilesystem
 
 Broad filesystem discovery is not part of the pre-`initialize` path. Instead of implicit inference from the entire repository or worktree, the system uses a bounded discovery model:

@@ -96,6 +96,12 @@ pub struct AgentExecution {
     /// resolve directly without artifact-name heuristics.
     #[serde(default)]
     pub transcript_artifact_id: Option<String>,
+    // ── P066: Toolchain cache mapping diagnostics ─────────────────────────────
+    /// Bounded JSON document describing the toolchain cache mapping outcome for
+    /// this execution attempt. NULL = pre-P066 legacy row (synthesize
+    /// mapping_state=legacy_row_unavailable northbound).
+    #[serde(default)]
+    pub actual_toolchain_mapping_diagnostics_json: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

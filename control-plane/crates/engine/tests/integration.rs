@@ -7,7 +7,8 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    ideas, projections, runs, sessions, stages, work_items, workflow_conflicts,
+    ideas, projections, retry_operator_instructions, runs, sessions, stages, work_items,
+    workflow_conflicts,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
@@ -23,6 +24,7 @@ use domain::commands::{
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
+use domain::retry_instruction::RetryInstructionScopeKind;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use domain::workflow_conflict::{
@@ -262,6 +264,7 @@ fn make_agent_execution(
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     }
 }
 
@@ -907,6 +910,7 @@ async fn proposal_017_operator_can_select_loop_budget_candidate_transition() {
                 conflict_id: conflict_id.clone(),
                 selected_transition_id: transition_id.into(),
                 resolution_reason: "operator confirmed one more implementation pass".into(),
+                operator_instruction: None,
             }),
             caller,
         )
@@ -961,6 +965,271 @@ async fn proposal_017_operator_can_select_loop_budget_candidate_transition() {
 }
 
 #[tokio::test]
+async fn proposal_017_operator_conflict_resolution_instruction_creates_retry_binding() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let completed_stage_id = StageExecutionId::new();
+    let current_state_id = "state_8_implementation_continued";
+    let transition_id = "state_8_implementation_continued__to__state_8_implementation_continued__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Completed);
+    completed_stage.stage_id = current_state_id.into();
+    completed_stage.label = "Implementation Continued".into();
+    completed_stage.iteration = 50;
+    stages::insert(&pool, &completed_stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: current_state_id.into(),
+        condition_expression_id: Some("implementation_self_assessment_needs_code_fixes".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["implementation_self_assessment_v2".into()],
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: vec!["implementation_self_assessment_v2".into()],
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some(
+            "Loop budget exhausted for implementation_progress_count: 50/50 iterations".into(),
+        ),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    let conflict_id = conflict.conflict_id.clone();
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let commanded = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator confirmed one more implementation pass".into(),
+                operator_instruction: Some("  Refine only the documented P041 blockers.  ".into()),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "workflow_conflicts.resolve",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let retry_instruction_binding_id = match commanded.result {
+        engine::command_handler::CommandResult::WorkflowConflictTransitionSelected {
+            retry_instruction_binding_id,
+            ..
+        } => retry_instruction_binding_id.expect("operator instruction must create binding"),
+        _ => panic!("unexpected command result"),
+    };
+
+    let stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let pending = stages
+        .iter()
+        .find(|stage| stage.status == StageStatus::Pending)
+        .expect("operator-selected loop transition must create pending stage");
+
+    let bindings = retry_operator_instructions::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].binding_id, retry_instruction_binding_id);
+    assert_eq!(
+        bindings[0].instruction_text,
+        "Refine only the documented P041 blockers."
+    );
+    assert_eq!(
+        bindings[0].scope_kind,
+        RetryInstructionScopeKind::FullStageRetry
+    );
+    assert_eq!(bindings[0].stage_id, current_state_id);
+    assert_eq!(bindings[0].source_stage_execution_id, completed_stage_id);
+    assert_eq!(bindings[0].retry_stage_execution_id, pending.id);
+    assert_eq!(bindings[0].retry_attempt_number, pending.attempt_number);
+    assert_eq!(bindings[0].created_by_principal_id, "operator-test");
+    assert_eq!(bindings[0].created_by_principal_class, "operator");
+
+    let deliveries =
+        retry_operator_instructions::list_deliveries_by_binding(&pool, &bindings[0].binding_id)
+            .await
+            .unwrap();
+    assert!(
+        deliveries.is_empty(),
+        "workflow conflict resolution defers full-stage delivery to orchestrator fanout"
+    );
+}
+
+#[tokio::test]
+async fn proposal_017_conflict_instruction_validation_rejects_before_state_mutation() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let completed_stage_id = StageExecutionId::new();
+    let current_state_id = "state_8_implementation_continued";
+    let transition_id = "state_8_implementation_continued__to__state_8_implementation_continued__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_stage = make_stage(completed_stage_id, run_id, StageStatus::Completed);
+    completed_stage.stage_id = current_state_id.into();
+    completed_stage.iteration = 50;
+    stages::insert(&pool, &completed_stage).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: current_state_id.into(),
+        condition_expression_id: Some("implementation_self_assessment_needs_code_fixes".into()),
+        result: CandidateTransitionResult::NotMatched,
+        required_artifacts: vec!["implementation_self_assessment_v2".into()],
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: vec!["implementation_self_assessment_v2".into()],
+        source_agent_execution_id: None,
+        sanitized_diagnostic: Some(
+            "Loop budget exhausted for implementation_progress_count: 50/50 iterations".into(),
+        ),
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict.conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator confirmed one more implementation pass".into(),
+                operator_instruction: Some("   ".into()),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "workflow_conflicts.resolve",
+            ),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("empty operator instruction must be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("operator_instruction validation"),
+        "unexpected error: {err}"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    assert_eq!(stored_run.current_state.as_deref(), Some(current_state_id));
+    assert!(retry_operator_instructions::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn proposal_017_conflict_instruction_requires_new_retry_stage() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let current_state_id = "review";
+    let target_state_id = "complete";
+    let transition_id = "review__to__complete__0";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut running_target = make_stage(StageExecutionId::new(), run_id, StageStatus::Running);
+    running_target.stage_id = target_state_id.into();
+    running_target.iteration = 1;
+    stages::insert(&pool, &running_target).await.unwrap();
+
+    let candidate = CandidateTransitionEvaluation {
+        transition_id: transition_id.into(),
+        from_state_id: current_state_id.into(),
+        to_state_id: target_state_id.into(),
+        condition_expression_id: Some("ready".into()),
+        result: CandidateTransitionResult::Matched,
+        required_artifacts: Vec::new(),
+        missing_artifacts: Vec::new(),
+        missing_fields: Vec::new(),
+        source_artifact_ids: Vec::new(),
+        source_agent_execution_id: None,
+        sanitized_diagnostic: None,
+    };
+    let conflict = make_workflow_conflict(
+        run_id,
+        current_state_id,
+        candidate,
+        WorkflowConflictStatus::OperatorConfirmationRequired,
+    );
+    workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: conflict.conflict_id.clone(),
+                selected_transition_id: transition_id.into(),
+                resolution_reason: "operator selected matched transition".into(),
+                operator_instruction: Some("Apply one more refine instruction.".into()),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "workflow_conflicts.resolve",
+            ),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("instruction must not be silently dropped"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("requires a newly created retry stage"),
+        "unexpected error: {err}"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    assert_eq!(stored_run.current_state.as_deref(), Some(current_state_id));
+}
+
+#[tokio::test]
 async fn proposal_017_operator_cannot_select_plain_not_matched_transition() {
     let pool = test_pool().await;
 
@@ -1010,6 +1279,7 @@ async fn proposal_017_operator_cannot_select_plain_not_matched_transition() {
                 conflict_id: conflict.conflict_id.clone(),
                 selected_transition_id: transition_id.into(),
                 resolution_reason: "try approving anyway".into(),
+                operator_instruction: None,
             }),
             caller,
         )
@@ -1515,6 +1785,82 @@ async fn test_resolve_approval_rejection_matches_reject_stage_semantics() {
     assert_eq!(
         advance_items, 0,
         "non-manual ResolveApproval rejection must not enqueue AdvanceRun"
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_approval_rejects_manual_release_to_implementation_refinement() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::WaitingApproval);
+    run.current_state = Some("state_11_manual_release".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "state_11_manual_release", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: approval.id,
+                decision: ApprovalResolutionDecision::Rejected,
+                rationale: Some("implementation review still has code fixes".into()),
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "approvals.resolve",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let resolved = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.decision, ApprovalDecision::Rejected);
+
+    let rejected_stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rejected_stage.status,
+        StageStatus::Completed,
+        "release rejection must settle the stale release gate"
+    );
+
+    let updated_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(updated_run.status, RunStatus::Running);
+    assert_eq!(
+        updated_run.current_state.as_deref(),
+        Some("state_10_implementation_refined"),
+        "rejected manual release must loop back to implementation refinement"
+    );
+
+    let advance_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == db::work_item::WorkItemKind::AdvanceRun)
+        .count();
+    assert_eq!(
+        advance_items, 1,
+        "release rejection loopback must wake the scheduler"
     );
 }
 
@@ -2415,6 +2761,275 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
     assert_eq!(
         payload.pointer("/targeted_retry/provider_fallback/from_provider"),
         Some(&serde_json::json!("gemini"))
+    );
+}
+
+#[tokio::test]
+async fn test_targeted_retry_falls_back_from_gemini_docs_guardian_backend() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("review".into());
+    run.catalog_snapshot_json = Some(
+        serde_json::json!({
+            "backend_profiles": {
+                "gemini_docs_flash": {
+                    "provider": "gemini_acp",
+                    "model": "gemini-2.5-flash",
+                    "effort": "medium",
+                    "max_turns": 12
+                },
+                "claude_docs_medium": {
+                    "provider": "claude_acp",
+                    "model": "opus",
+                    "effort": "medium",
+                    "max_turns": 12
+                }
+            }
+        })
+        .to_string(),
+    );
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "review".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_docs_guardian = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_docs_guardian.agent_id = "docs_guardian".into();
+    failed_docs_guardian.provider = "gemini_acp".into();
+    failed_docs_guardian.model = Some("gemini-2.5-flash".into());
+    failed_docs_guardian.completed_at = Some(Utc::now());
+    let failed_docs_guardian_id = failed_docs_guardian.id;
+    agent_executions::insert(&pool, &failed_docs_guardian)
+        .await
+        .unwrap();
+    agent_execution_runtime_facts::upsert(
+        &pool,
+        &AgentExecutionRuntimeFacts {
+            agent_execution_id: failed_docs_guardian_id,
+            failure_kind: Some(AgentFailureKind::ProviderTimeout),
+            output_settlement: AgentOutputSettlement::MissingRequiredOutputs,
+            ..AgentExecutionRuntimeFacts::defaults_for(failed_docs_guardian_id, Utc::now())
+        },
+    )
+    .await
+    .unwrap();
+
+    let source_work_item_id = format!("docs-guardian:{old_stage_exec_id}:attempt:1");
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "agent_id": "docs_guardian",
+                "provider": "gemini",
+                "backend_profile_id": "gemini_docs_flash",
+                "model": "gemini-2.5-flash",
+                "effort": "medium",
+                "max_turns": 12,
+                "output_contract": "docs_report_v1",
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_docs_guardian_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("review".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "review".into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: Some(failed_docs_guardian_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let retry_invokes: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(retry_invokes.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+    assert_eq!(payload["agent_id"], serde_json::json!("docs_guardian"));
+    assert_eq!(payload["provider"], serde_json::json!("claude_acp"));
+    assert_eq!(
+        payload["backend_profile_id"],
+        serde_json::json!("claude_docs_medium")
+    );
+    assert_eq!(payload["model"], serde_json::json!("opus"));
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/to_provider"),
+        Some(&serde_json::json!("claude_acp"))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/from_provider"),
+        Some(&serde_json::json!("gemini"))
+    );
+}
+
+#[tokio::test]
+async fn test_targeted_retry_falls_back_from_claude_security_checker_backend() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    run.catalog_snapshot_json = Some(
+        serde_json::json!({
+            "backend_profiles": {
+                "claude_security_high": {
+                    "provider": "claude_acp",
+                    "model": "opus",
+                    "effort": "high",
+                    "max_turns": 16
+                },
+                "codex_architect_high": {
+                    "provider": "codex_acp",
+                    "model": "gpt-5.5",
+                    "effort": "xhigh",
+                    "max_turns": 16
+                }
+            }
+        })
+        .to_string(),
+    );
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "state_9_implementation_reviewed".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_security_checker = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_security_checker.agent_id = "security_checker".into();
+    failed_security_checker.provider = "claude_acp".into();
+    failed_security_checker.model = Some("opus".into());
+    failed_security_checker.completed_at = Some(Utc::now());
+    let failed_security_checker_id = failed_security_checker.id;
+    agent_executions::insert(&pool, &failed_security_checker)
+        .await
+        .unwrap();
+    agent_execution_runtime_facts::upsert(
+        &pool,
+        &AgentExecutionRuntimeFacts {
+            agent_execution_id: failed_security_checker_id,
+            failure_kind: Some(AgentFailureKind::MissingRequiredOutputs),
+            output_settlement: AgentOutputSettlement::MissingRequiredOutputs,
+            ..AgentExecutionRuntimeFacts::defaults_for(failed_security_checker_id, Utc::now())
+        },
+    )
+    .await
+    .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: format!("security-checker:{old_stage_exec_id}:attempt:1"),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_9_implementation_reviewed",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "agent_id": "security_checker",
+                "provider": "claude_acp",
+                "backend_profile_id": "claude_security_high",
+                "model": "opus",
+                "effort": "high",
+                "max_turns": 16,
+                "output_contract": "security_report_v1",
+                "task_outputs": ["security_report"],
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_security_checker_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("state_9_implementation_reviewed".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_9_implementation_reviewed".into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: Some(failed_security_checker_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let retry_invokes: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(retry_invokes.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+    assert_eq!(payload["agent_id"], serde_json::json!("security_checker"));
+    assert_eq!(payload["provider"], serde_json::json!("codex_acp"));
+    assert_eq!(
+        payload["backend_profile_id"],
+        serde_json::json!("codex_architect_high")
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/from_provider"),
+        Some(&serde_json::json!("claude_acp"))
     );
 }
 
@@ -8286,6 +8901,7 @@ sys.exit(0)
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -8459,6 +9075,184 @@ async fn implementation_status_transitions_use_active_contract_summary() {
         updated.current_state.as_deref(),
         Some("state_9_implementation_reviewed"),
         "transition must use active summary status=blocked instead of raw file needs_code_fixes"
+    );
+}
+
+#[tokio::test]
+async fn implementation_review_needs_code_fixes_blocks_manual_release_even_when_self_assessment_has_no_code_tasks(
+) {
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ActiveArtifactGenerationInput,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
+    use domain::ids::ArtifactId;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = tmp.path().join(".chainworks");
+    let implementation_dir = artifact_root.join("implementation");
+    let review_dir = artifact_root.join("review");
+    std::fs::create_dir_all(&implementation_dir).unwrap();
+    std::fs::create_dir_all(&review_dir).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root;
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_review_stage =
+        make_stage(StageExecutionId::new(), run_id, StageStatus::Completed);
+    completed_review_stage.stage_id = "state_9_implementation_reviewed".into();
+    completed_review_stage.label = "Implementation reviewed against proposal".into();
+    stages::insert(&pool, &completed_review_stage)
+        .await
+        .unwrap();
+
+    let self_assessment_path = implementation_dir.join("self-assessment.json");
+    let self_assessment_raw = serde_json::json!({
+        "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation_complete": true,
+        "verification_green": true,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [],
+        "known_risks": [],
+        "tests_run": ["writer-owned checks passed"],
+        "docs_impacted": []
+    });
+    std::fs::write(
+        &self_assessment_path,
+        serde_json::to_vec_pretty(&self_assessment_raw).unwrap(),
+    )
+    .unwrap();
+    let self_assessment_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation_continued".into(),
+        agent_id: "code_writer".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+        format: ArtifactFormat::Json,
+        file_path: self_assessment_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+        agent_execution_id: None,
+    };
+    artifacts::insert(&pool, &self_assessment_artifact)
+        .await
+        .unwrap();
+    let self_assessment_summary = parse_implementation_self_assessment_v2(
+        &self_assessment_raw,
+        ContractParseContext {
+            run_id: run_id.to_string(),
+            run_age: None,
+            declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+            canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(self_assessment_artifact.file_path.clone()),
+            source_generation_id: None,
+            artifact_created_at: Some(self_assessment_artifact.created_at),
+            v2_generation_seen_for_run: true,
+            legacy_v1_generation_available: false,
+        },
+    );
+    artifact_contracts::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        self_assessment_artifact.id,
+        &self_assessment_artifact.contract_id,
+        &self_assessment_summary,
+        self_assessment_artifact.created_at,
+    )
+    .await
+    .unwrap();
+
+    let review_summary_path = review_dir.join("implementation-summary.json");
+    let review_summary_raw = serde_json::json!({
+        "status": "needs_code_fixes",
+        "open_blockers": [{
+            "id": "BLOCK-001",
+            "title": "pre-push found implementation blocker"
+        }],
+        "must_fix": ["fix reviewer-confirmed implementation blockers"],
+        "recommended_next_step": "return_to_code_refine"
+    });
+    std::fs::write(
+        &review_summary_path,
+        serde_json::to_vec_pretty(&review_summary_raw).unwrap(),
+    )
+    .unwrap();
+    let review_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_9_implementation_reviewed".into(),
+        agent_id: "lead_orchestrator".into(),
+        name: "implementation_review_summary".into(),
+        contract_id: "implementation_review_summary_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: review_summary_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+        agent_execution_id: None,
+    };
+    artifacts::insert(&pool, &review_artifact).await.unwrap();
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: review_artifact.id,
+            contract_id: review_artifact.contract_id.clone(),
+            canonical_path: review_artifact.name.clone(),
+            raw_path: review_artifact.file_path.clone(),
+            raw_status: "needs_code_fixes".into(),
+            generation_id: format!("test-review-summary:{}", review_artifact.id),
+            source_agent_execution_id: None,
+            source_stage_execution_id: Some(completed_review_stage.id.to_string()),
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.current_state.as_deref(),
+        Some("state_10_implementation_refined"),
+        "review-owned needs_code_fixes must return to implementation refine even when code_writer self-assessment has zero blocking tasks"
+    );
+    assert_ne!(
+        updated.current_state.as_deref(),
+        Some("state_11_manual_release"),
+        "review-owned blockers must never be presented as manual release approval"
     );
 }
 
@@ -10883,6 +11677,8 @@ fn test_execution_request_carries_chainworks_meta_root() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),
@@ -11190,6 +11986,7 @@ async fn p017_mediation_cancel_run_cascade() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &mediation_execution)
         .await

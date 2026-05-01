@@ -30,6 +30,7 @@ At the current baseline, the product includes:
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
 - bounded artifact discovery and engine-owned settlement pipeline,
+- provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
@@ -170,11 +171,12 @@ The following flows should be treated as implemented system behavior:
 4. lead conflict mediation for same-run resolution of workflow conflicts,
 5. run progress, artifact inspection, and recovery from the operator shell,
 6. workflow-map rendering and fallback handling,
-7. repo-backed full delivery using dedicated worktrees and manual release,
-8. implementation self-assessment and handoff routing,
-9. rejected implementation approval loopback to proposal refinement,
-10. evidence-pack export for repo-backed runs,
-11. benchmark/sign-off evaluation and export.
+7. provider toolchain cache mapping and isolated build execution,
+8. repo-backed full delivery using dedicated worktrees and manual release,
+9. implementation self-assessment and handoff routing,
+10. rejected implementation approval loopback to proposal refinement,
+11. evidence-pack export for repo-backed runs,
+12. benchmark/sign-off evaluation and export.
 
 ## Current review posture
 

@@ -196,6 +196,7 @@ async fn insert_p051_test_agent_execution(pool: &sqlx::SqlitePool) -> AgentExecu
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(pool, &execution).await.unwrap();
 
@@ -244,6 +245,7 @@ async fn p017_mediation_owned_agent_execution_does_not_require_stage_execution()
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
 
     agent_executions::insert(&pool, &execution)
@@ -306,6 +308,7 @@ async fn p017_mediation_owned_retry_budget_and_artifact_claims_are_owner_keyed()
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -891,6 +894,7 @@ async fn agent_execution_provenance_round_trips_without_lineage_joins() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1047,6 +1051,7 @@ async fn proposal_048_persistence_fields_round_trip() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1209,6 +1214,7 @@ async fn proposal_051_xcode_runtime_observation_append_recovers_corrupt_json() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &execution).await.unwrap();
 
@@ -1630,6 +1636,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     let retry_agent_execution = AgentExecution {
         id: AgentExecutionId::new(),
@@ -1669,6 +1676,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
         output_tokens: None,
         cached_input_tokens: None,
         transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
     };
     agent_executions::insert(&pool, &failed_agent_execution)
         .await

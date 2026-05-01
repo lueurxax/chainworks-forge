@@ -1642,6 +1642,8 @@ agents:
 
       Put code-writer-owned source or test blockers only in remaining_code_tasks; each entry must be an object with summary, owner, blocking, and evidence.
 
+      If all remaining_code_tasks are blocking=false and verification_green is true, do not report the implementation as needs_code_fixes or keep implementation_complete=false just to hold deferred rollout/non-code work; move downstream work to handoff_tasks and let the contract settle as handoff_required.
+
       Put docs, manual evidence, release, ops, product, or human-operator work in handoff_tasks; each entry must be an object with summary, owner_class, target_stage, blocking_review, and evidence.
 
       Use only these owner_class values: docs, manual_evidence, release, ops, product, human_operator, unknown. Do not use docs-agent, docs_agent, operator, security-owner, release-owner, or slash-qualified owner_class values.

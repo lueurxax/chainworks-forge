@@ -893,6 +893,55 @@ fn workflow_status_targets_use_canonical_contract_values() {
 }
 
 #[test]
+fn implementation_review_transitions_use_aggregate_review_summary_not_self_assessment() {
+    for workflow_name in ["workflow.yaml", "full-mvp-live.yaml"] {
+        let wf_path = format!("{}/workflows/{workflow_name}", fixtures_dir());
+        let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+        let plan = compiler::compile(&wf_path, &cat_path).expect("should compile plan");
+        let review_state = plan
+            .states
+            .get("state_9_implementation_reviewed")
+            .expect("implementation review state");
+
+        let release_transition = review_state
+            .transitions
+            .iter()
+            .find(|transition| transition.to == "state_11_manual_release")
+            .expect("manual release transition");
+        assert!(
+            release_transition
+                .condition
+                .contains("implementation_review_summary.status"),
+            "{workflow_name} must not route to manual release from self-assessment alone"
+        );
+        assert!(
+            !release_transition
+                .condition
+                .contains("implementation_self_assessment_v2.blocking_remaining_code_tasks"),
+            "{workflow_name} manual release transition must be guarded by aggregate review truth"
+        );
+
+        let refine_transition = review_state
+            .transitions
+            .iter()
+            .find(|transition| transition.to == "state_10_implementation_refined")
+            .expect("implementation refine transition");
+        assert!(
+            refine_transition
+                .condition
+                .contains("implementation_review_summary.status"),
+            "{workflow_name} refine transition must consume aggregate review truth"
+        );
+        assert!(
+            !refine_transition
+                .condition
+                .contains("implementation_self_assessment_v2.blocking_remaining_code_tasks"),
+            "{workflow_name} refine transition must not depend only on code-writer self-assessment"
+        );
+    }
+}
+
+#[test]
 fn p051_catalog_lint_sets_xcode_signals_from_mcp_and_declared_commands() {
     let plan = compile_from_strings(
         r#"
@@ -1437,6 +1486,82 @@ agents:
         plan.workflow_family.as_deref()
     );
     assert!(from_snapshot.states.contains_key("start"));
+}
+
+#[test]
+fn compile_from_snapshot_json_rejects_policy_snapshot_without_format_version() {
+    let workflow = r#"
+workflow:
+  id: steward-workflow
+  family: mvp_live
+  risk_class: high
+  stack: swiftui
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: steward
+    run:
+      sequence:
+        - agent: steward
+          task: "observe"
+"#;
+    let catalog = catalog_with_default_system_lead(
+        r#"
+catalog_snapshot_format_version: 1
+backend_profiles:
+  steward_profile:
+    provider: claude
+    model: steward-model
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
+agents:
+  - id: steward
+    backend_profile: steward_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    toolchain_cache_policy:
+      version: 1
+      enabled: true
+      xcode_scope: run
+      go_scope: session
+    prompt: "observe"
+"#,
+    );
+    let workflow_path = write_temp_fixture("snapshot-policy-workflow.yaml", workflow);
+    let catalog_path = write_temp_fixture("snapshot-policy-catalog.yaml", &catalog);
+    let plan = compiler::compile(&workflow_path, &catalog_path).expect("plan compiles");
+
+    let mut catalog_snapshot: serde_json::Value =
+        serde_json::from_str(&plan.catalog_snapshot_json).expect("snapshot JSON parses");
+    catalog_snapshot
+        .as_object_mut()
+        .expect("catalog snapshot is an object")
+        .remove("catalog_snapshot_format_version");
+    let catalog_snapshot_json =
+        serde_json::to_string(&catalog_snapshot).expect("snapshot JSON serializes");
+
+    let result = compiler::compile_from_snapshot_json(
+        &plan.workflow_snapshot_json,
+        &catalog_snapshot_json,
+        &catalog_path,
+    );
+
+    let err = result.expect_err("snapshot without format version should fail");
+    assert!(
+        err.to_string()
+            .contains("frozen_snapshot_contract_incompatible"),
+        "error should identify as frozen_snapshot_contract_incompatible: {err}"
+    );
 }
 
 #[test]
