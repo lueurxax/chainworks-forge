@@ -40,6 +40,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### ACP transport and sessions
 
 - [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, and capacity management
+- [reference/acp-runtime-transport.md#toolchain-cache-mapping-proposal-066](reference/acp-runtime-transport.md#toolchain-cache-mapping-proposal-066) — Provider toolchain cache mapping: Xcode/Go isolation, environment redirection, and exclusive serialization
 - [reference/xcode-mcp-bridge-pool.md](reference/xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, and broker health
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract

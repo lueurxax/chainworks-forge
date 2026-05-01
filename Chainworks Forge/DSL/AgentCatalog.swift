@@ -128,6 +128,39 @@ struct AppConfig: Codable, Sendable {
     }
 }
 
+// MARK: - P066: Toolchain Cache Policy (AgentDefinition field)
+
+/// P066: Toolchain cache scope: run or session.
+enum ToolchainCacheScope: String, Codable, Sendable {
+    case run
+    case session
+}
+
+/// P066: Per-agent toolchain cache mapping policy from agents[].toolchain_cache_policy.
+/// Decoded through ToolchainMappingReadAdapter — not directly.
+struct ToolchainCachePolicy: Codable, Sendable {
+    let version: Int
+    let enabled: Bool
+    let xcodeScope: ToolchainCacheScope?
+    let goScope: ToolchainCacheScope?
+
+    enum CodingKeys: String, CodingKey {
+        case version, enabled
+        case xcodeScope = "xcode_scope"
+        case goScope = "go_scope"
+    }
+
+    var effectiveXcodeScope: ToolchainCacheScope? {
+        guard enabled else { return nil }
+        return xcodeScope ?? .run
+    }
+
+    var effectiveGoScope: ToolchainCacheScope? {
+        guard enabled else { return nil }
+        return goScope ?? .session
+    }
+}
+
 struct AgentDefinition: Codable, Sendable, Identifiable {
     let id: String
     let title: String
@@ -153,6 +186,10 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let sessionReuseScope: String?
     let sessionFamilyID: String?
 
+    // P066: Toolchain cache mapping policy. Absent = policy_absent.
+    // Decoded through ToolchainMappingReadAdapter — not via try? fallback.
+    let toolchainCachePolicy: ToolchainCachePolicy?
+
     enum CodingKeys: String, CodingKey {
         case id, title, mode, prompt, notes, inputs, outputs
         case backendProfile = "backend_profile"
@@ -169,6 +206,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         case requiresXcodeHostExecution = "requires_xcode_host_execution"
         case sessionReuseScope = "session_reuse_scope"
         case sessionFamilyID = "session_family_id"
+        case toolchainCachePolicy = "toolchain_cache_policy"
     }
 
     init(
@@ -192,7 +230,8 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         prompt: String,
         notes: String? = nil,
         sessionReuseScope: String? = nil,
-        sessionFamilyID: String? = nil
+        sessionFamilyID: String? = nil,
+        toolchainCachePolicy: ToolchainCachePolicy? = nil
     ) {
         self.id = id
         self.title = title
@@ -215,6 +254,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         self.notes = notes
         self.sessionReuseScope = sessionReuseScope
         self.sessionFamilyID = sessionFamilyID
+        self.toolchainCachePolicy = toolchainCachePolicy
     }
 }
 

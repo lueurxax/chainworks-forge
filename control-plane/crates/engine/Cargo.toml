@@ -27,4 +27,5 @@ dirs = "5"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+uuid = { workspace = true }
 acp = { path = "../acp" }

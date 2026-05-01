@@ -4,6 +4,25 @@ use sqlx::{Row, Sqlite, SqlitePool};
 
 const STARTUP_RECOVERY_STALE_AFTER_MS: i64 = 60_000;
 
+/// P066 T17: Toolchain cache fields nested inside StartupRecoverySummary.
+/// Populated after the first startup recovery sweep that enumerates session-scoped roots.
+/// Pre-migration rows have all fields None — surface as "no sweep yet".
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct ToolchainCacheRecoveryReadback {
+    pub session_scoped_roots_seen: Option<i64>,
+    pub session_scoped_roots_reclaimed: Option<i64>,
+    pub session_scoped_cleanup_failures: Option<i64>,
+    pub orphan_threshold_minutes: Option<i64>,
+    pub last_sweep_started_at: Option<DateTime<Utc>>,
+}
+
+impl ToolchainCacheRecoveryReadback {
+    pub fn is_empty(&self) -> bool {
+        self.session_scoped_roots_seen.is_none()
+            && self.last_sweep_started_at.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupRecoveryReadback {
     pub id: String,
@@ -14,6 +33,8 @@ pub struct StartupRecoveryReadback {
     pub next_retry_or_backoff_time: Option<DateTime<Utc>>,
     pub stale_after_ms: i64,
     pub updated_at: DateTime<Utc>,
+    /// P066 T17: toolchainCache extension. None fields = no sweep yet.
+    pub toolchain_cache: ToolchainCacheRecoveryReadback,
 }
 
 impl StartupRecoveryReadback {
@@ -126,6 +147,7 @@ pub async fn build_startup_recovery_readback(
         next_retry_or_backoff_time,
         stale_after_ms: STARTUP_RECOVERY_STALE_AFTER_MS,
         updated_at,
+        toolchain_cache: ToolchainCacheRecoveryReadback::default(),
     })
 }
 
@@ -137,8 +159,13 @@ pub async fn record_startup_recovery_readback(
         r#"INSERT INTO startup_recovery_readbacks
            (id, recovered_item_count, queued_under_startup_recovery_backpressure_count,
             oldest_recovered_queued_age_ms, affected_run_count, next_retry_or_backoff_time,
-            stale_after_ms, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            stale_after_ms, updated_at,
+            toolchain_session_scoped_roots_seen,
+            toolchain_session_scoped_roots_reclaimed,
+            toolchain_session_scoped_cleanup_failures,
+            toolchain_orphan_threshold_minutes,
+            toolchain_last_sweep_started_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
     )
     .bind(&readback.id)
     .bind(readback.recovered_item_count)
@@ -152,6 +179,16 @@ pub async fn record_startup_recovery_readback(
     )
     .bind(readback.stale_after_ms)
     .bind(readback.updated_at.to_rfc3339())
+    .bind(readback.toolchain_cache.session_scoped_roots_seen)
+    .bind(readback.toolchain_cache.session_scoped_roots_reclaimed)
+    .bind(readback.toolchain_cache.session_scoped_cleanup_failures)
+    .bind(readback.toolchain_cache.orphan_threshold_minutes)
+    .bind(
+        readback
+            .toolchain_cache
+            .last_sweep_started_at
+            .map(|t| t.to_rfc3339()),
+    )
     .execute(pool)
     .await
     .context("record startup recovery readback")?;
@@ -164,7 +201,12 @@ pub async fn latest_startup_recovery_readback(
     let row = sqlx::query(
         r#"SELECT id, recovered_item_count, queued_under_startup_recovery_backpressure_count,
                   oldest_recovered_queued_age_ms, affected_run_count, next_retry_or_backoff_time,
-                  stale_after_ms, updated_at
+                  stale_after_ms, updated_at,
+                  toolchain_session_scoped_roots_seen,
+                  toolchain_session_scoped_roots_reclaimed,
+                  toolchain_session_scoped_cleanup_failures,
+                  toolchain_orphan_threshold_minutes,
+                  toolchain_last_sweep_started_at
            FROM startup_recovery_readbacks
            ORDER BY updated_at DESC, id ASC
            LIMIT 1"#,
@@ -230,6 +272,7 @@ fn parse_startup_recovery_readback_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<StartupRecoveryReadback> {
     let next_retry_or_backoff_time: Option<String> = row.get("next_retry_or_backoff_time");
+    let toolchain_last_sweep: Option<String> = row.try_get("toolchain_last_sweep_started_at").unwrap_or(None);
     Ok(StartupRecoveryReadback {
         id: row.get("id"),
         recovered_item_count: row.get("recovered_item_count"),
@@ -242,6 +285,15 @@ fn parse_startup_recovery_readback_row(
             .transpose()?,
         stale_after_ms: row.get("stale_after_ms"),
         updated_at: parse_datetime(row.get("updated_at"))?,
+        toolchain_cache: ToolchainCacheRecoveryReadback {
+            session_scoped_roots_seen: row.try_get("toolchain_session_scoped_roots_seen").unwrap_or(None),
+            session_scoped_roots_reclaimed: row.try_get("toolchain_session_scoped_roots_reclaimed").unwrap_or(None),
+            session_scoped_cleanup_failures: row.try_get("toolchain_session_scoped_cleanup_failures").unwrap_or(None),
+            orphan_threshold_minutes: row.try_get("toolchain_orphan_threshold_minutes").unwrap_or(None),
+            last_sweep_started_at: toolchain_last_sweep
+                .map(|raw| parse_datetime(&raw))
+                .transpose()?,
+        },
     })
 }
 

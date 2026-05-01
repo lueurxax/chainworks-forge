@@ -646,6 +646,7 @@ async fn claim_invoke_agent_work_item_with_start(
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         },
     )
     .await?;
@@ -902,6 +903,8 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 origin_stage_id: None,
                 origin_stage_execution_id: None,
                 mediation_record_id: None,
+                toolchain_home: None,
+                toolchain_go_scope_enabled: false,
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -3461,6 +3464,7 @@ impl BackgroundExecutor {
                         output_tokens: None,
                         cached_input_tokens: None,
                         transcript_artifact_id: None,
+                        actual_toolchain_mapping_diagnostics_json: None,
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
                 }
@@ -3785,6 +3789,8 @@ impl BackgroundExecutor {
                             .or_else(|| stage_execution_id.map(|id| id.to_string()))
                     },
                     mediation_record_id: mediation_record_id.clone(),
+                    toolchain_home: None,
+                    toolchain_go_scope_enabled: false,
                 };
                 // Runtime event: session starting
                 let _ = self

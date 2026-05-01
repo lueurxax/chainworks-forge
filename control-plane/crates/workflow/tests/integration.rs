@@ -1489,6 +1489,82 @@ agents:
 }
 
 #[test]
+fn compile_from_snapshot_json_rejects_policy_snapshot_without_format_version() {
+    let workflow = r#"
+workflow:
+  id: steward-workflow
+  family: mvp_live
+  risk_class: high
+  stack: swiftui
+initial_state: start
+states:
+  start:
+    label: Start
+    type: start
+    owner: steward
+    run:
+      sequence:
+        - agent: steward
+          task: "observe"
+"#;
+    let catalog = catalog_with_default_system_lead(
+        r#"
+catalog_snapshot_format_version: 1
+backend_profiles:
+  steward_profile:
+    provider: claude
+    model: steward-model
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
+agents:
+  - id: steward
+    backend_profile: steward_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    toolchain_cache_policy:
+      version: 1
+      enabled: true
+      xcode_scope: run
+      go_scope: session
+    prompt: "observe"
+"#,
+    );
+    let workflow_path = write_temp_fixture("snapshot-policy-workflow.yaml", workflow);
+    let catalog_path = write_temp_fixture("snapshot-policy-catalog.yaml", &catalog);
+    let plan = compiler::compile(&workflow_path, &catalog_path).expect("plan compiles");
+
+    let mut catalog_snapshot: serde_json::Value =
+        serde_json::from_str(&plan.catalog_snapshot_json).expect("snapshot JSON parses");
+    catalog_snapshot
+        .as_object_mut()
+        .expect("catalog snapshot is an object")
+        .remove("catalog_snapshot_format_version");
+    let catalog_snapshot_json =
+        serde_json::to_string(&catalog_snapshot).expect("snapshot JSON serializes");
+
+    let result = compiler::compile_from_snapshot_json(
+        &plan.workflow_snapshot_json,
+        &catalog_snapshot_json,
+        &catalog_path,
+    );
+
+    let err = result.expect_err("snapshot without format version should fail");
+    assert!(
+        err.to_string()
+            .contains("frozen_snapshot_contract_incompatible"),
+        "error should identify as frozen_snapshot_contract_incompatible: {err}"
+    );
+}
+
+#[test]
 fn steward_metadata_contract_tests_snapshot_hashes_are_canonical_over_yaml_ordering() {
     let catalog_a = r#"
 backend_profiles:
