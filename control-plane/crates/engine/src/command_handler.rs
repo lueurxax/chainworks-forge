@@ -9,16 +9,18 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, command_journal, ideas, legacy_discovery_overrides, projections,
+    artifact_contracts, closeout, command_journal, ideas, legacy_discovery_overrides, projections,
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
+use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{CallerContext, Command};
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
+use domain::proposal_gate_result::{ProposalGateLineage, ProposalGateResult, ProposalGateStatus};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
@@ -32,6 +34,9 @@ use crate::cancellation;
 use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
+};
+use crate::synthesizers::closeout_readiness::{
+    synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
 };
 use crate::work_queue::WorkQueue;
 
@@ -98,6 +103,14 @@ pub enum CommandResult {
         reason: String,
         journal_id: String,
     },
+    /// P077: gate settled and closeout transaction committed.
+    ProposalGateSettled {
+        run_id: RunId,
+        gate_id: String,
+        journal_id: String,
+        gate_generation_id: String,
+        readiness_generation_id: String,
+    },
 }
 
 pub struct StartRunBlockedByDeliveryPreflight {
@@ -152,6 +165,7 @@ impl CommandJournalEntry {
             Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
             Command::ResolveLeadMediationConfirmation(_) => "ResolveLeadMediationConfirmation",
             Command::ResolveApproval(_) => "ResolveApproval",
+            Command::SettleProposalGate(_) => "SettleProposalGate",
         };
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
@@ -174,6 +188,7 @@ impl CommandJournalEntry {
             Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
             Command::ResolveLeadMediationConfirmation(c) => Some(c.run_id.to_string()),
             Command::ResolveApproval(c) => Some(c.run_id.to_string()),
+            Command::SettleProposalGate(c) => Some(c.run_id.to_string()),
         };
         let principal_class = caller.principal_class.to_string();
 
@@ -204,6 +219,7 @@ impl CommandJournalEntry {
                 | "ResetSession"
                 | "ResolveLeadMediationConfirmation"
                 | "ResolveApproval"
+                | "SettleProposalGate"
         )
     }
 }
@@ -620,6 +636,11 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: ResolveApproval requires operator principal");
         }
+        if matches!(&cmd, Command::SettleProposalGate(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: SettleProposalGate requires operator principal");
+        }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal = CommandJournalEntry::new(&cmd, &caller);
@@ -866,6 +887,8 @@ impl CommandHandler {
                     chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
                     // P060: Frozen review routing options.
                     review_routing_json: validated_review_routing_json,
+                    // P077: Frozen closeout readiness mode from workflow snapshot metadata.
+                    closeout_readiness_mode: c.closeout_readiness_mode.clone(),
                 };
                 runs::insert_tx(&mut tx, &run).await?;
                 // OPS-001 (P017 R2 audit): the workflow compiler ran
@@ -2661,6 +2684,152 @@ impl CommandHandler {
                     },
                 };
                 Ok(result)
+            }
+            Command::SettleProposalGate(mut c) => {
+                // BLK-008: bind principal from authenticated CallerContext —
+                // never trust the caller-supplied payload field.
+                c.principal = caller.principal_id.clone();
+
+                // BLK-009: Reject import_receipt paths until the executor can validate
+                // and persist an active proposal_gate_result_v1 generation. Unmanaged
+                // file-only receipts are explicitly rejected by R14.
+                if c.receipt_json.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+                    anyhow::bail!(
+                        "import_receipt not yet implemented: typed ProposalGateReceipt schema \
+                         and active proposal_gate_result_v1 generation persistence are required \
+                         before ImportReceipt can be accepted"
+                    );
+                }
+
+                let gate_id = format!("p{}:{}", c.proposal_id, c.proposal_id);
+                let tx_started = Instant::now();
+                let mut tx = db::pool::begin_immediate_with_retry(
+                    &self.pool,
+                    "command.SettleProposalGate",
+                )
+                .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.SettleProposalGate", tx_started);
+
+                // Build ProposalGateResult (RecordSettlement = operator declares gate passed).
+                let gate_generation_id = uuid::Uuid::new_v4().to_string();
+                let gate_result = ProposalGateResult {
+                    gate_id: gate_id.clone(),
+                    proposal_id: c.proposal_id.clone(),
+                    run_id: c.run_id.to_string(),
+                    stage_id: c.stage_id.clone(),
+                    status: ProposalGateStatus::Passed,
+                    generation_id: gate_generation_id,
+                    diagnostic_reason: None,
+                    executor_version: None,
+                    evidence_digest: None,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    settled_at: Utc::now(),
+                    authorization_lineage: Some(ProposalGateLineage {
+                        principal: c.principal.clone(),
+                        capability: c.capability.clone(),
+                        journal_id: journal.id.clone(),
+                        authority: c.authority.clone(),
+                        reason: c.reason.clone(),
+                        source_artifacts: c.source_artifacts.clone(),
+                        run_id: c.run_id.to_string(),
+                        proposal_id: c.proposal_id.clone(),
+                        stage_id: c.stage_id.clone(),
+                        workflow_digest: c.workflow_digest.clone(),
+                        worktree_head: c.worktree_head.clone(),
+                        dirty_or_changed_file_digest: c.dirty_or_changed_file_digest.clone(),
+                        source_generation_ids: c.source_generation_ids.clone(),
+                        current_fingerprint: c.current_fingerprint.clone(),
+                    }),
+                    failure_classification: None,
+                };
+
+                // Resolve closeout readiness mode from the frozen run column.
+                let run_id_str = c.run_id.to_string();
+                let mode_column =
+                    closeout::find_closeout_readiness_mode(&self.pool, &run_id_str).await?;
+                let has_enforcement_migration =
+                    closeout::has_enforcement_migration_record(&self.pool, &run_id_str).await?;
+                let mode_result = resolve_closeout_readiness_mode(
+                    mode_column.as_deref(),
+                    has_enforcement_migration,
+                );
+
+                // Load active self-assessment if present.
+                let self_assessment_stored =
+                    artifact_contracts::find_active_implementation_self_assessment_summary(
+                        &self.pool,
+                        c.run_id,
+                    )
+                    .await?;
+                let self_assessment_ref = self_assessment_stored.as_ref().map(|s| &s.summary);
+
+                // P077 BLK-006: source controlled_reports_green from active artifact contracts.
+                let controlled_reports_green =
+                    closeout::compute_controlled_reports_green(&self.pool, &run_id_str)
+                        .await
+                        .ok()
+                        .flatten();
+
+                // P077 BLK-011: read prior blocker_digest for soft-convergence detection.
+                let prior_blocker_digest =
+                    closeout::find_active_blocker_digest(&self.pool, &run_id_str)
+                        .await
+                        .ok()
+                        .flatten();
+
+                // Synthesize closeout readiness.
+                let synth_result =
+                    synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
+                        run_id: &run_id_str,
+                        stage_id: &c.stage_id,
+                        gate_result: &gate_result,
+                        mode_result: &mode_result,
+                        self_assessment: self_assessment_ref,
+                        accepted_risks: &[],
+                        loop_budget_remaining: true,
+                        fingerprint: None,
+                        fingerprint_latency_exceeded: false,
+                        controlled_reports_green,
+                        previous_blocker_digest: prior_blocker_digest.as_deref(),
+                    });
+
+                // Atomically activate gate + readiness generations, then rebuild projections.
+                let closeout_tx_result = closeout::execute_closeout_transaction(
+                    &self.pool,
+                    closeout::CloseoutTransactionInputs {
+                        gate_result: &gate_result,
+                        readiness: &synth_result.readiness,
+                        blocker_digest: synth_result.current_blocker_digest.as_deref(),
+                    },
+                )
+                .await?;
+                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+
+                Ok(CommandResult::ProposalGateSettled {
+                    run_id: c.run_id,
+                    gate_id,
+                    journal_id: journal.id.clone(),
+                    gate_generation_id: closeout_tx_result.gate_generation_id,
+                    readiness_generation_id: closeout_tx_result.readiness_generation_id,
+                })
             }
         }
     }

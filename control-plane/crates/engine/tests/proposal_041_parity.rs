@@ -323,6 +323,7 @@ fn make_start_cmd(
         workflow_yaml_path: workflow_yaml_path.display().to_string(),
         agent_catalog_yaml_path: agent_catalog_yaml_path.display().to_string(),
         review_routing_json: None,
+        closeout_readiness_mode: None,
     })
 }
 

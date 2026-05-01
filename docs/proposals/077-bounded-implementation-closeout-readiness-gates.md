@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-29 |
-| Status | Draft |
+| Status | Implemented |
 | Author | Andrey Khasanov |
 | Depends on | [052-orchestrator-loop-budget-source-of-truth.md](052-orchestrator-loop-budget-source-of-truth.md), [059-release-evidence-gates-and-approval-payload-contract.md](059-release-evidence-gates-and-approval-payload-contract.md), [073-stability-freeze-regression-budget-and-refactor-plan.md](073-stability-freeze-regression-budget-and-refactor-plan.md), [output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff) |
 | Scope | Add bounded, machine-readable readiness rules that decide whether an implementation run may leave implementation review for manual release, handoff, or completed stop-state. |
@@ -309,3 +309,16 @@ The gate must not require live Xcode, GitHub PR review, Copilot review, daemon d
 - Code agents are not invoked for missing gates, manual release evidence, PR review comments, or other non-code closeout tasks.
 - Runs expose a concise closeout readiness explanation through MCP, GraphQL, and operator UI.
 - `./scripts/test-gate.sh proposal-077` passes.
+
+---
+
+## 11. Implementation Refinements
+
+The following details were refined during implementation (Stage 10):
+
+### 11.1 Closeout Fingerprint
+To prevent decision consistency issues between synthesizer execution and transaction commit, a **Closeout Fingerprint** was added to the readiness model. This fingerprint captures the immutable state of the run at evaluation time and is stored as `fingerprint_json` in the artifact.
+
+### 11.2 Latency Budget
+A **5,000ms latency budget** is enforced for fingerprint computation. If the budget is exceeded, the synthesizer fails closed with `status: unknown` and `decision: block_with_evidence` to avoid blocking the engine with expensive state scans.
+

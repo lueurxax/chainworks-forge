@@ -1637,6 +1637,7 @@ Available gates:
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
+  proposal-077,p077  Proposal 077 Phase-1 closeout readiness gates (Rust domain/db/engine only; GraphQL/MCP/UI surfaces deferred)
   proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -3718,6 +3719,23 @@ PLIST
     else
       run_full_suite
     fi
+    ;;
+  proposal-077|p077)
+    # P077 Phase-1 gate: Rust domain/db/engine unit and proof-gate tests.
+    # Covers: typed domain contracts, closeout synthesizer decision matrix,
+    # DB closeout transaction, and accessor routing (memory-level).
+    # NOT covered: integrated orchestrator transition guard against live SQLite,
+    # GraphQL/MCP readback parity, macOS UI/accessibility surfaces.
+    # See docs/reference/test-gates.md for narrowed coverage statement.
+    log "Proposal 077 Phase-1 closeout readiness gate (Rust domain/db/engine)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p domain proposal_077_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p db closeout_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p engine proposal_077_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test --test p077_proof_gate -- --nocapture
+    )
+    log "Proposal 077 Phase-1 gate passed"
     ;;
   *)
     print_usage >&2

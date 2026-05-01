@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    artifact_contracts, artifacts, lead_conflict_mediations, legacy_discovery_overrides, sessions,
-    validation, workflow_conflicts,
+    artifact_contracts, artifacts, closeout, lead_conflict_mediations, legacy_discovery_overrides,
+    sessions, validation, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -676,6 +676,34 @@ pub(crate) async fn implementation_self_assessment_summary_json(
         .map_err(Into::into)
 }
 
+/// P077: Serialize the active closeout readiness generation for MCP readback.
+/// Returns null when no active generation exists (run not yet at state_9 or gate not settled).
+pub(crate) async fn closeout_readiness_summary_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let run_id_str = run_id.to_string();
+    let readiness = closeout::find_active_readiness_generation(pool, &run_id_str).await?;
+    let Some(readiness) = readiness else {
+        return Ok(serde_json::Value::Null);
+    };
+    let gate = closeout::find_active_gate_generation(pool, &run_id_str).await?;
+    Ok(serde_json::json!({
+        "status": readiness.status,
+        "decision": readiness.decision,
+        "generation_id": readiness.generation_id,
+        "readiness_mode": readiness.readiness_mode,
+        "diagnostic_reason": readiness.diagnostic_reason,
+        "primary_unblock": readiness.primary_unblock,
+        "code_blocker_count": readiness.code_blocker_count,
+        "handoff_owner": readiness.handoff_owner,
+        "risk_settlement_required": readiness.risk_settlement_required,
+        "gate_status": gate.as_ref().map(|g| g.status.as_str()),
+        "gate_generation_id": gate.as_ref().map(|g| g.generation_id.as_str()),
+        "is_applicable": true,
+    }))
+}
+
 pub(crate) fn public_artifact_path(path: &str) -> String {
     if path.ends_with("implementation/self-assessment.json") {
         "implementation/self-assessment.json".to_string()
@@ -1225,6 +1253,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

@@ -125,6 +125,8 @@ The current controlled contracts are:
 | `security_report_v1` | `security/report.json` | `pass`, `block`, `invalid`, `unknown` |
 | `prepush_review_v1` | `review/prepush.json` | `pass`, `block`, `invalid`, `unknown` |
 | `docs_report_v1` | `docs/report.json` | `pass`, `not_needed`, `block`, `invalid`, `unknown` |
+| `docs_delta_v1` | `docs/changed-files.json` | generated evidence |
+| `implementation_closeout_readiness_v1` | `review/implementation-closeout-readiness.json` | `ready`, `ready_with_risks`, `handoff_required`, `not_ready`, `blocked`, `invalid`, `unknown` |
 | `implementation_self_assessment_v2` | `implementation/self-assessment.json` | `complete`, `handoff_required`, `needs_code_fixes`, `blocked`, `unknown`, `invalid` |
 | `tests_result_v1` | `implementation/tests.json` | `green`, `red`, `blocked`, `unknown` |
 | `implementation_review_summary_v1` | `review/implementation-summary.json` | `code_complete`, `needs_code_fixes`, `release_evidence_blocked`, `invalid` |
@@ -167,13 +169,57 @@ The stable status vocabulary is:
 - `handoff_required`: code work can leave the implementation loop, but downstream non-code handoff remains.
 - `complete`: implementation and verification are complete with no blocking handoff.
 - `unknown`: no valid v2 or compatible legacy truth is available yet.
-
 Workflow transitions read the active contract row, not raw files. `needs_code_fixes` keeps the run in the implementation
 loop. `complete`, `handoff_required`, and `blocked` leave the code-writer loop and route the run to the downstream
 review, release, or operator decision surfaces that own the remaining work. Legacy `implementation_self_assessment`
 artifacts remain readable as compatibility evidence, but `seemingly_complete` is not transition authority for new
 implementation-loop decisions.
 
+### Implementation closeout readiness
+
+`implementation_closeout_readiness_v1` is the decision contract for moving from implementation review
+to manual release or handoff. It evaluates proposal-specific readiness by combining self-assessment,
+implementation audit, proposal gates, and release evidence handoff.
+
+#### Readiness Mode
+
+Closeout readiness is governed by a per-run **closeout readiness mode** frozen at run admission:
+- **`advisory`**: Diagnostic-only mode. Closeout readiness is synthesized and visible to operators, but the stricter Proposal 077 transition guards are not enforced.
+- **`enforcement`**: Strict gating mode. Transition to manual release requires a resolved `enter_manual_release` decision.
+
+#### Decision and Gating
+
+The canonical artifact path is `review/implementation-closeout-readiness.json`. The artifact contains:
+
+- `status`: the readiness status (`ready`, `ready_with_risks`, `handoff_required`, `not_ready`, `blocked`, `invalid`, `unknown`).
+- `decision`: the workflow routing decision (`enter_manual_release`, `await_non_code_handoff`, `return_to_code_refine`, `await_gate_definition`, `await_operator_decision`, `block_with_evidence`).
+- `proposal_gate`: status of the required canonical proposal gate.
+- `audit`: status and reference to the implementation audit report.
+- `code_blockers`: list of proposal-critical code blockers.
+- `handoff_blockers`: list of non-code handoff blockers.
+- `loop_policy`: current refine cycles used, remaining budget, and whether a soft convergence checkpoint was reached.
+- `fingerprint_json`: optional snapshot of the run state used to detect stale or replayed results.
+
+The closeout decision distinguishes code-owned blockers from non-code blockers to prevent infinite
+code/review loops. If code blockers exist and budget remains, the run returns to code refine.
+If only handoff blockers remain, the run moves to a handoff or operator-decision state.
+
+#### Soft Convergence Checkpoint
+
+If the same set of code blockers recurs across repeated audit/refine cycles without meaningful progress or a change in the blocker set, the synthesizer marks a **soft convergence checkpoint**. This routes the run to `await_operator_decision` instead of looping silently back to code refinement, even if the hard loop budget (P052) is not yet exhausted.
+
+#### Closeout Fingerprint and Latency Budget
+
+To ensure decision consistency, the synthesizer consumes a **Closeout Fingerprint** that captures the state of the run at the time of evaluation. If the fingerprint computation exceeds the **5,000ms latency budget**, the synthesizer fails closed with `status: unknown` and `decision: block_with_evidence`, preventing a transition based on potentially stale or inconsistent state.
+
+#### Risk Lineage
+
+For states such as `ready_with_risks`, enforcement mode requires **typed risk lineage** (accepted lineage or governed settlement) for each risk. Free-form `known_risks` text alone never satisfies the requirement to `enter_manual_release`.
+
+GraphQL exposes a nullable `implementationCloseoutReadinessSummary` field on run read models. MCP run detail/list
+responses expose the same projection as `implementation_closeout_readiness_summary`.
+
+### Generated run-state projection
 GraphQL exposes a nullable `implementationSelfAssessmentSummary` field on run read models. MCP run detail/list
 responses expose the same projection as `implementation_self_assessment_summary`. `null` means no v2/v1 projection
 exists yet; raw artifact readback remains available for evidence inspection.

@@ -9,8 +9,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, ideas, projections, runs, steward as steward_repo,
-    workflow_conflicts,
+    approvals, artifact_contracts, artifacts, closeout, ideas, projections, runs,
+    steward as steward_repo, workflow_conflicts,
 };
 use domain::commands::{
     ApprovalResolutionDecision, ApproveStageCmd, CallerContext, CancelRunCmd, Command,
@@ -157,6 +157,24 @@ async fn enrich_run_with_artifact_contracts(
     gql.knowledge_capsule_readback_json = Some(async_graphql::Json(
         proposal_064_knowledge_capsule_readback(pool, run_id).await?,
     ));
+    // P077: Populate closeout readiness summary from active closeout_gate_generations.
+    if let Some(readiness) = closeout::find_active_readiness_generation(pool, &run_id.to_string()).await? {
+        let gate = closeout::find_active_gate_generation(pool, &run_id.to_string()).await?;
+        gql.closeout_readiness_summary_json = Some(async_graphql::Json(serde_json::json!({
+            "status": readiness.status,
+            "decision": readiness.decision,
+            "generation_id": readiness.generation_id,
+            "readiness_mode": readiness.readiness_mode,
+            "diagnostic_reason": readiness.diagnostic_reason,
+            "primary_unblock": readiness.primary_unblock,
+            "code_blocker_count": readiness.code_blocker_count,
+            "handoff_owner": readiness.handoff_owner,
+            "risk_settlement_required": readiness.risk_settlement_required,
+            "gate_status": gate.as_ref().map(|g| g.status.as_str()),
+            "gate_generation_id": gate.as_ref().map(|g| g.generation_id.as_str()),
+            "is_applicable": true,
+        })));
+    }
     Ok(())
 }
 
@@ -722,6 +740,25 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     } else {
         None
     };
+    // P077: Populate closeout readiness summary from active closeout_gate_generations.
+    let run_id_str = run_id.to_string();
+    if let Some(readiness) = closeout::find_active_readiness_generation(pool, &run_id_str).await? {
+        let gate = closeout::find_active_gate_generation(pool, &run_id_str).await?;
+        run.closeout_readiness_summary_json = Some(async_graphql::Json(serde_json::json!({
+            "status": readiness.status,
+            "decision": readiness.decision,
+            "generation_id": readiness.generation_id,
+            "readiness_mode": readiness.readiness_mode,
+            "diagnostic_reason": readiness.diagnostic_reason,
+            "primary_unblock": readiness.primary_unblock,
+            "code_blocker_count": readiness.code_blocker_count,
+            "handoff_owner": readiness.handoff_owner,
+            "risk_settlement_required": readiness.risk_settlement_required,
+            "gate_status": gate.as_ref().map(|g| g.status.as_str()),
+            "gate_generation_id": gate.as_ref().map(|g| g.generation_id.as_str()),
+            "is_applicable": true,
+        })));
+    }
     Ok(run)
 }
 
@@ -1336,6 +1373,7 @@ impl MutationRoot {
             workflow_yaml_path,
             agent_catalog_yaml_path,
             review_routing_json,
+            closeout_readiness_mode: None,
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -2090,6 +2128,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

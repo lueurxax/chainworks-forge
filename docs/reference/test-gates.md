@@ -976,6 +976,50 @@ Command:
 ./scripts/test-gate.sh proposal-049
 ```
 
+### `proposal-077|p077`
+
+Bounded implementation closeout readiness gate — Phase-1 Rust slice.
+
+Scope (what this gate actually covers):
+
+- `implementation_closeout_readiness_v1` decision-matrix validation (Rust domain/db/engine)
+- proposal gate domain contracts and status normalization
+- audit verdict policy enforcement (synthesizer unit tests)
+- bounded code/refine loop and soft convergence checkpoints (memory-level)
+- closeout fingerprinting and latency budget validation
+- DB closeout transaction atomicity (db integration tests)
+- accessor routing proof (in-memory, not against live orchestrator graph)
+
+NOT covered by this gate (require additional integration gates or manual evidence):
+
+- integrated orchestrator transition guard against live SQLite (state_9 real run)
+- GraphQL/MCP runs.get/list closeout-readiness readback parity tests
+- macOS UI/accessibility surfaces and VoiceOver fixtures
+- Swift workspace tests
+
+Use when:
+
+- changing implementation closeout readiness logic, status normalization, or decision rules
+- changing proposal gate domain contracts or DB closeout transaction
+- validating bounded loop convergence or soft checkpoint behavior at the synthesizer level
+- reproving the Proposal 077 Phase-1 Rust domain/db/engine slice
+
+Host policy:
+
+- local Rust target only; no Swift or UI build required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-077
+```
+
+Important:
+
+- this gate covers the Phase-1 Rust domain/db/engine slice of Proposal 077; full R14 acceptance requires additional integrated transition, GraphQL/MCP parity, and macOS fixture coverage
+- it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
+- it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
+
 ### `p051-scaffold`
 
 Historical bridge-pool scaffold gate alias for the shared Xcode MCP bridge pool substrate.

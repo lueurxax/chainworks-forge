@@ -505,6 +505,7 @@ impl McpServer {
                 .await?,
                 "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
+                "closeout_readiness_summary": tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?,
                 "artifact_index": artifact_rows,
                 "artifacts": artifact_payloads,
             }));
@@ -1205,6 +1206,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

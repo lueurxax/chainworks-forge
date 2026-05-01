@@ -366,6 +366,21 @@ The implementation completeness and handoff contract uses status-based
 transitions for the implementation loop. The `code_writer` exits the implementation
 loop when the self-assessment status is `complete`, `handoff_required`, or `blocked`.
 
+#### Implementation closeout readiness transitions
+
+Proposal 077 adds a stricter transition guard for the implementation review stage
+(`state_9_implementation_reviewed`). A run may enter manual release (`state_11_manual_release`)
+only when `implementation_closeout_readiness_v1.decision == 'enter_manual_release'`.
+
+This guard replaces the simpler `implementation_self_assessment_v2.complete == true`
+check. It ensures that proposal-specific gates and implementation audits are satisfied
+before a run is presented as release-ready.
+
+If the closeout decision is `return_to_code_refine`, the run moves to
+`state_10_implementation_refined`, provided the refine budget is not exhausted.
+If the budget is exhausted or a non-code decision is required, the run routes to
+`await_operator_decision` or `await_non_code_handoff`.
+
 ---
 
 ## Resume Manager (`ResumeManager.swift`)

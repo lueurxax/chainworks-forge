@@ -6,7 +6,7 @@ use domain::commands::{
     CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    StartRunCmd,
+    ProposalGateSettlementAction, SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use engine::command_handler::CommandHandler;
@@ -162,6 +162,45 @@ pub fn tool_specs() -> Vec<McpTool> {
                 }
             }),
         },
+        McpTool {
+            name: "runs.settle_proposal_gate".to_string(),
+            description: "P077 Phase 0: Record a proposal gate settlement result (journaled-only). \
+                Requires operator principal. The principal field is bound from the authenticated \
+                caller context at the engine boundary.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": [
+                    "run_id", "proposal_id", "stage_id", "capability", "journal_id",
+                    "authority", "reason", "source_artifacts", "workflow_digest",
+                    "worktree_head", "dirty_or_changed_file_digest",
+                    "source_generation_ids", "current_fingerprint"
+                ],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "proposal_id": { "type": "string", "maxLength": 64 },
+                    "stage_id": { "type": "string", "maxLength": 128 },
+                    "capability": { "type": "string", "maxLength": 1024 },
+                    "journal_id": { "type": "string", "maxLength": 1024 },
+                    "authority": { "type": "string", "maxLength": 1024 },
+                    "reason": { "type": "string", "maxLength": 4096 },
+                    "source_artifacts": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 1024 },
+                        "maxItems": 64
+                    },
+                    "workflow_digest": { "type": "string", "maxLength": 1024 },
+                    "worktree_head": { "type": "string", "maxLength": 1024 },
+                    "dirty_or_changed_file_digest": { "type": "string", "maxLength": 1024 },
+                    "source_generation_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 1024 },
+                        "maxItems": 64
+                    },
+                    "current_fingerprint": { "type": "string", "maxLength": 1024 },
+                    "receipt_json": { "type": "string", "description": "Raw JSON receipt from the gate executor (max 256KiB)" }
+                }
+            }),
+        },
     ]
 }
 
@@ -219,6 +258,7 @@ pub async fn execute(
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
                 review_routing_json,
+                closeout_readiness_mode: None,
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let run_id = match &commanded.result {
@@ -481,6 +521,147 @@ pub async fn execute(
             );
         }
 
+        "runs.settle_proposal_gate" => {
+            let run_id = parse_run_id(&params)?;
+            let proposal_id = params["proposal_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'proposal_id'"))?
+                .to_string();
+            let stage_id = params["stage_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
+                .to_string();
+            let capability = params["capability"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'capability'"))?
+                .to_string();
+            let journal_id = params["journal_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'journal_id'"))?
+                .to_string();
+            let authority = params["authority"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'authority'"))?
+                .to_string();
+            // sec-002: cap reason at 4 KiB
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            if reason.len() > 4096 {
+                anyhow::bail!("'reason' exceeds maximum length of 4096 bytes");
+            }
+            // sec-002: cap source_artifacts at 64 entries, each string ≤ 1 KiB
+            let source_artifacts: Vec<String> = params["source_artifacts"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'source_artifacts'"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| anyhow::anyhow!("source_artifacts entry is not a string"))
+                        .map(str::to_string)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if source_artifacts.len() > 64 {
+                anyhow::bail!("'source_artifacts' exceeds maximum of 64 entries");
+            }
+            for s in &source_artifacts {
+                if s.len() > 1024 {
+                    anyhow::bail!("source_artifacts entry exceeds maximum length of 1024 bytes");
+                }
+            }
+            let workflow_digest = params["workflow_digest"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'workflow_digest'"))?
+                .to_string();
+            let worktree_head = params["worktree_head"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'worktree_head'"))?
+                .to_string();
+            let dirty_or_changed_file_digest = params["dirty_or_changed_file_digest"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'dirty_or_changed_file_digest'"))?
+                .to_string();
+            // sec-002: cap source_generation_ids at 64 entries, each string ≤ 1 KiB
+            let source_generation_ids: Vec<String> = params["source_generation_ids"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'source_generation_ids'"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("source_generation_ids entry is not a string")
+                        })
+                        .map(str::to_string)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if source_generation_ids.len() > 64 {
+                anyhow::bail!("'source_generation_ids' exceeds maximum of 64 entries");
+            }
+            for s in &source_generation_ids {
+                if s.len() > 1024 {
+                    anyhow::bail!(
+                        "source_generation_ids entry exceeds maximum length of 1024 bytes"
+                    );
+                }
+            }
+            let current_fingerprint = params["current_fingerprint"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'current_fingerprint'"))?
+                .to_string();
+            // sec-002: cap receipt_json at 256 KiB
+            let receipt_json = params["receipt_json"].as_str().map(str::to_string);
+            if let Some(ref r) = receipt_json {
+                if r.len() > 262_144 {
+                    anyhow::bail!("'receipt_json' exceeds maximum length of 256 KiB");
+                }
+            }
+
+            let caller =
+                mcp_caller(&principal.id, &principal.class, "runs.settle_proposal_gate");
+            let commanded = cmd_handler
+                .handle(
+                    Command::SettleProposalGate(SettleProposalGateCmd {
+                        run_id,
+                        proposal_id,
+                        stage_id,
+                        action: ProposalGateSettlementAction::RecordSettlement,
+                        // Overridden at engine boundary from CallerContext (BLK-008)
+                        principal: String::new(),
+                        capability,
+                        journal_id,
+                        authority,
+                        reason,
+                        source_artifacts,
+                        workflow_digest,
+                        worktree_head,
+                        dirty_or_changed_file_digest,
+                        source_generation_ids,
+                        current_fingerprint,
+                        receipt_json,
+                    }),
+                    caller,
+                )
+                .await?;
+            match commanded.result {
+                engine::command_handler::CommandResult::ProposalGateSettled {
+                    run_id,
+                    gate_id,
+                    journal_id: settled_journal_id,
+                    gate_generation_id,
+                    readiness_generation_id,
+                } => Ok(serde_json::json!({
+                    "settled": true,
+                    "run_id": run_id.to_string(),
+                    "gate_id": gate_id,
+                    "journal_id": settled_journal_id,
+                    "gate_generation_id": gate_generation_id,
+                    "readiness_generation_id": readiness_generation_id,
+                })),
+                _ => Err(anyhow::anyhow!("Unexpected result from SettleProposalGate")),
+            }
+        }
+
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }
 }
@@ -632,6 +813,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

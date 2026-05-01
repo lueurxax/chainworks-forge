@@ -14,8 +14,10 @@ use domain::artifact_contracts::{
     SourceGenerationImportDecision, ValidationIssue, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
+use domain::closeout_readiness::IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID;
 use domain::ids::{AgentExecutionId, ArtifactId, RunId};
 use domain::mediation::OwnerKind;
+use domain::proposal_gate_result::PROPOSAL_GATE_RESULT_V1_CONTRACT_ID;
 
 use crate::pool::{begin_immediate_with_retry, log_write_transaction};
 
@@ -891,6 +893,53 @@ pub async fn active_contract_exists_result(
     }
 }
 
+/// P077: Read a canonical field from closeout_gate_generations for
+/// proposal_gate_result_v1 and implementation_closeout_readiness_v1.
+/// Returns MissingControlled when no active generation exists for the run.
+async fn p077_canonical_field_result(
+    pool: &SqlitePool,
+    run_id: RunId,
+    contract_id: &str,
+    field_name: &str,
+) -> Result<CanonicalContractField> {
+    let row = sqlx::query(
+        r#"SELECT status, decision FROM closeout_gate_generations
+           WHERE run_id = ?1 AND contract_id = ?2 AND active = 1
+           ORDER BY created_at DESC LIMIT 1"#,
+    )
+    .bind(run_id.to_string())
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await
+    .context("p077_canonical_field_result: query closeout_gate_generations")?;
+
+    let Some(row) = row else {
+        return Ok(CanonicalContractField::MissingControlled {
+            contract_id: contract_id.to_string(),
+        });
+    };
+
+    let value = match (contract_id, field_name) {
+        (_, "status") => {
+            let status: String = row.get("status");
+            CanonicalContractField::Resolved(serde_json::json!(status))
+        }
+        (cid, "decision") if cid == IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID => {
+            let decision: Option<String> = row.get("decision");
+            match decision {
+                Some(d) => CanonicalContractField::Resolved(serde_json::json!(d)),
+                None => CanonicalContractField::MissingControlled {
+                    contract_id: contract_id.to_string(),
+                },
+            }
+        }
+        _ => CanonicalContractField::MissingControlled {
+            contract_id: contract_id.to_string(),
+        },
+    };
+    Ok(value)
+}
+
 pub async fn canonical_contract_field_result(
     pool: &SqlitePool,
     run_id: RunId,
@@ -903,6 +952,16 @@ pub async fn canonical_contract_field_result(
     if let Some(value) = active_override_field(pool, run_id, contract_id, field_name).await? {
         return Ok(CanonicalContractField::Resolved(value));
     }
+
+    // P077: closeout_gate_generations is the authoritative store for
+    // proposal_gate_result_v1 and implementation_closeout_readiness_v1.
+    // These are never inserted into active_artifact_contracts.
+    if contract_id == PROPOSAL_GATE_RESULT_V1_CONTRACT_ID
+        || contract_id == IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID
+    {
+        return p077_canonical_field_result(pool, run_id, contract_id, field_name).await;
+    }
+
     let row = sqlx::query(
         r#"SELECT g.contract_id, g.canonical_status, g.canonical_dimensions_json
            FROM active_artifact_contracts a
@@ -1617,6 +1676,11 @@ pub fn contract_id_for_alias(alias: &str) -> Option<&'static str> {
         "implementation_review_summary" => Some("implementation_review_summary_v1"),
         "implementation_self_assessment_v2" => Some("implementation_self_assessment_v2"),
         "tests_result_v1" => Some("tests_result_v1"),
+        // P077: closeout readiness artifacts stored in closeout_gate_generations.
+        "implementation_closeout_readiness_v1" => {
+            Some("implementation_closeout_readiness_v1")
+        }
+        "proposal_gate_result_v1" => Some("proposal_gate_result_v1"),
         _ => None,
     }
 }

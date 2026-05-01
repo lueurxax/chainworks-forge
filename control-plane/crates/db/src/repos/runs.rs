@@ -14,7 +14,8 @@ const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, w
              target_branch, delivery_configuration_json, delivery_preflight_json,
              workflow_family, project_key, risk_class, stack, workflow_snapshot_hash,
              catalog_snapshot_hash, workflow_snapshot_json, catalog_snapshot_json,
-             drift_detected_at, drift_details_json, chainworks_meta_root, review_routing_json"#;
+             drift_detected_at, drift_details_json, chainworks_meta_root, review_routing_json,
+             closeout_readiness_mode"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
     let mut tx = begin_immediate_with_retry(pool, "runs.insert").await?;
@@ -41,9 +42,9 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()
                           delivery_configuration_json, delivery_preflight_json, workflow_family, project_key,
                           risk_class, stack, workflow_snapshot_hash, catalog_snapshot_hash,
                           workflow_snapshot_json, catalog_snapshot_json, drift_detected_at, drift_details_json,
-                          chainworks_meta_root, review_routing_json)
+                          chainworks_meta_root, review_routing_json, closeout_readiness_mode)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
         "#,
     )
     .bind(id)
@@ -79,6 +80,7 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()
     .bind(&run.drift_details_json)
     .bind(&run.chainworks_meta_root)
     .bind(&run.review_routing_json)
+    .bind(&run.closeout_readiness_mode)
     .execute(&mut **tx)
     .await
     .context("insert run")?;
@@ -400,6 +402,7 @@ fn parse_run_row(r: &sqlx::sqlite::SqliteRow) -> Result<Run> {
         drift_details_json: r.get("drift_details_json"),
         chainworks_meta_root: r.get("chainworks_meta_root"),
         review_routing_json: r.get("review_routing_json"),
+        closeout_readiness_mode: r.get("closeout_readiness_mode"),
     })
 }
 

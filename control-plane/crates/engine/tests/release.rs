@@ -84,6 +84,7 @@ fn make_run(id: RunId, idea_id: IdeaId, workspace_root: &str, artifact_root: &st
         drift_details_json: None,
         chainworks_meta_root: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     }
 }
 
@@ -374,6 +375,7 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
         drift_details_json: None,
         chainworks_meta_root: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     };
     let delivery_config = DeliveryConfiguration {
         repo_identifier: "repo/test".into(),
