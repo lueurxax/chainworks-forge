@@ -591,7 +591,7 @@ async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending(
 }
 
 #[tokio::test]
-async fn proposal_058_runtime_facts_redacts_only_raw_debug_for_observers() {
+async fn proposal_058_runtime_facts_exposes_operator_debug_on_operator_read_surface() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
@@ -624,8 +624,8 @@ async fn proposal_058_runtime_facts_redacts_only_raw_debug_for_observers() {
                 stage_execution_id
             ))
             .data(auth::Principal::new(
-                "observer",
-                auth::PrincipalClass::Observer,
+                "operator",
+                auth::PrincipalClass::Operator,
             )),
         )
         .await;
@@ -638,7 +638,10 @@ async fn proposal_058_runtime_facts_redacts_only_raw_debug_for_observers() {
     let data = response.data.into_json().unwrap();
     let runtime_facts = &data["stage"]["executions"][0]["runtimeFacts"];
     assert_eq!(runtime_facts["failureKind"], "PROVIDER_QUOTA");
-    assert!(runtime_facts["failureKindRawDebug"].is_null());
+    assert_eq!(
+        runtime_facts["failureKindRawDebug"],
+        "future_provider_quota_variant"
+    );
     assert_eq!(
         runtime_facts["failureMessageRedacted"],
         "limit resets 10pm (Asia/Nicosia)"
@@ -663,8 +666,8 @@ async fn proposal_058_runtime_facts_redacts_only_raw_debug_for_observers() {
                 stage_execution_id
             ))
             .data(auth::Principal::new(
-                "observer",
-                auth::PrincipalClass::Observer,
+                "operator",
+                auth::PrincipalClass::Operator,
             )),
         )
         .await;
@@ -677,7 +680,10 @@ async fn proposal_058_runtime_facts_redacts_only_raw_debug_for_observers() {
     let data = response.data.into_json().unwrap();
     let runtime_facts = &data["agentExecutions"][0]["runtimeFacts"];
     assert_eq!(runtime_facts["failureKind"], "PROVIDER_QUOTA");
-    assert!(runtime_facts["failureKindRawDebug"].is_null());
+    assert_eq!(
+        runtime_facts["failureKindRawDebug"],
+        "future_provider_quota_variant"
+    );
     assert_eq!(
         runtime_facts["outputSettlement"],
         "MISSING_REQUIRED_OUTPUTS"
@@ -717,8 +723,8 @@ async fn proposal_058_runtime_facts_marks_fresh_after_budget_as_fresh_process() 
                 stage_execution_id
             ))
             .data(auth::Principal::new(
-                "observer",
-                auth::PrincipalClass::Observer,
+                "operator",
+                auth::PrincipalClass::Operator,
             )),
         )
         .await;

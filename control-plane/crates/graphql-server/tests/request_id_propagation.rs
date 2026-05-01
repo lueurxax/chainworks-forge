@@ -18,9 +18,12 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 
 use db::pool::create_pool;
-use db::repos::ideas;
+use db::repos::{approvals, ideas, runs, stages};
+use domain::approval::{Approval, ApprovalDecision};
 use domain::idea::{Idea, IdeaStatus};
-use domain::ids::IdeaId;
+use domain::ids::{ApprovalId, IdeaId, RunId, StageExecutionId};
+use domain::run::{Run, RunStatus};
+use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
 use engine::lifecycle_reporter::LifecycleReporter;
@@ -44,6 +47,92 @@ async fn make_idea(pool: &SqlitePool, id: IdeaId) {
     ideas::insert(pool, &idea).await.unwrap();
 }
 
+async fn make_pending_approval(pool: &SqlitePool) -> ApprovalId {
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    make_idea(pool, idea_id).await;
+    runs::insert(pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(pool, &make_manual_gate_stage(run_id, "state_6"))
+        .await
+        .unwrap();
+    let approval = Approval {
+        id: ApprovalId::new(),
+        run_id,
+        stage_id: "state_6".into(),
+        decision: ApprovalDecision::Pending,
+        requested_at: chrono::Utc::now(),
+        decided_at: None,
+        comment: None,
+        expires_at: None,
+    };
+    let approval_id = approval.id;
+    approvals::insert(pool, &approval).await.unwrap();
+    approval_id
+}
+
+fn make_run(id: RunId, idea_id: IdeaId) -> Run {
+    Run {
+        id,
+        idea_id,
+        status: RunStatus::Ready,
+        workflow_id: "wf".into(),
+        workflow_title: "Workflow".into(),
+        workspace_root: "/tmp/ws".into(),
+        artifact_root: "/tmp/art".into(),
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        cancellation_requested_at: None,
+        cancellation_settled_at: None,
+        cancellation_settlement_log: None,
+        current_state: None,
+        workflow_yaml_path: None,
+        agent_catalog_yaml_path: None,
+        worktree_root: None,
+        base_branch: None,
+        base_revision: None,
+        target_branch: None,
+        delivery_configuration_json: None,
+        delivery_preflight_json: None,
+        workflow_family: None,
+        project_key: None,
+        risk_class: None,
+        stack: None,
+        workflow_snapshot_hash: None,
+        catalog_snapshot_hash: None,
+        workflow_snapshot_json: None,
+        catalog_snapshot_json: None,
+        drift_detected_at: None,
+        drift_details_json: None,
+        chainworks_meta_root: None,
+        review_routing_json: None,
+    }
+}
+
+fn make_manual_gate_stage(run_id: RunId, stage_id: &str) -> StageExecution {
+    StageExecution {
+        id: StageExecutionId::new(),
+        run_id,
+        stage_id: stage_id.to_string(),
+        label: stage_id.to_string(),
+        status: StageStatus::WaitingApproval,
+        iteration: 0,
+        attempt_number: 1,
+        settlement_kind: None,
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        owner_agent: None,
+        provider: None,
+        model: None,
+        stage_type: Some("manual_gate".into()),
+        validation_failure_json: None,
+        evidence_packet_json: None,
+        recovery_snapshot_json: None,
+        retry_reason: None,
+    }
+}
+
 async fn build_app(pool: SqlitePool) -> Router {
     let events = event_bus::new_bus(64);
     let cmd_handler = Arc::new(CommandHandler::new(
@@ -52,11 +141,12 @@ async fn build_app(pool: SqlitePool) -> Router {
         WorkQueue::new(pool.clone()),
     ));
     let reporter = LifecycleReporter::new(0, "test", events.clone());
+    let principal_table = auth::PrincipalTable::test_fixture();
     let schema = graphql_server::schema::build_schema(
         pool,
         cmd_handler,
         events,
-        auth::PrincipalTable::test_fixture(),
+        principal_table.clone(),
         reporter.clone(),
     );
     // `start_with_extra_routes` is private; rebuild the router via the
@@ -91,49 +181,26 @@ async fn build_app(pool: SqlitePool) -> Router {
         }
         schema.execute(request).await.into()
     }
-    let pt = auth::PrincipalTable::test_fixture();
+    let auth_table = principal_table.clone();
     router
         .route("/graphql", get(playground).post(gql))
         .layer(middleware::from_fn(move |req, next| {
-            let table = pt.clone();
+            let table = auth_table.clone();
             async move { graphql_server::auth_layer::require_auth(req, next, table).await }
         }))
         .layer(Extension(schema))
-        .layer(Extension(auth::PrincipalTable::test_fixture()))
         .layer(Extension(reporter))
         .layer(middleware::from_fn(graphql_server::request_id::layer))
 }
 
-fn start_run_mutation(idea_id: &IdeaId) -> String {
+fn approve_approval_mutation(approval_id: ApprovalId) -> String {
     format!(
         r#"mutation {{
-          startRun(
-            ideaId: "{idea_id}",
-            workflowId: "wf",
-            workflowTitle: "t",
-            workspaceRoot: "/tmp/ws",
-            artifactRoot: "/tmp/art",
-            workflowYamlPath: "WFP",
-            agentCatalogYamlPath: "AGP"
-          ) {{
-            ... on StartRunStartedPayload {{ journalId }}
-            ... on StartRunBlockedPayload {{ journalId }}
+          approveApproval(approvalId: "{approval_id}") {{
+            approval {{ id }}
+            journalId
           }}
         }}"#
-    )
-    .replace(
-        "WFP",
-        &format!(
-            "{}/../../../examples/workflows/workflow.yaml",
-            env!("CARGO_MANIFEST_DIR")
-        ),
-    )
-    .replace(
-        "AGP",
-        &format!(
-            "{}/../../../examples/agents/agents.yaml",
-            env!("CARGO_MANIFEST_DIR")
-        ),
     )
 }
 
@@ -170,13 +237,12 @@ async fn post_mutation(
 #[tokio::test]
 async fn inbound_request_id_propagates_through_graphql_into_command_journal() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
-    let idea_id = IdeaId::new();
-    make_idea(&pool, idea_id).await;
+    let approval_id = make_pending_approval(&pool).await;
     let app = build_app(pool.clone()).await;
 
     let inbound = "test-req-id-42";
     let (code, echoed, json) =
-        post_mutation(&app, &start_run_mutation(&idea_id), Some(inbound)).await;
+        post_mutation(&app, &approve_approval_mutation(approval_id), Some(inbound)).await;
     assert_eq!(code, StatusCode::OK, "mutation must succeed: {json}");
     assert!(json.get("errors").is_none(), "unexpected errors: {json}");
     assert_eq!(
@@ -185,7 +251,9 @@ async fn inbound_request_id_propagates_through_graphql_into_command_journal() {
         "response must echo inbound request id"
     );
 
-    let journal_id = json["data"]["startRun"]["journalId"].as_str().unwrap();
+    let journal_id = json["data"]["approveApproval"]["journalId"]
+        .as_str()
+        .unwrap();
     // Grab the journal row directly — end-to-end proof that the id made
     // it from the HTTP header through the resolver to the INSERT.
     let row = sqlx::query("SELECT request_id FROM command_journal WHERE id = ?1")
@@ -200,11 +268,11 @@ async fn inbound_request_id_propagates_through_graphql_into_command_journal() {
 #[tokio::test]
 async fn missing_inbound_request_id_still_produces_and_persists_a_fresh_uuid() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
-    let idea_id = IdeaId::new();
-    make_idea(&pool, idea_id).await;
+    let approval_id = make_pending_approval(&pool).await;
     let app = build_app(pool.clone()).await;
 
-    let (code, echoed, json) = post_mutation(&app, &start_run_mutation(&idea_id), None).await;
+    let (code, echoed, json) =
+        post_mutation(&app, &approve_approval_mutation(approval_id), None).await;
     assert_eq!(code, StatusCode::OK, "mutation must succeed: {json}");
     assert!(json.get("errors").is_none(), "unexpected errors: {json}");
     let echoed = echoed.expect("middleware must mint a request id when client omits it");
@@ -213,7 +281,9 @@ async fn missing_inbound_request_id_still_produces_and_persists_a_fresh_uuid() {
         "echoed id must be a UUID: {echoed}"
     );
 
-    let journal_id = json["data"]["startRun"]["journalId"].as_str().unwrap();
+    let journal_id = json["data"]["approveApproval"]["journalId"]
+        .as_str()
+        .unwrap();
     let row = sqlx::query("SELECT request_id FROM command_journal WHERE id = ?1")
         .bind(journal_id)
         .fetch_one(&pool)
@@ -240,14 +310,15 @@ async fn request_id_propagates_through_graphql_and_mcp_and_journal() {
     // This test ties both legs into a single named fixture so the
     // proposal contract name appears in `cargo test` output.
     let pool = create_pool("sqlite::memory:").await.unwrap();
-    let idea_id = IdeaId::new();
-    make_idea(&pool, idea_id).await;
+    let approval_id = make_pending_approval(&pool).await;
     let app = build_app(pool.clone()).await;
 
     let inbound = "cross-surface-id";
     let (_code, echoed, json) =
-        post_mutation(&app, &start_run_mutation(&idea_id), Some(inbound)).await;
-    let journal_id = json["data"]["startRun"]["journalId"].as_str().unwrap();
+        post_mutation(&app, &approve_approval_mutation(approval_id), Some(inbound)).await;
+    let journal_id = json["data"]["approveApproval"]["journalId"]
+        .as_str()
+        .unwrap();
     let row = sqlx::query("SELECT request_id, caller_surface FROM command_journal WHERE id = ?1")
         .bind(journal_id)
         .fetch_one(&pool)

@@ -128,16 +128,7 @@ impl PrincipalTable {
                     graphql: Some(GraphqlPolicy {
                         allow_queries: true,
                         allow_subscriptions: true,
-                        allowed_mutations: vec![
-                            "startRun".into(),
-                            "approveStage".into(),
-                            "rejectStage".into(),
-                            "retryStage".into(),
-                            "overrideLegacyDiscoveryPolicy".into(),
-                            "cancelRun".into(),
-                            "approveApproval".into(),
-                            "rejectApproval".into(),
-                        ],
+                        allowed_mutations: approval_mutations(),
                     }),
                     mcp: None,
                 }),
@@ -321,16 +312,7 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
         if let Some(ref policies) = entry.surface_policies {
             if let Some(ref graphql) = policies.graphql {
                 // Validate known mutation names.
-                let known_mutations = [
-                    "startRun",
-                    "approveStage",
-                    "rejectStage",
-                    "retryStage",
-                    "overrideLegacyDiscoveryPolicy",
-                    "cancelRun",
-                    "approveApproval",
-                    "rejectApproval",
-                ];
+                let known_mutations = ["approveApproval", "rejectApproval"];
                 for mutation in &graphql.allowed_mutations {
                     if !known_mutations.contains(&mutation.as_str()) {
                         return Err(AuthError::TableLoadFailed(format!(
@@ -935,6 +917,34 @@ mod tests {
     }
 
     #[test]
+    fn test_fixture_uses_approval_only_graphql_policy() {
+        let table = PrincipalTable::test_fixture();
+
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "test-operator", "approveApproval"),
+            Some(true)
+        );
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "test-operator", "rejectApproval"),
+            Some(true)
+        );
+        for mutation in [
+            "startRun",
+            "approveStage",
+            "rejectStage",
+            "retryStage",
+            "overrideLegacyDiscoveryPolicy",
+            "cancelRun",
+        ] {
+            assert_eq!(
+                is_mutation_allowed_by_surface_policy(&table, "test-operator", mutation),
+                Some(false),
+                "{mutation} must not be exposed by the default GraphQL test fixture"
+            );
+        }
+    }
+
+    #[test]
     fn v2_rejects_duplicate_ids() {
         let entries = vec![
             PrincipalEntry {
@@ -987,7 +997,7 @@ mod tests {
                     allowed_mutations: vec![
                         "approveApproval".into(),
                         "rejectApproval".into(),
-                        "deleteEverything".into(),
+                        "startRun".into(),
                     ],
                 }),
                 mcp: None,
@@ -1007,7 +1017,7 @@ mod tests {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: true,
                     allow_subscriptions: true,
-                    allowed_mutations: vec!["approveApproval".into(), "startRun".into()],
+                    allowed_mutations: vec!["approveApproval".into()],
                 }),
                 mcp: None,
             }),
@@ -1028,7 +1038,7 @@ mod tests {
                 graphql: Some(GraphqlPolicy {
                     allow_queries: false,
                     allow_subscriptions: false,
-                    allowed_mutations: vec!["approveApproval".into(), "startRun".into()],
+                    allowed_mutations: vec!["approveApproval".into()],
                 }),
                 mcp: None,
             }),
