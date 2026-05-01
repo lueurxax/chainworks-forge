@@ -93,6 +93,7 @@ impl UnknownProviderFamily {
 pub struct InvokeAgentCapacityConfig {
     pub global_active_agent_executions: usize,
     pub per_run_active_agent_executions: usize,
+    pub xcode_mcp_active_invocations: usize,
     pub provider_caps: BTreeMap<ProviderFamily, usize>,
 }
 
@@ -117,6 +118,7 @@ impl Default for InvokeAgentCapacityConfig {
         Self {
             global_active_agent_executions: 20,
             per_run_active_agent_executions: 4,
+            xcode_mcp_active_invocations: 4,
             provider_caps: Self::default_provider_caps(),
         }
     }
@@ -202,6 +204,7 @@ mod tests {
 
         assert_eq!(config.global_active_agent_executions, 20);
         assert_eq!(config.per_run_active_agent_executions, 4);
+        assert_eq!(config.xcode_mcp_active_invocations, 4);
         assert_eq!(config.provider_cap(ProviderFamily::Claude), 8);
         assert_eq!(config.provider_cap(ProviderFamily::Gemini), 4);
         assert_eq!(config.provider_cap(ProviderFamily::Codex), 10);

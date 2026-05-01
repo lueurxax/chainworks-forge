@@ -174,6 +174,14 @@ review, release, or operator decision surfaces that own the remaining work. Lega
 artifacts remain readable as compatibility evidence, but `seemingly_complete` is not transition authority for new
 implementation-loop decisions.
 
+After implementation review aggregation, `implementation_review_summary_v1.status`
+is the closeout transition authority. `state_9_implementation_reviewed` must not
+advance to `state_11_manual_release` from the self-assessment's zero
+`blocking_remaining_code_tasks` alone. A canonical `needs_code_fixes` or `invalid`
+review summary routes to `state_10_implementation_refined`; `code_complete` can
+enter manual release, and `release_evidence_blocked` is preserved as a separate
+release-hold/manual decision state.
+
 GraphQL exposes a nullable `implementationSelfAssessmentSummary` field on run read models. MCP run detail/list
 responses expose the same projection as `implementation_self_assessment_summary`. `null` means no v2/v1 projection
 exists yet; raw artifact readback remains available for evidence inspection.

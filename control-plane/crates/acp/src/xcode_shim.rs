@@ -617,6 +617,54 @@ pub async fn dispatch_xcode_shim_request(
         };
     }
 
+    if policy.decision == XcodeShimRouteDecision::XcrunPassthrough {
+        match execute_xcrun_passthrough_process(&request.plan_input, config).await {
+            Ok(process_output) => {
+                let exit_status = process_output.event.exit_status;
+                record_shim_invocation(
+                    request.agent_execution_id,
+                    &request.grant,
+                    &request.attempt,
+                    &request.plan_input,
+                    &policy,
+                    "xcrun_passthrough",
+                    exit_status,
+                    observation_sink,
+                )
+                .await;
+                return XcodeShimDispatchOutcome {
+                    authorization,
+                    policy,
+                    plan: None,
+                    process_output: Some(process_output),
+                    exit_status,
+                    reason_code: None,
+                };
+            }
+            Err(error) => {
+                record_shim_invocation(
+                    request.agent_execution_id,
+                    &request.grant,
+                    &request.attempt,
+                    &request.plan_input,
+                    &policy,
+                    &error.reason_code,
+                    126,
+                    observation_sink,
+                )
+                .await;
+                return XcodeShimDispatchOutcome {
+                    authorization,
+                    policy,
+                    plan: None,
+                    process_output: None,
+                    exit_status: 126,
+                    reason_code: Some(error.reason_code),
+                };
+            }
+        }
+    }
+
     if policy.decision != XcodeShimRouteDecision::HostExecutor {
         let reason_code = policy
             .reason_code
@@ -719,6 +767,56 @@ pub async fn dispatch_xcode_shim_request(
             }
         }
     }
+}
+
+async fn execute_xcrun_passthrough_process(
+    input: &XcodeHostExecutorPlanInput,
+    config: &XcodeHostExecutorProcessConfig,
+) -> Result<XcodeHostExecutorProcessOutput, XcodeHostExecutorPlanError> {
+    let cwd = resolve_cwd_inside_workspace(&input.cwd, &input.workspace_root)?;
+    let (env, env_allowlist_applied, env_dropped_from_provider) =
+        apply_host_executor_env_allowlist(input.provider_env.clone());
+    let executable = config
+        .tool_paths
+        .get("xcrun")
+        .cloned()
+        .unwrap_or_else(|| "xcrun".to_string());
+    let started_at = Utc::now();
+    let timer = Instant::now();
+    let mut command = Command::new(executable);
+    command
+        .args(&input.args)
+        .current_dir(&cwd)
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(config.timeout, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => return Err(plan_error("p051_xcrun_passthrough_spawn_failed")),
+        Err(_) => return Err(plan_error("p051_xcrun_passthrough_timeout")),
+    };
+    let duration_ms = timer.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let exit_status = output.status.code().unwrap_or(-1) as i64;
+
+    Ok(XcodeHostExecutorProcessOutput {
+        event: XcodeHostExecutorEvent {
+            ts: started_at,
+            tool: "xcrun".to_string(),
+            argv: input.args.clone(),
+            cwd,
+            host_env_disposition: "allowlist_applied".to_string(),
+            env_allowlist_applied,
+            env_dropped_from_provider,
+            selected_simulator_id: None,
+            exit_status,
+            duration_ms,
+        },
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 pub async fn dispatch_xcode_shim_socket_request(
@@ -1841,6 +1939,83 @@ mod tests {
                 assert_eq!(event.cwd, workspace.path().to_string_lossy().into_owned());
             }
             other => panic!("expected host executor event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_executes_allowed_xcrun_passthrough() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let helper_dir = tempfile::tempdir().expect("helper dir");
+        let helper_path = helper_dir.path().join("xcrun-helper");
+        std::fs::write(
+            &helper_path,
+            "#!/bin/sh\nprintf passthrough-stdout\nprintf passthrough-stderr >&2\nexit 9\n",
+        )
+        .expect("write helper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod helper");
+        }
+        let request = XcodeShimDispatchRequest {
+            agent_execution_id: Some(AgentExecutionId::new()),
+            grant: grant(),
+            attempt: attempt(),
+            plan_input: XcodeHostExecutorPlanInput {
+                invoked_tool: "xcrun".to_string(),
+                args: args(&["--sdk", "macosx", "--show-sdk-path"]),
+                cwd: ".".to_string(),
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                provider_env: BTreeMap::from([(
+                    "CHAINWORKS_SECRET".to_string(),
+                    "should-not-leak".to_string(),
+                )]),
+                simulator_candidates: Vec::new(),
+            },
+        };
+        let config = XcodeHostExecutorProcessConfig {
+            tool_paths: BTreeMap::from([(
+                "xcrun".to_string(),
+                helper_path.to_string_lossy().into_owned(),
+            )]),
+            timeout: Duration::from_secs(5),
+        };
+        let sink = CapturingObservationSink::default();
+
+        let outcome = dispatch_xcode_shim_request(request, &config, &sink).await;
+
+        assert!(outcome.authorization.allowed);
+        assert_eq!(
+            outcome.policy.decision,
+            XcodeShimRouteDecision::XcrunPassthrough
+        );
+        assert_eq!(outcome.reason_code, None);
+        assert_eq!(outcome.exit_status, 9);
+        assert_eq!(outcome.plan, None);
+        let output = outcome.process_output.expect("passthrough output");
+        assert_eq!(output.event.tool, "xcrun");
+        assert_eq!(output.stdout, "passthrough-stdout");
+        assert_eq!(output.stderr, "passthrough-stderr");
+        assert!(
+            output
+                .event
+                .env_dropped_from_provider
+                .contains(&"CHAINWORKS_SECRET".to_string()),
+            "passthrough must still apply the host env allowlist"
+        );
+        let updates = sink.updates();
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::ShimInvocation(
+                event,
+            )) => {
+                assert_eq!(event.tool, "xcrun");
+                assert_eq!(event.policy_decision, "xcrun_passthrough");
+                assert_eq!(event.policy_reason, "xcrun_passthrough");
+                assert_eq!(event.exit_status, 9);
+            }
+            other => panic!("expected shim invocation event, got {other:?}"),
         }
     }
 

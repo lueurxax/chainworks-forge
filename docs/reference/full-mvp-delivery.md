@@ -226,6 +226,12 @@ The slice does not treat "looks good locally" as enough.
 The exit condition is canonical artifact-backed review status. The implementation gate
 reads normalized `audit_report`, `security_report`, `prepush_review_report`,
 `docs_report`, and `tests_result_v1.status` truth from the active artifact index.
+After `state_9_implementation_reviewed`, the release/refine decision is owned by
+`implementation_review_summary_v1.status`: `code_complete` may enter manual
+release, `needs_code_fixes` and `invalid` return to implementation refinement, and
+`release_evidence_blocked` enters the release-hold/manual decision surface. The
+workflow must not route to manual release from
+`implementation_self_assessment_v2.blocking_remaining_code_tasks == 0` alone.
 
 ## Manual release
 

@@ -2597,6 +2597,24 @@ impl CommandHandler {
                             .await?;
                             stage_status_event = Some((stage.id, StageStatus::Completed));
                             should_enqueue_advance = true;
+                            if stage.stage_id == "state_11_manual_release" {
+                                sqlx::query(
+                                    "UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3",
+                                )
+                                .bind(RunStatus::Running.to_string())
+                                .bind("state_10_implementation_refined")
+                                .bind(authoritative_run_id.to_string())
+                                .execute(&mut *tx)
+                                .await?;
+                                supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+                                    &mut tx,
+                                    authoritative_run_id,
+                                    &stage.stage_id,
+                                    now,
+                                    &journal.id,
+                                )
+                                .await?;
+                            }
                         } else {
                             stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
                                 .await?;
@@ -3519,6 +3537,60 @@ async fn supersede_current_workflow_conflict_for_stage_retry_tx(
             resume_policy: "continue_from_selected_transition".to_string(),
             selected_transition_id: None,
             selected_next_state_id: Some(stage_id.to_string()),
+            conflict_id: Some(conflict.conflict_id),
+            conflict_fingerprint: Some(conflict.conflict_fingerprint),
+            candidate_transition_hash: Some(conflict.candidate_transition_hash),
+            terminal_failure_reason: None,
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    now: DateTime<Utc>,
+    journal_id: &str,
+) -> Result<()> {
+    let Some(conflict) = workflow_conflicts::get_current_blocking_conflict_tx(tx, run_id).await?
+    else {
+        return Ok(());
+    };
+
+    if conflict.current_state_id != stage_id {
+        return Ok(());
+    }
+
+    workflow_conflicts::transition_conflict_status_tx(
+        tx,
+        &conflict.conflict_id,
+        WorkflowConflictStatus::Superseded,
+        now,
+        Some(serde_json::json!({
+            "resolution_kind": "manual_release_rejection_loopback",
+            "from_stage_id": stage_id,
+            "selected_next_state_id": "state_10_implementation_refined",
+            "journal_id": journal_id,
+        })),
+        None,
+        None,
+    )
+    .await?;
+
+    workflow_conflicts::upsert_transition_cursor_tx(
+        tx,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: stage_id.to_string(),
+            cursor_status: "manual_release_rejection_loopback".to_string(),
+            resume_policy: "continue_from_selected_transition".to_string(),
+            selected_transition_id: None,
+            selected_next_state_id: Some("state_10_implementation_refined".to_string()),
             conflict_id: Some(conflict.conflict_id),
             conflict_fingerprint: Some(conflict.conflict_fingerprint),
             candidate_transition_hash: Some(conflict.candidate_transition_hash),

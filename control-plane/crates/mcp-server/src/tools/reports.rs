@@ -863,9 +863,8 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, runs, validation, workflow_conflicts};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        parse_implementation_self_assessment_v2, ContractParseContext,
-        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -875,9 +874,9 @@ mod tests {
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
     };
     use domain::workflow_conflict::{
-        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
-        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
-        WorkflowConflictStatus,
+        CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
+        WorkflowConflictRecord, WorkflowConflictStatus, candidate_transition_hash,
+        workflow_conflict_fingerprint,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;

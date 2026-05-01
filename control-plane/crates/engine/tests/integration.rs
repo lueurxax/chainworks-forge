@@ -1787,6 +1787,82 @@ async fn test_resolve_approval_rejection_matches_reject_stage_semantics() {
     );
 }
 
+#[tokio::test]
+async fn test_resolve_approval_rejects_manual_release_to_implementation_refinement() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::WaitingApproval);
+    run.current_state = Some("state_11_manual_release".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::WaitingApproval);
+    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_type = Some("manual_gate".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let approval = make_approval(run_id, "state_11_manual_release", ApprovalDecision::Pending);
+    approvals::insert(&pool, &approval).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: approval.id,
+                decision: ApprovalResolutionDecision::Rejected,
+                rationale: Some("implementation review still has code fixes".into()),
+                run_id,
+                stage_id: "state_11_manual_release".into(),
+            }),
+            CallerContext::mcp(
+                "operator-test",
+                &PrincipalClass::Operator,
+                "approvals.resolve",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let resolved = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.decision, ApprovalDecision::Rejected);
+
+    let rejected_stage = stages::find_by_id(&pool, stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rejected_stage.status,
+        StageStatus::Completed,
+        "release rejection must settle the stale release gate"
+    );
+
+    let updated_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(updated_run.status, RunStatus::Running);
+    assert_eq!(
+        updated_run.current_state.as_deref(),
+        Some("state_10_implementation_refined"),
+        "rejected manual release must loop back to implementation refinement"
+    );
+
+    let advance_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == db::work_item::WorkItemKind::AdvanceRun)
+        .count();
+    assert_eq!(
+        advance_items, 1,
+        "release rejection loopback must wake the scheduler"
+    );
+}
+
 /// Rejecting a workflow manual gate must leave durable rejection evidence and
 /// allow the workflow transition evaluator to route an explicit loopback.
 #[tokio::test]
@@ -8728,6 +8804,184 @@ async fn implementation_status_transitions_use_active_contract_summary() {
         updated.current_state.as_deref(),
         Some("state_9_implementation_reviewed"),
         "transition must use active summary status=blocked instead of raw file needs_code_fixes"
+    );
+}
+
+#[tokio::test]
+async fn implementation_review_needs_code_fixes_blocks_manual_release_even_when_self_assessment_has_no_code_tasks(
+) {
+    use domain::artifact::{Artifact, ArtifactFormat};
+    use domain::artifact_contracts::{
+        parse_implementation_self_assessment_v2, ActiveArtifactGenerationInput,
+        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    };
+    use domain::ids::ArtifactId;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    let artifact_root = tmp.path().join(".chainworks");
+    let implementation_dir = artifact_root.join("implementation");
+    let review_dir = artifact_root.join("review");
+    std::fs::create_dir_all(&implementation_dir).unwrap();
+    std::fs::create_dir_all(&review_dir).unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root;
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut completed_review_stage =
+        make_stage(StageExecutionId::new(), run_id, StageStatus::Completed);
+    completed_review_stage.stage_id = "state_9_implementation_reviewed".into();
+    completed_review_stage.label = "Implementation reviewed against proposal".into();
+    stages::insert(&pool, &completed_review_stage)
+        .await
+        .unwrap();
+
+    let self_assessment_path = implementation_dir.join("self-assessment.json");
+    let self_assessment_raw = serde_json::json!({
+        "contract_id": IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+        "implementation_complete": true,
+        "verification_green": true,
+        "remaining_code_tasks": [],
+        "handoff_tasks": [],
+        "known_risks": [],
+        "tests_run": ["writer-owned checks passed"],
+        "docs_impacted": []
+    });
+    std::fs::write(
+        &self_assessment_path,
+        serde_json::to_vec_pretty(&self_assessment_raw).unwrap(),
+    )
+    .unwrap();
+    let self_assessment_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_8_implementation_continued".into(),
+        agent_id: "code_writer".into(),
+        name: "implementation_self_assessment".into(),
+        contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into(),
+        format: ArtifactFormat::Json,
+        file_path: self_assessment_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+        agent_execution_id: None,
+    };
+    artifacts::insert(&pool, &self_assessment_artifact)
+        .await
+        .unwrap();
+    let self_assessment_summary = parse_implementation_self_assessment_v2(
+        &self_assessment_raw,
+        ContractParseContext {
+            run_id: run_id.to_string(),
+            run_age: None,
+            declared_contract_id: Some(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.into()),
+            canonical_artifact_path: IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH.into(),
+            raw_artifact_path: Some(self_assessment_artifact.file_path.clone()),
+            source_generation_id: None,
+            artifact_created_at: Some(self_assessment_artifact.created_at),
+            v2_generation_seen_for_run: true,
+            legacy_v1_generation_available: false,
+        },
+    );
+    artifact_contracts::persist_implementation_self_assessment_summary(
+        &pool,
+        run_id,
+        self_assessment_artifact.id,
+        &self_assessment_artifact.contract_id,
+        &self_assessment_summary,
+        self_assessment_artifact.created_at,
+    )
+    .await
+    .unwrap();
+
+    let review_summary_path = review_dir.join("implementation-summary.json");
+    let review_summary_raw = serde_json::json!({
+        "status": "needs_code_fixes",
+        "open_blockers": [{
+            "id": "BLOCK-001",
+            "title": "pre-push found implementation blocker"
+        }],
+        "must_fix": ["fix reviewer-confirmed implementation blockers"],
+        "recommended_next_step": "return_to_code_refine"
+    });
+    std::fs::write(
+        &review_summary_path,
+        serde_json::to_vec_pretty(&review_summary_raw).unwrap(),
+    )
+    .unwrap();
+    let review_artifact = Artifact {
+        id: ArtifactId::new(),
+        run_id,
+        stage_id: "state_9_implementation_reviewed".into(),
+        agent_id: "lead_orchestrator".into(),
+        name: "implementation_review_summary".into(),
+        contract_id: "implementation_review_summary_v1".into(),
+        format: ArtifactFormat::Json,
+        file_path: review_summary_path.to_string_lossy().into_owned(),
+        checksum_sha256: None,
+        size_bytes: None,
+        provider: "test".into(),
+        model: None,
+        created_at: Utc::now(),
+        is_pinned: false,
+        report_kind: None,
+        report_version: None,
+        agent_execution_id: None,
+    };
+    artifacts::insert(&pool, &review_artifact).await.unwrap();
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: review_artifact.id,
+            contract_id: review_artifact.contract_id.clone(),
+            canonical_path: review_artifact.name.clone(),
+            raw_path: review_artifact.file_path.clone(),
+            raw_status: "needs_code_fixes".into(),
+            generation_id: format!("test-review-summary:{}", review_artifact.id),
+            source_agent_execution_id: None,
+            source_stage_execution_id: Some(completed_review_stage.id.to_string()),
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        updated.current_state.as_deref(),
+        Some("state_10_implementation_refined"),
+        "review-owned needs_code_fixes must return to implementation refine even when code_writer self-assessment has zero blocking tasks"
+    );
+    assert_ne!(
+        updated.current_state.as_deref(),
+        Some("state_11_manual_release"),
+        "review-owned blockers must never be presented as manual release approval"
     );
 }
 

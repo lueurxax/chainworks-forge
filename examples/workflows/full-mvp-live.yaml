@@ -275,9 +275,9 @@ states:
             - run_state
     transitions:
       - to: state_11_manual_release
-        when: implementation_self_assessment_v2.blocking_remaining_code_tasks == 0
+        when: implementation_review_summary.status == vars.implementation_review_target_status or implementation_review_summary.status == 'release_evidence_blocked'
       - to: state_10_implementation_refined
-        when: implementation_self_assessment_v2.blocking_remaining_code_tasks > 0
+        when: implementation_review_summary.status != vars.implementation_review_target_status and implementation_review_summary.status != 'release_evidence_blocked'
 
   state_10_implementation_refined:
     label: Implementation refined

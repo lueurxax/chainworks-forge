@@ -200,6 +200,7 @@ pub enum AcpPromptProgressKind {
     PromptSent,
     MessageReceived,
     MeaningfulProgress,
+    ProviderLocalActivity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -162,6 +162,16 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
     if lower.contains("epipe") || lower.contains("broken pipe") {
         return RuntimeFailureObservation::TransportEpipe;
     }
+    if lower.contains("provider_stream_silent_with_local_activity") {
+        return RuntimeFailureObservation::ProviderTimeout {
+            supervision_classification: Some("provider_stream_silent_with_local_activity".into()),
+        };
+    }
+    if lower.contains("provider_stream_silent_no_local_activity") {
+        return RuntimeFailureObservation::ProviderTimeout {
+            supervision_classification: Some("provider_stream_silent_no_local_activity".into()),
+        };
+    }
     if lower.contains("idle") && lower.contains("timeout") {
         return RuntimeFailureObservation::ProviderTimeout {
             supervision_classification: Some("idle_hang_before_first_progress".into()),
@@ -465,6 +475,24 @@ mod tests {
                 OperatorActionHint::Retry,
             ),
             (
+                RuntimeFailureObservation::ProviderTimeout {
+                    supervision_classification: Some(
+                        "provider_stream_silent_no_local_activity".into(),
+                    ),
+                },
+                AgentFailureKind::ProviderTimeout,
+                OperatorActionHint::Retry,
+            ),
+            (
+                RuntimeFailureObservation::ProviderTimeout {
+                    supervision_classification: Some(
+                        "provider_stream_silent_with_local_activity".into(),
+                    ),
+                },
+                AgentFailureKind::ProviderTimeout,
+                OperatorActionHint::Retry,
+            ),
+            (
                 RuntimeFailureObservation::ProviderInternalError,
                 AgentFailureKind::ProviderInternalError,
                 OperatorActionHint::Retry,
@@ -551,6 +579,24 @@ mod tests {
             observation_from_acp_error_message("ACP session idle timeout: no message"),
             RuntimeFailureObservation::ProviderTimeout {
                 supervision_classification: Some("idle_hang_before_first_progress".into())
+            }
+        );
+        assert_eq!(
+            observation_from_acp_error_message(
+                "ACP session idle timeout: provider_stream_silent_no_local_activity; no message"
+            ),
+            RuntimeFailureObservation::ProviderTimeout {
+                supervision_classification: Some("provider_stream_silent_no_local_activity".into())
+            }
+        );
+        assert_eq!(
+            observation_from_acp_error_message(
+                "ACP session idle timeout: provider_stream_silent_with_local_activity; no message"
+            ),
+            RuntimeFailureObservation::ProviderTimeout {
+                supervision_classification: Some(
+                    "provider_stream_silent_with_local_activity".into()
+                )
             }
         );
         assert_eq!(

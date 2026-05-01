@@ -761,7 +761,7 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_exe
 }
 
 #[tokio::test]
-async fn proposal_058_xcode_mcp_invoke_claim_is_single_flight_even_when_capacity_remains() {
+async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -812,7 +812,7 @@ async fn proposal_058_xcode_mcp_invoke_claim_is_single_flight_even_when_capacity
     .unwrap();
 
     let now = Utc::now();
-    for item_id in ["xcode-invoke-1", "xcode-invoke-2"] {
+    for item_id in ["xcode-invoke-1", "xcode-invoke-2", "xcode-invoke-3"] {
         work_items::enqueue(
             &pool,
             &WorkItem {
@@ -852,6 +852,7 @@ async fn proposal_058_xcode_mcp_invoke_claim_is_single_flight_even_when_capacity
     let capacity = engine::executor::InvokeAgentCapacityConfig {
         max_active_total: 10,
         max_active_per_run: 10,
+        max_active_xcode_mcp: 2,
         provider_caps: HashMap::from([("claude".to_string(), 10)]),
     };
 
@@ -865,10 +866,17 @@ async fn proposal_058_xcode_mcp_invoke_claim_is_single_flight_even_when_capacity
     let second =
         engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
             .await
+            .unwrap()
+            .expect("second Xcode MCP invocation should start while below configured cap");
+    assert_eq!(second.source_work_item_id, "xcode-invoke-2");
+
+    let third =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
             .unwrap();
     assert!(
-        second.is_none(),
-        "a second Xcode MCP invocation must wait while another one is active"
+        third.is_none(),
+        "a third Xcode MCP invocation must wait once the configured cap is reached"
     );
 }
 

@@ -187,6 +187,34 @@ fn make_invoke_work_item(
     }
 }
 
+fn make_xcode_invoke_work_item(
+    id: &str,
+    run_id: RunId,
+    stage_execution_id: StageExecutionId,
+    stage_id: &str,
+    status: WorkItemStatus,
+    scheduled_offset_seconds: i64,
+) -> WorkItem {
+    let mut item = make_invoke_work_item(
+        id,
+        run_id,
+        stage_execution_id,
+        stage_id,
+        "claude",
+        scheduled_offset_seconds,
+    );
+    let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+    payload["requested_mcp_server_ids"] = serde_json::json!(["xcode"]);
+    payload["xcode_broker_required"] = serde_json::json!(true);
+    payload["requires_xcode_host_execution"] = serde_json::json!(true);
+    item.payload_json = payload.to_string();
+    item.status = status;
+    if item.status == WorkItemStatus::Running {
+        item.attempt_count = 1;
+    }
+    item
+}
+
 fn test_workflow_yaml_path() -> String {
     format!(
         "{}/../../../examples/workflows/workflow.yaml",
@@ -483,6 +511,7 @@ async fn command_handler_refreshes_scheduler_projection_with_configured_capacity
     let capacity = DomainInvokeAgentCapacityConfig {
         global_active_agent_executions: 20,
         per_run_active_agent_executions: 10,
+        xcode_mcp_active_invocations: 4,
         provider_caps: BTreeMap::from([(ProviderFamily::Codex, 1)]),
     };
     let handler = CommandHandler::new_with_capacity(
@@ -2099,6 +2128,7 @@ async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_
     let capacity = StartCapacityConfig {
         max_active_total: 6,
         max_active_per_run: 10,
+        max_active_xcode_mcp: 4,
         provider_caps: HashMap::from([("gemini".into(), 1), ("codex".into(), 3)]),
     };
 
@@ -2136,6 +2166,91 @@ async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_
                 && summary.global_queue_depth == 1
         }),
         "claim/start must refresh scheduler projection in the same write unit for remaining backpressured work: {summaries:?}"
+    );
+}
+
+#[tokio::test]
+async fn xcode_mcp_capacity_backpressure_is_reported_as_its_own_reason() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let running_xcode_stage = StageExecutionId::new();
+    let pending_xcode_stage = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P061".into(),
+            body: "xcode capacity reason".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    for (stage_execution_id, stage_id) in [
+        (running_xcode_stage, "running_xcode"),
+        (pending_xcode_stage, "pending_xcode"),
+    ] {
+        stages::insert(&pool, &make_stage(run_id, stage_execution_id, stage_id))
+            .await
+            .unwrap();
+    }
+
+    work_items::enqueue(
+        &pool,
+        &make_xcode_invoke_work_item(
+            "running-xcode",
+            run_id,
+            running_xcode_stage,
+            "running_xcode",
+            WorkItemStatus::Running,
+            -2,
+        ),
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &make_xcode_invoke_work_item(
+            "pending-xcode",
+            run_id,
+            pending_xcode_stage,
+            "pending_xcode",
+            WorkItemStatus::Pending,
+            -1,
+        ),
+    )
+    .await
+    .unwrap();
+
+    scheduler::refresh_queue_summaries(
+        &pool,
+        &DomainInvokeAgentCapacityConfig {
+            global_active_agent_executions: 10,
+            per_run_active_agent_executions: 10,
+            xcode_mcp_active_invocations: 1,
+            provider_caps: BTreeMap::from([(ProviderFamily::Claude, 10)]),
+        },
+    )
+    .await
+    .unwrap();
+
+    let summaries = scheduler::list_queue_summaries(&pool).await.unwrap();
+    assert!(
+        summaries.iter().any(|summary| {
+            summary.run_id.as_deref() == Some(&run_id.to_string())
+                && summary.provider_family.as_deref() == Some("claude")
+                && summary.top_reason == "xcode_mcp_capacity"
+        }),
+        "Xcode MCP queue pressure must not be reported as generic queued/projection lag: {summaries:?}"
     );
 }
 
@@ -2185,6 +2300,7 @@ async fn invoke_agent_capacity_precheck_reports_when_all_pending_work_is_blocked
     let capacity = StartCapacityConfig {
         max_active_total: 6,
         max_active_per_run: 10,
+        max_active_xcode_mcp: 4,
         provider_caps: HashMap::from([("gemini".into(), 1), ("codex".into(), 3)]),
     };
 
@@ -2326,6 +2442,7 @@ async fn invoke_agent_claim_prefers_least_recently_served_run_within_candidate_w
         &StartCapacityConfig {
             max_active_total: usize::MAX,
             max_active_per_run: usize::MAX,
+            max_active_xcode_mcp: usize::MAX,
             provider_caps: HashMap::new(),
         },
     )
@@ -3177,7 +3294,9 @@ async fn transient_persistence_contention_requeues_running_work_without_failure_
     );
     assert_eq!(
         stored.last_error.as_deref(),
-        Some("transient_persistence_contention: error returned from database: (code: 5) database is locked")
+        Some(
+            "transient_persistence_contention: error returned from database: (code: 5) database is locked"
+        )
     );
 
     let failed_count: i64 =

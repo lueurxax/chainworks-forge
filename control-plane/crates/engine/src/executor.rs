@@ -220,10 +220,9 @@ pub struct ClaimedInvokeAgentStart {
 pub struct InvokeAgentCapacityConfig {
     pub max_active_total: usize,
     pub max_active_per_run: usize,
+    pub max_active_xcode_mcp: usize,
     pub provider_caps: std::collections::HashMap<String, usize>,
 }
-
-const MAX_ACTIVE_XCODE_MCP_INVOKE_AGENTS: i64 = 1;
 
 #[derive(Clone, Debug)]
 struct DeclaredContractImportResult {
@@ -243,6 +242,7 @@ impl InvokeAgentCapacityConfig {
         Self {
             max_active_total: usize::MAX,
             max_active_per_run: usize::MAX,
+            max_active_xcode_mcp: usize::MAX,
             provider_caps: std::collections::HashMap::new(),
         }
     }
@@ -254,6 +254,7 @@ fn invoke_agent_start_capacity_from_domain(
     InvokeAgentCapacityConfig {
         max_active_total: capacity.global_active_agent_executions,
         max_active_per_run: capacity.per_run_active_agent_executions,
+        max_active_xcode_mcp: capacity.xcode_mcp_active_invocations,
         provider_caps: capacity
             .provider_caps
             .iter()
@@ -370,7 +371,7 @@ async fn invoke_item_has_start_capacity(
     }
     if invoke_payload_requires_xcode_mcp(&payload) {
         let active_xcode = running_xcode_mcp_invoke_agent_count(pool).await?;
-        if active_xcode >= MAX_ACTIVE_XCODE_MCP_INVOKE_AGENTS {
+        if active_xcode as usize >= capacity.max_active_xcode_mcp {
             return Ok(false);
         }
     }
@@ -480,6 +481,7 @@ fn scheduler_capacity_config_from_start_capacity(
     domain::provider::InvokeAgentCapacityConfig {
         global_active_agent_executions: capacity.max_active_total,
         per_run_active_agent_executions: capacity.max_active_per_run,
+        xcode_mcp_active_invocations: capacity.max_active_xcode_mcp,
         provider_caps,
     }
 }
@@ -2527,7 +2529,9 @@ impl BackgroundExecutor {
         let disabled_interval = Duration::from_secs(interval.as_secs().saturating_mul(5).max(300));
 
         if !crate::mediation::feature_flag::is_phase_b_mediation_enabled() {
-            info!("P017 mediation expiry watchdog: Phase B not enabled, checking at reduced frequency");
+            info!(
+                "P017 mediation expiry watchdog: Phase B not enabled, checking at reduced frequency"
+            );
         }
 
         loop {
