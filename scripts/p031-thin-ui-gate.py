@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -958,6 +959,81 @@ def _git_rev(repo_root: Path, ref: str) -> str:
         return ""
 
 
+def _git_status_snapshot(repo_root: Path) -> tuple[str, int, str] | None:
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=str(repo_root),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    line_count = sum(1 for line in status.splitlines() if line)
+    return status, line_count, hashlib.sha256(status.encode()).hexdigest()
+
+
+def _require_ready_provenance(
+    errors: list[str],
+    label: str,
+    provenance: Any,
+    live_commit: str,
+    live_tree: str,
+    live_status_line_count: int,
+    live_status_sha256: str,
+) -> None:
+    if not isinstance(provenance, dict):
+        errors.append(f"P041 {label} provenance must be an object for ready_same_tree_verified")
+        return
+
+    commit_sha = provenance.get("commit_sha")
+    tree_id = provenance.get("tree_id")
+    status_sha256 = provenance.get("status_snapshot_sha256")
+    tree_clean = provenance.get("tree_clean")
+    status_line_count = provenance.get("status_snapshot_line_count")
+
+    for field, value in (
+        ("commit_sha", commit_sha),
+        ("tree_id", tree_id),
+        ("status_snapshot_sha256", status_sha256),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            errors.append(
+                f"P041 {label} provenance requires non-empty {field} "
+                "for ready_same_tree_verified live git provenance"
+            )
+
+    if commit_sha and commit_sha != live_commit:
+        errors.append(
+            f"P041 {label} provenance commit_sha {commit_sha[:12]} does not match "
+            f"live HEAD {live_commit[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+    if tree_id and tree_id != live_tree:
+        errors.append(
+            f"P041 {label} provenance tree_id {tree_id[:12]} does not match "
+            f"live HEAD^{{tree}} {live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+    if tree_clean is not True:
+        errors.append(
+            f"P041 {label} provenance must set tree_clean=true for ready_same_tree_verified"
+        )
+    if status_line_count != 0:
+        errors.append(
+            f"P041 {label} provenance status_snapshot_line_count is "
+            f"{status_line_count} (expected 0) for ready_same_tree_verified"
+        )
+    if status_line_count != live_status_line_count:
+        errors.append(
+            f"P041 {label} provenance status_snapshot_line_count {status_line_count} "
+            f"does not match live status line count {live_status_line_count}"
+        )
+    if status_sha256 and status_sha256 != live_status_sha256:
+        errors.append(
+            f"P041 {label} provenance status_snapshot_sha256 does not match "
+            "the live git status snapshot"
+        )
+
+
 def validate_p041_parity_row(repo_root: Path) -> GateResult:
     errors: list[str] = []
     row_path = repo_root / P041_RUNTIME_ROW_PATH
@@ -986,8 +1062,10 @@ def validate_p041_parity_row(repo_root: Path) -> GateResult:
             f"expected {P041_DETAIL_SCHEMA_VERSION}, got {row.get('detail_schema_version')}"
         )
 
+    ready = row.get("validation_status") == P041_READY_STATUS
     live_commit = _git_rev(repo_root, "HEAD")
     live_tree = _git_rev(repo_root, "HEAD^{tree}")
+    live_status = _git_status_snapshot(repo_root) if ready else None
     prov = row.get("provenance", {})
     row_commit = prov.get("commit_sha", "")
     row_tree = prov.get("tree_id", "")
@@ -1005,15 +1083,26 @@ def validate_p041_parity_row(repo_root: Path) -> GateResult:
             f"{live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
         )
 
-    if row.get("validation_status") == P041_READY_STATUS:
-        if not row_clean:
+    if ready:
+        if not live_commit or not live_tree or live_status is None:
             errors.append(
-                "P041 runtime row reports ready_same_tree_verified but tree_clean is false"
+                "P041 ready_same_tree_verified requires live git provenance "
+                "(HEAD, HEAD^{tree}, and status snapshot) to be available"
             )
-        if row_line_count != 0:
-            errors.append(
-                f"P041 runtime row reports ready_same_tree_verified but "
-                f"status_snapshot_line_count is {row_line_count} (expected 0)"
+        else:
+            _status_text, live_status_line_count, live_status_sha256 = live_status
+            if live_status_line_count != 0:
+                errors.append(
+                    "P041 ready_same_tree_verified requires a clean live git status snapshot"
+                )
+            _require_ready_provenance(
+                errors,
+                "runtime row",
+                prov,
+                live_commit,
+                live_tree,
+                live_status_line_count,
+                live_status_sha256,
             )
 
     detail_path = repo_root / P041_RUNTIME_DETAIL_PATH
@@ -1041,7 +1130,7 @@ def validate_p041_parity_row(repo_root: Path) -> GateResult:
             # Section 6.2 / 6.6 Decision 4: for ready publication, detail.provenance must
             # agree with row.provenance AND with the live checkout. Checking only row.provenance
             # against live is insufficient — a stale detail with matching row provenance would pass.
-            if row.get("validation_status") == P041_READY_STATUS:
+            if ready:
                 detail_prov = detail.get("provenance", {})
                 prov_fields = (
                     "commit_sha", "tree_id", "tree_clean",
@@ -1056,22 +1145,23 @@ def validate_p041_parity_row(repo_root: Path) -> GateResult:
                             f"row.provenance.{pfield} ({rv!r}); "
                             "row and detail provenance must agree for ready publication"
                         )
-                if live_commit and detail_prov.get("commit_sha") and \
-                        detail_prov.get("commit_sha") != live_commit:
-                    errors.append(
-                        f"P041 detail.provenance.commit_sha "
-                        f"{detail_prov.get('commit_sha', '')[:12]} does not match "
-                        f"live HEAD {live_commit[:12]}; rerun './scripts/test-gate.sh proposal-041'"
-                    )
-                if live_tree and detail_prov.get("tree_id") and \
-                        detail_prov.get("tree_id") != live_tree:
-                    errors.append(
-                        f"P041 detail.provenance.tree_id "
-                        f"{detail_prov.get('tree_id', '')[:12]} does not match "
-                        f"live HEAD^{{tree}} {live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+                if live_commit and live_tree and live_status is not None:
+                    _status_text, live_status_line_count, live_status_sha256 = live_status
+                    _require_ready_provenance(
+                        errors,
+                        "runtime detail",
+                        detail_prov,
+                        live_commit,
+                        live_tree,
+                        live_status_line_count,
+                        live_status_sha256,
                     )
         except (json.JSONDecodeError, OSError) as exc:
             errors.append(f"P041 runtime detail unreadable: {exc}")
+    elif ready:
+        errors.append(
+            f"P041 ready_same_tree_verified requires runtime detail at {P041_RUNTIME_DETAIL_PATH}"
+        )
 
     return GateResult(errors)
 
@@ -1154,6 +1244,44 @@ class P031ThinUIGateTests(unittest.TestCase):
         guide.update(updates)
         (root / WRITE_PATH_GUIDE_PATH).write_text(json.dumps(guide))
 
+    def write_p041_runtime(
+        self,
+        root: Path,
+        row_updates: dict[str, Any] | None = None,
+        detail_updates: dict[str, Any] | None = None,
+    ) -> None:
+        publication_root = root / "control-plane/target/parity/publication/current"
+        publication_root.mkdir(parents=True)
+        provenance = {
+            "commit_sha": "",
+            "tree_id": "",
+            "tree_clean": True,
+            "status_snapshot_sha256": "",
+            "status_snapshot_line_count": 0,
+        }
+        row: dict[str, Any] = {
+            "schema_version": P041_ROW_SCHEMA_VERSION,
+            "id": "p041_parity_evidence",
+            "validation_status": P041_READY_STATUS,
+            "publication_state": "published_ready",
+            "publication_generation_id": "gen-test",
+            "detail_schema_version": P041_DETAIL_SCHEMA_VERSION,
+            "provenance": dict(provenance),
+        }
+        detail: dict[str, Any] = {
+            "schema_version": P041_DETAIL_SCHEMA_VERSION,
+            "overall_status": P041_READY_STATUS,
+            "publication_state": "published_ready",
+            "publication_generation_id": "gen-test",
+            "provenance": dict(provenance),
+        }
+        if row_updates:
+            row.update(row_updates)
+        if detail_updates:
+            detail.update(detail_updates)
+        (publication_root / "p031-phase-0-manifest-row.json").write_text(json.dumps(row))
+        (publication_root / "p031-p041-parity-evidence.json").write_text(json.dumps(detail))
+
     def test_missing_inventory_fails_closed(self) -> None:
         root = self.make_repo()
         result = validate_inventory(root)
@@ -1165,6 +1293,18 @@ class P031ThinUIGateTests(unittest.TestCase):
         result = validate_write_path_guide(root)
         self.assertFalse(result.ok)
         self.assertIn("missing docs/reference/p031-operator-write-path-guide.json", result.errors[0])
+
+    def test_p041_ready_runtime_requires_live_git_provenance(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(root)
+
+        result = validate_p041_parity_row(root)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("live git provenance" in error for error in result.errors),
+            result.errors,
+        )
 
     def test_valid_write_path_guide_passes(self) -> None:
         root = self.make_repo()

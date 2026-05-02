@@ -569,15 +569,15 @@ Scope:
 - P041 `GoldenRunFixture` inventory and schema validation
 - capture/regeneration lifecycle validation through `scripts/parity/capture-golden-run.sh --validate`
 - deterministic offline replay over every required P041 fixture
-- generation-scoped work products under `control-plane/target/parity/work/<generation_id>/<fixture_id>/parity.sqlite`
-- generation-scoped `BehavioralDiffReport` and `server-replay.json` under `control-plane/target/parity/reports/<generation_id>/`
-- generation-scoped live-shadow reports under `control-plane/target/parity/shadow/<generation_id>/`
+- per-fixture replay databases under `control-plane/target/parity/<fixture_id>/parity.sqlite` (generation-scoped `work/<generation_id>/<fixture_id>/` layout is the proposal target; not yet wired into the gate — see `p041-generated-artifact-schemas.md`)
+- per-fixture `BehavioralDiffReport` and `server-replay.json` under `control-plane/target/parity/reports/<fixture_id>/` and `control-plane/target/parity/<fixture_id>/`
+- per-fixture live-shadow reports under `control-plane/target/parity/shadow/reports/<fixture_id>/` and shadow replay artifacts under `control-plane/target/parity/shadow/<fixture_id>/`
 - fixture-bound `surface_comparisons` for canonical state, projections, GraphQL readback, MCP report readback, artifact identity, and operator summary
 - fail-closed shadow side-effect policy for stubbed runtime/provider inputs
 - fixture-bound GraphQL run/stage/artifact/projection readback parity via `proposal_041_graphql_readback_parity_surfaces`
 - fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via P041-named tests
-- authoritative runtime publication artifacts at `control-plane/target/parity/publication/current/` (row and detail)
-- same-tree ownership, heartbeat, and liveness-based reclaim via `control-plane/target/parity-control/`
+- runtime publication contract validation (row + detail schema agreement, provenance shape) at `control-plane/target/parity/publication/current/`; the gate currently emits `blocked_missing_evidence` schema-validation publications and does not yet promote `ready_same_tree_verified`
+- `control-plane/target/parity-control/` lease, heartbeat, reclaim-marker, and current-step types are implemented in `engine::parity_control` and unit-tested, but not yet acquired/written by the gate driver
 
 Use when:
 
@@ -590,7 +590,7 @@ Host policy:
 
 - local Rust toolchain required
 - no macOS UI target, simulator, daemon process, or live ACP/provider adapter required
-- offline replay runs in isolated generation-scoped SQLite databases and temporary artifact roots
+- offline replay runs in per-fixture SQLite databases and temporary artifact roots
 
 Command:
 
@@ -601,9 +601,9 @@ Command:
 Important:
 
 - `p041` is accepted as an alias
-- the gate fails closed on dirty worktrees, missing fixtures, invalid schema, provenance mismatch, row/detail disagreement, or live-checkout mismatch
-- the canonical P031 acceptance switch is the runtime row at `control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json`
-- `docs/reference/p031-phase-0-artifact-manifest.json` tracks the reference promotion, but the runtime row is the live authority for the current checkout
+- the gate fails closed on missing fixtures, invalid schema, missing capture/regeneration provenance, missing executable frozen-input refs, missing fixture-bound surface comparisons, missing GraphQL/MCP collector owners, missing live-shadow correlation, or blocking divergences
+- the runtime publication contract test asserts row/detail schema-version equality, status equality, and `publication_generation_id` equality against a schema-validation publication; live `ready_same_tree_verified` promotion (with provenance + live-checkout match) is not yet wired into the gate
+- the canonical P031 acceptance switch (when implemented) is the runtime row at `control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json`; for now the reference promotion at `docs/reference/p031-p041-parity-evidence.json` is a `not_ready_pending_gate_run` skeleton
 - the `p031-p041-parity-evidence.md` companion is explicitly **non-authoritative** and structurally non-normative.
 
 Status Vocabulary:

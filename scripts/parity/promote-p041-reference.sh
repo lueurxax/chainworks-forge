@@ -61,6 +61,7 @@ python3 - "$RUNTIME_ROW" "$RUNTIME_DETAIL" "$REFERENCE_DETAIL" \
          "$REQUIRED_ROW_SCHEMA" "$REQUIRED_DETAIL_SCHEMA" "$READY_STATUS" \
          "$ROOT_DIR" <<'PY'
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -75,6 +76,75 @@ repo_root = Path(sys.argv[7])
 
 row = json.loads(runtime_row_path.read_text())
 detail = json.loads(runtime_detail_path.read_text())
+
+
+def require_non_empty_string(value, field_name):
+    if not isinstance(value, str) or not value.strip():
+        sys.exit(
+            f"promote-p041-reference: {field_name} is required for ready_same_tree_verified"
+        )
+    return value
+
+
+def require_git_output(args, label):
+    try:
+        return subprocess.check_output(
+            args,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=str(repo_root),
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        sys.exit(
+            f"promote-p041-reference: refusing to promote; live git {label} "
+            "could not be proven"
+        )
+
+
+def validate_ready_provenance(label, provenance, live_commit, live_tree, live_line_count, live_sha256):
+    if not isinstance(provenance, dict):
+        sys.exit(f"promote-p041-reference: {label}.provenance must be an object")
+    commit_sha = require_non_empty_string(
+        provenance.get("commit_sha"), f"{label}.provenance.commit_sha"
+    )
+    tree_id = require_non_empty_string(
+        provenance.get("tree_id"), f"{label}.provenance.tree_id"
+    )
+    status_sha256 = require_non_empty_string(
+        provenance.get("status_snapshot_sha256"),
+        f"{label}.provenance.status_snapshot_sha256",
+    )
+    line_count = provenance.get("status_snapshot_line_count")
+    if provenance.get("tree_clean") is not True:
+        sys.exit(
+            f"promote-p041-reference: {label}.provenance.tree_clean must be true"
+        )
+    if line_count != 0:
+        sys.exit(
+            f"promote-p041-reference: {label}.provenance.status_snapshot_line_count "
+            f"must be 0, got {line_count}"
+        )
+    if commit_sha != live_commit:
+        sys.exit(
+            f"promote-p041-reference: refusing to promote; {label}.provenance.commit_sha "
+            f"({commit_sha[:12]}) does not match live HEAD ({live_commit[:12]})"
+        )
+    if tree_id != live_tree:
+        sys.exit(
+            f"promote-p041-reference: refusing to promote; {label}.provenance.tree_id "
+            f"({tree_id[:12]}) does not match live HEAD^{{tree}} ({live_tree[:12]})"
+        )
+    if line_count != live_line_count:
+        sys.exit(
+            f"promote-p041-reference: refusing to promote; "
+            f"{label}.provenance.status_snapshot_line_count ({line_count}) "
+            f"does not match live git status line count ({live_line_count})"
+        )
+    if status_sha256 != live_sha256:
+        sys.exit(
+            f"promote-p041-reference: refusing to promote; "
+            f"{label}.provenance.status_snapshot_sha256 does not match live git status"
+        )
 
 # Validate schema versions
 if row.get("schema_version") != required_row_schema:
@@ -101,40 +171,50 @@ if row.get("validation_status") != detail.get("overall_status"):
         "promote-p041-reference: row.validation_status != detail.overall_status; "
         "runtime artifacts are inconsistent"
     )
+if row.get("publication_state") != detail.get("publication_state"):
+    sys.exit(
+        "promote-p041-reference: row.publication_state != detail.publication_state; "
+        "runtime artifacts are inconsistent"
+    )
+if row.get("publication_generation_id") != detail.get("publication_generation_id"):
+    sys.exit(
+        "promote-p041-reference: row.publication_generation_id != "
+        "detail.publication_generation_id; runtime artifacts are inconsistent"
+    )
 
-# Live-HEAD comparison (Decision 4, Section 6.6): refuse promotion if HEAD has moved
-# since the gate ran. An operator running the promoter after a rebase, amend, or
-# checkout could otherwise stamp stale runtime evidence into tracked reference snapshots.
-try:
-    live_commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"],
-        stderr=subprocess.DEVNULL,
-        text=True,
-        cwd=str(repo_root),
-    ).strip()
-    live_tree = subprocess.check_output(
-        ["git", "rev-parse", "HEAD^{tree}"],
-        stderr=subprocess.DEVNULL,
-        text=True,
-        cwd=str(repo_root),
-    ).strip()
-    prov = row.get("provenance", {})
-    row_commit = prov.get("commit_sha", "")
-    row_tree = prov.get("tree_id", "")
-    if live_commit and row_commit and row_commit != live_commit:
+# Live-checkout comparison (Decision 4, Section 6.6): promotion is allowed only
+# when row, detail, and live checkout provenance all agree.
+live_commit = require_git_output(["git", "rev-parse", "HEAD"], "HEAD").strip()
+live_tree = require_git_output(["git", "rev-parse", "HEAD^{tree}"], "HEAD^{tree}").strip()
+live_status = require_git_output(
+    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+    "status snapshot",
+)
+live_line_count = sum(1 for line in live_status.splitlines() if line)
+live_sha256 = hashlib.sha256(live_status.encode()).hexdigest()
+if live_line_count != 0:
+    sys.exit(
+        "promote-p041-reference: refusing to promote; live git status is not clean"
+    )
+
+row_prov = row.get("provenance", {})
+detail_prov = detail.get("provenance", {})
+for field in (
+    "commit_sha",
+    "tree_id",
+    "tree_clean",
+    "status_snapshot_sha256",
+    "status_snapshot_line_count",
+):
+    if row_prov.get(field) != detail_prov.get(field):
         sys.exit(
-            f"promote-p041-reference: refusing to promote; row.provenance.commit_sha "
-            f"({row_commit[:12]}) does not match live HEAD ({live_commit[:12]}); "
-            "HEAD may have moved since the gate ran — rerun the gate on the same tree first"
+            f"promote-p041-reference: row.provenance.{field} != "
+            f"detail.provenance.{field}; runtime artifacts are inconsistent"
         )
-    if live_tree and row_tree and row_tree != live_tree:
-        sys.exit(
-            f"promote-p041-reference: refusing to promote; row.provenance.tree_id "
-            f"({row_tree[:12]}) does not match live HEAD^{{tree}} ({live_tree[:12]}); "
-            "HEAD may have moved since the gate ran — rerun the gate on the same tree first"
-        )
-except subprocess.CalledProcessError:
-    pass  # Not in a git repo; skip live-checkout comparison
+validate_ready_provenance("row", row_prov, live_commit, live_tree, live_line_count, live_sha256)
+validate_ready_provenance(
+    "detail", detail_prov, live_commit, live_tree, live_line_count, live_sha256
+)
 
 # Idempotency: skip copy if the reference already matches
 if reference_detail_path.is_file():

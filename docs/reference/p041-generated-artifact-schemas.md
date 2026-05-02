@@ -116,9 +116,10 @@ Produced by comparing the replayed canonical state against the fixture's golden 
 
 ## Work Product Retention
 
-To ensure deterministic debugging of parity regressions, the harness follows these retention rules:
+The proposal target retention policy (P041 §6.4) is:
 
-1. **Successful generations**: Aggressively pruned. Only the final `publication/current/` row and detail artifacts are preserved.
-2. **Blocked generations**: Preserved in `control-plane/target/parity/work/<generation_id>/` and `reports/<generation_id>/`.
-3. **Stale/Ambiguous owner**: The harness enters `blocked_manual_recovery` if a liveness-based heartbeat check fails to prove that a prior owner has exited. Manual cleanup of the `target/parity-control/` lockfile is required to resume.
-4. **Cleanup**: Generations older than 7 days (by creation timestamp) are automatically pruned on the next gate start.
+1. **Successful generations**: prunable oldest-first; the harness must retain at minimum the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation.
+2. **`blocked_manual_recovery` generations**: never auto-pruned. Operator action is required because their diagnostic value is the reason reclamation is blocked.
+3. **Storage budget**: when retained parity generations exceed 500 MB, the CLI must warn and list preserved roots plus sizes; hitting the budget is diagnostic, not authorization to delete manual-recovery evidence.
+
+Implementation status: generation-scoped layout, automatic pruning, and the 500 MB budget check are not yet wired into the gate. Today the harness writes per-fixture work products under `control-plane/target/parity/<fixture_id>/` and `control-plane/target/parity/reports/<fixture_id>/` and does not auto-prune. `control-plane/target/parity-control/` is implemented as a cleanup-safe root and is never removed by gate cleanup.

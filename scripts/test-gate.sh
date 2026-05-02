@@ -2274,15 +2274,33 @@ PY
       # Capture git provenance once before any replay work begins (Section 6.2/6.3).
       # Exported as P041_GIT_* env vars so cargo test can embed the same provenance
       # in per-fixture server-replay.json and behavioral-diff-report.json artifacts.
-      _p041_commit=$(git rev-parse HEAD 2>/dev/null || true)
-      _p041_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)
-      _p041_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null || true)
+      if ! _p041_commit=$(git rev-parse HEAD 2>/dev/null); then
+        echo "[FAIL] proposal-041: unable to capture git HEAD provenance" >&2
+        exit 1
+      fi
+      if ! _p041_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null); then
+        echo "[FAIL] proposal-041: unable to capture git tree provenance" >&2
+        exit 1
+      fi
+      if ! _p041_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null); then
+        echo "[FAIL] proposal-041: unable to capture git status snapshot" >&2
+        exit 1
+      fi
       _p041_clean=$([ -z "$_p041_status" ] && echo true || echo false)
       _p041_line_count=$(printf '%s' "$_p041_status" | grep -c . 2>/dev/null || echo 0)
       # sha256: prefer shasum (macOS), fall back to sha256sum (Linux)
-      _p041_sha256=$(printf '%s' "$_p041_status" | shasum -a 256 2>/dev/null | cut -d' ' -f1 \
-                     || printf '%s' "$_p041_status" | sha256sum 2>/dev/null | cut -d' ' -f1 \
-                     || echo "")
+      if _p041_sha256=$(printf '%s' "$_p041_status" | shasum -a 256 2>/dev/null | cut -d' ' -f1); then
+        :
+      elif _p041_sha256=$(printf '%s' "$_p041_status" | sha256sum 2>/dev/null | cut -d' ' -f1); then
+        :
+      else
+        echo "[FAIL] proposal-041: unable to hash git status snapshot" >&2
+        exit 1
+      fi
+      if [ -z "$_p041_commit" ] || [ -z "$_p041_tree" ] || [ -z "$_p041_sha256" ]; then
+        echo "[FAIL] proposal-041: captured git provenance is incomplete" >&2
+        exit 1
+      fi
       export P041_GIT_COMMIT_SHA="$_p041_commit"
       export P041_GIT_TREE_ID="$_p041_tree"
       export P041_GIT_TREE_CLEAN="$_p041_clean"
@@ -2306,6 +2324,7 @@ PY
       cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
       python3 - <<'PY'
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -2516,35 +2535,68 @@ if detail.get("required_surfaces") != required_surfaces:
 # No sentinel bypass: any row claiming ready_same_tree_verified must carry real
 # provenance that matches the live HEAD or the gate fails closed.
 if row.get("validation_status") == "ready_same_tree_verified":
-    try:
-        live_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        live_tree = subprocess.check_output(
-            ["git", "rev-parse", "HEAD^{tree}"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        prov = row.get("provenance", {})
-        row_commit = prov.get("commit_sha", "")
-        row_tree = prov.get("tree_id", "")
-        if live_commit and row_commit and row_commit != live_commit:
-            raise SystemExit(
-                f"proposal-041: runtime row commit_sha {row_commit[:12]} does not match "
-                f"live HEAD {live_commit[:12]}; rerun the gate on the same clean tree"
+    def _git_output(args, label):
+        try:
+            return subprocess.check_output(
+                args, stderr=subprocess.DEVNULL, text=True
             )
-        if live_tree and row_tree and row_tree != live_tree:
+        except (subprocess.CalledProcessError, FileNotFoundError):
             raise SystemExit(
-                f"proposal-041: runtime row tree_id {row_tree[:12]} does not match "
-                f"live HEAD^{{tree}} {live_tree[:12]}; rerun the gate on the same clean tree"
+                f"proposal-041: ready_same_tree_verified requires live git {label}"
             )
-        prov_line_count = prov.get("status_snapshot_line_count", 1)
-        if not prov.get("tree_clean") or prov_line_count != 0:
+
+    live_commit = _git_output(["git", "rev-parse", "HEAD"], "HEAD").strip()
+    live_tree = _git_output(["git", "rev-parse", "HEAD^{tree}"], "HEAD^{tree}").strip()
+    live_status = _git_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        "status snapshot",
+    )
+    live_line_count = sum(1 for line in live_status.splitlines() if line)
+    live_sha256 = hashlib.sha256(live_status.encode()).hexdigest()
+    prov = row.get("provenance", {})
+    if not isinstance(prov, dict):
+        raise SystemExit("proposal-041: row.provenance must be an object")
+    row_commit = prov.get("commit_sha", "")
+    row_tree = prov.get("tree_id", "")
+    row_status_sha256 = prov.get("status_snapshot_sha256", "")
+    for field, value in (
+        ("commit_sha", row_commit),
+        ("tree_id", row_tree),
+        ("status_snapshot_sha256", row_status_sha256),
+    ):
+        if not isinstance(value, str) or not value.strip():
             raise SystemExit(
-                f"proposal-041: ready_same_tree_verified requires tree_clean=true and "
-                f"status_snapshot_line_count=0; got tree_clean={prov.get('tree_clean')} "
-                f"line_count={prov_line_count}"
+                f"proposal-041: row.provenance.{field} is required for "
+                "ready_same_tree_verified"
             )
-    except subprocess.CalledProcessError:
-        pass  # Not in a git repo; skip live-checkout comparison
+    if row_commit != live_commit:
+        raise SystemExit(
+            f"proposal-041: runtime row commit_sha {row_commit[:12]} does not match "
+            f"live HEAD {live_commit[:12]}; rerun the gate on the same clean tree"
+        )
+    if row_tree != live_tree:
+        raise SystemExit(
+            f"proposal-041: runtime row tree_id {row_tree[:12]} does not match "
+            f"live HEAD^{{tree}} {live_tree[:12]}; rerun the gate on the same clean tree"
+        )
+    prov_line_count = prov.get("status_snapshot_line_count", 1)
+    if not prov.get("tree_clean") or prov_line_count != 0:
+        raise SystemExit(
+            f"proposal-041: ready_same_tree_verified requires tree_clean=true and "
+            f"status_snapshot_line_count=0; got tree_clean={prov.get('tree_clean')} "
+            f"line_count={prov_line_count}"
+        )
+    if live_line_count != 0:
+        raise SystemExit("proposal-041: ready_same_tree_verified requires clean live git status")
+    if prov_line_count != live_line_count:
+        raise SystemExit(
+            f"proposal-041: row.provenance.status_snapshot_line_count {prov_line_count} "
+            f"does not match live git status line count {live_line_count}"
+        )
+    if row_status_sha256 != live_sha256:
+        raise SystemExit(
+            "proposal-041: row.provenance.status_snapshot_sha256 does not match live git status"
+        )
 
 # Row vs detail provenance agreement (Section 6.2): required for ready publication.
 if row.get("validation_status") == "ready_same_tree_verified":
@@ -2567,29 +2619,50 @@ if row.get("validation_status") == "ready_same_tree_verified":
 # agrees with row on status/state/generation could still carry stale provenance.
 if row.get("validation_status") == "ready_same_tree_verified":
     detail_prov = detail.get("provenance", {})
+    if not isinstance(detail_prov, dict):
+        raise SystemExit("proposal-041: detail.provenance must be an object")
     try:
-        _detail_live_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        _detail_live_tree = subprocess.check_output(
-            ["git", "rev-parse", "HEAD^{tree}"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        if _detail_live_commit and detail_prov.get("commit_sha") and \
-                detail_prov.get("commit_sha") != _detail_live_commit:
+        _detail_live_commit = live_commit
+        _detail_live_tree = live_tree
+        _detail_live_line_count = live_line_count
+        _detail_live_sha256 = live_sha256
+    except NameError:
+        raise SystemExit("proposal-041: ready_same_tree_verified requires live git provenance")
+    detail_commit = detail_prov.get("commit_sha", "")
+    detail_tree = detail_prov.get("tree_id", "")
+    detail_status_sha256 = detail_prov.get("status_snapshot_sha256", "")
+    for field, value in (
+        ("commit_sha", detail_commit),
+        ("tree_id", detail_tree),
+        ("status_snapshot_sha256", detail_status_sha256),
+    ):
+        if not isinstance(value, str) or not value.strip():
             raise SystemExit(
-                f"proposal-041: detail.provenance.commit_sha "
-                f"{detail_prov.get('commit_sha', '')[:12]} does not match "
-                f"live HEAD {_detail_live_commit[:12]}; rerun the gate on the same clean tree"
+                f"proposal-041: detail.provenance.{field} is required for "
+                "ready_same_tree_verified"
             )
-        if _detail_live_tree and detail_prov.get("tree_id") and \
-                detail_prov.get("tree_id") != _detail_live_tree:
-            raise SystemExit(
-                f"proposal-041: detail.provenance.tree_id "
-                f"{detail_prov.get('tree_id', '')[:12]} does not match "
-                f"live HEAD^{{tree}} {_detail_live_tree[:12]}; rerun the gate on the same clean tree"
-            )
-    except subprocess.CalledProcessError:
-        pass  # Not in a git repo; skip live-checkout comparison for detail
+    if detail_commit != _detail_live_commit:
+        raise SystemExit(
+            f"proposal-041: detail.provenance.commit_sha "
+            f"{detail_commit[:12]} does not match "
+            f"live HEAD {_detail_live_commit[:12]}; rerun the gate on the same clean tree"
+        )
+    if detail_tree != _detail_live_tree:
+        raise SystemExit(
+            f"proposal-041: detail.provenance.tree_id "
+            f"{detail_tree[:12]} does not match "
+            f"live HEAD^{{tree}} {_detail_live_tree[:12]}; rerun the gate on the same clean tree"
+        )
+    if detail_prov.get("status_snapshot_line_count") != _detail_live_line_count:
+        raise SystemExit(
+            "proposal-041: detail.provenance.status_snapshot_line_count "
+            "does not match live git status"
+        )
+    if detail_status_sha256 != _detail_live_sha256:
+        raise SystemExit(
+            "proposal-041: detail.provenance.status_snapshot_sha256 "
+            "does not match live git status"
+        )
 
 # Status-to-prefix mapping per proposal Section 5 table.
 STATUS_TO_PREFIX = {
