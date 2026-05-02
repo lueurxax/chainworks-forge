@@ -158,8 +158,9 @@ mod tests {
 
     #[test]
     fn p066_toolchain_mapping_setup_failed_display() {
-        let err = ToolchainMappingSetupFailed::new(ToolchainSetupFailureReason::PathEscape, "xcode")
-            .with_detail("../../../etc/passwd");
+        let err =
+            ToolchainMappingSetupFailed::new(ToolchainSetupFailureReason::PathEscape, "xcode")
+                .with_detail("../../../etc/passwd");
         let s = err.to_string();
         assert!(s.contains("toolchain_mapping_setup_failed"));
         assert!(s.contains("xcode"));
@@ -174,7 +175,10 @@ mod tests {
             deadline_ms: 300_000,
         };
         assert!(err.to_string().contains("xcode_run_scope_queue_timeout"));
-        assert_eq!(XcodeRunScopeQueueTimeout::failure_kind_str(), "xcode_run_scope_queue_timeout");
+        assert_eq!(
+            XcodeRunScopeQueueTimeout::failure_kind_str(),
+            "xcode_run_scope_queue_timeout"
+        );
     }
 
     #[test]

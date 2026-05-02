@@ -104,9 +104,7 @@ impl ProposalGateFailureClassification {
             ProposalGateFailureClassification::CodeOwnedBudgetRemaining => {
                 "code_owned_budget_remaining"
             }
-            ProposalGateFailureClassification::UnclearOrNonCodeOwned => {
-                "unclear_or_non_code_owned"
-            }
+            ProposalGateFailureClassification::UnclearOrNonCodeOwned => "unclear_or_non_code_owned",
             ProposalGateFailureClassification::BudgetExhausted => "budget_exhausted",
         }
     }
@@ -270,9 +268,7 @@ pub fn parse_proposal_gate_result(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    let elapsed_ms = obj
-        .get("elapsed_ms")
-        .and_then(|v| v.as_u64());
+    let elapsed_ms = obj.get("elapsed_ms").and_then(|v| v.as_u64());
 
     let settled_at = obj
         .get("settled_at")
@@ -416,7 +412,10 @@ mod tests {
             "state_5",
             "gate not registered",
         );
-        assert_eq!(r.gate_id, "p123:123", "gate_id must use proposal_id parameter");
+        assert_eq!(
+            r.gate_id, "p123:123",
+            "gate_id must use proposal_id parameter"
+        );
         assert_eq!(r.proposal_id, "123", "proposal_id must use parameter");
         assert_eq!(r.status, ProposalGateStatus::MissingDefinition);
     }

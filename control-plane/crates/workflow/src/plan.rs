@@ -44,7 +44,10 @@ impl ToolchainCachePolicySnapshot {
         if !self.enabled {
             return None;
         }
-        Some(self.go_scope.unwrap_or(ToolchainCacheScopeSnapshot::Session))
+        Some(
+            self.go_scope
+                .unwrap_or(ToolchainCacheScopeSnapshot::Session),
+        )
     }
 }
 
@@ -83,6 +86,10 @@ pub struct RunPlan {
     /// carries a toolchain_cache_policy. Absent on pre-P066 (legacy_v0) snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_plan_snapshot_format_version: Option<u32>,
+    /// P077: Closeout readiness enforcement mode frozen from workflow metadata at compile time.
+    /// Accepted values: "advisory" | "enforcement". Absent means advisory (legacy fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closeout_readiness_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

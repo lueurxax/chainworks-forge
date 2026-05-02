@@ -286,9 +286,9 @@ mod tests {
     use domain::run::{Run, RunStatus};
     use domain::stage::{StageExecution, StageStatus};
     use domain::workflow_conflict::{
-        CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
-        WorkflowConflictRecord, WorkflowConflictStatus, candidate_transition_hash,
-        workflow_conflict_fingerprint,
+        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
+        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+        WorkflowConflictStatus,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;

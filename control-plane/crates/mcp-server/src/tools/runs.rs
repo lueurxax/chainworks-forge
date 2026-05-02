@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{artifact_contracts, legacy_discovery_overrides, projections, runs};
+use db::repos::{artifact_contracts, closeout, legacy_discovery_overrides, projections, runs};
 use domain::commands::{
     CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
@@ -164,9 +164,10 @@ pub fn tool_specs() -> Vec<McpTool> {
         },
         McpTool {
             name: "runs.settle_proposal_gate".to_string(),
-            description: "P077 Phase 0: Record a proposal gate settlement result (journaled-only). \
+            description: "P077: Execute, import, or waive a proposal gate settlement result. \
                 Requires operator principal. The principal field is bound from the authenticated \
-                caller context at the engine boundary.".to_string(),
+                caller context at the engine boundary."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "required": [
@@ -179,6 +180,11 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "run_id": { "type": "string" },
                     "proposal_id": { "type": "string", "maxLength": 64 },
                     "stage_id": { "type": "string", "maxLength": 128 },
+                    "action": {
+                        "type": "string",
+                        "enum": ["record_settlement", "execute", "import_receipt", "waive"],
+                        "description": "Defaults to import_receipt when receipt_json is supplied, otherwise record_settlement"
+                    },
                     "capability": { "type": "string", "maxLength": 1024 },
                     "journal_id": { "type": "string", "maxLength": 1024 },
                     "authority": { "type": "string", "maxLength": 1024 },
@@ -322,7 +328,9 @@ pub async fn execute(
                             )?,
                         );
                     }
-                    attach_implementation_self_assessment_summary(pool, value).await
+                    let value = attach_implementation_self_assessment_summary(pool, value).await?;
+                    // P077 BLK-004: attach closeout_readiness_summary parity on runs.get.
+                    attach_closeout_readiness_summary(pool, value).await
                 }
                 None => Ok(serde_json::Value::Null),
             }
@@ -332,13 +340,13 @@ pub async fn execute(
             let items = projections::list_active_projection(pool).await?;
             let mut values = Vec::with_capacity(items.len());
             for item in items {
-                values.push(
-                    attach_implementation_self_assessment_summary(
-                        pool,
-                        serde_json::to_value(&item)?,
-                    )
-                    .await?,
-                );
+                let value = attach_implementation_self_assessment_summary(
+                    pool,
+                    serde_json::to_value(&item)?,
+                )
+                .await?;
+                // P077 BLK-004: attach closeout_readiness_summary parity on runs.list.
+                values.push(attach_closeout_readiness_summary(pool, value).await?);
             }
             Ok(serde_json::Value::Array(values))
         }
@@ -616,16 +624,30 @@ pub async fn execute(
                     anyhow::bail!("'receipt_json' exceeds maximum length of 256 KiB");
                 }
             }
+            let default_action = if receipt_json
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                "import_receipt"
+            } else {
+                "record_settlement"
+            };
+            let action = match params["action"].as_str().unwrap_or(default_action) {
+                "record_settlement" => ProposalGateSettlementAction::RecordSettlement,
+                "execute" => ProposalGateSettlementAction::Execute,
+                "import_receipt" => ProposalGateSettlementAction::ImportReceipt,
+                "waive" => ProposalGateSettlementAction::Waive,
+                other => anyhow::bail!("invalid proposal gate settlement action '{other}'"),
+            };
 
-            let caller =
-                mcp_caller(&principal.id, &principal.class, "runs.settle_proposal_gate");
+            let caller = mcp_caller(&principal.id, &principal.class, "runs.settle_proposal_gate");
             let commanded = cmd_handler
                 .handle(
                     Command::SettleProposalGate(SettleProposalGateCmd {
                         run_id,
                         proposal_id,
                         stage_id,
-                        action: ProposalGateSettlementAction::RecordSettlement,
+                        action,
                         // Overridden at engine boundary from CallerContext (BLK-008)
                         principal: String::new(),
                         capability,
@@ -738,6 +760,37 @@ async fn attach_implementation_self_assessment_summary(
     Ok(value)
 }
 
+/// P077 BLK-004: Attach closeout_readiness_summary to a run JSON value.
+///
+/// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor)
+/// so GraphQL, MCP runs.get/list, and exported projections all share one typed shape.
+async fn attach_closeout_readiness_summary(
+    pool: &SqlitePool,
+    mut value: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let run_id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| id.parse::<RunId>().ok());
+
+    let summary_value = match run_id {
+        Some(run_id) => {
+            let run_id_str = run_id.to_string();
+            match closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
+                Some(summary) => serde_json::to_value(&summary)?,
+                None => serde_json::Value::Null,
+            }
+        }
+        None => serde_json::Value::Null,
+    };
+
+    if let Some(object) = value.as_object_mut() {
+        object.insert("closeout_readiness_summary".to_string(), summary_value);
+    }
+
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,8 +800,9 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, runs};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -1060,12 +1114,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            result["delivery_preflight_json"]
-                .as_str()
-                .unwrap()
-                .contains("repo_root_exists")
-        );
+        assert!(result["delivery_preflight_json"]
+            .as_str()
+            .unwrap()
+            .contains("repo_root_exists"));
     }
 
     #[tokio::test]

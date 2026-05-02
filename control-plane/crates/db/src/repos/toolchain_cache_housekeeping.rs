@@ -44,9 +44,7 @@ pub async fn insert(
     Ok(())
 }
 
-pub async fn latest(
-    pool: &SqlitePool,
-) -> Result<Option<ToolchainCacheHousekeepingReadback>> {
+pub async fn latest(pool: &SqlitePool) -> Result<Option<ToolchainCacheHousekeepingReadback>> {
     let row = sqlx::query(
         r#"SELECT id, last_sweep_started_at, run_scoped_roots_pruned,
                   run_scoped_prune_failures, oldest_eligible_root_age_days,
@@ -62,9 +60,7 @@ pub async fn latest(
     row.map(parse_row).transpose()
 }
 
-fn parse_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> Result<ToolchainCacheHousekeepingReadback> {
+fn parse_row(row: sqlx::sqlite::SqliteRow) -> Result<ToolchainCacheHousekeepingReadback> {
     Ok(ToolchainCacheHousekeepingReadback {
         id: row.get("id"),
         last_sweep_started_at: parse_datetime(row.get("last_sweep_started_at"))?,

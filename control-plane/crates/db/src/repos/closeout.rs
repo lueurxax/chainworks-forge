@@ -12,16 +12,24 @@
 //
 // Invariant: no transition is evaluated between gate activation and readiness activation.
 
+use std::str::FromStr;
+
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use domain::closeout_readiness::{
-    CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
+    CloseoutFingerprint, CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
     IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID,
 };
-use domain::proposal_gate_result::{ProposalGateResult, PROPOSAL_GATE_RESULT_V1_CONTRACT_ID};
+use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
+use domain::closeout_readiness_summary_accessor::{
+    CloseoutReadinessAccessorInputs, CloseoutReadinessSummary, CloseoutReadinessSummaryAccessor,
+};
+use domain::proposal_gate_result::{
+    ProposalGateResult, ProposalGateStatus, PROPOSAL_GATE_RESULT_V1_CONTRACT_ID,
+};
 
 use crate::pool::begin_immediate_with_retry;
 
@@ -126,9 +134,7 @@ pub async fn execute_closeout_transaction(
 
     // Commit: crash before this leaves prior active truth authoritative.
     // Crash after commit exposes a coherent gate/readiness pair.
-    tx.commit()
-        .await
-        .context("commit closeout transaction")?;
+    tx.commit().await.context("commit closeout transaction")?;
 
     // Return data to transition evaluation ONLY after commit.
     Ok(CloseoutTransactionResult {
@@ -230,14 +236,175 @@ pub async fn find_active_readiness_generation(
     .transpose()
 }
 
+/// P077: Load the full CloseoutReadinessSummary for a run by routing through
+/// CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor).
+///
+/// Returns `None` when no active readiness generation exists yet (awaiting first
+/// settlement). Returns the typed summary when one does — all callers (GraphQL,
+/// MCP runs.get/list, run-state projection, transition evaluation) must use this
+/// function rather than building ad-hoc JSON from raw DB rows.
+pub async fn load_closeout_readiness_summary(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<CloseoutReadinessSummary>> {
+    // Load readiness row with all fields needed to construct the domain type.
+    let readiness_row = sqlx::query(
+        r#"
+        SELECT status, decision, generation_id, stage_id, readiness_mode,
+               diagnostic_reason, primary_unblock, code_blocker_count,
+               handoff_owner, risk_settlement_required, fingerprint_json, created_at
+        FROM closeout_gate_generations
+        WHERE run_id = ?1 AND contract_id = ?2 AND active = 1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id)
+    .bind(IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID)
+    .fetch_optional(pool)
+    .await
+    .context("load_closeout_readiness_summary: find readiness row")?;
+
+    let Some(r) = readiness_row else {
+        return Ok(None);
+    };
+
+    let status_str: String = r.try_get("status").context("readiness status")?;
+    let decision_str: String = r.try_get("decision").context("readiness decision")?;
+    let generation_id: String = r
+        .try_get("generation_id")
+        .context("readiness generation_id")?;
+    let stage_id: String = r.try_get("stage_id").context("readiness stage_id")?;
+    let readiness_mode: Option<String> = r.try_get("readiness_mode").context("readiness_mode")?;
+    let diagnostic_reason: Option<String> = r
+        .try_get("diagnostic_reason")
+        .context("diagnostic_reason")?;
+    let primary_unblock: Option<String> =
+        r.try_get("primary_unblock").context("primary_unblock")?;
+    let code_blocker_count: i64 = r
+        .try_get("code_blocker_count")
+        .context("code_blocker_count")?;
+    let handoff_owner: Option<String> = r.try_get("handoff_owner").context("handoff_owner")?;
+    let risk_settlement_required: i64 = r
+        .try_get("risk_settlement_required")
+        .context("risk_settlement_required")?;
+    let fingerprint_json: Option<String> =
+        r.try_get("fingerprint_json").context("fingerprint_json")?;
+    let created_at_str: String = r.try_get("created_at").context("readiness created_at")?;
+
+    let status =
+        CloseoutReadinessStatus::from_str(&status_str).unwrap_or(CloseoutReadinessStatus::Unknown);
+    let decision = CloseoutReadinessDecision::from_str(&decision_str)
+        .unwrap_or(CloseoutReadinessDecision::AwaitOperatorDecision);
+    let fingerprint: Option<CloseoutFingerprint> = fingerprint_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok());
+    let synthesized_at: DateTime<Utc> = created_at_str
+        .parse::<DateTime<Utc>>()
+        .unwrap_or_else(|_| Utc::now());
+
+    let readiness = CloseoutReadiness {
+        run_id: run_id.to_string(),
+        stage_id: stage_id.clone(),
+        status,
+        decision,
+        generation_id,
+        readiness_mode: readiness_mode.unwrap_or_else(|| "advisory".to_string()),
+        diagnostic_reason,
+        primary_unblock,
+        code_blocker_count: code_blocker_count as u32,
+        handoff_owner,
+        risk_settlement_required: risk_settlement_required != 0,
+        fingerprint,
+        synthesized_at,
+    };
+
+    // Load gate row for gate_status and gate_generation_id.
+    let gate_row = sqlx::query(
+        r#"
+        SELECT status, generation_id
+        FROM closeout_gate_generations
+        WHERE run_id = ?1 AND contract_id = ?2 AND active = 1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id)
+    .bind(PROPOSAL_GATE_RESULT_V1_CONTRACT_ID)
+    .fetch_optional(pool)
+    .await
+    .context("load_closeout_readiness_summary: find gate row")?;
+
+    let gate_result = match gate_row {
+        Some(g) => {
+            let gate_status_str: String = g.try_get("status").context("gate status")?;
+            let gate_generation_id: String =
+                g.try_get("generation_id").context("gate generation_id")?;
+            ProposalGateResult {
+                gate_id: String::new(),
+                proposal_id: String::new(),
+                run_id: run_id.to_string(),
+                stage_id: stage_id.clone(),
+                status: ProposalGateStatus::from_str(&gate_status_str)
+                    .unwrap_or(ProposalGateStatus::MissingDefinition),
+                generation_id: gate_generation_id,
+                diagnostic_reason: None,
+                executor_version: None,
+                evidence_digest: None,
+                exit_code: None,
+                elapsed_ms: None,
+                settled_at: Utc::now(),
+                authorization_lineage: None,
+                failure_classification: None,
+            }
+        }
+        None => ProposalGateResult::missing_definition(
+            String::new(),
+            run_id,
+            String::new(),
+            &stage_id,
+            "no active gate generation",
+        ),
+    };
+
+    // Load mode from the runs table and resolve.
+    let mode_column: Option<Option<String>> =
+        sqlx::query_scalar("SELECT closeout_readiness_mode FROM runs WHERE id = ?1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .context("load_closeout_readiness_summary: find closeout_readiness_mode")?;
+    let mode_column = mode_column.flatten();
+
+    // Check for enforcement migration record.
+    let enforcement_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM closeout_readiness_mode_overrides WHERE run_id = ?1 AND mode = 'enforcement'",
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let has_enforcement_migration = enforcement_count > 0;
+
+    let mode_result =
+        resolve_closeout_readiness_mode(mode_column.as_deref(), has_enforcement_migration);
+
+    let summary =
+        CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
+            readiness: &readiness,
+            gate_result: &gate_result,
+            mode_result: &mode_result,
+            accepted_risks: &[],
+        });
+
+    Ok(Some(summary))
+}
+
 /// P077 BLK-011: Read the blocker_digest persisted on the most recent active
 /// implementation_closeout_readiness_v1 generation. Used as
 /// `previous_blocker_digest` on the next state-9 synthesis to detect
 /// soft-convergence (repeated identical blockers without diff or gate progress).
-pub async fn find_active_blocker_digest(
-    pool: &SqlitePool,
-    run_id: &str,
-) -> Result<Option<String>> {
+pub async fn find_active_blocker_digest(pool: &SqlitePool, run_id: &str) -> Result<Option<String>> {
     let row: Option<Option<String>> = sqlx::query_scalar(
         r#"SELECT blocker_digest
            FROM closeout_gate_generations
@@ -258,21 +425,16 @@ pub async fn find_closeout_readiness_mode(
     pool: &SqlitePool,
     run_id: &str,
 ) -> Result<Option<String>> {
-    let row = sqlx::query_scalar(
-        "SELECT closeout_readiness_mode FROM runs WHERE id = ?1",
-    )
-    .bind(run_id)
-    .fetch_optional(pool)
-    .await
-    .context("find closeout_readiness_mode")?;
+    let row = sqlx::query_scalar("SELECT closeout_readiness_mode FROM runs WHERE id = ?1")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .context("find closeout_readiness_mode")?;
     Ok(row.flatten())
 }
 
 /// Check for an enforcement-migration override record for a run.
-pub async fn has_enforcement_migration_record(
-    pool: &SqlitePool,
-    run_id: &str,
-) -> Result<bool> {
+pub async fn has_enforcement_migration_record(pool: &SqlitePool, run_id: &str) -> Result<bool> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM closeout_readiness_mode_overrides WHERE run_id = ?1 AND mode = 'enforcement'",
     )
@@ -421,7 +583,9 @@ pub struct ActiveReadinessRow {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use domain::closeout_readiness::{CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus};
+    use domain::closeout_readiness::{
+        CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
+    };
     use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
 
     async fn setup_test_db() -> SqlitePool {
@@ -449,7 +613,11 @@ mod tests {
         }
     }
 
-    fn make_readiness(run_id: &str, status: CloseoutReadinessStatus, decision: CloseoutReadinessDecision) -> CloseoutReadiness {
+    fn make_readiness(
+        run_id: &str,
+        status: CloseoutReadinessStatus,
+        decision: CloseoutReadinessDecision,
+    ) -> CloseoutReadiness {
         CloseoutReadiness {
             run_id: run_id.into(),
             stage_id: "state_9".into(),
@@ -549,13 +717,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.readiness_status, CloseoutReadinessStatus::Ready);
-        assert_eq!(result.readiness_decision, CloseoutReadinessDecision::EnterManualRelease);
+        assert_eq!(
+            result.readiness_decision,
+            CloseoutReadinessDecision::EnterManualRelease
+        );
 
         let active_gate = find_active_gate_generation(&pool, &run_id).await.unwrap();
         assert!(active_gate.is_some());
         assert_eq!(active_gate.unwrap().status, "passed");
 
-        let active_readiness = find_active_readiness_generation(&pool, &run_id).await.unwrap();
+        let active_readiness = find_active_readiness_generation(&pool, &run_id)
+            .await
+            .unwrap();
         assert!(active_readiness.is_some());
         let active_readiness = active_readiness.unwrap();
         assert_eq!(active_readiness.status, "ready");
@@ -622,8 +795,13 @@ mod tests {
         let gate = find_active_gate_generation(&pool, &run_id).await.unwrap();
         assert!(gate.is_none(), "no gate generation should exist yet");
 
-        let readiness = find_active_readiness_generation(&pool, &run_id).await.unwrap();
-        assert!(readiness.is_none(), "no readiness generation should exist yet");
+        let readiness = find_active_readiness_generation(&pool, &run_id)
+            .await
+            .unwrap();
+        assert!(
+            readiness.is_none(),
+            "no readiness generation should exist yet"
+        );
     }
 
     #[tokio::test]
@@ -703,7 +881,9 @@ mod tests {
         let pool = setup_test_db().await;
         let run_id = insert_test_run(&pool).await;
 
-        let result = compute_controlled_reports_green(&pool, &run_id).await.unwrap();
+        let result = compute_controlled_reports_green(&pool, &run_id)
+            .await
+            .unwrap();
         assert_eq!(result, None);
     }
 
@@ -718,7 +898,9 @@ mod tests {
         insert_active_contract(&pool, &run_id, "prepush_review_v1", "pass").await;
         insert_active_contract(&pool, &run_id, "tests_result_v1", "green").await;
 
-        let result = compute_controlled_reports_green(&pool, &run_id).await.unwrap();
+        let result = compute_controlled_reports_green(&pool, &run_id)
+            .await
+            .unwrap();
         assert_eq!(result, Some(true));
     }
 
@@ -733,7 +915,9 @@ mod tests {
         insert_active_contract(&pool, &run_id, "prepush_review_v1", "pass").await;
         insert_active_contract(&pool, &run_id, "tests_result_v1", "green").await;
 
-        let result = compute_controlled_reports_green(&pool, &run_id).await.unwrap();
+        let result = compute_controlled_reports_green(&pool, &run_id)
+            .await
+            .unwrap();
         assert_eq!(result, Some(true));
     }
 
@@ -748,7 +932,9 @@ mod tests {
         insert_active_contract(&pool, &run_id, "prepush_review_v1", "pass").await;
         insert_active_contract(&pool, &run_id, "tests_result_v1", "green").await;
 
-        let result = compute_controlled_reports_green(&pool, &run_id).await.unwrap();
+        let result = compute_controlled_reports_green(&pool, &run_id)
+            .await
+            .unwrap();
         assert_eq!(result, Some(false));
     }
 
@@ -763,7 +949,9 @@ mod tests {
         insert_active_contract(&pool, &run_id, "prepush_review_v1", "pass").await;
         insert_active_contract(&pool, &run_id, "tests_result_v1", "red").await;
 
-        let result = compute_controlled_reports_green(&pool, &run_id).await.unwrap();
+        let result = compute_controlled_reports_green(&pool, &run_id)
+            .await
+            .unwrap();
         assert_eq!(result, Some(false));
     }
 
@@ -828,7 +1016,9 @@ mod tests {
         insert_active_contract(&pool, &run_id, "docs_report_v1", "pass").await;
         // security, prepush, tests missing.
 
-        let result = compute_controlled_reports_green(&pool, &run_id).await.unwrap();
+        let result = compute_controlled_reports_green(&pool, &run_id)
+            .await
+            .unwrap();
         assert_eq!(result, None);
     }
 }

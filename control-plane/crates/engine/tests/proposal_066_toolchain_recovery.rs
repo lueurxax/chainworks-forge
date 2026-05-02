@@ -51,7 +51,11 @@ async fn sweep_with_zero_threshold(
             if !path.is_dir() {
                 continue;
             }
-            let Some(gen_id) = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            let Some(gen_id) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+            else {
                 continue;
             };
             roots_seen += 1;
@@ -83,15 +87,20 @@ async fn sweep_with_zero_threshold(
             if !xcode_root.is_dir() {
                 continue;
             }
-            let Some(run_id_str) = run_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            let Some(run_id_str) = run_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+            else {
                 continue;
             };
             // Check active run in DB
-            let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?1")
-                .bind(&run_id_str)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM runs WHERE id = ?1")
+                    .bind(&run_id_str)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap_or(None);
             let is_active = status
                 .map(|s| !matches!(s.as_str(), "completed" | "failed" | "cancelled"))
                 .unwrap_or(false);
@@ -139,7 +148,10 @@ async fn p066_t14_orphan_go_root_is_reclaimed() {
     assert_eq!(readback.session_scoped_roots_seen, Some(1));
     assert_eq!(readback.session_scoped_roots_reclaimed, Some(1));
     assert_eq!(readback.session_scoped_cleanup_failures, Some(0));
-    assert!(!go_root.exists(), "orphan Go root must be removed by startup sweep");
+    assert!(
+        !go_root.exists(),
+        "orphan Go root must be removed by startup sweep"
+    );
 }
 
 #[tokio::test]
@@ -156,16 +168,14 @@ async fn p066_t14_live_go_session_root_is_preserved() {
     assert!(go_root.exists());
 
     let live_ids = std::collections::HashSet::from([live_gen_id.to_string()]);
-    let readback = sweep_with_zero_threshold(
-        &pool,
-        toolchain_home,
-        Utc::now(),
-        &live_ids,
-    )
-    .await;
+    let readback = sweep_with_zero_threshold(&pool, toolchain_home, Utc::now(), &live_ids).await;
 
     assert_eq!(readback.session_scoped_roots_seen, Some(1));
-    assert_eq!(readback.session_scoped_roots_reclaimed, Some(0), "live session must not be reclaimed");
+    assert_eq!(
+        readback.session_scoped_roots_reclaimed,
+        Some(0),
+        "live session must not be reclaimed"
+    );
     assert!(go_root.exists(), "live Go session root must be preserved");
 }
 
@@ -185,26 +195,32 @@ async fn p066_t14_multiple_go_roots_mixed_live_and_orphan() {
     }
 
     let live_ids = std::collections::HashSet::from([live.to_string()]);
-    let readback = sweep_with_zero_threshold(
-        &pool,
-        toolchain_home,
-        Utc::now(),
-        &live_ids,
-    )
-    .await;
+    let readback = sweep_with_zero_threshold(&pool, toolchain_home, Utc::now(), &live_ids).await;
 
     assert_eq!(readback.session_scoped_roots_seen, Some(3));
     assert_eq!(readback.session_scoped_roots_reclaimed, Some(2));
     assert!(
-        toolchain_home.join("providers").join("go").join(live).exists(),
+        toolchain_home
+            .join("providers")
+            .join("go")
+            .join(live)
+            .exists(),
         "live root must be preserved"
     );
     assert!(
-        !toolchain_home.join("providers").join("go").join(orphan1).exists(),
+        !toolchain_home
+            .join("providers")
+            .join("go")
+            .join(orphan1)
+            .exists(),
         "orphan1 must be reclaimed"
     );
     assert!(
-        !toolchain_home.join("providers").join("go").join(orphan2).exists(),
+        !toolchain_home
+            .join("providers")
+            .join("go")
+            .join(orphan2)
+            .exists(),
         "orphan2 must be reclaimed"
     );
 }
@@ -248,15 +264,13 @@ async fn p066_t14_xcode_root_for_active_run_is_quarantined() {
     fs::create_dir_all(&xcode_root).unwrap();
     fs::write(xcode_root.join("DerivedData"), b"test").unwrap();
 
-    let _ = sweep_with_zero_threshold(
-        &pool,
-        toolchain_home,
-        sweep_started_at,
-        &Default::default(),
-    )
-    .await;
+    let _ = sweep_with_zero_threshold(&pool, toolchain_home, sweep_started_at, &Default::default())
+        .await;
 
-    assert!(!xcode_root.exists(), "xcode/ must be quarantined for active run");
+    assert!(
+        !xcode_root.exists(),
+        "xcode/ must be quarantined for active run"
+    );
 
     // Verify quarantine dir exists.
     let epoch_ms = sweep_started_at.timestamp_millis().to_string();
@@ -266,7 +280,10 @@ async fn p066_t14_xcode_root_for_active_run_is_quarantined() {
         .join(&run_id)
         .join("quarantine")
         .join(&epoch_ms);
-    assert!(quarantine_dir.exists(), "quarantine dir must exist after sweep");
+    assert!(
+        quarantine_dir.exists(),
+        "quarantine dir must exist after sweep"
+    );
 }
 
 #[tokio::test]
@@ -303,15 +320,12 @@ async fn p066_t14_xcode_root_for_terminal_run_is_not_quarantined() {
         .join("xcode");
     fs::create_dir_all(&xcode_root).unwrap();
 
-    let _ = sweep_with_zero_threshold(
-        &pool,
-        toolchain_home,
-        Utc::now(),
-        &Default::default(),
-    )
-    .await;
+    let _ = sweep_with_zero_threshold(&pool, toolchain_home, Utc::now(), &Default::default()).await;
 
-    assert!(xcode_root.exists(), "xcode/ for terminal run must NOT be quarantined — housekeeping handles pruning");
+    assert!(
+        xcode_root.exists(),
+        "xcode/ for terminal run must NOT be quarantined — housekeeping handles pruning"
+    );
 }
 
 #[tokio::test]
@@ -329,15 +343,12 @@ async fn p066_t14_xcode_root_for_unknown_run_is_not_quarantined() {
         .join("xcode");
     fs::create_dir_all(&xcode_root).unwrap();
 
-    let _ = sweep_with_zero_threshold(
-        &pool,
-        toolchain_home,
-        Utc::now(),
-        &Default::default(),
-    )
-    .await;
+    let _ = sweep_with_zero_threshold(&pool, toolchain_home, Utc::now(), &Default::default()).await;
 
-    assert!(xcode_root.exists(), "xcode/ for unknown run must NOT be quarantined");
+    assert!(
+        xcode_root.exists(),
+        "xcode/ for unknown run must NOT be quarantined"
+    );
 }
 
 #[tokio::test]
@@ -353,18 +364,17 @@ async fn p066_t14_toolchain_cache_readback_fields_populated() {
         make_old_dir(&path);
     }
 
-    let readback = sweep_with_zero_threshold(
-        &pool,
-        toolchain_home,
-        sweep_started_at,
-        &Default::default(),
-    )
-    .await;
+    let readback =
+        sweep_with_zero_threshold(&pool, toolchain_home, sweep_started_at, &Default::default())
+            .await;
 
     assert_eq!(readback.session_scoped_roots_seen, Some(2));
     assert_eq!(readback.session_scoped_roots_reclaimed, Some(2));
     assert_eq!(readback.session_scoped_cleanup_failures, Some(0));
     assert_eq!(readback.orphan_threshold_minutes, Some(0));
     assert!(readback.last_sweep_started_at.is_some());
-    assert!(!readback.is_empty(), "readback must not be empty after a sweep");
+    assert!(
+        !readback.is_empty(),
+        "readback must not be empty after a sweep"
+    );
 }

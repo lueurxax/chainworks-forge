@@ -12,7 +12,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::closeout_readiness::{CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus};
+use crate::closeout_readiness::{
+    CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
+};
 use crate::closeout_readiness_mode::CloseoutReadinessModeResult;
 use crate::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
 use crate::risk_lineage::RiskAcceptanceLineage;
@@ -79,10 +81,7 @@ impl CloseoutReadinessSummaryAccessor {
             accepted_risks,
         } = inputs;
 
-        let fingerprint_hash = readiness
-            .fingerprint
-            .as_ref()
-            .map(|fp| fp.short_hash());
+        let fingerprint_hash = readiness.fingerprint.as_ref().map(|fp| fp.short_hash());
 
         CloseoutReadinessSummary {
             run_id: readiness.run_id.clone(),
@@ -107,7 +106,10 @@ impl CloseoutReadinessSummaryAccessor {
 
     /// Build a not-applicable summary for runs where P077 closeout readiness
     /// does not apply (e.g. non-proposal-backed, pre-state_9 runs).
-    pub fn not_applicable(run_id: impl Into<String>, stage_id: impl Into<String>) -> CloseoutReadinessSummary {
+    pub fn not_applicable(
+        run_id: impl Into<String>,
+        stage_id: impl Into<String>,
+    ) -> CloseoutReadinessSummary {
         CloseoutReadinessSummary {
             run_id: run_id.into(),
             stage_id: stage_id.into(),
@@ -169,11 +171,16 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    use crate::closeout_readiness::{CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus};
+    use crate::closeout_readiness::{
+        CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
+    };
     use crate::closeout_readiness_mode::{CloseoutReadinessMode, CloseoutReadinessModeResult};
     use crate::proposal_gate_result::ProposalGateResult;
 
-    fn make_readiness(status: CloseoutReadinessStatus, decision: CloseoutReadinessDecision) -> CloseoutReadiness {
+    fn make_readiness(
+        status: CloseoutReadinessStatus,
+        decision: CloseoutReadinessDecision,
+    ) -> CloseoutReadiness {
         CloseoutReadiness {
             run_id: "run-1".into(),
             stage_id: "state_9".into(),
@@ -219,12 +226,13 @@ mod tests {
         let gate = make_gate(ProposalGateStatus::Passed);
         let mode = CloseoutReadinessModeResult::Known(CloseoutReadinessMode::Enforcement);
 
-        let summary = CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
-            readiness: &readiness,
-            gate_result: &gate,
-            mode_result: &mode,
-            accepted_risks: &[],
-        });
+        let summary =
+            CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
+                readiness: &readiness,
+                gate_result: &gate,
+                mode_result: &mode,
+                accepted_risks: &[],
+            });
 
         assert_eq!(summary.readiness_status, CloseoutReadinessStatus::Ready);
         assert_eq!(summary.gate_status, ProposalGateStatus::Passed);
@@ -241,7 +249,8 @@ mod tests {
 
     #[test]
     fn awaiting_first_generation_has_awaiting_diagnostic_reason() {
-        let summary = CloseoutReadinessSummaryAccessor::awaiting_first_generation("run-1", "state_9");
+        let summary =
+            CloseoutReadinessSummaryAccessor::awaiting_first_generation("run-1", "state_9");
         assert!(summary.is_applicable);
         assert_eq!(
             summary.diagnostic_reason.as_deref(),
@@ -258,12 +267,13 @@ mod tests {
         let gate = make_gate(ProposalGateStatus::Failed);
         let mode = CloseoutReadinessModeResult::Known(CloseoutReadinessMode::Advisory);
 
-        let summary = CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
-            readiness: &readiness,
-            gate_result: &gate,
-            mode_result: &mode,
-            accepted_risks: &[],
-        });
+        let summary =
+            CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
+                readiness: &readiness,
+                gate_result: &gate,
+                mode_result: &mode,
+                accepted_risks: &[],
+            });
 
         let decision = route_transition_decision(&summary);
         assert_eq!(decision, CloseoutReadinessDecision::ReturnToCodeRefine);
@@ -271,16 +281,20 @@ mod tests {
 
     #[test]
     fn generation_hash_display_is_8_chars_for_long_generation_id() {
-        let readiness = make_readiness(CloseoutReadinessStatus::Ready, CloseoutReadinessDecision::EnterManualRelease);
+        let readiness = make_readiness(
+            CloseoutReadinessStatus::Ready,
+            CloseoutReadinessDecision::EnterManualRelease,
+        );
         let gate = make_gate(ProposalGateStatus::Passed);
         let mode = CloseoutReadinessModeResult::Known(CloseoutReadinessMode::Advisory);
 
-        let summary = CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
-            readiness: &readiness,
-            gate_result: &gate,
-            mode_result: &mode,
-            accepted_risks: &[],
-        });
+        let summary =
+            CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
+                readiness: &readiness,
+                gate_result: &gate,
+                mode_result: &mode,
+                accepted_risks: &[],
+            });
         assert_eq!(summary.generation_hash_display().len(), 8);
     }
 }

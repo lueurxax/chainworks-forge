@@ -52,19 +52,28 @@ fn p066_toolchain_mapper_xcode_prepares_correct_directories() {
     }
 
     // created_directories list must record the dirs.
-    assert!(result.created_directories.contains(&"DerivedData".to_string()));
-    assert!(result.created_directories.contains(&"SourcePackages".to_string()));
+    assert!(result
+        .created_directories
+        .contains(&"DerivedData".to_string()));
+    assert!(result
+        .created_directories
+        .contains(&"SourcePackages".to_string()));
     assert!(result.created_directories.contains(&"tmp".to_string()));
 
     // Relative root suffix must not contain toolchain_home prefix.
     assert!(
-        !result.relative_root_suffix.contains(toolchain_home.to_str().unwrap()),
+        !result
+            .relative_root_suffix
+            .contains(toolchain_home.to_str().unwrap()),
         "relative_root_suffix must be relative, not absolute"
     );
     assert!(result.relative_root_suffix.contains("providers/xcode"));
 
     // Xcode does not inject env vars.
-    assert!(result.env_vars.is_empty(), "xcode family must not set env vars via mapper");
+    assert!(
+        result.env_vars.is_empty(),
+        "xcode family must not set env vars via mapper"
+    );
 }
 
 #[test]
@@ -73,13 +82,8 @@ fn p066_toolchain_mapper_go_prepares_correct_directories() {
     let toolchain_home = tmp.path();
     let session_gen_id = "sess-xyz789";
 
-    let result = prepare_toolchain_mapping(
-        toolchain_home,
-        ToolchainFamily::Go,
-        session_gen_id,
-        0,
-    )
-    .expect("go mapping must succeed");
+    let result = prepare_toolchain_mapping(toolchain_home, ToolchainFamily::Go, session_gen_id, 0)
+        .expect("go mapping must succeed");
 
     // Root must be providers/go/{session_generation_id}
     let expected_root = toolchain_home
@@ -96,7 +100,10 @@ fn p066_toolchain_mapper_go_prepares_correct_directories() {
     }
 
     // Go env vars must be set.
-    assert!(!result.env_vars.is_empty(), "go family must produce env vars");
+    assert!(
+        !result.env_vars.is_empty(),
+        "go family must produce env vars"
+    );
 }
 
 #[cfg(unix)]
@@ -108,7 +115,11 @@ fn p066_toolchain_mapper_sets_owner_only_permissions_on_root_and_subdirectories(
     let result = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-perms", 0)
         .expect("go mapping must succeed");
 
-    let root_mode = std::fs::metadata(&result.root).unwrap().permissions().mode() & 0o777;
+    let root_mode = std::fs::metadata(&result.root)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(root_mode, 0o700, "mapping root must be owner-only");
 
     for subdir in &result.created_directories {
@@ -121,13 +132,8 @@ fn p066_toolchain_mapper_sets_owner_only_permissions_on_root_and_subdirectories(
 #[test]
 fn p066_toolchain_mapper_setup_duration_recorded() {
     let tmp = tempfile::tempdir().unwrap();
-    let result = prepare_toolchain_mapping(
-        tmp.path(),
-        ToolchainFamily::Xcode,
-        "run-timing",
-        0,
-    )
-    .unwrap();
+    let result =
+        prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "run-timing", 0).unwrap();
 
     assert!(
         result.setup_duration_ms >= 0,
@@ -142,13 +148,8 @@ fn p066_toolchain_mapper_setup_duration_recorded() {
 #[test]
 fn p066_toolchain_mapper_diag_family_result_shape() {
     let tmp = tempfile::tempdir().unwrap();
-    let result = prepare_toolchain_mapping(
-        tmp.path(),
-        ToolchainFamily::Xcode,
-        "run-diag-shape",
-        0,
-    )
-    .unwrap();
+    let result =
+        prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "run-diag-shape", 0).unwrap();
 
     let family_result = result.to_diag_family_result();
     assert_eq!(family_result.family, "xcode");
@@ -163,8 +164,7 @@ fn p066_toolchain_mapper_diag_family_result_shape() {
 #[test]
 fn p066_toolchain_mapper_dotdot_scope_key_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "..", 0)
-        .unwrap_err();
+    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "..", 0).unwrap_err();
     assert_eq!(
         err.reason,
         ToolchainSetupFailureReason::PathEscape,
@@ -175,8 +175,7 @@ fn p066_toolchain_mapper_dotdot_scope_key_rejected() {
 #[test]
 fn p066_toolchain_mapper_empty_scope_key_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "", 0)
-        .unwrap_err();
+    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "", 0).unwrap_err();
     assert_eq!(
         err.reason,
         ToolchainSetupFailureReason::PathEscape,
@@ -187,8 +186,7 @@ fn p066_toolchain_mapper_empty_scope_key_rejected() {
 #[test]
 fn p066_toolchain_mapper_slash_in_scope_key_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let err =
-        prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "a/b", 0).unwrap_err();
+    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, "a/b", 0).unwrap_err();
     assert_eq!(
         err.reason,
         ToolchainSetupFailureReason::PathEscape,
@@ -199,8 +197,7 @@ fn p066_toolchain_mapper_slash_in_scope_key_rejected() {
 #[test]
 fn p066_toolchain_mapper_dot_scope_key_rejected() {
     let tmp = tempfile::tempdir().unwrap();
-    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, ".", 0)
-        .unwrap_err();
+    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Xcode, ".", 0).unwrap_err();
     assert_eq!(
         err.reason,
         ToolchainSetupFailureReason::PathEscape,
@@ -229,8 +226,8 @@ fn p066_toolchain_mapper_rejects_symlinked_provider_path_escape() {
     let outside = tempfile::tempdir().unwrap();
     symlink(outside.path(), tmp.path().join("providers")).unwrap();
 
-    let err = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-symlink", 0)
-        .unwrap_err();
+    let err =
+        prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-symlink", 0).unwrap_err();
 
     assert_eq!(
         err.reason,
@@ -275,10 +272,7 @@ fn p066_go_env_vars_include_all_required_keys() {
 
     let required = ["GOCACHE", "GOMODCACHE", "GOPATH", "TMPDIR", "GOENV"];
     for key in &required {
-        assert!(
-            env.contains_key(*key),
-            "Go env vars must include {key}"
-        );
+        assert!(env.contains_key(*key), "Go env vars must include {key}");
     }
 }
 
@@ -325,8 +319,7 @@ fn p066_go_env_vars_gocache_gomodcache_gopath_tmpdir_correct_subdirs() {
 #[test]
 fn p066_go_mapping_produces_correct_env_vars() {
     let tmp = tempfile::tempdir().unwrap();
-    let result = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-abc", 0)
-        .unwrap();
+    let result = prepare_toolchain_mapping(tmp.path(), ToolchainFamily::Go, "sess-abc", 0).unwrap();
 
     assert_eq!(
         result.env_vars.get("GOENV").map(|s| s.as_str()),
@@ -374,10 +367,7 @@ fn p066_xcode_host_executor_plan_injects_derived_data_path() {
 
     let plan = XcodeHostExecutorPlan::build(input).expect("plan must build");
 
-    let derived_data_flag_pos = plan
-        .argv
-        .iter()
-        .position(|a| a == "-derivedDataPath");
+    let derived_data_flag_pos = plan.argv.iter().position(|a| a == "-derivedDataPath");
     assert!(
         derived_data_flag_pos.is_some(),
         "xcodebuild plan must inject -derivedDataPath"
@@ -430,7 +420,9 @@ fn p066_xcode_host_executor_plan_derives_tmpdir_from_mapping_root() {
         "TMPDIR must be set in host-executor env when toolchain_mapping_root is present"
     );
     assert!(
-        tmpdir.unwrap().contains("/tc/providers/xcode/run-abc/xcode/tmp"),
+        tmpdir
+            .unwrap()
+            .contains("/tc/providers/xcode/run-abc/xcode/tmp"),
         "TMPDIR must derive from mapping root/tmp, got: {:?}",
         tmpdir
     );
@@ -448,7 +440,9 @@ fn p066_xcode_host_executor_plan_without_mapping_root_no_deriveddata_injection()
         "without toolchain_mapping_root, -derivedDataPath must not be injected"
     );
     assert!(
-        !plan.argv.contains(&"-clonedSourcePackagesDirPath".to_string()),
+        !plan
+            .argv
+            .contains(&"-clonedSourcePackagesDirPath".to_string()),
         "without toolchain_mapping_root, -clonedSourcePackagesDirPath must not be injected"
     );
 }
@@ -491,13 +485,8 @@ fn p066_go_session_root_cleanup_on_drop() {
     let toolchain_home = tmp.path();
     let session_gen_id = "gen-session-abc";
 
-    let result = prepare_toolchain_mapping(
-        toolchain_home,
-        ToolchainFamily::Go,
-        session_gen_id,
-        0,
-    )
-    .expect("Go mapping must succeed");
+    let result = prepare_toolchain_mapping(toolchain_home, ToolchainFamily::Go, session_gen_id, 0)
+        .expect("Go mapping must succeed");
 
     let root = result.root.clone();
     assert!(root.exists(), "root must exist after prepare");
@@ -505,7 +494,10 @@ fn p066_go_session_root_cleanup_on_drop() {
     // Simulate session close: remove the root (this is what AcpSession::close does
     // for cleanup_paths — std::fs::remove_dir_all on each registered path).
     std::fs::remove_dir_all(&root).expect("cleanup must succeed");
-    assert!(!root.exists(), "Go session root must be removed after cleanup");
+    assert!(
+        !root.exists(),
+        "Go session root must be removed after cleanup"
+    );
 }
 
 #[test]
@@ -517,7 +509,10 @@ fn p066_go_session_root_layout_matches_session_scope_contract() {
         .expect("Go mapping must succeed");
 
     let expected = tmp.path().join("providers").join("go").join(session_gen_id);
-    assert_eq!(result.root, expected, "Go root must be under providers/go/{{session_gen_id}}");
+    assert_eq!(
+        result.root, expected,
+        "Go root must be under providers/go/{{session_gen_id}}"
+    );
     assert_eq!(result.family.scope_key_kind(), "session_generation_id");
     assert_eq!(result.family.effective_scope(), "session");
 }
@@ -535,7 +530,9 @@ fn p066_go_session_cleanup_fields_are_correct_in_diagnostics() {
         domain::toolchain_diagnostics::DiagCleanupPlan::DeleteOnClose,
     );
     assert!(
-        cleanup.aggregate_outcome_surfaces.contains(&"startupRecoverySummary.toolchainCache".to_string()),
+        cleanup
+            .aggregate_outcome_surfaces
+            .contains(&"startupRecoverySummary.toolchainCache".to_string()),
         "cleanup must surface in startupRecoverySummary.toolchainCache"
     );
 }

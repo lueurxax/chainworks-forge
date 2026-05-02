@@ -31,11 +31,11 @@
 use chrono::Utc;
 use uuid::Uuid;
 
+use domain::artifact_contracts::ImplementationSelfAssessmentSummary;
 use domain::closeout_readiness::{
     CloseoutFingerprint, CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
 };
 use domain::closeout_readiness_mode::CloseoutReadinessModeResult;
-use domain::artifact_contracts::ImplementationSelfAssessmentSummary;
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateResult, ProposalGateStatus,
 };
@@ -179,10 +179,7 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
 
 /// Gate cause routing — returns Some if the gate status itself determines the decision.
 /// Returns None if the gate status allows proceeding to the full decision matrix.
-fn route_gate_cause(
-    gate: &ProposalGateResult,
-    budget_remaining: bool,
-) -> Option<GateRouted> {
+fn route_gate_cause(gate: &ProposalGateResult, budget_remaining: bool) -> Option<GateRouted> {
     match &gate.status {
         ProposalGateStatus::Passed => None,
         ProposalGateStatus::Waived => {
@@ -346,7 +343,10 @@ pub fn compute_blocker_digest(
 }
 
 /// Apply the full R14 decision matrix after gate cause routing passes.
-fn apply_decision_matrix(inputs: SynthesizerInputs<'_>, generation_id: String) -> CloseoutReadiness {
+fn apply_decision_matrix(
+    inputs: SynthesizerInputs<'_>,
+    generation_id: String,
+) -> CloseoutReadiness {
     let mode = inputs.mode_result.effective_mode();
     let assessment = inputs.self_assessment;
 
@@ -394,9 +394,7 @@ fn apply_decision_matrix(inputs: SynthesizerInputs<'_>, generation_id: String) -
         };
     }
 
-    let blocking_code_tasks = assessment
-        .blocking_remaining_code_task_count
-        .unwrap_or(0);
+    let blocking_code_tasks = assessment.blocking_remaining_code_task_count.unwrap_or(0);
 
     // Code blockers present.
     if blocking_code_tasks > 0 {
@@ -484,12 +482,16 @@ fn apply_decision_matrix(inputs: SynthesizerInputs<'_>, generation_id: String) -
         .filter(|r| r.validate().is_err())
         .count();
 
-    if unaccepted_risk_count > 0 || inputs.accepted_risks.is_empty() && !assessment.known_risks.is_empty() {
+    if unaccepted_risk_count > 0
+        || inputs.accepted_risks.is_empty() && !assessment.known_risks.is_empty()
+    {
         let risk_settlement_required = !assessment.known_risks.is_empty();
         if risk_settlement_required {
             let accepted_count = inputs.accepted_risks.len();
             let known_count = assessment.known_risks.len();
-            if accepted_count < known_count || !risks_satisfy_enter_manual_release(inputs.accepted_risks) {
+            if accepted_count < known_count
+                || !risks_satisfy_enter_manual_release(inputs.accepted_risks)
+            {
                 return CloseoutReadiness {
                     run_id: inputs.run_id.to_string(),
                     stage_id: inputs.stage_id.to_string(),
@@ -524,9 +526,11 @@ fn apply_decision_matrix(inputs: SynthesizerInputs<'_>, generation_id: String) -
             generation_id,
             readiness_mode: mode.as_str().to_string(),
             diagnostic_reason: Some(
-                "ready_with_risks: acceptance_required — typed lineage needed".into()
+                "ready_with_risks: acceptance_required — typed lineage needed".into(),
             ),
-            primary_unblock: Some("Settle risks through governed waiver or release-owner decision".into()),
+            primary_unblock: Some(
+                "Settle risks through governed waiver or release-owner decision".into(),
+            ),
             code_blocker_count: 0,
             handoff_owner: None,
             risk_settlement_required: true,
@@ -585,11 +589,11 @@ fn apply_decision_matrix(inputs: SynthesizerInputs<'_>, generation_id: String) -
 mod tests {
     use super::*;
     use chrono::Utc;
-    use domain::closeout_readiness_mode::{
-        CloseoutReadinessModeError, CloseoutReadinessMode, CloseoutReadinessModeResult,
-    };
     use domain::artifact_contracts::{
         ImplementationSelfAssessmentStatus, ImplementationSelfAssessmentSummary,
+    };
+    use domain::closeout_readiness_mode::{
+        CloseoutReadinessMode, CloseoutReadinessModeError, CloseoutReadinessModeResult,
     };
     use domain::proposal_gate_result::{ProposalGateLineage, ProposalGateResult};
     use domain::risk_lineage::{RiskAcceptanceLineage, RiskAcceptanceSource, RiskClassification};
@@ -865,8 +869,14 @@ mod tests {
             previous_blocker_digest: None,
         });
 
-        assert_eq!(result.readiness.status, CloseoutReadinessStatus::ReadyWithRisks);
-        assert_eq!(result.readiness.decision, CloseoutReadinessDecision::EnterManualRelease);
+        assert_eq!(
+            result.readiness.status,
+            CloseoutReadinessStatus::ReadyWithRisks
+        );
+        assert_eq!(
+            result.readiness.decision,
+            CloseoutReadinessDecision::EnterManualRelease
+        );
         assert!(!result.readiness.risk_settlement_required);
     }
 

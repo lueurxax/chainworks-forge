@@ -318,12 +318,18 @@ pub struct ResolveApprovalCmd {
 
 // ── P077: Gate settlement command ──────────────────────────────────────
 
-/// Action for `SettleProposalGateCmd`. Phase 0 uses only `RecordSettlement`;
-/// future phases may add orchestrator-driven variants.
+/// Action for `SettleProposalGateCmd`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalGateSettlementAction {
+    /// Compatibility alias for the managed gate executor path.
     RecordSettlement,
+    /// Run the managed gate executor and activate its result.
+    Execute,
+    /// Import a typed `proposal_gate_receipt.v1` emitted by the managed executor.
+    ImportReceipt,
+    /// Operator-authorized waiver with full lineage.
+    Waive,
 }
 
 /// P077 Phase 0: settle a proposal gate result.

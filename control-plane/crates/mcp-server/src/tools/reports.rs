@@ -717,31 +717,17 @@ pub(crate) async fn implementation_self_assessment_summary_json(
 }
 
 /// P077: Serialize the active closeout readiness generation for MCP readback.
+/// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor).
 /// Returns null when no active generation exists (run not yet at state_9 or gate not settled).
 pub(crate) async fn closeout_readiness_summary_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
     let run_id_str = run_id.to_string();
-    let readiness = closeout::find_active_readiness_generation(pool, &run_id_str).await?;
-    let Some(readiness) = readiness else {
-        return Ok(serde_json::Value::Null);
-    };
-    let gate = closeout::find_active_gate_generation(pool, &run_id_str).await?;
-    Ok(serde_json::json!({
-        "status": readiness.status,
-        "decision": readiness.decision,
-        "generation_id": readiness.generation_id,
-        "readiness_mode": readiness.readiness_mode,
-        "diagnostic_reason": readiness.diagnostic_reason,
-        "primary_unblock": readiness.primary_unblock,
-        "code_blocker_count": readiness.code_blocker_count,
-        "handoff_owner": readiness.handoff_owner,
-        "risk_settlement_required": readiness.risk_settlement_required,
-        "gate_status": gate.as_ref().map(|g| g.status.as_str()),
-        "gate_generation_id": gate.as_ref().map(|g| g.generation_id.as_str()),
-        "is_applicable": true,
-    }))
+    match closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
+        Some(summary) => Ok(serde_json::to_value(&summary)?),
+        None => Ok(serde_json::Value::Null),
+    }
 }
 
 pub(crate) fn public_artifact_path(path: &str) -> String {
@@ -931,8 +917,9 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, runs, validation, workflow_conflicts};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -942,9 +929,9 @@ mod tests {
         ValidationFailureClass, ValidationFailureRecord, ValidationStatus,
     };
     use domain::workflow_conflict::{
-        CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictReason,
-        WorkflowConflictRecord, WorkflowConflictStatus, candidate_transition_hash,
-        workflow_conflict_fingerprint,
+        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
+        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+        WorkflowConflictStatus,
     };
     use engine::event_bus;
     use engine::work_queue::WorkQueue;

@@ -23,12 +23,10 @@ use domain::closeout_readiness_summary_accessor::{
     route_transition_decision, CloseoutReadinessAccessorInputs, CloseoutReadinessSummaryAccessor,
 };
 use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
-use domain::risk_lineage::{
-    RiskAcceptanceLineage, RiskAcceptanceSource, RiskClassification,
-};
+use domain::risk_lineage::{RiskAcceptanceLineage, RiskAcceptanceSource, RiskClassification};
 use engine::synthesizers::closeout_readiness::{
-    synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
-    compute_blocker_digest,
+    compute_blocker_digest, synthesize_implementation_closeout_readiness_for_state9,
+    SynthesizerInputs,
 };
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -106,7 +104,14 @@ fn synthesize(
     mode: &CloseoutReadinessModeResult,
 ) -> (CloseoutReadinessStatus, CloseoutReadinessDecision) {
     // Use controlled_reports_green=Some(true) so enforcement tests are not blocked by report check.
-    synthesize_with_reports(gate_status, assessment, accepted_risks, loop_budget_remaining, mode, Some(true))
+    synthesize_with_reports(
+        gate_status,
+        assessment,
+        accepted_risks,
+        loop_budget_remaining,
+        mode,
+        Some(true),
+    )
 }
 
 fn synthesize_with_reports(
@@ -342,7 +347,10 @@ fn p077_proof_gate_waived_gate_with_risks_accepted_enters_manual_release() {
         CloseoutReadinessDecision::EnterManualRelease,
         "waived gate with valid lineage + risks accepted must enter manual release"
     );
-    assert_eq!(result.readiness.status, CloseoutReadinessStatus::ReadyWithRisks);
+    assert_eq!(
+        result.readiness.status,
+        CloseoutReadinessStatus::ReadyWithRisks
+    );
 }
 
 // ── (7) repeated identical blockers => soft convergence checkpoint ──────────
@@ -444,12 +452,13 @@ fn p077_proof_gate_transition_evaluation_reads_active_truth_not_stale_json() {
     });
 
     // Build the summary through the single accessor (same path used in transition evaluation)
-    let summary = CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
-        readiness: &synth_result.readiness,
-        gate_result: &g,
-        mode_result: &mode,
-        accepted_risks: &[],
-    });
+    let summary =
+        CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
+            readiness: &synth_result.readiness,
+            gate_result: &g,
+            mode_result: &mode,
+            accepted_risks: &[],
+        });
 
     // route_transition_decision must return EnterManualRelease for a ready run
     let decision = route_transition_decision(&summary);
@@ -486,12 +495,13 @@ fn p077_proof_gate_accessor_exposes_same_fields_for_graphql_mcp_and_transition()
         previous_blocker_digest: None,
     });
 
-    let summary = CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
-        readiness: &synth.readiness,
-        gate_result: &g,
-        mode_result: &mode,
-        accepted_risks: &[],
-    });
+    let summary =
+        CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
+            readiness: &synth.readiness,
+            gate_result: &g,
+            mode_result: &mode,
+            accepted_risks: &[],
+        });
 
     // These fields must be present for all three surfaces (GraphQL, MCP, transition)
     assert_eq!(summary.run_id, "run-2");

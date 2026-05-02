@@ -33,7 +33,8 @@ use domain::workflow_conflict::{
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
 use crate::synthesizers::closeout_readiness::{
-    synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs as CloseoutSynthesizerInputs,
+    synthesize_implementation_closeout_readiness_for_state9,
+    SynthesizerInputs as CloseoutSynthesizerInputs,
 };
 use crate::work_queue::WorkQueue;
 
@@ -1444,35 +1445,35 @@ impl Orchestrator {
 
         // Read the active proposal gate result (if the operator has already settled one).
         // If none, use MissingDefinition — synthesizer routes to AwaitGateDefinition.
-        let gate_result =
-            match closeout::find_active_gate_generation(&self.pool, &run_id_str).await {
-                Ok(Some(row)) => ProposalGateResult {
-                    gate_id: format!("p077:{}", &row.generation_id),
-                    proposal_id: "077".to_string(),
-                    run_id: run_id_str.clone(),
-                    stage_id: current_state_id.to_string(),
-                    status: row
-                        .status
-                        .parse::<ProposalGateStatus>()
-                        .unwrap_or(ProposalGateStatus::Invalid),
-                    generation_id: row.generation_id,
-                    diagnostic_reason: row.diagnostic_reason,
-                    executor_version: None,
-                    evidence_digest: None,
-                    exit_code: None,
-                    elapsed_ms: None,
-                    settled_at: chrono::Utc::now(),
-                    authorization_lineage: None,
-                    failure_classification: None,
-                },
-                _ => ProposalGateResult::missing_definition(
-                    format!("gate-missing:{}", uuid::Uuid::new_v4()),
-                    &run_id_str,
-                    "077",
-                    current_state_id,
-                    "no_proposal_gate_settled",
-                ),
-            };
+        let gate_result = match closeout::find_active_gate_generation(&self.pool, &run_id_str).await
+        {
+            Ok(Some(row)) => ProposalGateResult {
+                gate_id: format!("p077:{}", &row.generation_id),
+                proposal_id: "077".to_string(),
+                run_id: run_id_str.clone(),
+                stage_id: current_state_id.to_string(),
+                status: row
+                    .status
+                    .parse::<ProposalGateStatus>()
+                    .unwrap_or(ProposalGateStatus::Invalid),
+                generation_id: row.generation_id,
+                diagnostic_reason: row.diagnostic_reason,
+                executor_version: None,
+                evidence_digest: None,
+                exit_code: None,
+                elapsed_ms: None,
+                settled_at: chrono::Utc::now(),
+                authorization_lineage: None,
+                failure_classification: None,
+            },
+            _ => ProposalGateResult::missing_definition(
+                format!("gate-missing:{}", uuid::Uuid::new_v4()),
+                &run_id_str,
+                "077",
+                current_state_id,
+                "no_proposal_gate_settled",
+            ),
+        };
 
         // Resolve the closeout readiness mode from the frozen run column.
         let has_enforcement_migration =
@@ -5749,8 +5750,7 @@ fn is_health_fallback_eligible_task(
                 .any(|output| output == "proposal_current"))
         || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
         || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
-        || (agent_id == "prepush_code_reviewer"
-            && output_contract == Some("prepush_review_v1"))
+        || (agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1"))
 }
 
 fn is_health_fallback_source_provider(provider: &str) -> bool {
@@ -5848,7 +5848,11 @@ fn run_local_health_fallback_profile_candidates(
     }
     if agent_id == "security_checker" && output_contract == Some("security_report_v1") {
         if matches!(source_provider, "claude" | "claude_acp") {
-            return vec!["codex_architect_high", "codex_audit_high", "codex_writer_high"];
+            return vec![
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ];
         }
         return vec!["claude_security_high", "claude_product_high"];
     }
@@ -6871,6 +6875,7 @@ mod tests {
             catalog_snapshot_json: "{}".into(),
             dynamic_candidate_bindings: Vec::new(),
             run_plan_snapshot_format_version: None,
+            closeout_readiness_mode: None,
         }
     }
 

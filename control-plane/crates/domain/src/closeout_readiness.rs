@@ -19,8 +19,7 @@ pub const IMPLEMENTATION_CLOSEOUT_READINESS_ARTIFACT_PATH: &str =
     "review/implementation-closeout-readiness.json";
 
 /// Derived diagnostic projection — NOT a transition source.
-pub const IMPLEMENTATION_CLOSEOUT_INPUTS_V1_CONTRACT_ID: &str =
-    "implementation_closeout_inputs_v1";
+pub const IMPLEMENTATION_CLOSEOUT_INPUTS_V1_CONTRACT_ID: &str = "implementation_closeout_inputs_v1";
 pub const IMPLEMENTATION_CLOSEOUT_INPUTS_ARTIFACT_PATH: &str =
     "review/implementation-closeout-inputs.json";
 
@@ -230,16 +229,11 @@ pub fn parse_closeout_readiness(
 ) -> Result<CloseoutReadiness, String> {
     let obj = raw
         .as_object()
-        .ok_or_else(|| {
-            "implementation_closeout_readiness_v1: expected JSON object".to_string()
-        })?;
+        .ok_or_else(|| "implementation_closeout_readiness_v1: expected JSON object".to_string())?;
 
-    let status_str = obj
-        .get("status")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            "implementation_closeout_readiness_v1: missing required field 'status'".to_string()
-        })?;
+    let status_str = obj.get("status").and_then(|v| v.as_str()).ok_or_else(|| {
+        "implementation_closeout_readiness_v1: missing required field 'status'".to_string()
+    })?;
 
     let status: CloseoutReadinessStatus = status_str
         .parse()
@@ -348,11 +342,26 @@ mod tests {
     #[test]
     fn all_decisions_round_trip() {
         let cases = [
-            ("enter_manual_release", CloseoutReadinessDecision::EnterManualRelease),
-            ("return_to_code_refine", CloseoutReadinessDecision::ReturnToCodeRefine),
-            ("await_non_code_handoff", CloseoutReadinessDecision::AwaitNonCodeHandoff),
-            ("await_gate_definition", CloseoutReadinessDecision::AwaitGateDefinition),
-            ("await_operator_decision", CloseoutReadinessDecision::AwaitOperatorDecision),
+            (
+                "enter_manual_release",
+                CloseoutReadinessDecision::EnterManualRelease,
+            ),
+            (
+                "return_to_code_refine",
+                CloseoutReadinessDecision::ReturnToCodeRefine,
+            ),
+            (
+                "await_non_code_handoff",
+                CloseoutReadinessDecision::AwaitNonCodeHandoff,
+            ),
+            (
+                "await_gate_definition",
+                CloseoutReadinessDecision::AwaitGateDefinition,
+            ),
+            (
+                "await_operator_decision",
+                CloseoutReadinessDecision::AwaitOperatorDecision,
+            ),
         ];
         for (s, expected) in &cases {
             let parsed: CloseoutReadinessDecision = s.parse().unwrap();

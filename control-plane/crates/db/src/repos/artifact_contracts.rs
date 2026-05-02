@@ -1225,7 +1225,59 @@ pub async fn rebuild_run_state_projection_tx(
     .fetch_all(&mut **tx)
     .await?;
 
+    // P077: Also fetch active closeout_gate_generations rows (proposal_gate_result_v1 and
+    // implementation_closeout_readiness_v1). These are never inserted into
+    // active_artifact_contracts but must appear in the exported projection so that
+    // downstream consumers (run-state JSON, GraphQL, MCP runs.get) see P077 truth.
+    let p077_rows = sqlx::query(
+        r#"SELECT contract_id, status, decision, generation_id, created_at
+           FROM closeout_gate_generations
+           WHERE run_id = ?1 AND active = 1
+           ORDER BY contract_id"#,
+    )
+    .bind(&run_id_str)
+    .fetch_all(&mut **tx)
+    .await?;
+
     let mut contracts = serde_json::Map::new();
+
+    for p077_row in p077_rows {
+        let contract_id: String = p077_row.get("contract_id");
+        let status: String = p077_row.get("status");
+        let decision: Option<String> = p077_row.get("decision");
+        let generation_id: String = p077_row.get("generation_id");
+        let created_at: String = p077_row.get("created_at");
+        contracts.insert(
+            contract_id.clone(),
+            serde_json::json!({
+                "canonical_path": serde_json::Value::Null,
+                "raw_path": serde_json::Value::Null,
+                "raw_status": status,
+                "status": status,
+                "db_status": status,
+                "decision": decision,
+                "status_overridden": false,
+                "active_override_id": serde_json::Value::Null,
+                "generation_id": generation_id,
+                "artifact_generation_id": generation_id,
+                "source_agent_execution_id": serde_json::Value::Null,
+                "source_stage_execution_id": serde_json::Value::Null,
+                "source_session_generation_id": serde_json::Value::Null,
+                "source_work_item_id": serde_json::Value::Null,
+                "supersedes_artifact_generation_id": serde_json::Value::Null,
+                "supersedes": [],
+                "output_settlement": "none",
+                "source_generation_verified": false,
+                "valid": true,
+                "partial": false,
+                "warnings": [],
+                "validation_errors": [],
+                "created_at": created_at,
+                "p077": true,
+            }),
+        );
+    }
+
     for row in active_rows {
         let contract_id: String = row.get("contract_id");
         let warnings: Vec<String> = serde_json::from_str(&row.get::<String, _>("warnings_json"))?;
@@ -1677,9 +1729,7 @@ pub fn contract_id_for_alias(alias: &str) -> Option<&'static str> {
         "implementation_self_assessment_v2" => Some("implementation_self_assessment_v2"),
         "tests_result_v1" => Some("tests_result_v1"),
         // P077: closeout readiness artifacts stored in closeout_gate_generations.
-        "implementation_closeout_readiness_v1" => {
-            Some("implementation_closeout_readiness_v1")
-        }
+        "implementation_closeout_readiness_v1" => Some("implementation_closeout_readiness_v1"),
         "proposal_gate_result_v1" => Some("proposal_gate_result_v1"),
         _ => None,
     }

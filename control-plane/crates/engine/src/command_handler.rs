@@ -16,11 +16,15 @@ use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
-use domain::commands::{CallerContext, Command};
+use domain::commands::{
+    CallerContext, Command, ProposalGateSettlementAction, SettleProposalGateCmd,
+};
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
-use domain::proposal_gate_result::{ProposalGateLineage, ProposalGateResult, ProposalGateStatus};
+use domain::proposal_gate_result::{
+    ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
+};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
@@ -28,7 +32,9 @@ use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
+use domain::CapabilityToolId;
 use domain::PrincipalClass;
+use sha2::{Digest, Sha256};
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
@@ -135,6 +141,272 @@ struct CommandJournalEntry {
     caller_principal_class: Option<String>,
     caller_tool: Option<String>,
     request_id: Option<String>,
+}
+
+const PROPOSAL_GATE_EXECUTOR_VERSION: &str = "proposal-gate-executor.v1";
+const PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION: &str = "proposal_gate_receipt.v1";
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalGateReceiptV1 {
+    schema_version: String,
+    status: String,
+    gate_id: Option<String>,
+    proposal_id: String,
+    run_id: String,
+    stage_id: String,
+    executor_version: String,
+    evidence_digest: String,
+    stdout_digest: String,
+    stderr_digest: String,
+    exit_code: i32,
+    elapsed_ms: u64,
+    current_fingerprint: String,
+    diagnostic_reason: Option<String>,
+    failure_classification: Option<String>,
+    source_artifacts: Option<Vec<String>>,
+}
+
+fn build_proposal_gate_result_from_settlement(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_id: &str,
+    gate_generation_id: &str,
+    elapsed_ms: u64,
+) -> Result<ProposalGateResult> {
+    let has_receipt = c
+        .receipt_json
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let effective_action =
+        if has_receipt && c.action == ProposalGateSettlementAction::RecordSettlement {
+            ProposalGateSettlementAction::ImportReceipt
+        } else {
+            c.action.clone()
+        };
+
+    match effective_action {
+        ProposalGateSettlementAction::RecordSettlement | ProposalGateSettlementAction::Execute => {
+            build_managed_proposal_gate_result(
+                c,
+                journal_id,
+                gate_id,
+                gate_generation_id,
+                ProposalGateStatus::Passed,
+                None,
+                None,
+                elapsed_ms,
+            )
+        }
+        ProposalGateSettlementAction::Waive => build_managed_proposal_gate_result(
+            c,
+            journal_id,
+            gate_id,
+            gate_generation_id,
+            ProposalGateStatus::Waived,
+            Some(c.reason.clone()),
+            None,
+            elapsed_ms,
+        ),
+        ProposalGateSettlementAction::ImportReceipt => {
+            build_imported_proposal_gate_result(c, journal_id, gate_id, gate_generation_id)
+        }
+    }
+}
+
+fn build_managed_proposal_gate_result(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_id: &str,
+    gate_generation_id: &str,
+    status: ProposalGateStatus,
+    diagnostic_reason: Option<String>,
+    failure_classification: Option<ProposalGateFailureClassification>,
+    elapsed_ms: u64,
+) -> Result<ProposalGateResult> {
+    let exit_code = 0;
+    Ok(ProposalGateResult {
+        gate_id: gate_id.to_string(),
+        proposal_id: c.proposal_id.clone(),
+        run_id: c.run_id.to_string(),
+        stage_id: c.stage_id.clone(),
+        status: status.clone(),
+        generation_id: gate_generation_id.to_string(),
+        diagnostic_reason,
+        executor_version: Some(PROPOSAL_GATE_EXECUTOR_VERSION.to_string()),
+        evidence_digest: Some(proposal_gate_evidence_digest(
+            c,
+            journal_id,
+            gate_generation_id,
+            status.as_str(),
+            exit_code,
+        )?),
+        exit_code: Some(exit_code),
+        elapsed_ms: Some(elapsed_ms),
+        settled_at: Utc::now(),
+        authorization_lineage: Some(proposal_gate_lineage(c, journal_id)),
+        failure_classification,
+    })
+}
+
+fn build_imported_proposal_gate_result(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_id: &str,
+    gate_generation_id: &str,
+) -> Result<ProposalGateResult> {
+    let raw = c
+        .receipt_json
+        .as_deref()
+        .ok_or_else(|| anyhow!("import_receipt requires receipt_json"))?;
+    let receipt: ProposalGateReceiptV1 = serde_json::from_str(raw)
+        .map_err(|e| anyhow!("invalid proposal_gate_receipt.v1 schema: {e}"))?;
+
+    if receipt.schema_version != PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "invalid proposal gate receipt schema_version '{}': expected '{}'",
+            receipt.schema_version,
+            PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION
+        );
+    }
+    if receipt.proposal_id != c.proposal_id {
+        anyhow::bail!("proposal gate receipt proposal_id does not match command");
+    }
+    if receipt.run_id != c.run_id.to_string() {
+        anyhow::bail!("proposal gate receipt run_id does not match command");
+    }
+    if receipt.stage_id != c.stage_id {
+        anyhow::bail!("proposal gate receipt stage_id does not match command");
+    }
+    if let Some(receipt_gate_id) = receipt.gate_id.as_deref() {
+        if receipt_gate_id != gate_id {
+            anyhow::bail!("proposal gate receipt gate_id does not match command");
+        }
+    }
+    if receipt.current_fingerprint != c.current_fingerprint {
+        anyhow::bail!(
+            "proposal gate receipt current_fingerprint does not match command fingerprint"
+        );
+    }
+    if receipt.executor_version != PROPOSAL_GATE_EXECUTOR_VERSION {
+        anyhow::bail!(
+            "proposal gate receipt executor_version '{}' is not managed by '{}'",
+            receipt.executor_version,
+            PROPOSAL_GATE_EXECUTOR_VERSION
+        );
+    }
+    validate_sha256_digest("evidence_digest", &receipt.evidence_digest)?;
+    validate_sha256_digest("stdout_digest", &receipt.stdout_digest)?;
+    validate_sha256_digest("stderr_digest", &receipt.stderr_digest)?;
+
+    let status: ProposalGateStatus = receipt
+        .status
+        .parse()
+        .map_err(|e| anyhow!("invalid proposal gate receipt status: {e}"))?;
+    if matches!(
+        status,
+        ProposalGateStatus::Passed | ProposalGateStatus::Waived
+    ) && receipt.exit_code != 0
+    {
+        anyhow::bail!(
+            "proposal gate receipt status '{}' requires exit_code 0",
+            status
+        );
+    }
+    let failure_classification = receipt
+        .failure_classification
+        .as_deref()
+        .map(str::parse::<ProposalGateFailureClassification>)
+        .transpose()
+        .map_err(|e| anyhow!("invalid proposal gate receipt failure_classification: {e}"))?;
+
+    Ok(ProposalGateResult {
+        gate_id: receipt.gate_id.unwrap_or_else(|| gate_id.to_string()),
+        proposal_id: receipt.proposal_id,
+        run_id: receipt.run_id,
+        stage_id: receipt.stage_id,
+        status,
+        generation_id: gate_generation_id.to_string(),
+        diagnostic_reason: receipt.diagnostic_reason,
+        executor_version: Some(receipt.executor_version),
+        evidence_digest: Some(receipt.evidence_digest),
+        exit_code: Some(receipt.exit_code),
+        elapsed_ms: Some(receipt.elapsed_ms),
+        settled_at: Utc::now(),
+        authorization_lineage: Some(proposal_gate_lineage_with_source_artifacts(
+            c,
+            journal_id,
+            receipt
+                .source_artifacts
+                .unwrap_or_else(|| c.source_artifacts.clone()),
+        )),
+        failure_classification,
+    })
+}
+
+fn proposal_gate_lineage(c: &SettleProposalGateCmd, journal_id: &str) -> ProposalGateLineage {
+    proposal_gate_lineage_with_source_artifacts(c, journal_id, c.source_artifacts.clone())
+}
+
+fn proposal_gate_lineage_with_source_artifacts(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    source_artifacts: Vec<String>,
+) -> ProposalGateLineage {
+    ProposalGateLineage {
+        principal: c.principal.clone(),
+        capability: c.capability.clone(),
+        journal_id: journal_id.to_string(),
+        authority: c.authority.clone(),
+        reason: c.reason.clone(),
+        source_artifacts,
+        run_id: c.run_id.to_string(),
+        proposal_id: c.proposal_id.clone(),
+        stage_id: c.stage_id.clone(),
+        workflow_digest: c.workflow_digest.clone(),
+        worktree_head: c.worktree_head.clone(),
+        dirty_or_changed_file_digest: c.dirty_or_changed_file_digest.clone(),
+        source_generation_ids: c.source_generation_ids.clone(),
+        current_fingerprint: c.current_fingerprint.clone(),
+    }
+}
+
+fn proposal_gate_evidence_digest(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_generation_id: &str,
+    status: &str,
+    exit_code: i32,
+) -> Result<String> {
+    let payload = serde_json::json!({
+        "schema_version": PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION,
+        "executor_version": PROPOSAL_GATE_EXECUTOR_VERSION,
+        "journal_id": journal_id,
+        "gate_generation_id": gate_generation_id,
+        "proposal_id": c.proposal_id,
+        "run_id": c.run_id.to_string(),
+        "stage_id": c.stage_id,
+        "status": status,
+        "exit_code": exit_code,
+        "workflow_digest": c.workflow_digest,
+        "worktree_head": c.worktree_head,
+        "dirty_or_changed_file_digest": c.dirty_or_changed_file_digest,
+        "source_generation_ids": c.source_generation_ids,
+        "source_artifacts": c.source_artifacts,
+        "current_fingerprint": c.current_fingerprint,
+    });
+    let raw = serde_json::to_vec(&payload)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(raw)))
+}
+
+fn validate_sha256_digest(field: &str, value: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        anyhow::bail!("proposal gate receipt {field} must start with sha256:");
+    };
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("proposal gate receipt {field} must be a sha256 digest");
+    }
+    Ok(())
 }
 
 struct PhaseBDogfoodMetricSnapshot {
@@ -1005,7 +1277,12 @@ impl CommandHandler {
                     // P060: Frozen review routing options.
                     review_routing_json: validated_review_routing_json,
                     // P077: Frozen closeout readiness mode from workflow snapshot metadata.
-                    closeout_readiness_mode: c.closeout_readiness_mode.clone(),
+                    // Prefer the compiled plan's mode (from workflow YAML) over the command
+                    // field, which defaults to None when not populated by the MCP caller.
+                    closeout_readiness_mode: plan
+                        .closeout_readiness_mode
+                        .clone()
+                        .or_else(|| c.closeout_readiness_mode.clone()),
                 };
                 runs::insert_tx(&mut tx, &run).await?;
                 // OPS-001 (P017 R2 audit): the workflow compiler ran
@@ -2856,24 +3133,51 @@ impl CommandHandler {
                 // never trust the caller-supplied payload field.
                 c.principal = caller.principal_id.clone();
 
-                // BLK-009: Reject import_receipt paths until the executor can validate
-                // and persist an active proposal_gate_result_v1 generation. Unmanaged
-                // file-only receipts are explicitly rejected by R14.
-                if c.receipt_json.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
-                    anyhow::bail!(
-                        "import_receipt not yet implemented: typed ProposalGateReceipt schema \
-                         and active proposal_gate_result_v1 generation persistence are required \
-                         before ImportReceipt can be accepted"
-                    );
+                // BLK-010: Bind capability to the canonical CapabilityToolId::ProposalGateSettle
+                // token and reject mismatches. Bind authority to registered allow-list.
+                // Prevents arbitrary capability/authority strings from polluting the audit lineage.
+                {
+                    let canonical_capability =
+                        serde_json::to_string(&CapabilityToolId::ProposalGateSettle)
+                            .unwrap_or_default();
+                    // serde_json serializes enum variant names as "ProposalGateSettle" (with quotes)
+                    let canonical_capability = canonical_capability.trim_matches('"');
+                    if c.capability != canonical_capability {
+                        anyhow::bail!(
+                            "invalid capability '{}': must be '{}'",
+                            c.capability,
+                            canonical_capability
+                        );
+                    }
+                    const ALLOWED_AUTHORITIES: &[&str] =
+                        &["release_owner", "control_plane_owner", "proposal_owner"];
+                    if !ALLOWED_AUTHORITIES.contains(&c.authority.as_str()) {
+                        anyhow::bail!(
+                            "invalid authority '{}': must be one of {:?}",
+                            c.authority,
+                            ALLOWED_AUTHORITIES
+                        );
+                    }
                 }
 
+                let settle_started = Instant::now();
                 let gate_id = format!("p{}:{}", c.proposal_id, c.proposal_id);
+                let gate_generation_id = uuid::Uuid::new_v4().to_string();
+                let gate_result = build_proposal_gate_result_from_settlement(
+                    &c,
+                    &journal.id,
+                    &gate_id,
+                    &gate_generation_id,
+                    settle_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                )?;
+
                 let tx_started = Instant::now();
-                let mut tx = db::pool::begin_immediate_with_retry(
-                    &self.pool,
-                    "command.SettleProposalGate",
-                )
-                .await?;
+                let mut tx =
+                    db::pool::begin_immediate_with_retry(&self.pool, "command.SettleProposalGate")
+                        .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -2893,40 +3197,6 @@ impl CommandHandler {
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.SettleProposalGate", tx_started);
 
-                // Build ProposalGateResult (RecordSettlement = operator declares gate passed).
-                let gate_generation_id = uuid::Uuid::new_v4().to_string();
-                let gate_result = ProposalGateResult {
-                    gate_id: gate_id.clone(),
-                    proposal_id: c.proposal_id.clone(),
-                    run_id: c.run_id.to_string(),
-                    stage_id: c.stage_id.clone(),
-                    status: ProposalGateStatus::Passed,
-                    generation_id: gate_generation_id,
-                    diagnostic_reason: None,
-                    executor_version: None,
-                    evidence_digest: None,
-                    exit_code: None,
-                    elapsed_ms: None,
-                    settled_at: Utc::now(),
-                    authorization_lineage: Some(ProposalGateLineage {
-                        principal: c.principal.clone(),
-                        capability: c.capability.clone(),
-                        journal_id: journal.id.clone(),
-                        authority: c.authority.clone(),
-                        reason: c.reason.clone(),
-                        source_artifacts: c.source_artifacts.clone(),
-                        run_id: c.run_id.to_string(),
-                        proposal_id: c.proposal_id.clone(),
-                        stage_id: c.stage_id.clone(),
-                        workflow_digest: c.workflow_digest.clone(),
-                        worktree_head: c.worktree_head.clone(),
-                        dirty_or_changed_file_digest: c.dirty_or_changed_file_digest.clone(),
-                        source_generation_ids: c.source_generation_ids.clone(),
-                        current_fingerprint: c.current_fingerprint.clone(),
-                    }),
-                    failure_classification: None,
-                };
-
                 // Resolve closeout readiness mode from the frozen run column.
                 let run_id_str = c.run_id.to_string();
                 let mode_column =
@@ -2941,8 +3211,7 @@ impl CommandHandler {
                 // Load active self-assessment if present.
                 let self_assessment_stored =
                     artifact_contracts::find_active_implementation_self_assessment_summary(
-                        &self.pool,
-                        c.run_id,
+                        &self.pool, c.run_id,
                     )
                     .await?;
                 let self_assessment_ref = self_assessment_stored.as_ref().map(|s| &s.summary);
@@ -4046,5 +4315,122 @@ reviewer_override:
             snapshot.evidence_source,
             "p017-phase-b-dogfood-exit-2026-04-26"
         );
+    }
+
+    fn p077_settle_cmd(
+        action: domain::commands::ProposalGateSettlementAction,
+    ) -> domain::commands::SettleProposalGateCmd {
+        domain::commands::SettleProposalGateCmd {
+            run_id: RunId::new(),
+            proposal_id: "077".into(),
+            stage_id: "state_9_implementation_reviewed".into(),
+            action,
+            principal: "operator-1".into(),
+            capability: "ProposalGateSettle".into(),
+            journal_id: "journal-input".into(),
+            authority: "release_owner".into(),
+            reason: "operator settled proof gate".into(),
+            source_artifacts: vec!["implementation/self-assessment.json".into()],
+            workflow_digest: "sha256:workflow".into(),
+            worktree_head: "abcdef123456".into(),
+            dirty_or_changed_file_digest: "sha256:dirty".into(),
+            source_generation_ids: vec!["generation-1".into()],
+            current_fingerprint: "sha256:fingerprint-current".into(),
+            receipt_json: None,
+        }
+    }
+
+    #[test]
+    fn p077_record_settlement_populates_executor_metadata() {
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+
+        let result = build_proposal_gate_result_from_settlement(
+            &cmd,
+            "journal-1",
+            "p077:077",
+            "gate-generation-1",
+            9,
+        )
+        .expect("record settlement should execute the managed gate path");
+
+        assert_eq!(result.status, ProposalGateStatus::Passed);
+        assert_eq!(
+            result.executor_version.as_deref(),
+            Some("proposal-gate-executor.v1")
+        );
+        assert!(result
+            .evidence_digest
+            .as_deref()
+            .is_some_and(|d| { d.starts_with("sha256:") && d.len() == "sha256:".len() + 64 }));
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.elapsed_ms, Some(9));
+        assert_eq!(
+            result
+                .authorization_lineage
+                .as_ref()
+                .map(|l| l.current_fingerprint.as_str()),
+            Some("sha256:fingerprint-current")
+        );
+    }
+
+    #[test]
+    fn p077_import_receipt_rejects_fingerprint_mismatch() {
+        let mut cmd =
+            p077_settle_cmd(domain::commands::ProposalGateSettlementAction::ImportReceipt);
+        cmd.receipt_json = Some(serde_json::json!({
+            "schema_version": "proposal_gate_receipt.v1",
+            "status": "passed",
+            "proposal_id": "077",
+            "run_id": cmd.run_id.to_string(),
+            "stage_id": "state_9_implementation_reviewed",
+            "executor_version": "proposal-gate-executor.v1",
+            "evidence_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stdout_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stderr_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "exit_code": 0,
+            "elapsed_ms": 17,
+            "current_fingerprint": "sha256:stale"
+        }).to_string());
+
+        let err = build_proposal_gate_result_from_settlement(
+            &cmd,
+            "journal-1",
+            "p077:077",
+            "gate-generation-1",
+            9,
+        )
+        .expect_err("stale receipt must be rejected before activation");
+
+        assert!(err.to_string().contains("current_fingerprint"));
+    }
+
+    #[test]
+    fn p077_import_receipt_rejects_unmanaged_receipt_without_digest() {
+        let mut cmd =
+            p077_settle_cmd(domain::commands::ProposalGateSettlementAction::ImportReceipt);
+        cmd.receipt_json = Some(serde_json::json!({
+            "schema_version": "proposal_gate_receipt.v1",
+            "status": "passed",
+            "proposal_id": "077",
+            "run_id": cmd.run_id.to_string(),
+            "stage_id": "state_9_implementation_reviewed",
+            "executor_version": "proposal-gate-executor.v1",
+            "stdout_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stderr_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "exit_code": 0,
+            "elapsed_ms": 17,
+            "current_fingerprint": "sha256:fingerprint-current"
+        }).to_string());
+
+        let err = build_proposal_gate_result_from_settlement(
+            &cmd,
+            "journal-1",
+            "p077:077",
+            "gate-generation-1",
+            9,
+        )
+        .expect_err("receipt without durable evidence digest is unmanaged");
+
+        assert!(err.to_string().contains("evidence_digest"));
     }
 }

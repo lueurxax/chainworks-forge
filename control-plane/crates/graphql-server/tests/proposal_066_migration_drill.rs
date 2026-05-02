@@ -7,7 +7,6 @@
 /// Phase 0 production-observable gate: §rollout.phases.phase_0_scaffold says:
 ///   "A migration drill with at least 10 legacy NULL rows and 10 post-migration
 ///    rows proves restart-time sentinel synthesis across GraphQL, MCP, and report surfaces."
-
 use std::sync::Arc;
 
 use async_graphql::Request;
@@ -63,6 +62,7 @@ fn make_run_record(run_id: RunId, idea_id: IdeaId) -> Run {
         drift_details_json: None,
         chainworks_meta_root: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     }
 }
 
@@ -275,9 +275,10 @@ async fn p066_migration_drill_legacy_rows_synthesize_sentinel() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
     assert!(
@@ -320,11 +321,7 @@ async fn p066_migration_drill_legacy_rows_synthesize_sentinel() {
             "legacy row {} must have policySource=synthesized_legacy",
             i
         );
-        assert_eq!(
-            diag["version"], 1,
-            "legacy row {} must have version=1",
-            i
-        );
+        assert_eq!(diag["version"], 1, "legacy row {} must have version=1", i);
     }
 }
 
@@ -350,9 +347,10 @@ async fn p066_migration_drill_post_migration_rows_expose_structured_data() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
     assert!(
@@ -414,7 +412,10 @@ async fn p066_migration_drill_post_migration_rows_expose_structured_data() {
                     i
                 );
             }
-            other => panic!("unexpected mapping state '{}' in post-migration row {}", other, i),
+            other => panic!(
+                "unexpected mapping state '{}' in post-migration row {}",
+                other, i
+            ),
         }
     }
 }
@@ -432,8 +433,7 @@ async fn p066_migration_drill_mixed_corpus_differentiates_legacy_from_post_migra
     const POST_COUNT: usize = 12;
 
     let pool = create_pool("sqlite::memory:").await.unwrap();
-    let (legacy_stage_id, post_stage_id) =
-        seed_drill_corpus(&pool, LEGACY_COUNT, POST_COUNT).await;
+    let (legacy_stage_id, post_stage_id) = seed_drill_corpus(&pool, LEGACY_COUNT, POST_COUNT).await;
 
     // Fresh schema instance — simulates daemon restart opening the same DB.
     let schema = build_test_schema(pool.clone());
@@ -447,7 +447,11 @@ async fn p066_migration_drill_mixed_corpus_differentiates_legacy_from_post_migra
     let legacy_resp = schema
         .execute(Request::new(legacy_query).data(principal.clone()))
         .await;
-    assert!(legacy_resp.errors.is_empty(), "errors: {:?}", legacy_resp.errors);
+    assert!(
+        legacy_resp.errors.is_empty(),
+        "errors: {:?}",
+        legacy_resp.errors
+    );
     let legacy_data = legacy_resp.data.into_json().unwrap();
     let legacy_execs = legacy_data["stage"]["executions"]
         .as_array()
@@ -461,14 +465,28 @@ async fn p066_migration_drill_mixed_corpus_differentiates_legacy_from_post_migra
     let post_resp = schema
         .execute(Request::new(post_query).data(principal))
         .await;
-    assert!(post_resp.errors.is_empty(), "errors: {:?}", post_resp.errors);
+    assert!(
+        post_resp.errors.is_empty(),
+        "errors: {:?}",
+        post_resp.errors
+    );
     let post_data = post_resp.data.into_json().unwrap();
     let post_execs = post_data["stage"]["executions"]
         .as_array()
         .expect("post-migration executions must be array");
 
-    assert_eq!(legacy_execs.len(), LEGACY_COUNT, "must have {} legacy rows", LEGACY_COUNT);
-    assert_eq!(post_execs.len(), POST_COUNT, "must have {} post-migration rows", POST_COUNT);
+    assert_eq!(
+        legacy_execs.len(),
+        LEGACY_COUNT,
+        "must have {} legacy rows",
+        LEGACY_COUNT
+    );
+    assert_eq!(
+        post_execs.len(),
+        POST_COUNT,
+        "must have {} post-migration rows",
+        POST_COUNT
+    );
 
     let legacy_with_synthesized = legacy_execs
         .iter()
@@ -481,9 +499,7 @@ async fn p066_migration_drill_mixed_corpus_differentiates_legacy_from_post_migra
 
     let post_with_runplan = post_execs
         .iter()
-        .filter(|e| {
-            e["actualToolchainMappingDiagnostics"]["policySource"] == "runplan_snapshot"
-        })
+        .filter(|e| e["actualToolchainMappingDiagnostics"]["policySource"] == "runplan_snapshot")
         .count();
 
     assert_eq!(

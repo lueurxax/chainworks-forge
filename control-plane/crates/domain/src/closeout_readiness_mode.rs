@@ -101,9 +101,7 @@ impl CloseoutReadinessModeResult {
     pub fn effective_mode(&self) -> CloseoutReadinessMode {
         match self {
             CloseoutReadinessModeResult::Known(mode) => mode.clone(),
-            CloseoutReadinessModeResult::LegacyFallbackAdvisory => {
-                CloseoutReadinessMode::Advisory
-            }
+            CloseoutReadinessModeResult::LegacyFallbackAdvisory => CloseoutReadinessMode::Advisory,
             CloseoutReadinessModeResult::Diagnostic(_) => CloseoutReadinessMode::Advisory,
         }
     }
@@ -241,9 +239,9 @@ mod tests {
 
     #[test]
     fn diagnostic_mode_resolves_to_advisory_for_effective_mode() {
-        let result = CloseoutReadinessModeResult::Diagnostic(CloseoutReadinessModeError::Malformed(
-            "test".into(),
-        ));
+        let result = CloseoutReadinessModeResult::Diagnostic(
+            CloseoutReadinessModeError::Malformed("test".into()),
+        );
         assert_eq!(result.effective_mode(), CloseoutReadinessMode::Advisory);
         assert!(result.is_diagnostic());
     }
