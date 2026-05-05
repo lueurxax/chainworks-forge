@@ -44,6 +44,7 @@ At the current baseline, the product includes:
 - worktree mutation barrier protecting concurrent read/write and orchestrated sync (Proposal 064),
 - run worktree main sync and cross-run knowledge capsules (Proposal 064 Phase 0 contract freeze),
 - implementation completeness and handoff contract with structured status and verification truth,
+- fail-closed server parity harness with generation-scoped storage and runtime publication (Proposal 041),
 - rejected implementation approval loopback to proposal refinement,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
 - Forge Steward system-health analysis,
@@ -73,6 +74,7 @@ Use these reference docs as the current source of truth:
 | Stop/cancel truth | [run-control.md](run-control.md) |
 | Idea-owned workspace root | [project-workspace-contract.md](project-workspace-contract.md) |
 | Idea archive/restore | [idea-lifecycle.md](idea-lifecycle.md) |
+| Parity harness | [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md) |
 | Workflow map | [live-workflow-map.md](live-workflow-map.md) |
 | Repo-backed full delivery | [full-mvp-delivery.md](full-mvp-delivery.md) |
 | MVP sign-off | [mvp-sign-off.md](mvp-sign-off.md) |

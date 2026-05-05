@@ -569,14 +569,16 @@ Scope:
 - P041 `GoldenRunFixture` inventory and schema validation
 - capture/regeneration lifecycle validation through `scripts/parity/capture-golden-run.sh --validate`
 - deterministic offline replay over every required P041 fixture
-- retained fixture replay databases under `control-plane/target/parity/{fixture_id}/parity.sqlite`
-- persisted `BehavioralDiffReport` generation under `control-plane/target/parity/reports/{fixture_id}/`
-- persisted `server-replay.json` generation under `control-plane/target/parity/{fixture_id}/`
+- per-fixture replay databases under `control-plane/target/parity/work/<generation_id>/<fixture_id>/parity.sqlite` (generation id comes from `P041_PUBLICATION_GENERATION_ID`, exported by the gate as `p041-<utc_iso>-<rand8>`; bare `cargo test` runs outside the gate use the sentinel `unscoped-fixture-replay`)
+- per-fixture `BehavioralDiffReport` under `control-plane/target/parity/reports/<generation_id>/<fixture_id>/behavioral-diff-report.json` and `server-replay.json` under `control-plane/target/parity/work/<generation_id>/<fixture_id>/`
+- per-fixture live-shadow reports under `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/live-shadow-report.json` (schema `live-shadow-report.v1`)
 - fixture-bound `surface_comparisons` for canonical state, projections, GraphQL readback, MCP report readback, artifact identity, and operator summary
-- fail-closed shadow side-effect policy for stubbed runtime/provider inputs, including correlated `mode=live_shadow` reports under `control-plane/target/parity/shadow/reports/{fixture_id}/`
+- fail-closed shadow side-effect policy for stubbed runtime/provider inputs
 - fixture-bound GraphQL run/stage/artifact/projection readback parity via `proposal_041_graphql_readback_parity_surfaces`
 - fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via P041-named tests
-- P031 handoff parity readiness is tracked through `docs/reference/p031-phase-0-artifact-manifest.json`; do not use obsolete proposal-local evidence paths.
+- runtime publication contract validation (row + detail schema agreement, provenance shape) at `control-plane/target/parity/publication/current/` plus generation-scoped staging at `control-plane/target/parity/publication/generations/<generation_id>/`; the gate computes the canonical status from fixture verdicts, provenance, and `parity-control` markers and promotes `ready_same_tree_verified` only when every fixture passes, the live tree is clean (`tree_clean == true` and `status_snapshot_line_count == 0`), and provenance is real (not the `test-run-no-git` sentinel)
+- `control-plane/target/parity-control/` is acquired by the gate driver before destructive work; `lease.json`, `current-step.json`, `release-marker.json`, and `reclaim-marker.json` are written via the same-directory temp-file + durable-flush + atomic-rename contract. The gate also refreshes `lease.json` (`heartbeat_unix_ms` plus monotonic `control_sequence`) between fixture-inventory, replay, shadow, readback, handoff, and runtime-publication phases, so the A1/A2 freshness-window successor reclaim path is exercisable end-to-end against the gate's own lease; `engine::parity_control` provides all marker types and the reclaim-decision matrix.
+- generation retention follows proposal §6.4: the gate prunes older non-manual generations oldest-first while preserving the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation; storage above 500 MB triggers a `[WARN]` listing preserved roots and sizes (warning only, never authorization to delete manual-recovery evidence)
 
 Use when:
 
@@ -589,7 +591,7 @@ Host policy:
 
 - local Rust toolchain required
 - no macOS UI target, simulator, daemon process, or live ACP/provider adapter required
-- offline replay runs in retained per-fixture SQLite databases and isolated temporary artifact roots
+- offline replay runs in per-fixture SQLite databases and temporary artifact roots
 
 Command:
 
@@ -600,8 +602,29 @@ Command:
 Important:
 
 - `p041` is accepted as an alias
-- the gate fails closed on missing fixtures, invalid schema, missing capture/regeneration provenance, missing executable frozen input references, missing fixture-bound surface comparisons, missing GraphQL/MCP collector owners, missing live-shadow correlation, blocking divergences, or missing P031 handoff evidence
-- the P031 handoff artifact is not a substitute for the gate; it is valid only when this gate passes on the same tree
+- the gate fails closed on missing fixtures, invalid schema, missing capture/regeneration provenance, missing executable frozen-input refs, missing fixture-bound surface comparisons, missing GraphQL/MCP collector owners, missing live-shadow correlation, or blocking divergences
+- the runtime publication contract test asserts row/detail schema-version equality, status equality, `publication_generation_id` equality, and canonical-path validation for `runtime_detail_path` / `reference_detail_path`; live `ready_same_tree_verified` promotion (with real provenance, clean tree, and live-checkout match) is wired and gated by `scripts/p031-thin-ui-gate.py validate_p041_parity_row`
+- the canonical P031 acceptance switch is the runtime row at `control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json`; the reference snapshot at `docs/reference/p031-p041-parity-evidence.json` is populated via `scripts/parity/promote-p041-reference.sh` after a successful gate run
+- the `p031-p041-parity-evidence.md` companion is explicitly **non-authoritative** and structurally non-normative.
+
+Status Vocabulary:
+
+| Status enum | Meaning | CLI Prefix |
+|---|---|---|
+| `ready_same_tree_verified` | Ready for P031 acceptance/promotion | `PASS` |
+| `blocked_manual_recovery` | Stale/ambiguous owner requires manual resolution | `FAIL` |
+| `blocked_missing_evidence` | Missing producer artifact | `FAIL` |
+| `blocked_divergence` | Behavioral regression in fixture/surface | `FAIL` |
+| `blocked_dirty_tree` | Rerun required on clean checkout | `WARN` |
+| `blocked_timeout` | Timed out; descendant absence not proven | `WARN` |
+| `blocked_interrupted` | Interrupted by operator | `WARN` |
+| `blocked_in_progress` | Rerun active; do not trust stale evidence | `INFO` |
+
+Summary Grid:
+
+- The gate renders a 7x6 matrix of fixtures by surfaces.
+- Grid tokens: `PASS`, `FAIL`, `MISS`, `SKIP`, `TIMEOUT`.
+- The CLI switches to a vertical narrow-terminal fallback if width is insufficient.
 
 ### `proposal-043|p043`
 
@@ -619,6 +642,25 @@ Use when:
 - changing GraphQL read projections or client consumption rules for the thin macOS client
 - updating the P031 consumption contract for read surfaces, freshness, or deferred UI states
 - reproving the P043 read-contract lane without touching UI or daemon lifecycle implementation
+
+Host policy:
+
+- local Rust toolchain required
+- no macOS UI target, simulator, daemon process, or live ACP/provider adapter required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-043
+```
+
+Important:
+
+- `p043` is accepted as an alias
+- the gate runs `cd control-plane && cargo test -p graphql-server proposal_043_ -- --nocapture` and then validates the reference contract from the repository root
+- the test slice covers projection-backed run/stage queries, explicit missing-projection `projectionLag` state, projection-enriched run/stage subscription payloads, `approvalResolved`, and operator-only V1 reads
+- it fails closed if the reference contract is missing, not `Implemented` / `Ready with Risks`, omits any required P043 surface, omits exact freshness budget rows, omits projection freshness field proof, omits subscription posture, omits freshness behavior limitations, or omits operator-only V1, projection parity, known holds, or cutover decision coverage
+- it is not enough for the GraphQL tests to pass; the reference contract must also validate on the same tree
 
 ### `proposal-031|p031`
 
@@ -726,26 +768,6 @@ Important:
 - `proposal-031` passing means the static/API/read-boundary contract is intact
 - `proposal-031-readiness` passing means P031 release/closeout evidence is no longer known-pending
 
-
-Host policy:
-
-- local Rust toolchain required
-- no macOS UI target, simulator, daemon process, or live ACP/provider adapter required
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-043
-```
-
-Important:
-
-- `p043` is accepted as an alias
-- the gate runs `cd control-plane && cargo test -p graphql-server proposal_043_ -- --nocapture` and then validates the reference contract from the repository root
-- the test slice covers projection-backed run/stage queries, explicit missing-projection `projectionLag` state, projection-enriched run/stage subscription payloads, `approvalResolved`, and operator-only V1 reads
-- it fails closed if the reference contract is missing, not `Implemented` / `Ready with Risks`, omits any required P043 surface, omits exact freshness budget rows, omits projection freshness field proof, omits subscription posture, omits freshness behavior limitations, or omits operator-only V1, projection parity, known holds, or cutover decision coverage
-- it is not enough for the GraphQL tests to pass; the reference contract must also validate on the same tree
-
 ### `proposal-044`
 
 Post-approval task execution and release gate completion gate.
@@ -812,7 +834,7 @@ Command:
 
 Important:
 
-- this gate is the canonical proof path for the proposal-047 control-plane workspace slice
+- this is the canonical proof path for the proposal-047 control-plane workspace slice
 - the runner also accepts the `p047` alias for parity with other proposal gates
 
 ### `proposal-029-mcp|p029-mcp`
@@ -845,7 +867,7 @@ Command:
 
 Important:
 
-- this gate is the canonical proof path for [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
+- this is the canonical proof path for [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
 - the runner also accepts the `p029-mcp` alias
 - the gate is distinct from `proposal-029|p029` (second-wave ACP runtime profiles); the two labels coexist
 - the gate enumerates a fixed focused inventory and grep-checks each `cargo test` output for a matching `test <name>` line, so rename/typo/delete fails the gate independently of the test body
@@ -949,6 +971,13 @@ Use when:
 Host policy:
 
 - local Rust toolchain required; no iOS/macOS simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-048
+```
+
 ### `proposal-049|p049`
 
 Steward analysis system gate for the Rust control-plane slice.
@@ -971,8 +1000,8 @@ Host policy:
 - executes in-process against the `control-plane/` workspace
 
 Command:
+
 ```bash
-./scripts/test-gate.sh proposal-048
 ./scripts/test-gate.sh proposal-049
 ```
 
@@ -1202,7 +1231,6 @@ Prerequisite posture:
 - P037 control-plane evidence bucket: P057 consumes the failed/partial ACP execution settlement prerequisite through its own Rust engine degraded-output tests instead of invoking the broader Xcode-backed `proposal-037` gate.
 - Same-tree composed gates: `proposal-043` and `proposal-050` run before P057-local assertions.
 - P057 prerequisite: the implementation-completeness handoff contract is now stable reference truth in [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff), and `proposal-054|p054` is retained as the reproducible gate alias for that implemented contract. If P057 changes implementation self-assessment or handoff transition semantics, compose the retained `proposal-054` gate or document the accepted schema delta in this gate reference.
-- P057 prerequisite waiver: P056, dated 2026-04-19. No registered `proposal-056` gate exists on this tree. The canonical artifact-contract implementation keeps new artifact contract and override payloads in typed domain/db/engine modules and proves that slice locally; compose `proposal-056` here when it is registered. Rollback/hold rule: if P056 registers a module-boundary gate that changes artifact contract ownership, pause canonical artifact-contract closure until the P056 gate is same-tree green or this waiver names the accepted boundary delta.
 
 Important:
 
@@ -1267,6 +1295,81 @@ Important:
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
 - the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
 
+### `proposal-061|p061`
+
+SQLite write serialization and executor backpressure gate.
+
+The `proposal-061|p061` names are retained historical aliases for the implemented
+SQLite write-serialization, scheduler-backpressure, host-interruption, and
+generated-state housekeeping contract documented in
+[`rust-control-plane.md`](rust-control-plane.md).
+
+Scope:
+
+- `InvokeAgentCapacityConfig` defaults and provider alias normalization
+- Capacity accounting for global, provider, and per-run caps
+- Capacity-aware claim/start leaves blocked work pending and does not create agent_executions
+- Fair scheduler selection via `scheduler_service_state` durable least-recently-served state
+- Hot-index-backed pending InvokeAgent scans and active-count queries with EXPLAIN/query-plan assertions
+- ApproveStage, RetryStage, and CancelRun p95 command latency below 2 seconds under 20 active fake agents
+- Retry/Startup-repair transaction boundaries, atomic supersession, and requeue through capacity gates
+- Projection freshness, zero-count cleanup, all-blocked scan updates, and stale readback markers for scheduler summaries
+- GraphQL and MCP parity for `schedulerHealthSummary` and queue summaries
+- Sustained-backpressure subscription/MCP notification fire and clear behavior
+- Simulated host sleep/wake and network migration classification, process cleanup, jittered retry under caps, and quota exemption
+- DB contention instrumentation in runtime health logs and projections
+- Generated-state housekeeping safety for active/blocked run outputs, managed worktree targets, source files, run artifacts, SQLite database files, stale ACP homes, and unmanaged worktrees
+
+Use when:
+
+- changing scheduler capacity, fairness, or backpressure logic
+- changing SQLite transaction boundaries or write coordination for operator commands
+- changing host-interruption detection, classification, or recovery
+- changing scheduler-health or queue-summary readback surfaces
+
+Host policy:
+
+- local Rust toolchain required
+- no live provider account, Xcode, simulator, daemon process, UI target, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-061
+```
+
+Important:
+
+- `p061` is accepted as an alias
+- the gate asserts p95 command latency under load; ensure the local host is not under extreme unrelated CPU pressure
+- query-plan assertions prove that scheduler scans do not regress to full table scans at fixture scale
+- host-interruption retries must be exempt from provider quota retry budget
+- the gate fails closed if capacity gates, fair selection, p95 latency, atomic supersession, projection parity, backpressure notifications, or host-interruption classification evidence is missing
+
+### `proposal-064|p064`
+
+P064 Phase 0 main-sync and cross-run knowledge readback contract gate.
+
+Scope:
+
+- P064 Phase 0 dogfood baseline artifact and kickoff record are present and schema-versioned
+- migration `033_p064_main_sync_and_knowledge_capsules.sql` freezes main-sync, barrier, knowledge-capsule, work-item, and background-lease storage contracts
+- `domain::main_sync` enum/value contracts round-trip
+- MCP main-sync and knowledge-capsule tools remain registered as capability ids but hidden while runtime modes are off
+- GraphQL exposes projection-backed JSON readback for main-sync status, accepted/pending command state, barriers, active consumers, and knowledge-capsule attachments
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-064
+```
+
+Important:
+
+- `p064` is accepted as an alias
+- this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
+- later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
+
 ### `proposal-065|p065`
 
 Operator retry instruction contract gate.
@@ -1293,6 +1396,7 @@ Host policy:
 - local Rust toolchain required; no UI target or simulator needed
 
 Command:
+
 ```bash
 ./scripts/test-gate.sh proposal-065
 ```
@@ -1487,183 +1591,3 @@ Running them all on every edit burns time and makes failures harder to interpret
 - [agent-ui-test-execution.md](agent-ui-test-execution.md)
 - [provider-platform.md](provider-platform.md)
 - [operator-experience.md](operator-experience.md)
-
-### `proposal-057|p057`
-
-Historical proposal gate for the implemented canonical artifact contracts and run-state
-projection contract. The proposal document has been retired after implementation; the
-gate name remains stable because tests, scripts, and historical proof records use that
-identifier.
-
-Scope:
-
-- typed artifact contract status normalization for machine-consumed reports
-- active-index SQLite owner and exported `active-index.json` projection semantics
-- generated run-state projection from DB truth plus active contracts
-- degraded output policy default-deny / explicit-allow contract
-- typed operator overrides with capability-gated MCP ownership
-- GraphQL/MCP readback parity for canonical artifact statuses, override truth, and projection warnings
-
-Use when:
-
-- changing transition evaluation for artifact status fields
-- changing artifact import, supersession, active contract pointers, or run-state projection
-- changing canonical artifact override command/readback behavior
-- changing degraded partial-output settlement policy
-
-Host policy:
-
-- local Rust toolchain required
-- control-plane-only Rust evidence; this gate must not invoke Xcode or Swift test plans
-- no simulator, daemon process, UI target, or network required
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-057
-```
-
-Prerequisite posture:
-
-- P037 control-plane evidence bucket: P057 consumes the failed/partial ACP execution settlement prerequisite through its own Rust engine degraded-output tests instead of invoking the broader Xcode-backed `proposal-037` gate.
-- Same-tree composed gates: `proposal-043` and `proposal-050` run before P057-local assertions.
-- P057 prerequisite: the implementation-completeness handoff contract is now stable reference truth in [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff), and `proposal-054|p054` is retained as the reproducible gate alias for that implemented contract. If P057 changes implementation self-assessment or handoff transition semantics, compose the retained `proposal-054` gate or document the accepted schema delta in this gate reference.
-- P057 prerequisite waiver: P056, dated 2026-04-19. No registered `proposal-056` gate exists on this tree. The canonical artifact-contract implementation keeps new artifact contract and override payloads in typed domain/db/engine modules and proves that slice locally; compose `proposal-056` here when it is registered. Rollback/hold rule: if P056 registers a module-boundary gate that changes artifact contract ownership, pause canonical artifact-contract closure until the P056 gate is same-tree green or this waiver names the accepted boundary delta.
-
-Important:
-
-- `p057` is accepted as an alias
-- the active artifact index is canonical in SQLite; `active-index.json` is only an exported projection and stale/partial exports must never drive transition truth
-- degraded partial-output settlement is denied by default and requires explicit compiled stage policy before `valid_outputs_from_failed_execution` can satisfy transitions
-- typed operator overrides are separate from raw report files, require operator capability, write command journal evidence, expire at `expires_at_stage`, and remain visible in readback after expiry
-- the gate fails closed if canonical status normalization, active-index SQLite ownership, stale export rebuild, raw artifact fallback denial, degraded policy, typed overrides, or GraphQL/MCP readback parity evidence is missing
-
-### `proposal-058|p058`
-
-Implemented regression gate for ACP provider failure classification and session artifact ownership.
-
-The original proposal document has been retired after implementation. The gate name
-remains `proposal-058` because the Rust test targets and historical proof lane use that
-identifier.
-
-Scope:
-
-- typed `AgentFailureKind`, `AgentOutputSettlement`, runtime facts, and operator action hints
-- typed ACP/P037/P045/P051/P057 failure-observation classification matrix coverage
-- runtime failure redaction fixtures and P045 recovery-action mapping from P058 runtime facts
-- durable `agent_execution_runtime_facts` read/write behavior
-- artifact source-generation claims, including `superseded_pending_retry`
-- `InvokeAgent` claim/start ownership: generic work-queue claim skips `InvokeAgent`, while the engine-owned start transaction pre-creates exactly one `agent_executions` row and matching source-generation claim
-- retry enqueue-to-claim late-output rejection and source-generation CAS behavior
-- GraphQL/MCP runtime-facts parity and artifact source provenance
-- no-secret redacted runtime failure readback
-
-Use when:
-
-- changing ACP provider/transport error classification
-- changing executor output validation settlement or degraded output behavior
-- changing session reuse, retry supersession, or late-output handling
-- changing artifact active-index source provenance
-- changing GraphQL or MCP execution truth readback
-
-Host policy:
-
-- local Rust toolchain required
-- no live provider account, Xcode, simulator, daemon process, UI target, network, or real quota exhaustion required
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-058
-```
-
-Prerequisite posture:
-
-- Same-tree dependency evidence: P058 consumes P037 timeout semantics, P045 recovery/retry semantics, P051 Xcode MCP observations, and canonical artifact contracts.
-- The focused P058 gate uses fixture/fake transport coverage for those consumed seams rather than requiring live provider, live Xcode, or UI evidence.
-
-Important:
-
-- `p058` is accepted as an alias
-- runtime facts are durable typed execution truth, not log parsing
-- `InvokeAgent` provider startup must use the pre-created execution identity from the claim/start DTO; creating a second execution row after the claim boundary is a gate failure
-- P058 claim/start tests must run; compiling them with `--no-run` is not sufficient proof
-- DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
-- `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
-- stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
-- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
-
-### `proposal-061|p061`
-
-SQLite write serialization and executor backpressure gate.
-
-The `proposal-061|p061` names are retained historical aliases for the implemented
-SQLite write-serialization, scheduler-backpressure, host-interruption, and
-generated-state housekeeping contract documented in
-[`rust-control-plane.md`](rust-control-plane.md).
-
-Scope:
-
-- `InvokeAgentCapacityConfig` defaults and provider alias normalization
-- Capacity accounting for global, provider, and per-run caps
-- Capacity-aware claim/start leaves blocked work pending and does not create agent_executions
-- Fair scheduler selection via `scheduler_service_state` durable least-recently-served state
-- Hot-index-backed pending InvokeAgent scans and active-count queries with EXPLAIN/query-plan assertions
-- ApproveStage, RetryStage, and CancelRun p95 command latency below 2 seconds under 20 active fake agents
-- Retry/Startup-repair transaction boundaries, atomic supersession, and requeue through capacity gates
-- Projection freshness, zero-count cleanup, all-blocked scan updates, and stale readback markers for scheduler summaries
-- GraphQL and MCP parity for `schedulerHealthSummary` and queue summaries
-- Sustained-backpressure subscription/MCP notification fire and clear behavior
-- Simulated host sleep/wake and network migration classification, process cleanup, jittered retry under caps, and quota exemption
-- DB contention instrumentation in runtime health logs and projections
-- Generated-state housekeeping safety for active/blocked run outputs, managed worktree targets, source files, run artifacts, SQLite database files, stale ACP homes, and unmanaged worktrees
-
-Use when:
-
-- changing scheduler capacity, fairness, or backpressure logic
-- changing SQLite transaction boundaries or write coordination for operator commands
-- changing host-interruption detection, classification, or recovery
-- changing scheduler-health or queue-summary readback surfaces
-
-Host policy:
-
-- local Rust toolchain required
-- no live provider account, Xcode, simulator, daemon process, UI target, or network required
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-061
-```
-
-Important:
-
-- `p061` is accepted as an alias
-- the gate asserts p95 command latency under load; ensure the local host is not under extreme unrelated CPU pressure
-- query-plan assertions prove that scheduler scans do not regress to full table scans at fixture scale
-- host-interruption retries must be exempt from provider quota retry budget
-- the gate fails closed if capacity gates, fair selection, p95 latency, atomic supersession, projection parity, backpressure notifications, or host-interruption classification evidence is missing
-
-### `proposal-064|p064`
-
-P064 Phase 0 main-sync and cross-run knowledge readback contract gate.
-
-Scope:
-
-- P064 Phase 0 dogfood baseline artifact and kickoff record are present and schema-versioned
-- migration `033_p064_main_sync_and_knowledge_capsules.sql` freezes main-sync, barrier, knowledge-capsule, work-item, and background-lease storage contracts
-- `domain::main_sync` enum/value contracts round-trip
-- MCP main-sync and knowledge-capsule tools remain registered as capability ids but hidden while runtime modes are off
-- GraphQL exposes projection-backed JSON readback for main-sync status, accepted/pending command state, barriers, active consumers, and knowledge-capsule attachments
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-064
-```
-
-Important:
-
-- `p064` is accepted as an alias
-- this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
-- later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection

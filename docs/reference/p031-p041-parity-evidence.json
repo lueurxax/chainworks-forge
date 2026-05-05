@@ -1,0 +1,45 @@
+{
+  "schema_version": "p031-p041-parity-evidence.v1",
+  "overall_status": "blocked_missing_evidence",
+  "publication_generation_id": "reference-snapshot",
+  "publication_state": "reference_snapshot",
+  "required_fixtures": [
+    "proposal-loop-basic",
+    "implementation-refine-review",
+    "approval-pause-resume",
+    "retry-recovery-flow",
+    "cancelled-or-blocked-run",
+    "terminal-report-evidence",
+    "projection-readback-surface"
+  ],
+  "required_surfaces": [
+    "canonical_domain_state",
+    "projections",
+    "graphql_readback",
+    "mcp_report_readback",
+    "artifact_identity",
+    "operator_summary"
+  ],
+  "fixtures": [],
+  "blocking_reasons": [
+    "reference_snapshot_not_yet_populated_from_live_run"
+  ],
+  "missing_evidence": [
+    {
+      "missing_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+      "expected_producer": "scripts/test-gate.sh proposal-041",
+      "affected_fixture_or_surface": "all_fixtures",
+      "next_action": "run './scripts/test-gate.sh proposal-041' on a clean tree to populate the runtime artifact, then run scripts/parity/promote-p041-reference.sh to promote it here"
+    }
+  ],
+  "provenance": {
+    "commit_sha": "reference-snapshot",
+    "tree_id": "reference-snapshot",
+    "tree_clean": false,
+    "status_snapshot_sha256": "reference-snapshot",
+    "status_snapshot_line_count": 1,
+    "generated_at": "2026-04-30T00:00:00Z",
+    "gate": "./scripts/test-gate.sh proposal-041"
+  },
+  "_note": "This is a promoted reference snapshot schema skeleton. Populated via scripts/parity/promote-p041-reference.sh after a successful gate run produces ready_same_tree_verified runtime evidence. The authoritative runtime artifact lives at control-plane/target/parity/publication/current/p031-p041-parity-evidence.json."
+}

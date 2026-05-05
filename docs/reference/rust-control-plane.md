@@ -10,6 +10,7 @@ Related stable docs:
 - [runtime-contract.md](runtime-contract.md)
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md)
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
+- [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md)
 - [test-gates.md](test-gates.md)
 
 ## Purpose
@@ -38,7 +39,7 @@ This reference covers:
 - the work queue and recovery service
 - daemon startup and configuration
 
-It does not cover the SwiftUI operator shell, the thin-client cutover (P031), or the parity harness (P041).
+It does not cover the SwiftUI operator shell or the thin-client cutover (P031). The parity harness (P041) is a specialized engine extension described in [test-gates.md](test-gates.md) and [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md).
 
 ## Architecture
 
@@ -724,7 +725,6 @@ The retained gate aliases are operational:
 The following items are explicitly out of scope for this baseline:
 
 - **Thin-client cutover** -- authority transfer from client to daemon (P031).
-- **Parity harness** -- golden-run comparison and behavioral diff tooling (P041).
 - **Thin-client UI cutover** -- P043 finalized the GraphQL projection read contract, but user-visible macOS cutover remains owned by P031.
 - **Northbound MCP command plane** -- full external command surface (P029).
 - **Multi-host or distributed deployment** -- no remote workflow platformization.

@@ -1780,15 +1780,42 @@ mod tests {
     fn p041_report_path(fixture_id: &str) -> PathBuf {
         control_plane_root()
             .join("target/parity/reports")
+            .join(p041_generation_id())
             .join(fixture_id)
             .join("behavioral-diff-report.json")
     }
 
     fn p041_replay_path(fixture_id: &str) -> PathBuf {
         control_plane_root()
-            .join("target/parity")
+            .join("target/parity/work")
+            .join(p041_generation_id())
             .join(fixture_id)
             .join("server-replay.json")
+    }
+
+    fn p041_generation_id() -> String {
+        let generation_id = std::env::var("P041_PUBLICATION_GENERATION_ID")
+            .unwrap_or_else(|_| "unscoped-fixture-replay".to_string());
+        assert_safe_p041_generation_id(&generation_id);
+        generation_id
+    }
+
+    fn assert_safe_p041_generation_id(raw: &str) {
+        if raw == "unscoped-fixture-replay" {
+            return;
+        }
+        let valid_prefix = raw.starts_with("p041-");
+        let valid_chars = raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | 'T' | 'Z'));
+        assert!(
+            valid_prefix
+                && valid_chars
+                && !raw.contains("..")
+                && !raw.contains('/')
+                && !raw.contains('\\'),
+            "P041_PUBLICATION_GENERATION_ID must be a safe path segment"
+        );
     }
 
     fn read_json(path: &Path) -> serde_json::Value {
@@ -1815,12 +1842,17 @@ mod tests {
         tool_value: serde_json::Value,
         resource_value: serde_json::Value,
     ) -> serde_json::Value {
+        // P041 §6.5: exclude mcp_execution_truth (runtime-only) and
+        // canonical_artifact_contracts (P057 system projection, not in golden fixtures).
         let tool_reports = tool_value
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .filter(|report| report["report_kind"] != serde_json::json!("mcp_execution_truth"))
+            .filter(|report| {
+                report["report_kind"] != serde_json::json!("canonical_artifact_contracts")
+            })
             .map(|report| {
                 serde_json::json!({
                     "kind": report["report_kind"],
@@ -1863,6 +1895,8 @@ mod tests {
             .filter(|artifact| {
                 !artifact["report_kind"].is_null()
                     && artifact["report_kind"] != serde_json::json!("mcp_execution_truth")
+                    && artifact["report_kind"]
+                        != serde_json::json!("canonical_artifact_contracts")
             })
             .filter_map(|artifact| artifact["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();

@@ -322,6 +322,94 @@ impl QueryRoot {
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
     }
 
+    /// P041 §6.5: Work-queue counts for all items associated with a run.
+    async fn run_queue_summary(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlRunQueueSummary> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let run_id_str = run_id.as_str();
+        let rows = sqlx::query(
+            r#"SELECT status, COUNT(*) AS cnt FROM work_items WHERE run_id = ?1 GROUP BY status"#,
+        )
+        .bind(run_id_str)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+        let mut pending = 0i64;
+        let mut running = 0i64;
+        let mut completed = 0i64;
+        let mut failed = 0i64;
+        let mut cancelled = 0i64;
+        for row in &rows {
+            let status: String = row.get("status");
+            let cnt: i64 = row.get("cnt");
+            match status.as_str() {
+                "pending" => pending = cnt,
+                "running" => running = cnt,
+                "completed" => completed = cnt,
+                "failed" => failed = cnt,
+                "cancelled" => cancelled = cnt,
+                _ => {}
+            }
+        }
+        Ok(GqlRunQueueSummary {
+            run_id: run_id.clone(),
+            pending,
+            running,
+            completed,
+            failed,
+            cancelled,
+            total: pending + running + completed + failed + cancelled,
+        })
+    }
+
+    /// P041 §6.5: Work-queue counts for all items associated with a stage execution.
+    async fn stage_queue_summary(
+        &self,
+        ctx: &Context<'_>,
+        stage_execution_id: ID,
+    ) -> Result<GqlStageQueueSummary> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let stage_id_str = stage_execution_id.as_str();
+        let rows = sqlx::query(
+            r#"SELECT status, COUNT(*) AS cnt FROM work_items WHERE stage_id = ?1 GROUP BY status"#,
+        )
+        .bind(stage_id_str)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+        let mut pending = 0i64;
+        let mut running = 0i64;
+        let mut completed = 0i64;
+        let mut failed = 0i64;
+        let mut cancelled = 0i64;
+        for row in &rows {
+            let status: String = row.get("status");
+            let cnt: i64 = row.get("cnt");
+            match status.as_str() {
+                "pending" => pending = cnt,
+                "running" => running = cnt,
+                "completed" => completed = cnt,
+                "failed" => failed = cnt,
+                "cancelled" => cancelled = cnt,
+                _ => {}
+            }
+        }
+        Ok(GqlStageQueueSummary {
+            stage_execution_id: stage_execution_id.clone(),
+            pending,
+            running,
+            completed,
+            failed,
+            cancelled,
+            total: pending + running + completed + failed + cancelled,
+        })
+    }
+
     async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
@@ -613,6 +701,30 @@ impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
             backup_path: r.backup_path,
         }
     }
+}
+
+/// P041 §6.5: Run-level work-queue summary for `runQueueSummary(runId:)`.
+#[derive(SimpleObject, Clone)]
+pub struct GqlRunQueueSummary {
+    pub run_id: ID,
+    pub pending: i64,
+    pub running: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    pub total: i64,
+}
+
+/// P041 §6.5: Stage-level work-queue summary for `stageQueueSummary(stageExecutionId:)`.
+#[derive(SimpleObject, Clone)]
+pub struct GqlStageQueueSummary {
+    pub stage_execution_id: ID,
+    pub pending: i64,
+    pub running: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    pub total: i64,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -5027,7 +5139,8 @@ mod tests {
     async fn proposal_041_graphql_readback_parity_surfaces() {
         for fixture_id in P041_FIXTURES {
             // The engine crate's `proposal_041_parity.rs` integration
-            // test produces `target/parity/reports/<fixture_id>/behavioral-diff-report.json`
+            // test produces
+            // `target/parity/reports/<generation>/<fixture_id>/behavioral-diff-report.json`
             // + the SQLite DB at the path that report's `database_ref`
             // points to. Under `cargo test --workspace` the engine
             // integration binary and this graphql-server lib binary
@@ -5057,6 +5170,13 @@ mod tests {
             let idea_id = replay["run_projection"]["idea_id"]
                 .as_str()
                 .expect("idea_id");
+            // P041 §6.5: stageQueueSummary requires a stage execution ID;
+            // use the first stage from the replay's stage_projection.
+            let first_stage_exec_id = replay["stage_projection"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|s| s["id"].as_str())
+                .unwrap_or("");
             let db_path =
                 workspace_root().join(report["database_ref"].as_str().expect("database_ref"));
             if !db_path.is_file() {
@@ -5078,8 +5198,9 @@ mod tests {
                 test_reporter(),
             );
             let response = schema
-                .execute(Request::new(format!(
-                    r#"
+                .execute(
+                    Request::new(format!(
+                        r#"
                     query P041FixtureReadback {{
                       run(id: "{run_id}") {{
                         id
@@ -5103,16 +5224,36 @@ mod tests {
                         contractId
                         reportKind
                       }}
+                      runQueueSummary(runId: "{run_id}") {{
+                        runId
+                        pending
+                        running
+                        completed
+                        failed
+                        cancelled
+                        total
+                      }}
+                      stageQueueSummary(stageExecutionId: "{first_stage_exec_id}") {{
+                        stageExecutionId
+                        pending
+                        running
+                        completed
+                        failed
+                        cancelled
+                        total
+                      }}
                     }}
                     "#
-                )))
+                    ))
+                    .data(test_principal()),
+                )
                 .await;
             assert!(
                 response.errors.is_empty(),
                 "P041 GraphQL fixture readback query must succeed for {fixture_id}: {response:?}"
             );
             let data = response.data.into_json().unwrap();
-            let actual = normalize_p041_graphql_actual(data, run_id);
+            let actual = normalize_p041_graphql_actual(data, run_id, first_stage_exec_id);
             update_p041_surface(
                 &mut report,
                 "graphql_readback",
@@ -5143,15 +5284,42 @@ mod tests {
     fn p041_report_path(fixture_id: &str) -> PathBuf {
         control_plane_root()
             .join("target/parity/reports")
+            .join(p041_generation_id())
             .join(fixture_id)
             .join("behavioral-diff-report.json")
     }
 
     fn p041_replay_path(fixture_id: &str) -> PathBuf {
         control_plane_root()
-            .join("target/parity")
+            .join("target/parity/work")
+            .join(p041_generation_id())
             .join(fixture_id)
             .join("server-replay.json")
+    }
+
+    fn p041_generation_id() -> String {
+        let generation_id = std::env::var("P041_PUBLICATION_GENERATION_ID")
+            .unwrap_or_else(|_| "unscoped-fixture-replay".to_string());
+        assert_safe_p041_generation_id(&generation_id);
+        generation_id
+    }
+
+    fn assert_safe_p041_generation_id(raw: &str) {
+        if raw == "unscoped-fixture-replay" {
+            return;
+        }
+        let valid_prefix = raw.starts_with("p041-");
+        let valid_chars = raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | 'T' | 'Z'));
+        assert!(
+            valid_prefix
+                && valid_chars
+                && !raw.contains("..")
+                && !raw.contains('/')
+                && !raw.contains('\\'),
+            "P041_PUBLICATION_GENERATION_ID must be a safe path segment"
+        );
     }
 
     fn read_json(path: &Path) -> serde_json::Value {
@@ -5174,7 +5342,11 @@ mod tests {
         .expect("write P041 report");
     }
 
-    fn normalize_p041_graphql_actual(data: serde_json::Value, run_id: &str) -> serde_json::Value {
+    fn normalize_p041_graphql_actual(
+        data: serde_json::Value,
+        run_id: &str,
+        first_stage_exec_id: &str,
+    ) -> serde_json::Value {
         let mut stages = data["stages"]
             .as_array()
             .cloned()
@@ -5194,11 +5366,19 @@ mod tests {
                 .unwrap_or_default()
                 .cmp(right["stage_id"].as_str().unwrap_or_default())
         });
+        // P041 §6.5: exclude P057 system projection exports (active-index.json,
+        // run-state.json) which are supplemental infrastructure artifacts that
+        // post-date the golden fixtures and are not agent-produced outputs.
+        const P057_SYSTEM_ARTIFACTS: &[&str] = &["active-index.json", "run-state.json"];
         let mut artifacts = data["artifacts"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .filter(|artifact| {
+                !P057_SYSTEM_ARTIFACTS
+                    .contains(&artifact["name"].as_str().unwrap_or_default())
+            })
             .map(|artifact| {
                 serde_json::json!({
                     "name": artifact["name"],
@@ -5212,6 +5392,25 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .cmp(right["name"].as_str().unwrap_or_default())
+        });
+        // P041 §6.5: normalize queue summaries — only compare active (pending/running)
+        // counts so the comparison is fixture-independent (exact completed totals vary
+        // per-fixture but active counts must be zero for any terminal run).
+        let run_qs = &data["runQueueSummary"];
+        let normalized_run_queue_summary = serde_json::json!({
+            "run_id": "$run_id",
+            "pending": run_qs["pending"],
+            "running": run_qs["running"],
+        });
+        let stage_qs = &data["stageQueueSummary"];
+        let normalized_stage_queue_summary = serde_json::json!({
+            "stage_execution_id": if first_stage_exec_id.is_empty() {
+                serde_json::json!("$first_stage_id")
+            } else {
+                serde_json::json!("$first_stage_id")
+            },
+            "pending": stage_qs["pending"],
+            "running": stage_qs["running"],
         });
         serde_json::json!({
             "collector_owner": "graphql-server::schema::build_schema",
@@ -5232,6 +5431,8 @@ mod tests {
             }).collect::<Vec<_>>(),
             "stages": stages,
             "artifacts": artifacts,
+            "run_queue_summary": normalized_run_queue_summary,
+            "stage_queue_summary": normalized_stage_queue_summary,
         })
     }
 
