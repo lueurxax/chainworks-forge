@@ -365,11 +365,11 @@ struct DaemonClientEndpoint: Sendable, Equatable {
     var baseURL: URL
     var bearerToken: String
 
-    var graphqlURL: URL {
+    nonisolated var graphqlURL: URL {
         baseURL.appendingPathComponent("graphql", isDirectory: false)
     }
 
-    var graphqlWSURL: URL {
+    nonisolated var graphqlWSURL: URL {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
         components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
         components.path = "/graphql/ws"

@@ -428,7 +428,7 @@ protocol P031GraphQLReadTransport: Sendable {
 }
 
 protocol P031GraphQLSubscriptionTransport: Sendable {
-  func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error>
+  nonisolated func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error>
 }
 
 enum P031GraphQLWebSocketFrameAction: Equatable, Sendable {
@@ -549,7 +549,7 @@ struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable
 struct P031GraphQLSubscriptionClient<Transport: P031GraphQLSubscriptionTransport>: Sendable {
   let transport: Transport
 
-  func subscribe(
+  nonisolated func subscribe(
     operationName: String,
     document: String,
     variables: [String: P031GraphQLVariableValue] = [:]
@@ -565,7 +565,7 @@ struct P031GraphQLSubscriptionClient<Transport: P031GraphQLSubscriptionTransport
     return transport.subscribe(request)
   }
 
-  func subscribe<Payload: Decodable>(
+  nonisolated func subscribe<Payload: Decodable>(
     _ payloadType: Payload.Type,
     operationName: String,
     document: String,
@@ -654,7 +654,7 @@ struct P031URLSessionGraphQLSubscriptionTransport: P031GraphQLSubscriptionTransp
     self.urlSession = urlSession
   }
 
-  func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error> {
+  nonisolated func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error> {
     let socket = urlSession.webSocketTask(with: Self.subscribeRequest(for: endpoint))
     return AsyncThrowingStream { continuation in
       let task = Task {
@@ -672,7 +672,7 @@ struct P031URLSessionGraphQLSubscriptionTransport: P031GraphQLSubscriptionTransp
     }
   }
 
-  static func subscribeRequest(for endpoint: DaemonClientEndpoint) -> URLRequest {
+  nonisolated static func subscribeRequest(for endpoint: DaemonClientEndpoint) -> URLRequest {
     var request = URLRequest(url: endpoint.graphqlWSURL)
     request.setValue("graphql-transport-ws", forHTTPHeaderField: "Sec-WebSocket-Protocol")
     return request
@@ -809,17 +809,17 @@ extension URLSessionWebSocketTask.Message {
   }
 }
 
-private struct P031GraphQLResponseEnvelope<Payload: Decodable>: Decodable {
+nonisolated private struct P031GraphQLResponseEnvelope<Payload: Decodable>: Decodable {
   let data: Payload?
   let errors: [P031GraphQLResponseError]?
 }
 
-private struct P031GraphQLResponseError: Decodable {
+nonisolated private struct P031GraphQLResponseError: Decodable {
   let message: String
 }
 
 enum P031GraphQLResponseDecoder {
-  static func decode<Payload: Decodable>(
+  nonisolated static func decode<Payload: Decodable>(
     _ payloadType: Payload.Type,
     from data: Data,
     operationName: String
@@ -2322,15 +2322,15 @@ struct P031GraphQLWorkflowReadStore<
     let daemonStatus: DaemonStatusJSONPayload
   }
 
-  private struct RunStatusChangedPayload: Decodable {
+  nonisolated private struct RunStatusChangedPayload: Decodable {
     let runStatusChanged: P031RunStatusChangedReadModel
   }
 
-  private struct DaemonStatusChangedPayload: Decodable {
+  nonisolated private struct DaemonStatusChangedPayload: Decodable {
     let daemonStatusChanged: DaemonStatusJSONPayload
   }
 
-  private struct DaemonStatusJSONPayload: Decodable {
+  nonisolated private struct DaemonStatusJSONPayload: Decodable {
     let json: String
   }
 }
