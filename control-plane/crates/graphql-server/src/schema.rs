@@ -322,7 +322,7 @@ impl QueryRoot {
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
     }
 
-    /// P041 §6.5: Work-queue counts for all items associated with a run.
+    /// Work-queue counts for all items associated with a run.
     async fn run_queue_summary(&self, ctx: &Context<'_>, run_id: ID) -> Result<GqlRunQueueSummary> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
@@ -362,7 +362,7 @@ impl QueryRoot {
         })
     }
 
-    /// P041 §6.5: Work-queue counts for all items associated with a stage execution.
+    /// Work-queue counts for all items associated with a stage execution.
     async fn stage_queue_summary(
         &self,
         ctx: &Context<'_>,
@@ -699,7 +699,7 @@ impl From<domain::lifecycle::FailureReason> for GqlFailureReason {
     }
 }
 
-/// P041 §6.5: Run-level work-queue summary for `runQueueSummary(runId:)`.
+/// Run-level work-queue summary for `runQueueSummary(runId:)`.
 #[derive(SimpleObject, Clone)]
 pub struct GqlRunQueueSummary {
     pub run_id: ID,
@@ -711,7 +711,7 @@ pub struct GqlRunQueueSummary {
     pub total: i64,
 }
 
-/// P041 §6.5: Stage-level work-queue summary for `stageQueueSummary(stageExecutionId:)`.
+/// Stage-level work-queue summary for `stageQueueSummary(stageExecutionId:)`.
 #[derive(SimpleObject, Clone)]
 pub struct GqlStageQueueSummary {
     pub stage_execution_id: ID,
@@ -5183,8 +5183,8 @@ mod tests {
             let idea_id = replay["run_projection"]["idea_id"]
                 .as_str()
                 .expect("idea_id");
-            // P041 §6.5: stageQueueSummary requires a stage execution ID;
-            // use the first stage from the replay's stage_projection.
+            // stageQueueSummary requires a stage execution ID; use the first
+            // stage from the replay's stage_projection.
             let first_stage_exec_id = replay["stage_projection"]
                 .as_array()
                 .and_then(|arr| arr.first())
@@ -5379,8 +5379,8 @@ mod tests {
                 .unwrap_or_default()
                 .cmp(right["stage_id"].as_str().unwrap_or_default())
         });
-        // P041 §6.5: exclude P057 system projection exports (active-index.json,
-        // run-state.json) which are supplemental infrastructure artifacts that
+        // Exclude P057 system projection exports (active-index.json,
+        // run-state.json). They are supplemental infrastructure artifacts that
         // post-date the golden fixtures and are not agent-produced outputs.
         const P057_SYSTEM_ARTIFACTS: &[&str] = &["active-index.json", "run-state.json"];
         let mut artifacts = data["artifacts"]
@@ -5405,9 +5405,9 @@ mod tests {
                 .unwrap_or_default()
                 .cmp(right["name"].as_str().unwrap_or_default())
         });
-        // P041 §6.5: normalize queue summaries — only compare active (pending/running)
-        // counts so the comparison is fixture-independent (exact completed totals vary
-        // per-fixture but active counts must be zero for any terminal run).
+        // Normalize queue summaries by comparing only active (pending/running)
+        // counts. Exact completed totals vary by fixture, but active counts must
+        // be zero for any terminal run.
         let run_qs = &data["runQueueSummary"];
         let normalized_run_queue_summary = serde_json::json!({
             "run_id": "$run_id",

@@ -44,7 +44,7 @@ At the current baseline, the product includes:
 - worktree mutation barrier protecting concurrent read/write and orchestrated sync (Proposal 064),
 - run worktree main sync and cross-run knowledge capsules (Proposal 064 Phase 0 contract freeze),
 - implementation completeness and handoff contract with structured status and verification truth,
-- fail-closed server parity harness with generation-scoped storage and runtime publication (Proposal 041),
+- fail-closed server parity harness with generation-scoped storage and runtime publication,
 - rejected implementation approval loopback to proposal refinement,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
 - Forge Steward system-health analysis,

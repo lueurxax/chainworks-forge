@@ -5,7 +5,7 @@
 | Date | 2026-04-17 (revised R2) |
 | Status | Draft (R2 — readiness blockers addressed: schema/runtime ownership, retry lineage, skip policy, MCP auth/namespace, distinct gate, command/query journaling split) |
 | Author | Andrey Khasanov |
-| Depends on | [041-server-parity-harness-golden-runs-and-behavioral-diff.md](041-server-parity-harness-golden-runs-and-behavioral-diff.md) |
+| Depends on | Server parity harness contracts in [p041-generated-artifact-schemas.md](../reference/p041-generated-artifact-schemas.md) and the retained `proposal-041|p041` gate in [test-gates.md#proposal-041p041](../reference/test-gates.md#proposal-041p041) |
 | Scope | Add run resume, agent-level retry, approval gate re-arm, stage skip, evidence retrieval, and deterministic recovery suggestions to the MCP tool surface, including the required Rust schema/runtime/auth/gate work. |
 | Goal | The operator can recover from common blocked/interrupted run states through MCP tools with durable audit, safe retry lineage, and deterministic recovery recommendations. |
 

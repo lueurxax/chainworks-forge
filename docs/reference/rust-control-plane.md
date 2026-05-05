@@ -39,7 +39,7 @@ This reference covers:
 - the work queue and recovery service
 - daemon startup and configuration
 
-It does not cover the SwiftUI operator shell or the thin-client cutover (P031). The parity harness (P041) is a specialized engine extension described in [test-gates.md](test-gates.md) and [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md).
+It does not cover the SwiftUI operator shell or the thin-client cutover (P031). The server parity harness is a specialized engine extension described in [test-gates.md](test-gates.md) and [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md).
 
 ## Architecture
 

@@ -564,31 +564,33 @@ Important:
 
 Server parity harness, golden fixtures, and behavioral diff gate.
 
+This gate name is a retained historical alias for the implemented server parity harness.
+
 Scope:
 
-- P041 `GoldenRunFixture` inventory and schema validation
+- server parity `GoldenRunFixture` inventory and schema validation
 - capture/regeneration lifecycle validation through `scripts/parity/capture-golden-run.sh --validate`
-- deterministic offline replay over every required P041 fixture
+- deterministic offline replay over every required parity fixture
 - per-fixture replay databases under `control-plane/target/parity/work/<generation_id>/<fixture_id>/parity.sqlite` (generation id comes from `P041_PUBLICATION_GENERATION_ID`, exported by the gate as `p041-<utc_iso>-<rand8>`; bare `cargo test` runs outside the gate use the sentinel `unscoped-fixture-replay`)
 - per-fixture `BehavioralDiffReport` under `control-plane/target/parity/reports/<generation_id>/<fixture_id>/behavioral-diff-report.json` and `server-replay.json` under `control-plane/target/parity/work/<generation_id>/<fixture_id>/`
 - per-fixture live-shadow reports under `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/live-shadow-report.json` (schema `live-shadow-report.v1`)
 - fixture-bound `surface_comparisons` for canonical state, projections, GraphQL readback, MCP report readback, artifact identity, and operator summary
 - fail-closed shadow side-effect policy for stubbed runtime/provider inputs
 - fixture-bound GraphQL run/stage/artifact/projection readback parity via `proposal_041_graphql_readback_parity_surfaces`
-- fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via P041-named tests
+- fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via retained P041-named tests
 - runtime publication contract validation (row + detail schema agreement, provenance shape) at `control-plane/target/parity/publication/current/` plus generation-scoped staging at `control-plane/target/parity/publication/generations/<generation_id>/`; the gate computes the canonical status from fixture verdicts, provenance, and `parity-control` markers and promotes `ready_same_tree_verified` only when every fixture passes, the live tree is clean (`tree_clean == true` and `status_snapshot_line_count == 0`), and provenance is real (not the `test-run-no-git` sentinel)
 - `control-plane/target/parity-control/` is acquired by the gate driver before destructive work; `lease.json`, `current-step.json`, `timeout-marker.json`, `interruption-marker.json`, `release-marker.json`, and `reclaim-marker.json` are written via the same-directory temp-file + Darwin `F_FULLFSYNC` (with `fsync` fallback) + atomic-rename contract. Before any `target/parity*` directory is created or written, the gate rejects symlinked or out-of-target paths.
-- P041 subprocesses run through the gate supervisor with a dedicated process group/session. The supervisor records the active `pgid` in `lease.json` and `current-step.json`, enforces a 25-minute default gate deadline (`P041_GATE_DEADLINE_SECONDS=1500`) plus per-command deadlines for replay (`P041_REPLAY_DEADLINE_SECONDS=60`), GraphQL/MCP readback (`P041_READBACK_DEADLINE_SECONDS=30`), and live-shadow validation (`P041_SHADOW_DEADLINE_SECONDS=60`), with `P041_DRAIN_GRACE_SECONDS=30` for termination drain. Test binaries are prebuilt before the short per-fixture deadlines begin.
+- server parity subprocesses run through the gate supervisor with a dedicated process group/session. The supervisor records the active `pgid` in `lease.json` and `current-step.json`, enforces a 25-minute default gate deadline (`P041_GATE_DEADLINE_SECONDS=1500`) plus per-command deadlines for replay (`P041_REPLAY_DEADLINE_SECONDS=60`), GraphQL/MCP readback (`P041_READBACK_DEADLINE_SECONDS=30`), and live-shadow validation (`P041_SHADOW_DEADLINE_SECONDS=60`), with `P041_DRAIN_GRACE_SECONDS=30` for termination drain. Test binaries are prebuilt before the short per-fixture deadlines begin.
 - On timeout, the supervisor sends process-group termination and publishes `blocked_timeout` through `timeout-marker.json` plus the current runtime row/detail. On SIGINT/SIGTERM interruption, it follows the same drain path and publishes `blocked_interrupted` through `interruption-marker.json` plus the current runtime row/detail.
 - The reclaim matrix is implemented in the gate: Case A live/fresh owners fail closed as in-progress; Case A2 live/stalled owners park at `blocked_manual_recovery` after two unchanged heartbeat/control-sequence observations; Case B missing `pgid` metadata parks at `blocked_manual_recovery`; Case C observable descendants park at `blocked_manual_recovery`; Case D PID-gone plus proven descendant absence writes `reclaim_allowed`.
-- generation retention follows proposal §6.4: the gate prunes older non-manual generations oldest-first while preserving the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation; storage above 500 MB triggers a `[WARN]` listing preserved roots and sizes (warning only, never authorization to delete manual-recovery evidence)
+- generation retention follows the server parity retention contract: the gate prunes older non-manual generations oldest-first while preserving the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation; storage above 500 MB triggers a `[WARN]` listing preserved roots and sizes (warning only, never authorization to delete manual-recovery evidence)
 
 Use when:
 
 - changing server/client parity fixture contracts
 - changing Rust replay, projection, artifact/report, GraphQL-readback, or MCP-readback parity surfaces
 - preparing P031 thin-client cutover evidence
-- updating P041 golden fixtures or behavioral diff schema
+- updating server parity golden fixtures or behavioral diff schema
 
 Host policy:
 

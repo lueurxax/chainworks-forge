@@ -1,6 +1,6 @@
-# P041 Generated Artifact Schemas
+# Server Parity Generated Artifact Schemas
 
-This document defines the versioned schemas for runtime parity artifacts produced by the P041 server parity harness.
+This document defines the versioned schemas for runtime parity artifacts produced by the server parity harness. The `P041`/`proposal-041` names remain retained historical aliases for the stable gate, tests, environment variables, and generated IDs.
 
 ## Runtime Handoff Schemas
 
@@ -15,7 +15,7 @@ The canonical same-tree P031 acceptance switch. Published to `control-plane/targ
 | `runtime_detail_path` | `String` | Repo-relative path to the runtime detail artifact. Must equal the canonical constant `control-plane/target/parity/publication/current/p031-p041-parity-evidence.json`; absolute paths and `..` traversal are rejected. |
 | `reference_detail_path` | `String` | Repo-relative path to the promoted reference snapshot. Must equal the canonical constant `docs/reference/p031-p041-parity-evidence.json`; absolute paths and `..` traversal are rejected. |
 | `validation_status` | `Status` | Canonical status (e.g., `ready_same_tree_verified`). |
-| `publication_state` | `String` | e.g., `revoked_for_rerun`, `published`. |
+| `publication_state` | `String` | e.g., `published_ready`, `diagnostic_blocked`, `revoked_for_rerun`. |
 | `publication_generation_id` | `String` | Unique ID for the current generation. |
 | `detail_schema_version` | `String` | Must match the detail artifact's schema version. |
 | `provenance` | `Provenance` | Git commit, tree ID, clean-tree proof, and timestamp. |
@@ -39,7 +39,7 @@ The authoritative runtime detail artifact. Published to `control-plane/target/pa
 
 ## Fixture Work Product Schemas
 
-These schemas describe the artifacts produced by the P041 parity harness in `control-plane/crates/engine/tests/proposal_041_parity.rs`. Field shapes below are the actual emitter output, not a target schema.
+These schemas describe the artifacts produced by the server parity harness in `control-plane/crates/engine/tests/proposal_041_parity.rs`. Field shapes below are the actual emitter output, not a target schema.
 
 ### `server-replay.v1`
 
@@ -120,14 +120,18 @@ Produced by live-shadow replays. Written to `control-plane/target/parity/shadow/
 | `blocked_interrupted` | Interrupted by operator | `WARN` |
 | `blocked_in_progress` | Rerun active; do not trust stale evidence | `INFO` |
 
-Blocked-state precedence (P041 §5) is fixed for CLI and summary rendering: `blocked_manual_recovery` overrides `blocked_missing_evidence`, which overrides `blocked_divergence`, which overrides `blocked_dirty_tree`, which overrides `blocked_timeout`, which overrides `blocked_interrupted`, which overrides `blocked_in_progress`. `ready_same_tree_verified` is legal only when none of those blocked states apply.
+The CLI and summary renderer use fixed blocked-state precedence: `blocked_manual_recovery` overrides `blocked_missing_evidence`, which overrides `blocked_divergence`, which overrides `blocked_dirty_tree`, which overrides `blocked_timeout`, which overrides `blocked_interrupted`, which overrides `blocked_in_progress`. `ready_same_tree_verified` is legal only when none of those blocked states apply.
 
 ## Work Product Retention
 
-The proposal target retention policy (P041 §6.4) is:
+The parity harness retains generation-scoped work products under these rules:
 
 1. **Successful generations**: prunable oldest-first; the harness must retain at minimum the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation.
 2. **`blocked_manual_recovery` generations**: never auto-pruned. Operator action is required because their diagnostic value is the reason reclamation is blocked.
 3. **Storage budget**: when retained parity generations exceed 500 MB, the CLI must warn and list preserved roots plus sizes; hitting the budget is diagnostic, not authorization to delete manual-recovery evidence.
 
-Implementation status: the generation-scoped path layout is now wired into the harness — per-fixture work products are written under `control-plane/target/parity/work/<generation_id>/<fixture_id>/`, reports under `control-plane/target/parity/reports/<generation_id>/<fixture_id>/`, and shadow output under `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/`. The active generation id comes from `P041_PUBLICATION_GENERATION_ID`, which the gate exports as `p041-<utc_iso>-<rand8>`; bare `cargo test` runs outside the gate use the sentinel `unscoped-fixture-replay`. Automatic pruning (oldest-first retention of one ready and one non-manual blocked diagnostic generation, never pruning `blocked_manual_recovery`) and the 500 MB storage-budget warning are wired into the gate. `control-plane/target/parity-control/` is implemented as a cleanup-safe root, is acquired by the gate, and is never removed by gate cleanup. Canonical control/publication files use same-directory temp files, Darwin `F_FULLFSYNC` with `fsync` fallback, atomic rename, and best-effort parent-directory sync. The gate validates `target/parity*` boundaries before mkdir/write, runs every external command through a process-group supervisor, records the active `pgid`, enforces a 25-minute default gate deadline with 60s replay, 30s GraphQL/MCP readback, 60s live-shadow, and 30s drain defaults after prebuilding test binaries, publishes `blocked_timeout` on timeout, publishes `blocked_interrupted` on SIGINT/SIGTERM, and applies the full A/A2/B/C/D reclaim matrix from the lease heartbeat, control sequence, PID birth time, and descendant-observation evidence.
+Per-fixture work products are written under `control-plane/target/parity/work/<generation_id>/<fixture_id>/`, reports under `control-plane/target/parity/reports/<generation_id>/<fixture_id>/`, and shadow output under `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/`. The active generation id comes from `P041_PUBLICATION_GENERATION_ID`, which the gate exports as `p041-<utc_iso>-<rand8>`; bare `cargo test` runs outside the gate use the sentinel `unscoped-fixture-replay`.
+
+The gate prunes older generations oldest-first while preserving the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation. Storage above 500 MB triggers a warning listing preserved roots and sizes; the warning is diagnostic and does not authorize deletion of manual-recovery evidence.
+
+`control-plane/target/parity-control/` is a cleanup-safe root acquired by the gate and never removed by gate cleanup. Canonical control/publication files use same-directory temp files, Darwin `F_FULLFSYNC` with `fsync` fallback, atomic rename, and best-effort parent-directory sync. The gate validates `target/parity*` boundaries before mkdir/write, runs every external command through a process-group supervisor, records the active `pgid`, enforces a 25-minute default gate deadline with 60s replay, 30s GraphQL/MCP readback, 60s live-shadow, and 30s drain defaults after prebuilding test binaries, publishes `blocked_timeout` on timeout, publishes `blocked_interrupted` on SIGINT/SIGTERM, and applies the A/A2/B/C/D reclaim matrix from the lease heartbeat, control sequence, PID birth time, and descendant-observation evidence.

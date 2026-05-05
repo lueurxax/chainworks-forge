@@ -60,8 +60,8 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 - [test-suite-architecture.md](test-suite-architecture.md) — Swift Testing unit-suite structure, conventions, mock lanes, tags, plans, residual gaps
 - [test-gates.md](test-gates.md) — Layered local and CI execution gates, gate ownership, crash-aware runner behavior
-- [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md) — Versioned schemas for runtime parity artifacts, publication rows, and work products (P041)
-- [p031-p041-parity-evidence.json](p031-p041-parity-evidence.json) — Promoted reference snapshot for server parity evidence (P041)
+- [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md) — Versioned schemas for server parity runtime artifacts, publication rows, and work products
+- [p031-p041-parity-evidence.json](p031-p041-parity-evidence.json) — Promoted reference snapshot for server parity evidence
 - [agent-ui-test-execution.md](agent-ui-test-execution.md) — How agents should run preview review, focused XCUITest, and app-launched UI proof flows
 
 ## System Health
