@@ -22,6 +22,10 @@ without the run-specific operator evidence listed below.
 - P031 UX/accessibility release sign-off is recorded in
   `docs/evidence/p031-ux-accessibility-signoff.md` after the 2026-05-05
   operator spot check.
+- Critical write-path readiness is recorded in
+  `docs/evidence/p031-degraded-state-evidence.md` and
+  `docs/evidence/p031-dogfood-signoff.md` after the 2026-05-05 release-owner
+  confirmation.
 
 ## Still Required Before Ready
 
@@ -32,7 +36,6 @@ without the run-specific operator evidence listed below.
 - Degraded-state scripted drill evidence, or a dated release-owner waiver for the
   existing partial restart/degraded evidence.
 - Freshness confirmation tied to the dogfood run window.
-- Critical write-path readiness or release-owner waiver.
 
 ## Gate-Sensitive Evidence Files
 
@@ -58,7 +61,7 @@ owner records real dogfood, degraded-state, and freshness evidence.
 | VoiceOver/accessibility check | `docs/evidence/p031-ux-accessibility-signoff.md` | P031 release owner | Complete |
 | Degraded-state drill or waiver | TBD | P031 release owner | Pending |
 | Dogfood freshness confirmation | TBD | P031 release owner | Pending |
-| Critical write-path waiver/readiness | TBD | P031 release owner | Pending |
+| Critical write-path waiver/readiness | `docs/evidence/p031-degraded-state-evidence.md` | P031 release owner | Complete |
 
 ## Verification Order
 

@@ -4,7 +4,7 @@ Status: READY_WITH_SCRIPTED_DRILL_OR_WAIVER_PENDING
 Owner: P031 release owner
 Blocking Phase: Phase 0d
 Blocker Recorded: 2026-04-24
-Last Updated: 2026-04-25T04:27:00Z
+Last Updated: 2026-05-05T19:37:03+03:00
 
 ## Evidence Criteria
 - Affected thin UI surfaces visibly enter disabled/degraded state within 60 seconds from the triggering degraded condition.
@@ -33,11 +33,18 @@ Observed against criteria:
 - No local orchestrator, MCP UI call, GraphQL mutation, or local UI write control became visible.
 - After recovery, restored run rows were read through GraphQL and displayed as live server projections.
 
+Critical write-path readiness:
+
+- The release owner confirmed on 2026-05-05 that the P031 thin macOS UI is accepted as a GraphQL read surface for release.
+- Local workflow/control writes must remain unavailable from the P031 UI.
+- Command/control operations remain outside the thin UI, with approval-only GraphQL mutations allowed only for approval decisions.
+- This sign-off confirms the write-path readiness item. It does not waive the separate degraded-state scripted drill or degraded-state release waiver requirement.
+
 Limitations:
 
 - This was an incidental restart/degraded sequence, not a scripted fault-injection drill.
 - The release-suitable degraded screenshot is sanitized to the Forge window; the original full-desktop capture is retained only as local audit context.
-- No signed release-owner waiver is present.
+- No signed release-owner degraded-state waiver is present.
 - No operator dogfood confirmation has been recorded.
 
 Required owner action: P031 release owner must either accept this partial degraded-state evidence with a dated waiver or run a scripted degraded-state drill during Phase 3 dogfood.

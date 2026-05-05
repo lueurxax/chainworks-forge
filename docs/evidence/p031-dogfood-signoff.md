@@ -4,17 +4,17 @@ Status: READY_TEMPLATE_WITH_RUNTIME_PREREQS_ATTACHED
 Owner: P031 release owner
 Blocking Phase: Phase 3
 Template Date: 2026-04-24
-Last Updated: 2026-04-25T04:27:00Z
+Last Updated: 2026-05-05T19:37:03+03:00
 
 ## Phase 3 Checklist
 - [ ] Run prerequisite gates (P027, P041, P042, P043, P031).
 - [ ] Two full-mvp-live dogfood runs completed.
 - [ ] Operator workflow-completion notes captured.
 - [ ] Degraded-state recovery and approval diagnostic evidence captured.
-- [ ] UX/Accessibility spot check completed.
+- [x] UX/Accessibility spot check completed.
 - [ ] Freshness baseline measured (p50/p95).
 - [ ] Degraded-state/fail-closed evidence or waiver attached.
-- [ ] Critical write-path readiness or release-owner waiver confirmed.
+- [x] Critical write-path readiness or release-owner waiver confirmed.
 
 ## Local Evidence Status
 
@@ -27,6 +27,8 @@ Attached pre-dogfood evidence:
 - Runtime screenshots attached under `docs/evidence/p031-runtime/`.
 - Partial degraded-state restart evidence attached in `docs/evidence/p031-degraded-state-evidence.md`.
 - Report payload metadata-only evidence attached in `docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json`.
+- UX/accessibility human spot check sign-off attached in `docs/evidence/p031-ux-accessibility-signoff.md`.
+- Critical write-path readiness was confirmed by the release owner on 2026-05-05: the P031 macOS UI remains a GraphQL read surface, local workflow/control writes remain unavailable from the UI, and command/control operations stay outside the thin UI except for approved approval-only GraphQL mutations.
 - Current copied DB contains no completed `Full MVP Live` runs; all current run rows are `blocked` or `cancelled`, so this tree cannot honestly claim the two-run dogfood completion criterion from historical data.
 
 Still required for Phase 3 sign-off:
@@ -35,10 +37,8 @@ Still required for Phase 3 sign-off:
 - Operator workflow-completion notes.
 - Approval diagnostic comprehension on a run with pending approval rows.
 - Report payload indicator evidence on representative report artifacts.
-- VoiceOver/accessibility spot check.
 - Release-owner acceptance/waiver for degraded-state evidence if no scripted drill is run.
-- Critical write-path readiness or release-owner waiver.
 
 ## Sign-Off
 
-Not signed. Complete the checklist with run-specific evidence before Phase 3 closeout.
+Not signed for full dogfood closeout. Complete the remaining run-specific dogfood, degraded-state, and freshness evidence before Phase 3 closeout.
