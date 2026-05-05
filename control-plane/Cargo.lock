@@ -714,6 +714,7 @@ dependencies = [
  "db",
  "dirs",
  "domain",
+ "libc",
  "md-5",
  "serde",
  "serde_json",
