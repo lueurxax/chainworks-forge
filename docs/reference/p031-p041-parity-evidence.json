@@ -1,8 +1,135 @@
 {
-  "schema_version": "p031-p041-parity-evidence.v1",
-  "overall_status": "blocked_missing_evidence",
-  "publication_generation_id": "reference-snapshot",
-  "publication_state": "reference_snapshot",
+  "blocking_reasons": [],
+  "divergence_evidence": [],
+  "fixtures": [
+    {
+      "fixture_id": "proposal-loop-basic",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:56.663263+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/proposal-loop-basic/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/proposal-loop-basic/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/proposal-loop-basic/live-shadow-report.json",
+      "verdict": "ready"
+    },
+    {
+      "fixture_id": "implementation-refine-review",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:56.881653+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/implementation-refine-review/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/implementation-refine-review/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/implementation-refine-review/live-shadow-report.json",
+      "verdict": "ready"
+    },
+    {
+      "fixture_id": "approval-pause-resume",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:57.097837+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/approval-pause-resume/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/approval-pause-resume/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/approval-pause-resume/live-shadow-report.json",
+      "verdict": "ready"
+    },
+    {
+      "fixture_id": "retry-recovery-flow",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:57.288306+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/retry-recovery-flow/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/retry-recovery-flow/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/retry-recovery-flow/live-shadow-report.json",
+      "verdict": "ready"
+    },
+    {
+      "fixture_id": "cancelled-or-blocked-run",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:57.559054+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/cancelled-or-blocked-run/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/cancelled-or-blocked-run/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/cancelled-or-blocked-run/live-shadow-report.json",
+      "verdict": "ready"
+    },
+    {
+      "fixture_id": "terminal-report-evidence",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:57.745169+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/terminal-report-evidence/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/terminal-report-evidence/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/terminal-report-evidence/live-shadow-report.json",
+      "verdict": "ready"
+    },
+    {
+      "fixture_id": "projection-readback-surface",
+      "provenance": {
+        "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+        "fixture_revision": 1,
+        "gate": "./scripts/test-gate.sh proposal-041",
+        "generated_at": "2026-05-05T05:53:57.931905+00:00",
+        "source": "behavioral-diff-report",
+        "tree_clean": true,
+        "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+      },
+      "replay_path": "control-plane/target/parity/work/p041-2026-05-05T05:47:41Z-cfe94c7a/projection-readback-surface/server-replay.json",
+      "report_path": "control-plane/target/parity/reports/p041-2026-05-05T05:47:41Z-cfe94c7a/projection-readback-surface/behavioral-diff-report.json",
+      "shadow_report_path": "control-plane/target/parity/shadow/p041-2026-05-05T05:47:41Z-cfe94c7a/projection-readback-surface/live-shadow-report.json",
+      "verdict": "ready"
+    }
+  ],
+  "interrupted_evidence": [],
+  "manual_recovery_evidence": null,
+  "missing_evidence": [],
+  "overall_status": "ready_same_tree_verified",
+  "provenance": {
+    "commit_sha": "e61f70845cca07d088f9a39fd606c1e26e839145",
+    "gate": "./scripts/test-gate.sh proposal-041",
+    "generated_at": "2026-05-05T05:53:58.293730+00:00",
+    "status_snapshot_line_count": 0,
+    "status_snapshot_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tree_clean": true,
+    "tree_id": "ef19119a1849bc0e79995caeefb1d107465d8a3a"
+  },
+  "publication_generation_id": "p041-2026-05-05T05:47:41Z-cfe94c7a",
+  "publication_state": "published_ready",
   "required_fixtures": [
     "proposal-loop-basic",
     "implementation-refine-review",
@@ -20,26 +147,6 @@
     "artifact_identity",
     "operator_summary"
   ],
-  "fixtures": [],
-  "blocking_reasons": [
-    "reference_snapshot_not_yet_populated_from_live_run"
-  ],
-  "missing_evidence": [
-    {
-      "missing_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
-      "expected_producer": "scripts/test-gate.sh proposal-041",
-      "affected_fixture_or_surface": "all_fixtures",
-      "next_action": "run './scripts/test-gate.sh proposal-041' on a clean tree to populate the runtime artifact, then run scripts/parity/promote-p041-reference.sh to promote it here"
-    }
-  ],
-  "provenance": {
-    "commit_sha": "reference-snapshot",
-    "tree_id": "reference-snapshot",
-    "tree_clean": false,
-    "status_snapshot_sha256": "reference-snapshot",
-    "status_snapshot_line_count": 1,
-    "generated_at": "2026-04-30T00:00:00Z",
-    "gate": "./scripts/test-gate.sh proposal-041"
-  },
-  "_note": "This is a promoted reference snapshot schema skeleton. Populated via scripts/parity/promote-p041-reference.sh after a successful gate run produces ready_same_tree_verified runtime evidence. The authoritative runtime artifact lives at control-plane/target/parity/publication/current/p031-p041-parity-evidence.json."
+  "schema_version": "p031-p041-parity-evidence.v1",
+  "timeout_evidence": []
 }
