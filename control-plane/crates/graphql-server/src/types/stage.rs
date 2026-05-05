@@ -205,7 +205,9 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
             session_reset_reason: execution.session_reset_reason,
             // P066: synthesize legacy sentinel when column is NULL.
             actual_toolchain_mapping_diagnostics: toolchain_mapping_from_json(
-                execution.actual_toolchain_mapping_diagnostics_json.as_deref(),
+                execution
+                    .actual_toolchain_mapping_diagnostics_json
+                    .as_deref(),
             ),
         }
     }
@@ -250,9 +252,7 @@ pub(crate) fn toolchain_mapping_legacy_sentinel() -> GqlToolchainMappingDiagnost
 
 /// P066: Parse a stored diagnostics JSON document or synthesize a sentinel.
 /// Absolute paths are never exposed — only the structured fields are returned.
-pub(crate) fn toolchain_mapping_from_json(
-    json: Option<&str>,
-) -> GqlToolchainMappingDiagnostics {
+pub(crate) fn toolchain_mapping_from_json(json: Option<&str>) -> GqlToolchainMappingDiagnostics {
     let Some(json) = json else {
         return toolchain_mapping_legacy_sentinel();
     };
@@ -278,18 +278,13 @@ pub(crate) fn toolchain_mapping_from_json(
             .and_then(|v| v.as_str())
             .unwrap_or("synthesized_legacy")
             .to_string(),
-        policy_version: val
-            .get("policy_version")
-            .and_then(|v| v.as_i64()),
+        policy_version: val.get("policy_version").and_then(|v| v.as_i64()),
         provider_family: val
             .get("provider_family")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string(),
-        version: val
-            .get("version")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(1),
+        version: val.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
     }
 }
 

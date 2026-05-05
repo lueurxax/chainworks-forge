@@ -163,7 +163,10 @@ impl From<StartupRecoveryReadback> for GqlStartupRecoverySummary {
 /// P066 T18: Durable housekeeping summary for periodic run-root pruning.
 /// One row per sweep. Used as promotion gate evidence for Phase 3 catalog backfill.
 #[derive(SimpleObject, Clone, Debug)]
-#[graphql(name = "ToolchainCacheHousekeepingSummary", rename_fields = "camelCase")]
+#[graphql(
+    name = "ToolchainCacheHousekeepingSummary",
+    rename_fields = "camelCase"
+)]
 pub struct GqlToolchainCacheHousekeepingSummary {
     pub id: ID,
     pub last_sweep_started_at: String,

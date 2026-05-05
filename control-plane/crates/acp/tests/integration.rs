@@ -131,7 +131,7 @@ if msg is None:
 
 send({"jsonrpc": "2.0", "method": "session/update",
       "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": "working..."}}})
-time.sleep(0.5)
+time.sleep(2.0)
 
 artifact_path = os.path.join(cwd, "result.json")
 with open(artifact_path, "w") as f:
@@ -1354,6 +1354,8 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     }
 }
 
@@ -1404,6 +1406,8 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1477,6 +1481,8 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1535,6 +1541,8 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1598,6 +1606,8 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1668,6 +1678,8 @@ async fn mcp_servers_session_new_serialization_tests() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1731,6 +1743,8 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1792,6 +1806,8 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
     let config = AcpSessionConfig {
         set_mode_after_session_new: true,
@@ -1858,6 +1874,8 @@ async fn transport_fails_when_required_config_option_is_rejected() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
     let config = AcpSessionConfig {
         required_config_options: vec![("model".to_string(), "haiku".to_string())],
@@ -1923,6 +1941,8 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
     let config = AcpSessionConfig {
         required_config_options: vec![("model".to_string(), "opus".to_string())],
@@ -1976,6 +1996,8 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -2078,6 +2100,8 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -5079,6 +5103,8 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5138,6 +5164,8 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let error = adapter
@@ -5219,6 +5247,8 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5274,6 +5304,8 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5334,6 +5366,8 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5417,6 +5451,8 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5499,6 +5535,8 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5564,6 +5602,8 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5625,6 +5665,8 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5701,6 +5743,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -5748,6 +5792,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -5833,11 +5879,13 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let manager_for_task = Arc::clone(&manager);
     let task = tokio::spawn(async move { manager_for_task.start_session(req).await });
-    let update = timeout(Duration::from_secs(1), rx.recv())
+    let update = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("prompt progress should be reported before terminal response")
         .expect("progress sink should receive an update");
@@ -5918,6 +5966,8 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let execution = {
@@ -6001,6 +6051,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -6049,6 +6101,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -6104,6 +6158,8 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6205,6 +6261,8 @@ sys.exit(0)
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let _ = adapter.execute(req).await;

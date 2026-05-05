@@ -7,10 +7,9 @@
 /// - Absent toolchain_cache_policy decodes as None (policy_absent)
 /// - catalog_snapshot_format_version validation logic
 /// - Scope defaults: xcode→run, go→session when enabled and absent
-
 use workflow::catalog::{
-    validate_catalog_snapshot_format_version, validate_toolchain_cache_policies,
-    AgentCatalogFile, AgentEntry, ToolchainCachePolicyYaml, ToolchainCacheScope,
+    validate_catalog_snapshot_format_version, validate_toolchain_cache_policies, AgentCatalogFile,
+    AgentEntry, ToolchainCachePolicyYaml, ToolchainCacheScope,
 };
 use workflow::plan::{ToolchainCachePolicySnapshot, ToolchainCacheScopeSnapshot};
 
@@ -301,7 +300,10 @@ fn p066_validate_policies_rejects_unsupported_version_in_catalog() {
         agents: Some(vec![entry]),
     };
     let result = validate_toolchain_cache_policies(&catalog);
-    assert!(result.is_err(), "unsupported version in catalog should fail");
+    assert!(
+        result.is_err(),
+        "unsupported version in catalog should fail"
+    );
 }
 
 #[test]

@@ -48,6 +48,7 @@ Preferred reviewer behavior:
 ## Validation commands
 
 Use `scripts/test-gate.sh` as the canonical gate wrapper when validation is requested.
+Do not replace gate invocations with raw `xcodebuild -testPlan ...` commands.
 
 Common commands:
 
@@ -55,6 +56,8 @@ Common commands:
 ./scripts/test-gate.sh list
 ./scripts/test-gate.sh build
 ./scripts/test-gate.sh fast
+./scripts/test-gate.sh guardrails
+./scripts/test-gate.sh full
 ./scripts/test-gate.sh proposal-XXX
 ```
 
@@ -62,11 +65,18 @@ Rust-only commands, when explicitly requested:
 
 ```bash
 cd control-plane
+cargo build
 cargo test
 cargo test -p engine <test_name>
+cd .. && ./scripts/test-gate.sh proposal-027
 ```
 
 UI tests are remote-only by repository policy. Do not run local UI smoke tests unless the user explicitly asks and the remote-host workflow is available.
+Canonical remote UI smoke invocation:
+
+```bash
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh ui-smoke"
+```
 
 ## Safety rules
 

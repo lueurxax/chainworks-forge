@@ -5,7 +5,6 @@
 /// - Stored disabled_by_policy JSON → correct MCP key exposure
 /// - policy_source is always runplan_snapshot or synthesized_legacy (never agent_catalog)
 /// - Absolute paths are not exposed in MCP reports
-
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{agent_executions, ideas, runs, stages};
@@ -86,7 +85,9 @@ async fn seed_execution_with_diagnostics(
     .await
     .unwrap();
 
-    runs::insert(pool, &make_run(run_id, idea_id)).await.unwrap();
+    runs::insert(pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
 
     stages::insert(
         pool,
@@ -199,8 +200,10 @@ async fn p066_mcp_null_toolchain_diagnostics_synthesizes_legacy_row_unavailable(
     let exec = &canonical["agent_executions"][0];
     let diag = &exec["actual_toolchain_mapping_diagnostics"];
 
-    assert_eq!(diag["mapping_state"], "legacy_row_unavailable",
-        "NULL column must synthesize legacy_row_unavailable");
+    assert_eq!(
+        diag["mapping_state"], "legacy_row_unavailable",
+        "NULL column must synthesize legacy_row_unavailable"
+    );
     assert_eq!(diag["mapping_enabled"], false);
     assert_eq!(diag["inactive_reason"], "legacy_row");
     assert_eq!(diag["policy_source"], "synthesized_legacy");
@@ -243,10 +246,14 @@ async fn p066_mcp_disabled_by_policy_diagnostics_exposed_correctly() {
     assert_eq!(diag["mapping_state"], "disabled_by_policy");
     assert_eq!(diag["mapping_enabled"], false);
     assert_eq!(diag["inactive_reason"], "policy_disabled");
-    assert_eq!(diag["policy_source"], "runplan_snapshot",
-        "policy_source must be runplan_snapshot for compiled executions");
-    assert_ne!(diag["policy_source"], "agent_catalog",
-        "agent_catalog must never be an authoritative policy_source per DEC-003");
+    assert_eq!(
+        diag["policy_source"], "runplan_snapshot",
+        "policy_source must be runplan_snapshot for compiled executions"
+    );
+    assert_ne!(
+        diag["policy_source"], "agent_catalog",
+        "agent_catalog must never be an authoritative policy_source per DEC-003"
+    );
     assert_eq!(diag["policy_version"], 1);
     assert_eq!(diag["provider_family"], "claude");
     assert_eq!(diag["version"], 1);
