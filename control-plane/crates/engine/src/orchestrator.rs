@@ -180,18 +180,26 @@ impl Orchestrator {
         // We detect "stale" completed stages by checking whether any LATER state
         // has a stage (meaning the workflow already moved past this state and
         // looped back). If so, this Completed stage belongs to a prior cycle.
-        // Stale detection: a Completed stage from a prior loop iteration must
+        // Stale detection: a terminal stage from a prior loop iteration must
         // not be re-evaluated — we need to create a new stage instead.
-        // We use iteration count: if the stage's iteration is less than the
-        // total number of stages for that state_id, it's from a prior cycle.
+        // Stale detection applies to any terminal status (Completed/Failed/etc)
+        // if the workflow has already moved past this state and looped back.
         let stage_is_stale = current_stage
-            .filter(|s| s.status == StageStatus::Completed)
-            .map(|completed_stage| {
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    StageStatus::Completed
+                        | StageStatus::Failed
+                        | StageStatus::Blocked
+                        | StageStatus::Skipped
+                )
+            })
+            .map(|terminal_stage| {
                 // If any other stage (different state_id) was started AFTER
                 // this one, the workflow has moved past this state and looped back.
                 all_stages.iter().any(|other| {
                     other.stage_id != current_state_id
-                        && other.started_at > completed_stage.started_at
+                        && other.started_at > terminal_stage.started_at
                 })
             })
             .unwrap_or(false);
@@ -268,7 +276,7 @@ impl Orchestrator {
                     run_id = %run_id,
                     state = %current_state_id,
                     iteration = stage.iteration,
-                    "Stale completed stage from prior loop iteration — creating new stage"
+                    "Stale terminal stage from prior loop iteration — creating new stage"
                 );
                 // Fall through to Case 2 (lazy creation)
             } else {
@@ -3502,6 +3510,15 @@ impl Orchestrator {
             }
             candidate_evaluations.push(evaluation);
         }
+        self.apply_implementation_review_refinement_guard(
+            run_id,
+            current_state_id,
+            state,
+            plan,
+            all_stages,
+            &mut candidate_evaluations,
+        )
+        .await?;
 
         if let Some(aggregate_diagnostic) = self
             .proposal_review_summary_transition_truth_conflict(&candidate_evaluations, &run, plan)
@@ -3671,6 +3688,103 @@ impl Orchestrator {
             .await?;
         }
 
+        Ok(())
+    }
+
+    async fn apply_implementation_review_refinement_guard(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        state: &workflow::plan::CompiledState,
+        plan: &workflow::plan::RunPlan,
+        all_stages: &[StageExecution],
+        candidate_evaluations: &mut [CandidateTransitionEvaluation],
+    ) -> Result<()> {
+        if current_state_id != "state_9_implementation_reviewed" {
+            return Ok(());
+        }
+
+        let Some(release_index) = state
+            .transitions
+            .iter()
+            .position(|transition| transition.to == "state_11_manual_release")
+        else {
+            return Ok(());
+        };
+        if candidate_evaluations
+            .get(release_index)
+            .map(|candidate| candidate.result.clone())
+            != Some(CandidateTransitionResult::Matched)
+        {
+            return Ok(());
+        }
+
+        let target_status = plan
+            .variables
+            .get("implementation_review_target_status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("code_complete");
+        let status = db::repos::artifact_contracts::canonical_contract_field_result(
+            &self.pool,
+            run_id,
+            "implementation_review_summary",
+            "status",
+        )
+        .await?;
+        let status_label = match &status {
+            db::repos::artifact_contracts::CanonicalContractField::Resolved(value) => value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string()),
+            db::repos::artifact_contracts::CanonicalContractField::MissingControlled {
+                contract_id,
+            } => format!("missing:{contract_id}"),
+            db::repos::artifact_contracts::CanonicalContractField::UncontrolledAlias => {
+                "uncontrolled_alias".to_string()
+            }
+        };
+        if matches!(
+            status,
+            db::repos::artifact_contracts::CanonicalContractField::Resolved(ref value)
+                if value.as_str() == Some(target_status)
+        ) {
+            return Ok(());
+        }
+
+        let Some(refine_index) = state
+            .transitions
+            .iter()
+            .position(|transition| transition.to == "state_10_implementation_refined")
+        else {
+            candidate_evaluations[release_index].result = CandidateTransitionResult::NotMatched;
+            candidate_evaluations[release_index].sanitized_diagnostic = Some(format!(
+                "implementation_review_summary.status={status_label} cannot enter manual release, and no refinement transition exists"
+            ));
+            return Ok(());
+        };
+
+        candidate_evaluations[release_index].result = CandidateTransitionResult::NotMatched;
+        candidate_evaluations[release_index].sanitized_diagnostic = Some(format!(
+            "implementation_review_summary.status={status_label} routes back to implementation refinement, not manual release"
+        ));
+
+        if let Some(exhaustion) = loop_budget_exhaustion_for_transition_target(
+            &state.transitions[refine_index],
+            plan,
+            all_stages,
+        ) {
+            candidate_evaluations[refine_index].result = CandidateTransitionResult::NotMatched;
+            candidate_evaluations[refine_index].sanitized_diagnostic = Some(format!(
+                "implementation_review_summary.status={status_label} requires refinement, but loop budget exhausted for {}: {}/{} iterations",
+                exhaustion.counter, exhaustion.iterations, exhaustion.max
+            ));
+            return Ok(());
+        }
+
+        candidate_evaluations[refine_index].result = CandidateTransitionResult::Matched;
+        candidate_evaluations[refine_index].sanitized_diagnostic = Some(format!(
+            "implementation_review_summary.status={status_label} requires continued implementation refinement"
+        ));
         Ok(())
     }
 
@@ -7690,6 +7804,135 @@ mod tests {
             CandidateTransitionResult::InvalidExpression,
             "P017 requires unknown catalog artifact references to fail closed"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stale_failed_stage_reentry_is_ignored() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "Stale failed stage".into(),
+            body: "re-entry should ignore old failed stages if a newer stage from another state exists".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wf_path = temp_dir.path().join("wf.yaml");
+        let cat_path = temp_dir.path().join("catalog.yaml");
+        std::fs::write(&wf_path, "
+workflow:
+  id: test_wf
+initial_state: state_9
+states:
+  state_9:
+    label: Review
+    owner: reviewer
+    transitions:
+      - to: state_10
+        when: 'false'
+  state_10:
+    label: Refine
+    owner: refiner
+    transitions:
+      - to: state_9
+        when: 'true'
+").unwrap();
+        std::fs::write(&cat_path, "
+agents:
+  - id: reviewer
+    backend_profile: reviewer_profile
+    system_role: lead
+    permission_profile: default
+    lead_resolution_contract: proposal_review_v1
+  - id: refiner
+    backend_profile: refiner_profile
+    permission_profile: default
+backend_profiles:
+  reviewer_profile:
+    provider: codex
+  refiner_profile:
+    provider: codex
+contracts:
+  proposal_review_v1:
+    format: json
+permission_profiles:
+  default: {}
+").unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.current_state = Some("state_9".into());
+        run.workflow_yaml_path = Some(wf_path.to_str().unwrap().into());
+        run.agent_catalog_yaml_path = Some(cat_path.to_str().unwrap().into());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        // 1. Failed stage for state_9 (old)
+        let failed_state_9 = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_9".into(),
+            label: "Review".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::minutes(10),
+            completed_at: Some(now - chrono::Duration::minutes(9)),
+            owner_agent: Some("reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &failed_state_9).await.unwrap();
+
+        // 2. Successful stage for state_10 (more recent)
+        let completed_state_10 = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_10".into(),
+            label: "Refine".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::minutes(5),
+            completed_at: Some(now - chrono::Duration::minutes(4)),
+            owner_agent: Some("refiner".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &completed_state_10).await.unwrap();
+
+        // Advance workflow
+        orchestrator.advance_run(run_id).await.unwrap();
+
+        // Check if a NEW stage for state_9 was created
+        let all_stages = db::repos::stages::list_by_run(&pool, run_id).await.unwrap();
+        let state_9_stages: Vec<_> = all_stages.iter().filter(|s| s.stage_id == "state_9").collect();
+
+        assert_eq!(state_9_stages.len(), 2, "Should have created a new stage for state_9 because the old one is stale");
     }
 
     #[tokio::test(flavor = "multi_thread")]

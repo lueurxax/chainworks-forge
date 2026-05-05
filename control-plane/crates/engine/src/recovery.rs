@@ -318,12 +318,8 @@ impl RecoveryService {
         // stale Xcode run-scoped roots that can't be proven safe.
         let toolchain_cache = if let Ok(home) = std::env::var("CHAINWORKS_TOOLCHAIN_HOME") {
             let sweep_started_at = Utc::now();
-            let result = sweep_toolchain_cache_roots(
-                &self.pool,
-                Path::new(&home),
-                sweep_started_at,
-            )
-            .await;
+            let result =
+                sweep_toolchain_cache_roots(&self.pool, Path::new(&home), sweep_started_at).await;
             match result {
                 Ok(tc) => tc,
                 Err(e) => {

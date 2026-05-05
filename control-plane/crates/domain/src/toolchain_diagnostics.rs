@@ -468,10 +468,7 @@ impl DiagCleanupState {
         Self {
             owner: DiagCleanupOwner::AcpSessionClose,
             plan: DiagCleanupPlan::DeleteOnClose,
-            aggregate_outcome_surfaces: CLEANUP_SURFACES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            aggregate_outcome_surfaces: CLEANUP_SURFACES.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -479,10 +476,7 @@ impl DiagCleanupState {
         Self {
             owner: DiagCleanupOwner::GeneratedStateHousekeeping,
             plan: DiagCleanupPlan::DeferUntilTerminalPrune,
-            aggregate_outcome_surfaces: CLEANUP_SURFACES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            aggregate_outcome_surfaces: CLEANUP_SURFACES.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -490,10 +484,7 @@ impl DiagCleanupState {
         Self {
             owner: DiagCleanupOwner::StartupRecoverySweep,
             plan: DiagCleanupPlan::QuarantineThenRecreate,
-            aggregate_outcome_surfaces: CLEANUP_SURFACES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            aggregate_outcome_surfaces: CLEANUP_SURFACES.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -594,7 +585,10 @@ mod tests {
         let d = ToolchainMappingDiagnosticsV1::unsupported_family("auggie");
         assert_eq!(d.mapping_state, DiagMappingState::UnsupportedFamily);
         assert!(!d.mapping_enabled);
-        assert_eq!(d.inactive_reason, Some(DiagInactiveReason::UnsupportedFamily));
+        assert_eq!(
+            d.inactive_reason,
+            Some(DiagInactiveReason::UnsupportedFamily)
+        );
         assert_eq!(d.policy_source, DiagPolicySource::RunplanSnapshot);
     }
 
@@ -607,11 +601,23 @@ mod tests {
             "mapping_setup_disk_full",
         );
         assert_eq!(d.mapping_state, DiagMappingState::SetupFailed);
-        assert!(d.mapping_enabled, "setup_failed must have mapping_enabled=true (attempted)");
-        assert!(d.inactive_reason.is_none(), "setup_failed has no inactive_reason");
+        assert!(
+            d.mapping_enabled,
+            "setup_failed must have mapping_enabled=true (attempted)"
+        );
+        assert!(
+            d.inactive_reason.is_none(),
+            "setup_failed has no inactive_reason"
+        );
         assert_eq!(d.setup.status, DiagSetupStatus::Failed);
-        assert_eq!(d.setup.failure_kind.as_deref(), Some("toolchain_mapping_setup_failed"));
-        assert_eq!(d.setup.failure_reason.as_deref(), Some("mapping_setup_disk_full"));
+        assert_eq!(
+            d.setup.failure_kind.as_deref(),
+            Some("toolchain_mapping_setup_failed")
+        );
+        assert_eq!(
+            d.setup.failure_reason.as_deref(),
+            Some("mapping_setup_disk_full")
+        );
         assert_eq!(d.policy_source, DiagPolicySource::RunplanSnapshot);
     }
 
@@ -728,7 +734,10 @@ mod tests {
             (DiagMappingState::UnsupportedFamily, "unsupported_family"),
             (DiagMappingState::SetupFailed, "setup_failed"),
             (DiagMappingState::QueueTimeout, "queue_timeout"),
-            (DiagMappingState::LegacyRowUnavailable, "legacy_row_unavailable"),
+            (
+                DiagMappingState::LegacyRowUnavailable,
+                "legacy_row_unavailable",
+            ),
         ];
         for (state, expected) in &states {
             assert_eq!(state.as_str(), *expected, "as_str mismatch for {:?}", state);
@@ -757,10 +766,16 @@ mod tests {
         assert_eq!(timed_out.status, DiagConcurrencyStatus::QueueTimeout);
 
         let cancelled = DiagConcurrencyState::cancelled_before_acquire();
-        assert_eq!(cancelled.status, DiagConcurrencyStatus::CancelledBeforeAcquire);
+        assert_eq!(
+            cancelled.status,
+            DiagConcurrencyStatus::CancelledBeforeAcquire
+        );
 
         let quarantined = DiagConcurrencyState::root_quarantined_before_reuse();
-        assert_eq!(quarantined.status, DiagConcurrencyStatus::RootQuarantinedBeforeReuse);
+        assert_eq!(
+            quarantined.status,
+            DiagConcurrencyStatus::RootQuarantinedBeforeReuse
+        );
     }
 
     #[test]
@@ -773,7 +788,9 @@ mod tests {
         let close = DiagCleanupState::delete_on_close();
         assert_eq!(close.owner, DiagCleanupOwner::AcpSessionClose);
         assert_eq!(close.plan, DiagCleanupPlan::DeleteOnClose);
-        assert!(close.aggregate_outcome_surfaces.contains(&"startupRecoverySummary.toolchainCache".to_string()));
+        assert!(close
+            .aggregate_outcome_surfaces
+            .contains(&"startupRecoverySummary.toolchainCache".to_string()));
 
         let prune = DiagCleanupState::defer_until_terminal_prune();
         assert_eq!(prune.owner, DiagCleanupOwner::GeneratedStateHousekeeping);

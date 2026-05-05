@@ -105,15 +105,20 @@ pub async fn sweep_xcode_toolchain_roots(
             if !run_dir.is_dir() {
                 continue;
             }
-            let Some(run_id_str) = run_dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()) else {
+            let Some(run_id_str) = run_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+            else {
                 continue;
             };
 
-            let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?1")
-                .bind(&run_id_str)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM runs WHERE id = ?1")
+                    .bind(&run_id_str)
+                    .fetch_optional(pool)
+                    .await
+                    .unwrap_or(None);
 
             let is_terminal = status
                 .as_deref()
@@ -157,16 +162,18 @@ pub async fn sweep_xcode_toolchain_roots(
         }
     }
 
-    Ok(db::repos::toolchain_cache_housekeeping::ToolchainCacheHousekeepingReadback {
-        id: uuid::Uuid::new_v4().to_string(),
-        last_sweep_started_at: now,
-        run_scoped_roots_pruned: roots_pruned,
-        run_scoped_prune_failures: prune_failures,
-        oldest_eligible_root_age_days,
-        disk_pressure_blocks: 0,
-        quarantined_roots_created: 0,
-        created_at: Utc::now(),
-    })
+    Ok(
+        db::repos::toolchain_cache_housekeeping::ToolchainCacheHousekeepingReadback {
+            id: uuid::Uuid::new_v4().to_string(),
+            last_sweep_started_at: now,
+            run_scoped_roots_pruned: roots_pruned,
+            run_scoped_prune_failures: prune_failures,
+            oldest_eligible_root_age_days,
+            disk_pressure_blocks: 0,
+            quarantined_roots_created: 0,
+            created_at: Utc::now(),
+        },
+    )
 }
 
 async fn load_run_cleanup_candidates(pool: &SqlitePool) -> Result<Vec<RunCleanupCandidate>> {

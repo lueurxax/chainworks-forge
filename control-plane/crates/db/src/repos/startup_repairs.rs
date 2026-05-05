@@ -18,8 +18,7 @@ pub struct ToolchainCacheRecoveryReadback {
 
 impl ToolchainCacheRecoveryReadback {
     pub fn is_empty(&self) -> bool {
-        self.session_scoped_roots_seen.is_none()
-            && self.last_sweep_started_at.is_none()
+        self.session_scoped_roots_seen.is_none() && self.last_sweep_started_at.is_none()
     }
 }
 
@@ -272,7 +271,9 @@ fn parse_startup_recovery_readback_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<StartupRecoveryReadback> {
     let next_retry_or_backoff_time: Option<String> = row.get("next_retry_or_backoff_time");
-    let toolchain_last_sweep: Option<String> = row.try_get("toolchain_last_sweep_started_at").unwrap_or(None);
+    let toolchain_last_sweep: Option<String> = row
+        .try_get("toolchain_last_sweep_started_at")
+        .unwrap_or(None);
     Ok(StartupRecoveryReadback {
         id: row.get("id"),
         recovered_item_count: row.get("recovered_item_count"),
@@ -286,10 +287,18 @@ fn parse_startup_recovery_readback_row(
         stale_after_ms: row.get("stale_after_ms"),
         updated_at: parse_datetime(row.get("updated_at"))?,
         toolchain_cache: ToolchainCacheRecoveryReadback {
-            session_scoped_roots_seen: row.try_get("toolchain_session_scoped_roots_seen").unwrap_or(None),
-            session_scoped_roots_reclaimed: row.try_get("toolchain_session_scoped_roots_reclaimed").unwrap_or(None),
-            session_scoped_cleanup_failures: row.try_get("toolchain_session_scoped_cleanup_failures").unwrap_or(None),
-            orphan_threshold_minutes: row.try_get("toolchain_orphan_threshold_minutes").unwrap_or(None),
+            session_scoped_roots_seen: row
+                .try_get("toolchain_session_scoped_roots_seen")
+                .unwrap_or(None),
+            session_scoped_roots_reclaimed: row
+                .try_get("toolchain_session_scoped_roots_reclaimed")
+                .unwrap_or(None),
+            session_scoped_cleanup_failures: row
+                .try_get("toolchain_session_scoped_cleanup_failures")
+                .unwrap_or(None),
+            orphan_threshold_minutes: row
+                .try_get("toolchain_orphan_threshold_minutes")
+                .unwrap_or(None),
             last_sweep_started_at: toolchain_last_sweep
                 .map(|raw| parse_datetime(&raw))
                 .transpose()?,
