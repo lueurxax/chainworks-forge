@@ -1021,4 +1021,74 @@ mod tests {
             .unwrap();
         assert_eq!(result, None);
     }
+
+    /// P077 projection parity: after execute_closeout_transaction + rebuild_run_state_projection,
+    /// the exported run-state active_artifacts map must contain both proposal_gate_result_v1
+    /// and implementation_closeout_readiness_v1 so downstream consumers (GraphQL, MCP runs.get)
+    /// observe P077 truth via the canonical projection path.
+    #[tokio::test]
+    async fn p077_projection_parity_after_closeout_transaction() {
+        use crate::repos::artifact_contracts;
+
+        let pool = setup_test_db().await;
+        let run_id_str = insert_test_run(&pool).await;
+        let run_id: domain::ids::RunId = run_id_str.parse().unwrap();
+
+        let gate = make_gate(&run_id_str, ProposalGateStatus::Passed);
+        let readiness = make_readiness(
+            &run_id_str,
+            CloseoutReadinessStatus::Ready,
+            CloseoutReadinessDecision::EnterManualRelease,
+        );
+
+        execute_closeout_transaction(
+            &pool,
+            CloseoutTransactionInputs {
+                gate_result: &gate,
+                readiness: &readiness,
+                blocker_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        artifact_contracts::rebuild_run_state_projection(&pool, run_id)
+            .await
+            .unwrap();
+
+        let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("projection must exist after rebuild");
+
+        let active = projection
+            .run_state_json
+            .get("active_artifacts")
+            .expect("run_state_json must have active_artifacts");
+
+        assert!(
+            active.get("proposal_gate_result_v1").is_some(),
+            "proposal_gate_result_v1 must be present in projected active_artifacts"
+        );
+        assert!(
+            active.get("implementation_closeout_readiness_v1").is_some(),
+            "implementation_closeout_readiness_v1 must be present in projected active_artifacts"
+        );
+
+        // Verify the projected gate status is correct.
+        let gate_entry = &active["proposal_gate_result_v1"];
+        assert_eq!(
+            gate_entry.get("raw_status").and_then(|v| v.as_str()),
+            Some("passed"),
+            "projected gate status must be 'passed'"
+        );
+
+        // Verify the projected readiness decision is correct.
+        let readiness_entry = &active["implementation_closeout_readiness_v1"];
+        assert_eq!(
+            readiness_entry.get("decision").and_then(|v| v.as_str()),
+            Some("enter_manual_release"),
+            "projected readiness decision must be 'enter_manual_release'"
+        );
+    }
 }

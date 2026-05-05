@@ -3135,30 +3135,7 @@ impl CommandHandler {
 
                 // BLK-010: Bind capability to the canonical CapabilityToolId::ProposalGateSettle
                 // token and reject mismatches. Bind authority to registered allow-list.
-                // Prevents arbitrary capability/authority strings from polluting the audit lineage.
-                {
-                    let canonical_capability =
-                        serde_json::to_string(&CapabilityToolId::ProposalGateSettle)
-                            .unwrap_or_default();
-                    // serde_json serializes enum variant names as "ProposalGateSettle" (with quotes)
-                    let canonical_capability = canonical_capability.trim_matches('"');
-                    if c.capability != canonical_capability {
-                        anyhow::bail!(
-                            "invalid capability '{}': must be '{}'",
-                            c.capability,
-                            canonical_capability
-                        );
-                    }
-                    const ALLOWED_AUTHORITIES: &[&str] =
-                        &["release_owner", "control_plane_owner", "proposal_owner"];
-                    if !ALLOWED_AUTHORITIES.contains(&c.authority.as_str()) {
-                        anyhow::bail!(
-                            "invalid authority '{}': must be one of {:?}",
-                            c.authority,
-                            ALLOWED_AUTHORITIES
-                        );
-                    }
-                }
+                validate_proposal_gate_authorization(&c)?;
 
                 let settle_started = Instant::now();
                 let gate_id = format!("p{}:{}", c.proposal_id, c.proposal_id);
@@ -4218,6 +4195,33 @@ async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
     Ok(())
 }
 
+/// P077 BLK-010: Validate that the caller-supplied capability matches the canonical
+/// CapabilityToolId::ProposalGateSettle token and that the authority is in the
+/// registered allow-list.  Extracted for unit-testability.
+fn validate_proposal_gate_authorization(c: &SettleProposalGateCmd) -> Result<()> {
+    let canonical_capability =
+        serde_json::to_string(&CapabilityToolId::ProposalGateSettle).unwrap_or_default();
+    // serde_json serializes enum variant names as "ProposalGateSettle" (with quotes).
+    let canonical_capability = canonical_capability.trim_matches('"');
+    if c.capability != canonical_capability {
+        anyhow::bail!(
+            "invalid capability '{}': must be '{}'",
+            c.capability,
+            canonical_capability
+        );
+    }
+    const ALLOWED_AUTHORITIES: &[&str] =
+        &["release_owner", "control_plane_owner", "proposal_owner"];
+    if !ALLOWED_AUTHORITIES.contains(&c.authority.as_str()) {
+        anyhow::bail!(
+            "invalid authority '{}': must be one of {:?}",
+            c.authority,
+            ALLOWED_AUTHORITIES
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4432,5 +4436,61 @@ reviewer_override:
         .expect_err("receipt without durable evidence digest is unmanaged");
 
         assert!(err.to_string().contains("evidence_digest"));
+    }
+
+    // ── BLK-010: capability/authority binding rejection tests ─────────────────
+
+    #[test]
+    fn p077_mismatched_capability_is_rejected() {
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+        cmd.capability = "SomeOtherCapability".into();
+
+        let err = validate_proposal_gate_authorization(&cmd)
+            .expect_err("mismatched capability must be rejected");
+
+        assert!(
+            err.to_string().contains("invalid capability"),
+            "error should mention invalid capability: {err}"
+        );
+        assert!(
+            err.to_string().contains("ProposalGateSettle"),
+            "error should name the expected canonical token: {err}"
+        );
+    }
+
+    #[test]
+    fn p077_unknown_authority_is_rejected() {
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+        cmd.authority = "rogue_authority".into();
+
+        let err = validate_proposal_gate_authorization(&cmd)
+            .expect_err("unknown authority must be rejected");
+
+        assert!(
+            err.to_string().contains("invalid authority"),
+            "error should mention invalid authority: {err}"
+        );
+        assert!(
+            err.to_string().contains("release_owner"),
+            "error should name at least one allowed authority: {err}"
+        );
+    }
+
+    #[test]
+    fn p077_canonical_capability_and_known_authority_pass_validation() {
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+        validate_proposal_gate_authorization(&cmd)
+            .expect("canonical capability + known authority must pass validation");
+    }
+
+    #[test]
+    fn p077_all_allowed_authorities_pass_validation() {
+        for authority in ["release_owner", "control_plane_owner", "proposal_owner"] {
+            let mut cmd =
+                p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+            cmd.authority = authority.into();
+            validate_proposal_gate_authorization(&cmd)
+                .unwrap_or_else(|e| panic!("authority '{authority}' should pass: {e}"));
+        }
     }
 }
