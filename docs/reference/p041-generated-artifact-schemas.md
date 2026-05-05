@@ -12,8 +12,8 @@ The canonical same-tree P031 acceptance switch. Published to `control-plane/targ
 |---|---|---|
 | `schema_version` | `String` | Fixed: `p031-phase-0-runtime-manifest-row.v1`. |
 | `id` | `String` | Fixed: `p041_parity_evidence`. |
-| `runtime_detail_path` | `String` | Path to the runtime detail artifact. |
-| `reference_detail_path` | `String` | Path to the promoted reference snapshot. |
+| `runtime_detail_path` | `String` | Repo-relative path to the runtime detail artifact. Must equal the canonical constant `control-plane/target/parity/publication/current/p031-p041-parity-evidence.json`; absolute paths and `..` traversal are rejected. |
+| `reference_detail_path` | `String` | Repo-relative path to the promoted reference snapshot. Must equal the canonical constant `docs/reference/p031-p041-parity-evidence.json`; absolute paths and `..` traversal are rejected. |
 | `validation_status` | `Status` | Canonical status (e.g., `ready_same_tree_verified`). |
 | `publication_state` | `String` | e.g., `revoked_for_rerun`, `published`. |
 | `publication_generation_id` | `String` | Unique ID for the current generation. |
@@ -32,9 +32,9 @@ The authoritative runtime detail artifact. Published to `control-plane/target/pa
 | `publication_state` | `String` | Must match row's publication state. |
 | `required_fixtures` | `[String]` | List of all seven required fixture IDs. |
 | `required_surfaces` | `[String]` | List of all six required surface IDs. |
-| `fixtures` | `[FixtureVerdict]` | Per-fixture verdicts and provenance. |
+| `fixtures` | `[FixtureVerdict]` | Per-fixture verdicts and provenance. Each entry has `fixture_id` (String), `report_path` (repo-relative path to `behavioral-diff-report.json`), `replay_path` (repo-relative path to `server-replay.json`), `shadow_report_path` (repo-relative path to `live-shadow-report.json`), `verdict` (per-fixture status), and `provenance` (fixture provenance summary). |
 | `blocking_reasons` | `[String]` | Diagnostic reasons for non-ready status. |
-| `missing_evidence` | `[String]` | Paths to missing producer artifacts. |
+| `missing_evidence` | `[MissingEvidenceEntry]` | Structured missing-evidence diagnostics. Each entry has `missing_path` (String), `expected_producer` (String), `affected_fixture_or_surface` (String), and `next_action` (String). |
 | `provenance` | `Provenance` | Shared provenance block. |
 
 ## Fixture Work Product Schemas
@@ -43,7 +43,7 @@ These schemas describe the artifacts produced by the P041 parity harness in `con
 
 ### `server-replay.v1`
 
-Produced by the canonical replay of a golden fixture (offline or live-shadow). Written to `control-plane/target/parity/<fixture_id>/server-replay.json` for offline replays and `control-plane/target/parity/shadow/<replay_id>/server-replay.json` for live-shadow replays.
+Produced by the canonical replay of a golden fixture (offline or live-shadow). Written to `control-plane/target/parity/work/<generation_id>/<fixture_id>/server-replay.json` for offline replays and `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/server-replay.json` for live-shadow replays. The active generation id is read from `P041_PUBLICATION_GENERATION_ID`; the schema-validation harness uses the literal `unscoped-fixture-replay` when the env var is unset.
 
 | Field | Type | Description |
 |---|---|---|
@@ -59,12 +59,12 @@ Produced by the canonical replay of a golden fixture (offline or live-shadow). W
 | `executable_inputs` | `ExecutableInputs` | Repo-relative paths to: `workflow_snapshot`, `agent_catalog_snapshot`, `provider_profile`, `runtime_events`, `operator_decisions`, `database`. |
 | `run_projection` | `RunProjection` | Snapshot of the run projection row: `id`, `idea_id`, `status`, `workflow_id`, `workflow_title`, `total_stages`, `completed_stages`, `failed_stages`, `pending_approvals`. |
 | `stage_projection` | `[StageProjection]` | Per-stage projection rows: `id`, `run_id`, `stage_id`, `label`, `status`, `iteration`, `attempt_number`, `settlement_kind`, `has_artifacts`, `has_pending_approval`, `has_validation_failure`. |
-| `artifact_index` | `[ArtifactIndex]` | Materialized artifact rows: `id`, `run_id`, `stage_id`, `agent_id`, `name`, `contract_id`, `format`, `file_path`, `provider`, `report_kind`, `report_version`. |
+| `artifact_index` | `[ArtifactIndex]` | Materialized artifact rows: `id`, `run_id`, `stage_id`, `agent_id`, `name`, `contract_id`, `format`, `file_path`, `provider`, `report_kind`, `report_version`. `file_path` is normalized to be portable: paths under the workspace root are emitted workspace-relative; remaining absolute paths under `/Users/`, `/var/folders/`, `/private/var/folders/`, or `/tmp/` are replaced with a `<machine-local>…` token so server-replay artifacts do not leak host or home-directory layout. |
 | `operator_decisions` | `[OperatorDecision]` | Replay of the fixture's frozen operator decision stream: `stage_id`, `decision`, `at`. |
 
 ### `behavioral-diff-report.v1`
 
-Produced by comparing the replayed canonical state against the fixture's golden client truth. Written to `control-plane/target/parity/reports/<fixture_id>/behavioral-diff-report.json` for offline replays and `control-plane/target/parity/shadow/reports/<fixture_id>/behavioral-diff-report.json` for live-shadow replays. The same schema is reused by the `fixture_regeneration` mode for regeneration diff reports stored alongside fixtures.
+Produced by comparing the replayed canonical state against the fixture's golden client truth. Written to `control-plane/target/parity/reports/<generation_id>/<fixture_id>/behavioral-diff-report.json` for offline replays. The same schema is reused by the `fixture_regeneration` mode for regeneration diff reports stored alongside fixtures. Live-shadow replays emit the dedicated `live-shadow-report.v1` schema (see below) to `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/live-shadow-report.json` instead.
 
 | Field | Type | Description |
 |---|---|---|
@@ -91,7 +91,13 @@ Produced by comparing the replayed canonical state against the fixture's golden 
 | `verdict` | `String` | `ready` when `blocking_count == 0`; `red` otherwise. |
 | `created_at` | `String` | RFC3339 timestamp at which the report was emitted. |
 
-> Note: there is no separate `live-shadow-report.v1` schema. Live-shadow replays emit a `behavioral-diff-report.v1` with `mode == "live_shadow"` and a populated `shadow_contract`. The shadow contract enforces that the replay wrote to the `shadow` storage namespace, did not settle production stages, and forbade live adapter invocation.
+### `live-shadow-report.v1`
+
+Produced by live-shadow replays. Written to `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/live-shadow-report.json`. Field shape mirrors `behavioral-diff-report.v1` with the following pinned values:
+
+- `schema_version` is `live-shadow-report.v1`.
+- `mode` is `live_shadow`.
+- `shadow_contract` is populated with `{ source_run_id, shadow_run_id, fixture_or_capture_id, idempotency_key, storage_namespace = "shadow", artifact_root, settles_production_stages = false, live_adapter_invocation = "forbidden" }`. The shadow contract enforces that the replay wrote to the `shadow` storage namespace, did not settle production stages, and forbade live adapter invocation.
 
 ## Ownership and Integrity
 
@@ -114,6 +120,8 @@ Produced by comparing the replayed canonical state against the fixture's golden 
 | `blocked_interrupted` | Interrupted by operator | `WARN` |
 | `blocked_in_progress` | Rerun active; do not trust stale evidence | `INFO` |
 
+Blocked-state precedence (P041 §5) is fixed for CLI and summary rendering: `blocked_manual_recovery` overrides `blocked_missing_evidence`, which overrides `blocked_divergence`, which overrides `blocked_dirty_tree`, which overrides `blocked_timeout`, which overrides `blocked_interrupted`, which overrides `blocked_in_progress`. `ready_same_tree_verified` is legal only when none of those blocked states apply.
+
 ## Work Product Retention
 
 The proposal target retention policy (P041 §6.4) is:
@@ -122,4 +130,4 @@ The proposal target retention policy (P041 §6.4) is:
 2. **`blocked_manual_recovery` generations**: never auto-pruned. Operator action is required because their diagnostic value is the reason reclamation is blocked.
 3. **Storage budget**: when retained parity generations exceed 500 MB, the CLI must warn and list preserved roots plus sizes; hitting the budget is diagnostic, not authorization to delete manual-recovery evidence.
 
-Implementation status: generation-scoped layout, automatic pruning, and the 500 MB budget check are not yet wired into the gate. Today the harness writes per-fixture work products under `control-plane/target/parity/<fixture_id>/` and `control-plane/target/parity/reports/<fixture_id>/` and does not auto-prune. `control-plane/target/parity-control/` is implemented as a cleanup-safe root and is never removed by gate cleanup.
+Implementation status: the generation-scoped path layout is now wired into the harness — per-fixture work products are written under `control-plane/target/parity/work/<generation_id>/<fixture_id>/`, reports under `control-plane/target/parity/reports/<generation_id>/<fixture_id>/`, and shadow output under `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/`. The active generation id comes from `P041_PUBLICATION_GENERATION_ID`, which the gate exports as `p041-<utc_iso>-<rand8>`; bare `cargo test` runs outside the gate use the sentinel `unscoped-fixture-replay`. Automatic pruning (oldest-first retention of one ready and one non-manual blocked diagnostic generation, never pruning `blocked_manual_recovery`) and the 500 MB storage-budget warning are wired into the gate. `control-plane/target/parity-control/` is implemented as a cleanup-safe root, is acquired by the gate (lease, current-step, release-marker, and reclaim-marker written via atomic same-directory rename), and is never removed by gate cleanup. Lease heartbeat refresh is driven between phases of the gate: the `p041_update_lease_heartbeat` step rewrites `lease.json` with a fresh `heartbeat_unix_ms` and an incremented `control_sequence` before each fixture-inventory, replay, shadow, readback, handoff, and runtime-publication phase, so the A1/A2 freshness-window successor reclaim path is exercisable end-to-end against the gate's own lease.

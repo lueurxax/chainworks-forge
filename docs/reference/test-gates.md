@@ -569,15 +569,16 @@ Scope:
 - P041 `GoldenRunFixture` inventory and schema validation
 - capture/regeneration lifecycle validation through `scripts/parity/capture-golden-run.sh --validate`
 - deterministic offline replay over every required P041 fixture
-- per-fixture replay databases under `control-plane/target/parity/<fixture_id>/parity.sqlite` (generation-scoped `work/<generation_id>/<fixture_id>/` layout is the proposal target; not yet wired into the gate — see `p041-generated-artifact-schemas.md`)
-- per-fixture `BehavioralDiffReport` and `server-replay.json` under `control-plane/target/parity/reports/<fixture_id>/` and `control-plane/target/parity/<fixture_id>/`
-- per-fixture live-shadow reports under `control-plane/target/parity/shadow/reports/<fixture_id>/` and shadow replay artifacts under `control-plane/target/parity/shadow/<fixture_id>/`
+- per-fixture replay databases under `control-plane/target/parity/work/<generation_id>/<fixture_id>/parity.sqlite` (generation id comes from `P041_PUBLICATION_GENERATION_ID`, exported by the gate as `p041-<utc_iso>-<rand8>`; bare `cargo test` runs outside the gate use the sentinel `unscoped-fixture-replay`)
+- per-fixture `BehavioralDiffReport` under `control-plane/target/parity/reports/<generation_id>/<fixture_id>/behavioral-diff-report.json` and `server-replay.json` under `control-plane/target/parity/work/<generation_id>/<fixture_id>/`
+- per-fixture live-shadow reports under `control-plane/target/parity/shadow/<generation_id>/<fixture_id>/live-shadow-report.json` (schema `live-shadow-report.v1`)
 - fixture-bound `surface_comparisons` for canonical state, projections, GraphQL readback, MCP report readback, artifact identity, and operator summary
 - fail-closed shadow side-effect policy for stubbed runtime/provider inputs
 - fixture-bound GraphQL run/stage/artifact/projection readback parity via `proposal_041_graphql_readback_parity_surfaces`
 - fixture-bound MCP `reports.get` and `report://{run_id}` readback parity via P041-named tests
-- runtime publication contract validation (row + detail schema agreement, provenance shape) at `control-plane/target/parity/publication/current/`; the gate currently emits `blocked_missing_evidence` schema-validation publications and does not yet promote `ready_same_tree_verified`
-- `control-plane/target/parity-control/` lease, heartbeat, reclaim-marker, and current-step types are implemented in `engine::parity_control` and unit-tested, but not yet acquired/written by the gate driver
+- runtime publication contract validation (row + detail schema agreement, provenance shape) at `control-plane/target/parity/publication/current/` plus generation-scoped staging at `control-plane/target/parity/publication/generations/<generation_id>/`; the gate computes the canonical status from fixture verdicts, provenance, and `parity-control` markers and promotes `ready_same_tree_verified` only when every fixture passes, the live tree is clean (`tree_clean == true` and `status_snapshot_line_count == 0`), and provenance is real (not the `test-run-no-git` sentinel)
+- `control-plane/target/parity-control/` is acquired by the gate driver before destructive work; `lease.json`, `current-step.json`, `release-marker.json`, and `reclaim-marker.json` are written via the same-directory temp-file + durable-flush + atomic-rename contract. The gate also refreshes `lease.json` (`heartbeat_unix_ms` plus monotonic `control_sequence`) between fixture-inventory, replay, shadow, readback, handoff, and runtime-publication phases, so the A1/A2 freshness-window successor reclaim path is exercisable end-to-end against the gate's own lease; `engine::parity_control` provides all marker types and the reclaim-decision matrix.
+- generation retention follows proposal §6.4: the gate prunes older non-manual generations oldest-first while preserving the newest ready generation, the newest non-manual blocked diagnostic generation, and every `blocked_manual_recovery` generation; storage above 500 MB triggers a `[WARN]` listing preserved roots and sizes (warning only, never authorization to delete manual-recovery evidence)
 
 Use when:
 
@@ -602,8 +603,8 @@ Important:
 
 - `p041` is accepted as an alias
 - the gate fails closed on missing fixtures, invalid schema, missing capture/regeneration provenance, missing executable frozen-input refs, missing fixture-bound surface comparisons, missing GraphQL/MCP collector owners, missing live-shadow correlation, or blocking divergences
-- the runtime publication contract test asserts row/detail schema-version equality, status equality, and `publication_generation_id` equality against a schema-validation publication; live `ready_same_tree_verified` promotion (with provenance + live-checkout match) is not yet wired into the gate
-- the canonical P031 acceptance switch (when implemented) is the runtime row at `control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json`; for now the reference promotion at `docs/reference/p031-p041-parity-evidence.json` is a `not_ready_pending_gate_run` skeleton
+- the runtime publication contract test asserts row/detail schema-version equality, status equality, `publication_generation_id` equality, and canonical-path validation for `runtime_detail_path` / `reference_detail_path`; live `ready_same_tree_verified` promotion (with real provenance, clean tree, and live-checkout match) is wired and gated by `scripts/p031-thin-ui-gate.py validate_p041_parity_row`
+- the canonical P031 acceptance switch is the runtime row at `control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json`; the reference snapshot at `docs/reference/p031-p041-parity-evidence.json` is populated via `scripts/parity/promote-p041-reference.sh` after a successful gate run
 - the `p031-p041-parity-evidence.md` companion is explicitly **non-authoritative** and structurally non-normative.
 
 Status Vocabulary:

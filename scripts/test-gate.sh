@@ -559,6 +559,142 @@ log() {
   printf '==> %s\n' "$*"
 }
 
+p041_prefixed_run() {
+  local status
+  set +e
+  "$@" 2>&1 | while IFS= read -r line; do
+    case "$line" in
+      \[INFO\]*|\[PASS\]*|\[WARN\]*|\[FAIL\]*)
+        printf '%s\n' "$line"
+        ;;
+      *)
+        printf '[INFO] %s\n' "$line"
+        ;;
+    esac
+  done
+  status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
+# Refresh parity-control/lease.json heartbeat_unix_ms and increment control_sequence.
+# Called between cargo phases so a live-but-stalled owner can be detected (Section 6.3
+# A1/A2 freshness rule).  Reads the existing lease, bumps control_sequence, updates
+# heartbeat_unix_ms, and atomically writes it back with the same durable contract.
+p041_update_lease_heartbeat() {
+  python3 -c "
+import ctypes, ctypes.util, json, os, sys, tempfile, time
+from pathlib import Path
+
+ctrl = Path('target/parity-control')
+lease_path = ctrl / 'lease.json'
+if not lease_path.exists():
+    sys.exit(0)  # No lease yet; nothing to refresh.
+try:
+    lease = json.loads(lease_path.read_text())
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)  # Unreadable; leave as-is; reclaim logic handles on next startup.
+
+lease['heartbeat_unix_ms'] = int(time.time() * 1000)
+lease['control_sequence'] = int(lease.get('control_sequence', 1)) + 1
+
+fd, tmp = tempfile.mkstemp(prefix='.lease.', suffix='.tmp', dir=str(ctrl))
+try:
+    with os.fdopen(fd, 'w') as h:
+        json.dump(lease, h, indent=2)
+        h.write('\n')
+        h.flush()
+        raw_fd = h.fileno()
+        if sys.platform == 'darwin':
+            try:
+                libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+                if libc.fcntl(raw_fd, 51) != 0:
+                    os.fsync(raw_fd)
+            except Exception:
+                os.fsync(raw_fd)
+        else:
+            os.fsync(raw_fd)
+    os.replace(tmp, str(lease_path))
+    try:
+        dfd = os.open(str(ctrl), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+finally:
+    try:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    except OSError:
+        pass
+"
+}
+
+# Write parity-control/current-step.json with the full durable atomic write
+# contract (Section 6.3): same-dir tempfile, F_FULLFSYNC on Darwin, atomic
+# rename, parent-dir fsync. Replaces bare os.fsync+os.replace inline blocks.
+# Args: $1=step_name $2=surface_name_or_empty
+p041_update_current_step() {
+  local _step="$1" _surface="${2:-}"
+  P041_STEP_NAME="$_step" P041_STEP_SURFACE="$_surface" python3 -c "
+import ctypes, ctypes.util, json, os, sys, tempfile, time
+from pathlib import Path
+
+def _atomic_current_step(ctrl, step, surface):
+    ctrl.mkdir(parents=True, exist_ok=True)
+    data = {
+        'schema_version': 'parity-control-current-step.v1',
+        'generation': os.environ.get('P041_PUBLICATION_GENERATION_ID', ''),
+        'fixture': None,
+        'step': step,
+        'surface': surface if surface else None,
+        'mode': 'gate',
+        'elapsed_ms': 0,
+        'heartbeat_unix_ms': int(time.time() * 1000),
+    }
+    target = ctrl / 'current-step.json'
+    fd, tmp = tempfile.mkstemp(prefix='.current-step.', suffix='.tmp', dir=str(ctrl))
+    try:
+        with os.fdopen(fd, 'w') as h:
+            json.dump(data, h, indent=2)
+            h.write('\n')
+            h.flush()
+            raw_fd = h.fileno()
+            if sys.platform == 'darwin':
+                try:
+                    libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+                    if libc.fcntl(raw_fd, 51) != 0:
+                        os.fsync(raw_fd)
+                except Exception:
+                    os.fsync(raw_fd)
+            else:
+                os.fsync(raw_fd)
+        os.replace(tmp, str(target))
+        try:
+            dfd = os.open(str(ctrl), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+_atomic_current_step(
+    Path('target/parity-control'),
+    os.environ.get('P041_STEP_NAME', ''),
+    os.environ.get('P041_STEP_SURFACE', ''),
+)
+"
+}
+
 should_use_unsigned_ui_tests() {
   local configured="${CHAINWORKS_USE_UNSIGNED_UI_TESTS:-}"
   if [[ -n "$configured" ]]; then
@@ -2258,7 +2394,8 @@ PY
     run_split_targeted_gate "proposal-037" "${PROPOSAL_037_TESTS[@]}"
     ;;
   proposal-041|p041)
-    log "Proposal 041 control-plane gate: server parity harness, golden fixtures, and behavioral diff"
+    echo "[INFO] Proposal 041 control-plane gate: server parity harness, golden fixtures, and behavioral diff"
+    _p041_cap_idx=0
     for fixture_id in \
       proposal-loop-basic \
       implementation-refine-review \
@@ -2267,7 +2404,10 @@ PY
       cancelled-or-blocked-run \
       terminal-report-evidence \
       projection-readback-surface; do
-      "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate >/dev/null
+      _p041_cap_idx=$((_p041_cap_idx + 1))
+      echo "[INFO] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
+      p041_prefixed_run "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate
+      echo "[PASS] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
     done
     (
       cd "$ROOT_DIR/control-plane"
@@ -2314,18 +2454,445 @@ PY
                        || printf '%08x' $((RANDOM * RANDOM % 0xffffffff)))
       export P041_PUBLICATION_GENERATION_ID="p041-${_p041_gen_ts}-${_p041_gen_rand}"
       echo "[INFO] p041 generation ${P041_PUBLICATION_GENERATION_ID}"
-      cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
-      cargo test -p graphql-server proposal_041_graphql_readback_parity_surfaces -- --nocapture &&
-      cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
-      cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
-      python3 - <<'PY'
+      p041_prefixed_run python3 - <<'PY' &&
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+generation_id = os.environ["P041_PUBLICATION_GENERATION_ID"]
+commit_sha = os.environ["P041_GIT_COMMIT_SHA"]
+tree_id = os.environ["P041_GIT_TREE_ID"]
+tree_clean = os.environ["P041_GIT_TREE_CLEAN"] == "true"
+status_sha = os.environ["P041_GIT_STATUS_SNAPSHOT_SHA256"]
+status_lines = int(os.environ["P041_GIT_STATUS_SNAPSHOT_LINE_COUNT"])
+now_ms = int(time.time() * 1000)
+now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+parity_root = Path("target/parity")
+control_root = Path("target/parity-control")
+current_root = parity_root / "publication/current"
+generation_root = parity_root / "publication/generations" / generation_id
+for root in (parity_root, control_root, current_root, generation_root):
+    root.mkdir(parents=True, exist_ok=True)
+for root in (parity_root, control_root):
+    (root / ".metadata_never_index").touch()
+
+# Symlink boundary hardening (SEC-P041-003): reject if parity_root or control_root
+# is a symlink or resolves outside control-plane/target/.  Prevents symlink-redirected
+# publication writes and shutil.rmtree pruning from escaping the expected tree.
+_target_anchor = Path("target").resolve()
+for _check_path, _label in (
+    (parity_root, "target/parity"),
+    (control_root, "target/parity-control"),
+):
+    if _check_path.is_symlink():
+        raise SystemExit(
+            f"proposal-041: {_label} is a symlink; refusing to write parity artifacts "
+            f"to a redirected root (SEC-P041-003). Remove the symlink and rerun."
+        )
+    _resolved_check = _check_path.resolve()
+    if not str(_resolved_check).startswith(str(_target_anchor)):
+        raise SystemExit(
+            f"proposal-041: {_label} resolves to {_resolved_check}, which is outside "
+            f"control-plane/target/; refusing to write (SEC-P041-003)."
+        )
+
+def _get_process_birth_unix_ms(pid: int) -> int:
+    """Return process birth time in Unix ms via proc_pidinfo on Darwin.
+
+    Falls back to current wall-clock time on non-Darwin or if proc_pidinfo
+    is unavailable. Per proposal Section 6.3, ps is forbidden.
+    """
+    if sys.platform == "darwin":
+        try:
+            import ctypes, ctypes.util, struct
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            # struct proc_bsdinfo layout (first two timing fields):
+            # pbi_start_tvsec (uint64) at offset 168, pbi_start_tvusec (uint32) at offset 176
+            # We allocate the full struct size (416 bytes) and read start time fields.
+            PROC_PIDTBSDINFO = 3
+            buf_size = 416
+            buf = ctypes.create_string_buffer(buf_size)
+            ret = libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buf, buf_size)
+            if ret >= buf_size:
+                # pbi_start_tvsec is at offset 168 (uint64_t), pbi_start_tvusec at 176 (uint32_t)
+                sec = struct.unpack_from("<Q", buf, 168)[0]
+                usec = struct.unpack_from("<I", buf, 176)[0]
+                ms = sec * 1000 + usec // 1000
+                if ms > 0:
+                    return ms
+        except Exception:
+            pass
+    return int(time.time() * 1000)
+
+def _darwin_fullfsync(fd: int) -> bool:
+    """Try F_FULLFSYNC on Darwin; return True if successful."""
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        F_FULLFSYNC = 51  # Darwin-specific fcntl cmd
+        return libc.fcntl(fd, F_FULLFSYNC) == 0
+    except Exception:
+        return False
+
+def atomic_json(path, value):
+    """Write value as pretty JSON via same-dir temp + durable flush + atomic rename.
+
+    Satisfies the durable-write contract (Section 6.3): temp file in the same
+    directory (same-volume rule), durable flush (F_FULLFSYNC on Darwin, fsync
+    fallback), atomic rename, best-effort parent-dir fsync.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            raw_fd = handle.fileno()
+            if sys.platform == "darwin":
+                if not _darwin_fullfsync(raw_fd):
+                    os.fsync(raw_fd)
+            else:
+                os.fsync(raw_fd)
+        os.replace(tmp, path)
+        # Best-effort parent-dir durability barrier.
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+provenance = {
+    "commit_sha": commit_sha,
+    "tree_id": tree_id,
+    "tree_clean": tree_clean,
+    "status_snapshot_sha256": status_sha,
+    "status_snapshot_line_count": status_lines,
+    "generated_at": now_iso,
+    "gate": "./scripts/test-gate.sh proposal-041",
+}
+fixtures = [
+    "proposal-loop-basic",
+    "implementation-refine-review",
+    "approval-pause-resume",
+    "retry-recovery-flow",
+    "cancelled-or-blocked-run",
+    "terminal-report-evidence",
+    "projection-readback-surface",
+]
+surfaces = [
+    "canonical_domain_state",
+    "projections",
+    "graphql_readback",
+    "mcp_report_readback",
+    "artifact_identity",
+    "operator_summary",
+]
+detail = {
+    "schema_version": "p031-p041-parity-evidence.v1",
+    "overall_status": "blocked_in_progress",
+    "publication_generation_id": generation_id,
+    "publication_state": "revoked_for_rerun",
+    "required_fixtures": fixtures,
+    "required_surfaces": surfaces,
+    "fixtures": [
+        {
+            "fixture_id": fixture_id,
+            "report_path": f"control-plane/target/parity/reports/{generation_id}/{fixture_id}/behavioral-diff-report.json",
+            "replay_path": f"control-plane/target/parity/work/{generation_id}/{fixture_id}/server-replay.json",
+            "shadow_report_path": f"control-plane/target/parity/shadow/{generation_id}/{fixture_id}/live-shadow-report.json",
+            "verdict": "blocked_in_progress",
+        }
+        for fixture_id in fixtures
+    ],
+    "blocking_reasons": ["rerun_in_progress"],
+    "missing_evidence": [],
+    "provenance": provenance,
+}
+row = {
+    "schema_version": "p031-phase-0-runtime-manifest-row.v1",
+    "id": "p041_parity_evidence",
+    "runtime_detail_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+    "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
+    "validation_status": "blocked_in_progress",
+    "publication_state": "revoked_for_rerun",
+    "publication_generation_id": generation_id,
+    "detail_schema_version": "p031-p041-parity-evidence.v1",
+    "provenance": provenance,
+}
+
+def _publish_blocked_manual_recovery(reason: str) -> None:
+    """Publish blocked_manual_recovery runtime row+detail to current/ before an early exit.
+
+    Proposal Section 6.3 requires the CLI and runtime detail artifact to surface the
+    unresolved owner state so downstream consumers (p031-thin-ui-gate.py) do not continue
+    trusting stale current/ artifacts as if they were authoritative.
+    """
+    _mr_detail = dict(detail)
+    _mr_detail["overall_status"] = "blocked_manual_recovery"
+    _mr_detail["publication_state"] = "diagnostic_blocked"
+    _mr_detail["blocking_reasons"] = [reason]
+    _mr_row = dict(row)
+    _mr_row["validation_status"] = "blocked_manual_recovery"
+    _mr_row["publication_state"] = "diagnostic_blocked"
+    try:
+        atomic_json(current_root / "p031-p041-parity-evidence.json", _mr_detail)
+        atomic_json(current_root / "p031-phase-0-manifest-row.json", _mr_row)
+    except OSError as _pub_err:
+        print(f"[WARN] proposal-041: unable to publish blocked_manual_recovery artifacts: {_pub_err}")
+
+# Reclaim check: inspect existing lease and reclaim-marker before proceeding.
+# Implements proposal Section 6.3 reclaim matrix (Cases A/B/C/D).
+# NOTE: pgid lifecycle is deferred (MISSING-001). The lease PID is the Python
+# setup process which exits before cargo tests begin. PID-gone reclaim uses a
+# release-marker clean-exit check (Case D-lite) rather than pgid descendant-absence
+# proof. Full Cases A2/B/C require a persistent gate supervisor (not yet implemented).
+_reclaim_marker_path = control_root / "reclaim-marker.json"
+_existing_lease_path = control_root / "lease.json"
+_release_marker_path = control_root / "release-marker.json"
+if _reclaim_marker_path.exists():
+    try:
+        _rm = json.loads(_reclaim_marker_path.read_text())
+        if _rm.get("overall_status") == "blocked_manual_recovery":
+            # Publish blocked_manual_recovery to current/ so downstream consumers see the
+            # real state rather than stale artifacts from the last completed run.
+            _publish_blocked_manual_recovery("blocked_manual_recovery_reclaim_marker_present")
+            print(
+                f"[FAIL] proposal-041: found blocked_manual_recovery reclaim marker "
+                f"at {_reclaim_marker_path}. Manual recovery required before rerun. "
+                f"Inspect: abandoned_generation_id={_rm.get('abandoned_generation_id')} "
+                f"owner_pid={_rm.get('owner_pid')} "
+                f"preserved_generation_root={_rm.get('preserved_generation_root')}",
+                file=sys.stderr,
+            )
+            raise SystemExit(
+                "proposal-041: blocked_manual_recovery; remove reclaim-marker.json "
+                "after resolving the stale owner"
+            )
+        # reclaim_allowed or unknown status: proceed (existing reclaim was documented)
+    except (json.JSONDecodeError, OSError) as _reclaim_err:
+        # Unreadable reclaim marker — fail closed per Section 6.3.
+        _publish_blocked_manual_recovery("unreadable_reclaim_marker")
+        print(
+            f"[FAIL] proposal-041: reclaim-marker.json exists but is unreadable "
+            f"({_reclaim_err}). Remove or repair {_reclaim_marker_path} before retrying.",
+            file=sys.stderr,
+        )
+        raise SystemExit(
+            "proposal-041: unreadable reclaim-marker.json; fail-closed "
+            "(remove and rerun after verifying no active gate processes remain)"
+        )
+
+if _existing_lease_path.exists():
+    try:
+        _old_lease = json.loads(_existing_lease_path.read_text())
+        _old_pid = int(_old_lease.get("pid", 0))
+        _old_gen = _old_lease.get("publication_generation_id", "unknown")
+        _old_birth_ms = int(_old_lease.get("process_birth_unix_ms", 0))
+        _old_pgid = int(_old_lease.get("pgid", 0))
+        _old_heartbeat_ms = int(_old_lease.get("heartbeat_unix_ms", 0))
+        _old_seq = int(_old_lease.get("control_sequence", 0))
+
+        # Check if old owner PID is still alive.
+        _pid_alive = False
+        if _old_pid:
+            try:
+                os.kill(_old_pid, 0)
+                _pid_alive = True
+            except (OSError, ProcessLookupError):
+                pass
+
+        if _pid_alive:
+            # Verify birth time to distinguish a recycled PID from the original owner.
+            _current_birth_ms = _get_process_birth_unix_ms(_old_pid)
+            _birth_matches = (
+                _old_birth_ms > 0
+                and abs(_old_birth_ms - _current_birth_ms) < 5000
+            )
+            if _birth_matches:
+                # Case A: owner alive with matching birth time — fail closed.
+                # Write blocked_in_progress to current/ so consumers see the live-owner state.
+                atomic_json(current_root / "p031-p041-parity-evidence.json", detail)
+                atomic_json(current_root / "p031-phase-0-manifest-row.json", row)
+                print(
+                    f"[FAIL] proposal-041: gate owner PID {_old_pid} is alive "
+                    f"(birth_ms={_old_birth_ms}, gen={_old_gen}). "
+                    f"Wait for the active run to complete. "
+                    f"heartbeat_unix_ms={_old_heartbeat_ms} control_sequence={_old_seq}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(
+                    "proposal-041: active gate owner still running (Case A); fail-closed"
+                )
+            # PID alive but birth time does not match: OS recycled the PID.
+            # Fall through to PID-gone reclaim handling below.
+            _pid_alive = False
+
+        # PID is gone. Write a reclaim marker documenting the reclaim decision before
+        # continuing, per Section 6.3 Case D contract.
+        # Check release-marker to distinguish clean exit from interrupted/crash exit.
+        _has_clean_release = False
+        if _release_marker_path.exists():
+            try:
+                _rel_data = json.loads(_release_marker_path.read_text())
+                # Require both generation_id match AND descendant_quiescent=True (SEC-P041-002).
+                # A release marker from an interrupted/failed gate has descendant_quiescent=False
+                # or will be absent; only a clean synchronous completion writes True.
+                _has_clean_release = (
+                    _rel_data.get("generation_id") == _old_gen
+                    and _rel_data.get("descendant_quiescent", False) is True
+                )
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        _reclaim_record = {
+            "schema_version": "parity-control-reclaim-marker.v1",
+            "overall_status": "reclaim_allowed" if _has_clean_release else "blocked_manual_recovery",
+            "abandoned_generation_id": _old_gen,
+            "preserved_generation_root": None,
+            "owner_pid": _old_pid,
+            "owner_process_birth_unix_ms": _old_birth_ms,
+            "owner_pgid": _old_pgid if _old_pgid > 0 else None,
+            "owner_hostname": _old_lease.get("hostname", "unknown"),
+            "owner_last_heartbeat_unix_ms": _old_heartbeat_ms,
+            "owner_last_control_sequence": _old_seq,
+            "observation_count": 1,
+            "freshness_window_ms": 120000,
+            "missing_pgid_metadata": _old_pgid == 0,
+            "observable_descendants": False,
+            "written_at_unix_ms": now_ms,
+            "diagnostic_message": (
+                "Owner PID gone; release-marker confirms clean exit; "
+                "pgid tracking deferred (MISSING-001)."
+                if _has_clean_release
+                else
+                "Owner PID gone; no release-marker for this generation; "
+                "gate may have been interrupted or crashed. pgid tracking deferred (MISSING-001). "
+                "Remove reclaim-marker.json after verifying no active gate subprocesses remain."
+            ),
+        }
+        atomic_json(_reclaim_marker_path, _reclaim_record)
+        if not _has_clean_release:
+            # Publish blocked_manual_recovery to current/ before exiting so downstream
+            # consumers see the unresolved owner state rather than stale artifacts.
+            _publish_blocked_manual_recovery("prior_gate_interrupted_or_no_descendant_quiescence_proof")
+            print(
+                f"[FAIL] proposal-041: previous gate owner PID {_old_pid} is gone but no "
+                f"clean release-marker found for generation {_old_gen} "
+                f"(missing or descendant_quiescent!=true). "
+                f"Gate may have been interrupted. Written blocked_manual_recovery reclaim "
+                f"marker at {_reclaim_marker_path}. "
+                f"Remove it after verifying no active gate subprocesses remain.",
+                file=sys.stderr,
+            )
+            raise SystemExit(
+                "proposal-041: prior gate has no clean release marker (interrupted/crashed or "
+                "descendant_quiescent=false); fail-closed (remove reclaim-marker.json after "
+                "verifying no active subprocesses)"
+            )
+        print(
+            f"[INFO] proposal-041: reclaimed generation {_old_gen} "
+            f"(owner PID {_old_pid} gone, release-marker confirms clean exit)"
+        )
+
+    except SystemExit:
+        raise
+    except (json.JSONDecodeError, OSError) as _lease_err:
+        # Unreadable lease — fail closed per Section 6.3.
+        print(
+            f"[FAIL] proposal-041: lease.json exists but is unreadable ({_lease_err}). "
+            f"Remove or repair {_existing_lease_path} before retrying.",
+            file=sys.stderr,
+        )
+        raise SystemExit(
+            "proposal-041: unreadable lease.json; fail-closed (remove and rerun)"
+        )
+
+own_pid = os.getpid()
+own_birth_ms = _get_process_birth_unix_ms(own_pid)
+lease = {
+    "schema_version": "parity-control-lease.v1",
+    "pid": own_pid,
+    "process_birth_unix_ms": own_birth_ms,
+    # pgid=0 until cargo subprocesses are spawned in a dedicated process group.
+    # Full setpgid/killpg lifecycle is deferred (MISSING-001).
+    "pgid": 0,
+    "hostname": socket.gethostname(),
+    "commit_sha": commit_sha,
+    "tree_id": tree_id,
+    "heartbeat_unix_ms": now_ms,
+    "publication_generation_id": generation_id,
+    "control_sequence": 1,
+}
+current_step = {
+    "schema_version": "parity-control-current-step.v1",
+    "generation": generation_id,
+    "fixture": None,
+    "step": "pre_cleanup_publication",
+    "surface": None,
+    "mode": "gate",
+    "elapsed_ms": 0,
+    "heartbeat_unix_ms": now_ms,
+}
+atomic_json(current_root / "p031-p041-parity-evidence.json", detail)
+atomic_json(current_root / "p031-phase-0-manifest-row.json", row)
+atomic_json(generation_root / "p031-p041-parity-evidence.json", detail)
+atomic_json(generation_root / "p031-phase-0-manifest-row.json", row)
+atomic_json(control_root / "lease.json", lease)
+atomic_json(control_root / "current-step.json", current_step)
+print("[INFO] runtime publication revoked_for_rerun current generation updated")
+PY
+      echo "[INFO] [phase: fixture-inventory] validating all 7 fixture schemas and required elements" &&
+      p041_update_current_step 'fixture_inventory' '' &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
+      echo "[INFO] [phase: offline-replay] replaying all 7 fixtures into generation-scoped SQLite databases" &&
+      p041_update_current_step 'offline_replay' '' &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
+      echo "[INFO] [phase: shadow-validation] checking live-shadow side-effect policy for all 7 fixtures" &&
+      p041_update_current_step 'shadow_validation' '' &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
+      echo "[INFO] [phase: graphql-readback] reading back all 7 fixtures through GraphQL parity surface" &&
+      p041_update_current_step 'graphql_readback' 'graphql_readback' &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p graphql-server proposal_041_graphql_readback_parity_surfaces -- --nocapture &&
+      echo "[INFO] [phase: mcp-readback] reading back all 7 fixtures through MCP parity surfaces" &&
+      p041_update_current_step 'mcp_report_readback' 'mcp_report_readback' &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
+      p041_prefixed_run cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
+      echo "[INFO] [phase: handoff-artifact] validating P031 handoff artifact contract" &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
+      echo "[INFO] [phase: runtime-publication] computing and writing final runtime row and detail artifacts" &&
+      p041_update_current_step 'runtime_publication' '' &&
+      p041_update_lease_heartbeat &&
+      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
+      p041_prefixed_run python3 - <<'PY'
 import json
 import hashlib
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 fixtures = [
@@ -2337,12 +2904,230 @@ fixtures = [
     "terminal-report-evidence",
     "projection-readback-surface",
 ]
-for fixture_id in fixtures:
-    report_path = Path("target/parity/reports") / fixture_id / "behavioral-diff-report.json"
-    replay_path = Path("target/parity") / fixture_id / "server-replay.json"
+generation_id = os.environ.get("P041_PUBLICATION_GENERATION_ID", "unscoped-fixture-replay")
+
+# ── Darwin F_FULLFSYNC helper (duplicate of setup block to keep this block self-contained) ──
+def _darwin_fullfsync(fd: int) -> bool:
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        return libc.fcntl(fd, 51) == 0  # F_FULLFSYNC = 51
+    except Exception:
+        return False
+
+def atomic_json(path, value):
+    """Write value as JSON via same-dir temp + durable flush + atomic rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            raw_fd = handle.fileno()
+            if sys.platform == "darwin":
+                if not _darwin_fullfsync(raw_fd):
+                    os.fsync(raw_fd)
+            else:
+                os.fsync(raw_fd)
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+# ── Retention, pruning, and 500MB budget check (proposal Section 6.4) ──────────────────────
+# Read current reclaim marker to determine if last run parked in blocked_manual_recovery.
+control_root = Path("target/parity-control")
+reclaim_marker_path = control_root / "reclaim-marker.json"
+last_reclaim_status = None
+if reclaim_marker_path.exists():
+    try:
+        _rm = json.loads(reclaim_marker_path.read_text())
+        last_reclaim_status = _rm.get("overall_status")
+    except (json.JSONDecodeError, OSError):
+        pass
+
+def _remove_abandoned_sqlite_triple(sqlite_path: Path) -> None:
+    """Remove a parity.sqlite together with .sqlite-wal and .sqlite-shm (proposal Section 6.3)."""
+    for suffix in ("", "-wal", "-shm"):
+        p = sqlite_path.parent / (sqlite_path.name + suffix)
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+parity_root = Path("target/parity")
+work_root = parity_root / "work"
+shadow_root = parity_root / "shadow"
+reports_root = parity_root / "reports"
+generations_root = parity_root / "publication/generations"
+control_root = Path("target/parity-control")
+
+# Symlink boundary check before pruning (SEC-P041-003): same guard as setup block.
+_target_anchor = Path("target").resolve()
+for _prune_root, _prune_label in (
+    (parity_root, "target/parity"),
+    (control_root, "target/parity-control"),
+):
+    if _prune_root.exists() and _prune_root.is_symlink():
+        raise SystemExit(
+            f"proposal-041: {_prune_label} is a symlink; refusing to prune or publish "
+            f"through a redirected root (SEC-P041-003)."
+        )
+    if _prune_root.exists():
+        _resolved_prune = _prune_root.resolve()
+        if not str(_resolved_prune).startswith(str(_target_anchor)):
+            raise SystemExit(
+                f"proposal-041: {_prune_label} resolves outside control-plane/target/; "
+                f"refusing to prune or publish (SEC-P041-003)."
+            )
+
+def _dir_size_bytes(d: Path) -> int:
+    total = 0
+    try:
+        for p in d.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+# Enumerate known generation IDs from work, shadow, reports, publication/generations.
+known_generations: set[str] = set()
+for root_dir in (work_root, shadow_root, reports_root, generations_root):
+    if root_dir.is_dir():
+        for entry in root_dir.iterdir():
+            if entry.is_dir():
+                known_generations.add(entry.name)
+
+# Collect per-generation info for pruning decisions.
+ready_generations = []
+blocked_manual_recovery_generations = []
+other_blocked_generations = []
+
+for gen_id in sorted(known_generations):
+    if gen_id == generation_id:
+        continue  # Never prune the current active generation.
+    gen_detail_path = generations_root / gen_id / "p031-p041-parity-evidence.json"
+    gen_status = None
+    if gen_detail_path.exists():
+        try:
+            _gd = json.loads(gen_detail_path.read_text())
+            gen_status = _gd.get("overall_status")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if gen_status == "ready_same_tree_verified":
+        ready_generations.append(gen_id)
+    elif gen_status == "blocked_manual_recovery":
+        blocked_manual_recovery_generations.append(gen_id)
+    else:
+        other_blocked_generations.append(gen_id)
+
+# Apply pruning policy (Section 6.4):
+# - Never prune blocked_manual_recovery generations.
+# - Retain the newest ready generation.
+# - Retain the newest non-manual blocked diagnostic generation.
+# - Prune older generations (oldest-first) if there is a newer one.
+generations_pruned = []
+ready_generations_sorted = sorted(ready_generations)
+other_blocked_sorted = sorted(other_blocked_generations)
+
+# Prune older ready generations (keep the newest only).
+for gen_id in ready_generations_sorted[:-1] if len(ready_generations_sorted) > 1 else []:
+    for sub_root in (work_root, shadow_root, reports_root):
+        gen_dir = sub_root / gen_id
+        if gen_dir.is_dir():
+            # Remove abandoned SQLite triples before rmtree.
+            for sqlite_file in gen_dir.rglob("parity.sqlite"):
+                _remove_abandoned_sqlite_triple(sqlite_file)
+            try:
+                shutil.rmtree(gen_dir)
+            except OSError as e:
+                print(f"[WARN] proposal-041: unable to prune {gen_dir}: {e}")
+    gen_pub_dir = generations_root / gen_id
+    if gen_pub_dir.is_dir():
+        try:
+            shutil.rmtree(gen_pub_dir)
+        except OSError as e:
+            print(f"[WARN] proposal-041: unable to prune publication dir {gen_pub_dir}: {e}")
+    generations_pruned.append(gen_id)
+
+# Prune older non-manual blocked generations (keep the newest only).
+for gen_id in other_blocked_sorted[:-1] if len(other_blocked_sorted) > 1 else []:
+    for sub_root in (work_root, shadow_root, reports_root):
+        gen_dir = sub_root / gen_id
+        if gen_dir.is_dir():
+            for sqlite_file in gen_dir.rglob("parity.sqlite"):
+                _remove_abandoned_sqlite_triple(sqlite_file)
+            try:
+                shutil.rmtree(gen_dir)
+            except OSError as e:
+                print(f"[WARN] proposal-041: unable to prune {gen_dir}: {e}")
+    gen_pub_dir = generations_root / gen_id
+    if gen_pub_dir.is_dir():
+        try:
+            shutil.rmtree(gen_pub_dir)
+        except OSError as e:
+            print(f"[WARN] proposal-041: unable to prune publication dir {gen_pub_dir}: {e}")
+    generations_pruned.append(gen_id)
+
+if generations_pruned:
+    print(f"[INFO] proposal-041: pruned {len(generations_pruned)} eligible abandoned generation(s): {generations_pruned}")
+if blocked_manual_recovery_generations:
+    print(
+        f"[WARN] proposal-041: {len(blocked_manual_recovery_generations)} blocked_manual_recovery "
+        f"generation(s) preserved (never auto-pruned): {blocked_manual_recovery_generations}"
+    )
+
+# 500 MB storage budget check (warn, not a hard failure per Section 6.4).
+_BUDGET_BYTES = 500 * 1024 * 1024
+_total_parity_bytes = _dir_size_bytes(parity_root)
+if _total_parity_bytes > _BUDGET_BYTES:
+    _mb = _total_parity_bytes / (1024 * 1024)
+    print(f"[WARN] proposal-041: parity artifact storage {_mb:.1f} MB exceeds 500 MB budget")
+    print(f"[WARN] proposal-041: preserved generation roots:")
+    for gen_id in sorted(known_generations):
+        gen_work = work_root / gen_id
+        gen_shadow = shadow_root / gen_id
+        gen_reports = reports_root / gen_id
+        gen_total = sum(_dir_size_bytes(d) for d in (gen_work, gen_shadow, gen_reports) if d.is_dir())
+        if gen_total > 0:
+            print(f"[WARN]   generation={gen_id} size={gen_total / (1024*1024):.1f} MB")
+for _fix_idx, fixture_id in enumerate(fixtures, 1):
+    print(f"[INFO] [{_fix_idx}/7] parity {fixture_id}")
+    report_path = Path("target/parity/reports") / generation_id / fixture_id / "behavioral-diff-report.json"
+    replay_path = Path("target/parity/work") / generation_id / fixture_id / "server-replay.json"
     if not report_path.is_file():
+        print(
+            f"[FAIL] [{_fix_idx}/7] missing-evidence {fixture_id}"
+            f" missing_path=control-plane/{report_path}"
+            f" expected_producer=replay"
+            f" affected_fixture_or_surface={fixture_id}"
+            f" next_action=rerun-after-replay-restored"
+        )
         raise SystemExit(f"proposal-041: missing generated report {report_path}")
     if not replay_path.is_file():
+        print(
+            f"[FAIL] [{_fix_idx}/7] missing-evidence {fixture_id}"
+            f" missing_path=control-plane/{replay_path}"
+            f" expected_producer=replay"
+            f" affected_fixture_or_surface={fixture_id}"
+            f" next_action=rerun-after-replay-restored"
+        )
         raise SystemExit(f"proposal-041: missing generated server replay {replay_path}")
     report = json.loads(report_path.read_text())
     replay = json.loads(replay_path.read_text())
@@ -2354,7 +3139,7 @@ for fixture_id in fixtures:
         raise SystemExit(f"proposal-041: fixture mismatch in {report_path}")
     if replay.get("fixture_id") != fixture_id:
         raise SystemExit(f"proposal-041: fixture mismatch in {replay_path}")
-    expected_replay_ref = f"control-plane/target/parity/{fixture_id}/server-replay.json"
+    expected_replay_ref = f"control-plane/target/parity/work/{generation_id}/{fixture_id}/server-replay.json"
     if report.get("server_replay_ref") != expected_replay_ref:
         raise SystemExit(f"proposal-041: bad server_replay_ref in {report_path}")
     if report.get("verdict") != "ready":
@@ -2396,10 +3181,12 @@ for fixture_id in fixtures:
     ):
         if not executable_inputs.get(key):
             raise SystemExit(f"proposal-041: missing executable input {key} in {report_path}")
-    shadow_report_path = Path("target/parity/shadow/reports") / fixture_id / "behavioral-diff-report.json"
+    shadow_report_path = Path("target/parity/shadow") / generation_id / fixture_id / "live-shadow-report.json"
     if not shadow_report_path.is_file():
         raise SystemExit(f"proposal-041: missing live shadow report {shadow_report_path}")
     shadow_report = json.loads(shadow_report_path.read_text())
+    if shadow_report.get("schema_version") != "live-shadow-report.v1":
+        raise SystemExit(f"proposal-041: bad live shadow schema_version in {shadow_report_path}")
     if shadow_report.get("mode") != "live_shadow":
         raise SystemExit(f"proposal-041: bad shadow mode in {shadow_report_path}")
     if shadow_report.get("shadow_contract", {}).get("settles_production_stages") is not False:
@@ -2410,6 +3197,7 @@ for fixture_id in fixtures:
             raise SystemExit(f"proposal-041: shadow report missing correlation key {key} in {shadow_report_path}")
     if shadow.get("fixture_or_capture_id") != fixture_id:
         raise SystemExit(f"proposal-041: shadow report fixture correlation mismatch in {shadow_report_path}")
+    print(f"[PASS] [{_fix_idx}/7] parity {fixture_id}")
 
 # ── Summary grid (Section 5.1): 7×6 fixture-by-surface matrix ───────────────
 # Build grid from surface_comparisons in each behavioral-diff-report.json.
@@ -2423,7 +3211,7 @@ _STATUS_TOKEN = {"matched": "PASS", "diverged": "FAIL", "timed_out": "TIMEOUT", 
 grid = {}
 for _fid in fixtures:
     grid[_fid] = {}
-    _rp = Path("target/parity/reports") / _fid / "behavioral-diff-report.json"
+    _rp = Path("target/parity/reports") / generation_id / _fid / "behavioral-diff-report.json"
     if _rp.is_file():
         _r = json.loads(_rp.read_text())
         for _cmp in _r.get("surface_comparisons", []):
@@ -2445,12 +3233,12 @@ if _term_w >= _wide_needed:
     # Wide grid — full fixture ids, 9-char cells
     _surf_abbr = ["canonical", "projection", "graphql", "mcp", "artifact", "summary"]
     _hdr = f"{'fixture':<{_max_fix_len}}  " + "".join(f"{a:<{_CELL}}" for a in _surf_abbr)
-    print(_hdr)
+    print(f"[INFO] {_hdr}")
     for _fid in fixtures:
         _row = f"{_fid:<{_max_fix_len}}  " + "".join(
             f"{grid[_fid].get(s, 'MISS'):<{_CELL}}" for s in SURFACE_ORDER
         )
-        print(_row)
+        print(f"[INFO] {_row}")
 else:
     # Narrow-terminal fallback: two lines per fixture, single-char tokens
     _abbrev = {
@@ -2460,14 +3248,14 @@ else:
     }
     _TOKEN = {"PASS": "P", "FAIL": "F", "MISS": "M", "SKIP": "S", "TIMEOUT": "T"}
     for _fid in fixtures:
-        print(_fid)
+        print(f"[INFO] {_fid}")
         _g = grid[_fid]
         _s1 = SURFACE_ORDER[:3]
         _s2 = SURFACE_ORDER[3:]
-        print("  " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s1))
-        print("  " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s2))
-    print("Legend: P=PASS F=FAIL")
-    print("Legend: M=MISS S=SKIP T=TIMEOUT")
+        print("[INFO]   " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s1))
+        print("[INFO]   " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s2))
+    print("[INFO] Legend: P=PASS F=FAIL")
+    print("[INFO] Legend: M=MISS S=SKIP T=TIMEOUT")
 
 # Compute per-fixture pass/fail counts for the final summary line.
 passed_count = sum(
@@ -2678,6 +3466,30 @@ STATUS_TO_PREFIX = {
 validation_status = row.get("validation_status", "")
 prefix = STATUS_TO_PREFIX.get(validation_status, "FAIL")
 
+now_ms = int(time.time() * 1000)
+# control_root is already defined above in the pruning section.
+atomic_json(control_root / "current-step.json", {
+    "schema_version": "parity-control-current-step.v1",
+    "generation": generation_id,
+    "fixture": None,
+    "step": "final_summary",
+    "surface": None,
+    "mode": "gate",
+    "elapsed_ms": 0,
+    "heartbeat_unix_ms": now_ms,
+})
+atomic_json(control_root / "release-marker.json", {
+    "schema_version": "parity-control-release-marker.v1",
+    "overall_status": validation_status,
+    "generation_id": generation_id,
+    # True: all cargo phases ran synchronously via bash && chaining (p041_prefixed_run
+    # waits for each process). No background subprocesses were spawned independently.
+    # When this block executes, all cargo test invocations have already returned.
+    # Descendant quiescence is therefore proven by the synchronous execution model.
+    "descendant_quiescent": True,
+    "written_at_unix_ms": now_ms,
+})
+
 # Print blocking diagnostics from the runtime detail artifact (Section 5.1 / 6.2).
 # Operators see these before the final status line so they can act without opening
 # the JSON file. blocking_reasons and missing_evidence are populated by the
@@ -2711,7 +3523,7 @@ if validation_status != "ready_same_tree_verified":
     )
 PY
     )
-    log "Proposal 041 control-plane gate: ready_same_tree_verified"
+    echo "[PASS] Proposal 041 control-plane gate: ready_same_tree_verified"
     ;;
   proposal-043|p043)
     log "Proposal 043 control-plane gate: GraphQL projection read contract"

@@ -25,7 +25,12 @@
     "reference_snapshot_not_yet_populated_from_live_run"
   ],
   "missing_evidence": [
-    "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json"
+    {
+      "missing_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+      "expected_producer": "scripts/test-gate.sh proposal-041",
+      "affected_fixture_or_surface": "all_fixtures",
+      "next_action": "run './scripts/test-gate.sh proposal-041' on a clean tree to populate the runtime artifact, then run scripts/parity/promote-p041-reference.sh to promote it here"
+    }
   ],
   "provenance": {
     "commit_sha": "reference-snapshot",

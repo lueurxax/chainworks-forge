@@ -17,7 +17,7 @@
 //! In-place truncate-and-rewrite is forbidden for any control file.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,8 +77,9 @@ impl ParityControlRoot {
             .with_context(|| format!("create parity-control root {}", self.root.display()))?;
         let never_index = self.root.join(".metadata_never_index");
         if !never_index.exists() {
-            fs::write(&never_index, b"")
-                .with_context(|| format!("write .metadata_never_index in {}", self.root.display()))?;
+            fs::write(&never_index, b"").with_context(|| {
+                format!("write .metadata_never_index in {}", self.root.display())
+            })?;
         }
         Ok(())
     }
@@ -484,12 +485,14 @@ pub fn write_atomic_json<T: Serialize>(target: &Path, value: &T) -> Result<()> {
     {
         // create_new(true) refuses to open an existing file or follow symlinks
         // (O_CREAT|O_EXCL), providing defense-in-depth against symlink races in
-        // shared target directories.
+        // shared target directories. mode(0o600) prevents leaking lease/pid/host
+        // metadata to other users on shared hosts.
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW as i32)
+            .mode(0o600)
             .open(&tmp_path)
             .with_context(|| format!("create temp file {}", tmp_path.display()))?;
         f.write_all(json.as_bytes())
@@ -622,12 +625,29 @@ pub async fn wal_checkpoint_before_readback(pool: &sqlx::SqlitePool) -> Result<(
 
 // ─── Pre-cleanup blocked publication ─────────────────────────────────────────
 
+/// Canonical repo-relative path for the P041 runtime detail artifact.
+///
+/// Used in `runtime_detail_path` fields so consumers always receive a stable
+/// repo-relative path rather than an absolute filesystem path.
+pub const P041_RUNTIME_DETAIL_CANONICAL_PATH: &str =
+    "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json";
+
+/// Canonical repo-relative path for the P041 promoted reference snapshot.
+pub const P041_REFERENCE_DETAIL_CANONICAL_PATH: &str =
+    "docs/reference/p031-p041-parity-evidence.json";
+
 /// Write pre-cleanup `blocked_in_progress` / `revoked_for_rerun` publication artifacts.
 ///
 /// Per proposal P041 Section 6.3 step 5, this MUST be called before any ephemeral
 /// cleanup or replay work begins. It atomically revokes stale ready evidence from a
 /// prior generation so consumers see `blocked_in_progress` rather than stale `ready`
 /// evidence during a rerun.
+///
+/// The caller must supply the full provenance snapshot captured from one exact
+/// `git status --porcelain=v1` run before cleanup begins (proposal Section 6.3 step 3).
+/// Pass sentinel values (`tree_clean=false`, `status_snapshot_sha256="pending"`,
+/// `status_snapshot_line_count=0`) only when the real capture is not yet available
+/// (e.g., in pre-gate test contexts where git is not accessible).
 ///
 /// Both `p031-p041-parity-evidence.json` and `p031-phase-0-manifest-row.json` are written
 /// using the standard same-directory temp-file → durable-flush → atomic-rename contract.
@@ -636,14 +656,17 @@ pub fn write_pre_cleanup_publication(
     generation_id: &str,
     commit_sha: &str,
     tree_id: &str,
+    tree_clean: bool,
+    status_snapshot_sha256: &str,
+    status_snapshot_line_count: u64,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let provenance = serde_json::json!({
         "commit_sha": commit_sha,
         "tree_id": tree_id,
-        "tree_clean": false,
-        "status_snapshot_sha256": "pending",
-        "status_snapshot_line_count": 0,
+        "tree_clean": tree_clean,
+        "status_snapshot_sha256": status_snapshot_sha256,
+        "status_snapshot_line_count": status_snapshot_line_count,
         "generated_at": now,
         "gate": "./scripts/test-gate.sh proposal-041"
     });
@@ -654,16 +677,12 @@ pub fn write_pre_cleanup_publication(
         .iter()
         .map(|fid| serde_json::json!({
             "fixture_id": fid,
-            "report_path": format!("control-plane/target/parity/reports/{fid}/behavioral-diff-report.json"),
-            "replay_path": format!("control-plane/target/parity/{fid}/server-replay.json"),
-            "shadow_report_path": format!("control-plane/target/parity/shadow/reports/{fid}/behavioral-diff-report.json"),
+            "report_path": format!("control-plane/target/parity/reports/{generation_id}/{fid}/behavioral-diff-report.json"),
+            "replay_path": format!("control-plane/target/parity/work/{generation_id}/{fid}/server-replay.json"),
+            "shadow_report_path": format!("control-plane/target/parity/shadow/{generation_id}/{fid}/live-shadow-report.json"),
             "verdict": "blocked_in_progress",
         }))
         .collect();
-    let runtime_detail_path = pub_current_dir
-        .join("p031-p041-parity-evidence.json")
-        .to_string_lossy()
-        .to_string();
     let detail = serde_json::json!({
         "schema_version": "p031-p041-parity-evidence.v1",
         "overall_status": "blocked_in_progress",
@@ -679,8 +698,8 @@ pub fn write_pre_cleanup_publication(
     let row = serde_json::json!({
         "schema_version": "p031-phase-0-runtime-manifest-row.v1",
         "id": "p041_parity_evidence",
-        "runtime_detail_path": runtime_detail_path,
-        "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
+        "runtime_detail_path": P041_RUNTIME_DETAIL_CANONICAL_PATH,
+        "reference_detail_path": P041_REFERENCE_DETAIL_CANONICAL_PATH,
         "validation_status": "blocked_in_progress",
         "publication_state": "revoked_for_rerun",
         "publication_generation_id": generation_id,
@@ -706,11 +725,40 @@ pub fn write_pre_cleanup_publication(
 }
 
 fn read_optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
-    if !path.exists() {
-        return Ok(None);
+    // 64 KiB cap: control files are small JSON objects; reject oversized files to
+    // avoid unbounded memory pressure from corrupted or adversarially crafted files.
+    const MAX_CONTROL_FILE_BYTES: u64 = 64 * 1024;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("open control file {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat opened control file {}", path.display()))?;
+    if metadata.len() > MAX_CONTROL_FILE_BYTES {
+        return Err(anyhow::anyhow!(
+            "control file {} is {} bytes, exceeding the {} byte limit; \
+             file may be corrupted — remove it and rerun the gate",
+            path.display(),
+            metadata.len(),
+            MAX_CONTROL_FILE_BYTES,
+        ));
     }
-    let raw = fs::read_to_string(path)
+    let mut raw = String::new();
+    let bytes_read = Read::by_ref(&mut file)
+        .take(MAX_CONTROL_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
         .with_context(|| format!("read control file {}", path.display()))?;
+    if bytes_read as u64 > MAX_CONTROL_FILE_BYTES {
+        return Err(anyhow::anyhow!(
+            "control file {} exceeds the {} byte limit; file may be corrupted — remove it and rerun the gate",
+            path.display(),
+            MAX_CONTROL_FILE_BYTES,
+        ));
+    }
     let value: T = serde_json::from_str(&raw)
         .with_context(|| format!("parse control file {}", path.display()))?;
     Ok(Some(value))
@@ -759,9 +807,9 @@ pub fn evaluate_reclaim_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     #[allow(unused_imports)]
     use sqlx::Executor;
+    use tempfile::tempdir;
 
     #[test]
     fn lease_record_roundtrip_preserves_all_fields() -> Result<()> {
@@ -810,21 +858,26 @@ mod tests {
         let lease = LeaseRecord::new(9999, 1_000_000, "h", "c", "t", "gen-abandoned");
         let marker = ReclaimMarker::blocked_manual_recovery(
             &lease,
-            true,   // missing_pgid_metadata
-            false,  // observable_descendants
+            true,  // missing_pgid_metadata
+            false, // observable_descendants
             Some("/tmp/parity-gen-abandoned".to_string()),
-            1,      // observation_count (Case B: no pgid metadata, no wait)
+            1, // observation_count (Case B: no pgid metadata, no wait)
             120_000,
             "missing pgid metadata",
         );
         ctrl.write_reclaim_marker(&marker)?;
 
-        let read_back = ctrl.read_reclaim_marker()?.expect("reclaim marker readable");
+        let read_back = ctrl
+            .read_reclaim_marker()?
+            .expect("reclaim marker readable");
         assert_eq!(read_back.schema_version, "parity-control-reclaim-marker.v1");
         assert_eq!(read_back.overall_status, "blocked_manual_recovery");
         assert_eq!(read_back.abandoned_generation_id, "gen-abandoned");
         assert!(read_back.missing_pgid_metadata);
-        assert_eq!(read_back.preserved_generation_root, Some("/tmp/parity-gen-abandoned".to_string()));
+        assert_eq!(
+            read_back.preserved_generation_root,
+            Some("/tmp/parity-gen-abandoned".to_string())
+        );
         assert_eq!(read_back.observation_count, 1);
         Ok(())
     }
@@ -856,13 +909,25 @@ mod tests {
     #[test]
     fn reclaim_decision_covers_all_four_cases() {
         // Case A: pid alive
-        assert_eq!(evaluate_reclaim_decision(true, true, true), "blocked_in_progress");
+        assert_eq!(
+            evaluate_reclaim_decision(true, true, true),
+            "blocked_in_progress"
+        );
         // Case B: pid gone, no pgid metadata
-        assert_eq!(evaluate_reclaim_decision(false, false, false), "blocked_manual_recovery");
+        assert_eq!(
+            evaluate_reclaim_decision(false, false, false),
+            "blocked_manual_recovery"
+        );
         // Case C: pid gone, pgid present, descendants observable
-        assert_eq!(evaluate_reclaim_decision(false, true, false), "blocked_manual_recovery");
+        assert_eq!(
+            evaluate_reclaim_decision(false, true, false),
+            "blocked_manual_recovery"
+        );
         // Case D: pid gone, pgid present, absence proven
-        assert_eq!(evaluate_reclaim_decision(false, true, true), "reclaim_allowed");
+        assert_eq!(
+            evaluate_reclaim_decision(false, true, true),
+            "reclaim_allowed"
+        );
     }
 
     #[test]
@@ -909,7 +974,15 @@ mod tests {
     fn write_pre_cleanup_publication_emits_full_required_fields() -> Result<()> {
         let dir = tempdir()?;
         let pub_current = dir.path().join("publication/current");
-        write_pre_cleanup_publication(&pub_current, "gen-test-001", "abc123", "def456")?;
+        write_pre_cleanup_publication(
+            &pub_current,
+            "gen-test-001",
+            "abc123",
+            "def456",
+            false,
+            "pending",
+            0,
+        )?;
 
         let detail_bytes = fs::read_to_string(pub_current.join("p031-p041-parity-evidence.json"))?;
         let detail: serde_json::Value = serde_json::from_str(&detail_bytes)?;
@@ -940,16 +1013,33 @@ mod tests {
             detail_surfaces, REQUIRED_COMPARISON_SURFACES,
             "write_pre_cleanup_publication must emit the full REQUIRED_COMPARISON_SURFACES list"
         );
+        let first_fixture = &detail["fixtures"][0];
+        assert_eq!(
+            first_fixture["report_path"],
+            "control-plane/target/parity/reports/gen-test-001/proposal-loop-basic/behavioral-diff-report.json"
+        );
+        assert_eq!(
+            first_fixture["replay_path"],
+            "control-plane/target/parity/work/gen-test-001/proposal-loop-basic/server-replay.json"
+        );
+        assert_eq!(
+            first_fixture["shadow_report_path"],
+            "control-plane/target/parity/shadow/gen-test-001/proposal-loop-basic/live-shadow-report.json"
+        );
 
-        // runtime_detail_path must be non-empty and point at the expected file.
+        // runtime_detail_path must be the canonical repo-relative path (never absolute).
         let runtime_detail_path = row["runtime_detail_path"].as_str().unwrap_or("");
         assert!(
             !runtime_detail_path.is_empty(),
             "runtime_detail_path must be non-empty"
         );
         assert!(
-            runtime_detail_path.ends_with("p031-p041-parity-evidence.json"),
-            "runtime_detail_path must end with the detail filename, got: {runtime_detail_path}"
+            !runtime_detail_path.starts_with('/'),
+            "runtime_detail_path must be repo-relative, not absolute; got: {runtime_detail_path}"
+        );
+        assert_eq!(
+            runtime_detail_path, P041_RUNTIME_DETAIL_CANONICAL_PATH,
+            "runtime_detail_path must equal the canonical constant"
         );
 
         // Cross-artifact invariants must hold for blocked_in_progress too.

@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -14,15 +13,14 @@ use domain::ids::{AgentExecutionId, IdeaId, RunId};
 use engine::command_handler::{CommandHandler, CommandResult};
 use engine::event_bus;
 use engine::parity_control::{
-    InterruptionMarker, LeaseRecord, ParityControlRoot, ReclaimMarker, ReleaseMarker, TimeoutMarker,
-    REQUIRED_COMPARISON_SURFACES, REQUIRED_FIXTURES,
     evaluate_reclaim_decision, is_owner_stalled, write_atomic_json, write_pre_cleanup_publication,
+    InterruptionMarker, LeaseRecord, ParityControlRoot, ReclaimMarker, ReleaseMarker,
+    TimeoutMarker, REQUIRED_COMPARISON_SURFACES, REQUIRED_FIXTURES,
 };
 use engine::work_queue::WorkQueue;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
-
 
 #[derive(Debug, Deserialize)]
 struct GoldenRunFixture {
@@ -168,8 +166,22 @@ fn target_parity_root() -> PathBuf {
     control_plane_root().join("target/parity")
 }
 
+fn target_parity_work_root() -> PathBuf {
+    target_parity_root()
+        .join("work")
+        .join(active_generation_id())
+}
+
 fn target_parity_reports_root() -> PathBuf {
-    target_parity_root().join("reports")
+    target_parity_root()
+        .join("reports")
+        .join(active_generation_id())
+}
+
+fn target_parity_shadow_root() -> PathBuf {
+    target_parity_root()
+        .join("shadow")
+        .join(active_generation_id())
 }
 
 fn repo_relative(path: &Path) -> String {
@@ -177,6 +189,69 @@ fn repo_relative(path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// Normalize an artifact file_path for inclusion in server-replay.json.
+///
+/// Strips the workspace root prefix when possible. Paths that remain absolute
+/// are replaced with an opaque `<machine-local>/<filename>` placeholder so
+/// server-replay artifacts are fully portable and do not leak any host identity,
+/// username, home-directory layout, mount name, or temp-path structure.
+fn normalize_artifact_file_path(raw: &str) -> String {
+    // First try to make it workspace-relative.
+    let as_path = std::path::Path::new(raw);
+    if let Ok(rel) = as_path.strip_prefix(workspace_root()) {
+        return rel.display().to_string();
+    }
+    if as_path.is_absolute() {
+        let basename = as_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        return format!("<machine-local>/{basename}");
+    }
+    raw.to_string()
+}
+
+#[test]
+fn proposal_041_redacts_every_non_workspace_absolute_artifact_path() {
+    let cases = [
+        ("/Users/alice/run/output.json", "<machine-local>/output.json"),
+        ("/home/alice/run/output.json", "<machine-local>/output.json"),
+        ("/private/tmp/chainworks/output.json", "<machine-local>/output.json"),
+        ("/Volumes/External/build/output.json", "<machine-local>/output.json"),
+        ("/opt/org/private/output.json", "<machine-local>/output.json"),
+    ];
+    for (raw, expected) in cases {
+        assert_eq!(normalize_artifact_file_path(raw), expected);
+    }
+
+    let workspace_file = workspace_root().join("control-plane/target/parity/work/replay.json");
+    assert_eq!(
+        normalize_artifact_file_path(&workspace_file.display().to_string()),
+        "control-plane/target/parity/work/replay.json"
+    );
+    assert_eq!(
+        normalize_artifact_file_path("relative/artifact.json"),
+        "relative/artifact.json"
+    );
+}
+
+fn assert_safe_p041_generation_id(raw: &str) -> Result<()> {
+    if raw == "unscoped-fixture-replay" {
+        return Ok(());
+    }
+    let valid_prefix = raw.starts_with("p041-");
+    let valid_chars = raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | 'T' | 'Z'));
+    if !valid_prefix || !valid_chars || raw.contains("..") || raw.contains('/') || raw.contains('\\')
+    {
+        return Err(anyhow!(
+            "invalid P041_PUBLICATION_GENERATION_ID path segment: {raw:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn load_fixture(fixture_id: &str) -> Result<(PathBuf, GoldenRunFixture)> {
@@ -191,6 +266,16 @@ fn load_fixture(fixture_id: &str) -> Result<(PathBuf, GoldenRunFixture)> {
 fn read_json(path: &Path) -> Result<Value> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+fn read_optional_json_for_test<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", path.display()))
+            .map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 fn load_runtime_events(fixture_dir: &Path, fixture: &GoldenRunFixture) -> Result<RuntimeEvents> {
@@ -475,7 +560,10 @@ async fn proposal_041_shadow_side_effect_policy_is_fail_closed() -> Result<()> {
             source_run_id: format!("source-{fixture_id}"),
             shadow_run_id: format!("shadow-{fixture_id}"),
             storage_namespace: "shadow".into(),
-            artifact_root: format!("target/parity/shadow/{fixture_id}"),
+            artifact_root: format!(
+                "target/parity/shadow/{}/{fixture_id}",
+                active_generation_id()
+            ),
             runtime_policy: "stubbed".into(),
             idempotency_key: format!("p041-{fixture_id}"),
         })
@@ -484,7 +572,10 @@ async fn proposal_041_shadow_side_effect_policy_is_fail_closed() -> Result<()> {
             source_run_id: format!("source-{fixture_id}"),
             shadow_run_id: format!("shadow-{fixture_id}"),
             storage_namespace: "production".into(),
-            artifact_root: format!("target/parity/shadow/{fixture_id}"),
+            artifact_root: format!(
+                "target/parity/shadow/{}/{fixture_id}",
+                active_generation_id()
+            ),
             runtime_policy: "stubbed".into(),
             idempotency_key: format!("p041-{fixture_id}"),
         })
@@ -493,13 +584,16 @@ async fn proposal_041_shadow_side_effect_policy_is_fail_closed() -> Result<()> {
             source_run_id: format!("source-{fixture_id}"),
             shadow_run_id: format!("shadow-{fixture_id}"),
             storage_namespace: "shadow".into(),
-            artifact_root: format!("target/parity/shadow/{fixture_id}"),
+            artifact_root: format!(
+                "target/parity/shadow/{}/{fixture_id}",
+                active_generation_id()
+            ),
             runtime_policy: "live".into(),
             idempotency_key: format!("p041-{fixture_id}"),
         })
         .is_err());
         let shadow_report = replay_shadow_fixture_and_write_report(fixture_id).await?;
-        assert_eq!(shadow_report["schema_version"], "behavioral-diff-report.v1");
+        assert_eq!(shadow_report["schema_version"], "live-shadow-report.v1");
         assert_eq!(shadow_report["mode"], "live_shadow");
         assert_eq!(shadow_report["run_fixture_id"], *fixture_id);
         assert_eq!(
@@ -571,12 +665,10 @@ async fn proposal_041_handoff_artifact_contract_is_ready() -> Result<()> {
         assert_eq!(report["verdict"], "ready");
         assert_eq!(report["summary"]["blocking_count"], 0);
         assert!(
-            raw.contains(&format!(
-                "control-plane/target/parity/reports/{fixture_id}/behavioral-diff-report.json"
-            )),
-            "handoff artifact does not name generated report path for {fixture_id}"
+            raw.contains(fixture_id),
+            "handoff artifact does not name fixture {fixture_id}"
         );
-        let replay_path = target_parity_root()
+        let replay_path = target_parity_work_root()
             .join(fixture_id)
             .join("server-replay.json");
         assert!(
@@ -636,57 +728,60 @@ async fn replay_shadow_fixture_and_write_report(fixture_id: &str) -> Result<Valu
         source_run_id: format!("source-{fixture_id}"),
         shadow_run_id: format!("shadow-{fixture_id}"),
         storage_namespace: "shadow".into(),
-        artifact_root: format!("target/parity/shadow/{fixture_id}"),
+        artifact_root: format!(
+            "target/parity/shadow/{}/{fixture_id}",
+            active_generation_id()
+        ),
         runtime_policy: "stubbed".into(),
         idempotency_key: format!("p041-shadow-{fixture_id}"),
     })?;
-    replay_fixture_with_mode(
-        fixture_id,
-        ReplayMode::LiveShadow {
-            replay_id: unique_shadow_replay_id(fixture_id),
-        },
-    )
-    .await
+    replay_fixture_with_mode(fixture_id, ReplayMode::LiveShadow).await
 }
 
 enum ReplayMode {
     OfflineFixtureReplay,
-    LiveShadow { replay_id: String },
+    LiveShadow,
 }
 
 impl ReplayMode {
     fn mode(&self) -> &'static str {
         match self {
             Self::OfflineFixtureReplay => "offline_fixture_replay",
-            Self::LiveShadow { .. } => "live_shadow",
+            Self::LiveShadow => "live_shadow",
         }
     }
 
     fn replay_dir(&self, fixture_id: &str) -> PathBuf {
         match self {
-            Self::OfflineFixtureReplay => target_parity_root().join(fixture_id),
-            Self::LiveShadow { replay_id } => target_parity_root().join("shadow").join(replay_id),
+            Self::OfflineFixtureReplay => target_parity_work_root().join(fixture_id),
+            Self::LiveShadow => target_parity_shadow_root().join(fixture_id),
         }
     }
 
     fn report_dir(&self, fixture_id: &str) -> PathBuf {
         match self {
             Self::OfflineFixtureReplay => target_parity_reports_root().join(fixture_id),
-            Self::LiveShadow { .. } => target_parity_root().join("shadow/reports").join(fixture_id),
+            Self::LiveShadow => target_parity_shadow_root().join(fixture_id),
+        }
+    }
+
+    fn report_filename(&self) -> &'static str {
+        match self {
+            Self::OfflineFixtureReplay => "behavioral-diff-report.json",
+            Self::LiveShadow => "live-shadow-report.json",
+        }
+    }
+
+    fn report_schema_version(&self) -> &'static str {
+        match self {
+            Self::OfflineFixtureReplay => "behavioral-diff-report.v1",
+            Self::LiveShadow => "live-shadow-report.v1",
         }
     }
 
     fn database_path(&self, fixture_id: &str) -> PathBuf {
         self.replay_dir(fixture_id).join("parity.sqlite")
     }
-}
-
-fn unique_shadow_replay_id(fixture_id: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{fixture_id}-{}-{nanos}", std::process::id())
 }
 
 async fn replay_fixture_with_mode(fixture_id: &str, mode: ReplayMode) -> Result<Value> {
@@ -963,7 +1058,7 @@ async fn replay_fixture_with_mode(fixture_id: &str, mode: ReplayMode) -> Result<
             "name": artifact.name,
             "contract_id": artifact.contract_id,
             "format": artifact.format,
-            "file_path": artifact.file_path,
+            "file_path": normalize_artifact_file_path(&artifact.file_path),
             "provider": artifact.provider,
             "report_kind": artifact.report_kind,
             "report_version": artifact.report_version,
@@ -977,10 +1072,22 @@ async fn replay_fixture_with_mode(fixture_id: &str, mode: ReplayMode) -> Result<
     let replay_dir = mode.replay_dir(fixture_id);
     fs::create_dir_all(&replay_dir)?;
     let replay_path = replay_dir.join("server-replay.json");
-    fs::write(&replay_path, serde_json::to_string_pretty(&server_replay)?)?;
+    let replay_json = serde_json::to_string_pretty(&server_replay)?;
+    // Regression: no machine-local absolute artifact paths may appear in server-replay artifacts.
+    if let Some(artifacts) = server_replay["artifact_index"].as_array() {
+        for artifact in artifacts {
+            let file_path = artifact["file_path"].as_str().unwrap_or_default();
+            assert!(
+                !Path::new(file_path).is_absolute(),
+                "server-replay.json for fixture {fixture_id} contains absolute machine artifact path \
+                 {file_path}; normalize_artifact_file_path must redact every non-workspace absolute root",
+            );
+        }
+    }
+    fs::write(&replay_path, replay_json)?;
 
     let report = json!({
-        "schema_version": "behavioral-diff-report.v1",
+        "schema_version": mode.report_schema_version(),
         "overall_status": if verdict == "ready" { "fixture_ready" } else { "blocked_divergence" },
         "publication_generation_id": active_generation_id(),
         "provenance": gate_provenance(),
@@ -1034,7 +1141,7 @@ async fn replay_fixture_with_mode(fixture_id: &str, mode: ReplayMode) -> Result<
     let report_dir = mode.report_dir(fixture_id);
     fs::create_dir_all(&report_dir)?;
     fs::write(
-        report_dir.join("behavioral-diff-report.json"),
+        report_dir.join(mode.report_filename()),
         serde_json::to_string_pretty(&report)?,
     )?;
 
@@ -1188,6 +1295,20 @@ fn fixture_graphql_readback_expected(
             .unwrap_or_default()
             .cmp(right["name"].as_str().unwrap_or_default())
     });
+    // P041 §6.5: queue summary expected values — for any terminal run the active
+    // (pending/running) counts must be zero.  Exact completed totals are not
+    // compared because they vary per-fixture; the normalization step in schema.rs
+    // strips them from the actual response to match this shape.
+    let run_queue_summary = json!({
+        "run_id": "$run_id",
+        "pending": 0,
+        "running": 0,
+    });
+    let stage_queue_summary = json!({
+        "stage_execution_id": "$first_stage_id",
+        "pending": 0,
+        "running": 0,
+    });
     json!({
         "collector_owner": "graphql-server::schema::build_schema",
         "query": "P041FixtureReadback",
@@ -1201,6 +1322,8 @@ fn fixture_graphql_readback_expected(
         }],
         "stages": stages,
         "artifacts": artifacts,
+        "run_queue_summary": run_queue_summary,
+        "stage_queue_summary": stage_queue_summary,
     })
 }
 
@@ -1242,10 +1365,10 @@ fn fixture_mcp_readback_expected(_expected_reports: &Value, expected_artifacts: 
 /// detail artifacts. Falls back to `"test-run-no-git"` sentinel values when the
 /// env vars are absent (local `cargo test` runs outside the gate).
 fn gate_provenance() -> Value {
-    let commit_sha = std::env::var("P041_GIT_COMMIT_SHA")
-        .unwrap_or_else(|_| "test-run-no-git".to_string());
-    let tree_id = std::env::var("P041_GIT_TREE_ID")
-        .unwrap_or_else(|_| "test-run-no-git".to_string());
+    let commit_sha =
+        std::env::var("P041_GIT_COMMIT_SHA").unwrap_or_else(|_| "test-run-no-git".to_string());
+    let tree_id =
+        std::env::var("P041_GIT_TREE_ID").unwrap_or_else(|_| "test-run-no-git".to_string());
     let tree_clean = std::env::var("P041_GIT_TREE_CLEAN")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -1274,8 +1397,11 @@ fn gate_provenance() -> Value {
 /// detail artifacts. Falls back to `"unscoped-fixture-replay"` for standalone
 /// `cargo test` runs outside the gate.
 fn active_generation_id() -> String {
-    std::env::var("P041_PUBLICATION_GENERATION_ID")
-        .unwrap_or_else(|_| "unscoped-fixture-replay".to_string())
+    let generation_id = std::env::var("P041_PUBLICATION_GENERATION_ID")
+        .unwrap_or_else(|_| "unscoped-fixture-replay".to_string());
+    assert_safe_p041_generation_id(&generation_id)
+        .expect("P041_PUBLICATION_GENERATION_ID must be a safe path segment");
+    generation_id
 }
 
 fn compare_surface(
@@ -1422,6 +1548,15 @@ async fn drive_runtime_events_through_executor(
         }
     }
 
+    // Drain any work items enqueued after the run reached terminal status
+    // (e.g. the post-completion advance_run that calls rebuild_all_for_run).
+    // Without this drain the run_queue_summary shows pending=1 instead of 0.
+    for _ in 0..20 {
+        if !executor.process_next_item().await? {
+            break;
+        }
+    }
+
     assert!(processed > 0, "P041 executor replay must process work");
     Ok(())
 }
@@ -1533,17 +1668,16 @@ fn write_replay_contracts_from_snapshots(
         .map(|(name, path)| format!("  {name}: {path}"))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(
-        &catalog_path,
-        format!(
-            r#"schema_version: 1
+    let catalog_yaml = format!(
+        r#"schema_version: 1
 artifacts:
 {artifact_map}
 permission_profiles:
   P041_FIXTURE:
     filesystem:
       read:
-        - "**"
+        - "control-plane/crates/engine/tests/fixtures/parity/golden-runs/**"
+        - "control-plane/target/parity/**"
 contracts:
   P041FixtureLeadContract:
     format: json
@@ -1560,9 +1694,16 @@ agents:
     lead_resolution_contract: P041FixtureLeadContract
     prompt: "Replay P041 fixture stage through the canonical executor boundary."
 "#,
-            fixture_agent.provider, fixture_agent.id
-        ),
-    )?;
+        fixture_agent.provider, fixture_agent.id
+    );
+    // Regression: the generated catalog must not grant broad "**" filesystem read.
+    // A broad glob allows any path on the host and must never appear in P041 fixture
+    // catalogs, even though this catalog is only executed by the in-memory stub adapter.
+    assert!(
+        !catalog_yaml.contains("      read:\n        - \"**\""),
+        "generated P041 agent catalog must not contain an unrestricted '\"**\"' filesystem read glob"
+    );
+    fs::write(&catalog_path, &catalog_yaml)?;
 
     let mut states = String::new();
     for state in &workflow_snapshot.states {
@@ -1681,32 +1822,149 @@ fn divergence(
 /// having already written behavioral-diff reports to disk.
 #[tokio::test]
 async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
+    // Use the gate-provided generation ID when available (P041_PUBLICATION_GENERATION_ID
+    // is exported by scripts/test-gate.sh proposal-041 before invoking cargo test).
+    // Falls back to a stable sentinel for standalone cargo test runs.
+    let pub_generation_id = active_generation_id();
+    let pub_generation = target_parity_root()
+        .join("publication/generations")
+        .join(&pub_generation_id);
     let pub_current = target_parity_root().join("publication/current");
+    fs::create_dir_all(&pub_generation)?;
     fs::create_dir_all(&pub_current)?;
 
     let mut fixture_entries: Vec<Value> = Vec::new();
+    let mut missing_evidence: Vec<Value> = Vec::new();
+    let mut divergence_evidence: Vec<Value> = Vec::new();
+    let mut timeout_evidence: Vec<Value> = Vec::new();
+    let mut interrupted_evidence: Vec<Value> = Vec::new();
 
     for fixture_id in REQUIRED_FIXTURES {
         let report_path = target_parity_reports_root()
             .join(fixture_id)
             .join("behavioral-diff-report.json");
-        let replay_path = target_parity_root()
+        let replay_path = target_parity_work_root()
             .join(fixture_id)
             .join("server-replay.json");
-        let shadow_report_path = target_parity_root()
-            .join("shadow/reports")
+        let shadow_report_path = target_parity_shadow_root()
             .join(fixture_id)
-            .join("behavioral-diff-report.json");
+            .join("live-shadow-report.json");
 
-        // Validate schema_version if the per-fixture report exists, but always use
-        // "schema_validation_only" as the verdict in the runtime detail to avoid
-        // the contradiction of per-fixture verdict=ready while overall_status=blocked.
+        let mut fixture_status = "ready".to_string();
+        // P041 §6.2: per-fixture provenance summary required in each fixtures[] entry.
+        let mut fixture_provenance_summary = json!({
+            "source": "unavailable",
+            "reason": "behavioral-diff-report not present"
+        });
         if report_path.is_file() {
             let report = read_json(&report_path)?;
             assert_eq!(
                 report["schema_version"], "behavioral-diff-report.v1",
                 "{fixture_id}: bad schema_version in behavioral-diff-report"
             );
+            fixture_provenance_summary = json!({
+                "source": "behavioral-diff-report",
+                "fixture_revision": report["fixture_revision"],
+                "commit_sha": report["provenance"]["commit_sha"],
+                "tree_id": report["provenance"]["tree_id"],
+                "tree_clean": report["provenance"]["tree_clean"],
+                "generated_at": report["provenance"]["generated_at"],
+                "gate": report["provenance"]["gate"],
+            });
+            if report["verdict"] != "ready" || report["summary"]["blocking_count"] != 0 {
+                fixture_status = "blocked_divergence".to_string();
+                divergence_evidence.push(json!({
+                    "report_path": repo_relative(&report_path),
+                    "affected_fixture_or_surface": fixture_id,
+                    "verdict": report["verdict"],
+                    "blocking_count": report["summary"]["blocking_count"],
+                    "next_action": "inspect behavioral-diff-report.json and fix the divergent surface"
+                }));
+            }
+            if let Some(comparisons) = report["surface_comparisons"].as_array() {
+                for comparison in comparisons {
+                    match comparison["status"].as_str() {
+                        Some("missing_evidence") => {
+                            fixture_status = "blocked_missing_evidence".to_string();
+                            missing_evidence.push(json!({
+                                "missing_path": comparison["actual"]["missing_path"].as_str().unwrap_or("unknown"),
+                                "expected_producer": comparison["actual"]["expected_producer"].as_str().unwrap_or("surface comparison"),
+                                "affected_fixture_or_surface": format!(
+                                    "{}:{}",
+                                    fixture_id,
+                                    comparison["surface"].as_str().unwrap_or("unknown")
+                                ),
+                                "next_action": "rerun ./scripts/test-gate.sh proposal-041 after restoring the missing surface evidence"
+                            }));
+                        }
+                        Some("timed_out") => {
+                            if fixture_status == "ready" {
+                                fixture_status = "blocked_timeout".to_string();
+                            }
+                            timeout_evidence.push(json!({
+                                "report_path": repo_relative(&report_path),
+                                "affected_fixture_or_surface": format!(
+                                    "{}:{}",
+                                    fixture_id,
+                                    comparison["surface"].as_str().unwrap_or("unknown")
+                                ),
+                                "next_action": "inspect parity-control timeout marker and rerun after the stalled producer is fixed"
+                            }));
+                        }
+                        Some("diverged") => {
+                            if fixture_status == "ready" || fixture_status == "blocked_timeout" {
+                                fixture_status = "blocked_divergence".to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            fixture_status = "blocked_missing_evidence".to_string();
+            missing_evidence.push(json!({
+                "missing_path": repo_relative(&report_path),
+                "expected_producer": "offline fixture replay",
+                "affected_fixture_or_surface": fixture_id,
+                "next_action": "rerun ./scripts/test-gate.sh proposal-041 after replay artifacts are regenerated"
+            }));
+        }
+        if !replay_path.is_file() {
+            fixture_status = "blocked_missing_evidence".to_string();
+            missing_evidence.push(json!({
+                "missing_path": repo_relative(&replay_path),
+                "expected_producer": "offline fixture replay",
+                "affected_fixture_or_surface": fixture_id,
+                "next_action": "rerun ./scripts/test-gate.sh proposal-041 after server replay is regenerated"
+            }));
+        }
+        if shadow_report_path.is_file() {
+            let shadow_report = read_json(&shadow_report_path)?;
+            assert_eq!(
+                shadow_report["schema_version"], "live-shadow-report.v1",
+                "{fixture_id}: bad schema_version in live-shadow-report"
+            );
+            if shadow_report["verdict"] != "ready" {
+                let shadow_status = shadow_report["overall_status"]
+                    .as_str()
+                    .or_else(|| shadow_report["verdict"].as_str())
+                    .unwrap_or("blocked_divergence");
+                fixture_status = match shadow_status {
+                    "blocked_timeout" => "blocked_timeout".to_string(),
+                    "blocked_interrupted" => "blocked_interrupted".to_string(),
+                    "blocked_manual_recovery" => "blocked_manual_recovery".to_string(),
+                    "blocked_missing_evidence" => "blocked_missing_evidence".to_string(),
+                    _ => "blocked_divergence".to_string(),
+                };
+            }
+        } else {
+            fixture_status = "blocked_missing_evidence".to_string();
+            missing_evidence.push(json!({
+                "missing_path": repo_relative(&shadow_report_path),
+                "expected_producer": "live shadow validation",
+                "affected_fixture_or_surface": fixture_id,
+                "next_action": "rerun ./scripts/test-gate.sh proposal-041 after live shadow artifacts are regenerated"
+            }));
         }
 
         fixture_entries.push(json!({
@@ -1714,33 +1972,136 @@ async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
             "report_path": repo_relative(&report_path),
             "replay_path": repo_relative(&replay_path),
             "shadow_report_path": repo_relative(&shadow_report_path),
-            "verdict": "schema_validation_only",
+            "verdict": fixture_status,
+            "provenance": fixture_provenance_summary,
         }));
     }
 
-    // Sentinel provenance cannot certify same-tree readiness.
-    // This test validates cross-artifact contract shape only; overall_status must
-    // never be ready_same_tree_verified here. A live gate run with real provenance
-    // (implementing MISSING-001/MISSING-002/MISSING-003) is required for ready publication.
-    let overall_status = "blocked_missing_evidence";
-    let publication_state = "schema_validation_only";
-
-    // Use the gate-provided generation ID when available (P041_PUBLICATION_GENERATION_ID
-    // is exported by scripts/test-gate.sh proposal-041 before invoking cargo test).
-    // Falls back to a stable sentinel for standalone cargo test runs.
-    let pub_generation_id = active_generation_id();
     const DETAIL_SCHEMA_VERSION: &str = "p031-p041-parity-evidence.v1";
     const ROW_SCHEMA_VERSION: &str = "p031-phase-0-runtime-manifest-row.v1";
 
-    let provenance = json!({
-        "commit_sha": "schema-validation-only",
-        "tree_id": "schema-validation-only",
-        "tree_clean": true,
-        "status_snapshot_sha256": "schema-validation-only",
-        "status_snapshot_line_count": 0,
-        "generated_at": "2026-04-30T00:00:00Z",
-        "gate": "./scripts/test-gate.sh proposal-041",
-    });
+    let provenance = gate_provenance();
+    let ctrl = ParityControlRoot::new(control_plane_root().join("target/parity-control"));
+    let reclaim_marker = ctrl.read_reclaim_marker()?;
+    let interruption_marker: Option<InterruptionMarker> =
+        read_optional_json_for_test(&ctrl.interruption_marker_path())?;
+    let timeout_marker: Option<TimeoutMarker> = read_optional_json_for_test(&ctrl.timeout_marker_path())?;
+    if let Some(marker) = &interruption_marker {
+        if marker.generation_id == pub_generation_id {
+            interrupted_evidence.push(json!({
+                "marker_path": repo_relative(&ctrl.interruption_marker_path()),
+                "signal": marker.signal.clone(),
+                "descendant_pgid": marker.descendant_pgid,
+                "descendant_absent": marker.descendant_absent,
+                "next_action": "inspect the interruption marker and rerun"
+            }));
+        }
+    }
+    if let Some(marker) = &timeout_marker {
+        if marker.generation_id == pub_generation_id {
+            timeout_evidence.push(json!({
+                "marker_path": repo_relative(&ctrl.timeout_marker_path()),
+                "active_fixture": marker.active_fixture.clone(),
+                "active_surface": marker.active_surface.clone(),
+                "descendant_pgid": marker.descendant_pgid,
+                "descendant_absent": marker.descendant_absent,
+                "next_action": "inspect the timeout marker and stalled producer before rerun"
+            }));
+        }
+    }
+    let manual_recovery_evidence = reclaim_marker
+        .as_ref()
+        .filter(|marker| {
+            marker.overall_status == "blocked_manual_recovery"
+                && marker.abandoned_generation_id == pub_generation_id
+        })
+        .map(|marker| {
+            json!({
+                "marker_path": repo_relative(&ctrl.reclaim_marker_path()),
+                "owner_pid": marker.owner_pid,
+                "owner_process_birth_unix_ms": marker.owner_process_birth_unix_ms,
+                "owner_pgid": marker.owner_pgid,
+                "owner_last_heartbeat_unix_ms": marker.owner_last_heartbeat_unix_ms,
+                "owner_last_control_sequence": marker.owner_last_control_sequence,
+                "observation_count": marker.observation_count,
+                "freshness_window_ms": marker.freshness_window_ms,
+                "preserved_generation_root": marker.preserved_generation_root.clone(),
+                "next_action": "preserve the blocked generation and resolve descendant ambiguity before rerun"
+            })
+        });
+    let has_real_provenance = provenance["commit_sha"].as_str() != Some("test-run-no-git")
+        && provenance["tree_id"].as_str() != Some("test-run-no-git")
+        && provenance["status_snapshot_sha256"].as_str() != Some("test-run-no-git");
+    let tree_clean = provenance["tree_clean"].as_bool().unwrap_or(false);
+    let status_line_count = provenance["status_snapshot_line_count"]
+        .as_u64()
+        .unwrap_or(1);
+    let all_fixtures_ready = missing_evidence.is_empty()
+        && fixture_entries
+            .iter()
+            .all(|entry| entry["verdict"].as_str() == Some("ready"));
+    let (overall_status, publication_state, blocking_reasons): (&str, &str, Vec<String>) =
+        if manual_recovery_evidence.is_some() {
+            (
+                "blocked_manual_recovery",
+                "diagnostic_blocked",
+                vec!["manual_recovery_required_before_reclaim".to_string()],
+            )
+        } else if !missing_evidence.is_empty() {
+            (
+                "blocked_missing_evidence",
+                "diagnostic_blocked",
+                vec!["required_runtime_evidence_missing".to_string()],
+            )
+        } else if !divergence_evidence.is_empty()
+            || fixture_entries
+                .iter()
+                .any(|entry| entry["verdict"].as_str() == Some("blocked_divergence"))
+        {
+            (
+                "blocked_divergence",
+                "diagnostic_blocked",
+                vec!["behavioral_diff_reported_blocking_divergence".to_string()],
+            )
+        } else if all_fixtures_ready && (!tree_clean || status_line_count != 0) {
+            (
+                "blocked_dirty_tree",
+                "diagnostic_blocked",
+                vec!["dirty_tree_cannot_certify_same_tree_readiness".to_string()],
+            )
+        } else if !timeout_evidence.is_empty()
+            || fixture_entries
+                .iter()
+                .any(|entry| entry["verdict"].as_str() == Some("blocked_timeout"))
+        {
+            (
+                "blocked_timeout",
+                "diagnostic_blocked",
+                vec!["parity_generation_timed_out".to_string()],
+            )
+        } else if !interrupted_evidence.is_empty()
+            || fixture_entries
+                .iter()
+                .any(|entry| entry["verdict"].as_str() == Some("blocked_interrupted"))
+        {
+            (
+                "blocked_interrupted",
+                "diagnostic_blocked",
+                vec!["parity_generation_interrupted".to_string()],
+            )
+        } else if all_fixtures_ready && has_real_provenance && tree_clean && status_line_count == 0 {
+            (
+                "ready_same_tree_verified",
+                "published_ready",
+                Vec::<String>::new(),
+            )
+        } else {
+            (
+                "blocked_missing_evidence",
+                "schema_validation_only",
+                vec!["missing_or_sentinel_evidence_cannot_certify_same_tree_readiness".to_string()],
+            )
+        };
 
     let detail = json!({
         "schema_version": DETAIL_SCHEMA_VERSION,
@@ -1750,21 +2111,12 @@ async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
         "required_fixtures": REQUIRED_FIXTURES,
         "required_surfaces": REQUIRED_COMPARISON_SURFACES,
         "fixtures": fixture_entries,
-        "blocking_reasons": json!(["sentinel_provenance_cannot_certify_same_tree_readiness"]),
-        "missing_evidence": json!([
-            {
-                "missing_path": "control-plane/target/parity/work/<generation_id>/<fixture_id>/parity.sqlite",
-                "expected_producer": "generation-scoped live gate replay (MISSING-002)",
-                "affected_fixture_or_surface": "all_fixtures",
-                "next_action": "implement generation-scoped replay layout and run ./scripts/test-gate.sh proposal-041 on a clean tree"
-            },
-            {
-                "missing_path": "control-plane/target/parity-control/lease.json",
-                "expected_producer": "ParityControlRoot lifecycle wired into gate (MISSING-003)",
-                "affected_fixture_or_surface": "all_fixtures",
-                "next_action": "wire ParityControlRoot acquire/release into the gate before any destructive work"
-            }
-        ]),
+        "blocking_reasons": blocking_reasons,
+        "missing_evidence": missing_evidence,
+        "divergence_evidence": divergence_evidence,
+        "timeout_evidence": timeout_evidence,
+        "interrupted_evidence": interrupted_evidence,
+        "manual_recovery_evidence": manual_recovery_evidence,
         "provenance": provenance.clone(),
     });
 
@@ -1809,13 +2161,53 @@ async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
             "ready_same_tree_verified requires tree_clean == true"
         );
         assert_eq!(
-            row["provenance"]["status_snapshot_line_count"].as_i64().unwrap_or(1),
+            row["provenance"]["status_snapshot_line_count"]
+                .as_i64()
+                .unwrap_or(1),
             0,
             "ready_same_tree_verified requires status_snapshot_line_count == 0"
         );
     }
 
-    // Emit to publication/current/ via atomic same-directory temp+rename (BLOCK-004).
+    // P041 §6.2: every fixture entry must carry a per-fixture provenance summary.
+    for entry in fixture_entries.iter() {
+        let fid = entry["fixture_id"].as_str().unwrap_or("unknown");
+        assert!(
+            !entry["provenance"].is_null(),
+            "fixture '{fid}': fixtures[] entry must have a provenance field (§6.2)"
+        );
+        assert!(
+            entry["provenance"].is_object(),
+            "fixture '{fid}': provenance must be a JSON object"
+        );
+        assert!(
+            entry["provenance"]["source"].is_string(),
+            "fixture '{fid}': provenance.source must be present"
+        );
+    }
+
+    // Stage generation-scoped candidate artifacts, then promote matching row/detail
+    // to publication/current/ via atomic same-directory temp+rename.
+    write_atomic_json(
+        &pub_generation.join("p031-p041-parity-evidence.json"),
+        &detail,
+    )?;
+    write_atomic_json(
+        &pub_generation.join("p031-phase-0-manifest-row.json"),
+        &row,
+    )?;
+    assert!(
+        pub_generation
+            .join("p031-p041-parity-evidence.json")
+            .is_file(),
+        "generation-scoped detail artifact must be staged before current promotion"
+    );
+    assert!(
+        pub_generation
+            .join("p031-phase-0-manifest-row.json")
+            .is_file(),
+        "generation-scoped row artifact must be staged before current promotion"
+    );
     write_atomic_json(&pub_current.join("p031-p041-parity-evidence.json"), &detail)?;
     write_atomic_json(&pub_current.join("p031-phase-0-manifest-row.json"), &row)?;
 
@@ -1872,7 +2264,12 @@ fn evaluate_stalled_owner(
     obs2_heartbeat_ms: u64,
     obs2_sequence: u64,
 ) -> &'static str {
-    if is_owner_stalled(obs1_heartbeat_ms, obs1_sequence, obs2_heartbeat_ms, obs2_sequence) {
+    if is_owner_stalled(
+        obs1_heartbeat_ms,
+        obs1_sequence,
+        obs2_heartbeat_ms,
+        obs2_sequence,
+    ) {
         "blocked_manual_recovery"
     } else {
         "blocked_in_progress"
@@ -1920,6 +2317,33 @@ fn proposal_041_stubborn_descendant_timeout_blocks_ready_publication() {
     assert_eq!(
         status_after_drain, "ready_same_tree_verified",
         "clean tree with proven descendant absence may produce ready after drain"
+    );
+}
+
+/// P041 §6.3 ¶15: descendant absence must be proven before ready publication,
+/// even when no timeout or interrupt occurred (e.g., release_marker.descendant_quiescent=false).
+/// SEC-P041-001: a successor must not reclaim on a release marker that records
+/// descendant_quiescent=false.
+#[test]
+fn proposal_041_descendant_not_quiescent_blocks_ready_publication() {
+    // No timeout, no interrupt, clean tree, all fixtures pass — but descendants
+    // are NOT proven absent.  ready_same_tree_verified must still be blocked.
+    let status = compute_publication_status_with_timeout(true, 0, true, true, false, false);
+    assert_ne!(
+        status, "ready_same_tree_verified",
+        "unproven descendant absence must block ready_same_tree_verified \
+         (release_marker.descendant_quiescent=false is not a clean release)"
+    );
+    assert_eq!(
+        status, "blocked_timeout",
+        "unproven descendant absence must produce blocked_timeout"
+    );
+
+    // Once descendants are proven absent, ready publication is allowed.
+    let ready = compute_publication_status_with_timeout(true, 0, true, true, false, true);
+    assert_eq!(
+        ready, "ready_same_tree_verified",
+        "proven descendant absence with all fixtures passing must allow ready_same_tree_verified"
     );
 }
 
@@ -1975,7 +2399,13 @@ fn compute_publication_status_with_timeout(
     if !tree_clean || status_snapshot_line_count != 0 {
         return "blocked_dirty_tree";
     }
-    if timed_out && !descendant_absent {
+    // P041 §6.3 ¶15: ready publication is legal only after descendant quiescence is proven.
+    // This applies regardless of whether the run timed out — unproven descendant absence
+    // always blocks ready publication.
+    if !descendant_absent {
+        return "blocked_timeout";
+    }
+    if timed_out {
         return "blocked_timeout";
     }
     if !all_fixtures_pass || !all_surfaces_pass {
@@ -2056,14 +2486,19 @@ fn proposal_041_parity_control_directory_and_atomic_write_contract() -> Result<(
     assert_eq!(lease.control_sequence, 0);
     ctrl.write_lease(&lease)?;
 
-    let read_back = ctrl.read_lease()?.expect("lease.json must be readable after write");
+    let read_back = ctrl
+        .read_lease()?
+        .expect("lease.json must be readable after write");
     assert_eq!(read_back.schema_version, "parity-control-lease.v1");
     assert_eq!(read_back.pid, lease.pid);
     assert_eq!(read_back.process_birth_unix_ms, 1_700_000_000_000);
     assert_eq!(read_back.hostname, "testhost");
     assert_eq!(read_back.commit_sha, "abc123commit");
     assert_eq!(read_back.tree_id, "def456tree");
-    assert_eq!(read_back.publication_generation_id, "gen-parity-control-test");
+    assert_eq!(
+        read_back.publication_generation_id,
+        "gen-parity-control-test"
+    );
     assert_eq!(read_back.control_sequence, 0);
 
     // Atomic write leaves no .tmp residue
@@ -2076,15 +2511,18 @@ fn proposal_041_parity_control_directory_and_atomic_write_contract() -> Result<(
                 .unwrap_or(false)
         })
         .collect();
-    assert!(tmp_files.is_empty(), "no .tmp files may remain after atomic write");
+    assert!(
+        tmp_files.is_empty(),
+        "no .tmp files may remain after atomic write"
+    );
 
     // Reclaim marker: blocked_manual_recovery (Case B — missing pgid metadata)
     let marker_b = ReclaimMarker::blocked_manual_recovery(
         &lease,
-        true,   // missing_pgid_metadata
-        false,  // observable_descendants
+        true,  // missing_pgid_metadata
+        false, // observable_descendants
         Some(ctrl.root().to_string_lossy().to_string()),
-        1,      // observation_count: 1 for Case B (no pgid metadata → no wait)
+        1,       // observation_count: 1 for Case B (no pgid metadata → no wait)
         120_000, // freshness_window_ms
         "Case B: pgid metadata missing after abnormal exit",
     );
@@ -2115,35 +2553,62 @@ fn proposal_041_parity_control_directory_and_atomic_write_contract() -> Result<(
 
     // Interruption marker
     let int_marker = InterruptionMarker::new("gen-parity-control-test", "SIGTERM");
-    assert_eq!(int_marker.schema_version, "parity-control-interruption-marker.v1");
+    assert_eq!(
+        int_marker.schema_version,
+        "parity-control-interruption-marker.v1"
+    );
     assert_eq!(int_marker.overall_status, "blocked_interrupted");
     ctrl.write_interruption_marker(&int_marker)?;
     assert!(ctrl.interruption_marker_path().is_file());
 
     // Timeout marker
     let timeout_marker = TimeoutMarker::new("gen-parity-control-test", false);
-    assert_eq!(timeout_marker.schema_version, "parity-control-timeout-marker.v1");
+    assert_eq!(
+        timeout_marker.schema_version,
+        "parity-control-timeout-marker.v1"
+    );
     assert_eq!(timeout_marker.overall_status, "blocked_timeout");
     ctrl.write_timeout_marker(&timeout_marker)?;
     assert!(ctrl.timeout_marker_path().is_file());
 
     // Release marker
     let release_marker = ReleaseMarker::ready("gen-parity-control-test");
-    assert_eq!(release_marker.schema_version, "parity-control-release-marker.v1");
+    assert_eq!(
+        release_marker.schema_version,
+        "parity-control-release-marker.v1"
+    );
     assert_eq!(release_marker.overall_status, "ready_same_tree_verified");
     assert!(release_marker.descendant_quiescent);
     ctrl.write_release_marker(&release_marker)?;
     assert!(ctrl.release_marker_path().is_file());
 
     // Reclaim decision function is consistent with actual marker states
-    assert_eq!(evaluate_reclaim_decision(true, true, true), "blocked_in_progress");
-    assert_eq!(evaluate_reclaim_decision(false, false, false), "blocked_manual_recovery");
-    assert_eq!(evaluate_reclaim_decision(false, true, false), "blocked_manual_recovery");
-    assert_eq!(evaluate_reclaim_decision(false, true, true), "reclaim_allowed");
+    assert_eq!(
+        evaluate_reclaim_decision(true, true, true),
+        "blocked_in_progress"
+    );
+    assert_eq!(
+        evaluate_reclaim_decision(false, false, false),
+        "blocked_manual_recovery"
+    );
+    assert_eq!(
+        evaluate_reclaim_decision(false, true, false),
+        "blocked_manual_recovery"
+    );
+    assert_eq!(
+        evaluate_reclaim_decision(false, true, true),
+        "reclaim_allowed"
+    );
 
     // Stale-owner detection
-    assert!(is_owner_stalled(1_000_000, 5, 1_000_000, 5), "two stale obs must escalate");
-    assert!(!is_owner_stalled(1_000_000, 5, 2_000_000, 6), "fresh second obs must not escalate");
+    assert!(
+        is_owner_stalled(1_000_000, 5, 1_000_000, 5),
+        "two stale obs must escalate"
+    );
+    assert!(
+        !is_owner_stalled(1_000_000, 5, 2_000_000, 6),
+        "fresh second obs must not escalate"
+    );
 
     Ok(())
 }
@@ -2171,13 +2636,26 @@ fn proposal_041_pre_cleanup_publication_revokes_stale_ready_evidence() -> Result
         r#"{"schema_version":"p031-p041-parity-evidence.v1","overall_status":"ready_same_tree_verified","publication_state":"published_ready","publication_generation_id":"gen-prior-001"}"#,
     )?;
 
-    // New invocation: write blocked_in_progress BEFORE cleanup begins
-    write_pre_cleanup_publication(&pub_current, "gen-new-001", "abc123", "def456")?;
+    // New invocation: write blocked_in_progress BEFORE cleanup begins.
+    // Pre-cleanup provenance uses sentinel values since the porcelain status
+    // snapshot is captured in a later step (proposal Section 6.3 step 3).
+    write_pre_cleanup_publication(
+        &pub_current,
+        "gen-new-001",
+        "abc123",
+        "def456",
+        false,
+        "pending",
+        0,
+    )?;
 
     // Verify row is now revoked for the new generation
     let row_raw = fs::read_to_string(pub_current.join("p031-phase-0-manifest-row.json"))?;
     let row: Value = serde_json::from_str(&row_raw)?;
-    assert_eq!(row["schema_version"], "p031-phase-0-runtime-manifest-row.v1");
+    assert_eq!(
+        row["schema_version"],
+        "p031-phase-0-runtime-manifest-row.v1"
+    );
     assert_eq!(row["id"], "p041_parity_evidence");
     assert_eq!(row["validation_status"], "blocked_in_progress");
     assert_eq!(row["publication_state"], "revoked_for_rerun");
@@ -2195,7 +2673,10 @@ fn proposal_041_pre_cleanup_publication_revokes_stale_ready_evidence() -> Result
     // Cross-artifact compatibility: row.validation_status == detail.overall_status
     assert_eq!(row["validation_status"], detail["overall_status"]);
     assert_eq!(row["publication_state"], detail["publication_state"]);
-    assert_eq!(row["publication_generation_id"], detail["publication_generation_id"]);
+    assert_eq!(
+        row["publication_generation_id"],
+        detail["publication_generation_id"]
+    );
 
     // Stale ready evidence must be fully overwritten
     assert_ne!(row["validation_status"], "ready_same_tree_verified");
@@ -2228,12 +2709,8 @@ fn proposal_041_cli_prefix_projection_matches_section_5_table() {
     for &(status, expected_prefix) in cases {
         let prefix = match status {
             "ready_same_tree_verified" => "PASS",
-            "blocked_missing_evidence"
-            | "blocked_divergence"
-            | "blocked_manual_recovery" => "FAIL",
-            "blocked_dirty_tree"
-            | "blocked_timeout"
-            | "blocked_interrupted" => "WARN",
+            "blocked_missing_evidence" | "blocked_divergence" | "blocked_manual_recovery" => "FAIL",
+            "blocked_dirty_tree" | "blocked_timeout" | "blocked_interrupted" => "WARN",
             "blocked_in_progress" => "INFO",
             _ => "FAIL",
         };
@@ -2246,12 +2723,8 @@ fn proposal_041_cli_prefix_projection_matches_section_5_table() {
     // Unknown status must also default to FAIL
     let unknown_prefix = match "unknown_status_enum" {
         "ready_same_tree_verified" => "PASS",
-        "blocked_missing_evidence"
-        | "blocked_divergence"
-        | "blocked_manual_recovery" => "FAIL",
-        "blocked_dirty_tree"
-        | "blocked_timeout"
-        | "blocked_interrupted" => "WARN",
+        "blocked_missing_evidence" | "blocked_divergence" | "blocked_manual_recovery" => "FAIL",
+        "blocked_dirty_tree" | "blocked_timeout" | "blocked_interrupted" => "WARN",
         "blocked_in_progress" => "INFO",
         _ => "FAIL",
     };

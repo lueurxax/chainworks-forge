@@ -1062,15 +1062,63 @@ def validate_p041_parity_row(repo_root: Path) -> GateResult:
             f"expected {P041_DETAIL_SCHEMA_VERSION}, got {row.get('detail_schema_version')}"
         )
 
+    # Validate runtime_detail_path and reference_detail_path before checking readiness.
+    # These path fields direct downstream consumers to the canonical artifacts; an
+    # absolute path, traversal sequence, or wrong canonical path is a consumer safety issue
+    # regardless of the overall validation_status (proposal Section 6.6 Decision 3 / PREPUSH-BLOCK-003).
+    _CANONICAL_RUNTIME_DETAIL = str(P041_RUNTIME_DETAIL_PATH)
+    _CANONICAL_REFERENCE_DETAIL = "docs/reference/p031-p041-parity-evidence.json"
+
+    runtime_detail_path = row.get("runtime_detail_path", "")
+    if not runtime_detail_path:
+        errors.append("P041 row missing runtime_detail_path")
+    elif not isinstance(runtime_detail_path, str):
+        errors.append(
+            f"P041 row.runtime_detail_path must be a string, got: {type(runtime_detail_path).__name__}"
+        )
+    elif runtime_detail_path.startswith("/") or ".." in runtime_detail_path:
+        errors.append(
+            f"P041 row.runtime_detail_path must be a relative canonical path with no "
+            f"'..', got: {runtime_detail_path!r}"
+        )
+    elif runtime_detail_path != _CANONICAL_RUNTIME_DETAIL:
+        errors.append(
+            f"P041 row.runtime_detail_path must equal "
+            f"{_CANONICAL_RUNTIME_DETAIL!r}, got: {runtime_detail_path!r}"
+        )
+
+    reference_detail_path = row.get("reference_detail_path", "")
+    if not reference_detail_path:
+        errors.append("P041 row missing reference_detail_path")
+    elif not isinstance(reference_detail_path, str):
+        errors.append(
+            f"P041 row.reference_detail_path must be a string, got: {type(reference_detail_path).__name__}"
+        )
+    elif reference_detail_path.startswith("/") or ".." in reference_detail_path:
+        errors.append(
+            f"P041 row.reference_detail_path must be a relative canonical path with no "
+            f"'..', got: {reference_detail_path!r}"
+        )
+    elif reference_detail_path != _CANONICAL_REFERENCE_DETAIL:
+        errors.append(
+            f"P041 row.reference_detail_path must equal "
+            f"{_CANONICAL_REFERENCE_DETAIL!r}, got: {reference_detail_path!r}"
+        )
+
     ready = row.get("validation_status") == P041_READY_STATUS
+    if not ready:
+        errors.append(
+            f"P041 runtime row validation_status is "
+            f"{row.get('validation_status')!r}, not {P041_READY_STATUS!r}; "
+            "P031 acceptance requires ready_same_tree_verified — rerun "
+            "'./scripts/test-gate.sh proposal-041' on a clean tree first"
+        )
     live_commit = _git_rev(repo_root, "HEAD")
     live_tree = _git_rev(repo_root, "HEAD^{tree}")
     live_status = _git_status_snapshot(repo_root) if ready else None
     prov = row.get("provenance", {})
     row_commit = prov.get("commit_sha", "")
     row_tree = prov.get("tree_id", "")
-    row_clean = prov.get("tree_clean", False)
-    row_line_count = prov.get("status_snapshot_line_count", -1)
 
     if live_commit and row_commit and row_commit != live_commit:
         errors.append(
@@ -1262,6 +1310,8 @@ class P031ThinUIGateTests(unittest.TestCase):
         row: dict[str, Any] = {
             "schema_version": P041_ROW_SCHEMA_VERSION,
             "id": "p041_parity_evidence",
+            "runtime_detail_path": str(P041_RUNTIME_DETAIL_PATH),
+            "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
             "validation_status": P041_READY_STATUS,
             "publication_state": "published_ready",
             "publication_generation_id": "gen-test",
@@ -1294,6 +1344,42 @@ class P031ThinUIGateTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("missing docs/reference/p031-operator-write-path-guide.json", result.errors[0])
 
+    def test_p041_non_ready_row_is_rejected_directly(self) -> None:
+        for non_ready_status in (
+            "blocked_missing_evidence",
+            "blocked_divergence",
+            "blocked_dirty_tree",
+            "blocked_timeout",
+            "blocked_interrupted",
+            "blocked_in_progress",
+            "blocked_manual_recovery",
+        ):
+            with self.subTest(validation_status=non_ready_status):
+                root = self.make_repo()
+                self.write_p041_runtime(
+                    root,
+                    row_updates={
+                        "validation_status": non_ready_status,
+                        "publication_state": "blocked",
+                    },
+                    detail_updates={
+                        "overall_status": non_ready_status,
+                        "publication_state": "blocked",
+                    },
+                )
+
+                result = validate_p041_parity_row(root)
+
+                self.assertFalse(result.ok, f"expected error for status {non_ready_status}")
+                self.assertTrue(
+                    any(non_ready_status in error for error in result.errors),
+                    f"expected {non_ready_status!r} named in errors: {result.errors}",
+                )
+                self.assertTrue(
+                    any("ready_same_tree_verified" in error for error in result.errors),
+                    f"expected ready_same_tree_verified named in errors: {result.errors}",
+                )
+
     def test_p041_ready_runtime_requires_live_git_provenance(self) -> None:
         root = self.make_repo()
         self.write_p041_runtime(root)
@@ -1304,6 +1390,116 @@ class P031ThinUIGateTests(unittest.TestCase):
         self.assertTrue(
             any("live git provenance" in error for error in result.errors),
             result.errors,
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_absolute(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"runtime_detail_path": "/absolute/path/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e and "relative" in e for e in result.errors),
+            f"expected relative-path error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_traversal(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"runtime_detail_path": "control-plane/../target/parity/publication/current/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e and ".." in e for e in result.errors),
+            f"expected traversal error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_mismatched(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"runtime_detail_path": "wrong/path/parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e for e in result.errors),
+            f"expected runtime_detail_path error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_missing(self) -> None:
+        root = self.make_repo()
+        row_updates: dict[str, Any] = {}
+        row_updates["runtime_detail_path"] = ""  # type: ignore[assignment]
+        self.write_p041_runtime(root, row_updates=row_updates)
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e for e in result.errors),
+            f"expected runtime_detail_path error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_non_string(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(root, row_updates={"runtime_detail_path": 42})
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e and "string" in e for e in result.errors),
+            f"expected runtime_detail_path type error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_absolute(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"reference_detail_path": "/docs/reference/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e and "relative" in e for e in result.errors),
+            f"expected relative-path error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_traversal(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"reference_detail_path": "docs/../reference/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e and ".." in e for e in result.errors),
+            f"expected traversal error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_mismatched(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"reference_detail_path": "docs/reference/other-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e for e in result.errors),
+            f"expected reference_detail_path error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_non_string(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(root, row_updates={"reference_detail_path": 42})
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e and "string" in e for e in result.errors),
+            f"expected reference_detail_path type error, got: {result.errors}",
         )
 
     def test_valid_write_path_guide_passes(self) -> None:
