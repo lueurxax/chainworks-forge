@@ -4,7 +4,7 @@ Status: READY_TEMPLATE_WITH_RUNTIME_PREREQS_ATTACHED
 Owner: P031 release owner
 Blocking Phase: Phase 3
 Template Date: 2026-04-24
-Last Updated: 2026-05-05T19:37:03+03:00
+Last Updated: 2026-05-05T19:40:00+03:00
 
 ## Phase 3 Checklist
 - [ ] Run prerequisite gates (P027, P041, P042, P043, P031).
@@ -38,6 +38,19 @@ Still required for Phase 3 sign-off:
 - Approval diagnostic comprehension on a run with pending approval rows.
 - Report payload indicator evidence on representative report artifacts.
 - Release-owner acceptance/waiver for degraded-state evidence if no scripted drill is run.
+- Operator acceptance of the current workflow UI after the P036/P085 UI restoration work is complete.
+
+## Operator Acceptance Blocker
+
+The operator explicitly did not accept the current P031 thin UI for release dogfood on 2026-05-05.
+
+Operator feedback:
+
+- The workflow is not clear enough for release acceptance.
+- The current UI differs materially from the prior operator workflow.
+- The relevant UI concerns are tracked in the UI follow-up proposals, especially P036 for visual/navigation restoration and P085 for thin-client affordance parity.
+
+This blocks Phase 3 dogfood sign-off. The two required `full-mvp-live` dogfood runs should not be treated as release acceptance until the UI restoration/affordance concerns have been addressed or explicitly waived by the release owner.
 
 ## Sign-Off
 

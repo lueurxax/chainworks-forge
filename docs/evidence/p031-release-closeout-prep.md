@@ -2,7 +2,7 @@
 
 Status: PREP_ONLY_NOT_SIGNOFF
 Owner: P031 release owner
-Last Updated: 2026-05-05
+Last Updated: 2026-05-05T19:40:00+03:00
 
 This packet is a preparation checklist for the next P031 audit. It is not release
 sign-off evidence and must not be used to mark `proposal-031-readiness` ready
@@ -29,6 +29,10 @@ without the run-specific operator evidence listed below.
 
 ## Still Required Before Ready
 
+- Resolve the operator acceptance blocker recorded in
+  `docs/evidence/p031-dogfood-signoff.md`. The current UI is not accepted for
+  release dogfood because it is not clear enough and differs materially from the
+  prior operator workflow.
 - Two full-mvp-live dogfood runs completed against the release candidate.
 - Operator workflow-completion notes for both dogfood runs.
 - Approval diagnostic comprehension evidence on a run with pending approval rows.
@@ -54,6 +58,7 @@ owner records real dogfood, degraded-state, and freshness evidence.
 
 | Item | Evidence Location | Owner | Status |
 | --- | --- | --- | --- |
+| Operator UI acceptance | `docs/evidence/p031-dogfood-signoff.md` | P031 release owner | Blocked pending P036/P085 UI work |
 | Dogfood run 1 | TBD | P031 release owner | Pending |
 | Dogfood run 2 | TBD | P031 release owner | Pending |
 | Approval diagnostic check | TBD | P031 release owner | Pending |
