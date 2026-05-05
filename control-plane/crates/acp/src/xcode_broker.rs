@@ -2448,7 +2448,10 @@ mod tests {
         .await
         .expect("backend pid lookup must not wait for the hung session mutex");
 
-        assert!(pid.is_some(), "backend pid should be known while request is hung");
+        assert!(
+            pid.is_some(),
+            "backend pid should be known while request is hung"
+        );
         forward.abort();
         backend.release_lease(&context.lease_id).await.unwrap();
     }

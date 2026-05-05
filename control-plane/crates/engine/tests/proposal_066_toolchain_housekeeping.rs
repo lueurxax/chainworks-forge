@@ -63,7 +63,10 @@ async fn p066_t19_terminal_run_xcode_root_is_pruned() {
     use engine::housekeeping::sweep_xcode_toolchain_roots as sweep;
     sweep(&pool, toolchain_home).await.unwrap();
 
-    assert!(!xcode_root.exists(), "terminal run Xcode root must be pruned");
+    assert!(
+        !xcode_root.exists(),
+        "terminal run Xcode root must be pruned"
+    );
 }
 
 #[tokio::test]
@@ -78,7 +81,10 @@ async fn p066_t19_active_run_xcode_root_is_preserved() {
     use engine::housekeeping::sweep_xcode_toolchain_roots as sweep;
     sweep(&pool, toolchain_home).await.unwrap();
 
-    assert!(xcode_root.exists(), "active run Xcode root must be preserved");
+    assert!(
+        xcode_root.exists(),
+        "active run Xcode root must be preserved"
+    );
 }
 
 #[tokio::test]
@@ -93,7 +99,10 @@ async fn p066_t19_unknown_run_xcode_root_is_preserved() {
     use engine::housekeeping::sweep_xcode_toolchain_roots as sweep;
     sweep(&pool, toolchain_home).await.unwrap();
 
-    assert!(xcode_root.exists(), "unknown run Xcode root must be preserved");
+    assert!(
+        xcode_root.exists(),
+        "unknown run Xcode root must be preserved"
+    );
 }
 
 #[tokio::test]
@@ -113,11 +122,17 @@ async fn p066_t19_mixed_roots_only_terminal_pruned() {
     use engine::housekeeping::sweep_xcode_toolchain_roots as sweep;
     let readback = sweep(&pool, toolchain_home).await.unwrap();
 
-    assert!(!completed_root.exists(), "completed run root must be pruned");
+    assert!(
+        !completed_root.exists(),
+        "completed run root must be pruned"
+    );
     assert!(!failed_root.exists(), "failed run root must be pruned");
     assert!(running_root.exists(), "running run root must be preserved");
 
-    assert_eq!(readback.run_scoped_roots_pruned, 2, "2 terminal roots pruned");
+    assert_eq!(
+        readback.run_scoped_roots_pruned, 2,
+        "2 terminal roots pruned"
+    );
     assert_eq!(readback.run_scoped_prune_failures, 0);
 }
 

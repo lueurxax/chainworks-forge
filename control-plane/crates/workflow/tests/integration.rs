@@ -767,39 +767,26 @@ fn test_compile_full_mvp_live_plan() {
     // Verify provider resolution
     let s1 = &plan.states["state_1_idea_received"];
     assert_eq!(s1.owner.agent_id, "lead_orchestrator");
-    assert_eq!(s1.owner.provider, "claude", "lead_orchestrator uses claude");
+    assert_eq!(s1.owner.provider, "junie", "lead_orchestrator uses junie");
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
     assert_eq!(
-        s4.owner.provider, "claude",
-        "state_4 owner=lead_orchestrator → claude"
-    );
-    // Parallel tasks should have mixed providers
-    let ux_task = s4
-        .tasks
-        .iter()
-        .find(|t| t.agent.agent_id == "proposal_reviewer_ux");
-    assert!(ux_task.is_some(), "should have UX reviewer task");
-    assert_eq!(
-        ux_task.unwrap().agent.provider,
-        "gemini",
-        "UX reviewer uses gemini"
-    );
-
-    let arch_task = s4
-        .tasks
-        .iter()
-        .find(|t| t.agent.agent_id == "proposal_reviewer_architect");
-    assert!(arch_task.is_some(), "should have architect reviewer task");
-    assert_eq!(
-        arch_task.unwrap().agent.provider,
-        "codex",
-        "architect uses codex"
+        s4.owner.provider, "junie",
+        "state_4 owner=lead_orchestrator uses junie"
     );
     assert_eq!(
-        arch_task.unwrap().agent.requested_mcp_server_ids,
-        vec!["xcode".to_string(), "context7".to_string()],
-        "architect MCP intent comes from codex_architect_high backend_profile"
+        s4.system_task
+            .as_ref()
+            .expect("state_4 routes proposal review through a system task")
+            .task_type,
+        "proposal_review_router"
+    );
+    assert_eq!(
+        s4.dynamic_parallel
+            .as_ref()
+            .expect("state_4 materializes reviewers dynamically")
+            .selector_artifact,
+        "agent_selection_plan_v1"
     );
 
     // Verify code_writer → claude
@@ -917,6 +904,12 @@ fn implementation_review_transitions_use_aggregate_review_summary_not_self_asses
         assert!(
             !release_transition
                 .condition
+                .contains("release_evidence_blocked"),
+            "{workflow_name} must route release_evidence_blocked back to implementation refinement"
+        );
+        assert!(
+            !release_transition
+                .condition
                 .contains("implementation_self_assessment_v2.blocking_remaining_code_tasks"),
             "{workflow_name} manual release transition must be guarded by aggregate review truth"
         );
@@ -931,6 +924,12 @@ fn implementation_review_transitions_use_aggregate_review_summary_not_self_asses
                 .condition
                 .contains("implementation_review_summary.status"),
             "{workflow_name} refine transition must consume aggregate review truth"
+        );
+        assert!(
+            !refine_transition
+                .condition
+                .contains("release_evidence_blocked"),
+            "{workflow_name} refine transition must not exclude release_evidence_blocked"
         );
         assert!(
             !refine_transition

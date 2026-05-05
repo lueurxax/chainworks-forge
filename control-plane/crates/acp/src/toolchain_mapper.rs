@@ -197,7 +197,10 @@ pub fn validate_path_containment(
 /// Returns `DiskFull` if available bytes < `min_free_bytes`.
 /// On non-unix platforms or if stat fails, the check is skipped (fail-open for the check itself).
 #[cfg(unix)]
-pub fn check_free_space(path: &Path, min_free_bytes: u64) -> Result<(), ToolchainSetupFailureReason> {
+pub fn check_free_space(
+    path: &Path,
+    min_free_bytes: u64,
+) -> Result<(), ToolchainSetupFailureReason> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -220,7 +223,10 @@ pub fn check_free_space(path: &Path, min_free_bytes: u64) -> Result<(), Toolchai
 }
 
 #[cfg(not(unix))]
-pub fn check_free_space(_path: &Path, _min_free_bytes: u64) -> Result<(), ToolchainSetupFailureReason> {
+pub fn check_free_space(
+    _path: &Path,
+    _min_free_bytes: u64,
+) -> Result<(), ToolchainSetupFailureReason> {
     Ok(())
 }
 
@@ -328,10 +334,7 @@ pub fn prepare_toolchain_mapping(
     })
 }
 
-fn deadline_check(
-    start: Instant,
-    family_str: &str,
-) -> Result<(), ToolchainMappingSetupFailed> {
+fn deadline_check(start: Instant, family_str: &str) -> Result<(), ToolchainMappingSetupFailed> {
     if start.elapsed() > TOOLCHAIN_SETUP_DEADLINE {
         return Err(ToolchainMappingSetupFailed::new(
             ToolchainSetupFailureReason::Timeout,
@@ -348,11 +351,8 @@ fn set_owner_only_permissions(
 ) -> Result<(), ToolchainMappingSetupFailed> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-        ToolchainMappingSetupFailed::new(
-            ToolchainSetupFailureReason::PermissionDenied,
-            family_str,
-        )
-        .with_detail(e.to_string())
+        ToolchainMappingSetupFailed::new(ToolchainSetupFailureReason::PermissionDenied, family_str)
+            .with_detail(e.to_string())
     })
 }
 

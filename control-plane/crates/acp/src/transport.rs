@@ -1,7 +1,6 @@
 //! ACP JSON-RPC 2.0 subprocess transport.
 //!
-//! Implements the wire protocol documented in `ClaudeAgentACPTransport.swift` and
-//! `CodexACPTransport.swift`:
+//! Implements the Rust control-plane ACP wire protocol:
 //! - ndjson over stdio (one JSON object per line, `\n` delimited)
 //! - Three-phase handshake: `initialize` → `session/new` → `session/prompt`
 //! - Streaming `session/update` notifications during the prompt phase
@@ -1527,7 +1526,6 @@ pub(crate) async fn probe_initialize_with_timeout(
 
 /// Build a JSON-RPC result response that grants the first `allow_once` option
 /// (or `approved` as a fallback) found in `session/request_permission` params.
-/// Matches ACPProtocolSupport.swift `permissionSelectionResponse`.
 fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
     // Options may be at params["options"] or params["toolCall"]["options"]
     let options: Vec<&Value> = params["options"]

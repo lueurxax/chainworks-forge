@@ -47,8 +47,8 @@ struct RunPlanCompilerTests {
         // Verify a sample agent's backend is resolved
         let leadOrch = plan.agentBindings["lead_orchestrator"]
         #expect(leadOrch != nil)
-        #expect(ProviderFamily.from(runtimeIdentifier: leadOrch?.provider ?? "") == .claudeACP)
-        #expect(leadOrch?.effort == "high")
+        #expect(ProviderFamily.from(runtimeIdentifier: leadOrch?.provider ?? "") == .junie)
+        #expect(leadOrch?.effort == "medium")
     }
 
     @Test("Initial state is start type")
@@ -346,8 +346,8 @@ struct RunPlanCompilerTests {
 
         // Verify lead_orchestrator binding details
         let leadOrch = plan.agentBindings["lead_orchestrator"]
-        #expect(ProviderFamily.from(runtimeIdentifier: leadOrch?.provider ?? "") == .claudeACP)
-        #expect(leadOrch?.effort == "high")
+        #expect(ProviderFamily.from(runtimeIdentifier: leadOrch?.provider ?? "") == .junie)
+        #expect(leadOrch?.effort == "medium")
 
         // Verify code_writer binding details
         let codeWriter = plan.agentBindings["code_writer"]

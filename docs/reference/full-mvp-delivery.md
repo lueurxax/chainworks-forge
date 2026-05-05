@@ -235,7 +235,8 @@ reads normalized `audit_report`, `security_report`, `prepush_review_report`,
 After `state_9_implementation_reviewed`, the release/refine decision is owned by
 `implementation_review_summary_v1.status`: `code_complete` may enter manual
 release, `needs_code_fixes` and `invalid` return to implementation refinement, and
-`release_evidence_blocked` enters the release-hold/manual decision surface. The
+`release_evidence_blocked` returns to implementation refinement so release
+evidence gaps remain part of orchestrator-owned closeout work. The
 workflow must not route to manual release from
 `implementation_self_assessment_v2.blocking_remaining_code_tasks == 0` alone.
 
