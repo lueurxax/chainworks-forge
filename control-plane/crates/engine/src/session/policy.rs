@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use db::repos::sessions;
+use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::session::{
     SessionEvent, SessionEventType, SessionGeneration, SessionGenerationStatus, SessionLineage,
     SessionReuseDisposition,
@@ -82,6 +83,27 @@ pub async fn ensure_policy(
 
     if let Some(active_generation) = active {
         if active_generation.status == SessionGenerationStatus::Active {
+            if active_generation_has_missing_required_outputs_failure(pool, &active_generation.id)
+                .await?
+            {
+                invalidate_generation(
+                    pool,
+                    &lineage,
+                    &active_generation,
+                    PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON,
+                )
+                .await?;
+                return create_generation(
+                    pool,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshAfterInvalidation,
+                    None,
+                    None,
+                )
+                .await;
+            }
+
             let scope = lineage.session_reuse_scope.as_str();
             if scope == "none" {
                 invalidate_generation(
@@ -309,6 +331,27 @@ pub async fn ensure_policy_tx(
 
     if let Some(active_generation) = active {
         if active_generation.status == SessionGenerationStatus::Active {
+            if active_generation_has_missing_required_outputs_failure_tx(tx, &active_generation.id)
+                .await?
+            {
+                invalidate_generation_tx(
+                    tx,
+                    &lineage,
+                    &active_generation,
+                    PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON,
+                )
+                .await?;
+                return create_generation_tx(
+                    tx,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshAfterInvalidation,
+                    None,
+                    None,
+                )
+                .await;
+            }
+
             let scope = lineage.session_reuse_scope.as_str();
             if scope == "none" {
                 invalidate_generation_tx(
@@ -486,6 +529,123 @@ pub async fn ensure_policy_tx(
         checkpoint_artifact_id,
     )
     .await
+}
+
+const PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON: &str = "previous_missing_required_outputs";
+
+pub async fn invalidate_generation_after_missing_required_outputs(
+    pool: &SqlitePool,
+    session_generation_id: Option<&str>,
+    facts: &AgentExecutionRuntimeFacts,
+) -> Result<bool> {
+    let Some(session_generation_id) = session_generation_id else {
+        return Ok(false);
+    };
+    if !runtime_facts_require_session_invalidation(facts) {
+        return Ok(false);
+    }
+    let Some(generation) = sessions::find_generation_by_id(pool, session_generation_id).await?
+    else {
+        return Ok(false);
+    };
+    if generation.status != SessionGenerationStatus::Active {
+        return Ok(false);
+    }
+    let Some(lineage) = sessions::find_lineage_by_id(pool, &generation.lineage_id).await? else {
+        return Ok(false);
+    };
+    invalidate_generation(
+        pool,
+        &lineage,
+        &generation,
+        PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON,
+    )
+    .await?;
+    Ok(true)
+}
+
+pub async fn invalidate_generation_after_missing_required_outputs_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_generation_id: Option<&str>,
+    facts: &AgentExecutionRuntimeFacts,
+) -> Result<bool> {
+    let Some(session_generation_id) = session_generation_id else {
+        return Ok(false);
+    };
+    if !runtime_facts_require_session_invalidation(facts) {
+        return Ok(false);
+    }
+    let Some(generation) = sessions::find_generation_by_id_tx(tx, session_generation_id).await?
+    else {
+        return Ok(false);
+    };
+    if generation.status != SessionGenerationStatus::Active {
+        return Ok(false);
+    }
+    let Some(lineage) = sessions::find_lineage_by_id_tx(tx, &generation.lineage_id).await? else {
+        return Ok(false);
+    };
+    invalidate_generation_tx(
+        tx,
+        &lineage,
+        &generation,
+        PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON,
+    )
+    .await?;
+    Ok(true)
+}
+
+fn runtime_facts_require_session_invalidation(facts: &AgentExecutionRuntimeFacts) -> bool {
+    matches!(
+        &facts.failure_kind,
+        Some(AgentFailureKind::MissingRequiredOutputs)
+    ) || facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+}
+
+async fn active_generation_has_missing_required_outputs_failure(
+    pool: &SqlitePool,
+    generation_id: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT 1
+           FROM agent_executions ae
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE ae.session_generation_id = ?1
+             AND ae.status = 'failed'
+             AND (
+               facts.failure_kind = 'missing_required_outputs'
+               OR facts.output_settlement = 'missing_required_outputs'
+             )
+           LIMIT 1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn active_generation_has_missing_required_outputs_failure_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation_id: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT 1
+           FROM agent_executions ae
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE ae.session_generation_id = ?1
+             AND ae.status = 'failed'
+             AND (
+               facts.failure_kind = 'missing_required_outputs'
+               OR facts.output_settlement = 'missing_required_outputs'
+             )
+           LIMIT 1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
 }
 
 async fn budget_signals_from_generation(
@@ -804,15 +964,21 @@ async fn create_generation_tx(
 mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{ideas, runs, sessions};
+    use db::repos::{agent_execution_runtime_facts, agent_executions, ideas, runs, sessions};
+    use domain::agent::{
+        AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
+        AgentStatus,
+    };
     use domain::idea::{Idea, IdeaStatus};
-    use domain::ids::{IdeaId, RunId};
+    use domain::ids::{AgentExecutionId, IdeaId, RunId};
     use domain::run::{Run, RunStatus};
     use domain::session::{
         SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition,
     };
 
-    use super::{ensure_policy, SessionPolicyInput};
+    use super::{
+        ensure_policy, invalidate_generation_after_missing_required_outputs, SessionPolicyInput,
+    };
 
     async fn test_pool() -> sqlx::SqlitePool {
         create_pool("sqlite::memory:")
@@ -1126,6 +1292,135 @@ mod tests {
         let decision = ensure_policy(&pool, base_input()).await.unwrap();
         assert_eq!(decision.disposition, SessionReuseDisposition::Reused);
         assert_eq!(decision.generation.id, "generation-family");
+    }
+
+    #[tokio::test]
+    async fn missing_required_outputs_failure_invalidates_generation_before_reuse() {
+        let pool = test_pool().await;
+        seed_run(&pool).await;
+        let now = chrono::Utc::now();
+        let lineage = SessionLineage {
+            id: "lineage-missing-outputs".into(),
+            run_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "proposal_writer".into(),
+            lineage_id: "proposal-loop".into(),
+            session_reuse_scope: "same_agent_family_within_run".into(),
+            session_family_id: Some("proposal-loop".into()),
+            active_generation_id: Some("generation-missing-outputs".into()),
+            created_at: now,
+            closed_at: None,
+        };
+        sessions::insert_lineage(&pool, &lineage).await.unwrap();
+        sessions::insert_generation(
+            &pool,
+            &SessionGeneration {
+                id: "generation-missing-outputs".into(),
+                lineage_id: lineage.id.clone(),
+                generation: 1,
+                invocation_owner_key: "owner".into(),
+                provider_session_id: Some("provider-session".into()),
+                binding_fingerprint: "fingerprint".into(),
+                rehydrated_from_checkpoint_artifact_id: None,
+                working_directory: "/tmp/ws".into(),
+                workspace_mode: "read_only".into(),
+                runtime_provider: "claude".into(),
+                runtime_model: "sonnet".into(),
+                status: SessionGenerationStatus::Active,
+                turn_count: 2,
+                estimated_input_tokens: 0,
+                latest_cached_input_tokens: None,
+                latest_output_tokens: None,
+                latest_model_context_window: None,
+                cumulative_prompt_tokens: 0,
+                cumulative_cost_cents: 0,
+                created_at: now,
+                last_activity_at: None,
+                ended_at: None,
+                end_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent_execution_id = AgentExecutionId::new();
+        agent_executions::insert(
+            &pool,
+            &AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: None,
+                agent_id: "proposal_writer".into(),
+                provider: "claude".into(),
+                model: Some("sonnet".into()),
+                started_at: now,
+                completed_at: Some(now),
+                status: AgentStatus::Failed,
+                owner_execution_lineage_id: Some("owner".into()),
+                session_lineage_id: Some(lineage.id.clone()),
+                session_generation_id: Some("generation-missing-outputs".into()),
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: Some("owner".into()),
+                session_reuse_scope: Some("same_agent_family_within_run".into()),
+                session_family_id: Some("proposal-loop".into()),
+                session_reuse_disposition: Some("reused".into()),
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: Some("lead_conflict_mediation".into()),
+                owner_id: Some("mediation-owner".into()),
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let invalidated = invalidate_generation_after_missing_required_outputs(
+            &pool,
+            Some("generation-missing-outputs"),
+            &facts,
+        )
+        .await
+        .unwrap();
+        assert!(invalidated);
+        let prior = sessions::find_generation_by_id(&pool, "generation-missing-outputs")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prior.status, SessionGenerationStatus::Invalidated);
+        assert_eq!(
+            prior.end_reason.as_deref(),
+            Some("previous_missing_required_outputs")
+        );
+
+        let decision = ensure_policy(&pool, base_input()).await.unwrap();
+
+        assert_eq!(
+            decision.disposition,
+            SessionReuseDisposition::FreshAfterInvalidation
+        );
+        assert_eq!(decision.generation.generation, 2);
+        assert!(!decision.should_reuse_live_session);
     }
 
     #[tokio::test]

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -55,7 +57,18 @@ REQUIRED_MANIFEST_ENTRY_IDS = {
     "report_payload_priority_decision",
     "ux_accessibility_signoff",
     "dogfood_signoff_template",
+    "p041_parity_evidence",
 }
+
+P041_RUNTIME_ROW_PATH = Path(
+    "control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json"
+)
+P041_RUNTIME_DETAIL_PATH = Path(
+    "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json"
+)
+P041_ROW_SCHEMA_VERSION = "p031-phase-0-runtime-manifest-row.v1"
+P041_DETAIL_SCHEMA_VERSION = "p031-p041-parity-evidence.v1"
+P041_READY_STATUS = "ready_same_tree_verified"
 
 EVIDENCE_BLOCKING_STATUSES = {
     "blocked",
@@ -934,11 +947,279 @@ def validate_phase0_manifest(repo_root: Path) -> GateResult:
     return GateResult(errors)
 
 
+def _git_rev(repo_root: Path, ref: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", ref],
+            cwd=str(repo_root),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def _git_status_snapshot(repo_root: Path) -> tuple[str, int, str] | None:
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=str(repo_root),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    line_count = sum(1 for line in status.splitlines() if line)
+    return status, line_count, hashlib.sha256(status.encode()).hexdigest()
+
+
+def _require_ready_provenance(
+    errors: list[str],
+    label: str,
+    provenance: Any,
+    live_commit: str,
+    live_tree: str,
+    live_status_line_count: int,
+    live_status_sha256: str,
+) -> None:
+    if not isinstance(provenance, dict):
+        errors.append(f"P041 {label} provenance must be an object for ready_same_tree_verified")
+        return
+
+    commit_sha = provenance.get("commit_sha")
+    tree_id = provenance.get("tree_id")
+    status_sha256 = provenance.get("status_snapshot_sha256")
+    tree_clean = provenance.get("tree_clean")
+    status_line_count = provenance.get("status_snapshot_line_count")
+
+    for field, value in (
+        ("commit_sha", commit_sha),
+        ("tree_id", tree_id),
+        ("status_snapshot_sha256", status_sha256),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            errors.append(
+                f"P041 {label} provenance requires non-empty {field} "
+                "for ready_same_tree_verified live git provenance"
+            )
+
+    if commit_sha and commit_sha != live_commit:
+        errors.append(
+            f"P041 {label} provenance commit_sha {commit_sha[:12]} does not match "
+            f"live HEAD {live_commit[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+    if tree_id and tree_id != live_tree:
+        errors.append(
+            f"P041 {label} provenance tree_id {tree_id[:12]} does not match "
+            f"live HEAD^{{tree}} {live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+    if tree_clean is not True:
+        errors.append(
+            f"P041 {label} provenance must set tree_clean=true for ready_same_tree_verified"
+        )
+    if status_line_count != 0:
+        errors.append(
+            f"P041 {label} provenance status_snapshot_line_count is "
+            f"{status_line_count} (expected 0) for ready_same_tree_verified"
+        )
+    if status_line_count != live_status_line_count:
+        errors.append(
+            f"P041 {label} provenance status_snapshot_line_count {status_line_count} "
+            f"does not match live status line count {live_status_line_count}"
+        )
+    if status_sha256 and status_sha256 != live_status_sha256:
+        errors.append(
+            f"P041 {label} provenance status_snapshot_sha256 does not match "
+            "the live git status snapshot"
+        )
+
+
+def validate_p041_parity_row(repo_root: Path) -> GateResult:
+    errors: list[str] = []
+    row_path = repo_root / P041_RUNTIME_ROW_PATH
+    if not row_path.is_file():
+        errors.append(
+            f"P041 runtime row not found at {P041_RUNTIME_ROW_PATH}; "
+            "run './scripts/test-gate.sh proposal-041' on a clean tree first"
+        )
+        return GateResult(errors)
+
+    try:
+        row = json.loads(row_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        errors.append(f"P041 runtime row unreadable: {exc}")
+        return GateResult(errors)
+
+    if row.get("schema_version") != P041_ROW_SCHEMA_VERSION:
+        errors.append(
+            f"P041 runtime row schema_version mismatch: "
+            f"expected {P041_ROW_SCHEMA_VERSION}, got {row.get('schema_version')}"
+        )
+
+    if row.get("detail_schema_version") != P041_DETAIL_SCHEMA_VERSION:
+        errors.append(
+            f"P041 runtime row detail_schema_version mismatch: "
+            f"expected {P041_DETAIL_SCHEMA_VERSION}, got {row.get('detail_schema_version')}"
+        )
+
+    # Validate runtime_detail_path and reference_detail_path before checking readiness.
+    # These path fields direct downstream consumers to the canonical artifacts; an
+    # absolute path, traversal sequence, or wrong canonical path is a consumer safety issue
+    # regardless of the overall validation_status (proposal Section 6.6 Decision 3 / PREPUSH-BLOCK-003).
+    _CANONICAL_RUNTIME_DETAIL = str(P041_RUNTIME_DETAIL_PATH)
+    _CANONICAL_REFERENCE_DETAIL = "docs/reference/p031-p041-parity-evidence.json"
+
+    runtime_detail_path = row.get("runtime_detail_path", "")
+    if not runtime_detail_path:
+        errors.append("P041 row missing runtime_detail_path")
+    elif not isinstance(runtime_detail_path, str):
+        errors.append(
+            f"P041 row.runtime_detail_path must be a string, got: {type(runtime_detail_path).__name__}"
+        )
+    elif runtime_detail_path.startswith("/") or ".." in runtime_detail_path:
+        errors.append(
+            f"P041 row.runtime_detail_path must be a relative canonical path with no "
+            f"'..', got: {runtime_detail_path!r}"
+        )
+    elif runtime_detail_path != _CANONICAL_RUNTIME_DETAIL:
+        errors.append(
+            f"P041 row.runtime_detail_path must equal "
+            f"{_CANONICAL_RUNTIME_DETAIL!r}, got: {runtime_detail_path!r}"
+        )
+
+    reference_detail_path = row.get("reference_detail_path", "")
+    if not reference_detail_path:
+        errors.append("P041 row missing reference_detail_path")
+    elif not isinstance(reference_detail_path, str):
+        errors.append(
+            f"P041 row.reference_detail_path must be a string, got: {type(reference_detail_path).__name__}"
+        )
+    elif reference_detail_path.startswith("/") or ".." in reference_detail_path:
+        errors.append(
+            f"P041 row.reference_detail_path must be a relative canonical path with no "
+            f"'..', got: {reference_detail_path!r}"
+        )
+    elif reference_detail_path != _CANONICAL_REFERENCE_DETAIL:
+        errors.append(
+            f"P041 row.reference_detail_path must equal "
+            f"{_CANONICAL_REFERENCE_DETAIL!r}, got: {reference_detail_path!r}"
+        )
+
+    ready = row.get("validation_status") == P041_READY_STATUS
+    if not ready:
+        errors.append(
+            f"P041 runtime row validation_status is "
+            f"{row.get('validation_status')!r}, not {P041_READY_STATUS!r}; "
+            "P031 acceptance requires ready_same_tree_verified — rerun "
+            "'./scripts/test-gate.sh proposal-041' on a clean tree first"
+        )
+    live_commit = _git_rev(repo_root, "HEAD")
+    live_tree = _git_rev(repo_root, "HEAD^{tree}")
+    live_status = _git_status_snapshot(repo_root) if ready else None
+    prov = row.get("provenance", {})
+    row_commit = prov.get("commit_sha", "")
+    row_tree = prov.get("tree_id", "")
+
+    if live_commit and row_commit and row_commit != live_commit:
+        errors.append(
+            f"P041 runtime row commit_sha {row_commit[:12]} does not match live HEAD "
+            f"{live_commit[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+    if live_tree and row_tree and row_tree != live_tree:
+        errors.append(
+            f"P041 runtime row tree_id {row_tree[:12]} does not match live HEAD^{{tree}} "
+            f"{live_tree[:12]}; rerun './scripts/test-gate.sh proposal-041'"
+        )
+
+    if ready:
+        if not live_commit or not live_tree or live_status is None:
+            errors.append(
+                "P041 ready_same_tree_verified requires live git provenance "
+                "(HEAD, HEAD^{tree}, and status snapshot) to be available"
+            )
+        else:
+            _status_text, live_status_line_count, live_status_sha256 = live_status
+            if live_status_line_count != 0:
+                errors.append(
+                    "P041 ready_same_tree_verified requires a clean live git status snapshot"
+                )
+            _require_ready_provenance(
+                errors,
+                "runtime row",
+                prov,
+                live_commit,
+                live_tree,
+                live_status_line_count,
+                live_status_sha256,
+            )
+
+    detail_path = repo_root / P041_RUNTIME_DETAIL_PATH
+    if detail_path.is_file():
+        try:
+            detail = json.loads(detail_path.read_text())
+            if detail.get("schema_version") != P041_DETAIL_SCHEMA_VERSION:
+                errors.append(
+                    f"P041 runtime detail schema_version mismatch: "
+                    f"expected {P041_DETAIL_SCHEMA_VERSION}, got {detail.get('schema_version')}"
+                )
+            if row.get("validation_status") != detail.get("overall_status"):
+                errors.append(
+                    "P041 row.validation_status does not equal detail.overall_status: "
+                    f"{row.get('validation_status')} != {detail.get('overall_status')}"
+                )
+            if row.get("publication_state") != detail.get("publication_state"):
+                errors.append(
+                    "P041 row.publication_state does not equal detail.publication_state"
+                )
+            if row.get("publication_generation_id") != detail.get("publication_generation_id"):
+                errors.append(
+                    "P041 row.publication_generation_id does not equal detail.publication_generation_id"
+                )
+            # Section 6.2 / 6.6 Decision 4: for ready publication, detail.provenance must
+            # agree with row.provenance AND with the live checkout. Checking only row.provenance
+            # against live is insufficient — a stale detail with matching row provenance would pass.
+            if ready:
+                detail_prov = detail.get("provenance", {})
+                prov_fields = (
+                    "commit_sha", "tree_id", "tree_clean",
+                    "status_snapshot_sha256", "status_snapshot_line_count",
+                )
+                for pfield in prov_fields:
+                    dv = detail_prov.get(pfield)
+                    rv = prov.get(pfield)
+                    if dv != rv:
+                        errors.append(
+                            f"P041 detail.provenance.{pfield} ({dv!r}) does not match "
+                            f"row.provenance.{pfield} ({rv!r}); "
+                            "row and detail provenance must agree for ready publication"
+                        )
+                if live_commit and live_tree and live_status is not None:
+                    _status_text, live_status_line_count, live_status_sha256 = live_status
+                    _require_ready_provenance(
+                        errors,
+                        "runtime detail",
+                        detail_prov,
+                        live_commit,
+                        live_tree,
+                        live_status_line_count,
+                        live_status_sha256,
+                    )
+        except (json.JSONDecodeError, OSError) as exc:
+            errors.append(f"P041 runtime detail unreadable: {exc}")
+    elif ready:
+        errors.append(
+            f"P041 ready_same_tree_verified requires runtime detail at {P041_RUNTIME_DETAIL_PATH}"
+        )
+
+    return GateResult(errors)
+
+
 def validate_p031_contracts(repo_root: Path) -> GateResult:
     errors: list[str] = []
     errors.extend(validate_inventory(repo_root).errors)
     errors.extend(validate_write_path_guide(repo_root).errors)
     errors.extend(validate_phase0_manifest(repo_root).errors)
+    errors.extend(validate_p041_parity_row(repo_root).errors)
     return GateResult(errors)
 
 
@@ -1011,6 +1292,46 @@ class P031ThinUIGateTests(unittest.TestCase):
         guide.update(updates)
         (root / WRITE_PATH_GUIDE_PATH).write_text(json.dumps(guide))
 
+    def write_p041_runtime(
+        self,
+        root: Path,
+        row_updates: dict[str, Any] | None = None,
+        detail_updates: dict[str, Any] | None = None,
+    ) -> None:
+        publication_root = root / "control-plane/target/parity/publication/current"
+        publication_root.mkdir(parents=True)
+        provenance = {
+            "commit_sha": "",
+            "tree_id": "",
+            "tree_clean": True,
+            "status_snapshot_sha256": "",
+            "status_snapshot_line_count": 0,
+        }
+        row: dict[str, Any] = {
+            "schema_version": P041_ROW_SCHEMA_VERSION,
+            "id": "p041_parity_evidence",
+            "runtime_detail_path": str(P041_RUNTIME_DETAIL_PATH),
+            "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
+            "validation_status": P041_READY_STATUS,
+            "publication_state": "published_ready",
+            "publication_generation_id": "gen-test",
+            "detail_schema_version": P041_DETAIL_SCHEMA_VERSION,
+            "provenance": dict(provenance),
+        }
+        detail: dict[str, Any] = {
+            "schema_version": P041_DETAIL_SCHEMA_VERSION,
+            "overall_status": P041_READY_STATUS,
+            "publication_state": "published_ready",
+            "publication_generation_id": "gen-test",
+            "provenance": dict(provenance),
+        }
+        if row_updates:
+            row.update(row_updates)
+        if detail_updates:
+            detail.update(detail_updates)
+        (publication_root / "p031-phase-0-manifest-row.json").write_text(json.dumps(row))
+        (publication_root / "p031-p041-parity-evidence.json").write_text(json.dumps(detail))
+
     def test_missing_inventory_fails_closed(self) -> None:
         root = self.make_repo()
         result = validate_inventory(root)
@@ -1022,6 +1343,164 @@ class P031ThinUIGateTests(unittest.TestCase):
         result = validate_write_path_guide(root)
         self.assertFalse(result.ok)
         self.assertIn("missing docs/reference/p031-operator-write-path-guide.json", result.errors[0])
+
+    def test_p041_non_ready_row_is_rejected_directly(self) -> None:
+        for non_ready_status in (
+            "blocked_missing_evidence",
+            "blocked_divergence",
+            "blocked_dirty_tree",
+            "blocked_timeout",
+            "blocked_interrupted",
+            "blocked_in_progress",
+            "blocked_manual_recovery",
+        ):
+            with self.subTest(validation_status=non_ready_status):
+                root = self.make_repo()
+                self.write_p041_runtime(
+                    root,
+                    row_updates={
+                        "validation_status": non_ready_status,
+                        "publication_state": "blocked",
+                    },
+                    detail_updates={
+                        "overall_status": non_ready_status,
+                        "publication_state": "blocked",
+                    },
+                )
+
+                result = validate_p041_parity_row(root)
+
+                self.assertFalse(result.ok, f"expected error for status {non_ready_status}")
+                self.assertTrue(
+                    any(non_ready_status in error for error in result.errors),
+                    f"expected {non_ready_status!r} named in errors: {result.errors}",
+                )
+                self.assertTrue(
+                    any("ready_same_tree_verified" in error for error in result.errors),
+                    f"expected ready_same_tree_verified named in errors: {result.errors}",
+                )
+
+    def test_p041_ready_runtime_requires_live_git_provenance(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(root)
+
+        result = validate_p041_parity_row(root)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("live git provenance" in error for error in result.errors),
+            result.errors,
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_absolute(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"runtime_detail_path": "/absolute/path/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e and "relative" in e for e in result.errors),
+            f"expected relative-path error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_traversal(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"runtime_detail_path": "control-plane/../target/parity/publication/current/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e and ".." in e for e in result.errors),
+            f"expected traversal error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_mismatched(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"runtime_detail_path": "wrong/path/parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e for e in result.errors),
+            f"expected runtime_detail_path error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_missing(self) -> None:
+        root = self.make_repo()
+        row_updates: dict[str, Any] = {}
+        row_updates["runtime_detail_path"] = ""  # type: ignore[assignment]
+        self.write_p041_runtime(root, row_updates=row_updates)
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e for e in result.errors),
+            f"expected runtime_detail_path error, got: {result.errors}",
+        )
+
+    def test_p041_row_runtime_detail_path_rejects_non_string(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(root, row_updates={"runtime_detail_path": 42})
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("runtime_detail_path" in e and "string" in e for e in result.errors),
+            f"expected runtime_detail_path type error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_absolute(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"reference_detail_path": "/docs/reference/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e and "relative" in e for e in result.errors),
+            f"expected relative-path error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_traversal(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"reference_detail_path": "docs/../reference/p031-p041-parity-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e and ".." in e for e in result.errors),
+            f"expected traversal error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_mismatched(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(
+            root,
+            row_updates={"reference_detail_path": "docs/reference/other-evidence.json"},
+        )
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e for e in result.errors),
+            f"expected reference_detail_path error, got: {result.errors}",
+        )
+
+    def test_p041_row_reference_detail_path_rejects_non_string(self) -> None:
+        root = self.make_repo()
+        self.write_p041_runtime(root, row_updates={"reference_detail_path": 42})
+        result = validate_p041_parity_row(root)
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("reference_detail_path" in e and "string" in e for e in result.errors),
+            f"expected reference_detail_path type error, got: {result.errors}",
+        )
 
     def test_valid_write_path_guide_passes(self) -> None:
         root = self.make_repo()

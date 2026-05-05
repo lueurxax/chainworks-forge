@@ -5,7 +5,7 @@
 | Date | 2026-04-01 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Proposals 027, 029, 041, 042, and the canonical thin UI read contract in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md) |
+| Depends on | Proposals 027, 029, 042, the server parity harness contracts in [p041-generated-artifact-schemas.md](../reference/p041-generated-artifact-schemas.md) and [test-gates.md#proposal-041p041](../reference/test-gates.md#proposal-041p041), and the canonical thin UI read contract in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md) |
 | Goal | Collect and organize all remaining polish, stabilization, productization, and follow-on improvements after parity extraction, MCP exposure, query contracts, daemon lifecycle, and thin-client cutover land. |
 
 ## 1. Why this proposal exists

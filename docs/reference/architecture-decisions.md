@@ -130,3 +130,15 @@ This document records the key architecture decisions made during the foundation 
 4. The UI remains a "thin client": it renders server-published truth and performs only these governed mutations.
 
 **Consequence:** Improved operator experience for the most common human-in-the-loop action without expanding the UI into a general command-and-control plane. The thin UI boundary is now "read-side and human-gate mutation consumer".
+
+## ARCH-041: Fail-Closed Server Parity Harness and Runtime Publication
+
+**Context:** P031 thin-client acceptance depends on parity evidence that must be deterministic, same-tree correct, and safe to rerun without stale state or surviving descendants producing false positives.
+
+**Decision:** Implement a generation-scoped, fail-closed parity harness with authoritative runtime publication.
+1. **Generation Isolation:** Every rerun creates a new `publication_generation_id` and isolated `target/parity/work/<gen_id>/` roots.
+2. **Fail-Closed Ownership:** The harness uses a `parity-control` root with PID + birth-time lease records. Ambiguous or stale owners park in `blocked_manual_recovery` instead of reclaiming optimistically.
+3. **Runtime Authority:** The canonical P031 switch is the runtime row at `target/parity/publication/current/p031-phase-0-manifest-row.json`, not a tracked doc snapshot.
+4. **Provenance Enforcement:** Readiness requires that published `commit_sha` and `tree_id` exactly match the live checkout at evaluation time.
+
+**Consequence:** Same-tree reruns are idempotent and safe. Dirty trees cannot produce ready evidence. Operators have one source of truth for parity readiness that is inherently tied to the current checkout.

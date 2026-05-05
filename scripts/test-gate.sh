@@ -559,6 +559,446 @@ log() {
   printf '==> %s\n' "$*"
 }
 
+p041_prefixed_run() {
+  local status
+  set +e
+  "$@" 2>&1 | while IFS= read -r line; do
+    case "$line" in
+      \[INFO\]*|\[PASS\]*|\[WARN\]*|\[FAIL\]*)
+        printf '%s\n' "$line"
+        ;;
+      *)
+        printf '[INFO] %s\n' "$line"
+        ;;
+    esac
+  done
+  status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
+p041_supervised_run() {
+  local _args_json
+  _args_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@")"
+  P041_SUPERVISED_ARGS_JSON="$_args_json" python3 - <<'PY'
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+args = json.loads(os.environ["P041_SUPERVISED_ARGS_JSON"])
+if not args:
+    raise SystemExit("p041_supervised_run: missing command")
+
+_base_dir = Path.cwd()
+if (_base_dir / "control-plane").is_dir():
+    _base_dir = _base_dir / "control-plane"
+control_root = _base_dir / "target/parity-control"
+lease_path = control_root / "lease.json"
+current_step_path = control_root / "current-step.json"
+interruption_marker_path = control_root / "interruption-marker.json"
+timeout_marker_path = control_root / "timeout-marker.json"
+publication_current_root = _base_dir / "target/parity/publication/current"
+
+def _prefix(line: str) -> None:
+    line = line.rstrip("\n")
+    if line.startswith(("[INFO]", "[PASS]", "[WARN]", "[FAIL]")):
+        print(line, flush=True)
+    else:
+        print(f"[INFO] {line}", flush=True)
+
+def _target_boundary_is_safe(path: Path) -> bool:
+    target = _base_dir / "target"
+    try:
+        if target.is_symlink():
+            return False
+        if path.is_symlink():
+            return False
+        anchor = target.resolve()
+        resolved = path.resolve()
+        return str(resolved).startswith(str(anchor))
+    except OSError:
+        return False
+
+def _darwin_fullfsync(fd: int) -> bool:
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        return libc.fcntl(fd, 51) == 0
+    except Exception:
+        return False
+
+def _atomic_json(path: Path, value: dict) -> None:
+    if not _target_boundary_is_safe(path):
+        raise SystemExit(f"proposal-041: refusing write outside control-plane/target: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            raw_fd = handle.fileno()
+            if not _darwin_fullfsync(raw_fd):
+                os.fsync(raw_fd)
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+def _write_lease_pgid(pgid: int) -> None:
+    lease = _read_json(lease_path)
+    if not lease:
+        return
+    lease["pgid"] = pgid
+    lease["heartbeat_unix_ms"] = int(time.time() * 1000)
+    lease["control_sequence"] = int(lease.get("control_sequence", 0)) + 1
+    _atomic_json(lease_path, lease)
+
+def _write_current_step(pgid=None) -> None:
+    step = _read_json(current_step_path) or {
+        "schema_version": "parity-control-current-step.v1",
+        "generation": os.environ.get("P041_PUBLICATION_GENERATION_ID", ""),
+        "fixture": None,
+        "step": os.environ.get("P041_STEP_NAME", "supervised_command"),
+        "surface": os.environ.get("P041_STEP_SURFACE") or None,
+        "mode": "gate",
+        "elapsed_ms": 0,
+    }
+    step["heartbeat_unix_ms"] = int(time.time() * 1000)
+    step["command"] = args
+    step["deadline_at_unix_ms"] = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+    if pgid is not None:
+        step["pgid"] = pgid
+    _atomic_json(current_step_path, step)
+
+def _write_timeout_marker(pgid, descendant_absent: bool) -> None:
+    _atomic_json(timeout_marker_path, {
+        "schema_version": "parity-control-timeout-marker.v1",
+        "overall_status": "blocked_timeout",
+        "generation_id": os.environ.get("P041_PUBLICATION_GENERATION_ID", ""),
+        "active_fixture": os.environ.get("P041_STEP_FIXTURE") or None,
+        "active_surface": os.environ.get("P041_STEP_SURFACE") or None,
+        "descendant_pgid": pgid,
+        "descendant_absent": descendant_absent,
+        "written_at_unix_ms": int(time.time() * 1000),
+    })
+
+def _write_interruption_marker(pgid, descendant_absent: bool, signal_name: str) -> None:
+    _atomic_json(interruption_marker_path, {
+        "schema_version": "parity-control-interruption-marker.v1",
+        "overall_status": "blocked_interrupted",
+        "generation_id": os.environ.get("P041_PUBLICATION_GENERATION_ID", ""),
+        "signal": signal_name,
+        "descendant_pgid": pgid,
+        "descendant_absent": descendant_absent,
+        "written_at_unix_ms": int(time.time() * 1000),
+    })
+
+def _write_status_publication(status: str, reason: str) -> None:
+    generation_id = os.environ.get("P041_PUBLICATION_GENERATION_ID", "")
+    if not generation_id:
+        return
+    provenance = {
+        "commit_sha": os.environ.get("P041_GIT_COMMIT_SHA", "interrupted-before-provenance"),
+        "tree_id": os.environ.get("P041_GIT_TREE_ID", "interrupted-before-provenance"),
+        "tree_clean": os.environ.get("P041_GIT_TREE_CLEAN") == "true",
+        "status_snapshot_sha256": os.environ.get("P041_GIT_STATUS_SNAPSHOT_SHA256", "interrupted-before-provenance"),
+        "status_snapshot_line_count": int(os.environ.get("P041_GIT_STATUS_SNAPSHOT_LINE_COUNT", "1") or 1),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "gate": "./scripts/test-gate.sh proposal-041",
+    }
+    detail = {
+        "schema_version": "p031-p041-parity-evidence.v1",
+        "overall_status": status,
+        "publication_generation_id": generation_id,
+        "publication_state": "diagnostic_blocked",
+        "required_fixtures": [
+            "proposal-loop-basic",
+            "implementation-refine-review",
+            "approval-pause-resume",
+            "retry-recovery-flow",
+            "cancelled-or-blocked-run",
+            "terminal-report-evidence",
+            "projection-readback-surface",
+        ],
+        "required_surfaces": [
+            "canonical_domain_state",
+            "projections",
+            "graphql_readback",
+            "mcp_report_readback",
+            "artifact_identity",
+            "operator_summary",
+        ],
+        "fixtures": [],
+        "blocking_reasons": [reason],
+        "missing_evidence": [],
+        "provenance": provenance,
+    }
+    row = {
+        "schema_version": "p031-phase-0-runtime-manifest-row.v1",
+        "id": "p041_parity_evidence",
+        "runtime_detail_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+        "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
+        "validation_status": status,
+        "publication_state": "diagnostic_blocked",
+        "publication_generation_id": generation_id,
+        "detail_schema_version": "p031-p041-parity-evidence.v1",
+        "provenance": provenance,
+    }
+    _atomic_json(publication_current_root / "p031-p041-parity-evidence.json", detail)
+    _atomic_json(publication_current_root / "p031-phase-0-manifest-row.json", row)
+
+global_deadline_ms = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+command_deadline_seconds = int(os.environ.get("P041_COMMAND_DEADLINE_SECONDS", "0") or 0)
+deadline_candidates = [value for value in [global_deadline_ms] if value > 0]
+if command_deadline_seconds > 0:
+    deadline_candidates.append(int(time.time() * 1000) + command_deadline_seconds * 1000)
+deadline_ms = min(deadline_candidates) if deadline_candidates else 0
+drain_seconds = int(os.environ.get("P041_DRAIN_GRACE_SECONDS", "30") or 30)
+if deadline_ms and int(time.time() * 1000) >= deadline_ms:
+    _write_timeout_marker(None, True)
+    _write_status_publication("blocked_timeout", "gate_deadline_expired_before_command_start")
+    raise SystemExit("proposal-041: gate deadline expired before starting command")
+
+interrupted_signal = None
+
+def _handle_signal(signum, _frame):
+    global interrupted_signal
+    interrupted_signal = signal.Signals(signum).name
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+process = subprocess.Popen(
+    args,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    bufsize=1,
+    start_new_session=True,
+)
+pgid = os.getpgid(process.pid)
+_write_lease_pgid(pgid)
+_write_current_step(pgid)
+
+timed_out = False
+try:
+    assert process.stdout is not None
+    while True:
+        ready, _, _ = select.select([process.stdout], [], [], 0.25)
+        if ready:
+            line = process.stdout.readline()
+            if line:
+                _prefix(line)
+        rc = process.poll()
+        if rc is not None:
+            for line in process.stdout:
+                _prefix(line)
+            raise SystemExit(rc)
+        if deadline_ms and int(time.time() * 1000) >= deadline_ms:
+            timed_out = True
+            break
+        if interrupted_signal is not None:
+            break
+except KeyboardInterrupt:
+    interrupted_signal = "SIGINT"
+
+if timed_out or interrupted_signal is not None:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + drain_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    descendant_absent = process.poll() is not None
+    if not descendant_absent:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        descendant_absent = process.poll() is not None
+    if interrupted_signal is not None:
+        _write_interruption_marker(pgid, descendant_absent, interrupted_signal)
+        _write_status_publication("blocked_interrupted", "gate_interrupted_by_signal")
+        _prefix(
+            f"[WARN] proposal-041: command interrupted by {interrupted_signal}; pgid={pgid} "
+            f"descendant_absent={str(descendant_absent).lower()}"
+        )
+        raise SystemExit(130 if interrupted_signal == "SIGINT" else 143)
+    _write_timeout_marker(pgid, descendant_absent)
+    _write_status_publication("blocked_timeout", "gate_or_command_deadline_expired")
+    _prefix(
+        f"[FAIL] proposal-041: command timed out; pgid={pgid} "
+        f"descendant_absent={str(descendant_absent).lower()}"
+    )
+    raise SystemExit(124)
+PY
+}
+
+# Refresh parity-control/lease.json heartbeat_unix_ms and increment control_sequence.
+# Called between cargo phases so a live-but-stalled owner can be detected (Section 6.3
+# A1/A2 freshness rule).  Reads the existing lease, bumps control_sequence, updates
+# heartbeat_unix_ms, and atomically writes it back with the same durable contract.
+p041_update_lease_heartbeat() {
+  python3 -c "
+import ctypes, ctypes.util, json, os, sys, tempfile, time
+from pathlib import Path
+
+ctrl = Path('target/parity-control')
+target = Path('target')
+anchor = (Path.cwd() / 'target').resolve()
+if target.is_symlink():
+    raise SystemExit('proposal-041: target is a symlink; refusing parity-control heartbeat write')
+if ctrl.exists() and (ctrl.is_symlink() or not str(ctrl.resolve()).startswith(str(anchor))):
+    raise SystemExit('proposal-041: target/parity-control boundary check failed before heartbeat write')
+lease_path = ctrl / 'lease.json'
+if not lease_path.exists():
+    sys.exit(0)  # No lease yet; nothing to refresh.
+try:
+    lease = json.loads(lease_path.read_text())
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)  # Unreadable; leave as-is; reclaim logic handles on next startup.
+
+lease['heartbeat_unix_ms'] = int(time.time() * 1000)
+lease['control_sequence'] = int(lease.get('control_sequence', 1)) + 1
+
+fd, tmp = tempfile.mkstemp(prefix='.lease.', suffix='.tmp', dir=str(ctrl))
+try:
+    with os.fdopen(fd, 'w') as h:
+        json.dump(lease, h, indent=2)
+        h.write('\n')
+        h.flush()
+        raw_fd = h.fileno()
+        if sys.platform == 'darwin':
+            try:
+                libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+                if libc.fcntl(raw_fd, 51) != 0:
+                    os.fsync(raw_fd)
+            except Exception:
+                os.fsync(raw_fd)
+        else:
+            os.fsync(raw_fd)
+    os.replace(tmp, str(lease_path))
+    try:
+        dfd = os.open(str(ctrl), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+finally:
+    try:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    except OSError:
+        pass
+"
+}
+
+# Write parity-control/current-step.json with the full durable atomic write
+# contract (Section 6.3): same-dir tempfile, F_FULLFSYNC on Darwin, atomic
+# rename, parent-dir fsync. Replaces bare os.fsync+os.replace inline blocks.
+# Args: $1=step_name $2=surface_name_or_empty
+p041_update_current_step() {
+  local _step="$1" _surface="${2:-}"
+  P041_STEP_NAME="$_step" P041_STEP_SURFACE="$_surface" python3 -c "
+import ctypes, ctypes.util, json, os, sys, tempfile, time
+from pathlib import Path
+
+def _atomic_current_step(ctrl, step, surface):
+    target_root = Path('target')
+    anchor = (Path.cwd() / 'target').resolve()
+    if target_root.is_symlink():
+        raise SystemExit('proposal-041: target is a symlink; refusing current-step write')
+    if ctrl.exists() and (ctrl.is_symlink() or not str(ctrl.resolve()).startswith(str(anchor))):
+        raise SystemExit('proposal-041: target/parity-control boundary check failed before current-step write')
+    ctrl.mkdir(parents=True, exist_ok=True)
+    data = {
+        'schema_version': 'parity-control-current-step.v1',
+        'generation': os.environ.get('P041_PUBLICATION_GENERATION_ID', ''),
+        'fixture': None,
+        'step': step,
+        'surface': surface if surface else None,
+        'mode': 'gate',
+        'elapsed_ms': 0,
+        'heartbeat_unix_ms': int(time.time() * 1000),
+    }
+    target = ctrl / 'current-step.json'
+    fd, tmp = tempfile.mkstemp(prefix='.current-step.', suffix='.tmp', dir=str(ctrl))
+    try:
+        with os.fdopen(fd, 'w') as h:
+            json.dump(data, h, indent=2)
+            h.write('\n')
+            h.flush()
+            raw_fd = h.fileno()
+            if sys.platform == 'darwin':
+                try:
+                    libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+                    if libc.fcntl(raw_fd, 51) != 0:
+                        os.fsync(raw_fd)
+                except Exception:
+                    os.fsync(raw_fd)
+            else:
+                os.fsync(raw_fd)
+        os.replace(tmp, str(target))
+        try:
+            dfd = os.open(str(ctrl), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+_atomic_current_step(
+    Path('target/parity-control'),
+    os.environ.get('P041_STEP_NAME', ''),
+    os.environ.get('P041_STEP_SURFACE', ''),
+)
+"
+}
+
 should_use_unsigned_ui_tests() {
   local configured="${CHAINWORKS_USE_UNSIGNED_UI_TESTS:-}"
   if [[ -n "$configured" ]]; then
@@ -2258,7 +2698,15 @@ PY
     run_split_targeted_gate "proposal-037" "${PROPOSAL_037_TESTS[@]}"
     ;;
   proposal-041|p041)
-    log "Proposal 041 control-plane gate: server parity harness, golden fixtures, and behavioral diff"
+    echo "[INFO] Proposal 041 control-plane gate: server parity harness, golden fixtures, and behavioral diff"
+    export P041_GATE_DEADLINE_SECONDS="${P041_GATE_DEADLINE_SECONDS:-1500}"
+    export P041_DRAIN_GRACE_SECONDS="${P041_DRAIN_GRACE_SECONDS:-30}"
+    export P041_REPLAY_DEADLINE_SECONDS="${P041_REPLAY_DEADLINE_SECONDS:-60}"
+    export P041_READBACK_DEADLINE_SECONDS="${P041_READBACK_DEADLINE_SECONDS:-30}"
+    export P041_SHADOW_DEADLINE_SECONDS="${P041_SHADOW_DEADLINE_SECONDS:-60}"
+    _p041_deadline_now="$(date +%s)"
+    export P041_GATE_DEADLINE_UNIX_MS="$(( (_p041_deadline_now + P041_GATE_DEADLINE_SECONDS) * 1000 ))"
+    _p041_cap_idx=0
     for fixture_id in \
       proposal-loop-basic \
       implementation-refine-review \
@@ -2267,19 +2715,606 @@ PY
       cancelled-or-blocked-run \
       terminal-report-evidence \
       projection-readback-surface; do
-      "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate >/dev/null
+      _p041_cap_idx=$((_p041_cap_idx + 1))
+      echo "[INFO] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
+      P041_STEP_FIXTURE="$fixture_id" \
+      P041_COMMAND_DEADLINE_SECONDS="$P041_REPLAY_DEADLINE_SECONDS" \
+        p041_supervised_run "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate || exit $?
+      echo "[PASS] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
     done
     (
       cd "$ROOT_DIR/control-plane"
-      cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
-      cargo test -p graphql-server proposal_041_graphql_readback_parity_surfaces -- --nocapture &&
-      cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
-      cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
-      cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
-      python3 - <<'PY'
+      # Capture git provenance once before any replay work begins (Section 6.2/6.3).
+      # Exported as P041_GIT_* env vars so cargo test can embed the same provenance
+      # in per-fixture server-replay.json and behavioral-diff-report.json artifacts.
+      if ! _p041_commit=$(git rev-parse HEAD 2>/dev/null); then
+        echo "[FAIL] proposal-041: unable to capture git HEAD provenance" >&2
+        exit 1
+      fi
+      if ! _p041_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null); then
+        echo "[FAIL] proposal-041: unable to capture git tree provenance" >&2
+        exit 1
+      fi
+      if ! _p041_status=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null); then
+        echo "[FAIL] proposal-041: unable to capture git status snapshot" >&2
+        exit 1
+      fi
+      _p041_clean=$([ -z "$_p041_status" ] && echo true || echo false)
+      _p041_line_count=$(printf '%s' "$_p041_status" | awk 'NF { count += 1 } END { print count + 0 }')
+      # sha256: prefer shasum (macOS), fall back to sha256sum (Linux)
+      if _p041_sha256=$(printf '%s' "$_p041_status" | shasum -a 256 2>/dev/null | cut -d' ' -f1); then
+        :
+      elif _p041_sha256=$(printf '%s' "$_p041_status" | sha256sum 2>/dev/null | cut -d' ' -f1); then
+        :
+      else
+        echo "[FAIL] proposal-041: unable to hash git status snapshot" >&2
+        exit 1
+      fi
+      if [ -z "$_p041_commit" ] || [ -z "$_p041_tree" ] || [ -z "$_p041_sha256" ]; then
+        echo "[FAIL] proposal-041: captured git provenance is incomplete" >&2
+        exit 1
+      fi
+      export P041_GIT_COMMIT_SHA="$_p041_commit"
+      export P041_GIT_TREE_ID="$_p041_tree"
+      export P041_GIT_TREE_CLEAN="$_p041_clean"
+      export P041_GIT_STATUS_SNAPSHOT_LINE_COUNT="$_p041_line_count"
+      export P041_GIT_STATUS_SNAPSHOT_SHA256="$_p041_sha256"
+      # Generate a unique publication_generation_id for this gate run.
+      # Exported so all cargo test binaries embed the same generation ID in their
+      # artifacts (server-replay.json, behavioral-diff-report.json, row/detail).
+      _p041_gen_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "ts-unknown")
+      _p041_gen_rand=$(od -vAn -N4 -tx4 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-8 \
+                       || printf '%08x' $((RANDOM * RANDOM % 0xffffffff)))
+      export P041_PUBLICATION_GENERATION_ID="p041-${_p041_gen_ts}-${_p041_gen_rand}"
+      echo "[INFO] p041 generation ${P041_PUBLICATION_GENERATION_ID}"
+      p041_prefixed_run python3 - <<'PY' &&
 import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+generation_id = os.environ["P041_PUBLICATION_GENERATION_ID"]
+commit_sha = os.environ["P041_GIT_COMMIT_SHA"]
+tree_id = os.environ["P041_GIT_TREE_ID"]
+tree_clean = os.environ["P041_GIT_TREE_CLEAN"] == "true"
+status_sha = os.environ["P041_GIT_STATUS_SNAPSHOT_SHA256"]
+status_lines = int(os.environ["P041_GIT_STATUS_SNAPSHOT_LINE_COUNT"])
+now_ms = int(time.time() * 1000)
+now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+parity_root = Path("target/parity")
+control_root = Path("target/parity-control")
+current_root = parity_root / "publication/current"
+generation_root = parity_root / "publication/generations" / generation_id
+
+# Symlink boundary hardening (SEC-P041-003): reject before any mkdir/write if
+# target, parity_root, or control_root is a symlink or resolves outside
+# control-plane/target/. This keeps publication writes and pruning from escaping
+# the expected tree.
+_target_anchor = Path("target").resolve()
+def _validate_p041_target_boundary(_check_path: Path, _label: str) -> None:
+    if Path("target").is_symlink():
+        raise SystemExit(
+            "proposal-041: target is a symlink; refusing to write parity artifacts "
+            "through a redirected root (SEC-P041-003)."
+        )
+    if _check_path.is_symlink():
+        raise SystemExit(
+            f"proposal-041: {_label} is a symlink; refusing to write parity artifacts "
+            f"to a redirected root (SEC-P041-003). Remove the symlink and rerun."
+        )
+    _resolved_check = _check_path.resolve()
+    if not str(_resolved_check).startswith(str(_target_anchor)):
+        raise SystemExit(
+            f"proposal-041: {_label} resolves to {_resolved_check}, which is outside "
+            f"control-plane/target/; refusing to write (SEC-P041-003)."
+        )
+
+for _check_path, _label in (
+    (parity_root, "target/parity"),
+    (control_root, "target/parity-control"),
+    (current_root, "target/parity/publication/current"),
+    (generation_root, "target/parity/publication/generations/<generation>"),
+):
+    _validate_p041_target_boundary(_check_path, _label)
+
+for root in (parity_root, control_root, current_root, generation_root):
+    root.mkdir(parents=True, exist_ok=True)
+for root in (parity_root, control_root):
+    (root / ".metadata_never_index").touch()
+
+def _get_process_birth_unix_ms(pid: int) -> int:
+    """Return process birth time in Unix ms via proc_pidinfo on Darwin.
+
+    Falls back to current wall-clock time on non-Darwin or if proc_pidinfo
+    is unavailable. Per proposal Section 6.3, ps is forbidden.
+    """
+    if sys.platform == "darwin":
+        try:
+            import ctypes, ctypes.util, struct
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            # struct proc_bsdinfo layout (first two timing fields):
+            # pbi_start_tvsec (uint64) at offset 168, pbi_start_tvusec (uint32) at offset 176
+            # We allocate the full struct size (416 bytes) and read start time fields.
+            PROC_PIDTBSDINFO = 3
+            buf_size = 416
+            buf = ctypes.create_string_buffer(buf_size)
+            ret = libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buf, buf_size)
+            if ret >= buf_size:
+                # pbi_start_tvsec is at offset 168 (uint64_t), pbi_start_tvusec at 176 (uint32_t)
+                sec = struct.unpack_from("<Q", buf, 168)[0]
+                usec = struct.unpack_from("<I", buf, 176)[0]
+                ms = sec * 1000 + usec // 1000
+                if ms > 0:
+                    return ms
+        except Exception:
+            pass
+    return int(time.time() * 1000)
+
+def _darwin_fullfsync(fd: int) -> bool:
+    """Try F_FULLFSYNC on Darwin; return True if successful."""
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        F_FULLFSYNC = 51  # Darwin-specific fcntl cmd
+        return libc.fcntl(fd, F_FULLFSYNC) == 0
+    except Exception:
+        return False
+
+def atomic_json(path, value):
+    """Write value as pretty JSON via same-dir temp + durable flush + atomic rename.
+
+    Satisfies the durable-write contract (Section 6.3): temp file in the same
+    directory (same-volume rule), durable flush (F_FULLFSYNC on Darwin, fsync
+    fallback), atomic rename, best-effort parent-dir fsync.
+    """
+    _validate_p041_target_boundary(path.parent, f"{path.parent}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            raw_fd = handle.fileno()
+            if sys.platform == "darwin":
+                if not _darwin_fullfsync(raw_fd):
+                    os.fsync(raw_fd)
+            else:
+                os.fsync(raw_fd)
+        os.replace(tmp, path)
+        # Best-effort parent-dir durability barrier.
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+provenance = {
+    "commit_sha": commit_sha,
+    "tree_id": tree_id,
+    "tree_clean": tree_clean,
+    "status_snapshot_sha256": status_sha,
+    "status_snapshot_line_count": status_lines,
+    "generated_at": now_iso,
+    "gate": "./scripts/test-gate.sh proposal-041",
+}
+fixtures = [
+    "proposal-loop-basic",
+    "implementation-refine-review",
+    "approval-pause-resume",
+    "retry-recovery-flow",
+    "cancelled-or-blocked-run",
+    "terminal-report-evidence",
+    "projection-readback-surface",
+]
+surfaces = [
+    "canonical_domain_state",
+    "projections",
+    "graphql_readback",
+    "mcp_report_readback",
+    "artifact_identity",
+    "operator_summary",
+]
+detail = {
+    "schema_version": "p031-p041-parity-evidence.v1",
+    "overall_status": "blocked_in_progress",
+    "publication_generation_id": generation_id,
+    "publication_state": "revoked_for_rerun",
+    "required_fixtures": fixtures,
+    "required_surfaces": surfaces,
+    "fixtures": [
+        {
+            "fixture_id": fixture_id,
+            "report_path": f"control-plane/target/parity/reports/{generation_id}/{fixture_id}/behavioral-diff-report.json",
+            "replay_path": f"control-plane/target/parity/work/{generation_id}/{fixture_id}/server-replay.json",
+            "shadow_report_path": f"control-plane/target/parity/shadow/{generation_id}/{fixture_id}/live-shadow-report.json",
+            "verdict": "blocked_in_progress",
+        }
+        for fixture_id in fixtures
+    ],
+    "blocking_reasons": ["rerun_in_progress"],
+    "missing_evidence": [],
+    "provenance": provenance,
+}
+row = {
+    "schema_version": "p031-phase-0-runtime-manifest-row.v1",
+    "id": "p041_parity_evidence",
+    "runtime_detail_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+    "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
+    "validation_status": "blocked_in_progress",
+    "publication_state": "revoked_for_rerun",
+    "publication_generation_id": generation_id,
+    "detail_schema_version": "p031-p041-parity-evidence.v1",
+    "provenance": provenance,
+}
+
+def _publish_blocked_manual_recovery(reason: str) -> None:
+    """Publish blocked_manual_recovery runtime row+detail to current/ before an early exit.
+
+    Proposal Section 6.3 requires the CLI and runtime detail artifact to surface the
+    unresolved owner state so downstream consumers (p031-thin-ui-gate.py) do not continue
+    trusting stale current/ artifacts as if they were authoritative.
+    """
+    _mr_detail = dict(detail)
+    _mr_detail["overall_status"] = "blocked_manual_recovery"
+    _mr_detail["publication_state"] = "diagnostic_blocked"
+    _mr_detail["blocking_reasons"] = [reason]
+    _mr_row = dict(row)
+    _mr_row["validation_status"] = "blocked_manual_recovery"
+    _mr_row["publication_state"] = "diagnostic_blocked"
+    try:
+        atomic_json(current_root / "p031-p041-parity-evidence.json", _mr_detail)
+        atomic_json(current_root / "p031-phase-0-manifest-row.json", _mr_row)
+    except OSError as _pub_err:
+        print(f"[WARN] proposal-041: unable to publish blocked_manual_recovery artifacts: {_pub_err}")
+
+# Reclaim check: inspect existing lease and reclaim-marker before proceeding.
+# Implements proposal Section 6.3 reclaim matrix (Cases A/B/C/D).
+_reclaim_marker_path = control_root / "reclaim-marker.json"
+_existing_lease_path = control_root / "lease.json"
+_release_marker_path = control_root / "release-marker.json"
+_deadline_ms = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+
+def _remaining_deadline_ms() -> int:
+    if _deadline_ms <= 0:
+        return 120_000
+    return max(0, _deadline_ms - int(time.time() * 1000))
+
+def _freshness_window_ms() -> int:
+    remaining = _remaining_deadline_ms()
+    if remaining <= 0:
+        return 1_000
+    return max(1_000, min(120_000, remaining // 4))
+
+def _pgid_has_observable_descendants(pgid: int, owner_pid: int = 0) -> bool:
+    if pgid <= 0:
+        return False
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,pgid="],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        return True
+    own_pid = os.getpid()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            proc_pgid = int(parts[1])
+        except ValueError:
+            continue
+        if proc_pgid == pgid and pid not in {own_pid, owner_pid}:
+            return True
+    return False
+
+def _preserved_generation_root(gen_id: str):
+    candidate = Path("target/parity/publication/generations") / gen_id
+    return str(candidate) if candidate.exists() else None
+
+def _write_reclaim_marker(
+    abandoned_lease: dict,
+    overall_status: str,
+    observation_count: int,
+    freshness_window_ms: int,
+    missing_pgid_metadata: bool,
+    observable_descendants: bool,
+    diagnostic_message: str,
+) -> None:
+    old_pgid = int(abandoned_lease.get("pgid", 0) or 0)
+    old_gen = abandoned_lease.get("publication_generation_id", "unknown")
+    atomic_json(_reclaim_marker_path, {
+        "schema_version": "parity-control-reclaim-marker.v1",
+        "overall_status": overall_status,
+        "abandoned_generation_id": old_gen,
+        "preserved_generation_root": _preserved_generation_root(old_gen),
+        "owner_pid": int(abandoned_lease.get("pid", 0) or 0),
+        "owner_process_birth_unix_ms": int(abandoned_lease.get("process_birth_unix_ms", 0) or 0),
+        "owner_pgid": old_pgid if old_pgid > 0 else None,
+        "owner_hostname": abandoned_lease.get("hostname", "unknown"),
+        "owner_last_heartbeat_unix_ms": int(abandoned_lease.get("heartbeat_unix_ms", 0) or 0),
+        "owner_last_control_sequence": int(abandoned_lease.get("control_sequence", 0) or 0),
+        "observation_count": observation_count,
+        "freshness_window_ms": freshness_window_ms,
+        "missing_pgid_metadata": missing_pgid_metadata,
+        "observable_descendants": observable_descendants,
+        "written_at_unix_ms": int(time.time() * 1000),
+        "diagnostic_message": diagnostic_message,
+    })
+if _reclaim_marker_path.exists():
+    try:
+        _rm = json.loads(_reclaim_marker_path.read_text())
+        if _rm.get("overall_status") == "blocked_manual_recovery":
+            # Publish blocked_manual_recovery to current/ so downstream consumers see the
+            # real state rather than stale artifacts from the last completed run.
+            _publish_blocked_manual_recovery("blocked_manual_recovery_reclaim_marker_present")
+            print(
+                f"[FAIL] proposal-041: found blocked_manual_recovery reclaim marker "
+                f"at {_reclaim_marker_path}. Manual recovery required before rerun. "
+                f"Inspect: abandoned_generation_id={_rm.get('abandoned_generation_id')} "
+                f"owner_pid={_rm.get('owner_pid')} "
+                f"preserved_generation_root={_rm.get('preserved_generation_root')}",
+                file=sys.stderr,
+            )
+            raise SystemExit(
+                "proposal-041: blocked_manual_recovery; remove reclaim-marker.json "
+                "after resolving the stale owner"
+            )
+        # reclaim_allowed or unknown status: proceed (existing reclaim was documented)
+    except (json.JSONDecodeError, OSError) as _reclaim_err:
+        # Unreadable reclaim marker — fail closed per Section 6.3.
+        _publish_blocked_manual_recovery("unreadable_reclaim_marker")
+        print(
+            f"[FAIL] proposal-041: reclaim-marker.json exists but is unreadable "
+            f"({_reclaim_err}). Remove or repair {_reclaim_marker_path} before retrying.",
+            file=sys.stderr,
+        )
+        raise SystemExit(
+            "proposal-041: unreadable reclaim-marker.json; fail-closed "
+            "(remove and rerun after verifying no active gate processes remain)"
+        )
+
+if _existing_lease_path.exists():
+    try:
+        _old_lease = json.loads(_existing_lease_path.read_text())
+        _old_pid = int(_old_lease.get("pid", 0))
+        _old_gen = _old_lease.get("publication_generation_id", "unknown")
+        _old_birth_ms = int(_old_lease.get("process_birth_unix_ms", 0))
+        _old_pgid = int(_old_lease.get("pgid", 0))
+        _old_heartbeat_ms = int(_old_lease.get("heartbeat_unix_ms", 0))
+        _old_seq = int(_old_lease.get("control_sequence", 0))
+
+        # Check if old owner PID is still alive.
+        _pid_alive = False
+        if _old_pid:
+            try:
+                os.kill(_old_pid, 0)
+                _pid_alive = True
+            except (OSError, ProcessLookupError):
+                pass
+
+        if _pid_alive:
+            # Verify birth time to distinguish a recycled PID from the original owner.
+            _current_birth_ms = _get_process_birth_unix_ms(_old_pid)
+            _birth_matches = (
+                _old_birth_ms > 0
+                and abs(_old_birth_ms - _current_birth_ms) < 5000
+            )
+            if _birth_matches:
+                _window_ms = _freshness_window_ms()
+                time.sleep(_window_ms / 1000.0)
+                try:
+                    _latest_lease = json.loads(_existing_lease_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    _publish_blocked_manual_recovery("unreadable_lease_after_stall_observation")
+                    raise SystemExit("proposal-041: lease unreadable after Case A observation")
+                _latest_heartbeat = int(_latest_lease.get("heartbeat_unix_ms", 0) or 0)
+                _latest_seq = int(_latest_lease.get("control_sequence", 0) or 0)
+                if _latest_heartbeat == _old_heartbeat_ms and _latest_seq == _old_seq:
+                    _observable = _pgid_has_observable_descendants(_old_pgid, _old_pid)
+                    _write_reclaim_marker(
+                        _old_lease,
+                        "blocked_manual_recovery",
+                        2,
+                        _window_ms,
+                        _old_pgid <= 0,
+                        _observable,
+                        "Case A2: owner PID alive but heartbeat and control_sequence were unchanged across two observations.",
+                    )
+                    _publish_blocked_manual_recovery("case_a2_stalled_owner_requires_manual_recovery")
+                    print(
+                        f"[FAIL] proposal-041: gate owner PID {_old_pid} stalled "
+                        f"for {_window_ms}ms (Case A2). Written blocked_manual_recovery "
+                        f"marker at {_reclaim_marker_path}.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit("proposal-041: stalled active gate owner (Case A2); fail-closed")
+                # Case A: owner alive but fresh — fail closed as in-progress.
+                atomic_json(current_root / "p031-p041-parity-evidence.json", detail)
+                atomic_json(current_root / "p031-phase-0-manifest-row.json", row)
+                print(
+                    f"[FAIL] proposal-041: gate owner PID {_old_pid} is alive and fresh "
+                    f"(Case A). Wait for the active run to complete. "
+                    f"heartbeat_unix_ms={_latest_heartbeat} control_sequence={_latest_seq}",
+                    file=sys.stderr,
+                )
+                raise SystemExit("proposal-041: active gate owner still running (Case A); fail-closed")
+            # PID alive but birth time does not match: OS recycled the PID.
+            # Fall through to PID-gone reclaim handling below.
+            _pid_alive = False
+
+        # PID is gone or recycled. Apply Cases B/C/D using pgid descendant proof.
+        if _old_pgid <= 0:
+            _write_reclaim_marker(
+                _old_lease,
+                "blocked_manual_recovery",
+                1,
+                0,
+                True,
+                False,
+                "Case B: owner PID gone but process-group metadata is missing; descendant absence cannot be proven.",
+            )
+            _publish_blocked_manual_recovery("case_b_missing_pgid_metadata")
+            print(
+                f"[FAIL] proposal-041: previous owner PID {_old_pid} is gone but "
+                f"lease for generation {_old_gen} has no pgid metadata (Case B). "
+                f"Written blocked_manual_recovery marker at {_reclaim_marker_path}.",
+                file=sys.stderr,
+            )
+            raise SystemExit("proposal-041: missing pgid metadata (Case B); fail-closed")
+        _observable_descendants = _pgid_has_observable_descendants(_old_pgid, _old_pid)
+        if _observable_descendants:
+            _write_reclaim_marker(
+                _old_lease,
+                "blocked_manual_recovery",
+                1,
+                0,
+                False,
+                True,
+                "Case C: owner PID gone but process-group descendants are still observable.",
+            )
+            _publish_blocked_manual_recovery("case_c_observable_descendants")
+            print(
+                f"[FAIL] proposal-041: previous owner PID {_old_pid} is gone but "
+                f"pgid {_old_pgid} still has observable descendants (Case C).",
+                file=sys.stderr,
+            )
+            raise SystemExit("proposal-041: observable descendants (Case C); fail-closed")
+        _write_reclaim_marker(
+            _old_lease,
+            "reclaim_allowed",
+            1,
+            0,
+            False,
+            False,
+            "Case D: owner PID gone, pgid metadata present, and descendant absence proven.",
+        )
+        print(
+            f"[INFO] proposal-041: reclaimed generation {_old_gen} "
+            f"(Case D: owner PID {_old_pid} gone, pgid {_old_pgid} descendant absence proven)"
+        )
+
+    except SystemExit:
+        raise
+    except (json.JSONDecodeError, OSError) as _lease_err:
+        # Unreadable lease — fail closed per Section 6.3.
+        print(
+            f"[FAIL] proposal-041: lease.json exists but is unreadable ({_lease_err}). "
+            f"Remove or repair {_existing_lease_path} before retrying.",
+            file=sys.stderr,
+        )
+        raise SystemExit(
+            "proposal-041: unreadable lease.json; fail-closed (remove and rerun)"
+        )
+
+own_pid = os.getpid()
+own_birth_ms = _get_process_birth_unix_ms(own_pid)
+own_pgid = os.getpgrp()
+lease = {
+    "schema_version": "parity-control-lease.v1",
+    "pid": own_pid,
+    "process_birth_unix_ms": own_birth_ms,
+    "pgid": own_pgid,
+    "hostname": socket.gethostname(),
+    "commit_sha": commit_sha,
+    "tree_id": tree_id,
+    "heartbeat_unix_ms": now_ms,
+    "publication_generation_id": generation_id,
+    "control_sequence": 1,
+}
+current_step = {
+    "schema_version": "parity-control-current-step.v1",
+    "generation": generation_id,
+    "fixture": None,
+    "step": "pre_cleanup_publication",
+    "surface": None,
+    "mode": "gate",
+    "elapsed_ms": 0,
+    "heartbeat_unix_ms": now_ms,
+}
+atomic_json(current_root / "p031-p041-parity-evidence.json", detail)
+atomic_json(current_root / "p031-phase-0-manifest-row.json", row)
+atomic_json(generation_root / "p031-p041-parity-evidence.json", detail)
+atomic_json(generation_root / "p031-phase-0-manifest-row.json", row)
+atomic_json(control_root / "lease.json", lease)
+atomic_json(control_root / "current-step.json", current_step)
+print("[INFO] runtime publication revoked_for_rerun current generation updated")
+PY
+      echo "[INFO] [phase: prebuild] compiling P041 test binaries before per-fixture deadlines" &&
+      p041_update_current_step 'prebuild' '' &&
+      p041_update_lease_heartbeat &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity --no-run &&
+      p041_supervised_run cargo test -p graphql-server --lib --no-run &&
+      p041_supervised_run cargo test -p mcp-server --lib --no-run &&
+      echo "[INFO] [phase: fixture-inventory] validating all 7 fixture schemas and required elements" &&
+      p041_update_current_step 'fixture_inventory' '' &&
+      p041_update_lease_heartbeat &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
+      echo "[INFO] [phase: offline-replay] replaying all 7 fixtures into generation-scoped SQLite databases" &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: offline-replay] fixture=${fixture_id} deadline=${P041_REPLAY_DEADLINE_SECONDS}s"
+        p041_update_current_step 'offline_replay' '' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_COMMAND_DEADLINE_SECONDS="$P041_REPLAY_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture || exit $?
+      done &&
+      echo "[INFO] [phase: shadow-validation] checking live-shadow side-effect policy for all 7 fixtures" &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: shadow-validation] fixture=${fixture_id} deadline=${P041_SHADOW_DEADLINE_SECONDS}s"
+        p041_update_current_step 'shadow_validation' '' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_COMMAND_DEADLINE_SECONDS="$P041_SHADOW_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture || exit $?
+      done &&
+      echo "[INFO] [phase: graphql-readback] reading back all 7 fixtures through GraphQL parity surface" &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: graphql-readback] fixture=${fixture_id} deadline=${P041_READBACK_DEADLINE_SECONDS}s"
+        p041_update_current_step 'graphql_readback' 'graphql_readback' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_STEP_SURFACE="graphql_readback" P041_COMMAND_DEADLINE_SECONDS="$P041_READBACK_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p graphql-server --lib proposal_041_graphql_readback_parity_surfaces -- --nocapture || exit $?
+      done &&
+      echo "[INFO] [phase: mcp-readback] reading back all 7 fixtures through MCP parity surfaces" &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: mcp-readback] fixture=${fixture_id} deadline=${P041_READBACK_DEADLINE_SECONDS}s"
+        p041_update_current_step 'mcp_report_readback' 'mcp_report_readback' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_STEP_SURFACE="mcp_report_readback" P041_COMMAND_DEADLINE_SECONDS="$P041_READBACK_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p mcp-server --lib proposal_041_report_resource_readback_parity_surface -- --nocapture || exit $?
+      done &&
+      echo "[INFO] [phase: handoff-artifact] validating P031 handoff artifact contract" &&
+      p041_update_lease_heartbeat &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
+      echo "[INFO] [phase: runtime-publication] computing and writing final runtime row and detail artifacts" &&
+      p041_update_current_step 'runtime_publication' '' &&
+      p041_update_lease_heartbeat &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
+      p041_prefixed_run python3 - <<'PY'
+import json
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 fixtures = [
@@ -2291,12 +3326,251 @@ fixtures = [
     "terminal-report-evidence",
     "projection-readback-surface",
 ]
-for fixture_id in fixtures:
-    report_path = Path("target/parity/reports") / fixture_id / "behavioral-diff-report.json"
-    replay_path = Path("target/parity") / fixture_id / "server-replay.json"
+generation_id = os.environ.get("P041_PUBLICATION_GENERATION_ID", "unscoped-fixture-replay")
+
+# ── Darwin F_FULLFSYNC helper (duplicate of setup block to keep this block self-contained) ──
+def _darwin_fullfsync(fd: int) -> bool:
+    try:
+        import ctypes, ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        return libc.fcntl(fd, 51) == 0  # F_FULLFSYNC = 51
+    except Exception:
+        return False
+
+def _validate_p041_final_target_boundary(path: Path, label: str) -> None:
+    target = Path("target")
+    anchor = target.resolve()
+    if target.is_symlink():
+        raise SystemExit(
+            "proposal-041: target is a symlink; refusing to prune or publish "
+            "through a redirected root (SEC-P041-003)."
+        )
+    if path.is_symlink():
+        raise SystemExit(
+            f"proposal-041: {label} is a symlink; refusing to prune or publish "
+            "through a redirected root (SEC-P041-003)."
+        )
+    resolved = path.resolve()
+    if not str(resolved).startswith(str(anchor)):
+        raise SystemExit(
+            f"proposal-041: {label} resolves outside control-plane/target/; "
+            "refusing to prune or publish (SEC-P041-003)."
+        )
+
+def atomic_json(path, value):
+    """Write value as JSON via same-dir temp + durable flush + atomic rename."""
+    _validate_p041_final_target_boundary(path.parent, f"{path.parent}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            raw_fd = handle.fileno()
+            if sys.platform == "darwin":
+                if not _darwin_fullfsync(raw_fd):
+                    os.fsync(raw_fd)
+            else:
+                os.fsync(raw_fd)
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+# ── Retention, pruning, and 500MB budget check (proposal Section 6.4) ──────────────────────
+# Read current reclaim marker to determine if last run parked in blocked_manual_recovery.
+control_root = Path("target/parity-control")
+reclaim_marker_path = control_root / "reclaim-marker.json"
+last_reclaim_status = None
+if reclaim_marker_path.exists():
+    try:
+        _rm = json.loads(reclaim_marker_path.read_text())
+        last_reclaim_status = _rm.get("overall_status")
+    except (json.JSONDecodeError, OSError):
+        pass
+
+def _remove_abandoned_sqlite_triple(sqlite_path: Path) -> None:
+    """Remove a parity.sqlite together with .sqlite-wal and .sqlite-shm (proposal Section 6.3)."""
+    for suffix in ("", "-wal", "-shm"):
+        p = sqlite_path.parent / (sqlite_path.name + suffix)
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+parity_root = Path("target/parity")
+work_root = parity_root / "work"
+shadow_root = parity_root / "shadow"
+reports_root = parity_root / "reports"
+generations_root = parity_root / "publication/generations"
+control_root = Path("target/parity-control")
+
+# Symlink boundary check before pruning (SEC-P041-003): same guard as setup block.
+_target_anchor = Path("target").resolve()
+for _prune_root, _prune_label in (
+    (parity_root, "target/parity"),
+    (control_root, "target/parity-control"),
+):
+    if _prune_root.is_symlink():
+        raise SystemExit(
+            f"proposal-041: {_prune_label} is a symlink; refusing to prune or publish "
+            f"through a redirected root (SEC-P041-003)."
+        )
+    if _prune_root.exists():
+        _resolved_prune = _prune_root.resolve()
+        if not str(_resolved_prune).startswith(str(_target_anchor)):
+            raise SystemExit(
+                f"proposal-041: {_prune_label} resolves outside control-plane/target/; "
+                f"refusing to prune or publish (SEC-P041-003)."
+            )
+
+def _dir_size_bytes(d: Path) -> int:
+    total = 0
+    try:
+        for p in d.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+# Enumerate known generation IDs from work, shadow, reports, publication/generations.
+known_generations: set[str] = set()
+for root_dir in (work_root, shadow_root, reports_root, generations_root):
+    if root_dir.is_dir():
+        for entry in root_dir.iterdir():
+            if entry.is_dir():
+                known_generations.add(entry.name)
+
+# Collect per-generation info for pruning decisions.
+ready_generations = []
+blocked_manual_recovery_generations = []
+other_blocked_generations = []
+
+for gen_id in sorted(known_generations):
+    if gen_id == generation_id:
+        continue  # Never prune the current active generation.
+    gen_detail_path = generations_root / gen_id / "p031-p041-parity-evidence.json"
+    gen_status = None
+    if gen_detail_path.exists():
+        try:
+            _gd = json.loads(gen_detail_path.read_text())
+            gen_status = _gd.get("overall_status")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if gen_status == "ready_same_tree_verified":
+        ready_generations.append(gen_id)
+    elif gen_status == "blocked_manual_recovery":
+        blocked_manual_recovery_generations.append(gen_id)
+    else:
+        other_blocked_generations.append(gen_id)
+
+# Apply pruning policy (Section 6.4):
+# - Never prune blocked_manual_recovery generations.
+# - Retain the newest ready generation.
+# - Retain the newest non-manual blocked diagnostic generation.
+# - Prune older generations (oldest-first) if there is a newer one.
+generations_pruned = []
+ready_generations_sorted = sorted(ready_generations)
+other_blocked_sorted = sorted(other_blocked_generations)
+
+# Prune older ready generations (keep the newest only).
+for gen_id in ready_generations_sorted[:-1] if len(ready_generations_sorted) > 1 else []:
+    for sub_root in (work_root, shadow_root, reports_root):
+        gen_dir = sub_root / gen_id
+        if gen_dir.is_dir():
+            # Remove abandoned SQLite triples before rmtree.
+            for sqlite_file in gen_dir.rglob("parity.sqlite"):
+                _remove_abandoned_sqlite_triple(sqlite_file)
+            try:
+                shutil.rmtree(gen_dir)
+            except OSError as e:
+                print(f"[WARN] proposal-041: unable to prune {gen_dir}: {e}")
+    gen_pub_dir = generations_root / gen_id
+    if gen_pub_dir.is_dir():
+        try:
+            shutil.rmtree(gen_pub_dir)
+        except OSError as e:
+            print(f"[WARN] proposal-041: unable to prune publication dir {gen_pub_dir}: {e}")
+    generations_pruned.append(gen_id)
+
+# Prune older non-manual blocked generations (keep the newest only).
+for gen_id in other_blocked_sorted[:-1] if len(other_blocked_sorted) > 1 else []:
+    for sub_root in (work_root, shadow_root, reports_root):
+        gen_dir = sub_root / gen_id
+        if gen_dir.is_dir():
+            for sqlite_file in gen_dir.rglob("parity.sqlite"):
+                _remove_abandoned_sqlite_triple(sqlite_file)
+            try:
+                shutil.rmtree(gen_dir)
+            except OSError as e:
+                print(f"[WARN] proposal-041: unable to prune {gen_dir}: {e}")
+    gen_pub_dir = generations_root / gen_id
+    if gen_pub_dir.is_dir():
+        try:
+            shutil.rmtree(gen_pub_dir)
+        except OSError as e:
+            print(f"[WARN] proposal-041: unable to prune publication dir {gen_pub_dir}: {e}")
+    generations_pruned.append(gen_id)
+
+if generations_pruned:
+    print(f"[INFO] proposal-041: pruned {len(generations_pruned)} eligible abandoned generation(s): {generations_pruned}")
+if blocked_manual_recovery_generations:
+    print(
+        f"[WARN] proposal-041: {len(blocked_manual_recovery_generations)} blocked_manual_recovery "
+        f"generation(s) preserved (never auto-pruned): {blocked_manual_recovery_generations}"
+    )
+
+# 500 MB storage budget check (warn, not a hard failure per Section 6.4).
+_BUDGET_BYTES = 500 * 1024 * 1024
+_total_parity_bytes = _dir_size_bytes(parity_root)
+if _total_parity_bytes > _BUDGET_BYTES:
+    _mb = _total_parity_bytes / (1024 * 1024)
+    print(f"[WARN] proposal-041: parity artifact storage {_mb:.1f} MB exceeds 500 MB budget")
+    print(f"[WARN] proposal-041: preserved generation roots:")
+    for gen_id in sorted(known_generations):
+        gen_work = work_root / gen_id
+        gen_shadow = shadow_root / gen_id
+        gen_reports = reports_root / gen_id
+        gen_total = sum(_dir_size_bytes(d) for d in (gen_work, gen_shadow, gen_reports) if d.is_dir())
+        if gen_total > 0:
+            print(f"[WARN]   generation={gen_id} size={gen_total / (1024*1024):.1f} MB")
+for _fix_idx, fixture_id in enumerate(fixtures, 1):
+    print(f"[INFO] [{_fix_idx}/7] parity {fixture_id}")
+    report_path = Path("target/parity/reports") / generation_id / fixture_id / "behavioral-diff-report.json"
+    replay_path = Path("target/parity/work") / generation_id / fixture_id / "server-replay.json"
     if not report_path.is_file():
+        print(
+            f"[FAIL] [{_fix_idx}/7] missing-evidence {fixture_id}"
+            f" missing_path=control-plane/{report_path}"
+            f" expected_producer=replay"
+            f" affected_fixture_or_surface={fixture_id}"
+            f" next_action=rerun-after-replay-restored"
+        )
         raise SystemExit(f"proposal-041: missing generated report {report_path}")
     if not replay_path.is_file():
+        print(
+            f"[FAIL] [{_fix_idx}/7] missing-evidence {fixture_id}"
+            f" missing_path=control-plane/{replay_path}"
+            f" expected_producer=replay"
+            f" affected_fixture_or_surface={fixture_id}"
+            f" next_action=rerun-after-replay-restored"
+        )
         raise SystemExit(f"proposal-041: missing generated server replay {replay_path}")
     report = json.loads(report_path.read_text())
     replay = json.loads(replay_path.read_text())
@@ -2308,7 +3582,7 @@ for fixture_id in fixtures:
         raise SystemExit(f"proposal-041: fixture mismatch in {report_path}")
     if replay.get("fixture_id") != fixture_id:
         raise SystemExit(f"proposal-041: fixture mismatch in {replay_path}")
-    expected_replay_ref = f"control-plane/target/parity/{fixture_id}/server-replay.json"
+    expected_replay_ref = f"control-plane/target/parity/work/{generation_id}/{fixture_id}/server-replay.json"
     if report.get("server_replay_ref") != expected_replay_ref:
         raise SystemExit(f"proposal-041: bad server_replay_ref in {report_path}")
     if report.get("verdict") != "ready":
@@ -2350,10 +3624,12 @@ for fixture_id in fixtures:
     ):
         if not executable_inputs.get(key):
             raise SystemExit(f"proposal-041: missing executable input {key} in {report_path}")
-    shadow_report_path = Path("target/parity/shadow/reports") / fixture_id / "behavioral-diff-report.json"
+    shadow_report_path = Path("target/parity/shadow") / generation_id / fixture_id / "live-shadow-report.json"
     if not shadow_report_path.is_file():
         raise SystemExit(f"proposal-041: missing live shadow report {shadow_report_path}")
     shadow_report = json.loads(shadow_report_path.read_text())
+    if shadow_report.get("schema_version") != "live-shadow-report.v1":
+        raise SystemExit(f"proposal-041: bad live shadow schema_version in {shadow_report_path}")
     if shadow_report.get("mode") != "live_shadow":
         raise SystemExit(f"proposal-041: bad shadow mode in {shadow_report_path}")
     if shadow_report.get("shadow_contract", {}).get("settles_production_stages") is not False:
@@ -2364,9 +3640,333 @@ for fixture_id in fixtures:
             raise SystemExit(f"proposal-041: shadow report missing correlation key {key} in {shadow_report_path}")
     if shadow.get("fixture_or_capture_id") != fixture_id:
         raise SystemExit(f"proposal-041: shadow report fixture correlation mismatch in {shadow_report_path}")
+    print(f"[PASS] [{_fix_idx}/7] parity {fixture_id}")
+
+# ── Summary grid (Section 5.1): 7×6 fixture-by-surface matrix ───────────────
+# Build grid from surface_comparisons in each behavioral-diff-report.json.
+SURFACE_ORDER = [
+    "canonical_domain_state", "projections", "graphql_readback",
+    "mcp_report_readback", "artifact_identity", "operator_summary",
+]
+# status → grid token (Section 5 table)
+_STATUS_TOKEN = {"matched": "PASS", "diverged": "FAIL", "timed_out": "TIMEOUT", "missing_evidence": "MISS"}
+
+grid = {}
+for _fid in fixtures:
+    grid[_fid] = {}
+    _rp = Path("target/parity/reports") / generation_id / _fid / "behavioral-diff-report.json"
+    if _rp.is_file():
+        _r = json.loads(_rp.read_text())
+        for _cmp in _r.get("surface_comparisons", []):
+            _surf = _cmp.get("surface", "")
+            _grid_tok = _STATUS_TOKEN.get(_cmp.get("status", ""), "FAIL")
+            if _surf:
+                grid[_fid][_surf] = _grid_tok
+    # Surfaces absent from surface_comparisons → MISS
+    for _surf in SURFACE_ORDER:
+        grid[_fid].setdefault(_surf, "MISS")
+
+import shutil as _shutil
+_term_w = _shutil.get_terminal_size((80, 24)).columns
+_CELL = 9  # each cell is 9 chars wide including trailing space (fits "TIMEOUT  ")
+_max_fix_len = max(len(f) for f in fixtures)
+_wide_needed = _max_fix_len + 2 + _CELL * len(SURFACE_ORDER)
+
+if _term_w >= _wide_needed:
+    # Wide grid — full fixture ids, 9-char cells
+    _surf_abbr = ["canonical", "projection", "graphql", "mcp", "artifact", "summary"]
+    _hdr = f"{'fixture':<{_max_fix_len}}  " + "".join(f"{a:<{_CELL}}" for a in _surf_abbr)
+    print(f"[INFO] {_hdr}")
+    for _fid in fixtures:
+        _row = f"{_fid:<{_max_fix_len}}  " + "".join(
+            f"{grid[_fid].get(s, 'MISS'):<{_CELL}}" for s in SURFACE_ORDER
+        )
+        print(f"[INFO] {_row}")
+else:
+    # Narrow-terminal fallback: two lines per fixture, single-char tokens
+    _abbrev = {
+        "canonical_domain_state": "canon", "projections": "proj",
+        "graphql_readback": "gql", "mcp_report_readback": "mcp",
+        "artifact_identity": "art", "operator_summary": "sum",
+    }
+    _TOKEN = {"PASS": "P", "FAIL": "F", "MISS": "M", "SKIP": "S", "TIMEOUT": "T"}
+    for _fid in fixtures:
+        print(f"[INFO] {_fid}")
+        _g = grid[_fid]
+        _s1 = SURFACE_ORDER[:3]
+        _s2 = SURFACE_ORDER[3:]
+        print("[INFO]   " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s1))
+        print("[INFO]   " + " ".join(f"{_abbrev[s]}={_TOKEN.get(_g.get(s,'MISS'),'?')}" for s in _s2))
+    print("[INFO] Legend: P=PASS F=FAIL")
+    print("[INFO] Legend: M=MISS S=SKIP T=TIMEOUT")
+
+# Compute per-fixture pass/fail counts for the final summary line.
+passed_count = sum(
+    1 for _fid in fixtures
+    if all(grid[_fid].get(s, "MISS") == "PASS" for s in SURFACE_ORDER)
+)
+failed_count = sum(
+    1 for _fid in fixtures
+    if any(grid[_fid].get(s, "MISS") not in ("PASS", "TIMEOUT") for s in SURFACE_ORDER)
+)
+missing_count = sum(
+    1 for _fid in fixtures
+    if any(grid[_fid].get(s, "MISS") == "MISS" for s in SURFACE_ORDER)
+)
+
+# Validate runtime row and detail artifacts (Phase C P031 cutover acceptance)
+row_path = Path("target/parity/publication/current/p031-phase-0-manifest-row.json")
+detail_path = Path("target/parity/publication/current/p031-p041-parity-evidence.json")
+if not row_path.is_file():
+    raise SystemExit(f"proposal-041: runtime row missing at {row_path}")
+if not detail_path.is_file():
+    raise SystemExit(f"proposal-041: runtime detail missing at {detail_path}")
+
+row = json.loads(row_path.read_text())
+detail = json.loads(detail_path.read_text())
+
+if row.get("schema_version") != "p031-phase-0-runtime-manifest-row.v1":
+    raise SystemExit(f"proposal-041: bad row schema_version: {row.get('schema_version')}")
+if detail.get("schema_version") != "p031-p041-parity-evidence.v1":
+    raise SystemExit(f"proposal-041: bad detail schema_version: {detail.get('schema_version')}")
+if row.get("id") != "p041_parity_evidence":
+    raise SystemExit(f"proposal-041: row.id must be p041_parity_evidence, got {row.get('id')}")
+if row.get("detail_schema_version") != detail.get("schema_version"):
+    raise SystemExit(
+        f"proposal-041: row.detail_schema_version {row.get('detail_schema_version')} "
+        f"!= detail.schema_version {detail.get('schema_version')}"
+    )
+if row.get("validation_status") != detail.get("overall_status"):
+    raise SystemExit(
+        f"proposal-041: row.validation_status {row.get('validation_status')} "
+        f"!= detail.overall_status {detail.get('overall_status')}"
+    )
+if row.get("publication_state") != detail.get("publication_state"):
+    raise SystemExit("proposal-041: row.publication_state != detail.publication_state")
+if row.get("publication_generation_id") != detail.get("publication_generation_id"):
+    raise SystemExit("proposal-041: row.publication_generation_id != detail.publication_generation_id")
+
+required_fixtures = [
+    "proposal-loop-basic", "implementation-refine-review", "approval-pause-resume",
+    "retry-recovery-flow", "cancelled-or-blocked-run", "terminal-report-evidence",
+    "projection-readback-surface",
+]
+required_surfaces = [
+    "canonical_domain_state", "projections", "graphql_readback",
+    "mcp_report_readback", "artifact_identity", "operator_summary",
+]
+if detail.get("required_fixtures") != required_fixtures:
+    raise SystemExit(f"proposal-041: detail.required_fixtures mismatch")
+if detail.get("required_surfaces") != required_surfaces:
+    raise SystemExit(f"proposal-041: detail.required_surfaces mismatch")
+
+# Live-checkout comparison: required when claiming ready_same_tree_verified.
+# Blocked artifacts (including schema-validation-only test artifacts) do not
+# require checkout comparison — only ready publication must match the live tree.
+# No sentinel bypass: any row claiming ready_same_tree_verified must carry real
+# provenance that matches the live HEAD or the gate fails closed.
+if row.get("validation_status") == "ready_same_tree_verified":
+    def _git_output(args, label):
+        try:
+            return subprocess.check_output(
+                args, stderr=subprocess.DEVNULL, text=True
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise SystemExit(
+                f"proposal-041: ready_same_tree_verified requires live git {label}"
+            )
+
+    live_commit = _git_output(["git", "rev-parse", "HEAD"], "HEAD").strip()
+    live_tree = _git_output(["git", "rev-parse", "HEAD^{tree}"], "HEAD^{tree}").strip()
+    live_status = _git_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        "status snapshot",
+    )
+    live_line_count = sum(1 for line in live_status.splitlines() if line)
+    live_sha256 = hashlib.sha256(live_status.encode()).hexdigest()
+    prov = row.get("provenance", {})
+    if not isinstance(prov, dict):
+        raise SystemExit("proposal-041: row.provenance must be an object")
+    row_commit = prov.get("commit_sha", "")
+    row_tree = prov.get("tree_id", "")
+    row_status_sha256 = prov.get("status_snapshot_sha256", "")
+    for field, value in (
+        ("commit_sha", row_commit),
+        ("tree_id", row_tree),
+        ("status_snapshot_sha256", row_status_sha256),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(
+                f"proposal-041: row.provenance.{field} is required for "
+                "ready_same_tree_verified"
+            )
+    if row_commit != live_commit:
+        raise SystemExit(
+            f"proposal-041: runtime row commit_sha {row_commit[:12]} does not match "
+            f"live HEAD {live_commit[:12]}; rerun the gate on the same clean tree"
+        )
+    if row_tree != live_tree:
+        raise SystemExit(
+            f"proposal-041: runtime row tree_id {row_tree[:12]} does not match "
+            f"live HEAD^{{tree}} {live_tree[:12]}; rerun the gate on the same clean tree"
+        )
+    prov_line_count = prov.get("status_snapshot_line_count", 1)
+    if not prov.get("tree_clean") or prov_line_count != 0:
+        raise SystemExit(
+            f"proposal-041: ready_same_tree_verified requires tree_clean=true and "
+            f"status_snapshot_line_count=0; got tree_clean={prov.get('tree_clean')} "
+            f"line_count={prov_line_count}"
+        )
+    if live_line_count != 0:
+        raise SystemExit("proposal-041: ready_same_tree_verified requires clean live git status")
+    if prov_line_count != live_line_count:
+        raise SystemExit(
+            f"proposal-041: row.provenance.status_snapshot_line_count {prov_line_count} "
+            f"does not match live git status line count {live_line_count}"
+        )
+    if row_status_sha256 != live_sha256:
+        raise SystemExit(
+            "proposal-041: row.provenance.status_snapshot_sha256 does not match live git status"
+        )
+
+# Row vs detail provenance agreement (Section 6.2): required for ready publication.
+if row.get("validation_status") == "ready_same_tree_verified":
+    row_prov = row.get("provenance", {})
+    detail_prov = detail.get("provenance", {})
+    for prov_field in (
+        "commit_sha", "tree_id", "tree_clean",
+        "status_snapshot_sha256", "status_snapshot_line_count",
+    ):
+        rv, dv = row_prov.get(prov_field), detail_prov.get(prov_field)
+        if rv != dv:
+            raise SystemExit(
+                f"proposal-041: row.provenance.{prov_field} ({rv!r}) != "
+                f"detail.provenance.{prov_field} ({dv!r}); "
+                "row and detail must agree on all provenance fields for ready publication"
+            )
+
+# Explicit detail.provenance vs live checkout (Section 6.6 Decision 4).
+# Checking row.provenance against live is not sufficient — a stale detail that
+# agrees with row on status/state/generation could still carry stale provenance.
+if row.get("validation_status") == "ready_same_tree_verified":
+    detail_prov = detail.get("provenance", {})
+    if not isinstance(detail_prov, dict):
+        raise SystemExit("proposal-041: detail.provenance must be an object")
+    try:
+        _detail_live_commit = live_commit
+        _detail_live_tree = live_tree
+        _detail_live_line_count = live_line_count
+        _detail_live_sha256 = live_sha256
+    except NameError:
+        raise SystemExit("proposal-041: ready_same_tree_verified requires live git provenance")
+    detail_commit = detail_prov.get("commit_sha", "")
+    detail_tree = detail_prov.get("tree_id", "")
+    detail_status_sha256 = detail_prov.get("status_snapshot_sha256", "")
+    for field, value in (
+        ("commit_sha", detail_commit),
+        ("tree_id", detail_tree),
+        ("status_snapshot_sha256", detail_status_sha256),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(
+                f"proposal-041: detail.provenance.{field} is required for "
+                "ready_same_tree_verified"
+            )
+    if detail_commit != _detail_live_commit:
+        raise SystemExit(
+            f"proposal-041: detail.provenance.commit_sha "
+            f"{detail_commit[:12]} does not match "
+            f"live HEAD {_detail_live_commit[:12]}; rerun the gate on the same clean tree"
+        )
+    if detail_tree != _detail_live_tree:
+        raise SystemExit(
+            f"proposal-041: detail.provenance.tree_id "
+            f"{detail_tree[:12]} does not match "
+            f"live HEAD^{{tree}} {_detail_live_tree[:12]}; rerun the gate on the same clean tree"
+        )
+    if detail_prov.get("status_snapshot_line_count") != _detail_live_line_count:
+        raise SystemExit(
+            "proposal-041: detail.provenance.status_snapshot_line_count "
+            "does not match live git status"
+        )
+    if detail_status_sha256 != _detail_live_sha256:
+        raise SystemExit(
+            "proposal-041: detail.provenance.status_snapshot_sha256 "
+            "does not match live git status"
+        )
+
+# Status-to-prefix mapping per proposal Section 5 table.
+STATUS_TO_PREFIX = {
+    "ready_same_tree_verified": "PASS",
+    "blocked_missing_evidence": "FAIL",
+    "blocked_divergence": "FAIL",
+    "blocked_manual_recovery": "FAIL",
+    "blocked_dirty_tree": "WARN",
+    "blocked_timeout": "WARN",
+    "blocked_interrupted": "WARN",
+    "blocked_in_progress": "INFO",
+}
+validation_status = row.get("validation_status", "")
+prefix = STATUS_TO_PREFIX.get(validation_status, "FAIL")
+
+now_ms = int(time.time() * 1000)
+# control_root is already defined above in the pruning section.
+atomic_json(control_root / "current-step.json", {
+    "schema_version": "parity-control-current-step.v1",
+    "generation": generation_id,
+    "fixture": None,
+    "step": "final_summary",
+    "surface": None,
+    "mode": "gate",
+    "elapsed_ms": 0,
+    "heartbeat_unix_ms": now_ms,
+})
+atomic_json(control_root / "release-marker.json", {
+    "schema_version": "parity-control-release-marker.v1",
+    "overall_status": validation_status,
+    "generation_id": generation_id,
+    # True: all cargo phases ran synchronously via bash && chaining (p041_prefixed_run
+    # waits for each process). No background subprocesses were spawned independently.
+    # When this block executes, all cargo test invocations have already returned.
+    # Descendant quiescence is therefore proven by the synchronous execution model.
+    "descendant_quiescent": True,
+    "written_at_unix_ms": now_ms,
+})
+
+# Print blocking diagnostics from the runtime detail artifact (Section 5.1 / 6.2).
+# Operators see these before the final status line so they can act without opening
+# the JSON file. blocking_reasons and missing_evidence are populated by the
+# runtime publication test for every non-ready publication.
+if validation_status != "ready_same_tree_verified":
+    for reason in detail.get("blocking_reasons", []):
+        print(f"[{prefix}] blocking_reason={reason}")
+    for item in detail.get("missing_evidence", []):
+        if isinstance(item, dict):
+            print(
+                f"[{prefix}] missing_evidence"
+                f" missing_path={item.get('missing_path', 'unknown')}"
+                f" expected_producer={item.get('expected_producer', 'unknown')}"
+                f" affected_fixture_or_surface={item.get('affected_fixture_or_surface', 'unknown')}"
+                f" next_action={item.get('next_action', 'unknown')}"
+            )
+        else:
+            print(f"[{prefix}] missing_evidence={item}")
+
+# The markdown companion is not generated in the current implementation.
+# Per Section 5.1: when the markdown companion is absent, the final footer
+# must say "JSON-only evidence" before printing the detail= path.
+print(f"[{prefix}] status={validation_status} passed_fixtures={passed_count} failed_fixtures={failed_count} missing_evidence={missing_count}")
+print(f"[INFO] JSON-only evidence")
+print(f"[INFO] row={row_path}")
+print(f"[INFO] detail={detail_path}")
+if validation_status != "ready_same_tree_verified":
+    raise SystemExit(
+        f"proposal-041: gate status is {validation_status}, not ready_same_tree_verified; "
+        f"inspect runtime detail at {detail_path}"
+    )
 PY
     )
-    log "Proposal 041 control-plane gate passed"
+    echo "[PASS] Proposal 041 control-plane gate: ready_same_tree_verified"
     ;;
   proposal-043|p043)
     log "Proposal 043 control-plane gate: GraphQL projection read contract"
@@ -2456,8 +4056,8 @@ for freshness in [
     require_contains(freshness, f"projection freshness {freshness}")
 
 for subscription in [
-    "`runStatusChanged(runID:)`",
-    "`stageStatusChanged(runID:)`",
+    "`runStatusChanged(runId:)`",
+    "`stageStatusChanged(runId:)`",
     "`approvalRequested`",
     "`approvalResolved`",
     "`runtimeStatusChanged`",

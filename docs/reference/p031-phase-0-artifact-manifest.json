@@ -4,7 +4,7 @@
   "entries": [
     {
       "id": "governing_contract",
-      "path": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+      "path": "docs/reference/query-projections-and-client-consumption-contract.md",
       "owner_role": "P031 release owner",
       "validation_status": "ready",
       "blocking_phase": "Phase 1"
@@ -85,6 +85,15 @@
       "owner_role": "P031 macOS thin UI owner",
       "validation_status": "validated_with_assistive_access_limitation",
       "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "p041_parity_evidence",
+      "path": "docs/reference/p031-p041-parity-evidence.json",
+      "owner_role": "P031 release owner + Rust control-plane owner",
+      "validation_status": "ready",
+      "blocking_phase": "Phase 1",
+      "runtime_detail_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+      "runtime_row_path": "control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json"
     },
     {
       "id": "dogfood_signoff_template",
