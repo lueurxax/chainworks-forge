@@ -2733,3 +2733,79 @@ fn proposal_041_cli_prefix_projection_matches_section_5_table() {
         "unknown status enum values must default to FAIL"
     );
 }
+
+#[test]
+fn proposal_041_gate_script_enforces_process_group_deadline_and_boundary_contract() -> Result<()> {
+    let script_path = workspace_root().join("scripts/test-gate.sh");
+    let script = fs::read_to_string(&script_path)?;
+    let p041_start = script
+        .find("proposal-041|p041)")
+        .expect("proposal-041 gate block must exist");
+    let p041_block = &script[p041_start..];
+
+    assert!(
+        !p041_block.contains("MISSING-001"),
+        "P041 gate must not defer pgid/process-group lifecycle"
+    );
+    assert!(
+        !p041_block.contains("\"pgid\": 0"),
+        "P041 lease must publish a real process-group id, never pgid=0"
+    );
+    assert!(
+        script.contains("start_new_session=True") && p041_block.contains("p041_supervised_run"),
+        "P041 subprocesses must run in a dedicated process group/session"
+    );
+    assert!(
+        script.contains("os.killpg(") && p041_block.contains("p041_supervised_run"),
+        "P041 timeout/interruption handling must terminate the tracked process group"
+    );
+    assert!(
+        p041_block.contains("P041_GATE_DEADLINE_SECONDS"),
+        "P041 gate must enforce an overall deadline"
+    );
+    assert!(
+        p041_block.contains("P041_DRAIN_GRACE_SECONDS"),
+        "P041 gate must enforce a post-signal drain grace"
+    );
+
+    let guard_pos = p041_block
+        .find("def _validate_p041_target_boundary")
+        .expect("P041 setup must define target boundary validation");
+    let mkdir_pos = p041_block
+        .find("root.mkdir(parents=True, exist_ok=True)")
+        .expect("P041 setup must create target roots");
+    assert!(
+        guard_pos < mkdir_pos,
+        "P041 setup must validate target/parity* boundaries before any mkdir/write"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn proposal_041_gate_script_implements_reclaim_matrix_cases() -> Result<()> {
+    let script_path = workspace_root().join("scripts/test-gate.sh");
+    let script = fs::read_to_string(&script_path)?;
+    let p041_start = script
+        .find("proposal-041|p041)")
+        .expect("proposal-041 gate block must exist");
+    let p041_block = &script[p041_start..];
+
+    for token in [
+        "Case A",
+        "Case A2",
+        "Case B",
+        "Case C",
+        "Case D",
+        "_pgid_has_observable_descendants",
+        "_write_reclaim_marker",
+        "2,\n                        _window_ms",
+    ] {
+        assert!(
+            p041_block.contains(token),
+            "P041 reclaim implementation missing token {token:?}"
+        );
+    }
+
+    Ok(())
+}

@@ -577,6 +577,191 @@ p041_prefixed_run() {
   return "$status"
 }
 
+p041_supervised_run() {
+  local _args_json
+  _args_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@")"
+  P041_SUPERVISED_ARGS_JSON="$_args_json" python3 - <<'PY'
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+args = json.loads(os.environ["P041_SUPERVISED_ARGS_JSON"])
+if not args:
+    raise SystemExit("p041_supervised_run: missing command")
+
+_base_dir = Path.cwd()
+if (_base_dir / "control-plane").is_dir():
+    _base_dir = _base_dir / "control-plane"
+control_root = _base_dir / "target/parity-control"
+lease_path = control_root / "lease.json"
+current_step_path = control_root / "current-step.json"
+timeout_marker_path = control_root / "timeout-marker.json"
+
+def _prefix(line: str) -> None:
+    line = line.rstrip("\n")
+    if line.startswith(("[INFO]", "[PASS]", "[WARN]", "[FAIL]")):
+        print(line, flush=True)
+    else:
+        print(f"[INFO] {line}", flush=True)
+
+def _target_boundary_is_safe(path: Path) -> bool:
+    target = _base_dir / "target"
+    try:
+        if target.is_symlink():
+            return False
+        if path.is_symlink():
+            return False
+        anchor = target.resolve()
+        resolved = path.resolve()
+        return str(resolved).startswith(str(anchor))
+    except OSError:
+        return False
+
+def _atomic_json(path: Path, value: dict) -> None:
+    if not _target_boundary_is_safe(path):
+        raise SystemExit(f"proposal-041: refusing write outside control-plane/target: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+def _write_lease_pgid(pgid: int) -> None:
+    lease = _read_json(lease_path)
+    if not lease:
+        return
+    lease["pgid"] = pgid
+    lease["heartbeat_unix_ms"] = int(time.time() * 1000)
+    lease["control_sequence"] = int(lease.get("control_sequence", 0)) + 1
+    _atomic_json(lease_path, lease)
+
+def _write_current_step(pgid=None) -> None:
+    step = _read_json(current_step_path) or {
+        "schema_version": "parity-control-current-step.v1",
+        "generation": os.environ.get("P041_PUBLICATION_GENERATION_ID", ""),
+        "fixture": None,
+        "step": os.environ.get("P041_STEP_NAME", "supervised_command"),
+        "surface": os.environ.get("P041_STEP_SURFACE") or None,
+        "mode": "gate",
+        "elapsed_ms": 0,
+    }
+    step["heartbeat_unix_ms"] = int(time.time() * 1000)
+    step["command"] = args
+    step["deadline_at_unix_ms"] = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+    if pgid is not None:
+        step["pgid"] = pgid
+    _atomic_json(current_step_path, step)
+
+def _write_timeout_marker(pgid, descendant_absent: bool) -> None:
+    _atomic_json(timeout_marker_path, {
+        "schema_version": "parity-control-timeout-marker.v1",
+        "overall_status": "blocked_timeout",
+        "generation_id": os.environ.get("P041_PUBLICATION_GENERATION_ID", ""),
+        "active_fixture": os.environ.get("P041_STEP_FIXTURE") or None,
+        "active_surface": os.environ.get("P041_STEP_SURFACE") or None,
+        "descendant_pgid": pgid,
+        "descendant_absent": descendant_absent,
+        "written_at_unix_ms": int(time.time() * 1000),
+    })
+
+deadline_ms = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+drain_seconds = int(os.environ.get("P041_DRAIN_GRACE_SECONDS", "20") or 20)
+if deadline_ms and int(time.time() * 1000) >= deadline_ms:
+    _write_timeout_marker(None, True)
+    raise SystemExit("proposal-041: gate deadline expired before starting command")
+
+process = subprocess.Popen(
+    args,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    bufsize=1,
+    start_new_session=True,
+)
+pgid = os.getpgid(process.pid)
+_write_lease_pgid(pgid)
+_write_current_step(pgid)
+
+timed_out = False
+try:
+    assert process.stdout is not None
+    while True:
+        ready, _, _ = select.select([process.stdout], [], [], 0.25)
+        if ready:
+            line = process.stdout.readline()
+            if line:
+                _prefix(line)
+        rc = process.poll()
+        if rc is not None:
+            for line in process.stdout:
+                _prefix(line)
+            raise SystemExit(rc)
+        if deadline_ms and int(time.time() * 1000) >= deadline_ms:
+            timed_out = True
+            break
+except KeyboardInterrupt:
+    timed_out = True
+
+if timed_out:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + drain_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    descendant_absent = process.poll() is not None
+    if not descendant_absent:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        descendant_absent = process.poll() is not None
+    _write_timeout_marker(pgid, descendant_absent)
+    _prefix(
+        f"[FAIL] proposal-041: command timed out; pgid={pgid} "
+        f"descendant_absent={str(descendant_absent).lower()}"
+    )
+    raise SystemExit(124)
+PY
+}
+
 # Refresh parity-control/lease.json heartbeat_unix_ms and increment control_sequence.
 # Called between cargo phases so a live-but-stalled owner can be detected (Section 6.3
 # A1/A2 freshness rule).  Reads the existing lease, bumps control_sequence, updates
@@ -587,6 +772,12 @@ import ctypes, ctypes.util, json, os, sys, tempfile, time
 from pathlib import Path
 
 ctrl = Path('target/parity-control')
+target = Path('target')
+anchor = (Path.cwd() / 'target').resolve()
+if target.is_symlink():
+    raise SystemExit('proposal-041: target is a symlink; refusing parity-control heartbeat write')
+if ctrl.exists() and (ctrl.is_symlink() or not str(ctrl.resolve()).startswith(str(anchor))):
+    raise SystemExit('proposal-041: target/parity-control boundary check failed before heartbeat write')
 lease_path = ctrl / 'lease.json'
 if not lease_path.exists():
     sys.exit(0)  # No lease yet; nothing to refresh.
@@ -643,6 +834,12 @@ import ctypes, ctypes.util, json, os, sys, tempfile, time
 from pathlib import Path
 
 def _atomic_current_step(ctrl, step, surface):
+    target_root = Path('target')
+    anchor = (Path.cwd() / 'target').resolve()
+    if target_root.is_symlink():
+        raise SystemExit('proposal-041: target is a symlink; refusing current-step write')
+    if ctrl.exists() and (ctrl.is_symlink() or not str(ctrl.resolve()).startswith(str(anchor))):
+        raise SystemExit('proposal-041: target/parity-control boundary check failed before current-step write')
     ctrl.mkdir(parents=True, exist_ok=True)
     data = {
         'schema_version': 'parity-control-current-step.v1',
@@ -2395,6 +2592,10 @@ PY
     ;;
   proposal-041|p041)
     echo "[INFO] Proposal 041 control-plane gate: server parity harness, golden fixtures, and behavioral diff"
+    export P041_GATE_DEADLINE_SECONDS="${P041_GATE_DEADLINE_SECONDS:-7200}"
+    export P041_DRAIN_GRACE_SECONDS="${P041_DRAIN_GRACE_SECONDS:-20}"
+    _p041_deadline_now="$(date +%s)"
+    export P041_GATE_DEADLINE_UNIX_MS="$(( (_p041_deadline_now + P041_GATE_DEADLINE_SECONDS) * 1000 ))"
     _p041_cap_idx=0
     for fixture_id in \
       proposal-loop-basic \
@@ -2406,7 +2607,7 @@ PY
       projection-readback-surface; do
       _p041_cap_idx=$((_p041_cap_idx + 1))
       echo "[INFO] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
-      p041_prefixed_run "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate
+      p041_supervised_run "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate
       echo "[PASS] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
     done
     (
@@ -2458,6 +2659,7 @@ PY
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -2476,19 +2678,18 @@ parity_root = Path("target/parity")
 control_root = Path("target/parity-control")
 current_root = parity_root / "publication/current"
 generation_root = parity_root / "publication/generations" / generation_id
-for root in (parity_root, control_root, current_root, generation_root):
-    root.mkdir(parents=True, exist_ok=True)
-for root in (parity_root, control_root):
-    (root / ".metadata_never_index").touch()
 
-# Symlink boundary hardening (SEC-P041-003): reject if parity_root or control_root
-# is a symlink or resolves outside control-plane/target/.  Prevents symlink-redirected
-# publication writes and shutil.rmtree pruning from escaping the expected tree.
+# Symlink boundary hardening (SEC-P041-003): reject before any mkdir/write if
+# target, parity_root, or control_root is a symlink or resolves outside
+# control-plane/target/. This keeps publication writes and pruning from escaping
+# the expected tree.
 _target_anchor = Path("target").resolve()
-for _check_path, _label in (
-    (parity_root, "target/parity"),
-    (control_root, "target/parity-control"),
-):
+def _validate_p041_target_boundary(_check_path: Path, _label: str) -> None:
+    if Path("target").is_symlink():
+        raise SystemExit(
+            "proposal-041: target is a symlink; refusing to write parity artifacts "
+            "through a redirected root (SEC-P041-003)."
+        )
     if _check_path.is_symlink():
         raise SystemExit(
             f"proposal-041: {_label} is a symlink; refusing to write parity artifacts "
@@ -2500,6 +2701,19 @@ for _check_path, _label in (
             f"proposal-041: {_label} resolves to {_resolved_check}, which is outside "
             f"control-plane/target/; refusing to write (SEC-P041-003)."
         )
+
+for _check_path, _label in (
+    (parity_root, "target/parity"),
+    (control_root, "target/parity-control"),
+    (current_root, "target/parity/publication/current"),
+    (generation_root, "target/parity/publication/generations/<generation>"),
+):
+    _validate_p041_target_boundary(_check_path, _label)
+
+for root in (parity_root, control_root, current_root, generation_root):
+    root.mkdir(parents=True, exist_ok=True)
+for root in (parity_root, control_root):
+    (root / ".metadata_never_index").touch()
 
 def _get_process_birth_unix_ms(pid: int) -> int:
     """Return process birth time in Unix ms via proc_pidinfo on Darwin.
@@ -2546,6 +2760,7 @@ def atomic_json(path, value):
     directory (same-volume rule), durable flush (F_FULLFSYNC on Darwin, fsync
     fallback), atomic rename, best-effort parent-dir fsync.
     """
+    _validate_p041_target_boundary(path.parent, f"{path.parent}")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -2657,13 +2872,80 @@ def _publish_blocked_manual_recovery(reason: str) -> None:
 
 # Reclaim check: inspect existing lease and reclaim-marker before proceeding.
 # Implements proposal Section 6.3 reclaim matrix (Cases A/B/C/D).
-# NOTE: pgid lifecycle is deferred (MISSING-001). The lease PID is the Python
-# setup process which exits before cargo tests begin. PID-gone reclaim uses a
-# release-marker clean-exit check (Case D-lite) rather than pgid descendant-absence
-# proof. Full Cases A2/B/C require a persistent gate supervisor (not yet implemented).
 _reclaim_marker_path = control_root / "reclaim-marker.json"
 _existing_lease_path = control_root / "lease.json"
 _release_marker_path = control_root / "release-marker.json"
+_deadline_ms = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+
+def _remaining_deadline_ms() -> int:
+    if _deadline_ms <= 0:
+        return 120_000
+    return max(0, _deadline_ms - int(time.time() * 1000))
+
+def _freshness_window_ms() -> int:
+    remaining = _remaining_deadline_ms()
+    if remaining <= 0:
+        return 1_000
+    return max(1_000, min(120_000, remaining // 4))
+
+def _pgid_has_observable_descendants(pgid: int, owner_pid: int = 0) -> bool:
+    if pgid <= 0:
+        return False
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,pgid="],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        return True
+    own_pid = os.getpid()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            proc_pgid = int(parts[1])
+        except ValueError:
+            continue
+        if proc_pgid == pgid and pid not in {own_pid, owner_pid}:
+            return True
+    return False
+
+def _preserved_generation_root(gen_id: str):
+    candidate = Path("target/parity/publication/generations") / gen_id
+    return str(candidate) if candidate.exists() else None
+
+def _write_reclaim_marker(
+    abandoned_lease: dict,
+    overall_status: str,
+    observation_count: int,
+    freshness_window_ms: int,
+    missing_pgid_metadata: bool,
+    observable_descendants: bool,
+    diagnostic_message: str,
+) -> None:
+    old_pgid = int(abandoned_lease.get("pgid", 0) or 0)
+    old_gen = abandoned_lease.get("publication_generation_id", "unknown")
+    atomic_json(_reclaim_marker_path, {
+        "schema_version": "parity-control-reclaim-marker.v1",
+        "overall_status": overall_status,
+        "abandoned_generation_id": old_gen,
+        "preserved_generation_root": _preserved_generation_root(old_gen),
+        "owner_pid": int(abandoned_lease.get("pid", 0) or 0),
+        "owner_process_birth_unix_ms": int(abandoned_lease.get("process_birth_unix_ms", 0) or 0),
+        "owner_pgid": old_pgid if old_pgid > 0 else None,
+        "owner_hostname": abandoned_lease.get("hostname", "unknown"),
+        "owner_last_heartbeat_unix_ms": int(abandoned_lease.get("heartbeat_unix_ms", 0) or 0),
+        "owner_last_control_sequence": int(abandoned_lease.get("control_sequence", 0) or 0),
+        "observation_count": observation_count,
+        "freshness_window_ms": freshness_window_ms,
+        "missing_pgid_metadata": missing_pgid_metadata,
+        "observable_descendants": observable_descendants,
+        "written_at_unix_ms": int(time.time() * 1000),
+        "diagnostic_message": diagnostic_message,
+    })
 if _reclaim_marker_path.exists():
     try:
         _rm = json.loads(_reclaim_marker_path.read_text())
@@ -2724,89 +3006,97 @@ if _existing_lease_path.exists():
                 and abs(_old_birth_ms - _current_birth_ms) < 5000
             )
             if _birth_matches:
-                # Case A: owner alive with matching birth time — fail closed.
-                # Write blocked_in_progress to current/ so consumers see the live-owner state.
+                _window_ms = _freshness_window_ms()
+                time.sleep(_window_ms / 1000.0)
+                try:
+                    _latest_lease = json.loads(_existing_lease_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    _publish_blocked_manual_recovery("unreadable_lease_after_stall_observation")
+                    raise SystemExit("proposal-041: lease unreadable after Case A observation")
+                _latest_heartbeat = int(_latest_lease.get("heartbeat_unix_ms", 0) or 0)
+                _latest_seq = int(_latest_lease.get("control_sequence", 0) or 0)
+                if _latest_heartbeat == _old_heartbeat_ms and _latest_seq == _old_seq:
+                    _observable = _pgid_has_observable_descendants(_old_pgid, _old_pid)
+                    _write_reclaim_marker(
+                        _old_lease,
+                        "blocked_manual_recovery",
+                        2,
+                        _window_ms,
+                        _old_pgid <= 0,
+                        _observable,
+                        "Case A2: owner PID alive but heartbeat and control_sequence were unchanged across two observations.",
+                    )
+                    _publish_blocked_manual_recovery("case_a2_stalled_owner_requires_manual_recovery")
+                    print(
+                        f"[FAIL] proposal-041: gate owner PID {_old_pid} stalled "
+                        f"for {_window_ms}ms (Case A2). Written blocked_manual_recovery "
+                        f"marker at {_reclaim_marker_path}.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit("proposal-041: stalled active gate owner (Case A2); fail-closed")
+                # Case A: owner alive but fresh — fail closed as in-progress.
                 atomic_json(current_root / "p031-p041-parity-evidence.json", detail)
                 atomic_json(current_root / "p031-phase-0-manifest-row.json", row)
                 print(
-                    f"[FAIL] proposal-041: gate owner PID {_old_pid} is alive "
-                    f"(birth_ms={_old_birth_ms}, gen={_old_gen}). "
-                    f"Wait for the active run to complete. "
-                    f"heartbeat_unix_ms={_old_heartbeat_ms} control_sequence={_old_seq}",
+                    f"[FAIL] proposal-041: gate owner PID {_old_pid} is alive and fresh "
+                    f"(Case A). Wait for the active run to complete. "
+                    f"heartbeat_unix_ms={_latest_heartbeat} control_sequence={_latest_seq}",
                     file=sys.stderr,
                 )
-                raise SystemExit(
-                    "proposal-041: active gate owner still running (Case A); fail-closed"
-                )
+                raise SystemExit("proposal-041: active gate owner still running (Case A); fail-closed")
             # PID alive but birth time does not match: OS recycled the PID.
             # Fall through to PID-gone reclaim handling below.
             _pid_alive = False
 
-        # PID is gone. Write a reclaim marker documenting the reclaim decision before
-        # continuing, per Section 6.3 Case D contract.
-        # Check release-marker to distinguish clean exit from interrupted/crash exit.
-        _has_clean_release = False
-        if _release_marker_path.exists():
-            try:
-                _rel_data = json.loads(_release_marker_path.read_text())
-                # Require both generation_id match AND descendant_quiescent=True (SEC-P041-002).
-                # A release marker from an interrupted/failed gate has descendant_quiescent=False
-                # or will be absent; only a clean synchronous completion writes True.
-                _has_clean_release = (
-                    _rel_data.get("generation_id") == _old_gen
-                    and _rel_data.get("descendant_quiescent", False) is True
-                )
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        _reclaim_record = {
-            "schema_version": "parity-control-reclaim-marker.v1",
-            "overall_status": "reclaim_allowed" if _has_clean_release else "blocked_manual_recovery",
-            "abandoned_generation_id": _old_gen,
-            "preserved_generation_root": None,
-            "owner_pid": _old_pid,
-            "owner_process_birth_unix_ms": _old_birth_ms,
-            "owner_pgid": _old_pgid if _old_pgid > 0 else None,
-            "owner_hostname": _old_lease.get("hostname", "unknown"),
-            "owner_last_heartbeat_unix_ms": _old_heartbeat_ms,
-            "owner_last_control_sequence": _old_seq,
-            "observation_count": 1,
-            "freshness_window_ms": 120000,
-            "missing_pgid_metadata": _old_pgid == 0,
-            "observable_descendants": False,
-            "written_at_unix_ms": now_ms,
-            "diagnostic_message": (
-                "Owner PID gone; release-marker confirms clean exit; "
-                "pgid tracking deferred (MISSING-001)."
-                if _has_clean_release
-                else
-                "Owner PID gone; no release-marker for this generation; "
-                "gate may have been interrupted or crashed. pgid tracking deferred (MISSING-001). "
-                "Remove reclaim-marker.json after verifying no active gate subprocesses remain."
-            ),
-        }
-        atomic_json(_reclaim_marker_path, _reclaim_record)
-        if not _has_clean_release:
-            # Publish blocked_manual_recovery to current/ before exiting so downstream
-            # consumers see the unresolved owner state rather than stale artifacts.
-            _publish_blocked_manual_recovery("prior_gate_interrupted_or_no_descendant_quiescence_proof")
+        # PID is gone or recycled. Apply Cases B/C/D using pgid descendant proof.
+        if _old_pgid <= 0:
+            _write_reclaim_marker(
+                _old_lease,
+                "blocked_manual_recovery",
+                1,
+                0,
+                True,
+                False,
+                "Case B: owner PID gone but process-group metadata is missing; descendant absence cannot be proven.",
+            )
+            _publish_blocked_manual_recovery("case_b_missing_pgid_metadata")
             print(
-                f"[FAIL] proposal-041: previous gate owner PID {_old_pid} is gone but no "
-                f"clean release-marker found for generation {_old_gen} "
-                f"(missing or descendant_quiescent!=true). "
-                f"Gate may have been interrupted. Written blocked_manual_recovery reclaim "
-                f"marker at {_reclaim_marker_path}. "
-                f"Remove it after verifying no active gate subprocesses remain.",
+                f"[FAIL] proposal-041: previous owner PID {_old_pid} is gone but "
+                f"lease for generation {_old_gen} has no pgid metadata (Case B). "
+                f"Written blocked_manual_recovery marker at {_reclaim_marker_path}.",
                 file=sys.stderr,
             )
-            raise SystemExit(
-                "proposal-041: prior gate has no clean release marker (interrupted/crashed or "
-                "descendant_quiescent=false); fail-closed (remove reclaim-marker.json after "
-                "verifying no active subprocesses)"
+            raise SystemExit("proposal-041: missing pgid metadata (Case B); fail-closed")
+        _observable_descendants = _pgid_has_observable_descendants(_old_pgid, _old_pid)
+        if _observable_descendants:
+            _write_reclaim_marker(
+                _old_lease,
+                "blocked_manual_recovery",
+                1,
+                0,
+                False,
+                True,
+                "Case C: owner PID gone but process-group descendants are still observable.",
             )
+            _publish_blocked_manual_recovery("case_c_observable_descendants")
+            print(
+                f"[FAIL] proposal-041: previous owner PID {_old_pid} is gone but "
+                f"pgid {_old_pgid} still has observable descendants (Case C).",
+                file=sys.stderr,
+            )
+            raise SystemExit("proposal-041: observable descendants (Case C); fail-closed")
+        _write_reclaim_marker(
+            _old_lease,
+            "reclaim_allowed",
+            1,
+            0,
+            False,
+            False,
+            "Case D: owner PID gone, pgid metadata present, and descendant absence proven.",
+        )
         print(
             f"[INFO] proposal-041: reclaimed generation {_old_gen} "
-            f"(owner PID {_old_pid} gone, release-marker confirms clean exit)"
+            f"(Case D: owner PID {_old_pid} gone, pgid {_old_pgid} descendant absence proven)"
         )
 
     except SystemExit:
@@ -2824,13 +3114,12 @@ if _existing_lease_path.exists():
 
 own_pid = os.getpid()
 own_birth_ms = _get_process_birth_unix_ms(own_pid)
+own_pgid = os.getpgrp()
 lease = {
     "schema_version": "parity-control-lease.v1",
     "pid": own_pid,
     "process_birth_unix_ms": own_birth_ms,
-    # pgid=0 until cargo subprocesses are spawned in a dedicated process group.
-    # Full setpgid/killpg lifecycle is deferred (MISSING-001).
-    "pgid": 0,
+    "pgid": own_pgid,
     "hostname": socket.gethostname(),
     "commit_sha": commit_sha,
     "tree_id": tree_id,
@@ -2859,31 +3148,31 @@ PY
       echo "[INFO] [phase: fixture-inventory] validating all 7 fixture schemas and required elements" &&
       p041_update_current_step 'fixture_inventory' '' &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
       echo "[INFO] [phase: offline-replay] replaying all 7 fixtures into generation-scoped SQLite databases" &&
       p041_update_current_step 'offline_replay' '' &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
       echo "[INFO] [phase: shadow-validation] checking live-shadow side-effect policy for all 7 fixtures" &&
       p041_update_current_step 'shadow_validation' '' &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
       echo "[INFO] [phase: graphql-readback] reading back all 7 fixtures through GraphQL parity surface" &&
       p041_update_current_step 'graphql_readback' 'graphql_readback' &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p graphql-server proposal_041_graphql_readback_parity_surfaces -- --nocapture &&
+      p041_supervised_run cargo test -p graphql-server proposal_041_graphql_readback_parity_surfaces -- --nocapture &&
       echo "[INFO] [phase: mcp-readback] reading back all 7 fixtures through MCP parity surfaces" &&
       p041_update_current_step 'mcp_report_readback' 'mcp_report_readback' &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
-      p041_prefixed_run cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
+      p041_supervised_run cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
+      p041_supervised_run cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
       echo "[INFO] [phase: handoff-artifact] validating P031 handoff artifact contract" &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&
       echo "[INFO] [phase: runtime-publication] computing and writing final runtime row and detail artifacts" &&
       p041_update_current_step 'runtime_publication' '' &&
       p041_update_lease_heartbeat &&
-      p041_prefixed_run cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_runtime_publication_contract_is_valid -- --exact --nocapture &&
       p041_prefixed_run python3 - <<'PY'
 import json
 import hashlib
@@ -2915,8 +3204,29 @@ def _darwin_fullfsync(fd: int) -> bool:
     except Exception:
         return False
 
+def _validate_p041_final_target_boundary(path: Path, label: str) -> None:
+    target = Path("target")
+    anchor = target.resolve()
+    if target.is_symlink():
+        raise SystemExit(
+            "proposal-041: target is a symlink; refusing to prune or publish "
+            "through a redirected root (SEC-P041-003)."
+        )
+    if path.is_symlink():
+        raise SystemExit(
+            f"proposal-041: {label} is a symlink; refusing to prune or publish "
+            "through a redirected root (SEC-P041-003)."
+        )
+    resolved = path.resolve()
+    if not str(resolved).startswith(str(anchor)):
+        raise SystemExit(
+            f"proposal-041: {label} resolves outside control-plane/target/; "
+            "refusing to prune or publish (SEC-P041-003)."
+        )
+
 def atomic_json(path, value):
     """Write value as JSON via same-dir temp + durable flush + atomic rename."""
+    _validate_p041_final_target_boundary(path.parent, f"{path.parent}")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -2980,7 +3290,7 @@ for _prune_root, _prune_label in (
     (parity_root, "target/parity"),
     (control_root, "target/parity-control"),
 ):
-    if _prune_root.exists() and _prune_root.is_symlink():
+    if _prune_root.is_symlink():
         raise SystemExit(
             f"proposal-041: {_prune_label} is a symlink; refusing to prune or publish "
             f"through a redirected root (SEC-P041-003)."
