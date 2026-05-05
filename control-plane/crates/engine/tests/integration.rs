@@ -7635,7 +7635,7 @@ async fn malformed_implementation_self_assessment_import_persists_invalid_active
 }
 
 #[tokio::test]
-async fn blocked_implementation_assessment_synthesizes_release_hold_review_summary() {
+async fn blocked_implementation_assessment_routes_back_to_refinement() {
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -7660,6 +7660,24 @@ async fn blocked_implementation_assessment_synthesizes_release_hold_review_summa
     run.current_state = Some("state_9_implementation_reviewed".into());
     run.workflow_yaml_path = Some(test_workflow_yaml_path());
     run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    let frozen_plan = workflow::compiler::compile(
+        run.workflow_yaml_path.as_deref().unwrap(),
+        run.agent_catalog_yaml_path.as_deref().unwrap(),
+    )
+    .unwrap();
+    run.workflow_snapshot_json = Some(
+        frozen_plan
+            .workflow_snapshot_json
+            .replace(
+                r#""when":"implementation_review_summary.status == vars.implementation_review_target_status""#,
+                r#""when":"implementation_review_summary.status == vars.implementation_review_target_status or implementation_review_summary.status == 'release_evidence_blocked'""#,
+            )
+            .replace(
+                r#""when":"implementation_review_summary.status != vars.implementation_review_target_status""#,
+                r#""when":"implementation_review_summary.status != vars.implementation_review_target_status and implementation_review_summary.status != 'release_evidence_blocked'""#,
+            ),
+    );
+    run.catalog_snapshot_json = Some(frozen_plan.catalog_snapshot_json);
     runs::insert(&pool, &run).await.unwrap();
 
     let self_assessment_path = implementation_dir.join("self-assessment.json");
@@ -7771,28 +7789,27 @@ async fn blocked_implementation_assessment_synthesizes_release_hold_review_summa
     let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
     assert_eq!(
         updated.current_state.as_deref(),
-        Some("state_11_manual_release")
+        Some("state_10_implementation_refined")
     );
-
-    orchestrator.advance_run(run_id).await.unwrap();
-    let updated = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
-    assert_eq!(updated.status, RunStatus::WaitingApproval);
+    assert_eq!(updated.status, RunStatus::Running);
 
     let release_stage = stages::list_by_run(&pool, run_id)
         .await
         .unwrap()
         .into_iter()
-        .find(|stage| stage.stage_id == "state_11_manual_release")
-        .expect("non-code release blocker should create manual release gate stage");
-    assert_eq!(release_stage.status, StageStatus::WaitingApproval);
+        .find(|stage| stage.stage_id == "state_11_manual_release");
+    assert!(
+        release_stage.is_none(),
+        "release evidence blockers must not create a manual release gate"
+    );
 
     let release_approvals = approvals::list_by_run(&pool, run_id).await.unwrap();
     assert!(
-        release_approvals.iter().any(|approval| {
+        !release_approvals.iter().any(|approval| {
             approval.stage_id == "state_11_manual_release"
                 && approval.decision == ApprovalDecision::Requested
         }),
-        "non-code release blocker should request operator release approval"
+        "release evidence blockers must not request operator release approval"
     );
 
     let queued_invocations = work_items::list_by_run(&pool, run_id)
@@ -9122,6 +9139,24 @@ async fn implementation_review_needs_code_fixes_blocks_manual_release_even_when_
     run.current_state = Some("state_9_implementation_reviewed".into());
     run.workflow_yaml_path = Some(test_workflow_yaml_path());
     run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    let frozen_plan = workflow::compiler::compile(
+        run.workflow_yaml_path.as_deref().unwrap(),
+        run.agent_catalog_yaml_path.as_deref().unwrap(),
+    )
+    .unwrap();
+    run.workflow_snapshot_json = Some(
+        frozen_plan
+            .workflow_snapshot_json
+            .replace(
+                r#""when":"implementation_review_summary.status == vars.implementation_review_target_status""#,
+                r#""when":"implementation_self_assessment_v2.blocking_remaining_code_tasks == 0""#,
+            )
+            .replace(
+                r#""when":"implementation_review_summary.status != vars.implementation_review_target_status""#,
+                r#""when":"implementation_self_assessment_v2.blocking_remaining_code_tasks > 0""#,
+            ),
+    );
+    run.catalog_snapshot_json = Some(frozen_plan.catalog_snapshot_json);
     runs::insert(&pool, &run).await.unwrap();
 
     let mut completed_review_stage =

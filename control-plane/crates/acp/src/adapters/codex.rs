@@ -12,7 +12,6 @@ const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
 
 /// Adapter for the OpenAI Codex CLI provider (`codex-acp`).
 ///
-/// Matches Swift `CodexACPTransport`:
 /// - Prepares an isolated runtime home with auth.json + config.toml
 /// - Sets CODEX_HOME, HOME, TMPDIR, PATH env vars
 /// - Mode: `"full-access"`, no `_meta` block
@@ -58,7 +57,6 @@ impl AcpAdapter for CodexAdapter {
             );
         }
 
-        // ── Prepare isolated runtime home (matches Swift prepareRuntimeHome) ──
         let runtime_home = prepare_runtime_home(&req.workspace_root)?;
 
         info!(
@@ -107,7 +105,7 @@ impl AcpAdapter for CodexAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime home preparation (matches Swift CodexACPTransport)
+// Runtime home preparation
 // ---------------------------------------------------------------------------
 
 /// Source Codex home: `$CODEX_HOME` or `~/.codex`

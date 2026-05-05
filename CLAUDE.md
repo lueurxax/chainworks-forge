@@ -60,9 +60,9 @@ The daemon requires a bearer token for MCP auth (P029). On first start, it auto-
 
 ## Architecture: big picture
 
-### Run lifecycle (Swift)
+### Run lifecycle
 
-An `Idea` + YAML `Workflow` + YAML `AgentCatalog` compiles into a **`RunPlanSnapshot`** (frozen at run start — workflow, catalog, provider bindings, path templates all captured together for drift detection on resume). `WorkflowOrchestrator` executes the state machine, creating `StageExecution` records **lazily** on state entry. `RuntimeAgentExecutor` dispatches each agent task over an ACP subprocess session (provider-specific adapters: Claude / Codex / Gemini / Auggie / Junie). Outputs land as `Artifact` files on disk with SwiftData metadata records.
+An `Idea` + YAML `Workflow` + YAML `AgentCatalog` compiles into a **`RunPlanSnapshot`** (frozen at run start — workflow, catalog, provider bindings, path templates all captured together for drift detection on resume). The Swift app is the operator shell and state/artifact reader. Live provider execution is owned by the Rust control plane, which dispatches ACP subprocess sessions through provider-specific adapters for Claude / Codex / Gemini / Auggie / Junie.
 
 Key engine pieces (under `Chainworks Forge/Engine/`):
 
@@ -71,13 +71,13 @@ Key engine pieces (under `Chainworks Forge/Engine/`):
 - `TransitionEvaluator.swift` — canonical `when:` expression evaluator (ARCH-031): `exists()`, comparisons, `vars.*`, `artifact.field`, `and/or`
 - `RuntimeAgentExecutor.swift` — single-agent execution with retries, watchdog, owner-aware execution identity
 - `AgentSessionManager.swift` — per-run session lineage, reuse scopes, generation tracking
-- `ExecutionService.swift` — top-level coordinator, transport factory
+- `ExecutionService.swift` — top-level coordinator, app-local fixture transport factory
 - `RecoveryCoordinator.swift` / `ResumeManager.swift` — startup repair, drift handling
 
-ACP transport lives under `Chainworks Forge/Engine/ACPAdapters/`:
-- `ACPSubprocessManager.swift` — spawns the provider binary with ndjson stdio
-- `ClaudeAgentACPTransport.swift`, `CodexACPTransport.swift`, `GeminiCLIACPTransport.swift`, etc. — per-provider session config (model catalog, mode, `_meta`)
-- Codex requires an isolated runtime home (`CODEX_HOME` + copied `auth.json` + sanitized `config.toml`) — see `CodexACPTransport.prepareRuntimeHome`
+ACP transport lives in the Rust control plane:
+- `control-plane/crates/acp/src/transport.rs` — ndjson JSON-RPC subprocess transport
+- `control-plane/crates/acp/src/adapters/*.rs` — per-provider launch/session config
+- Codex prepares an isolated runtime home (`CODEX_HOME` + copied `auth.json` + sanitized `config.toml`) in `control-plane/crates/acp/src/adapters/codex.rs`
 
 ### Rust control-plane (parity replica)
 

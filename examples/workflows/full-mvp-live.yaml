@@ -13,6 +13,7 @@ workflow:
   required_providers:
     - codex_acp
     - claude_acp
+    - junie
 variables:
   proposal_score_target: 8.5
   min_individual_proposal_score: 8

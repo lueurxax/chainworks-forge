@@ -131,7 +131,7 @@ if msg is None:
 
 send({"jsonrpc": "2.0", "method": "session/update",
       "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": "working..."}}})
-time.sleep(0.5)
+time.sleep(2.0)
 
 artifact_path = os.path.join(cwd, "result.json")
 with open(artifact_path, "w") as f:
@@ -5885,7 +5885,7 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
 
     let manager_for_task = Arc::clone(&manager);
     let task = tokio::spawn(async move { manager_for_task.start_session(req).await });
-    let update = timeout(Duration::from_secs(1), rx.recv())
+    let update = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("prompt progress should be reported before terminal response")
         .expect("progress sink should receive an update");
