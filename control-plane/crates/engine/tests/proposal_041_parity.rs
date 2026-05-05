@@ -2752,6 +2752,10 @@ fn proposal_041_gate_script_enforces_process_group_deadline_and_boundary_contrac
         "P041 lease must publish a real process-group id, never pgid=0"
     );
     assert!(
+        !p041_block.contains("grep -c . 2>/dev/null || echo 0"),
+        "P041 clean git status line-count must not produce duplicate 0 lines"
+    );
+    assert!(
         script.contains("start_new_session=True") && p041_block.contains("p041_supervised_run"),
         "P041 subprocesses must run in a dedicated process group/session"
     );

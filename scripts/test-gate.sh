@@ -2628,7 +2628,7 @@ PY
         exit 1
       fi
       _p041_clean=$([ -z "$_p041_status" ] && echo true || echo false)
-      _p041_line_count=$(printf '%s' "$_p041_status" | grep -c . 2>/dev/null || echo 0)
+      _p041_line_count=$(printf '%s' "$_p041_status" | awk 'NF { count += 1 } END { print count + 0 }')
       # sha256: prefer shasum (macOS), fall back to sha256sum (Linux)
       if _p041_sha256=$(printf '%s' "$_p041_status" | shasum -a 256 2>/dev/null | cut -d' ' -f1); then
         :
