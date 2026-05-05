@@ -359,7 +359,7 @@ work rather than by adding external infrastructure:
 
 ### SQLite write serialization and gateway (DbWriter)
 
-> **Phase 1 scaffold (Phases 2–8 deferred):** The DbWriter type, write classification types (WriteClass, WriteLane, WriteOperation, WriteResult), and priority lane constants are defined. The bounded MPSC executor, admission control, coalescing, heartbeat, and storageHealth monitoring are implemented in Phases 2–6. The description below reflects the intended design; behaviors marked with † are not yet active.
+> **Phase 1 implemented (Phases 2–8 deferred):** The DbWriter type, write classification types (WriteClass, WriteLane, WriteOperation, WriteResult), priority lane constants, write-bypass allowlist, and operation registry are implemented. The bounded MPSC executor, admission control, coalescing, heartbeat, and storageHealth monitoring are deferred to Phases 2–6. The description below reflects the intended design; behaviors marked with † are not yet active.
 
 The engine enforces a single-writer model for all domain mutations through a dedicated
 write coordination layer, the `DbWriter` (Proposal 075):
@@ -388,11 +388,12 @@ write coordination layer, the `DbWriter` (Proposal 075):
 
 ### Evidence spooling
 
-> **Phase 1 scaffold (Phase 3 deferred):** The evidence_spool_refs schema and metadata repository are present. The evidence file spool module (temp write, checksum, fsync, atomic rename, orphan sweep) is implemented in Phase 3.
+> **Phase 1 implemented (Phase 3 deferred):** The evidence_spool_refs and storage_write_pressure_snapshots schemas and metadata repository are implemented. The evidence file spool module (temp write, checksum, fsync, atomic rename, orphan sweep) is deferred to Phase 3.
 
 High-volume runtime evidence is spooled to the local filesystem instead of being inserted row-by-row into SQLite (Proposal 075):
 
 - **Metadata Pointers**: SQLite stores compact metadata (path, checksum, size, kind, owner) in the `evidence_spool_refs` table.
+- **Path Containment**: `relative_path` is enforced both in Rust (`validate_relative_path`) and at SQL level (migration `041_p075_evidence_path_constraints.sql`): no absolute paths, no `..`/`.` traversal segments, no backslash separators, no empty segments, length capped at 2048 bytes; identity fields (run/stage/agent ids) capped at 512 bytes; checksum capped at 256 bytes.
 - **Filesystem First**: The evidence file must be written, checksummed, and fsynced to disk **before** the Class C metadata write is enqueued to `DbWriter`.
 - **Artifact Integration**: Spooled evidence is integrated into the settlement pipeline and exposed via the `Artifact` domain model.
 - **Categories**: Transcripts, tool-traces, stdout/stderr snippets, and raw runtime events are primary candidates for spooling.
@@ -455,7 +456,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `039_p075_evidence_spool_refs.sql`, `040_p075_storage_write_pressure_snapshots.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `039_p075_evidence_spool_refs.sql`, `040_p075_storage_write_pressure_snapshots.sql`, `041_p075_evidence_path_constraints.sql`):
 
 | Table | Purpose |
 |---|---|

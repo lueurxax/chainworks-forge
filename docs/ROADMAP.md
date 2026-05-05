@@ -8,10 +8,11 @@ replace the reference docs.
 - P073 freeze mode.
 - UI action boundary closeout.
 - P031 corrected closeout over the GraphQL thin UI boundary.
-- Provider toolchain cache mapping and P075 persistence-budget infrastructure slice.
+- Provider toolchain cache mapping infrastructure.
 
 ## Next
 
+- P075 Persistence budget Phases 2-8 (DbWriter routing, evidence spooling, diagnostics).
 - P038 compaction as MCP-only operator action.
 - P046 session read/subscription behavior only; reset remains MCP-only.
 - P068 enforcement of the UI/action boundary and automation separation.

@@ -3763,11 +3763,23 @@ PLIST
     ;;
   proposal-075|p075)
     log "Proposal 075 Phase 1 gate: local persistence write budget scaffold (inventory mode)"
+    log "P075 NOTE: This gate is Phase 1 inventory mode. Fail-closed enforcement is Phase 7."
+    log "P075 NOTE: See audit report (audit/proposal-vs-implementation.json) for gap tracking."
 
     # Phase 1 gate: inventory mode.
     # Verifies that the foundational types, migrations, allowlist, and registry
     # are present and parse correctly. Does NOT enforce fail-closed on unlisted
     # write owners (that is Phase 7). Reports inventory findings only.
+    #
+    # TODO(2026-05-02 P075-GATE-FLIP): Flip to fail-closed mode in Phase 7 after Phase 6
+    # deliverables (GraphQL storageHealth, MCP diagnostics, DiagnosticsBundleBuilder
+    # integration) land and all temporary_rollout bypass entries are retired or have a
+    # retirement signal. Fail-closed means: reject unlisted runtime write owners, entries
+    # missing retirement data, entries whose expires_after_phase has passed, and
+    # row-per-chunk evidence writes. Also add a counter for remaining direct-write call
+    # sites (by expires_after_phase) so Phases 2-5 progress shows up as a strictly
+    # decreasing inventory.
+    # Tracked in audit report BLOCK-001/REQ-011 (prepush review MAJOR-001).
 
     log "P075 Phase 1: db crate unit tests (write_class, writer, bypass_allowlist, operation_registry)"
     (
@@ -3804,7 +3816,7 @@ PLIST
     fi
     log "P075 inventory: operation registry present at $P075_REGISTRY"
 
-    log "Proposal 075 Phase 1 gate passed (inventory mode)"
+    log "Proposal 075 Phase 1 gate passed (inventory mode; fail-closed deferred to Phase 7)"
     ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then

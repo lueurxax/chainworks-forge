@@ -1675,7 +1675,7 @@ Proposal 075 Phase 1 local persistence write budget scaffold gate.
 Scope:
 
 - `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
-- `writer`: `DbWriter` constants, lane order, phase-1 pass-through
+- `writer`: `DbWriter` constants, lane order, phase-1 stub (`submit` returns `WriteRejected{reason: "phase_1_unimplemented"}` so accidental production callers fail loudly until Phase 2 routing lands)
 - `bypass_allowlist`: parser, expiry, canonical file validation
 - `operation_registry`: parser, validation, canonical file validation
 - `evidence_spool_refs`: migration and repository round-trips, CHECK constraints

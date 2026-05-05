@@ -27,6 +27,20 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+use crate::pool::begin_immediate_with_retry;
+
+// P075-LOW-005: field length caps applied at validate_spool_ref_fields.
+const MAX_ID_LEN: usize = 256;
+const MAX_CHECKSUM_LEN: usize = 256;
+const MAX_CONTENT_TYPE_LEN: usize = 1024;
+const MAX_PRODUCER_OPERATION_LEN: usize = 1024;
+// P075-SEC-001: pre-parse size cap for summary_json (must be checked BEFORE serde_json::from_str).
+const MAX_SUMMARY_JSON_LEN: usize = 8192;
+// P075-SEC-001: max length for relative_path (mirrors SQL CHECK added in migration 041).
+pub const MAX_RELATIVE_PATH_LEN: usize = 2048;
+// P075-SEC-001: max length for producer-supplied identity fields.
+const MAX_IDENTITY_FIELD_LEN: usize = 512;
+
 /// Evidence kind enum matching the `kind` CHECK constraint in the migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvidenceKind {
@@ -135,20 +149,104 @@ pub struct EvidenceSpoolRef {
     pub status: EvidenceSpoolRefStatus,
 }
 
+/// Returns a safe, non-revealing representation of a path for error messages.
+///
+/// P075-LOW-003: do not emit raw relative_path values in error messages — they may
+/// contain user-controlled data. Use this redacted form in all error message formats.
+fn redact_path(path: &str) -> String {
+    format!("<path:{}_chars>", path.len())
+}
+
+/// Validate string field lengths and summary_json shape for an EvidenceSpoolRef.
+///
+/// P075-LOW-005: enforce modest length caps before insertion so runaway producers
+/// cannot write arbitrarily large metadata strings.
+/// P075-SEC-001: check summary_json byte length BEFORE serde_json::from_str to avoid
+/// unnecessary allocation and parsing of oversized producer-controlled strings.
+/// P075-LOW-002: validate summary_json as a JSON object, not merely length-bounded.
+pub fn validate_spool_ref_fields(spool_ref: &EvidenceSpoolRef) -> Result<()> {
+    if spool_ref.id.len() > MAX_ID_LEN {
+        bail!("id exceeds maximum length of {} bytes", MAX_ID_LEN);
+    }
+    if spool_ref.checksum.len() > MAX_CHECKSUM_LEN {
+        bail!("checksum exceeds maximum length of {} bytes", MAX_CHECKSUM_LEN);
+    }
+    if let Some(ref ct) = spool_ref.content_type {
+        if ct.len() > MAX_CONTENT_TYPE_LEN {
+            bail!("content_type exceeds maximum length of {} bytes", MAX_CONTENT_TYPE_LEN);
+        }
+    }
+    if spool_ref.producer_operation.len() > MAX_PRODUCER_OPERATION_LEN {
+        bail!(
+            "producer_operation exceeds maximum length of {} bytes",
+            MAX_PRODUCER_OPERATION_LEN
+        );
+    }
+    // P075-SEC-001: check byte length of producer-supplied identity fields.
+    if spool_ref.run_id.len() > MAX_IDENTITY_FIELD_LEN {
+        bail!("run_id exceeds maximum length of {} bytes", MAX_IDENTITY_FIELD_LEN);
+    }
+    if let Some(ref v) = spool_ref.stage_execution_id {
+        if v.len() > MAX_IDENTITY_FIELD_LEN {
+            bail!("stage_execution_id exceeds maximum length of {} bytes", MAX_IDENTITY_FIELD_LEN);
+        }
+    }
+    if let Some(ref v) = spool_ref.stage_id {
+        if v.len() > MAX_IDENTITY_FIELD_LEN {
+            bail!("stage_id exceeds maximum length of {} bytes", MAX_IDENTITY_FIELD_LEN);
+        }
+    }
+    if let Some(ref v) = spool_ref.agent_execution_id {
+        if v.len() > MAX_IDENTITY_FIELD_LEN {
+            bail!("agent_execution_id exceeds maximum length of {} bytes", MAX_IDENTITY_FIELD_LEN);
+        }
+    }
+    if let Some(ref v) = spool_ref.agent_id {
+        if v.len() > MAX_IDENTITY_FIELD_LEN {
+            bail!("agent_id exceeds maximum length of {} bytes", MAX_IDENTITY_FIELD_LEN);
+        }
+    }
+    // P075-SEC-001: check summary_json byte length BEFORE serde_json::from_str.
+    // Parsing a large producer-controlled string before bounding it wastes memory and CPU.
+    if let Some(ref summary) = spool_ref.summary_json {
+        if summary.len() > MAX_SUMMARY_JSON_LEN {
+            bail!(
+                "summary_json exceeds maximum length of {} bytes",
+                MAX_SUMMARY_JSON_LEN
+            );
+        }
+        // P075-LOW-002: summary_json must be a valid JSON object (not arbitrary JSON or free text).
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(summary)
+            .context("summary_json must be a valid JSON object")?;
+    }
+    Ok(())
+}
+
 /// Validate a relative path before insertion.
 ///
 /// Rejects backslash separators before segment splitting so that mixed-separator
 /// traversal such as `"foo\\..\bar"` cannot bypass the `".."` check. After
 /// backslash rejection, normalize_path is a no-op and callers need not normalize
 /// before validating.
+///
+/// P075-LOW-001: NFC normalization (rejecting paths whose NFC form differs from input)
+/// is deferred. Wire before Phase 3 producers land using the `unicode-normalization` crate.
 pub fn validate_relative_path(path: &str) -> Result<()> {
     if path.is_empty() {
         bail!("relative_path must not be empty");
     }
+    // P075-SEC-001: cap length before any further validation to bound allocation.
+    if path.len() > MAX_RELATIVE_PATH_LEN {
+        bail!(
+            "relative_path exceeds maximum length of {} bytes: {}",
+            MAX_RELATIVE_PATH_LEN,
+            redact_path(path)
+        );
+    }
     // Reject platform-specific separator ambiguity (P075 relative_path_rules).
     // Backslash rejection also blocks Windows-style absolute paths ("C:\...").
     if path.contains('\\') {
-        bail!("relative_path must not contain backslash separators: {path}");
+        bail!("relative_path must not contain backslash separators: {}", redact_path(path));
     }
     // Reject NUL bytes and ASCII control characters to prevent filesystem API
     // truncation and log injection in Phase 3+ readers (P075-SEC-004).
@@ -157,18 +255,21 @@ pub fn validate_relative_path(path: &str) -> Result<()> {
     }
     // Reject absolute paths.
     if std::path::Path::new(path).is_absolute() {
-        bail!("relative_path must not be absolute: {path}");
+        bail!("relative_path must not be absolute: {}", redact_path(path));
     }
     // Validate each segment after splitting on the only accepted separator.
     for segment in path.split('/') {
         if segment.is_empty() {
-            bail!("relative_path must not contain empty segments: {path}");
+            bail!("relative_path must not contain empty segments: {}", redact_path(path));
         }
         if segment == ".." {
-            bail!("relative_path must not contain '..' traversal segments: {path}");
+            bail!(
+                "relative_path must not contain '..' traversal segments: {}",
+                redact_path(path)
+            );
         }
         if segment == "." {
-            bail!("relative_path must not contain '.' segments: {path}");
+            bail!("relative_path must not contain '.' segments: {}", redact_path(path));
         }
     }
     Ok(())
@@ -181,7 +282,12 @@ pub fn normalize_path(path: &str) -> String {
 
 pub async fn insert(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) -> Result<()> {
     validate_relative_path(&spool_ref.relative_path).context("validate relative_path")?;
-    let mut tx = pool.begin().await.context("begin insert evidence_spool_ref")?;
+    validate_spool_ref_fields(spool_ref).context("validate spool_ref fields")?;
+    // FIX-004: use P061 begin_immediate_with_retry instead of pool.begin() (BEGIN DEFERRED)
+    // to align with the single retry primitive mandated by P075 and avoid contention divergence.
+    let mut tx = begin_immediate_with_retry(pool, "p075_evidence_spool_ref_insert")
+        .await
+        .context("begin insert evidence_spool_ref")?;
     insert_tx(&mut tx, spool_ref).await?;
     tx.commit().await.context("commit insert evidence_spool_ref")?;
     Ok(())
@@ -189,6 +295,7 @@ pub async fn insert(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) -> Result<(
 
 pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, spool_ref: &EvidenceSpoolRef) -> Result<()> {
     validate_relative_path(&spool_ref.relative_path).context("validate relative_path")?;
+    validate_spool_ref_fields(spool_ref).context("validate spool_ref fields")?;
     let created_at = spool_ref.created_at.to_rfc3339();
     let kind = spool_ref.kind.as_str();
     let status = spool_ref.status.as_str();
@@ -242,12 +349,16 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, spool_ref: &EvidenceSpo
 /// row exists with a different checksum or size, signalling `evidence_metadata_conflict`.
 pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) -> Result<bool> {
     validate_relative_path(&spool_ref.relative_path).context("validate relative_path")?;
+    validate_spool_ref_fields(spool_ref).context("validate spool_ref fields")?;
     let rel_path = normalize_path(&spool_ref.relative_path);
     let created_at = spool_ref.created_at.to_rfc3339();
     let kind = spool_ref.kind.as_str();
     let status = spool_ref.status.as_str();
 
-    let mut tx = pool.begin().await.context("begin insert_idempotent")?;
+    // FIX-004: use P061 begin_immediate_with_retry instead of pool.begin() (BEGIN DEFERRED).
+    let mut tx = begin_immediate_with_retry(pool, "p075_evidence_spool_ref_insert_idempotent")
+        .await
+        .context("begin insert_idempotent")?;
 
     // Single atomic statement: insert and skip silently on (run_id, relative_path) conflict.
     let result = sqlx::query(
@@ -314,10 +425,16 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
     }
 
     // Mismatch: hard error requiring manual reconcile (LIFT-REL-06, evidence_metadata_conflict_total).
+    // P075-LOW-003: relative_path is redacted; run_id is a structural identifier safe to log.
+    // CU-001 / P075-SEC-REVIEW-LOW-003: emit only the first 12 chars of each checksum to bound
+    // content-fingerprinting exposure while retaining enough for triage correlation.
     bail!(
         "evidence_metadata_conflict: run_id={} relative_path={} \
-         existing checksum={} new checksum={}",
-        spool_ref.run_id, rel_path, existing_checksum, spool_ref.checksum
+         existing checksum={}... new checksum={}...",
+        spool_ref.run_id,
+        redact_path(&rel_path),
+        &existing_checksum[..existing_checksum.len().min(12)],
+        &spool_ref.checksum[..spool_ref.checksum.len().min(12)]
     );
 }
 
@@ -384,18 +501,25 @@ pub async fn list_by_run_id(
 }
 
 /// Update status for a spool ref by id.
+///
+/// FIX-004b: uses P061 begin_immediate_with_retry for consistency with insert paths
+/// and to satisfy the single-retry-primitive contract from P075 (bypass-006 retirement).
 pub async fn update_status(
     pool: &SqlitePool,
     id: &str,
     status: EvidenceSpoolRefStatus,
 ) -> Result<()> {
     let status_str = status.as_str();
+    let mut tx = begin_immediate_with_retry(pool, "p075_evidence_spool_ref_update_status")
+        .await
+        .context("begin update_status evidence_spool_ref")?;
     sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
         .bind(status_str)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .context("update evidence_spool_ref status")?;
+    tx.commit().await.context("commit update_status evidence_spool_ref")?;
     Ok(())
 }
 
@@ -709,5 +833,326 @@ mod tests {
             let back = EvidenceSpoolRefStatus::from_str(s).expect("roundtrip");
             assert_eq!(status, back, "roundtrip failed for {s}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // P075-LOW-005: field length cap tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_fields_rejects_oversized_id() {
+        let mut r = make_ref("evsp_test_id", "run-test", "evidence/runs/run-test/f.jsonl");
+        r.id = "x".repeat(MAX_ID_LEN + 1);
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized id should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_checksum() {
+        let mut r = make_ref("evsp_test_cs", "run-test", "evidence/runs/run-test/f.jsonl");
+        r.checksum = "a".repeat(MAX_CHECKSUM_LEN + 1);
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized checksum should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_content_type() {
+        let mut r = make_ref("evsp_test_ct", "run-test", "evidence/runs/run-test/f.jsonl");
+        r.content_type = Some("t".repeat(MAX_CONTENT_TYPE_LEN + 1));
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized content_type should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_producer_operation() {
+        let mut r = make_ref("evsp_test_po", "run-test", "evidence/runs/run-test/f.jsonl");
+        r.producer_operation = "p".repeat(MAX_PRODUCER_OPERATION_LEN + 1);
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized producer_operation should fail");
+    }
+
+    #[test]
+    fn validate_fields_accepts_valid_fields() {
+        let r = make_ref("evsp_test_ok", "run-test", "evidence/runs/run-test/f.jsonl");
+        assert!(validate_spool_ref_fields(&r).is_ok(), "valid fields should pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // P075-LOW-002: summary_json JSON object validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_fields_rejects_non_object_summary_json() {
+        let mut r = make_ref("evsp_test_sj1", "run-test", "evidence/runs/run-test/f2.jsonl");
+        r.summary_json = Some(r#"["not","an","object"]"#.to_string());
+        assert!(validate_spool_ref_fields(&r).is_err(), "array summary_json should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_string_summary_json() {
+        let mut r = make_ref("evsp_test_sj2", "run-test", "evidence/runs/run-test/f3.jsonl");
+        r.summary_json = Some(r#""plain string""#.to_string());
+        assert!(validate_spool_ref_fields(&r).is_err(), "string summary_json should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_malformed_summary_json() {
+        let mut r = make_ref("evsp_test_sj3", "run-test", "evidence/runs/run-test/f4.jsonl");
+        r.summary_json = Some("not valid json".to_string());
+        assert!(validate_spool_ref_fields(&r).is_err(), "malformed summary_json should fail");
+    }
+
+    #[test]
+    fn validate_fields_accepts_valid_object_summary_json() {
+        let mut r = make_ref("evsp_test_sj4", "run-test", "evidence/runs/run-test/f5.jsonl");
+        r.summary_json = Some(r#"{"line_count":100,"chunk_count":5,"truncated":false}"#.to_string());
+        assert!(validate_spool_ref_fields(&r).is_ok(), "valid JSON object summary_json should pass");
+    }
+
+    #[test]
+    fn validate_fields_accepts_none_summary_json() {
+        let mut r = make_ref("evsp_test_sj5", "run-test", "evidence/runs/run-test/f6.jsonl");
+        r.summary_json = None;
+        assert!(validate_spool_ref_fields(&r).is_ok(), "None summary_json should pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // insert rejects oversized fields before hitting the database
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn insert_rejects_oversized_id_before_db() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let mut r = make_ref("evsp_test_db_id", "run-test", "evidence/runs/run-test/g.jsonl");
+        r.id = "x".repeat(MAX_ID_LEN + 1);
+        let result = insert(&pool, &r).await;
+        assert!(result.is_err(), "insert with oversized id should fail validation");
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency test: racing insert_idempotent tasks
+    // P075-SEC-002 / prepush review: lock in evidence_metadata_conflict semantics
+    // under genuine concurrent writers before Phase 3 producers wire.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn insert_idempotent_concurrent_same_checksum_is_safe() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let r1 = make_ref("evsp_conc_001", "run-conc", "evidence/runs/run-conc/ts.jsonl");
+        let r2 = r1.clone();
+
+        let pool1 = pool.clone();
+        let pool2 = pool.clone();
+
+        let (res1, res2) = tokio::join!(
+            tokio::spawn(async move { insert_idempotent(&pool1, &r1).await }),
+            tokio::spawn(async move { insert_idempotent(&pool2, &r2).await }),
+        );
+
+        let ok1 = res1.unwrap().unwrap();
+        let ok2 = res2.unwrap().unwrap();
+        // Exactly one task inserts (true) and the other gets the idempotent skip (false).
+        assert!(
+            ok1 ^ ok2,
+            "exactly one task should return true (inserted) and one false (idempotent); \
+             got ok1={ok1} ok2={ok2}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P075-SEC-001: pre-parse summary_json and oversized field rejection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_fields_rejects_oversized_summary_json_before_parse() {
+        let mut r = make_ref("evsp_sec001_a", "run-test", "evidence/runs/run-test/sec001a.jsonl");
+        // A string > MAX_SUMMARY_JSON_LEN that is NOT valid JSON.
+        // If size is checked first, we get a "exceeds maximum length" error.
+        // If JSON is parsed first, we would get a JSON parse error instead.
+        let not_json = "x".repeat(MAX_SUMMARY_JSON_LEN + 1);
+        r.summary_json = Some(not_json);
+        let result = validate_spool_ref_fields(&r);
+        assert!(result.is_err(), "oversized non-JSON summary_json should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "error must be about size (before parse), got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_summary_json_valid_json_before_parse() {
+        let mut r = make_ref("evsp_sec001_b", "run-test", "evidence/runs/run-test/sec001b.jsonl");
+        // Build a valid JSON object that exceeds 8192 bytes.
+        let large_value = "v".repeat(MAX_SUMMARY_JSON_LEN);
+        let large_json = format!(r#"{{"key":"{}"}}"#, large_value);
+        assert!(large_json.len() > MAX_SUMMARY_JSON_LEN, "test precondition: json must exceed cap");
+        r.summary_json = Some(large_json);
+        let result = validate_spool_ref_fields(&r);
+        assert!(result.is_err(), "oversized valid-JSON summary_json should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "error must be about size (before parse), got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_oversized_path() {
+        let long_segment = "a".repeat(MAX_RELATIVE_PATH_LEN + 1);
+        let result = validate_relative_path(&long_segment);
+        assert!(result.is_err(), "oversized relative_path should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "error must mention max length, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_run_id() {
+        let mut r = make_ref("evsp_sec001_c", "run-test", "evidence/runs/run-test/sec001c.jsonl");
+        r.run_id = "r".repeat(MAX_IDENTITY_FIELD_LEN + 1);
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized run_id should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_stage_execution_id() {
+        let mut r = make_ref("evsp_sec001_d", "run-test", "evidence/runs/run-test/sec001d.jsonl");
+        r.stage_execution_id = Some("s".repeat(MAX_IDENTITY_FIELD_LEN + 1));
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized stage_execution_id should fail");
+    }
+
+    #[test]
+    fn validate_fields_rejects_oversized_agent_id() {
+        let mut r = make_ref("evsp_sec001_e", "run-test", "evidence/runs/run-test/sec001e.jsonl");
+        r.agent_id = Some("a".repeat(MAX_IDENTITY_FIELD_LEN + 1));
+        assert!(validate_spool_ref_fields(&r).is_err(), "oversized agent_id should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // P075-SEC-002: DB-level path containment constraint tests (migration 041)
+    // These tests exercise the SQL CHECK constraints directly, independent of
+    // the Rust-side validator, proving defense-in-depth at the DB boundary.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_constraint_rejects_absolute_path_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_abs','1','r','transcript','/absolute/path',0,'sha256','abc','op','2025-01-01T00:00:00Z','available')"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "absolute relative_path should fail DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn check_constraint_rejects_traversal_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_trav','1','r','transcript','foo/../bar',0,'sha256','abc','op','2025-01-01T00:00:00Z','available')"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "'foo/../bar' should fail DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn check_constraint_rejects_dotdot_segment_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_dd','1','r','transcript','..',0,'sha256','abc','op','2025-01-01T00:00:00Z','available')"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "bare '..' relative_path should fail DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn check_constraint_rejects_dot_segment_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_dot','1','r','transcript','foo/./bar',0,'sha256','abc','op','2025-01-01T00:00:00Z','available')"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "'foo/./bar' should fail DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn check_constraint_rejects_double_slash_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_ds','1','r','transcript','foo//bar',0,'sha256','abc','op','2025-01-01T00:00:00Z','available')"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "'foo//bar' (empty segment) should fail DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn check_constraint_accepts_valid_relative_path_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_ok','1','r','transcript','evidence/runs/run-1/ts.jsonl',0,'sha256','abc','op','2025-01-01T00:00:00Z','available')"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_ok(), "valid relative_path should pass DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn check_constraint_rejects_oversized_run_id_at_db_level() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let long_id = "r".repeat(513);
+        let result = sqlx::query(
+            r#"INSERT INTO evidence_spool_refs
+               (id, metadata_version, run_id, kind, relative_path, size_bytes,
+                checksum_algorithm, checksum, producer_operation, created_at, status)
+               VALUES ('sec002_rid', '1', ?1, 'transcript', 'evidence/runs/sec002/f.jsonl', 0,
+                       'sha256', 'abc', 'op', '2025-01-01T00:00:00Z', 'available')"#,
+        )
+        .bind(&long_id)
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "run_id > 512 chars should fail DB CHECK constraint");
+    }
+
+    #[tokio::test]
+    async fn insert_idempotent_concurrent_checksum_mismatch_errors() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let r_base = make_ref("evsp_conc_002", "run-conc2", "evidence/runs/run-conc2/ts.jsonl");
+
+        // Pre-insert so both racers see a pre-existing row with different checksums.
+        insert(&pool, &r_base).await.unwrap();
+
+        let mut r_mismatch = r_base.clone();
+        r_mismatch.checksum = "different_checksum_xyz".to_string();
+
+        let result = insert_idempotent(&pool, &r_mismatch).await;
+        assert!(
+            result.is_err(),
+            "insert_idempotent with checksum mismatch must return error"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("evidence_metadata_conflict"),
+            "error must name evidence_metadata_conflict, got: {err}"
+        );
     }
 }

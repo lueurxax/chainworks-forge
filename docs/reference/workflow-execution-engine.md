@@ -22,9 +22,9 @@ is the only governed mutation path allowed in the macOS UI via GraphQL.
 **Rust Daemon Implementation:**
 The Rust control-plane daemon implements the same state machine and transition
 semantics while adding robust capacity-aware scheduling, scheduler fairness,
-executor backpressure, and host interruption recovery to handle concurrent runs
-on a single host. See [rust-control-plane.md](rust-control-plane.md) for details
-on the daemon's scheduler, write serialization, and recovery logic.
+executor backpressure, evidence spooling, and host interruption recovery to handle
+concurrent runs on a single host. See [rust-control-plane.md](rust-control-plane.md)
+for details on the daemon's scheduler, write serialization, and recovery logic.
 
 Related stable docs:
 

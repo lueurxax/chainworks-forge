@@ -107,7 +107,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
-- Local Persistence Write Budget and Evidence Spooling — Proposal 075 Phase 1 scaffold: write classification types, bounded priority lane definitions, evidence_spool_refs and storage_write_pressure_snapshots schemas, and write-bypass allowlist established. Runtime DbWriter routing, evidence file spooling, GraphQL/MCP diagnostics, and fail-closed gate are deferred to Phases 2–8.
+- Local Persistence Write Budget and Evidence Spooling — Proposal 075 Phase 1 scaffold: write classification types, bounded priority lane definitions, evidence_spool_refs and storage_write_pressure_snapshots schemas, and write-bypass allowlist implemented. Runtime DbWriter routing, evidence file spooling, GraphQL/MCP diagnostics, and fail-closed gate are deferred to Phases 2–8.
 
 Active proposal work is currently concentrated in:
 

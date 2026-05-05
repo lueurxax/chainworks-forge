@@ -26,6 +26,7 @@ At the current baseline, the product includes:
 - thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections,
 - lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
+- DbWriter scaffold and evidence spool metadata schema (P075 Phase 1; runtime routing, file spooling, and storageHealth diagnostics deferred to Phases 2–8),
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,

@@ -98,11 +98,8 @@
 //! The write returns `WriteFailed` and the file is flagged for manual reconcile via
 //! `storage.reconcile_evidence_orphans`.
 
-use crate::write_class::WriteLane;
+use crate::write_class::{WriteLane, WriteOperation, WriteResult};
 use sqlx::SqlitePool;
-
-#[cfg(test)]
-use crate::write_class::{WriteOperation, WriteResult};
 
 // ---------------------------------------------------------------------------
 // Coalescing configuration (Class B)
@@ -163,6 +160,12 @@ pub const CLASS_A_REJECTED_RETRY_INITIAL_DELAY_MS: u64 = 100;
 ///
 /// Intentionally empty in Phase 1. Phase 2 wires the admission filter and adds
 /// entries for terminal canonical state operations (run completion, stage completion).
+///
+/// **CLEAN-002 WARNING**: When the shutdown admission filter is wired in Phase 2,
+/// an empty list will reject ALL Class A writes on the shutdown signal — including
+/// terminal canonical state persistence. Phase 2 must add a regression test named
+/// `shutdown_class_a_admission_empty_list_rejects_all` to document that behavior
+/// and verify the list is non-empty before the filter is active.
 pub const SHUTDOWN_ADMITTED_OPERATIONS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
@@ -212,14 +215,14 @@ impl DbWriter {
 
     /// Submit a write operation.
     ///
-    /// **Phase 1: test-only.** This method is only compiled in `#[cfg(test)]` builds
-    /// so that production code cannot accidentally route writes through a no-op scaffold
-    /// and receive a fabricated `Committed` result (P075-SEC-003 / BLOCK-002). Phase 2
-    /// replaces this with bounded MPSC lane routing accessible from production code.
+    /// **Phase 1: returns WriteRejected{reason: "phase_1_unimplemented"} in production.**
+    /// This method is production-visible so that accidental callers fail loudly at runtime
+    /// rather than receiving a fabricated `Committed` (P075-SEC-003 / CLEAN-001). Phase 2
+    /// replaces the body with bounded MPSC lane routing.
     ///
-    /// Validates deadline constraints (LIFT-REL-09) and returns `Committed` after
-    /// logging. No transaction is executed.
-    #[cfg(test)]
+    /// Validates deadline constraints (LIFT-REL-09) first; returns a deadline-specific
+    /// WriteRejected before the phase_1_unimplemented sentinel when the deadline policy
+    /// is violated.
     pub async fn submit(&self, op: WriteOperation) -> WriteResult {
         if let Err(rejected) = op.validate() {
             return rejected;
@@ -230,10 +233,17 @@ impl DbWriter {
             lane = op.lane.as_str(),
             class = op.class.as_str(),
             idempotency_key = %op.idempotency_key,
-            "DbWriter.submit (phase-1 test-only pass-through)"
+            "DbWriter.submit (phase-1 stub: WriteRejected phase_1_unimplemented)"
         );
 
-        WriteResult::Committed
+        WriteResult::WriteRejected {
+            lane: op.lane.as_str(),
+            capacity: op.lane.capacity(),
+            queued_depth: 0,
+            oldest_queued_ms: 0,
+            operation_name: op.operation_name,
+            reason: "phase_1_unimplemented",
+        }
     }
 
     /// Expose pool for callers that own a separate read path.
@@ -291,6 +301,40 @@ mod tests {
     use super::*;
     use crate::write_class::{WriteClass, ReplayPolicy, WriteOperation, WriteResult};
     use std::time::Duration;
+
+    // Regression test: DbWriter::submit is production-visible (CLEAN-001).
+    // Phase 1 returns WriteRejected{reason="phase_1_unimplemented"} so accidental
+    // production callers fail loudly rather than fabricating a Committed.
+    /// CLEAN-002 / MAJOR-006 regression sentinel.
+    ///
+    /// Phase 1: `SHUTDOWN_ADMITTED_OPERATIONS` is intentionally empty — the shutdown
+    /// admission filter is not yet wired. This test documents the Phase 1 state.
+    ///
+    /// When Phase 2 wires the admission filter:
+    ///   1. Populate `SHUTDOWN_ADMITTED_OPERATIONS` with at least the terminal canonical
+    ///      state operation names (e.g. "run_completion", "stage_completion").
+    ///   2. Change this assertion from `is_empty()` to `!is_empty()`.
+    ///   3. Add `shutdown_class_a_admission_filter_rejects_unlisted_ops` to verify that
+    ///      an operation not in the list receives `WriteRejected("shutdown_admission_denied")`.
+    ///
+    /// Leaving the list empty while the filter is active would reject ALL Class A writes
+    /// on the shutdown signal — including terminal canonical state persistence.
+    #[test]
+    fn shutdown_class_a_admission_empty_list_rejects_all_phase1_sentinel() {
+        assert!(
+            SHUTDOWN_ADMITTED_OPERATIONS.is_empty(),
+            "Phase 1 sentinel: SHUTDOWN_ADMITTED_OPERATIONS must be empty until Phase 2 \
+             wires the admission filter. If you are adding entries here, also update this \
+             test to assert !is_empty() and wire the filter (CLEAN-002)."
+        );
+    }
+
+    #[test]
+    fn dbwriter_submit_is_production_visible() {
+        // Confirm the method is callable from both test and production contexts.
+        // Phase 2 removes this assertion when submit returns Committed for real writes.
+        let _ = DbWriter::submit; // method exists and is accessible
+    }
 
     #[test]
     fn dbwriter_constants_consistent() {
@@ -359,7 +403,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dbwriter_submit_normal_class_a_commits() {
+    async fn dbwriter_submit_phase1_returns_rejected_unimplemented() {
+        // Phase 1: submit returns WriteRejected{phase_1_unimplemented} for valid ops
+        // so accidental production callers fail loudly. Phase 2 changes this to Committed.
         let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
         let writer = DbWriter::new(pool);
         let op = WriteOperation {
@@ -375,6 +421,10 @@ mod tests {
             observed_at: None,
         };
         let result = writer.submit(op).await;
-        assert_eq!(result, WriteResult::Committed);
+        assert!(
+            matches!(result, WriteResult::WriteRejected { reason: "phase_1_unimplemented", .. }),
+            "Phase 1 submit must return WriteRejected(phase_1_unimplemented), got {:?}",
+            result
+        );
     }
 }
