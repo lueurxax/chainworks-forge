@@ -1,13 +1,15 @@
 {
   "schema_version": "p031-schema-decision-record.v1",
   "proposal_revision": "031-2026-04-21-run-72409268-r1-r18-restart-review-ready",
-  "governing_contract": "docs/proposals/031-thin-graphql-ui-rewrite.md",
-  "generated_at": "2026-04-24",
+  "governing_contract": "docs/reference/query-projections-and-client-consumption-contract.md",
+  "generated_at": "2026-04-30",
+  "runtime_handoff": "control-plane/target/parity/publication/current/p031-phase-0-manifest-row.json",
+  "runtime_detail": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
   "default_authorization": "operator_only",
   "surfaces": [
     {
       "surface": "runs_home",
-      "graphql_source": "runs / list_active_projection / list_by_idea_projection",
+      "graphql_source": "runs(ideaId:) and runs",
       "status": "implemented",
       "ui_rule": "Render from GraphQL read model; no SwiftData workflow truth."
     },
@@ -19,13 +21,13 @@
     },
     {
       "surface": "stage_list_progress",
-      "graphql_source": "stages(runID:) projection-backed fields",
+      "graphql_source": "stages(runId:) projection-backed fields",
       "status": "implemented",
       "ui_rule": "Use projection flags; do not infer approval, artifact, validation, or retry state locally."
     },
     {
       "surface": "stage_detail",
-      "graphql_source": "stage(id:) plus agentExecutions(stageExecutionID:)",
+      "graphql_source": "stage(id:) plus agentExecutions(stageExecutionId:)",
       "status": "implemented",
       "ui_rule": "Canonical details may render only with server-owned projection flags."
     },
@@ -37,13 +39,19 @@
     },
     {
       "surface": "artifact_viewer",
-      "graphql_source": "artifacts(runID:)",
+      "graphql_source": "artifacts(runId:)",
       "status": "implemented",
       "ui_rule": "Do not scan local artifact directories as workflow truth."
     },
     {
+      "surface": "run_stage_queue",
+      "graphql_source": "runQueueSummary(runId:) and stageQueueSummary(stageExecutionId:)",
+      "status": "implemented",
+      "ui_rule": "Render queued/backpressured work counts and reasons from projection truth."
+    },
+    {
       "surface": "report_viewer",
-      "graphql_source": "artifacts(runID:) report metadata; payload readback deferred unless GraphQL payload query lands",
+      "graphql_source": "artifacts(runId:) report metadata; payload readback deferred unless GraphQL payload query lands",
       "status": "partial",
       "ui_rule": "Render metadata and payload availability/unavailable reason."
     },
