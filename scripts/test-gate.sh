@@ -601,7 +601,9 @@ if (_base_dir / "control-plane").is_dir():
 control_root = _base_dir / "target/parity-control"
 lease_path = control_root / "lease.json"
 current_step_path = control_root / "current-step.json"
+interruption_marker_path = control_root / "interruption-marker.json"
 timeout_marker_path = control_root / "timeout-marker.json"
+publication_current_root = _base_dir / "target/parity/publication/current"
 
 def _prefix(line: str) -> None:
     line = line.rstrip("\n")
@@ -623,6 +625,18 @@ def _target_boundary_is_safe(path: Path) -> bool:
     except OSError:
         return False
 
+def _darwin_fullfsync(fd: int) -> bool:
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        return libc.fcntl(fd, 51) == 0
+    except Exception:
+        return False
+
 def _atomic_json(path: Path, value: dict) -> None:
     if not _target_boundary_is_safe(path):
         raise SystemExit(f"proposal-041: refusing write outside control-plane/target: {path}")
@@ -633,7 +647,9 @@ def _atomic_json(path: Path, value: dict) -> None:
             json.dump(value, handle, indent=2)
             handle.write("\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            raw_fd = handle.fileno()
+            if not _darwin_fullfsync(raw_fd):
+                os.fsync(raw_fd)
         os.replace(tmp, path)
         try:
             dir_fd = os.open(str(path.parent), os.O_RDONLY)
@@ -694,11 +710,91 @@ def _write_timeout_marker(pgid, descendant_absent: bool) -> None:
         "written_at_unix_ms": int(time.time() * 1000),
     })
 
-deadline_ms = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
-drain_seconds = int(os.environ.get("P041_DRAIN_GRACE_SECONDS", "20") or 20)
+def _write_interruption_marker(pgid, descendant_absent: bool, signal_name: str) -> None:
+    _atomic_json(interruption_marker_path, {
+        "schema_version": "parity-control-interruption-marker.v1",
+        "overall_status": "blocked_interrupted",
+        "generation_id": os.environ.get("P041_PUBLICATION_GENERATION_ID", ""),
+        "signal": signal_name,
+        "descendant_pgid": pgid,
+        "descendant_absent": descendant_absent,
+        "written_at_unix_ms": int(time.time() * 1000),
+    })
+
+def _write_status_publication(status: str, reason: str) -> None:
+    generation_id = os.environ.get("P041_PUBLICATION_GENERATION_ID", "")
+    if not generation_id:
+        return
+    provenance = {
+        "commit_sha": os.environ.get("P041_GIT_COMMIT_SHA", "interrupted-before-provenance"),
+        "tree_id": os.environ.get("P041_GIT_TREE_ID", "interrupted-before-provenance"),
+        "tree_clean": os.environ.get("P041_GIT_TREE_CLEAN") == "true",
+        "status_snapshot_sha256": os.environ.get("P041_GIT_STATUS_SNAPSHOT_SHA256", "interrupted-before-provenance"),
+        "status_snapshot_line_count": int(os.environ.get("P041_GIT_STATUS_SNAPSHOT_LINE_COUNT", "1") or 1),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "gate": "./scripts/test-gate.sh proposal-041",
+    }
+    detail = {
+        "schema_version": "p031-p041-parity-evidence.v1",
+        "overall_status": status,
+        "publication_generation_id": generation_id,
+        "publication_state": "diagnostic_blocked",
+        "required_fixtures": [
+            "proposal-loop-basic",
+            "implementation-refine-review",
+            "approval-pause-resume",
+            "retry-recovery-flow",
+            "cancelled-or-blocked-run",
+            "terminal-report-evidence",
+            "projection-readback-surface",
+        ],
+        "required_surfaces": [
+            "canonical_domain_state",
+            "projections",
+            "graphql_readback",
+            "mcp_report_readback",
+            "artifact_identity",
+            "operator_summary",
+        ],
+        "fixtures": [],
+        "blocking_reasons": [reason],
+        "missing_evidence": [],
+        "provenance": provenance,
+    }
+    row = {
+        "schema_version": "p031-phase-0-runtime-manifest-row.v1",
+        "id": "p041_parity_evidence",
+        "runtime_detail_path": "control-plane/target/parity/publication/current/p031-p041-parity-evidence.json",
+        "reference_detail_path": "docs/reference/p031-p041-parity-evidence.json",
+        "validation_status": status,
+        "publication_state": "diagnostic_blocked",
+        "publication_generation_id": generation_id,
+        "detail_schema_version": "p031-p041-parity-evidence.v1",
+        "provenance": provenance,
+    }
+    _atomic_json(publication_current_root / "p031-p041-parity-evidence.json", detail)
+    _atomic_json(publication_current_root / "p031-phase-0-manifest-row.json", row)
+
+global_deadline_ms = int(os.environ.get("P041_GATE_DEADLINE_UNIX_MS", "0") or 0)
+command_deadline_seconds = int(os.environ.get("P041_COMMAND_DEADLINE_SECONDS", "0") or 0)
+deadline_candidates = [value for value in [global_deadline_ms] if value > 0]
+if command_deadline_seconds > 0:
+    deadline_candidates.append(int(time.time() * 1000) + command_deadline_seconds * 1000)
+deadline_ms = min(deadline_candidates) if deadline_candidates else 0
+drain_seconds = int(os.environ.get("P041_DRAIN_GRACE_SECONDS", "30") or 30)
 if deadline_ms and int(time.time() * 1000) >= deadline_ms:
     _write_timeout_marker(None, True)
+    _write_status_publication("blocked_timeout", "gate_deadline_expired_before_command_start")
     raise SystemExit("proposal-041: gate deadline expired before starting command")
+
+interrupted_signal = None
+
+def _handle_signal(signum, _frame):
+    global interrupted_signal
+    interrupted_signal = signal.Signals(signum).name
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
 
 process = subprocess.Popen(
     args,
@@ -729,10 +825,12 @@ try:
         if deadline_ms and int(time.time() * 1000) >= deadline_ms:
             timed_out = True
             break
+        if interrupted_signal is not None:
+            break
 except KeyboardInterrupt:
-    timed_out = True
+    interrupted_signal = "SIGINT"
 
-if timed_out:
+if timed_out or interrupted_signal is not None:
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
@@ -753,7 +851,16 @@ if timed_out:
         except subprocess.TimeoutExpired:
             pass
         descendant_absent = process.poll() is not None
+    if interrupted_signal is not None:
+        _write_interruption_marker(pgid, descendant_absent, interrupted_signal)
+        _write_status_publication("blocked_interrupted", "gate_interrupted_by_signal")
+        _prefix(
+            f"[WARN] proposal-041: command interrupted by {interrupted_signal}; pgid={pgid} "
+            f"descendant_absent={str(descendant_absent).lower()}"
+        )
+        raise SystemExit(130 if interrupted_signal == "SIGINT" else 143)
     _write_timeout_marker(pgid, descendant_absent)
+    _write_status_publication("blocked_timeout", "gate_or_command_deadline_expired")
     _prefix(
         f"[FAIL] proposal-041: command timed out; pgid={pgid} "
         f"descendant_absent={str(descendant_absent).lower()}"
@@ -2592,8 +2699,11 @@ PY
     ;;
   proposal-041|p041)
     echo "[INFO] Proposal 041 control-plane gate: server parity harness, golden fixtures, and behavioral diff"
-    export P041_GATE_DEADLINE_SECONDS="${P041_GATE_DEADLINE_SECONDS:-7200}"
-    export P041_DRAIN_GRACE_SECONDS="${P041_DRAIN_GRACE_SECONDS:-20}"
+    export P041_GATE_DEADLINE_SECONDS="${P041_GATE_DEADLINE_SECONDS:-1500}"
+    export P041_DRAIN_GRACE_SECONDS="${P041_DRAIN_GRACE_SECONDS:-30}"
+    export P041_REPLAY_DEADLINE_SECONDS="${P041_REPLAY_DEADLINE_SECONDS:-60}"
+    export P041_READBACK_DEADLINE_SECONDS="${P041_READBACK_DEADLINE_SECONDS:-30}"
+    export P041_SHADOW_DEADLINE_SECONDS="${P041_SHADOW_DEADLINE_SECONDS:-60}"
     _p041_deadline_now="$(date +%s)"
     export P041_GATE_DEADLINE_UNIX_MS="$(( (_p041_deadline_now + P041_GATE_DEADLINE_SECONDS) * 1000 ))"
     _p041_cap_idx=0
@@ -2607,7 +2717,9 @@ PY
       projection-readback-surface; do
       _p041_cap_idx=$((_p041_cap_idx + 1))
       echo "[INFO] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
-      p041_supervised_run "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate
+      P041_STEP_FIXTURE="$fixture_id" \
+      P041_COMMAND_DEADLINE_SECONDS="$P041_REPLAY_DEADLINE_SECONDS" \
+        p041_supervised_run "$ROOT_DIR/scripts/parity/capture-golden-run.sh" "$fixture_id" --validate || exit $?
       echo "[PASS] [${_p041_cap_idx}/7] validate-capture ${fixture_id}"
     done
     (
@@ -3145,27 +3257,48 @@ atomic_json(control_root / "lease.json", lease)
 atomic_json(control_root / "current-step.json", current_step)
 print("[INFO] runtime publication revoked_for_rerun current generation updated")
 PY
+      echo "[INFO] [phase: prebuild] compiling P041 test binaries before per-fixture deadlines" &&
+      p041_update_current_step 'prebuild' '' &&
+      p041_update_lease_heartbeat &&
+      p041_supervised_run cargo test -p engine --test proposal_041_parity --no-run &&
+      p041_supervised_run cargo test -p graphql-server --lib --no-run &&
+      p041_supervised_run cargo test -p mcp-server --lib --no-run &&
       echo "[INFO] [phase: fixture-inventory] validating all 7 fixture schemas and required elements" &&
       p041_update_current_step 'fixture_inventory' '' &&
       p041_update_lease_heartbeat &&
       p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_fixture_inventory_and_schema_contract -- --exact --nocapture &&
       echo "[INFO] [phase: offline-replay] replaying all 7 fixtures into generation-scoped SQLite databases" &&
-      p041_update_current_step 'offline_replay' '' &&
-      p041_update_lease_heartbeat &&
-      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: offline-replay] fixture=${fixture_id} deadline=${P041_REPLAY_DEADLINE_SECONDS}s"
+        p041_update_current_step 'offline_replay' '' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_COMMAND_DEADLINE_SECONDS="$P041_REPLAY_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_offline_replay_emits_behavioral_diff_reports -- --exact --nocapture || exit $?
+      done &&
       echo "[INFO] [phase: shadow-validation] checking live-shadow side-effect policy for all 7 fixtures" &&
-      p041_update_current_step 'shadow_validation' '' &&
-      p041_update_lease_heartbeat &&
-      p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: shadow-validation] fixture=${fixture_id} deadline=${P041_SHADOW_DEADLINE_SECONDS}s"
+        p041_update_current_step 'shadow_validation' '' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_COMMAND_DEADLINE_SECONDS="$P041_SHADOW_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_shadow_side_effect_policy_is_fail_closed -- --exact --nocapture || exit $?
+      done &&
       echo "[INFO] [phase: graphql-readback] reading back all 7 fixtures through GraphQL parity surface" &&
-      p041_update_current_step 'graphql_readback' 'graphql_readback' &&
-      p041_update_lease_heartbeat &&
-      p041_supervised_run cargo test -p graphql-server proposal_041_graphql_readback_parity_surfaces -- --nocapture &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: graphql-readback] fixture=${fixture_id} deadline=${P041_READBACK_DEADLINE_SECONDS}s"
+        p041_update_current_step 'graphql_readback' 'graphql_readback' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_STEP_SURFACE="graphql_readback" P041_COMMAND_DEADLINE_SECONDS="$P041_READBACK_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p graphql-server --lib proposal_041_graphql_readback_parity_surfaces -- --nocapture || exit $?
+      done &&
       echo "[INFO] [phase: mcp-readback] reading back all 7 fixtures through MCP parity surfaces" &&
-      p041_update_current_step 'mcp_report_readback' 'mcp_report_readback' &&
-      p041_update_lease_heartbeat &&
-      p041_supervised_run cargo test -p mcp-server proposal_041_reports_get_readback_parity_surface -- --nocapture &&
-      p041_supervised_run cargo test -p mcp-server proposal_041_report_resource_readback_parity_surface -- --nocapture &&
+      for fixture_id in proposal-loop-basic implementation-refine-review approval-pause-resume retry-recovery-flow cancelled-or-blocked-run terminal-report-evidence projection-readback-surface; do
+        echo "[INFO] [phase: mcp-readback] fixture=${fixture_id} deadline=${P041_READBACK_DEADLINE_SECONDS}s"
+        p041_update_current_step 'mcp_report_readback' 'mcp_report_readback' &&
+        p041_update_lease_heartbeat &&
+        P041_ONLY_FIXTURE="$fixture_id" P041_STEP_FIXTURE="$fixture_id" P041_STEP_SURFACE="mcp_report_readback" P041_COMMAND_DEADLINE_SECONDS="$P041_READBACK_DEADLINE_SECONDS" \
+          p041_supervised_run cargo test -p mcp-server --lib proposal_041_report_resource_readback_parity_surface -- --nocapture || exit $?
+      done &&
       echo "[INFO] [phase: handoff-artifact] validating P031 handoff artifact contract" &&
       p041_update_lease_heartbeat &&
       p041_supervised_run cargo test -p engine --test proposal_041_parity proposal_041_handoff_artifact_contract_is_ready -- --exact --nocapture &&

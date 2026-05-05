@@ -1168,6 +1168,23 @@ mod tests {
         "projection-readback-surface",
     ];
 
+    fn p041_selected_fixtures() -> Vec<&'static str> {
+        match std::env::var("P041_ONLY_FIXTURE") {
+            Ok(raw) if !raw.trim().is_empty() => {
+                let requested = raw.trim().to_string();
+                let fixture = P041_FIXTURES
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate == requested.as_str())
+                    .unwrap_or_else(|| {
+                        panic!("P041_ONLY_FIXTURE {requested:?} is not in P041_FIXTURES")
+                    });
+                vec![fixture]
+            }
+            _ => P041_FIXTURES.to_vec(),
+        }
+    }
+
     fn make_idea(id: IdeaId) -> Idea {
         Idea {
             id,
@@ -1698,7 +1715,7 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_041_report_resource_readback_parity_surface() {
-        for fixture_id in P041_FIXTURES {
+        for fixture_id in p041_selected_fixtures() {
             // Same cross-binary ordering dependency as the graphql-server
             // P041 readback test: under `cargo test --workspace` the
             // engine integration binary and this mcp-server lib binary
@@ -1895,8 +1912,7 @@ mod tests {
             .filter(|artifact| {
                 !artifact["report_kind"].is_null()
                     && artifact["report_kind"] != serde_json::json!("mcp_execution_truth")
-                    && artifact["report_kind"]
-                        != serde_json::json!("canonical_artifact_contracts")
+                    && artifact["report_kind"] != serde_json::json!("canonical_artifact_contracts")
             })
             .filter_map(|artifact| artifact["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();

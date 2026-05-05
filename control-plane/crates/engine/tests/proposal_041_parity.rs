@@ -216,11 +216,23 @@ fn normalize_artifact_file_path(raw: &str) -> String {
 #[test]
 fn proposal_041_redacts_every_non_workspace_absolute_artifact_path() {
     let cases = [
-        ("/Users/alice/run/output.json", "<machine-local>/output.json"),
+        (
+            "/Users/alice/run/output.json",
+            "<machine-local>/output.json",
+        ),
         ("/home/alice/run/output.json", "<machine-local>/output.json"),
-        ("/private/tmp/chainworks/output.json", "<machine-local>/output.json"),
-        ("/Volumes/External/build/output.json", "<machine-local>/output.json"),
-        ("/opt/org/private/output.json", "<machine-local>/output.json"),
+        (
+            "/private/tmp/chainworks/output.json",
+            "<machine-local>/output.json",
+        ),
+        (
+            "/Volumes/External/build/output.json",
+            "<machine-local>/output.json",
+        ),
+        (
+            "/opt/org/private/output.json",
+            "<machine-local>/output.json",
+        ),
     ];
     for (raw, expected) in cases {
         assert_eq!(normalize_artifact_file_path(raw), expected);
@@ -245,7 +257,11 @@ fn assert_safe_p041_generation_id(raw: &str) -> Result<()> {
     let valid_chars = raw
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | 'T' | 'Z'));
-    if !valid_prefix || !valid_chars || raw.contains("..") || raw.contains('/') || raw.contains('\\')
+    if !valid_prefix
+        || !valid_chars
+        || raw.contains("..")
+        || raw.contains('/')
+        || raw.contains('\\')
     {
         return Err(anyhow!(
             "invalid P041_PUBLICATION_GENERATION_ID path segment: {raw:?}"
@@ -376,6 +392,23 @@ fn make_handler(pool: SqlitePool) -> CommandHandler {
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
     CommandHandler::new(pool, events, work_queue)
+}
+
+fn selected_required_fixtures() -> Vec<&'static str> {
+    match std::env::var("P041_ONLY_FIXTURE") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let requested = raw.trim().to_string();
+            let fixture = REQUIRED_FIXTURES
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == requested.as_str())
+                .unwrap_or_else(|| {
+                    panic!("P041_ONLY_FIXTURE {requested:?} is not in REQUIRED_FIXTURES")
+                });
+            vec![fixture]
+        }
+        _ => REQUIRED_FIXTURES.to_vec(),
+    }
 }
 
 fn make_start_cmd(
@@ -517,7 +550,7 @@ async fn proposal_041_fixture_inventory_and_schema_contract() -> Result<()> {
 #[tokio::test]
 async fn proposal_041_offline_replay_emits_behavioral_diff_reports() -> Result<()> {
     let mut failures = Vec::new();
-    for fixture_id in REQUIRED_FIXTURES {
+    for fixture_id in selected_required_fixtures() {
         let report = match replay_fixture_and_write_report(fixture_id).await {
             Ok(report) => report,
             Err(err) => {
@@ -528,7 +561,7 @@ async fn proposal_041_offline_replay_emits_behavioral_diff_reports() -> Result<(
         assert_eq!(report["schema_version"], "behavioral-diff-report.v1");
         assert_eq!(report["mode"], "offline_fixture_replay");
         assert_eq!(report["proof_mode"], "canonical_replay");
-        assert_eq!(report["run_fixture_id"], *fixture_id);
+        assert_eq!(report["run_fixture_id"], fixture_id);
         assert_eq!(report["verdict"], "ready");
         assert_eq!(report["summary"]["blocking_count"], 0);
         assert!(report["divergences"].as_array().unwrap().is_empty());
@@ -551,7 +584,7 @@ async fn proposal_041_offline_replay_emits_behavioral_diff_reports() -> Result<(
 
 #[tokio::test]
 async fn proposal_041_shadow_side_effect_policy_is_fail_closed() -> Result<()> {
-    for fixture_id in REQUIRED_FIXTURES {
+    for fixture_id in selected_required_fixtures() {
         let (dir, fixture) = load_fixture(fixture_id)?;
         let provider_profile = read_json(&dir.join(fixture.frozen_inputs.provider_profile))?;
         assert_eq!(provider_profile["runtime_policy"], "stubbed");
@@ -1985,7 +2018,8 @@ async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
     let reclaim_marker = ctrl.read_reclaim_marker()?;
     let interruption_marker: Option<InterruptionMarker> =
         read_optional_json_for_test(&ctrl.interruption_marker_path())?;
-    let timeout_marker: Option<TimeoutMarker> = read_optional_json_for_test(&ctrl.timeout_marker_path())?;
+    let timeout_marker: Option<TimeoutMarker> =
+        read_optional_json_for_test(&ctrl.timeout_marker_path())?;
     if let Some(marker) = &interruption_marker {
         if marker.generation_id == pub_generation_id {
             interrupted_evidence.push(json!({
@@ -2089,7 +2123,8 @@ async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
                 "diagnostic_blocked",
                 vec!["parity_generation_interrupted".to_string()],
             )
-        } else if all_fixtures_ready && has_real_provenance && tree_clean && status_line_count == 0 {
+        } else if all_fixtures_ready && has_real_provenance && tree_clean && status_line_count == 0
+        {
             (
                 "ready_same_tree_verified",
                 "published_ready",
@@ -2192,10 +2227,7 @@ async fn proposal_041_runtime_publication_contract_is_valid() -> Result<()> {
         &pub_generation.join("p031-p041-parity-evidence.json"),
         &detail,
     )?;
-    write_atomic_json(
-        &pub_generation.join("p031-phase-0-manifest-row.json"),
-        &row,
-    )?;
+    write_atomic_json(&pub_generation.join("p031-phase-0-manifest-row.json"), &row)?;
     assert!(
         pub_generation
             .join("p031-p041-parity-evidence.json")
@@ -2768,9 +2800,47 @@ fn proposal_041_gate_script_enforces_process_group_deadline_and_boundary_contrac
         "P041 gate must enforce an overall deadline"
     );
     assert!(
+        p041_block.contains("P041_GATE_DEADLINE_SECONDS:-1500"),
+        "P041 gate default must be the proposal's 25 minute bound"
+    );
+    assert!(
+        !p041_block.contains("P041_GATE_DEADLINE_SECONDS:-7200"),
+        "P041 gate must not use the old 7200s default"
+    );
+    assert!(
         p041_block.contains("P041_DRAIN_GRACE_SECONDS"),
         "P041 gate must enforce a post-signal drain grace"
     );
+    assert!(
+        p041_block.contains("P041_DRAIN_GRACE_SECONDS:-30"),
+        "P041 drain must default to the proposal's 30 second bound"
+    );
+    for token in [
+        "P041_REPLAY_DEADLINE_SECONDS:-60",
+        "P041_READBACK_DEADLINE_SECONDS:-30",
+        "P041_SHADOW_DEADLINE_SECONDS:-60",
+        "P041_COMMAND_DEADLINE_SECONDS",
+        "|| exit $?",
+        "cargo test -p graphql-server --lib proposal_041_graphql_readback_parity_surfaces",
+        "cargo test -p mcp-server --lib proposal_041_report_resource_readback_parity_surface",
+    ] {
+        assert!(
+            p041_block.contains(token),
+            "P041 gate missing bounded deadline token {token:?}"
+        );
+    }
+    for token in [
+        "def _darwin_fullfsync",
+        "signal.signal(signal.SIGINT",
+        "signal.signal(signal.SIGTERM",
+        "_write_interruption_marker",
+        "blocked_interrupted",
+    ] {
+        assert!(
+            script.contains(token),
+            "P041 supervisor missing interruption/durability token {token:?}"
+        );
+    }
 
     let guard_pos = p041_block
         .find("def _validate_p041_target_boundary")
@@ -2781,6 +2851,33 @@ fn proposal_041_gate_script_enforces_process_group_deadline_and_boundary_contrac
     assert!(
         guard_pos < mkdir_pos,
         "P041 setup must validate target/parity* boundaries before any mkdir/write"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn proposal_041_p031_manifest_marks_parity_evidence_ready() -> Result<()> {
+    let manifest_path = workspace_root().join("docs/reference/p031-phase-0-artifact-manifest.json");
+    let manifest = read_json(&manifest_path)?;
+    let entry = manifest["entries"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == serde_json::json!("p041_parity_evidence"))
+        })
+        .expect("p041_parity_evidence manifest row must exist");
+
+    assert_eq!(
+        entry["validation_status"],
+        serde_json::json!("ready"),
+        "P031 manifest must use the P031 ready token and leave same-tree proof to the runtime P041 row"
+    );
+    assert_eq!(
+        entry["blocking_phase"],
+        serde_json::json!("Phase 1"),
+        "P031 manifest p041 row remains a Phase 1 handoff entry once ready"
     );
 
     Ok(())

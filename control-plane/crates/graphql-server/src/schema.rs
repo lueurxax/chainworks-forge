@@ -323,11 +323,7 @@ impl QueryRoot {
     }
 
     /// P041 §6.5: Work-queue counts for all items associated with a run.
-    async fn run_queue_summary(
-        &self,
-        ctx: &Context<'_>,
-        run_id: ID,
-    ) -> Result<GqlRunQueueSummary> {
+    async fn run_queue_summary(&self, ctx: &Context<'_>, run_id: ID) -> Result<GqlRunQueueSummary> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let run_id_str = run_id.as_str();
@@ -1728,6 +1724,23 @@ mod tests {
         "terminal-report-evidence",
         "projection-readback-surface",
     ];
+
+    fn p041_selected_fixtures() -> Vec<&'static str> {
+        match std::env::var("P041_ONLY_FIXTURE") {
+            Ok(raw) if !raw.trim().is_empty() => {
+                let requested = raw.trim().to_string();
+                let fixture = P041_FIXTURES
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate == requested.as_str())
+                    .unwrap_or_else(|| {
+                        panic!("P041_ONLY_FIXTURE {requested:?} is not in P041_FIXTURES")
+                    });
+                vec![fixture]
+            }
+            _ => P041_FIXTURES.to_vec(),
+        }
+    }
 
     #[test]
     fn mutation_name_converter_covers_approval_mutations() {
@@ -5137,7 +5150,7 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_041_graphql_readback_parity_surfaces() {
-        for fixture_id in P041_FIXTURES {
+        for fixture_id in p041_selected_fixtures() {
             // The engine crate's `proposal_041_parity.rs` integration
             // test produces
             // `target/parity/reports/<generation>/<fixture_id>/behavioral-diff-report.json`
@@ -5376,8 +5389,7 @@ mod tests {
             .unwrap_or_default()
             .into_iter()
             .filter(|artifact| {
-                !P057_SYSTEM_ARTIFACTS
-                    .contains(&artifact["name"].as_str().unwrap_or_default())
+                !P057_SYSTEM_ARTIFACTS.contains(&artifact["name"].as_str().unwrap_or_default())
             })
             .map(|artifact| {
                 serde_json::json!({
