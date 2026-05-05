@@ -6872,13 +6872,13 @@ fn append_status_allowed_values_for_declared_output(prompt: &mut String, output:
 }
 
 fn append_docs_noop_contract_guidance(prompt: &mut String, declared_outputs: &[DeclaredOutput]) {
-    let has_docs_report = declared_outputs
+    let docs_report = declared_outputs
         .iter()
-        .any(|output| output.output_name == "docs_report");
-    let has_docs_delta = declared_outputs
+        .find(|output| output.output_name == "docs_report");
+    let docs_delta = declared_outputs
         .iter()
-        .any(|output| output.output_name == "docs_delta");
-    if !(has_docs_report || has_docs_delta) {
+        .find(|output| output.output_name == "docs_delta");
+    if docs_report.is_none() && docs_delta.is_none() {
         return;
     }
 
@@ -6886,15 +6886,31 @@ fn append_docs_noop_contract_guidance(prompt: &mut String, declared_outputs: &[D
         "\nDocumentation no-op is a valid structured result. If documentation is already aligned, \
          still emit the required outputs instead of omitting them:\n",
     );
-    if has_docs_report {
-        prompt.push_str(
-            "<<<CHAINWORKS_OUTPUT:docs_report>>>{\"status\":\"not_needed\",\"changed_docs\":[],\"missing_docs\":[],\"followups\":[]}<<<END_CHAINWORKS_OUTPUT>>>\n",
+    let mut outputs = serde_json::Map::new();
+    if let Some(output) = docs_report {
+        outputs.insert(
+            output.target_path.clone(),
+            serde_json::json!({
+                "status": "not_needed",
+                "changed_docs": [],
+                "missing_docs": [],
+                "followups": []
+            }),
         );
     }
-    if has_docs_delta {
-        prompt.push_str(
-            "<<<CHAINWORKS_OUTPUT:docs_delta>>>{\"files\":[],\"summary\":\"No documentation changes required.\"}<<<END_CHAINWORKS_OUTPUT>>>\n",
+    if let Some(output) = docs_delta {
+        outputs.insert(
+            output.target_path.clone(),
+            serde_json::json!({
+                "files": [],
+                "summary": "No documentation changes required."
+            }),
         );
+    }
+    let example = serde_json::json!({ "CHAINWORKS_OUTPUT": outputs });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
     }
 }
 
@@ -6940,12 +6956,22 @@ fn output_contract_repair_prompt(
         }
         prompt.push('\n');
     }
-    prompt.push_str("\nRequired corrected output envelopes:\n");
+    prompt.push_str(
+        "\nReturn exactly one final JSON object. Use canonical target paths as \
+         `CHAINWORKS_OUTPUT` keys; output-name keys are accepted only as fallback:\n",
+    );
+    let mut example_outputs = serde_json::Map::new();
     for output in declared_outputs {
-        prompt.push_str(&format!("<<<CHAINWORKS_OUTPUT:{}>>>\n", output.output_name));
         append_status_allowed_values_for_declared_output(&mut prompt, output);
-        prompt.push_str("{ /* valid JSON matching the declared contract */ }\n");
-        prompt.push_str("<<<END_CHAINWORKS_OUTPUT>>>\n");
+        example_outputs.insert(
+            output.target_path.clone(),
+            serde_json::json!({ "status": "complete" }),
+        );
+    }
+    let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example_outputs });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
     }
     append_docs_noop_contract_guidance(&mut prompt, declared_outputs);
     prompt
@@ -7083,8 +7109,11 @@ mod tests {
         );
 
         assert!(prompt.contains("\"status\":\"not_needed\""));
-        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:docs_report>>>"));
-        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:docs_delta>>>"));
+        assert!(prompt.contains("\"CHAINWORKS_OUTPUT\""));
+        assert!(prompt.contains("\"/workspace/.chainworks/docs/report.json\""));
+        assert!(prompt.contains("\"/workspace/.chainworks/docs/changed-files.json\""));
+        assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:docs_report>>>"));
+        assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:docs_delta>>>"));
         assert!(prompt.contains("\"files\":[]"));
     }
 
@@ -7122,7 +7151,10 @@ mod tests {
         ));
         assert!(prompt.contains("implementation_review_summary"));
         assert!(prompt.contains("required output was not produced"));
-        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
+        assert!(prompt.contains(
+            "{\"CHAINWORKS_OUTPUT\":{\"/workspace/.chainworks/review/implementation-summary.json\""
+        ));
+        assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
         assert!(prompt.contains("Do not redo unrelated implementation work"));
     }
 

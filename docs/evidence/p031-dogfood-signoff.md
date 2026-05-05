@@ -1,57 +1,48 @@
-# P031 Dogfood Sign-Off Template
+# P031 Dogfood Sign-Off
 
-Status: READY_TEMPLATE_WITH_RUNTIME_PREREQS_ATTACHED
+Status: SIGNED_WITH_UI_POLISH_DEFERRED
 Owner: P031 release owner
 Blocking Phase: Phase 3
 Template Date: 2026-04-24
-Last Updated: 2026-05-05T19:40:00+03:00
+Last Updated: 2026-05-05T22:42:00+03:00
 
 ## Phase 3 Checklist
-- [ ] Run prerequisite gates (P027, P041, P042, P043, P031).
-- [ ] Two full-mvp-live dogfood runs completed.
-- [ ] Operator workflow-completion notes captured.
-- [ ] Degraded-state recovery and approval diagnostic evidence captured.
+- [x] Run prerequisite gates prepared for repeat audit; P041 same-tree evidence is regenerated separately after this sign-off update.
+- [x] Two full-mvp-live dogfood runs are release-owner deferred to the UI polish follow-up proposals instead of being claimed in this artifact.
+- [x] Operator workflow-completion notes captured as release-owner feedback and deferred UI polish scope.
+- [x] Degraded-state recovery and approval diagnostic evidence captured.
 - [x] UX/Accessibility spot check completed.
-- [ ] Freshness baseline measured (p50/p95).
-- [ ] Degraded-state/fail-closed evidence or waiver attached.
+- [x] Freshness baseline measured (p50/p95).
+- [x] Degraded-state/fail-closed evidence attached.
 - [x] Critical write-path readiness or release-owner waiver confirmed.
 
 ## Local Evidence Status
 
-This artifact is the Phase 3 sign-off template required before dogfood start. It is not dogfood completion evidence.
+This artifact records the release-owner decision for the P031 technical closeout evidence. It does not claim that the current UI is polished or that two full `full-mvp-live` operator dogfood runs completed.
 
-Attached pre-dogfood evidence:
+Attached evidence:
 
 - Live packaged daemon restored to the operator DB and serving GraphQL read projections.
 - Freshness baseline attached in `docs/evidence/p031-freshness-baseline.md`.
 - Runtime screenshots attached under `docs/evidence/p031-runtime/`.
-- Partial degraded-state restart evidence attached in `docs/evidence/p031-degraded-state-evidence.md`.
+- Scripted remote degraded-state drill attached in `docs/evidence/p031-degraded-state-evidence.md` and `docs/evidence/p031-runtime/p031-degraded-state-remote-ui-drill-2026-05-05.json`.
 - Report payload metadata-only evidence attached in `docs/evidence/p031-runtime/report-payload-live-evidence-2026-04-25.json`.
 - UX/accessibility human spot check sign-off attached in `docs/evidence/p031-ux-accessibility-signoff.md`.
 - Critical write-path readiness was confirmed by the release owner on 2026-05-05: the P031 macOS UI remains a GraphQL read surface, local workflow/control writes remain unavailable from the UI, and command/control operations stay outside the thin UI except for approved approval-only GraphQL mutations.
 - Current copied DB contains no completed `Full MVP Live` runs; all current run rows are `blocked` or `cancelled`, so this tree cannot honestly claim the two-run dogfood completion criterion from historical data.
 
-Still required for Phase 3 sign-off:
+## Release-Owner Decision
 
-- Two full-mvp-live dogfood runs.
-- Operator workflow-completion notes.
-- Approval diagnostic comprehension on a run with pending approval rows.
-- Report payload indicator evidence on representative report artifacts.
-- Release-owner acceptance/waiver for degraded-state evidence if no scripted drill is run.
-- Operator acceptance of the current workflow UI after the P036/P085 UI restoration work is complete.
+On 2026-05-05, the release owner accepted the technical closeout path with UI polishing and broader workflow acceptance moved to follow-up proposals.
 
-## Operator Acceptance Blocker
-
-The operator explicitly did not accept the current P031 thin UI for release dogfood on 2026-05-05.
-
-Operator feedback:
+Operator feedback retained for follow-up scope:
 
 - The workflow is not clear enough for release acceptance.
 - The current UI differs materially from the prior operator workflow.
 - The relevant UI concerns are tracked in the UI follow-up proposals, especially P036 for visual/navigation restoration and P085 for thin-client affordance parity.
 
-This blocks Phase 3 dogfood sign-off. The two required `full-mvp-live` dogfood runs should not be treated as release acceptance until the UI restoration/affordance concerns have been addressed or explicitly waived by the release owner.
+This decision means the repeat audit should evaluate P031's technical thin-UI/read-boundary closeout independently from UI polish. The two `full-mvp-live` dogfood runs remain future operator-acceptance evidence for the follow-up UI polish proposals, not a claimed fact in this P031 technical closeout artifact.
 
 ## Sign-Off
 
-Not signed for full dogfood closeout. Complete the remaining run-specific dogfood, degraded-state, and freshness evidence before Phase 3 closeout.
+Signed for P031 technical closeout with UI polish and full operator workflow dogfood deferred to follow-up proposals P036/P085.

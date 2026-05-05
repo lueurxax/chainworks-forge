@@ -1714,6 +1714,7 @@ struct P031StageDetailReadModel: Decodable, Equatable, Sendable {
 }
 
 protocol P031WorkflowReadStore: Sendable {
+  func fetchIdeas(includeArchived: Bool) async throws -> [P031IdeaReadModel]
   func fetchRuns() async throws -> [P031RunRowReadModel]
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel
   func fetchIdea(id: String) async throws -> P031IdeaReadModel?
@@ -1731,6 +1732,7 @@ protocol P031WorkflowReadStore: Sendable {
 }
 
 struct P031GraphQLDocumentSet: Equatable, Sendable {
+  let ideas: String
   let runsHome: String
   let runDetail: String
   let stageDetail: String
@@ -1746,6 +1748,21 @@ struct P031GraphQLDocumentSet: Equatable, Sendable {
 }
 
 enum P031GraphQLDocuments {
+  static let ideas = """
+    query P031Ideas($includeArchived: Boolean) {
+      ideas(includeArchived: $includeArchived) {
+        id
+        title
+        body
+        workspaceRootPath
+        projectKey
+        status
+        createdAt
+        archivedAt
+      }
+    }
+    """
+
   static let runsHome = """
     query P031RunsHome {
       runs {
@@ -2061,6 +2078,7 @@ enum P031GraphQLDocuments {
     """
 
   static let defaultSet = P031GraphQLDocumentSet(
+    ideas: ideas,
     runsHome: runsHome,
     runDetail: runDetail,
     stageDetail: stageDetail,
@@ -2091,6 +2109,16 @@ struct P031GraphQLWorkflowReadStore<
     self.readClient = P031GraphQLReadClient(transport: readTransport)
     self.subscriptionClient = P031GraphQLSubscriptionClient(transport: subscriptionTransport)
     self.documents = documents
+  }
+
+  func fetchIdeas(includeArchived: Bool = false) async throws -> [P031IdeaReadModel] {
+    let payload = try await readClient.execute(
+      IdeasPayload.self,
+      operationName: "P031Ideas",
+      document: documents.ideas,
+      variables: ["includeArchived": .bool(includeArchived)]
+    )
+    return payload.ideas
   }
 
   func fetchRuns() async throws -> [P031RunRowReadModel] {
@@ -2294,6 +2322,10 @@ struct P031GraphQLWorkflowReadStore<
     let runs: [P031RunRowReadModel]
   }
 
+  private struct IdeasPayload: Decodable {
+    let ideas: [P031IdeaReadModel]
+  }
+
   private struct IdeaPayload: Decodable {
     let idea: P031IdeaReadModel?
   }
@@ -2376,6 +2408,23 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
 
   func fetchRuns() async throws -> [P031RunRowReadModel] {
     runs
+  }
+
+  func fetchIdeas(includeArchived: Bool = false) async throws -> [P031IdeaReadModel] {
+    Array(ideasByID.values)
+      .filter { includeArchived || $0.archivedAt == nil }
+      .sorted { lhs, rhs in
+        switch (lhs.createdAt, rhs.createdAt) {
+        case let (lhs?, rhs?):
+          return lhs > rhs
+        case (_?, nil):
+          return true
+        case (nil, _?):
+          return false
+        case (nil, nil):
+          return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+        }
+      }
   }
 
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel {

@@ -1,0 +1,47 @@
+{
+  "schema_version": "p031-degraded-state-remote-ui-drill.v1",
+  "status": "passed",
+  "captured_at": "2026-05-05T21:02:39+03:00",
+  "remote_host": "SMacBook.local",
+  "remote_workspace": "/Users/test/chainworks-p031-drill",
+  "test_identifier": "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal031DegradedStateDrillShowsReadOnlyUnavailableAndRecovers",
+  "command": "xcodebuild test -project 'Chainworks Forge.xcodeproj' -scheme 'Chainworks Forge' -destination 'platform=macOS' -parallel-testing-enabled NO -maximum-parallel-testing-workers 1 -derivedDataPath /tmp/p031-degraded-drill-signed-DerivedData -resultBundlePath /tmp/p031-degraded-drill-signed.xcresult -only-testing:'Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal031DegradedStateDrillShowsReadOnlyUnavailableAndRecovers' CHAINWORKS_P031_DEGRADED_DRILL=1",
+  "result_bundle": "/tmp/p031-degraded-drill-signed.xcresult",
+  "log_path": "/tmp/p031-degraded-drill-signed.log",
+  "seed_run": {
+    "id": "bb1620b5-bb27-46dc-96a5-9c817fcde47f",
+    "workflow_id": "p031-degraded-drill",
+    "workflow_title": "P031 Degraded-State Drill",
+    "status": "running",
+    "started_at": "2026-05-05T17:35:24Z"
+  },
+  "assertions": [
+    "Runs Home opens against the packaged daemon with in-memory store disabled.",
+    "A seeded active run renders from GraphQL-backed projections with live freshness.",
+    "The packaged daemon is stopped and /health becomes unavailable.",
+    "After operator refresh, the UI reaches Daemon unavailable within 60 seconds.",
+    "No Start Run, Cancel Run, Retry Stage, Approve, or Reject write controls are enabled during the outage.",
+    "No local run-detail fallback remains visible during the outage.",
+    "command_journal row count remains unchanged at 0.",
+    "After app relaunch, the packaged daemon is ready and the seeded run returns as a live GraphQL-backed projection."
+  ],
+  "screenshots_in_result_bundle": [
+    "P031_Degraded_Drill_01_ready",
+    "P031_Degraded_Drill_02_unavailable",
+    "P031_Degraded_Drill_03_recovered"
+  ],
+  "result": {
+    "tests_executed": 1,
+    "failures": 0,
+    "test_duration_seconds": 21.999,
+    "xcode_elapsed_seconds": 30.247
+  },
+  "post_drill_daemon_health": {
+    "state": "ready",
+    "schema_version": 38,
+    "binary_schema_version": 38,
+    "build_sha": "7b313677",
+    "pid": 26587,
+    "port": 4000
+  }
+}

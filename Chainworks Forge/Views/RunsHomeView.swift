@@ -30,6 +30,7 @@ struct RunsHomeView: View {
         } detail: {
             runDetailPane
         }
+        .accessibilityIdentifier("runs-home-owner-view")
         .task {
             await model.loadIfNeeded()
         }
@@ -90,6 +91,7 @@ struct RunsHomeView: View {
             }
         }
         .listStyle(.sidebar)
+        .accessibilityIdentifier("runs-home-list")
     }
 
     private var runDetailPane: some View {
@@ -122,6 +124,7 @@ struct RunsHomeView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))
+        .accessibilityIdentifier("run-detail-panel")
     }
 
     @ViewBuilder
@@ -150,6 +153,19 @@ struct RunsHomeView: View {
             )
             .padding(.horizontal, 20)
             .padding(.top, 20)
+        } else if let daemonLifecycle = model.daemonLifecycle,
+                  daemonLifecycle.state == nil,
+                  daemonLifecycle.title == "Daemon unavailable" {
+            P031CalloutCard(
+                title: daemonLifecycle.title,
+                bodyText: daemonLifecycle.errorDescription ?? daemonLifecycle.refreshFeedbackText,
+                accentColor: .orange
+            ) {
+                P031FreshnessBadge(snapshot: daemonLifecycle.freshness)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .accessibilityIdentifier("p031-daemon-unavailable-alert-\(daemonLifecycle.freshness.state.rawValue)")
         }
     }
 
@@ -969,6 +985,7 @@ private struct P031RunsHomeRowCard: View {
                 .stroke(isSelected ? Color.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
         )
         .accessibilityLabel(row.accessibilityLabel)
+        .accessibilityIdentifier("runs-home-run-row")
     }
 }
 
@@ -990,6 +1007,7 @@ private struct P031RunDetailSummaryCard: View {
                 }
             }
         }
+        .accessibilityIdentifier("p031-run-detail-summary-\(presentation.freshness.state.rawValue)")
     }
 
     private var detailBody: String {
@@ -2216,6 +2234,7 @@ private struct P031DaemonLifecycleCard: View {
                 ProgressView("Checking daemon status")
             }
         }
+        .accessibilityIdentifier("p031-daemon-lifecycle-card")
     }
 
     private func daemonAccentColor(for state: P031DaemonLifecycleState?) -> Color {
@@ -2316,6 +2335,7 @@ private struct P031FreshnessBadge: View {
             .padding(.vertical, 4)
             .background(tint.opacity(0.14), in: Capsule())
             .foregroundStyle(tint)
+            .accessibilityIdentifier("p031-freshness-\(label.lowercased().replacingOccurrences(of: " ", with: "-"))")
     }
 }
 

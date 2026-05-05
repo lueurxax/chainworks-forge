@@ -753,7 +753,7 @@ fn extract_text_from_value(value: &Value) -> Option<String> {
             (!parts.is_empty()).then(|| parts.join(""))
         }
         Value::Object(map) => {
-            for key in ["text", "content", "message", "delta", "parts"] {
+            for key in ["text", "content", "message", "delta", "parts", "output"] {
                 if let Some(text) = map.get(key).and_then(extract_text_from_value) {
                     return Some(text);
                 }
@@ -1118,6 +1118,11 @@ fn extract_json_object_output_envelopes(
     expected_outputs: &[ExpectedOutputSpec],
 ) -> Vec<DiscoveredArtifact> {
     let mut artifacts = Vec::new();
+    append_json_value_output_envelopes_from_text(stream_text, expected_outputs, &mut artifacts, 0);
+    let mut seen: HashSet<String> = artifacts
+        .iter()
+        .map(|artifact| artifact.name.clone())
+        .collect();
     let mut cursor = 0usize;
     while let Some(found_rel) = stream_text[cursor..].find("\"CHAINWORKS_OUTPUT\"") {
         let found = cursor + found_rel;
@@ -1129,13 +1134,44 @@ fn extract_json_object_output_envelopes(
             cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
             continue;
         };
-        artifacts.extend(chainworks_output_artifacts_from_value(
-            &value,
-            expected_outputs,
-        ));
+        for artifact in chainworks_output_artifacts_from_value(&value, expected_outputs) {
+            if seen.insert(artifact.name.clone()) {
+                artifacts.push(artifact);
+            }
+        }
         cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
     }
     artifacts
+}
+
+fn append_json_value_output_envelopes_from_text(
+    text: &str,
+    expected_outputs: &[ExpectedOutputSpec],
+    artifacts: &mut Vec<DiscoveredArtifact>,
+    depth: usize,
+) {
+    if depth > 2 || !text.contains("CHAINWORKS_OUTPUT") {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+        return;
+    };
+    match value {
+        Value::String(inner) => {
+            append_json_value_output_envelopes_from_text(
+                &inner,
+                expected_outputs,
+                artifacts,
+                depth + 1,
+            );
+        }
+        other => {
+            artifacts.extend(chainworks_output_artifacts_from_value(
+                &other,
+                expected_outputs,
+            ));
+        }
+    }
 }
 
 fn parse_enclosing_json_object_with_chainworks_output(
@@ -3229,6 +3265,28 @@ mod tests {
     }
 
     #[test]
+    fn final_prompt_response_output_field_is_captured_as_text() {
+        let parsed = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "stopReason": "end_turn",
+                "sessionId": "codex-session",
+                "output": [
+                    {
+                        "type": "text",
+                        "text": "<<<CHAINWORKS_OUTPUT:implementation_progress>>>{\"status\":\"done\"}<<<END_CHAINWORKS_OUTPUT>>>"
+                    }
+                ]
+            }
+        });
+
+        let chunk = extract_text_chunk(&parsed).expect("final output text should be captured");
+
+        assert!(chunk.contains("<<<CHAINWORKS_OUTPUT:implementation_progress>>>"));
+    }
+
+    #[test]
     fn json_chainworks_output_extraction_caps_declared_payload_before_settlement() {
         let output_path = "/tmp/run/implementation/progress.md";
         let expected_outputs = vec![ExpectedOutputSpec {
@@ -3260,6 +3318,73 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].name, output_path);
         assert_eq!(artifacts[0].content, b"abcde");
+        assert_eq!(
+            artifacts[0].source_kind,
+            DiscoveredArtifactSourceKind::ChainworksOutput
+        );
+    }
+
+    #[test]
+    fn json_chainworks_output_is_extracted_from_fenced_final_text_with_trailing_prose() {
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "tests_result".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/run/implementation/tests-result.json".to_string(),
+            companion_of: None,
+            display_label: "tests result".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let stream = "done\n```json\n{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"passed\",\"commands\":[]}}}\n```\nthanks";
+
+        let artifacts = extract_output_envelopes(stream, &expected_outputs);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "tests_result");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&artifacts[0].content).unwrap(),
+            serde_json::json!({"status": "passed", "commands": []})
+        );
+        assert_eq!(
+            artifacts[0].source_kind,
+            DiscoveredArtifactSourceKind::ChainworksOutput
+        );
+    }
+
+    #[test]
+    fn stringified_json_chainworks_output_is_extracted_from_final_text() {
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "implementation_self_assessment".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/run/implementation/self-assessment.json".to_string(),
+            companion_of: None,
+            display_label: "implementation self assessment".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let stream = serde_json::json!(
+            "{\"CHAINWORKS_OUTPUT\":{\"implementation_self_assessment\":{\"status\":\"needs_code_fixes\",\"remaining_code_tasks\":[]}}}"
+        )
+        .to_string();
+
+        let artifacts = extract_output_envelopes(&stream, &expected_outputs);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "implementation_self_assessment");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&artifacts[0].content).unwrap(),
+            serde_json::json!({"status": "needs_code_fixes", "remaining_code_tasks": []})
+        );
         assert_eq!(
             artifacts[0].source_kind,
             DiscoveredArtifactSourceKind::ChainworksOutput

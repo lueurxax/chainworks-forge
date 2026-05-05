@@ -5691,8 +5691,7 @@ fn is_health_fallback_eligible_task(
                 .any(|output| output == "proposal_current"))
         || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
         || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
-        || (agent_id == "prepush_code_reviewer"
-            && output_contract == Some("prepush_review_v1"))
+        || (agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1"))
 }
 
 fn is_health_fallback_source_provider(provider: &str) -> bool {
@@ -5790,7 +5789,11 @@ fn run_local_health_fallback_profile_candidates(
     }
     if agent_id == "security_checker" && output_contract == Some("security_report_v1") {
         if matches!(source_provider, "claude" | "claude_acp") {
-            return vec!["codex_architect_high", "codex_audit_high", "codex_writer_high"];
+            return vec![
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ];
         }
         return vec!["claude_security_high", "claude_product_high"];
     }
@@ -6578,12 +6581,12 @@ fn append_task_specific_guidance(
         parts.push(String::from(
             "Use exactly this final response shape, with no surrounding prose, \
              markdown, or code fences:\n\
-             {\"CHAINWORKS_OUTPUT\":{\"<canonical path from Required Outputs>\":{...}}}",
+             {\"CHAINWORKS_OUTPUT\":{\"<canonical path from Required Outputs>\":{\"status\":\"complete\"}}}",
         ));
         parts.push(String::from(
             "Use the exact canonical output paths from Required Outputs as \
-             `CHAINWORKS_OUTPUT` keys. Do not use output names as keys unless \
-             a canonical path is unavailable.",
+             `CHAINWORKS_OUTPUT` keys. Output-name keys are accepted only as \
+             fallback when a canonical path is unavailable.",
         ));
         parts.push(String::from(
             "Set `seemingly_complete` based only on remaining code-writer-owned \
@@ -7831,7 +7834,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let wf_path = temp_dir.path().join("wf.yaml");
         let cat_path = temp_dir.path().join("catalog.yaml");
-        std::fs::write(&wf_path, "
+        std::fs::write(
+            &wf_path,
+            "
 workflow:
   id: test_wf
 initial_state: state_9
@@ -7848,8 +7853,12 @@ states:
     transitions:
       - to: state_9
         when: 'true'
-").unwrap();
-        std::fs::write(&cat_path, "
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &cat_path,
+            "
 agents:
   - id: reviewer
     backend_profile: reviewer_profile
@@ -7869,7 +7878,9 @@ contracts:
     format: json
 permission_profiles:
   default: {}
-").unwrap();
+",
+        )
+        .unwrap();
 
         let run_id = RunId::new();
         let mut run = test_run(run_id);
@@ -7900,7 +7911,9 @@ permission_profiles:
             recovery_snapshot_json: None,
             retry_reason: None,
         };
-        db::repos::stages::insert(&pool, &failed_state_9).await.unwrap();
+        db::repos::stages::insert(&pool, &failed_state_9)
+            .await
+            .unwrap();
 
         // 2. Successful stage for state_10 (more recent)
         let completed_state_10 = StageExecution {
@@ -7923,16 +7936,25 @@ permission_profiles:
             recovery_snapshot_json: None,
             retry_reason: None,
         };
-        db::repos::stages::insert(&pool, &completed_state_10).await.unwrap();
+        db::repos::stages::insert(&pool, &completed_state_10)
+            .await
+            .unwrap();
 
         // Advance workflow
         orchestrator.advance_run(run_id).await.unwrap();
 
         // Check if a NEW stage for state_9 was created
         let all_stages = db::repos::stages::list_by_run(&pool, run_id).await.unwrap();
-        let state_9_stages: Vec<_> = all_stages.iter().filter(|s| s.stage_id == "state_9").collect();
+        let state_9_stages: Vec<_> = all_stages
+            .iter()
+            .filter(|s| s.stage_id == "state_9")
+            .collect();
 
-        assert_eq!(state_9_stages.len(), 2, "Should have created a new stage for state_9 because the old one is stale");
+        assert_eq!(
+            state_9_stages.len(),
+            2,
+            "Should have created a new stage for state_9 because the old one is stale"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

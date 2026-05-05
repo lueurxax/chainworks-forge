@@ -452,6 +452,10 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
   func workflowReadStoreUsesGraphQLReadContracts() async throws {
     let readTransport = CapturingP031ReadTransport(
       responses: [
+        "P031Ideas": Data(
+          """
+          {"data":{"ideas":[{"id":"idea-1","title":"Daemon idea","body":"Read from GraphQL","workspaceRootPath":"/tmp/daemon","projectKey":"P999","status":"active","createdAt":"2026-05-05T18:00:00Z","archivedAt":null}]}}
+          """.utf8),
         "P031RunsHome": Data(
           """
           {"data":{"runs":[{"id":"run-1","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":4,"completedStages":2,"failedStages":0,"pendingApprovals":1}]}}
@@ -481,6 +485,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       subscriptionTransport: subscriptionTransport
     )
 
+    let ideas = try await store.fetchIdeas(includeArchived: false)
     let runs = try await store.fetchRuns()
     let approvals = try await store.fetchApprovalInbox()
     let reports = try await store.fetchReportMetadata(runID: "run-1")
@@ -488,6 +493,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     let statusStream = try store.subscribeToRunStatus(runID: "run-1")
     let statusEvent = try await firstValue(from: statusStream)
 
+    #expect(ideas.map(\.title) == ["Daemon idea"])
     #expect(runs.map(\.id) == ["run-1"])
     #expect(approvals.map(\.id) == ["approval-1"])
     #expect(reports.map(\.id) == ["report-1"])
@@ -496,7 +502,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(statusEvent?.status == "completed")
     #expect(
       readTransport.requests.map(\.operationName) == [
-        "P031RunsHome", "P031ApprovalInbox", "P031ReportMetadata", "P031DaemonStatus",
+        "P031Ideas", "P031RunsHome", "P031ApprovalInbox", "P031ReportMetadata", "P031DaemonStatus",
       ])
     #expect(
       readTransport.requests.first { $0.operationName == "P031ReportMetadata" }?.variables == [
@@ -709,6 +715,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
   @Test("Workflow read store accepts injected P031 document sets")
   func workflowReadStoreUsesInjectedDocuments() async throws {
     let customDocuments = P031GraphQLDocumentSet(
+      ideas: P031GraphQLDocuments.ideas,
       runsHome:
         "query P031RunsHome { runs { id status workflowTitle freshnessState totalStages completedStages failedStages pendingApprovals } }",
       runDetail: P031GraphQLDocuments.runDetail,
@@ -2736,6 +2743,10 @@ private final class P031DaemonRestartRecorder {
 }
 
 private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
+  func fetchIdeas(includeArchived: Bool) async throws -> [P031IdeaReadModel] {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
   func fetchRuns() async throws -> [P031RunRowReadModel] {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
