@@ -14,8 +14,8 @@ use crate::protocol::JsonRpcRequest;
 use crate::protocol::JsonRpcResponse;
 use crate::protocol::McpTool;
 use crate::tools;
-use domain::ResourceTemplateId;
 use domain::events::DomainEvent;
+use domain::ResourceTemplateId;
 
 pub struct McpServer {
     pool: SqlitePool,
@@ -1138,8 +1138,9 @@ mod tests {
     use db::repos::{artifact_contracts, artifacts, ideas, projections, runs, steward, validation};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
-        ContractParseContext, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, parse_implementation_self_assessment_v2,
+        parse_implementation_self_assessment_v2, ContractParseContext,
+        IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
+        IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{ArtifactId, IdeaId, RunId};

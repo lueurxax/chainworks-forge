@@ -235,6 +235,9 @@ mod tests {
         // Acquire with u64::MAX — verifies no integer overflow or panic in the clamping path.
         // No competing holder, so this should succeed immediately.
         let result = registry.acquire(rid, u64::MAX).await;
-        assert!(result.is_ok(), "u64::MAX deadline must not panic or overflow");
+        assert!(
+            result.is_ok(),
+            "u64::MAX deadline must not panic or overflow"
+        );
     }
 }

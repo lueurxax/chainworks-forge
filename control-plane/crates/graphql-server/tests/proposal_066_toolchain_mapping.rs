@@ -5,7 +5,6 @@
 /// - Post-migration row with stored JSON → fields exposed correctly (active, disabled_by_policy)
 /// - policy_source is always runplan_snapshot or synthesized_legacy (never agent_catalog)
 /// - Absolute paths are not exposed on the northbound surface
-
 use std::sync::Arc;
 
 use async_graphql::Request;
@@ -86,7 +85,9 @@ async fn seed_execution(
     .await
     .unwrap();
 
-    runs::insert(pool, &make_run(run_id, idea_id)).await.unwrap();
+    runs::insert(pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
 
     stages::insert(
         pool,
@@ -217,30 +218,46 @@ async fn p066_null_toolchain_diagnostics_synthesizes_legacy_row_unavailable() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
 
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
 
-    assert_eq!(diag["mappingState"], "legacy_row_unavailable",
-        "NULL column must synthesize legacy_row_unavailable");
-    assert_eq!(diag["mappingEnabled"], false,
-        "legacy sentinel must have mappingEnabled=false");
-    assert_eq!(diag["inactiveReason"], "legacy_row",
-        "legacy sentinel must have inactiveReason=legacy_row");
-    assert_eq!(diag["policySource"], "synthesized_legacy",
-        "legacy sentinel must have policySource=synthesized_legacy");
-    assert!(diag["policyVersion"].is_null(),
-        "legacy sentinel policyVersion must be null");
-    assert_eq!(diag["providerFamily"], "unknown",
-        "legacy sentinel providerFamily must be unknown");
-    assert_eq!(diag["version"], 1,
-        "diagnostics doc version must be 1");
+    assert_eq!(
+        diag["mappingState"], "legacy_row_unavailable",
+        "NULL column must synthesize legacy_row_unavailable"
+    );
+    assert_eq!(
+        diag["mappingEnabled"], false,
+        "legacy sentinel must have mappingEnabled=false"
+    );
+    assert_eq!(
+        diag["inactiveReason"], "legacy_row",
+        "legacy sentinel must have inactiveReason=legacy_row"
+    );
+    assert_eq!(
+        diag["policySource"], "synthesized_legacy",
+        "legacy sentinel must have policySource=synthesized_legacy"
+    );
+    assert!(
+        diag["policyVersion"].is_null(),
+        "legacy sentinel policyVersion must be null"
+    );
+    assert_eq!(
+        diag["providerFamily"], "unknown",
+        "legacy sentinel providerFamily must be unknown"
+    );
+    assert_eq!(diag["version"], 1, "diagnostics doc version must be 1");
 }
 
 /// P066: Stored disabled_by_policy JSON → fields exposed correctly.
@@ -268,12 +285,17 @@ async fn p066_disabled_by_policy_diagnostics_exposed_correctly() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
 
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
@@ -281,15 +303,19 @@ async fn p066_disabled_by_policy_diagnostics_exposed_correctly() {
     assert_eq!(diag["mappingState"], "disabled_by_policy");
     assert_eq!(diag["mappingEnabled"], false);
     assert_eq!(diag["inactiveReason"], "policy_disabled");
-    assert_eq!(diag["policySource"], "runplan_snapshot",
-        "authoritative policy_source must be runplan_snapshot, not agent_catalog");
+    assert_eq!(
+        diag["policySource"], "runplan_snapshot",
+        "authoritative policy_source must be runplan_snapshot, not agent_catalog"
+    );
     assert_eq!(diag["policyVersion"], 1);
     assert_eq!(diag["providerFamily"], "claude");
     assert_eq!(diag["version"], 1);
 
     // policy_source must never be "agent_catalog" per DEC-003.
-    assert_ne!(diag["policySource"], "agent_catalog",
-        "agent_catalog must never be an authoritative policy_source");
+    assert_ne!(
+        diag["policySource"], "agent_catalog",
+        "agent_catalog must never be an authoritative policy_source"
+    );
 
     let _ = exec_id; // used in seeding
 }
@@ -319,19 +345,27 @@ async fn p066_active_mapping_diagnostics_exposed_correctly() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
 
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
 
     assert_eq!(diag["mappingState"], "active");
     assert_eq!(diag["mappingEnabled"], true);
-    assert!(diag["inactiveReason"].is_null(), "active state must have null inactiveReason");
+    assert!(
+        diag["inactiveReason"].is_null(),
+        "active state must have null inactiveReason"
+    );
     assert_eq!(diag["policySource"], "runplan_snapshot");
     assert_eq!(diag["policyVersion"], 1);
     assert_eq!(diag["providerFamily"], "xcode");
@@ -367,12 +401,17 @@ async fn p066_absolute_paths_not_exposed_on_graphql_surface() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
 
     let data = response.data.into_json().unwrap();
     let diag_str = data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"].to_string();
@@ -412,12 +451,17 @@ async fn p066_policy_absent_diagnostics_exposed_correctly() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
 
@@ -425,9 +469,15 @@ async fn p066_policy_absent_diagnostics_exposed_correctly() {
     assert_eq!(diag["mappingEnabled"], false);
     assert_eq!(diag["inactiveReason"], "policy_absent");
     assert_eq!(diag["policySource"], "runplan_snapshot");
-    assert!(diag["policyVersion"].is_null(), "policy_absent has no policy_version");
+    assert!(
+        diag["policyVersion"].is_null(),
+        "policy_absent has no policy_version"
+    );
     assert_eq!(diag["providerFamily"], "gemini");
-    assert_ne!(diag["policySource"], "agent_catalog", "DEC-003: agent_catalog must never be authoritative");
+    assert_ne!(
+        diag["policySource"], "agent_catalog",
+        "DEC-003: agent_catalog must never be authoritative"
+    );
 }
 
 /// P066: unsupported_family state — provider not covered by P066 mapping.
@@ -455,12 +505,17 @@ async fn p066_unsupported_family_diagnostics_exposed_correctly() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
 
@@ -495,12 +550,17 @@ async fn p066_setup_failed_diagnostics_exposed_correctly() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
 
@@ -544,20 +604,33 @@ async fn p066_queue_timeout_diagnostics_exposed_correctly() {
     );
 
     let response = schema
-        .execute(
-            Request::new(query).data(auth::Principal::new("operator", auth::PrincipalClass::Operator)),
-        )
+        .execute(Request::new(query).data(auth::Principal::new(
+            "operator",
+            auth::PrincipalClass::Operator,
+        )))
         .await;
 
-    assert!(response.errors.is_empty(), "graphql errors: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
     let data = response.data.into_json().unwrap();
     let diag = &data["stage"]["executions"][0]["actualToolchainMappingDiagnostics"];
 
     assert_eq!(diag["mappingState"], "queue_timeout");
-    assert_eq!(diag["mappingEnabled"], true, "queue_timeout implies mapping was enabled");
-    assert!(diag["inactiveReason"].is_null(), "queue_timeout has no inactive_reason");
+    assert_eq!(
+        diag["mappingEnabled"], true,
+        "queue_timeout implies mapping was enabled"
+    );
+    assert!(
+        diag["inactiveReason"].is_null(),
+        "queue_timeout has no inactive_reason"
+    );
     assert_eq!(diag["policySource"], "runplan_snapshot");
     // queue_timeout must not be misidentified as setup_failed (DEC-007)
-    assert_ne!(diag["mappingState"], "setup_failed",
-        "DEC-007: queue_timeout is not a setup failure");
+    assert_ne!(
+        diag["mappingState"], "setup_failed",
+        "DEC-007: queue_timeout is not a setup failure"
+    );
 }

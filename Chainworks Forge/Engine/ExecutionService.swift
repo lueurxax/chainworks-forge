@@ -1288,21 +1288,19 @@ extension ExecutionService: ExecutionTerminationControlling {}
 
 // MARK: - DefaultRuntimeTransportFactory (Proposal 026 — per-agent transport resolution)
 
-/// Resolves the correct transport for each agent based on adapter family from its provider binding.
-/// Transports are cached by adapter family — max one instance per family per run.
-/// Fixture transport is shared (created once). ACP transports are created on demand and cached.
+/// Resolves app-local fixture transports only.
+/// Live command/control execution is owned by the Rust control plane; the app
+/// reads state through GraphQL and disk-backed artifacts instead of spawning
+/// provider subprocesses itself.
 final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked Sendable {
     let fixtureTransport: (any RuntimeTransportProtocol)?
-    private let helperProcessJanitor: any RuntimeHelperProcessJanitorProtocol
-    private let lock = NSLock()
-    private var transportsByFamily: [String: any RuntimeTransportProtocol] = [:]
 
     init(
         fixtureTransport: (any RuntimeTransportProtocol)?,
         helperProcessJanitor: any RuntimeHelperProcessJanitorProtocol = RuntimeHelperProcessJanitor.live
     ) {
         self.fixtureTransport = fixtureTransport
-        self.helperProcessJanitor = helperProcessJanitor
+        _ = helperProcessJanitor
     }
 
     func transport(for agent: ResolvedAgent, binding: ResolvedProviderBinding?) throws -> any RuntimeTransportProtocol {
@@ -1314,45 +1312,10 @@ final class DefaultRuntimeTransportFactory: RuntimeTransportFactory, @unchecked 
             return fixtureTransport
         }
 
-        lock.lock()
-        defer { lock.unlock() }
-        if let existing = transportsByFamily[family] { return existing }
-
-        helperProcessJanitor.sweepStaleHelpers()
-
-        let created: any RuntimeTransportProtocol
-        switch family {
-        case "claude_agent_acp":
-            print("[TransportFactory] Creating ClaudeAgentACPTransport for family '\(family)'")
-            created = ClaudeAgentACPTransport()
-        case "gemini_cli_acp":
-            print("[TransportFactory] Creating GeminiCLIACPTransport for family '\(family)'")
-            created = GeminiCLIACPTransport()
-        case "codex_acp":
-            print("[TransportFactory] Creating CodexACPTransport for family '\(family)'")
-            created = CodexACPTransport()
-        case "auggie_cli_acp":
-            print("[TransportFactory] Creating AuggieCLIACPTransport for family '\(family)'")
-            created = AuggieCLIACPTransport()
-        case "junie_cli_acp":
-            print("[TransportFactory] Creating JunieCLIACPTransport for family '\(family)'")
-            created = JunieCLIACPTransport()
-        default:
-            throw RuntimeTransportError.unknownAdapterFamily(family)
-        }
-        transportsByFamily[family] = created
-        return created
+        throw RuntimeTransportError.unknownAdapterFamily(family)
     }
 }
 
 extension DefaultRuntimeTransportFactory: RuntimeTransportFactoryTerminationControlling {
-    func terminateActiveTransportsForAppShutdown() {
-        lock.lock()
-        let transports = Array(transportsByFamily.values)
-        lock.unlock()
-
-        for transport in transports {
-            (transport as? RuntimeTransportTerminationControlling)?.terminateActiveSessionsForAppShutdown()
-        }
-    }
+    func terminateActiveTransportsForAppShutdown() {}
 }

@@ -317,13 +317,14 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 
 | Adapter | Provider name | Binary env var |
 |---|---|---|
-| `ClaudeAgentAdapter` | `claude` | `CLAUDE_ACP_BIN` |
-| `CodexAdapter` | `codex` | `CODEX_ACP_BIN` |
-| `GeminiCliAdapter` | `gemini` | `GEMINI_ACP_BIN` |
-| `AuggieAdapter` | `auggie` | `AUGGIE_ACP_BIN` |
-| `JunieAdapter` | `junie` | `JUNIE_ACP_BIN` |
+| `ClaudeAgentAdapter` | `claude` | `CHAINWORKS_CLAUDE_ACP_BINARY` |
+| `CodexAdapter` | `codex` | `CHAINWORKS_CODEX_ACP_BINARY` |
+| `GeminiCliAdapter` | `gemini` | `CHAINWORKS_GEMINI_ACP_BINARY` |
+| `AuggieAdapter` | `auggie` | `CHAINWORKS_AUGGIE_ACP_BINARY` |
+| `JunieAdapter` | `junie` | `CHAINWORKS_JUNIE_ACP_BINARY` |
 
 Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called.
+`JunieAdapter` passes `--acp true` at launch so the local Junie CLI enters ACP JSON-RPC mode.
 
 ### Timeouts
 
@@ -601,11 +602,11 @@ The service returns a `RecoverySummary` with counts of inspected runs, repaired 
 
 Provider binary paths (required when executing agents):
 
-- `CLAUDE_ACP_BIN` -- path to Claude Agent ACP binary
-- `CODEX_ACP_BIN` -- path to Codex ACP binary
-- `GEMINI_ACP_BIN` -- path to Gemini CLI ACP binary
-- `AUGGIE_ACP_BIN` -- path to Auggie ACP binary
-- `JUNIE_ACP_BIN` -- path to Junie ACP binary
+- `CHAINWORKS_CLAUDE_ACP_BINARY` -- path to Claude Agent ACP binary
+- `CHAINWORKS_CODEX_ACP_BINARY` -- path to Codex ACP binary
+- `CHAINWORKS_GEMINI_ACP_BINARY` -- path to Gemini CLI ACP binary
+- `CHAINWORKS_AUGGIE_ACP_BINARY` -- path to Auggie ACP binary
+- `CHAINWORKS_JUNIE_ACP_BINARY` -- path to Junie ACP binary
 
 ### Startup sequence
 

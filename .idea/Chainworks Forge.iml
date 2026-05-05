@@ -9,6 +9,17 @@
       <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/engine/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/graphql-server/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/mcp-server/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/acp/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/auth/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/auth/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/daemon/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/db/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/domain/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/engine/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/graphql-server/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/mcp-server/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/workflow/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/control-plane/crates/workflow/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/control-plane/target" />
     </content>
     <orderEntry type="inheritedJdk" />

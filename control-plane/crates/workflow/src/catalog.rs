@@ -357,9 +357,9 @@ pub fn validate_catalog_snapshot_format_version(
 pub fn validate_toolchain_cache_policies(catalog: &AgentCatalogFile) -> anyhow::Result<()> {
     for agent in catalog.agents.as_deref().unwrap_or(&[]) {
         if let Some(policy) = &agent.toolchain_cache_policy {
-            policy.validate().map_err(|e| {
-                anyhow::anyhow!("agent '{}': {}", agent.id, e)
-            })?;
+            policy
+                .validate()
+                .map_err(|e| anyhow::anyhow!("agent '{}': {}", agent.id, e))?;
         }
     }
     Ok(())

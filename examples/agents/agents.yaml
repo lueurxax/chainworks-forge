@@ -11,6 +11,7 @@ app:
     - codex_acp
     - claude_acp
     - gemini_acp
+    - junie
 x_p060_score_weights: &p060_score_weights
   force_include: 5
   stack_matches: 4
@@ -1144,7 +1145,7 @@ agents:
     title: Lead / Orchestrator
     mode: orchestration
     system_role: lead
-    backend_profile: claude_orchestrator_high
+    backend_profile: junie_orchestrator_acp
     permission_profile: ORCH
     lead_resolution_contract: LeadResolutionContract
     skill_ref: orchestrator_core
@@ -1360,7 +1361,7 @@ agents:
   - id: proposal_review_router
     title: Proposal Review Router
     mode: system.routing
-    backend_profile: claude_orchestrator_high
+    backend_profile: junie_orchestrator_acp
     permission_profile: RO_REVIEW
     skill_ref: proposal_review_router_skill
     inputs:

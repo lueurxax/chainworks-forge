@@ -186,8 +186,9 @@ is the closeout transition authority. `state_9_implementation_reviewed` must not
 advance to `state_11_manual_release` from the self-assessment's zero
 `blocking_remaining_code_tasks` alone. A canonical `needs_code_fixes` or `invalid`
 review summary routes to `state_10_implementation_refined`; `code_complete` can
-enter manual release, and `release_evidence_blocked` is preserved as a separate
-release-hold/manual decision state.
+enter manual release. `release_evidence_blocked` routes back to
+`state_10_implementation_refined` so the orchestrator keeps closing the approved
+proposal instead of converting release-evidence gaps into a release approval.
 
 GraphQL exposes a nullable `implementationSelfAssessmentSummary` field on run read models. MCP run detail/list
 responses expose the same projection as `implementation_self_assessment_summary`. `null` means no v2/v1 projection

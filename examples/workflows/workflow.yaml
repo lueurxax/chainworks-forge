@@ -15,6 +15,7 @@ workflow:
   required_providers:
     - codex_acp
     - claude_acp
+    - junie
 variables:
   proposal_score_target: 8.5
   min_individual_proposal_score: 8
@@ -280,9 +281,9 @@ states:
             - run_state
     transitions:
       - to: state_11_manual_release
-        when: implementation_review_summary.status == vars.implementation_review_target_status or implementation_review_summary.status == 'release_evidence_blocked'
+        when: implementation_review_summary.status == vars.implementation_review_target_status
       - to: state_10_implementation_refined
-        when: implementation_review_summary.status != vars.implementation_review_target_status and implementation_review_summary.status != 'release_evidence_blocked'
+        when: implementation_review_summary.status != vars.implementation_review_target_status
 
   state_10_implementation_refined:
     label: Implementation refined

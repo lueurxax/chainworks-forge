@@ -5,7 +5,6 @@
 /// - startupRecoverySummary.toolchainCache fields are returned when present
 /// - toolchainCacheHousekeepingSummary returns None before first sweep
 /// - toolchainCacheHousekeepingSummary returns named fields after a sweep
-
 use std::sync::Arc;
 
 use async_graphql::Request;
@@ -14,7 +13,9 @@ use db::pool::create_pool;
 use db::repos::startup_repairs::{
     record_startup_recovery_readback, StartupRecoveryReadback, ToolchainCacheRecoveryReadback,
 };
-use db::repos::toolchain_cache_housekeeping::{insert as insert_housekeeping, ToolchainCacheHousekeepingReadback};
+use db::repos::toolchain_cache_housekeeping::{
+    insert as insert_housekeeping, ToolchainCacheHousekeepingReadback,
+};
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
 use engine::lifecycle_reporter::LifecycleReporter;
@@ -38,8 +39,10 @@ fn make_schema(pool: sqlx::SqlitePool) -> graphql_server::schema::AppSchema {
 }
 
 fn operator_request(query: &str) -> Request {
-    Request::new(query.to_string())
-        .data(auth::Principal::new("operator", auth::PrincipalClass::Operator))
+    Request::new(query.to_string()).data(auth::Principal::new(
+        "operator",
+        auth::PrincipalClass::Operator,
+    ))
 }
 
 /// T17: startupRecoverySummary returns None when no readback has been recorded.
@@ -82,7 +85,9 @@ async fn p066_startup_recovery_summary_includes_toolchain_cache_fields() {
             last_sweep_started_at: Some(now),
         },
     };
-    record_startup_recovery_readback(&pool, &readback).await.unwrap();
+    record_startup_recovery_readback(&pool, &readback)
+        .await
+        .unwrap();
 
     let schema = make_schema(pool);
     let query = r#"{ startupRecoverySummary {
@@ -105,16 +110,26 @@ async fn p066_startup_recovery_summary_includes_toolchain_cache_fields() {
     assert_eq!(summary["recoveredItemCount"], 3);
 
     let tc = &summary["toolchainCache"];
-    assert_eq!(tc["sessionScopedRootsSeen"], 5,
-        "sessionScopedRootsSeen must match stored value");
-    assert_eq!(tc["sessionScopedRootsReclaimed"], 2,
-        "sessionScopedRootsReclaimed must match stored value");
-    assert_eq!(tc["sessionScopedCleanupFailures"], 0,
-        "sessionScopedCleanupFailures must match stored value");
-    assert_eq!(tc["orphanThresholdMinutes"], 30,
-        "orphanThresholdMinutes must match stored value");
-    assert!(tc["lastSweepStartedAt"].is_string(),
-        "lastSweepStartedAt must be an ISO-8601 string");
+    assert_eq!(
+        tc["sessionScopedRootsSeen"], 5,
+        "sessionScopedRootsSeen must match stored value"
+    );
+    assert_eq!(
+        tc["sessionScopedRootsReclaimed"], 2,
+        "sessionScopedRootsReclaimed must match stored value"
+    );
+    assert_eq!(
+        tc["sessionScopedCleanupFailures"], 0,
+        "sessionScopedCleanupFailures must match stored value"
+    );
+    assert_eq!(
+        tc["orphanThresholdMinutes"], 30,
+        "orphanThresholdMinutes must match stored value"
+    );
+    assert!(
+        tc["lastSweepStartedAt"].is_string(),
+        "lastSweepStartedAt must be an ISO-8601 string"
+    );
 }
 
 /// T17: toolchainCache fields are None when no sweep has run (pre-P066 rows).
@@ -134,7 +149,9 @@ async fn p066_startup_recovery_summary_toolchain_cache_is_empty_before_sweep() {
         updated_at: now,
         toolchain_cache: ToolchainCacheRecoveryReadback::default(),
     };
-    record_startup_recovery_readback(&pool, &readback).await.unwrap();
+    record_startup_recovery_readback(&pool, &readback)
+        .await
+        .unwrap();
 
     let schema = make_schema(pool);
     let query = r#"{ startupRecoverySummary {
@@ -149,10 +166,14 @@ async fn p066_startup_recovery_summary_toolchain_cache_is_empty_before_sweep() {
 
     let data = response.data.into_json().unwrap();
     let tc = &data["startupRecoverySummary"]["toolchainCache"];
-    assert!(tc["sessionScopedRootsSeen"].is_null(),
-        "sessionScopedRootsSeen must be null before first sweep");
-    assert!(tc["lastSweepStartedAt"].is_null(),
-        "lastSweepStartedAt must be null before first sweep");
+    assert!(
+        tc["sessionScopedRootsSeen"].is_null(),
+        "sessionScopedRootsSeen must be null before first sweep"
+    );
+    assert!(
+        tc["lastSweepStartedAt"].is_null(),
+        "lastSweepStartedAt must be null before first sweep"
+    );
 }
 
 /// T18: toolchainCacheHousekeepingSummary returns None before first sweep.
@@ -208,16 +229,22 @@ async fn p066_toolchain_cache_housekeeping_summary_exposes_named_fields() {
     let data = response.data.into_json().unwrap();
     let summary = &data["toolchainCacheHousekeepingSummary"];
     assert!(!summary.is_null(), "summary should be present after sweep");
-    assert_eq!(summary["runScopedRootsPruned"], 7,
-        "runScopedRootsPruned must match");
-    assert_eq!(summary["runScopedPruneFailures"], 0,
-        "runScopedPruneFailures must match");
+    assert_eq!(
+        summary["runScopedRootsPruned"], 7,
+        "runScopedRootsPruned must match"
+    );
+    assert_eq!(
+        summary["runScopedPruneFailures"], 0,
+        "runScopedPruneFailures must match"
+    );
     assert!(
         summary["oldestEligibleRootAgeDays"].as_f64().is_some(),
         "oldestEligibleRootAgeDays must be a number"
     );
-    assert!((summary["oldestEligibleRootAgeDays"].as_f64().unwrap() - 3.5).abs() < 0.001,
-        "oldestEligibleRootAgeDays must be ~3.5");
+    assert!(
+        (summary["oldestEligibleRootAgeDays"].as_f64().unwrap() - 3.5).abs() < 0.001,
+        "oldestEligibleRootAgeDays must be ~3.5"
+    );
     assert_eq!(summary["diskPressureBlocks"], 0);
     assert_eq!(summary["quarantinedRootsCreated"], 0);
     assert!(summary["lastSweepStartedAt"].is_string());

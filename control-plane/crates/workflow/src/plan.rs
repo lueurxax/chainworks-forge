@@ -44,7 +44,10 @@ impl ToolchainCachePolicySnapshot {
         if !self.enabled {
             return None;
         }
-        Some(self.go_scope.unwrap_or(ToolchainCacheScopeSnapshot::Session))
+        Some(
+            self.go_scope
+                .unwrap_or(ToolchainCacheScopeSnapshot::Session),
+        )
     }
 }
 

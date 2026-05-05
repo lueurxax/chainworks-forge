@@ -175,7 +175,9 @@ fn compile_loaded(
     // a toolchain_cache_policy.
     let has_toolchain_policy = states.values().any(|s| {
         s.owner.toolchain_cache_policy.is_some()
-            || s.tasks.iter().any(|t| t.agent.toolchain_cache_policy.is_some())
+            || s.tasks
+                .iter()
+                .any(|t| t.agent.toolchain_cache_policy.is_some())
     });
     let run_plan_snapshot_format_version = if has_toolchain_policy {
         Some(crate::catalog::CATALOG_SNAPSHOT_FORMAT_VERSION)
@@ -519,12 +521,20 @@ fn build_agent_lookup(
                         version: p.version,
                         enabled: p.enabled,
                         xcode_scope: p.xcode_scope.map(|s| match s {
-                            crate::catalog::ToolchainCacheScope::Run => crate::plan::ToolchainCacheScopeSnapshot::Run,
-                            crate::catalog::ToolchainCacheScope::Session => crate::plan::ToolchainCacheScopeSnapshot::Session,
+                            crate::catalog::ToolchainCacheScope::Run => {
+                                crate::plan::ToolchainCacheScopeSnapshot::Run
+                            }
+                            crate::catalog::ToolchainCacheScope::Session => {
+                                crate::plan::ToolchainCacheScopeSnapshot::Session
+                            }
                         }),
                         go_scope: p.go_scope.map(|s| match s {
-                            crate::catalog::ToolchainCacheScope::Run => crate::plan::ToolchainCacheScopeSnapshot::Run,
-                            crate::catalog::ToolchainCacheScope::Session => crate::plan::ToolchainCacheScopeSnapshot::Session,
+                            crate::catalog::ToolchainCacheScope::Run => {
+                                crate::plan::ToolchainCacheScopeSnapshot::Run
+                            }
+                            crate::catalog::ToolchainCacheScope::Session => {
+                                crate::plan::ToolchainCacheScopeSnapshot::Session
+                            }
                         }),
                     }
                 }),
