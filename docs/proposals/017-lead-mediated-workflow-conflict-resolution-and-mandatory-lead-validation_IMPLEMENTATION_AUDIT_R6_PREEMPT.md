@@ -140,7 +140,8 @@ matching tier label at every of the three tier-emit sites.
 | `cargo build -p graphql-server -p mcp-server` | clean (warnings only, no errors) |
 | `cargo test -p mcp-server -- proposal_017_ p017_` | 4 passed (was 3 — `p017_cross_attempt_artifact_isolation_via_mcp_readback` added) |
 | `cargo test -p graphql-server -- proposal_017_ p017_` | 5 passed (was 4 — `p017_cross_attempt_artifact_isolation_via_graphql_readback` added) |
-| `./scripts/test-gate.sh proposal-017` | exit 0; full log archived as `docs/proposals/017-evidence/proposal-017-r6-preempt-gate-20260428T042037Z.log` (26,200 lines / 3.4 MB); both new isolation tests appear in the lib unittests output as `... ok` |
+| `cargo test -p db --test proposal_017_workflow_conflict_persistence` | 21 passed (was 20 — `p017_mediation_complete_with_attribution_is_atomic` added) |
+| `./scripts/test-gate.sh proposal-017` | exit 0; final closure-set log archived as `docs/proposals/017-evidence/proposal-017-r6-preempt-followup-gate-20260428T063242Z.log` (3.4 MB); structural-guard verification log at `docs/proposals/017-evidence/proposal-017-r6-preempt-strict-guard-gate-20260428T063705Z.log`; all three R6-preempt tests appear in the lib unittests output as `... ok` |
 
 ## Gate guards
 
