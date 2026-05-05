@@ -66,7 +66,11 @@ use crate::recovery::RecoveryService;
 use crate::session::fingerprint::{
     binding_fingerprint, invocation_owner_key, BindingFingerprintInput, InvocationOwnerKeyInput,
 };
-use crate::session::policy::{ensure_policy, SessionPolicyDecision, SessionPolicyInput};
+use crate::session::policy::{
+    ensure_policy, invalidate_generation_after_missing_required_outputs,
+    invalidate_generation_after_missing_required_outputs_tx, SessionPolicyDecision,
+    SessionPolicyInput,
+};
 use crate::work_queue::WorkQueue;
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
@@ -3867,6 +3871,30 @@ impl BackgroundExecutor {
                                 "Failed to persist ACP startup failure runtime facts"
                             );
                         }
+                        if let Some(decision) = policy_decision.as_ref() {
+                            match invalidate_generation_after_missing_required_outputs(
+                                &self.pool,
+                                Some(&decision.generation.id),
+                                &runtime_facts,
+                            )
+                            .await
+                            {
+                                Ok(true) => {
+                                    let _ = self.acp.close_session(&decision.generation.id).await;
+                                }
+                                Ok(false) => {}
+                                Err(update_error) => {
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        error = %update_error,
+                                        "Failed to invalidate session after missing required outputs"
+                                    );
+                                }
+                            }
+                        }
                         let _ =
                             self.events
                                 .send(domain::events::DomainEvent::RuntimeStatusChanged {
@@ -5795,9 +5823,21 @@ impl BackgroundExecutor {
             runtime_facts.quota_ledger_id = Some(ledger.id);
         }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
+        let invalidated_session_after_missing_outputs =
+            invalidate_generation_after_missing_required_outputs_tx(
+                &mut tx,
+                session_generation_id,
+                &runtime_facts,
+            )
+            .await?;
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
+        if invalidated_session_after_missing_outputs {
+            if let Some(session_generation_id) = session_generation_id {
+                let _ = self.acp.close_session(session_generation_id).await;
+            }
+        }
         for artifact in declared_artifacts_to_insert {
             self.persist_implementation_self_assessment_summary_if_applicable(artifact)
                 .await?;
