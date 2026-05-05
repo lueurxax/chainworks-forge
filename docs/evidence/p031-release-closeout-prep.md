@@ -19,6 +19,9 @@ without the run-specific operator evidence listed below.
   boundary explicitly nonisolated.
 - Targeted P031 thin GraphQL boundary tests passed after the actor-isolation fix:
   `Proposal031ThinGraphQLReadBoundaryTests`, 61 tests.
+- P031 UX/accessibility release sign-off is recorded in
+  `docs/evidence/p031-ux-accessibility-signoff.md` after the 2026-05-05
+  operator spot check.
 
 ## Still Required Before Ready
 
@@ -26,8 +29,6 @@ without the run-specific operator evidence listed below.
 - Operator workflow-completion notes for both dogfood runs.
 - Approval diagnostic comprehension evidence on a run with pending approval rows.
 - Report payload indicator evidence on representative report artifacts.
-- Human VoiceOver or accessibility spot check in an environment with Assistive
-  Access permission, or a dated release-owner waiver.
 - Degraded-state scripted drill evidence, or a dated release-owner waiver for the
   existing partial restart/degraded evidence.
 - Freshness confirmation tied to the dogfood run window.
@@ -43,8 +44,8 @@ ready status until the corresponding evidence exists:
 - `docs/evidence/p031-freshness-baseline.md`
 - `docs/evidence/p031-ux-accessibility-signoff.md`
 
-The current blocker phrases in those files are expected until the owner records
-real dogfood, degraded-state, freshness, and accessibility evidence.
+The current blocker phrases in the remaining open files are expected until the
+owner records real dogfood, degraded-state, and freshness evidence.
 
 ## Next Audit Capture Table
 
@@ -54,7 +55,7 @@ real dogfood, degraded-state, freshness, and accessibility evidence.
 | Dogfood run 2 | TBD | P031 release owner | Pending |
 | Approval diagnostic check | TBD | P031 release owner | Pending |
 | Report payload indicator check | TBD | P031 release owner | Pending |
-| VoiceOver/accessibility check | TBD | P031 release owner | Pending |
+| VoiceOver/accessibility check | `docs/evidence/p031-ux-accessibility-signoff.md` | P031 release owner | Complete |
 | Degraded-state drill or waiver | TBD | P031 release owner | Pending |
 | Dogfood freshness confirmation | TBD | P031 release owner | Pending |
 | Critical write-path waiver/readiness | TBD | P031 release owner | Pending |

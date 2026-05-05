@@ -83,7 +83,7 @@
       "id": "ux_accessibility_signoff",
       "path": "docs/evidence/p031-ux-accessibility-signoff.md",
       "owner_role": "P031 macOS thin UI owner",
-      "validation_status": "validated_with_assistive_access_limitation",
+      "validation_status": "signed_human_accessibility_check",
       "blocking_phase": "Phase 0d"
     },
     {
