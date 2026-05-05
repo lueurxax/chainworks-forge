@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    artifact_contracts, artifacts, lead_conflict_mediations, legacy_discovery_overrides, sessions,
-    validation, workflow_conflicts,
+    artifact_contracts, artifacts, lead_conflict_mediations, legacy_discovery_overrides,
+    rollout_contract_checks, sessions, validation, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -93,6 +93,7 @@ pub async fn execute(
                 "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
+                "rollout_contract_readback": rollout_contract_readback_json(pool, run_id).await?,
             }));
             if let Some(projection) =
                 db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
@@ -716,6 +717,18 @@ pub(crate) async fn implementation_self_assessment_summary_json(
         .map_err(Into::into)
 }
 
+pub(crate) async fn rollout_contract_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    Ok(
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+            .map(|check| check.operator_readback_json())
+            .unwrap_or(serde_json::Value::Null),
+    )
+}
+
 pub(crate) fn public_artifact_path(path: &str) -> String {
     if path.ends_with("implementation/self-assessment.json") {
         "implementation/self-assessment.json".to_string()
@@ -729,6 +742,17 @@ pub(crate) async fn artifact_report_json(
     artifact: &Artifact,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(artifact)?;
+    let include_rollout_readback =
+        artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name);
+
+    if include_rollout_readback {
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "rollout_contract_readback".to_string(),
+                rollout_contract_readback_json(pool, artifact.run_id).await?,
+            );
+        }
+    }
 
     if artifact.report_kind.as_deref() == Some("validation_failure") {
         if let Some(record) = validation::find_by_artifact_id(pool, artifact.id).await? {
@@ -900,7 +924,10 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, runs, validation, workflow_conflicts};
+    use db::repos::{
+        artifact_contracts, artifacts, ideas, rollout_contract_checks, runs, validation,
+        workflow_conflicts,
+    };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -1291,6 +1318,42 @@ mod tests {
         }
     }
 
+    async fn persist_rollout_contract_readback(pool: &sqlx::SqlitePool, run_id: RunId) {
+        use rollout_contract_checks::{
+            ProjectionIntegrity, RolloutContractDecision, RolloutContractEnforcementMode,
+            RolloutContractLifecycleState, RolloutContractStatus, UpsertRolloutContractCheck,
+        };
+
+        rollout_contract_checks::upsert_rollout_contract_check(
+            pool,
+            &UpsertRolloutContractCheck {
+                id: uuid::Uuid::new_v4(),
+                run_id: run_id.inner(),
+                proposal_id: "proposal-084".to_string(),
+                proposal_revision_id: "p084-r5".to_string(),
+                proposal_content_hash: "sha256:proposal".to_string(),
+                contract_object_hash: "sha256:contract".to_string(),
+                content_snapshot_id: "artifact-1".to_string(),
+                checker_version: "test-checker".to_string(),
+                status: RolloutContractStatus::Pass,
+                decision: RolloutContractDecision::Release,
+                lifecycle_state: RolloutContractLifecycleState::Terminal,
+                enforcement_mode: RolloutContractEnforcementMode::Enforce,
+                failure_reasons: vec![],
+                diagnostics: vec![],
+                waiver: None,
+                projection_integrity: ProjectionIntegrity::Valid,
+                cutover_policy_revision: Some("cutover-p084-test".to_string()),
+                redaction_state: "operator_safe".to_string(),
+                retry_count: 0,
+                preflight_timeout_seconds: 45,
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+
     fn make_workflow_conflict(run_id: RunId) -> WorkflowConflictRecord {
         let candidates = vec![CandidateTransitionEvaluation {
             transition_id: "review_to_complete".into(),
@@ -1487,6 +1550,70 @@ mod tests {
         assert!(names.contains(&"delivery_receipt".to_string()));
         assert!(names.contains(&"execution_report".to_string()));
         assert!(!names.contains(&"other_blob".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reports_get_exposes_rollout_readback_on_run_and_release_reports() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_rollout_contract_readback(&pool, run_id).await;
+
+        artifacts::insert(&pool, &make_artifact(run_id, "delivery_receipt", None))
+            .await
+            .unwrap();
+        artifacts::insert(
+            &pool,
+            &make_artifact(run_id, "execution_report", Some("execution_report")),
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        let reports = result.as_array().expect("reports array");
+        let mcp_truth = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
+            .expect("mcp execution truth report");
+        let delivery_receipt = reports
+            .iter()
+            .find(|report| report["name"] == serde_json::json!("delivery_receipt"))
+            .expect("delivery receipt report");
+        let execution_report = reports
+            .iter()
+            .find(|report| report["name"] == serde_json::json!("execution_report"))
+            .expect("execution report");
+
+        for readback in [
+            &mcp_truth["rollout_contract_readback"],
+            &delivery_receipt["rollout_contract_readback"],
+            &execution_report["rollout_contract_readback"],
+        ] {
+            assert_eq!(
+                readback["schema_version"],
+                serde_json::json!("operator_readback_v1")
+            );
+            assert_eq!(readback["backend_decision"], serde_json::json!("release"));
+            assert_eq!(
+                readback["cutover_policy_revision"],
+                serde_json::json!("cutover-p084-test")
+            );
+        }
     }
 
     #[tokio::test]

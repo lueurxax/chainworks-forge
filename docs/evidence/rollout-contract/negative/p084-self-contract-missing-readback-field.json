@@ -1,0 +1,51 @@
+{
+  "fixture_type": "self_contract_completeness_documentation",
+  "acceptance_criterion": "ac-006",
+  "scenario": "p084_self_contract_missing_required_operator_readback_v1_fields",
+  "required_report_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "example_incomplete_self_contract": {
+    "note": "A P084 self-contract that is missing required readback fields would fail the AC-006 gate check.",
+    "missing_fields_in_this_example": [
+      "rollout_contract_waiver_state",
+      "rollout_contract_waiver_expires_at",
+      "rollout_contract_enforcement_mode_reason",
+      "rollout_contract_enabled_state",
+      "rollout_contract_disabled_reason_code",
+      "rollout_contract_action_id",
+      "rollout_contract_operator_message",
+      "rollout_contract_projection_integrity",
+      "rollout_contract_cutover_policy_revision",
+      "rollout_contract_diagnostic_redaction",
+      "rollout_contract_next_steps"
+    ],
+    "incomplete_fixture": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {"mode": "feature_flag_disable_or_enforcement_mode_permissive", "data_loss_risk": "none"},
+      "rollout_contract_source_lane": "run_report"
+    }
+  },
+  "description": "The proposal-084 gate fails if the p084-full-surface.fixture.json is missing any of the 18 required operator_readback_v1 decision fields listed in required_report_fields. This file documents the expected failure mode for AC-006."
+}

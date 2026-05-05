@@ -20,6 +20,7 @@ pub mod preflight;
 pub mod proposal_review_router;
 pub mod recovery;
 pub mod release;
+pub mod rollout_contract_preflight;
 pub mod session;
 pub mod steward;
 pub mod work_queue;

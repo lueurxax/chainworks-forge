@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use db::repos::{agent_executions, projections, runs, stages};
+use db::repos::{agent_executions, projections, rollout_contract_checks, runs, stages};
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
 
@@ -84,6 +84,18 @@ fn scheduler_backpressure_mcp_notification(event: DomainEvent) -> Option<serde_j
             "stale_after_ms": stale_after_ms
         }
     }))
+}
+
+async fn rollout_contract_readback_json(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> anyhow::Result<serde_json::Value> {
+    Ok(
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+            .map(|check| check.operator_readback_json())
+            .unwrap_or(serde_json::Value::Null),
+    )
 }
 
 impl McpServer {
@@ -510,6 +522,7 @@ impl McpServer {
                 .await?,
                 "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
+                "rollout_contract_readback": rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
                 "artifact_index": artifact_rows,
                 "artifacts": artifact_payloads,
             }));
@@ -618,6 +631,10 @@ impl McpServer {
                     run_id_parsed,
                 )
                 .await?,
+            );
+            obj.insert(
+                "rollout_contract_readback".into(),
+                rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
             );
             let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
             let mut stage_values = Vec::new();
@@ -1135,7 +1152,10 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, projections, runs, steward, validation};
+    use db::repos::{
+        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, steward,
+        validation,
+    };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -1277,6 +1297,46 @@ mod tests {
             &artifact.contract_id,
             &summary,
             artifact.created_at,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn persist_rollout_contract_readback(
+        pool: &sqlx::SqlitePool,
+        run_id: domain::ids::RunId,
+    ) {
+        use rollout_contract_checks::{
+            ProjectionIntegrity, RolloutContractDecision, RolloutContractEnforcementMode,
+            RolloutContractLifecycleState, RolloutContractStatus, UpsertRolloutContractCheck,
+        };
+
+        let now = Utc::now();
+        rollout_contract_checks::upsert_rollout_contract_check(
+            pool,
+            &UpsertRolloutContractCheck {
+                id: uuid::Uuid::new_v4(),
+                run_id: run_id.inner(),
+                proposal_id: "proposal-084".into(),
+                proposal_revision_id: "p084-r5".into(),
+                proposal_content_hash: "sha256:proposal".into(),
+                contract_object_hash: "sha256:contract".into(),
+                content_snapshot_id: "snapshot-1".into(),
+                checker_version: "p084-lint-1".into(),
+                status: RolloutContractStatus::Fail,
+                decision: RolloutContractDecision::Hold,
+                lifecycle_state: RolloutContractLifecycleState::Terminal,
+                enforcement_mode: RolloutContractEnforcementMode::Enforce,
+                failure_reasons: vec!["missing_metrics".into()],
+                diagnostics: vec!["bounded diagnostic".into()],
+                waiver: None,
+                projection_integrity: ProjectionIntegrity::Valid,
+                cutover_policy_revision: Some("p084-cutover-v1".into()),
+                redaction_state: "bounded".into(),
+                retry_count: 0,
+                preflight_timeout_seconds: 45,
+            },
+            now,
         )
         .await
         .unwrap();
@@ -1468,6 +1528,7 @@ mod tests {
             .await
             .unwrap();
         persist_blocked_implementation_summary(&pool, run_id).await;
+        persist_rollout_contract_readback(&pool, run_id).await;
 
         let server = McpServer::new(
             pool.clone(),
@@ -1497,6 +1558,15 @@ mod tests {
             run["implementation_self_assessment_summary"]["status"],
             serde_json::json!("blocked"),
             "run:// resource must expose implementation self-assessment summary"
+        );
+        assert_eq!(
+            run["rollout_contract_readback"]["schema_version"],
+            serde_json::json!("operator_readback_v1"),
+            "run:// resource must expose rollout contract operator readback"
+        );
+        assert_eq!(
+            run["rollout_contract_readback"]["backend_decision"],
+            serde_json::json!("hold")
         );
     }
 

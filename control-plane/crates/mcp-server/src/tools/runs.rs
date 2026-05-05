@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{artifact_contracts, legacy_discovery_overrides, projections, runs};
+use db::repos::{
+    artifact_contracts, legacy_discovery_overrides, projections, rollout_contract_checks, runs,
+};
 use domain::commands::{
     CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
@@ -31,7 +33,11 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "workflow_yaml_path": { "type": "string", "description": "Path to workflow YAML file (enables state-machine execution)" },
                     "agent_catalog_yaml_path": { "type": "string", "description": "Path to agent catalog YAML file" },
                     "delivery_configuration_json": { "type": "string", "description": "Frozen delivery configuration JSON for repo-backed runs" },
-                    "review_routing_json": { "type": "string", "description": "Review routing options JSON for P060 dynamic reviewer selection" }
+                    "review_routing_json": { "type": "string", "description": "Review routing options JSON for P060 dynamic reviewer selection" },
+                    "rollout_contract_preflight_policy_json": {
+                        "type": "string",
+                        "description": "P084 rollout-contract run-start policy request JSON. Accepts waiver and/or enforcement_mode objects; server stamps authorization, principal, and audit event."
+                    }
                 }
             }),
         },
@@ -207,6 +213,10 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
             let review_routing_json = params["review_routing_json"].as_str().map(String::from);
+            let rollout_contract_preflight_policy_json = params
+                ["rollout_contract_preflight_policy_json"]
+                .as_str()
+                .map(String::from);
 
             let caller = mcp_caller(&principal.id, &principal.class, "runs.start");
             let cmd = Command::StartRun(StartRunCmd {
@@ -219,6 +229,7 @@ pub async fn execute(
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
                 review_routing_json,
+                rollout_contract_preflight_policy_json,
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let run_id = match &commanded.result {
@@ -528,11 +539,11 @@ async fn attach_implementation_self_assessment_summary(
     pool: &SqlitePool,
     mut value: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let summary = value
+    let run_id = value
         .get("id")
         .and_then(|id| id.as_str())
         .and_then(|id| id.parse::<RunId>().ok());
-    let summary = match summary {
+    let summary = match run_id {
         Some(run_id) => {
             artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
                 .await?
@@ -546,11 +557,24 @@ async fn attach_implementation_self_assessment_summary(
         }
         None => None,
     };
+    let rollout_contract_readback = match run_id {
+        Some(run_id) => rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+            pool,
+            run_id.inner(),
+        )
+        .await?
+        .map(|check| check.operator_readback_json()),
+        None => None,
+    };
 
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "implementation_self_assessment_summary".to_string(),
             summary.unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "rollout_contract_readback".to_string(),
+            rollout_contract_readback.unwrap_or(serde_json::Value::Null),
         );
     }
 
@@ -563,7 +587,7 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{artifact_contracts, artifacts, ideas, runs};
+    use db::repos::{artifact_contracts, artifacts, ideas, rollout_contract_checks, runs};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -716,6 +740,43 @@ mod tests {
         .unwrap();
     }
 
+    async fn persist_rollout_contract_readback(pool: &SqlitePool, run_id: RunId) {
+        use rollout_contract_checks::{
+            ProjectionIntegrity, RolloutContractDecision, RolloutContractEnforcementMode,
+            RolloutContractLifecycleState, RolloutContractStatus, UpsertRolloutContractCheck,
+        };
+
+        let now = Utc::now();
+        rollout_contract_checks::upsert_rollout_contract_check(
+            pool,
+            &UpsertRolloutContractCheck {
+                id: uuid::Uuid::new_v4(),
+                run_id: run_id.inner(),
+                proposal_id: "proposal-084".into(),
+                proposal_revision_id: "p084-r5".into(),
+                proposal_content_hash: "sha256:proposal".into(),
+                contract_object_hash: "sha256:contract".into(),
+                content_snapshot_id: "snapshot-1".into(),
+                checker_version: "p084-lint-1".into(),
+                status: RolloutContractStatus::Pass,
+                decision: RolloutContractDecision::Release,
+                lifecycle_state: RolloutContractLifecycleState::Terminal,
+                enforcement_mode: RolloutContractEnforcementMode::Enforce,
+                failure_reasons: vec![],
+                diagnostics: vec![],
+                waiver: None,
+                projection_integrity: ProjectionIntegrity::Valid,
+                cutover_policy_revision: Some("p084-cutover-v1".into()),
+                redaction_state: "bounded".into(),
+                retry_count: 0,
+                preflight_timeout_seconds: 45,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn runs_start_persists_delivery_configuration_json() {
         let start_schema = tool_specs()
@@ -842,6 +903,7 @@ mod tests {
         let run = make_run(RunId::new(), idea_id);
         runs::insert(&pool, &run).await.unwrap();
         persist_blocked_implementation_summary(&pool, run.id).await;
+        persist_rollout_contract_readback(&pool, run.id).await;
 
         let handler = make_command_handler(pool.clone());
         let result = execute(
@@ -858,6 +920,14 @@ mod tests {
         assert_eq!(summary["status"], serde_json::json!("blocked"));
         assert_eq!(summary["implementation_complete"], serde_json::json!(true));
         assert_eq!(summary["verification_green"], serde_json::json!(false));
+        assert_eq!(
+            result["rollout_contract_readback"]["schema_version"],
+            serde_json::json!("operator_readback_v1")
+        );
+        assert_eq!(
+            result["rollout_contract_readback"]["backend_decision"],
+            serde_json::json!("release")
+        );
     }
 
     #[tokio::test]

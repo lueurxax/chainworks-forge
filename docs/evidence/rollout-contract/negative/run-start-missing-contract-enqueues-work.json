@@ -1,0 +1,34 @@
+{
+  "fixture_type": "scheduler_behavior_documentation",
+  "acceptance_criterion": "ac-005",
+  "scenario": "run_start_with_missing_or_invalid_rollout_contract",
+  "enforcement_mode_behaviors": {
+    "enforce": {
+      "action": "block_work_enqueue",
+      "projection_written": "rollout-contract-check.json with status=fail and decision=hold",
+      "metric_emitted": "rollout_contract_run_start_block_total{proposal_id, reason=missing_contract, enforcement_mode=enforce}"
+    },
+    "permissive": {
+      "action": "allow_work_enqueue_but_record_would_block",
+      "projection_written": "rollout-contract-check.json with status=fail and decision=hold",
+      "metric_emitted": "rollout_contract_permissive_dogfood_total{proposal_id, status=would_block}"
+    },
+    "disabled": {
+      "action": "allow_work_enqueue_skip_rollout_check",
+      "projection_written": "rollout-contract-check.json with status=not_applicable",
+      "metric_emitted": "rollout_contract_enforcement_mode_total{proposal_id, mode=disabled}"
+    }
+  },
+  "non_terminal_artifact_states_that_trigger_rerun": [
+    "missing",
+    "stale",
+    "hash_mismatched",
+    "tamper_suspect",
+    "partial",
+    "timed_out",
+    "cancelled"
+  ],
+  "preflight_timeout_seconds": 45,
+  "single_flight_invariant": "Same-run checks coalesce; only one preflight runs per run at a time.",
+  "description": "Documents the run-start scheduler behavior when a rollout contract is missing or invalid. The actual enforcement is implemented in the Rust control-plane scheduler boundary (Phase 4). This file is documentation evidence for AC-005."
+}

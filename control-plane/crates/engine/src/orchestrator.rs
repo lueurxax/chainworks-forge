@@ -1426,6 +1426,7 @@ impl Orchestrator {
         let mut persisted_artifacts = artifacts::list_by_run(&self.pool, run_id).await?;
         let mut approved_proposal_artifact_id = None;
         let mut approved_proposal_digest = None;
+        let mut approved_proposal_artifact = None;
 
         for artifact_name in &required_artifacts {
             let (artifact_available, ensured_artifact) = self
@@ -1442,6 +1443,7 @@ impl Orchestrator {
                     if artifact.name == "approved_proposal" {
                         approved_proposal_artifact_id = Some(artifact.id.to_string());
                         approved_proposal_digest = artifact.checksum_sha256.clone();
+                        approved_proposal_artifact = Some(artifact.clone());
                     }
                     if !persisted_artifacts
                         .iter()
@@ -1469,7 +1471,7 @@ impl Orchestrator {
         } else {
             "blocked_before_code"
         };
-        let handoff_status = ImplementationHandoffStatus {
+        let mut handoff_status = ImplementationHandoffStatus {
             schema_version: ImplementationHandoffStatus::SCHEMA_VERSION.to_string(),
             run_id: run_id.to_string(),
             current_state_id: current_state_id.to_string(),
@@ -1498,6 +1500,51 @@ impl Orchestrator {
             .await?;
 
         if missing_artifacts.is_empty() {
+            let preflight =
+                crate::rollout_contract_preflight::implementation_run_start_rollout_contract_preflight(
+                    &self.pool,
+                    run,
+                    approved_proposal_artifact.as_ref(),
+                )
+                .await?;
+            if preflight.action
+                == crate::rollout_contract_preflight::RolloutContractPreflightAction::Hold
+            {
+                handoff_status.status = "blocked_before_code".to_string();
+                handoff_status.code_writer_start_status = "blocked_before_code".to_string();
+                handoff_status.blocked_before_code_reason =
+                    Some("rollout_contract_preflight_hold".to_string());
+                handoff_status.retryable_from =
+                    Some(format!("rollout_contract_preflight:{current_state_id}"));
+                handoff_status.updated_at = Utc::now();
+                workflow_conflicts::upsert_implementation_handoff_status(
+                    &self.pool,
+                    &handoff_status,
+                )
+                .await?;
+                stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+                if run.status != RunStatus::Blocked {
+                    runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+                }
+                let _ = self.events.send(DomainEvent::StageStatusChanged {
+                    run_id,
+                    stage_execution_id: stage.id,
+                    status: StageStatus::Blocked,
+                });
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Blocked,
+                });
+                warn!(
+                    run_id = %run_id,
+                    state = current_state_id,
+                    task = %task.task_name,
+                    rollout_contract_check_id = %preflight.check.id,
+                    failure_reasons = ?preflight.check.failure_reasons,
+                    "Rollout contract preflight held code_writer before enqueue"
+                );
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -5691,8 +5738,7 @@ fn is_health_fallback_eligible_task(
                 .any(|output| output == "proposal_current"))
         || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
         || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
-        || (agent_id == "prepush_code_reviewer"
-            && output_contract == Some("prepush_review_v1"))
+        || (agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1"))
 }
 
 fn is_health_fallback_source_provider(provider: &str) -> bool {
@@ -5790,7 +5836,11 @@ fn run_local_health_fallback_profile_candidates(
     }
     if agent_id == "security_checker" && output_contract == Some("security_report_v1") {
         if matches!(source_provider, "claude" | "claude_acp") {
-            return vec!["codex_architect_high", "codex_audit_high", "codex_writer_high"];
+            return vec![
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ];
         }
         return vec!["claude_security_high", "claude_product_high"];
     }
@@ -7831,7 +7881,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let wf_path = temp_dir.path().join("wf.yaml");
         let cat_path = temp_dir.path().join("catalog.yaml");
-        std::fs::write(&wf_path, "
+        std::fs::write(
+            &wf_path,
+            "
 workflow:
   id: test_wf
 initial_state: state_9
@@ -7848,8 +7900,12 @@ states:
     transitions:
       - to: state_9
         when: 'true'
-").unwrap();
-        std::fs::write(&cat_path, "
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &cat_path,
+            "
 agents:
   - id: reviewer
     backend_profile: reviewer_profile
@@ -7869,7 +7925,9 @@ contracts:
     format: json
 permission_profiles:
   default: {}
-").unwrap();
+",
+        )
+        .unwrap();
 
         let run_id = RunId::new();
         let mut run = test_run(run_id);
@@ -7900,7 +7958,9 @@ permission_profiles:
             recovery_snapshot_json: None,
             retry_reason: None,
         };
-        db::repos::stages::insert(&pool, &failed_state_9).await.unwrap();
+        db::repos::stages::insert(&pool, &failed_state_9)
+            .await
+            .unwrap();
 
         // 2. Successful stage for state_10 (more recent)
         let completed_state_10 = StageExecution {
@@ -7923,16 +7983,25 @@ permission_profiles:
             recovery_snapshot_json: None,
             retry_reason: None,
         };
-        db::repos::stages::insert(&pool, &completed_state_10).await.unwrap();
+        db::repos::stages::insert(&pool, &completed_state_10)
+            .await
+            .unwrap();
 
         // Advance workflow
         orchestrator.advance_run(run_id).await.unwrap();
 
         // Check if a NEW stage for state_9 was created
         let all_stages = db::repos::stages::list_by_run(&pool, run_id).await.unwrap();
-        let state_9_stages: Vec<_> = all_stages.iter().filter(|s| s.stage_id == "state_9").collect();
+        let state_9_stages: Vec<_> = all_stages
+            .iter()
+            .filter(|s| s.stage_id == "state_9")
+            .collect();
 
-        assert_eq!(state_9_stages.len(), 2, "Should have created a new stage for state_9 because the old one is stale");
+        assert_eq!(
+            state_9_stages.len(),
+            2,
+            "Should have created a new stage for state_9 because the old one is stale"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

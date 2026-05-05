@@ -28,6 +28,89 @@ struct PreflightReport: Codable, Equatable, Sendable {
     let checks: [PreflightCheck]
     let warnings: [String]
     let blockingIssues: [String]
+    let rolloutDecisionSummary: RolloutDecisionSummary?
+
+    init(
+        status: PreflightStatus,
+        configurationSource: ConfigurationSource,
+        checks: [PreflightCheck],
+        warnings: [String],
+        blockingIssues: [String],
+        rolloutDecisionSummary: RolloutDecisionSummary? = nil
+    ) {
+        self.status = status
+        self.configurationSource = configurationSource
+        self.checks = checks
+        self.warnings = warnings
+        self.blockingIssues = blockingIssues
+        self.rolloutDecisionSummary = rolloutDecisionSummary
+    }
+}
+
+struct RolloutDecisionSummary: Codable, Equatable, Sendable {
+    let schemaVersion: String
+    let authoritativeRecordID: String?
+    let runID: String?
+    let proposalID: String?
+    let proposalRevisionID: String?
+    let status: String
+    let backendDecision: String
+    let failureReasons: [String]
+    let waiverState: String
+    let waiverExpiresAt: String?
+    let enforcementMode: String
+    let enforcementModeReason: String?
+    let holdConditions: [String]
+    let rollbackDisposition: RollbackDisposition
+    let enabledState: String
+    let disabledReasonCode: String?
+    let actionID: String?
+    let operatorMessage: String
+    let sourceLane: String
+    let projectionIntegrity: String
+    let cutoverPolicyRevision: String?
+    let diagnosticRedaction: String
+    let nextSteps: [String]
+    let updatedAt: String?
+
+    struct RollbackDisposition: Codable, Equatable, Sendable {
+        let mode: String
+        let dataLossRisk: String
+        let steps: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case mode
+            case dataLossRisk = "data_loss_risk"
+            case steps
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case authoritativeRecordID = "authoritative_record_id"
+        case runID = "run_id"
+        case proposalID = "proposal_id"
+        case proposalRevisionID = "proposal_revision_id"
+        case status
+        case backendDecision = "backend_decision"
+        case failureReasons = "failure_reasons"
+        case waiverState = "waiver_state"
+        case waiverExpiresAt = "waiver_expires_at"
+        case enforcementMode = "enforcement_mode"
+        case enforcementModeReason = "enforcement_mode_reason"
+        case holdConditions = "hold_conditions"
+        case rollbackDisposition = "rollback_disposition"
+        case enabledState = "enabled_state"
+        case disabledReasonCode = "disabled_reason_code"
+        case actionID = "action_id"
+        case operatorMessage = "operator_message"
+        case sourceLane = "source_lane"
+        case projectionIntegrity = "projection_integrity"
+        case cutoverPolicyRevision = "cutover_policy_revision"
+        case diagnosticRedaction = "diagnostic_redaction"
+        case nextSteps = "next_steps"
+        case updatedAt = "updated_at"
+    }
 }
 
 enum PreflightStatus: String, Codable, Equatable, Sendable {

@@ -85,6 +85,7 @@ fn start_run_cmd() -> Command {
         workflow_yaml_path: workflow.to_string_lossy().into_owned(),
         agent_catalog_yaml_path: catalog.to_string_lossy().into_owned(),
         review_routing_json: None,
+        rollout_contract_preflight_policy_json: None,
     })
 }
 

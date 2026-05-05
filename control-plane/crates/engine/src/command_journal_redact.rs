@@ -21,6 +21,7 @@
 //! | `StartRun`           | `workflow_yaml_path`           | preserve   |
 //! | `StartRun`           | `agent_catalog_yaml_path`      | preserve   |
 //! | `StartRun`           | `delivery_configuration_json`  | **redact** |
+//! | `StartRun`           | `rollout_contract_preflight_policy_json` | preserve |
 //! | `ApproveStage`       | `run_id`, `stage_id`           | preserve   |
 //! | `ApproveStage`       | `comment`                      | **redact** |
 //! | `RejectStage`        | `run_id`, `stage_id`           | preserve   |
@@ -228,6 +229,7 @@ mod tests {
             workflow_yaml_path: "examples/workflows/w.yaml".into(),
             agent_catalog_yaml_path: "examples/agents/a.yaml".into(),
             review_routing_json: None,
+            rollout_contract_preflight_policy_json: None,
         })
     }
 

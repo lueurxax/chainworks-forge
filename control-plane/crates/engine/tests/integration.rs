@@ -4828,6 +4828,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: delivery_configuration_json.clone(),
                 review_routing_json: None,
+                rollout_contract_preflight_policy_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -5775,6 +5776,7 @@ async fn delivery_preflight_success_persists_run_owned_result() {
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
                 review_routing_json: None,
+                rollout_contract_preflight_policy_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -5829,6 +5831,7 @@ async fn delivery_preflight_failure_blocks_before_run_creation() {
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
                 review_routing_json: None,
+                rollout_contract_preflight_policy_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -5868,6 +5871,7 @@ async fn release_workflow_without_delivery_configuration_blocks_before_run_creat
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: None,
                 review_routing_json: None,
+                rollout_contract_preflight_policy_json: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -11801,6 +11805,7 @@ fn test_runs_start_does_not_accept_chainworks_meta_root_override() {
         agent_catalog_yaml_path: "/tmp/cat.yaml".into(),
         delivery_configuration_json: None,
         review_routing_json: None,
+        rollout_contract_preflight_policy_json: None,
     };
     // If this compiles, StartRunCmd has no chainworks_meta_root field — the daemon owns it.
     let _ = cmd;

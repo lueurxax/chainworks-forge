@@ -1,0 +1,12 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": ["proposal-example"],
+  "readback_lanes": ["run_report"],
+  "readback_fields": ["status"],
+  "hold_conditions": [],
+  "rollback_disposition": {
+    "mode": "feature_flag_disable",
+    "data_loss_risk": "none"
+  }
+}

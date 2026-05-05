@@ -196,6 +196,10 @@ PROPOSAL_044_TESTS=(
   "test_state_11_to_state_12_happy_path"
 )
 
+PROPOSAL_084_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal084Tests"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -1679,6 +1683,7 @@ Available gates:
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
+  proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -3771,6 +3776,141 @@ PLIST
       cargo run -p db --bin p054_v1_retirement_check
     )
     log "Proposal 054 v1 fallback retirement check passed"
+    ;;
+  proposal-084|p084)
+    log "Proposal 084 gate: executable rollout gates and observability contract"
+    python3 - <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# AC-001: Template exists and contains required sections
+template = root / "docs/reference/executable-rollout-gate-template.md"
+if not template.exists():
+    raise SystemExit("proposal-084: missing docs/reference/executable-rollout-gate-template.md")
+text = template.read_text()
+for required in [
+    "rollout_contract_v1",
+    "rollout_contract_check_v1",
+    "operator_readback_v1",
+    "schema_version",
+    "applicability",
+    "gate_aliases",
+    "hold_conditions",
+    "rollback_disposition",
+    "metrics",
+    "cutover",
+    "safe path",
+]:
+    if required.lower() not in text.lower():
+        raise SystemExit(
+            f"proposal-084: template missing required section or term: {required!r}"
+        )
+
+# AC-002, AC-003, AC-007: Linter exists and correctly rejects negative fixtures
+linter = root / "scripts/lint-rollout-contract"
+if not linter.exists():
+    raise SystemExit("proposal-084: missing scripts/lint-rollout-contract")
+
+linter_negative_fixtures = [
+    "docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json",
+    "docs/evidence/rollout-contract/negative/missing-metrics-p017-style.json",
+    "docs/evidence/rollout-contract/negative/missing-operator-decision-fields.json",
+    "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json",
+]
+for fixture_path in linter_negative_fixtures:
+    full = root / fixture_path
+    if not full.exists():
+        raise SystemExit(f"proposal-084: missing negative fixture {fixture_path}")
+    result = subprocess.run(
+        [sys.executable, str(linter), str(full)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        raise SystemExit(
+            f"proposal-084: linter passed on negative fixture {fixture_path} "
+            f"— expected failure but got: {result.stdout.strip()}"
+        )
+
+# Documentation-only negative fixtures: existence + valid JSON
+doc_only_fixtures = [
+    "docs/evidence/rollout-contract/negative/missing-template.json",
+    "docs/evidence/rollout-contract/negative/run-start-missing-contract-enqueues-work.json",
+    "docs/evidence/rollout-contract/negative/p084-self-contract-missing-readback-field.json",
+]
+for fixture_path in doc_only_fixtures:
+    full = root / fixture_path
+    if not full.exists():
+        raise SystemExit(f"proposal-084: missing negative fixture {fixture_path}")
+    try:
+        json.loads(full.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-084: invalid JSON in {fixture_path}: {exc}") from exc
+
+# AC-004, AC-006: P084 self-contract fixture has all required operator readback fields
+p084_fixture = (
+    root / "docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json"
+)
+if not p084_fixture.exists():
+    raise SystemExit(
+        "proposal-084: missing "
+        "docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json"
+    )
+try:
+    fixture = json.loads(p084_fixture.read_text())
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"proposal-084: invalid JSON in p084-full-surface.fixture.json: {exc}") from exc
+
+required_fields = [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+]
+for field in required_fields:
+    if field not in fixture:
+        raise SystemExit(
+            f"proposal-084: p084-full-surface.fixture.json missing required field: {field}"
+        )
+
+# AC-002: test-gates.md documents the gate
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-084: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required in [
+    "### `proposal-084|p084`",
+    "rollout_contract_v1",
+    "negative fixture",
+    "lint-rollout-contract",
+]:
+    if required not in gates_text:
+        raise SystemExit(
+            f"proposal-084: docs/reference/test-gates.md missing required content: {required!r}"
+        )
+
+print("proposal-084 all gate checks passed")
+PY
+    run_targeted_tests "proposal-084" "${PROPOSAL_084_SWIFT_TESTS[@]}"
+    log "Proposal 084 gate passed"
     ;;
   full)
     check_idle_environment strict

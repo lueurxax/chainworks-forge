@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""lint-rollout-contract: pure validator for rollout_contract_v1 documents.
+
+Usage:
+    ./scripts/lint-rollout-contract <path-to-rollout-contract.json>
+
+Exit 0 = pass (prints PASS)
+Exit 1 = fail (prints one FAIL: <reason> line per violation)
+Exit 2 = usage error
+
+Safety contract:
+  - Never executes shell commands, expands variables, or follows redirections.
+  - Never accesses the network.
+  - Never loads external plugins or FFI validators.
+  - Rejects absolute paths, parent-traversal (..),  oversized payloads (> 1 MiB),
+    unsafe control characters, and shell metacharacters in command strings.
+  - Reads only the single file provided as argument; no filesystem traversal.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+
+MAX_FILE_BYTES = 1_048_576  # 1 MiB
+
+SCHEMA_VERSION = "rollout_contract_v1"
+ALLOWED_APPLICABILITY = {"required", "not_applicable"}
+ALLOWED_DATA_LOSS_RISK = {"none", "low", "medium", "high"}
+ALLOWED_DECISION_VOCABULARY = {
+    "pass",
+    "fail",
+    "waived",
+    "not_applicable",
+    "timeout",
+    "cancelled",
+    "missing_contract",
+    "tamper_detected",
+    "stale",
+    "release",
+    "hold",
+    "waive",
+}
+ALLOWED_ENFORCEMENT_MODES = {"enforce", "permissive", "disabled"}
+ALLOWED_READBACK_LANES = {"run_report", "mcp", "release_receipt", "graphql"}
+SHELL_METACHARACTERS = frozenset("|&;$`><(){}")
+
+REQUIRED_WHEN_APPLICABLE = (
+    "gate_aliases",
+    "metrics",
+    "readback_lanes",
+    "readback_fields",
+    "hold_conditions",
+    "rollback_disposition",
+)
+
+ROLLBACK_DISPOSITION_REQUIRED = ("mode", "data_loss_risk")
+ALLOWED_TOP_LEVEL_FIELDS = {
+    "schema_version",
+    "applicability",
+    "gate_aliases",
+    "commands",
+    "migrations",
+    "metrics",
+    "readback_lanes",
+    "readback_fields",
+    "readback_fixture",
+    "operator_report_fields",
+    "hold_conditions",
+    "hold_conditions_detail",
+    "rollback_disposition",
+    "decision_vocabulary",
+    "negative_fixtures",
+    "not_applicable_justification",
+    "not_applicable_justifications",
+    "cutover_policy",
+    "operator_message",
+}
+ALLOWED_COMMAND_FIELDS = {"allowlist", "commentary"}
+ALLOWED_MIGRATION_FIELDS = {"not_applicable", "justification", "description"}
+ALLOWED_METRIC_FIELDS = {"adoption_metric", "operational_metrics"}
+ALLOWED_ROLLBACK_FIELDS = {"mode", "data_loss_risk", "steps"}
+ALLOWED_CUTOVER_FIELDS = {
+    "revision",
+    "enforcement_mode_at_cutover",
+    "applicable_to",
+    "grandfathered_rendering",
+    "effective_timestamp_iso8601",
+}
+REQUIRED_OPERATOR_READBACK_FIELDS = (
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+)
+
+
+def _check_path_safety(value: str, context: str) -> list[str]:
+    failures: list[str] = []
+    if value.startswith("/"):
+        failures.append(f"unsafe_path: absolute path in {context}: {value!r}")
+        return failures
+    parts = PurePosixPath(value).parts
+    if ".." in parts:
+        failures.append(f"unsafe_path: parent traversal (..) in {context}: {value!r}")
+    return failures
+
+
+def _check_control_chars(value: str, context: str) -> list[str]:
+    for ch in value:
+        cp = ord(ch)
+        if cp < 0x20 and ch not in "\t\n\r":
+            return [f"control_characters: control character U+{cp:04X} in {context}"]
+    return []
+
+
+def _check_command_safety(cmd: str, context: str) -> list[str]:
+    failures: list[str] = []
+    for ch in SHELL_METACHARACTERS:
+        if ch in cmd:
+            failures.append(
+                f"unsafe_command: shell metacharacter {ch!r} in {context}: {cmd!r}"
+            )
+            return failures
+    if cmd.startswith("/"):
+        failures.append(f"unsafe_command: absolute path in {context}: {cmd!r}")
+    if failures:
+        return failures
+    if not cmd.startswith("./scripts/"):
+        failures.append(
+            f"unsafe_command: command must start with './scripts/' in {context}: {cmd!r}"
+        )
+    return failures
+
+
+def _check_unknown_fields(
+    obj: dict[str, object], allowed: set[str], context: str
+) -> list[str]:
+    return [
+        f"unknown_field: {context}.{key} is not allowed"
+        for key in sorted(obj)
+        if key not in allowed
+    ]
+
+
+def _check_string_list(value: object, context: str, *, non_empty: bool) -> list[str]:
+    if not isinstance(value, list):
+        return [f"invalid_{context}: must be an array"]
+    if non_empty and not value:
+        return [f"empty_{context}: {context} must have at least one entry when applicability=required"]
+    failures: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            failures.append(f"invalid_{context}[{i}]: entry must be a string")
+        else:
+            failures.extend(_check_control_chars(item, f"{context}[{i}]"))
+    return failures
+
+
+def _check_secret_like_values(value: object, context: str) -> list[str]:
+    failures: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            lowered = key.lower()
+            if any(marker in lowered for marker in ("password", "token", "api_key", "apikey", "secret")):
+                failures.append(f"secret_like_field: {context}.{key} is not allowed")
+            failures.extend(_check_secret_like_values(nested, f"{context}.{key}"))
+    elif isinstance(value, list):
+        for i, nested in enumerate(value):
+            failures.extend(_check_secret_like_values(nested, f"{context}[{i}]"))
+    elif isinstance(value, str):
+        failures.extend(_check_control_chars(value, context))
+        lowered = value.lower()
+        if any(marker in lowered for marker in ("password=", "token=", "api_key=", "apikey=", "secret=")):
+            failures.append(f"secret_like_value: {context} contains a secret-like assignment")
+    return failures
+
+
+def _is_iso8601(value: str) -> bool:
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def lint(path: str) -> list[str]:
+    p = Path(path)
+
+    if not p.exists():
+        return [f"file_not_found: {path}"]
+
+    size = p.stat().st_size
+    if size > MAX_FILE_BYTES:
+        return [f"oversized_payload: file size {size} exceeds 1 MiB limit"]
+
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"encoding_error: {exc}"]
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return [f"invalid_json: {exc}"]
+
+    if not isinstance(data, dict):
+        return ["invalid_json: top-level value must be a JSON object"]
+
+    failures: list[str] = []
+    failures.extend(_check_unknown_fields(data, ALLOWED_TOP_LEVEL_FIELDS, "rollout_contract_v1"))
+    failures.extend(_check_secret_like_values(data, "rollout_contract_v1"))
+
+    # schema_version
+    sv = data.get("schema_version")
+    if sv is None:
+        failures.append("missing_schema_version: schema_version field is required")
+    elif sv != SCHEMA_VERSION:
+        failures.append(
+            f"invalid_schema_version: expected {SCHEMA_VERSION!r}, got {sv!r}"
+        )
+
+    # applicability
+    applicability = data.get("applicability")
+    if applicability is None:
+        failures.append("missing_applicability: applicability field is required")
+    elif applicability not in ALLOWED_APPLICABILITY:
+        failures.append(
+            f"invalid_applicability: {applicability!r} not in {sorted(ALLOWED_APPLICABILITY)}"
+        )
+
+    if applicability == "not_applicable":
+        just = data.get("not_applicable_justification") or data.get(
+            "not_applicable_justifications"
+        )
+        if not just:
+            failures.append(
+                "missing_not_applicable_justification: "
+                "applicability=not_applicable requires not_applicable_justification"
+            )
+        return failures
+
+    if applicability != "required":
+        return failures
+
+    # required fields when applicability=required
+    for field in REQUIRED_WHEN_APPLICABLE:
+        if field not in data:
+            failures.append(f"missing_{field}: {field} is required when applicability=required")
+
+    # array fields must be non-empty
+    for field in ("gate_aliases", "readback_lanes"):
+        val = data.get(field)
+        if val is not None:
+            failures.extend(_check_string_list(val, field, non_empty=True))
+
+    lanes = data.get("readback_lanes")
+    if isinstance(lanes, list):
+        for i, lane in enumerate(lanes):
+            if isinstance(lane, str) and lane not in ALLOWED_READBACK_LANES:
+                failures.append(
+                    f"invalid_readback_lanes[{i}]: {lane!r} not in {sorted(ALLOWED_READBACK_LANES)}"
+                )
+
+    for field in ("readback_fields", "operator_report_fields"):
+        val = data.get(field)
+        if val is not None:
+            failures.extend(_check_string_list(val, field, non_empty=True))
+            if isinstance(val, list):
+                present = {item for item in val if isinstance(item, str)}
+                for required in REQUIRED_OPERATOR_READBACK_FIELDS:
+                    if required not in present:
+                        failures.append(
+                            f"missing_{field}.{required}: {field} must include operator_readback_v1 field {required}"
+                        )
+
+    # hold_conditions must be a list (can be empty)
+    hc = data.get("hold_conditions")
+    if hc is not None:
+        failures.extend(_check_string_list(hc, "hold_conditions", non_empty=False))
+
+    hcd = data.get("hold_conditions_detail")
+    if hcd is not None:
+        failures.extend(_check_string_list(hcd, "hold_conditions_detail", non_empty=False))
+
+    # rollback_disposition must have required sub-fields
+    rd = data.get("rollback_disposition")
+    if isinstance(rd, dict):
+        failures.extend(
+            _check_unknown_fields(rd, ALLOWED_ROLLBACK_FIELDS, "rollback_disposition")
+        )
+        for sub in ROLLBACK_DISPOSITION_REQUIRED:
+            if sub not in rd:
+                failures.append(
+                    f"missing_rollback_disposition.{sub}: "
+                    f"rollback_disposition.{sub} is required"
+                )
+        if "data_loss_risk" in rd and rd["data_loss_risk"] not in ALLOWED_DATA_LOSS_RISK:
+            failures.append(
+                f"invalid_rollback_disposition.data_loss_risk: {rd['data_loss_risk']!r} not in {sorted(ALLOWED_DATA_LOSS_RISK)}"
+            )
+        steps = rd.get("steps")
+        if steps is not None:
+            failures.extend(
+                _check_string_list(steps, "rollback_disposition.steps", non_empty=False)
+            )
+    elif rd is not None:
+        failures.append("invalid_rollback_disposition: rollback_disposition must be an object")
+
+    # metrics must define adoption_metric or operational_metrics
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        failures.extend(_check_unknown_fields(metrics, ALLOWED_METRIC_FIELDS, "metrics"))
+        if "adoption_metric" not in metrics and "operational_metrics" not in metrics:
+            failures.append(
+                "missing_metrics_content: "
+                "metrics must define adoption_metric or operational_metrics"
+            )
+        if "adoption_metric" in metrics and not isinstance(metrics["adoption_metric"], str):
+            failures.append("invalid_metrics.adoption_metric: must be a string")
+        if "operational_metrics" in metrics:
+            failures.extend(
+                _check_string_list(
+                    metrics["operational_metrics"],
+                    "metrics.operational_metrics",
+                    non_empty=True,
+                )
+            )
+    elif metrics is not None:
+        failures.append("invalid_metrics: metrics must be an object")
+
+    # commands: declarative allowlist safety
+    commands = data.get("commands")
+    if isinstance(commands, dict):
+        failures.extend(_check_unknown_fields(commands, ALLOWED_COMMAND_FIELDS, "commands"))
+        allowlist = commands.get("allowlist", [])
+        if not isinstance(allowlist, list):
+            failures.append("invalid_commands.allowlist: must be an array")
+        else:
+            for i, cmd in enumerate(allowlist):
+                if not isinstance(cmd, str):
+                    failures.append(
+                        f"invalid_commands.allowlist[{i}]: entry must be a string"
+                    )
+                else:
+                    failures.extend(
+                        _check_command_safety(cmd, f"commands.allowlist[{i}]")
+                    )
+        commentary = commands.get("commentary")
+        if commentary is not None and not isinstance(commentary, str):
+            failures.append("invalid_commands.commentary: must be a string")
+    elif commands is not None:
+        failures.append("invalid_commands: commands must be an object")
+
+    migrations = data.get("migrations")
+    if isinstance(migrations, dict):
+        failures.extend(_check_unknown_fields(migrations, ALLOWED_MIGRATION_FIELDS, "migrations"))
+        if "not_applicable" in migrations and not isinstance(
+            migrations["not_applicable"], bool
+        ):
+            failures.append("invalid_migrations.not_applicable: must be a boolean")
+        if migrations.get("not_applicable") is True and not migrations.get("justification"):
+            failures.append(
+                "missing_migrations.justification: migrations.not_applicable=true requires justification"
+            )
+        for field in ("justification", "description"):
+            if field in migrations and not isinstance(migrations[field], str):
+                failures.append(f"invalid_migrations.{field}: must be a string")
+    elif migrations is not None:
+        failures.append("invalid_migrations: migrations must be an object")
+
+    # path safety: readback_fixture
+    rf = data.get("readback_fixture")
+    if isinstance(rf, str):
+        failures.extend(_check_path_safety(rf, "readback_fixture"))
+
+    # path safety: negative_fixtures values
+    neg = data.get("negative_fixtures")
+    if isinstance(neg, dict):
+        for k, v in neg.items():
+            if isinstance(v, str):
+                failures.extend(_check_path_safety(v, f"negative_fixtures.{k}"))
+            else:
+                failures.append(f"invalid_negative_fixtures.{k}: value must be a string path")
+    elif neg is not None:
+        failures.append("invalid_negative_fixtures: negative_fixtures must be an object")
+
+    # duplicate source: inline + sidecar
+    if "rollout_contract_v1" in data and "rollout_contract_sidecar" in data:
+        failures.append(
+            "duplicate_source: both inline rollout_contract_v1 and "
+            "rollout_contract_sidecar keys present — only one source is allowed"
+        )
+
+    decision_vocabulary = data.get("decision_vocabulary")
+    if decision_vocabulary is not None:
+        failures.extend(
+            _check_string_list(decision_vocabulary, "decision_vocabulary", non_empty=True)
+        )
+        if isinstance(decision_vocabulary, list):
+            for i, entry in enumerate(decision_vocabulary):
+                if isinstance(entry, str) and entry not in ALLOWED_DECISION_VOCABULARY:
+                    failures.append(
+                        f"invalid_decision_vocabulary[{i}]: {entry!r} not in {sorted(ALLOWED_DECISION_VOCABULARY)}"
+                    )
+
+    cutover = data.get("cutover_policy")
+    if isinstance(cutover, dict):
+        failures.extend(_check_unknown_fields(cutover, ALLOWED_CUTOVER_FIELDS, "cutover_policy"))
+        for field in ("revision", "applicable_to"):
+            if not isinstance(cutover.get(field), str) or not cutover.get(field):
+                failures.append(f"missing_cutover_policy.{field}: must be a non-empty string")
+        mode = cutover.get("enforcement_mode_at_cutover")
+        if mode is not None and mode not in ALLOWED_ENFORCEMENT_MODES:
+            failures.append(
+                f"invalid_cutover_policy.enforcement_mode_at_cutover: {mode!r} not in {sorted(ALLOWED_ENFORCEMENT_MODES)}"
+            )
+        grandfathered = cutover.get("grandfathered_rendering")
+        if grandfathered is not None and grandfathered != "not_applicable":
+            failures.append(
+                "invalid_cutover_policy.grandfathered_rendering: must be 'not_applicable'"
+            )
+        effective_at = cutover.get("effective_timestamp_iso8601")
+        if effective_at is not None:
+            if not isinstance(effective_at, str) or not _is_iso8601(effective_at):
+                failures.append(
+                    "invalid_cutover_policy.effective_timestamp_iso8601: must be an ISO-8601 timestamp string"
+                )
+    elif cutover is not None:
+        failures.append("invalid_cutover_policy: cutover_policy must be an object")
+
+    # control-character checks on string fields
+    for field in ("operator_message", "not_applicable_justification"):
+        val = data.get(field)
+        if isinstance(val, str):
+            failures.extend(_check_control_chars(val, field))
+
+    return failures
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print(
+            "Usage: lint-rollout-contract <path-to-rollout-contract.json>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    path = sys.argv[1]
+    failures = lint(path)
+
+    if failures:
+        for failure in failures:
+            print(f"FAIL: {failure}")
+        sys.exit(1)
+    else:
+        print("PASS")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
