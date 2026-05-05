@@ -5,7 +5,7 @@
 | Date | 2026-04-25 |
 | Status | Correction / Amendment |
 | Corrects | `068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md` |
-| Depends on | Proposal 072 |
+| Depends on | [UI action boundary](../reference/ui-action-boundary.md) |
 | Goal | Update P068 so it reflects the final target boundary: agents and automations use MCP only; SwiftUI uses GraphQL for reads, subscriptions, and approval-only mutations. |
 
 ---
@@ -21,7 +21,7 @@ P068 mostly has the right boundary:
 
 But P068 currently phrases GraphQL as primarily the UI read path and only loosely allows UI mutations when explicitly required.
 
-The target state is now sharper:
+The implemented UI action boundary is sharper:
 
 > SwiftUI uses GraphQL for reads, subscriptions, and approval-only mutations.  
 > All non-approval operator actions are MCP-only.

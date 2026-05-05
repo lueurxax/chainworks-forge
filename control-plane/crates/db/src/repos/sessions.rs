@@ -454,6 +454,25 @@ pub async fn update_generation_usage(
     Ok(())
 }
 
+pub async fn touch_generation_activity(
+    pool: &SqlitePool,
+    generation_id: &str,
+    last_activity_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE session_generations
+           SET last_activity_at = ?1
+           WHERE id = ?2
+             AND status = 'active'"#,
+    )
+    .bind(last_activity_at.to_rfc3339())
+    .bind(generation_id)
+    .execute(pool)
+    .await
+    .context("touch session generation activity")?;
+    Ok(())
+}
+
 pub async fn count_generation_events(
     pool: &SqlitePool,
     generation_id: &str,
@@ -510,6 +529,25 @@ pub async fn update_generation_runtime_session(
     .await
     .context("update session generation runtime session")?;
     Ok(())
+}
+
+/// P066 T14: Return all session generation IDs that are currently live
+/// (active_generation_id IS NOT NULL AND lineage not closed).
+/// Used by startup recovery to identify orphan toolchain session-scoped roots.
+pub async fn list_live_session_generation_ids(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"SELECT active_generation_id
+           FROM session_lineages
+           WHERE active_generation_id IS NOT NULL
+             AND closed_at IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("list live session generation ids")?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 fn parse_generation_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionGeneration> {

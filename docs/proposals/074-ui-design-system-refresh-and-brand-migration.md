@@ -5,7 +5,7 @@
 | Date | 2026-04-26 |
 | Status | Draft |
 | Author | Engineering + Design-led implementation |
-| Depends on | Proposal 031, Proposal 068, Proposal 072 |
+| Depends on | Proposal 031, Proposal 068, [UI action boundary](../reference/ui-action-boundary.md) |
 | Target State | Native macOS SwiftUI client over GraphQL read projections + MCP control |
 | Goal | Migrate the Chainworks Forge operator app from the previous visual shell to the new `docs/brand` design system, with Apple HIG-aligned tokens, copy, and surfaces while preserving existing product behaviour and control boundaries. |
 
@@ -140,4 +140,3 @@ Without a dedicated proposal, UI implementation work remains ad hoc and visually
 ## 8. Completion signal
 
 This proposal is complete when the app design system migration is merged behind a stable branch point and the run-oriented operator screens pass visual review against the brand guide.
-

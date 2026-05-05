@@ -121,7 +121,12 @@ Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
 
-Mutations: `startRun`, `approveStage`, `rejectStage`, `retryStage`, `cancelRun`.
+Mutations: `approveApproval`, `rejectApproval`.
+
+GraphQL is the macOS UI read/subscription surface plus the approval-gate
+settlement surface. Non-approval operator commands such as starting runs,
+retrying stages, cancelling runs, resolving workflow conflicts, and recovery
+actions are MCP-only.
 
 Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
 
@@ -150,6 +155,9 @@ Tools are namespaced:
 
 **Operator Retry Instruction readback (P065):**
 `runs.get` includes compact retry-instruction provenance. `reports.get` includes full binding and delivery records, including raw text for operator-class principals.
+
+**Toolchain Mapping Readback:**
+`reports.get` includes a `toolchain_mapping` summary for each execution, detailing mapping status, effective scope, and relative root suffixes.
 
 Resources follow two URI families:
 
@@ -308,13 +316,14 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 
 | Adapter | Provider name | Binary env var |
 |---|---|---|
-| `ClaudeAgentAdapter` | `claude` | `CLAUDE_ACP_BIN` |
-| `CodexAdapter` | `codex` | `CODEX_ACP_BIN` |
-| `GeminiCliAdapter` | `gemini` | `GEMINI_ACP_BIN` |
-| `AuggieAdapter` | `auggie` | `AUGGIE_ACP_BIN` |
-| `JunieAdapter` | `junie` | `JUNIE_ACP_BIN` |
+| `ClaudeAgentAdapter` | `claude` | `CHAINWORKS_CLAUDE_ACP_BINARY` |
+| `CodexAdapter` | `codex` | `CHAINWORKS_CODEX_ACP_BINARY` |
+| `GeminiCliAdapter` | `gemini` | `CHAINWORKS_GEMINI_ACP_BINARY` |
+| `AuggieAdapter` | `auggie` | `CHAINWORKS_AUGGIE_ACP_BINARY` |
+| `JunieAdapter` | `junie` | `CHAINWORKS_JUNIE_ACP_BINARY` |
 
 Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called.
+`JunieAdapter` passes `--acp true` at launch so the local Junie CLI enters ACP JSON-RPC mode.
 
 ### Timeouts
 
@@ -375,32 +384,54 @@ write coordination layer:
 
 ### Provider runtime homes and toolchain caches
 
-Provider runtime homes are isolated from writable toolchain cache roots. The
-Codex adapter derives a per-session toolchain root and publishes both
-`CHAINWORKS_TOOLCHAIN_HOME` and `TOOLCHAIN_HOME` to the provider process. Rust
-tooling uses subpaths under that root for `TMPDIR`, `RUSTUP_HOME`,
-`CARGO_HOME`, and `CARGO_TARGET_DIR` so generated build/cache output does not
-land inside read-only provider runtime homes or shared repository-global build
-directories.
+Provider runtime homes are isolated from writable toolchain cache roots. Each
+agent entry in the catalog can define a `toolchain_cache_policy` to control how
+build and toolchain caches are mapped and isolated.
 
-The scheduler stays language-neutral: it allocates bounded execution capacity
-and writable roots, while provider adapters map the generic toolchain root to
-tool-specific environment variables or command arguments. Swift/Xcode and Go
-adapter-specific mappings extend this same contract; they must not add
-language-specific scheduler capacity dimensions.
+**Policy Scope:**
+- `run` (default for Xcode): Cache root is tied to the run ID. Preserves 
+  incremental build value across sessions in the same run. Serialized behind 
+  an exclusive per-run lease for host-executed Xcode tools.
+- `session` (default for Go): Cache root is tied to the ACP session 
+  generation. Naturally resets after crashes or explicit session reuse failure.
+
+**Adapter-Specific Mappings:**
+- **Xcode**: Redirects `DerivedData`, `SourcePackages`, and `TMPDIR` via 
+  `-derivedDataPath` and `-clonedSourcePackagesDirPath` arguments plus 
+  environment shaping. Same-run Xcode work is serialized to prevent 
+  concurrent DerivedData corruption.
+- **Go**: Redirects `GOCACHE`, `GOMODCACHE`, `GOPATH`, and `TMPDIR`. 
+  Enforces `GOENV=off` to prevent host-global overrides.
+
+The scheduler remains language-neutral: it allocates bounded execution capacity 
+and writable roots, while provider adapters map the generic toolchain root to 
+tool-specific environment variables or command arguments.
+
+**Diagnostics and Readback:**
+Each `AgentExecution` records `actualToolchainMappingDiagnostics` (GraphQL) / 
+`actual_toolchain_mapping_diagnostics` (MCP/Report). This document includes 
+setup status, effective scope, created directories, and any validation or 
+queue-wait latency.
+
+**Housekeeping and Cleanup:**
+- **Startup Recovery**: `startupRecoverySummary.toolchainCache` reports on 
+  session-scoped root reclamation after daemon restarts.
+- **Periodic Housekeeping**: `toolchainCacheHousekeepingSummary` reports on 
+  run-scoped root pruning (default 7-day retention) and disk-pressure 
+  eviction health.
 
 ### Schema
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `028_p017_phase_b_mediation.sql`; retained historical alias):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
-| `agent_executions` | Per-agent invocation records (provider, model, status, **owner_kind**, **owner_id**, **lead_mediation_record_id**, **origin_stage_id**, **origin_stage_execution_id**, **stage_execution_id**) |
+| `agent_executions` | Per-agent invocation records (status, **actual_toolchain_mapping_diagnostics_json**, etc.) |
 | `workflow_conflicts` | Blocking graph-authority conflicts (run_id, fingerprint, status, reason, current_mediation_id) |
 | `workflow_advisory_rejections` | Non-blocking historical records of rejected agent hints |
 | `lead_conflict_mediations` | Durable mediation lifecycle (id, run_id, conflict_id, status, lead_agent_id, settlement_result) |
@@ -427,7 +458,7 @@ migrated to a general owner model:
 - This allows mediation-owned executions to reuse the same retry, quota,
   artifact, and cost infrastructure as stage-owned executions.
 
-**Projections and read-model tables** (e.g., `002_projections.sql`, `021_scheduler_backpressure_foundation.sql`):
+**Projections and read-model tables** (e.g., `002_projections.sql`, `038_p066_cleanup_readbacks.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -435,6 +466,7 @@ migrated to a general owner model:
 | `stage_summaries` | Materialized stage projections (status, artifacts, approvals) |
 | `scheduler_queue_summaries` | Durable aggregate readback for queued/backpressured work |
 | `scheduler_health_snapshots` | Durable health readback for counts, pressure, latency |
+| `toolchain_cache_housekeeping_readbacks` | Low-churn projection for periodic toolchain cleanup health |
 | `approval_inbox` | Pending approval projection for operator surfaces |
 | `artifact_index` | Artifact discovery projection (format, pinned, report kind) |
 | `artifact_contract_summaries` | Structured verification truth for implementation assessment |
@@ -569,11 +601,11 @@ The service returns a `RecoverySummary` with counts of inspected runs, repaired 
 
 Provider binary paths (required when executing agents):
 
-- `CLAUDE_ACP_BIN` -- path to Claude Agent ACP binary
-- `CODEX_ACP_BIN` -- path to Codex ACP binary
-- `GEMINI_ACP_BIN` -- path to Gemini CLI ACP binary
-- `AUGGIE_ACP_BIN` -- path to Auggie ACP binary
-- `JUNIE_ACP_BIN` -- path to Junie ACP binary
+- `CHAINWORKS_CLAUDE_ACP_BINARY` -- path to Claude Agent ACP binary
+- `CHAINWORKS_CODEX_ACP_BINARY` -- path to Codex ACP binary
+- `CHAINWORKS_GEMINI_ACP_BINARY` -- path to Gemini CLI ACP binary
+- `CHAINWORKS_AUGGIE_ACP_BINARY` -- path to Auggie ACP binary
+- `CHAINWORKS_JUNIE_ACP_BINARY` -- path to Junie ACP binary
 
 ### Startup sequence
 

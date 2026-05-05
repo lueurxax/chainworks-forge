@@ -7,10 +7,63 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ── P066: Toolchain cache policy ──────────────────────────────────────────────
+
+/// Toolchain scope for xcode or go families.
+/// Only `run` and `session` are valid; unknown values fail YAML compilation.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolchainCacheScope {
+    Run,
+    Session,
+}
+
+/// P066: Per-agent toolchain cache mapping policy from agents[].toolchain_cache_policy.
+///
+/// `deny_unknown_fields` ensures unknown keys fail compilation rather than being
+/// silently dropped.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainCachePolicyYaml {
+    /// Format version — must be 1. Required field.
+    pub version: u32,
+    /// Whether toolchain cache mapping is enabled.
+    pub enabled: bool,
+    /// Xcode cache scope: run | session. Defaults to run when enabled.
+    pub xcode_scope: Option<ToolchainCacheScope>,
+    /// Go cache scope: run | session. Defaults to session when enabled.
+    pub go_scope: Option<ToolchainCacheScope>,
+}
+
+impl ToolchainCachePolicyYaml {
+    /// Validate that `version` is exactly 1 (the only supported value).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.version != 1 {
+            anyhow::bail!(
+                "toolchain_cache_policy.version={} is not supported; only version 1 is valid",
+                self.version
+            );
+        }
+        Ok(())
+    }
+}
+
+/// P066: Format version written into catalog snapshots that contain
+/// toolchain_cache_policy entries. Value 1 is the only supported version.
+/// Pre-P066 snapshots that omit this field and have no toolchain_cache_policy
+/// entries decode as legacy_v0 (policy_absent). Snapshots that contain
+/// toolchain_cache_policy but omit the version, or carry an unsupported version,
+/// must be rejected as frozen_snapshot_contract_incompatible.
+pub const CATALOG_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
 /// Root of an agent catalog YAML file.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AgentCatalogFile {
     pub schema_version: Option<u32>,
+    /// P066: Frozen-snapshot compatibility gate for toolchain_cache_policy.
+    /// Set to 1 when any agent entry declares toolchain_cache_policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_snapshot_format_version: Option<u32>,
     pub app: Option<serde_yaml::Value>,
     pub paths: Option<HashMap<String, String>>,
     pub artifacts: Option<HashMap<String, String>>,
@@ -139,6 +192,9 @@ pub struct AgentEntry {
     /// P060: Routing metadata for deterministic reviewer selection.
     #[serde(default)]
     pub routing: Option<RoutingMetadataYaml>,
+    /// P066: Toolchain cache mapping policy. Absent = policy_absent (disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_cache_policy: Option<ToolchainCachePolicyYaml>,
 }
 
 /// P060: Routing metadata block on an agent catalog entry.
@@ -164,6 +220,14 @@ pub struct RoutingMetadataYaml {
     pub usually_pair_with: Vec<String>,
     #[serde(default)]
     pub close_alternatives: Vec<String>,
+    #[serde(default)]
+    pub strong_proposal_keywords: Vec<String>,
+    #[serde(default)]
+    pub strong_repo_files: Vec<String>,
+    #[serde(default)]
+    pub strong_repo_symbols: Vec<String>,
+    #[serde(default)]
+    pub score_weights: domain::routing::ScoreWeights,
 }
 
 /// Validate that an executable catalog has exactly one system lead with the
@@ -254,6 +318,51 @@ fn permission_profile_exists(permission_profiles: Option<&serde_yaml::Value>, na
         return false;
     };
     mapping.contains_key(serde_yaml::Value::String(name.to_string()))
+}
+
+/// P066: Validate frozen-snapshot format version compatibility for a catalog snapshot.
+///
+/// Rules:
+/// - Absent version + no toolchain_cache_policy entries → legacy_v0, returns Ok(false) (policy_absent).
+/// - Absent version + any toolchain_cache_policy present → incompatible, returns Err.
+/// - Version present but unsupported (> 1) → incompatible, returns Err.
+/// - Version = 1 → Ok(true) (P066-aware snapshot).
+///
+/// Returns `Ok(true)` for P066-aware snapshots, `Ok(false)` for legacy_v0.
+pub fn validate_catalog_snapshot_format_version(
+    catalog: &AgentCatalogFile,
+) -> anyhow::Result<bool> {
+    let has_policy = catalog
+        .agents
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|a| a.toolchain_cache_policy.is_some());
+
+    match catalog.catalog_snapshot_format_version {
+        None if !has_policy => Ok(false),
+        None => anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: catalog snapshot contains toolchain_cache_policy \
+             entries but omits catalog_snapshot_format_version; mixed-version snapshot is not supported"
+        ),
+        Some(CATALOG_SNAPSHOT_FORMAT_VERSION) => Ok(true),
+        Some(v) => anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: catalog snapshot requires format version {v} \
+             but this reader only supports version {CATALOG_SNAPSHOT_FORMAT_VERSION}"
+        ),
+    }
+}
+
+/// P066: Validate all toolchain_cache_policy entries in the catalog.
+pub fn validate_toolchain_cache_policies(catalog: &AgentCatalogFile) -> anyhow::Result<()> {
+    for agent in catalog.agents.as_deref().unwrap_or(&[]) {
+        if let Some(policy) = &agent.toolchain_cache_policy {
+            policy
+                .validate()
+                .map_err(|e| anyhow::anyhow!("agent '{}': {}", agent.id, e))?;
+        }
+    }
+    Ok(())
 }
 
 /// Load and parse an agent catalog YAML file.

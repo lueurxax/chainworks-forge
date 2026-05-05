@@ -37,6 +37,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 22] {
 }
 
 pub fn p064_operator_tool_enabled(tool_name: &str) -> bool {
+    let tool_name = canonical_tool_name(tool_name);
     !matches!(
         tool_name,
         "runs.main_sync.request"
@@ -49,6 +50,7 @@ pub fn p064_operator_tool_enabled(tool_name: &str) -> bool {
 }
 
 pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
+    let tool_name = canonical_tool_name(tool_name);
     match tool_name {
         "ideas.create" => Some(CapabilityToolId::IdeasCreate),
         "ideas.list" => Some(CapabilityToolId::IdeasList),
@@ -76,6 +78,38 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
         _ => None,
     }
+}
+
+pub fn canonical_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "ideas_create" => "ideas.create",
+        "ideas_list" => "ideas.list",
+        "runs_start" => "runs.start",
+        "runs_list" => "runs.list",
+        "runs_get" => "runs.get",
+        "runs_main_sync_request" => "runs.main_sync.request",
+        "runs_main_sync_retry" => "runs.main_sync.retry",
+        "runs_main_sync_set_override" => "runs.main_sync.set_override",
+        "runs_main_sync_repair_state" => "runs.main_sync.repair_state",
+        "runs_main_sync_record_recovery_decision" => "runs.main_sync.record_recovery_decision",
+        "runs_knowledge_capsule_ignore" => "runs.knowledge_capsule.ignore",
+        "runs_cancel" => "runs.cancel",
+        "approvals_list" => "approvals.list",
+        "approvals_resolve" => "approvals.resolve",
+        "stages_retry" => "stages.retry",
+        "workflow_conflicts_resolve" => "workflow_conflicts.resolve",
+        "reports_get" => "reports.get",
+        "artifacts_override_contract" => "artifacts.override_contract",
+        "steward_run_analysis" => "steward.run_analysis",
+        "steward_list_analyses" => "steward.list_analyses",
+        "steward_get_analysis" => "steward.get_analysis",
+        _ => tool_name,
+    }
+}
+
+pub fn codex_compatible_tool(mut tool: McpTool) -> McpTool {
+    tool.name = tool.name.replace('.', "_");
+    tool
 }
 
 pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
@@ -182,6 +216,14 @@ mod tests {
         assert_eq!(
             super::capability_id_for("workflow_conflicts.resolve"),
             Some(CapabilityToolId::WorkflowConflictsResolve)
+        );
+        assert_eq!(
+            super::capability_id_for("workflow_conflicts_resolve"),
+            Some(CapabilityToolId::WorkflowConflictsResolve)
+        );
+        assert_eq!(
+            super::capability_id_for("runs_list"),
+            Some(CapabilityToolId::RunsList)
         );
         assert_eq!(
             super::mcp_tool_for(CapabilityToolId::StewardGetAnalysis).name,

@@ -88,6 +88,70 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server that emits prompt progress, waits briefly,
+    /// and only then sends the terminal `session/prompt` response. Tests use
+    /// this to prove live prompt activity is observable before settlement.
+    pub fn create_delayed_prompt_progress_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_delayed_prompt_progress.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "result": {"protocolVersion": 1, "serverInfo": {"name": "progress-fixture", "version": "0.0.1"}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {}).get("cwd", "/tmp")
+session_id = "fixture-session-delayed-progress"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+send({"jsonrpc": "2.0", "method": "session/update",
+      "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": "working..."}}})
+time.sleep(2.0)
+
+artifact_path = os.path.join(cwd, "result.json")
+with open(artifact_path, "w") as f:
+    f.write('{"ok": true}\n')
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+
+try:
+    recv()
+except Exception:
+    pass
+
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     pub fn create_set_mode_script(
         tmpdir: &std::path::Path,
         observed_mode_path: &std::path::Path,
@@ -139,6 +203,114 @@ sys.exit(0)
 "#,
             observed_mode_path = observed_mode_path.to_string_lossy().to_string(),
         );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    pub fn create_reject_required_config_option_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_reject_required_config.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "result": {"protocolVersion": 1, "serverInfo": {"name": "required-config-fixture", "version": "0.0.1"}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-required-config"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/set_config_option":
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "error": {"code": -32000, "message": "model unavailable"}})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    pub fn create_model_config_alias_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_model_config_alias.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "result": {"protocolVersion": 1, "serverInfo": {"name": "model-config-fixture", "version": "0.0.1"}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-model-config"
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "result": {
+          "sessionId": session_id,
+          "configOptions": [
+              {"id": "model", "name": "Model", "options": [
+                  {"value": "default", "name": "Default (recommended)", "description": "Opus 4.7 with 1M context - Most capable for complex work"},
+                  {"value": "sonnet", "name": "Sonnet", "description": "Sonnet 4.6 - Best for everyday tasks"},
+                  {"value": "haiku", "name": "Haiku", "description": "Haiku 4.5 - Fastest for quick answers"}
+              ]}
+          ]
+      }})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/set_config_option":
+    sys.exit(1)
+params = msg.get("params", {})
+if params.get("configId") != "model" or params.get("value") != "default":
+    send({"jsonrpc": "2.0", "id": msg["id"],
+          "error": {"code": -32000, "message": "unexpected config value", "data": params}})
+    sys.exit(0)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+sys.exit(0)
+"#;
         std::fs::write(&script, code).unwrap();
         let mut p = std::fs::metadata(&script).unwrap().permissions();
         p.set_mode(0o755);
@@ -987,6 +1159,79 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Like `create_broker_attach_session_script`, but fails the real
+    /// `session/new` path unless the broker warmup marker exists first.
+    pub fn create_broker_attach_requires_warmup_script(
+        tmpdir: &std::path::Path,
+        capture_path: &std::path::Path,
+        warmup_marker_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_broker_attach_requires_warmup.py");
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, pathlib
+
+capture_path = pathlib.Path({capture_path:?})
+warmup_marker_path = pathlib.Path({warmup_marker_path:?})
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    return json.loads(stripped)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{
+    "jsonrpc": "2.0",
+    "id": msg["id"],
+    "result": {{
+        "protocolVersion": 1,
+        "serverInfo": {{"name": "broker-attach-warmup-fixture", "version": "0.0.1"}},
+        "mcpCapabilities": {{"http": True}}
+    }}
+}})
+
+msg = recv()
+if msg is None:
+    sys.exit(0)
+if not warmup_marker_path.exists():
+    send({{"jsonrpc": "2.0", "id": msg["id"], "error": {{"code": -32000, "message": "warmup marker missing before session/new"}}}})
+    sys.exit(2)
+capture_path.write_text(json.dumps(msg.get("params", {{}})))
+session_id = "fixture-session-broker-attach-warmup"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+
+try:
+    recv()
+except Exception:
+    pass
+
+sys.exit(0)
+"#,
+            capture_path = capture_path.to_string_lossy(),
+            warmup_marker_path = warmup_marker_path.to_string_lossy(),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Like `create_broker_attach_session_script`, but keeps the session
     /// process alive during `session/close` until the test creates
     /// `allow_close_path`.
@@ -1109,6 +1354,8 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     }
 }
 
@@ -1159,6 +1406,8 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1232,6 +1481,8 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1290,6 +1541,8 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1353,6 +1606,8 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1423,6 +1678,8 @@ async fn mcp_servers_session_new_serialization_tests() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1486,6 +1743,8 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1547,6 +1806,8 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
     let config = AcpSessionConfig {
         set_mode_after_session_new: true,
@@ -1567,7 +1828,136 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn transport_fails_when_required_config_option_is_rejected() {
+    use acp::transport::{AcpSessionConfig, AcpTransportSession};
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_reject_required_config_option_script(tmp.path());
+    let child = Command::new(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: Some("haiku".into()),
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+    let config = AcpSessionConfig {
+        required_config_options: vec![("model".to_string(), "haiku".to_string())],
+        ..AcpSessionConfig::default()
+    };
+
+    let err = match AcpTransportSession::start(child, &req, &config).await {
+        Ok(_) => panic!("required model config rejection must fail session startup"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("required session/set_config_option rejected for model"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transport_resolves_required_model_alias_from_session_config_options() {
+    use acp::transport::{AcpSessionConfig, AcpTransportSession};
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_model_config_alias_script(tmp.path());
+    let child = Command::new(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_test".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: Some("opus".into()),
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "test prompt".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+    let config = AcpSessionConfig {
+        required_config_options: vec![("model".to_string(), "opus".to_string())],
+        ..AcpSessionConfig::default()
+    };
+
+    AcpTransportSession::start(child, &req, &config)
+        .await
+        .expect("model alias should resolve to the provider-advertised option value");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn adapter_launch_and_session_specs_are_prepared_separately() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
     use acp::adapters::codex::CodexAdapter;
     use acp::adapters::gemini::GeminiCliAdapter;
     use acp::adapters::{AcpAdapter, LaunchResourceGuard};
@@ -1606,6 +1996,8 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -1635,6 +2027,21 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
     assert_eq!(launch_spec.binary_path, "/bin/gemini-fixture");
     assert_eq!(launch_spec.args, vec!["--acp"]);
     assert!(resources.commit().is_empty());
+
+    let claude = ClaudeAgentAdapter::new_with_binary("/bin/claude-fixture");
+    for model in ["sonnet", "haiku"] {
+        let mut claude_req = req.clone();
+        claude_req.provider = "claude".into();
+        claude_req.model = Some(model.into());
+        let session_spec = claude.prepare_session_new_spec(&claude_req).unwrap();
+        assert_eq!(session_spec.model, model);
+        assert!(
+            session_spec
+                .required_config_options
+                .contains(&("model".to_string(), model.to_string())),
+            "Claude ACP ignores top-level session/new model on current adapters; Chainworks must enforce the requested model through session/set_config_option"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -1693,6 +2100,8 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -2532,6 +2941,299 @@ async fn xcode_mcp_bridge_pool_records_action_required_after_initialize_lock_wai
 }
 
 #[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn xcode_mcp_bridge_pool_records_action_required_during_slow_tools_list() {
+    use acp::{
+        HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBackendRequestContext,
+        XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeProcessCandidate,
+        XcodeRuntimeObservationSink,
+    };
+    use domain::ids::AgentExecutionId;
+    use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    struct CollectingSink {
+        updates: Mutex<Vec<XcodeRuntimeObservationUpdate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeRuntimeObservationSink for CollectingSink {
+        async fn append_xcode_runtime_observation(
+            &self,
+            _agent_execution_id: AgentExecutionId,
+            update: XcodeRuntimeObservationUpdate,
+        ) -> anyhow::Result<()> {
+            self.updates.lock().await.push(update);
+            Ok(())
+        }
+    }
+
+    struct SlowToolsListBackend;
+
+    #[async_trait::async_trait]
+    impl XcodeMcpBackend for SlowToolsListBackend {
+        async fn forward_json_rpc(
+            &self,
+            _context: XcodeMcpBackendRequestContext,
+            request: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            if request.get("method").and_then(|method| method.as_str()) == Some("tools/list") {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
+            Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "result": {"tools": []}
+            }))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let host = HostProbeContext {
+        expected_gui_uid: Some(501),
+        operator_home: Some("/Users/gui".to_string()),
+        darwin_tmpdir: Some("/var/folders/t/tmp".to_string()),
+        developer_dir: Some("/Applications/Xcode.app/Contents/Developer".to_string()),
+        candidate_xcodes: vec![XcodeProcessCandidate {
+            pid: 4242,
+            uid: 501,
+            workspace_identity: Some(workspace),
+            app_path: Some("/Applications/Xcode.app".to_string()),
+            developer_dir: None,
+            operator_home: None,
+            darwin_tmpdir: None,
+            alive: true,
+        }],
+    };
+    let sink = Arc::new(CollectingSink {
+        updates: Mutex::new(Vec::new()),
+    });
+    let pool = Arc::new(XcodeMcpBridgePool::new_with_sink_and_backend(
+        XcodeMcpBridgePoolConfig {
+            pool_id: "fixture-pool".to_string(),
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            max_active_leases: 1,
+            max_queued_leases: 0,
+            queue_timeout: Duration::from_millis(0),
+            spawn_init_timeout: Duration::from_secs(10),
+            first_connect_timeout: Duration::from_secs(60),
+            broker_disabled: false,
+            tool_allowlists_by_hash: Default::default(),
+            target_probe_context: Some(host),
+            use_local_host_probe: false,
+        },
+        sink.clone(),
+        Arc::new(SlowToolsListBackend),
+    ));
+    let mut req = brokered_xcode_request(&tmp, "claude");
+    req.agent_execution_id = Some(AgentExecutionId::new());
+    let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+    let lease_id = attachment.lease_ids[0].clone();
+
+    let forward = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            pool.forward_json_rpc_request(
+                &lease_id,
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            )
+            .await
+            .unwrap()
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let updates = sink.updates.lock().await;
+    let action_required = updates
+        .iter()
+        .filter_map(|update| match update {
+            XcodeRuntimeObservationUpdate::McpBrokerObservation(observation)
+                if observation.backend_start_disposition == "backend_request_action_required" =>
+            {
+                Some(observation)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(action_required.len(), 1);
+    assert_eq!(
+        action_required[0].backend_failure_class,
+        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired)
+    );
+    assert!(action_required[0]
+        .status_update
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Action Required: Check Xcode"));
+    drop(updates);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        forward.await.unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn xcode_mcp_bridge_pool_times_out_backend_request_after_action_required_budget() {
+    use acp::{
+        HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBackendRequestContext,
+        XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeProcessCandidate,
+        XcodeRuntimeObservationSink,
+    };
+    use domain::ids::AgentExecutionId;
+    use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    struct CollectingSink {
+        updates: Mutex<Vec<XcodeRuntimeObservationUpdate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeRuntimeObservationSink for CollectingSink {
+        async fn append_xcode_runtime_observation(
+            &self,
+            _agent_execution_id: AgentExecutionId,
+            update: XcodeRuntimeObservationUpdate,
+        ) -> anyhow::Result<()> {
+            self.updates.lock().await.push(update);
+            Ok(())
+        }
+    }
+
+    struct HungToolsListBackend;
+
+    #[async_trait::async_trait]
+    impl XcodeMcpBackend for HungToolsListBackend {
+        async fn forward_json_rpc(
+            &self,
+            _context: XcodeMcpBackendRequestContext,
+            request: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            if request.get("method").and_then(|method| method.as_str()) == Some("tools/list") {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "result": {"tools": []}
+            }))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let host = HostProbeContext {
+        expected_gui_uid: Some(501),
+        operator_home: Some("/Users/gui".to_string()),
+        darwin_tmpdir: Some("/var/folders/t/tmp".to_string()),
+        developer_dir: Some("/Applications/Xcode.app/Contents/Developer".to_string()),
+        candidate_xcodes: vec![XcodeProcessCandidate {
+            pid: 4242,
+            uid: 501,
+            workspace_identity: Some(workspace),
+            app_path: Some("/Applications/Xcode.app".to_string()),
+            developer_dir: None,
+            operator_home: None,
+            darwin_tmpdir: None,
+            alive: true,
+        }],
+    };
+    let sink = Arc::new(CollectingSink {
+        updates: Mutex::new(Vec::new()),
+    });
+    let pool = Arc::new(XcodeMcpBridgePool::new_with_sink_and_backend(
+        XcodeMcpBridgePoolConfig {
+            pool_id: "fixture-pool".to_string(),
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            max_active_leases: 1,
+            max_queued_leases: 0,
+            queue_timeout: Duration::from_millis(0),
+            spawn_init_timeout: Duration::from_secs(10),
+            first_connect_timeout: Duration::from_secs(60),
+            broker_disabled: false,
+            tool_allowlists_by_hash: Default::default(),
+            target_probe_context: Some(host),
+            use_local_host_probe: false,
+        },
+        sink.clone(),
+        Arc::new(HungToolsListBackend),
+    ));
+    let mut req = brokered_xcode_request(&tmp, "claude");
+    req.agent_execution_id = Some(AgentExecutionId::new());
+    let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+    let lease_id = attachment.lease_ids[0].clone();
+
+    let forward = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            pool.forward_json_rpc_request(
+                &lease_id,
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+
+    let err = forward
+        .await
+        .expect("backend request task should settle")
+        .expect_err("hung backend request should fail closed");
+    assert!(err.to_string().contains("xcode_mcp_initialize_timeout"));
+
+    let updates = sink.updates.lock().await;
+    let timed_out = updates
+        .iter()
+        .filter_map(|update| match update {
+            XcodeRuntimeObservationUpdate::McpBrokerObservation(observation)
+                if observation.backend_start_disposition == "backend_request_timeout" =>
+            {
+                Some(observation)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(timed_out.len(), 1);
+    assert_eq!(
+        timed_out[0].backend_failure_class,
+        Some(XcodeRuntimeFailureClass::XcodeMcpInitializeTimeout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn xcode_mcp_broker_default_timeouts_allow_human_consent_without_provider_race() {
+    use acp::{XcodeMcpBridgePoolConfig, XcodeMcpProcessBackendConfig};
+    use std::time::Duration;
+
+    assert!(XcodeMcpBridgePoolConfig::default().spawn_init_timeout >= Duration::from_secs(10 * 60));
+    assert!(
+        XcodeMcpBridgePoolConfig::default().first_connect_timeout >= Duration::from_secs(10 * 60)
+    );
+    assert!(
+        XcodeMcpBridgePoolConfig::default().first_connect_timeout
+            > XcodeMcpBridgePoolConfig::default().spawn_init_timeout,
+        "first-connect cleanup must not win the race against warmup/backend timeout"
+    );
+    assert!(
+        XcodeMcpProcessBackendConfig::default().request_timeout >= Duration::from_secs(10 * 60)
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn xcode_mcp_bridge_pool_process_backend_spawns_with_target_env_and_rewrites_ids() {
     use acp::{
@@ -2668,9 +3370,10 @@ for line in sys.stdin:
 
 #[cfg(unix)]
 #[tokio::test]
-async fn xcode_mcp_bridge_pool_process_backend_shares_initialized_backend_per_run_and_xcode_pid() {
-    // P051 intentionally shares one initialized backend per run/Xcode target to
-    // bound Xcode consent prompts; lease policy remains enforced before forward.
+async fn xcode_mcp_bridge_pool_process_backend_shares_initialized_backend_per_xcode_pid() {
+    // P051 intentionally shares one initialized backend per Xcode target to
+    // bound Xcode consent prompts across batched run retries; lease policy
+    // remains enforced before forward.
     use acp::{
         HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBridgePool,
         XcodeMcpBridgePoolConfig, XcodeMcpProcessBackend, XcodeMcpProcessBackendConfig,
@@ -2822,9 +3525,9 @@ for line in sys.stdin:
         .await
         .unwrap();
     let different_run_backend_pid = backend.backend_process_id(different_run_lease).await;
-    assert_ne!(different_run_backend_pid, first_backend_pid);
+    assert_eq!(different_run_backend_pid, first_backend_pid);
     assert_eq!(different_run_initialize["id"], "different-run-init");
-    assert_eq!(different_run_initialize["result"]["spawn_count"], 2);
+    assert_eq!(different_run_initialize["result"]["spawn_count"], 1);
 
     let tools = pool
         .forward_json_rpc_request(
@@ -2837,8 +3540,8 @@ for line in sys.stdin:
     assert_eq!(tools["result"]["received_id"], 2);
 
     let log = std::fs::read_to_string(&request_log).unwrap();
-    assert_eq!(log.matches("\"method\": \"initialize\"").count(), 2);
-    assert_eq!(std::fs::read_to_string(&spawn_count_path).unwrap(), "2");
+    assert_eq!(log.matches("\"method\": \"initialize\"").count(), 1);
+    assert_eq!(std::fs::read_to_string(&spawn_count_path).unwrap(), "1");
 
     pool.release_brokered_xcode_leases(&first_attachment.lease_ids)
         .await
@@ -2861,6 +3564,37 @@ for line in sys.stdin:
         backend.backend_process_id(different_run_lease).await,
         different_run_backend_pid
     );
+
+    let mut retry_same_run_req = brokered_xcode_request(&tmp, "gemini");
+    retry_same_run_req.run_id = run_id;
+    retry_same_run_req.agent_id = "p051_gemini_retry_same_run_xcode".into();
+    let retry_same_run_attachment = pool
+        .attach_brokered_xcode_leases(&retry_same_run_req)
+        .await
+        .unwrap();
+    let retry_same_run_lease = &retry_same_run_attachment.lease_ids[0];
+    let retry_same_run_initialize = pool
+        .forward_json_rpc_request(
+            retry_same_run_lease,
+            serde_json::json!({"jsonrpc":"2.0","id":"retry-same-run-init","method":"initialize"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry_same_run_initialize["id"], "retry-same-run-init");
+    assert_eq!(retry_same_run_initialize["result"]["spawn_count"], 1);
+    assert_eq!(
+        backend.backend_process_id(retry_same_run_lease).await,
+        first_backend_pid
+    );
+    assert_eq!(
+        std::fs::read_to_string(&spawn_count_path).unwrap(),
+        "1",
+        "retrying any run against the same Xcode target must reuse the warm consent-granted backend"
+    );
+    pool.release_brokered_xcode_leases(&retry_same_run_attachment.lease_ids)
+        .await
+        .unwrap();
+    assert_eq!(backend.backend_process_id(retry_same_run_lease).await, None);
 
     pool.release_brokered_xcode_leases(&different_run_attachment.lease_ids)
         .await
@@ -2995,6 +3729,180 @@ for line in sys.stdin:
     pool.release_brokered_xcode_leases(&attachment.lease_ids)
         .await
         .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn xcode_mcp_bridge_pool_warmup_runs_full_handshake_before_provider_receives_endpoint() {
+    use acp::{
+        HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBackendRequestContext,
+        XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeProcessCandidate,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    struct RecordingBackend {
+        methods: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeMcpBackend for RecordingBackend {
+        async fn forward_json_rpc(
+            &self,
+            _context: XcodeMcpBackendRequestContext,
+            request: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            let method = request
+                .get("method")
+                .and_then(|method| method.as_str())
+                .unwrap_or("<missing>")
+                .to_string();
+            self.methods.lock().await.push(method.clone());
+            let id = request
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let result = if method == "tools/list" {
+                serde_json::json!({"tools": []})
+            } else {
+                serde_json::json!({"ok": true})
+            };
+            Ok(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let host = HostProbeContext {
+        expected_gui_uid: Some(501),
+        operator_home: Some("/Users/gui".to_string()),
+        darwin_tmpdir: Some("/var/folders/t/tmp".to_string()),
+        developer_dir: Some("/Applications/Xcode.app/Contents/Developer".to_string()),
+        candidate_xcodes: vec![XcodeProcessCandidate {
+            pid: 4242,
+            uid: 501,
+            workspace_identity: Some(workspace),
+            app_path: Some("/Applications/Xcode.app".to_string()),
+            developer_dir: None,
+            operator_home: None,
+            darwin_tmpdir: None,
+            alive: true,
+        }],
+    };
+    let backend = Arc::new(RecordingBackend {
+        methods: Mutex::new(Vec::new()),
+    });
+    let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+        XcodeMcpBridgePoolConfig {
+            pool_id: "fixture-pool".to_string(),
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            max_active_leases: 1,
+            max_queued_leases: 0,
+            queue_timeout: Duration::from_millis(0),
+            spawn_init_timeout: Duration::from_secs(10),
+            first_connect_timeout: Duration::from_secs(60),
+            broker_disabled: false,
+            tool_allowlists_by_hash: Default::default(),
+            target_probe_context: Some(host),
+            use_local_host_probe: false,
+        },
+        Arc::new(acp::NoopXcodeRuntimeObservationSink),
+        backend.clone(),
+    );
+    let req = brokered_xcode_request(&tmp, "claude");
+    let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+
+    pool.warm_up_brokered_xcode_leases(&attachment.lease_ids)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backend.methods.lock().await.as_slice(),
+        ["initialize", "notifications/initialized", "tools/list"]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn xcode_mcp_bridge_pool_warmup_refreshes_first_connect_deadline() {
+    use acp::{
+        HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBackendRequestContext,
+        XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeProcessCandidate,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct ReadyBackend;
+
+    #[async_trait::async_trait]
+    impl XcodeMcpBackend for ReadyBackend {
+        async fn forward_json_rpc(
+            &self,
+            _context: XcodeMcpBackendRequestContext,
+            request: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            let method = request.get("method").and_then(|method| method.as_str());
+            let result = if method == Some("tools/list") {
+                serde_json::json!({"tools": []})
+            } else {
+                serde_json::json!({"ok": true})
+            };
+            Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "result": result
+            }))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let host = HostProbeContext {
+        expected_gui_uid: Some(501),
+        operator_home: Some("/Users/gui".to_string()),
+        darwin_tmpdir: Some("/var/folders/t/tmp".to_string()),
+        developer_dir: Some("/Applications/Xcode.app/Contents/Developer".to_string()),
+        candidate_xcodes: vec![XcodeProcessCandidate {
+            pid: 4242,
+            uid: 501,
+            workspace_identity: Some(workspace),
+            app_path: Some("/Applications/Xcode.app".to_string()),
+            developer_dir: None,
+            operator_home: None,
+            darwin_tmpdir: None,
+            alive: true,
+        }],
+    };
+    let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
+        XcodeMcpBridgePoolConfig {
+            pool_id: "fixture-pool".to_string(),
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            max_active_leases: 1,
+            max_queued_leases: 0,
+            queue_timeout: Duration::from_millis(0),
+            spawn_init_timeout: Duration::from_secs(10),
+            first_connect_timeout: Duration::from_millis(10),
+            broker_disabled: false,
+            tool_allowlists_by_hash: Default::default(),
+            target_probe_context: Some(host),
+            use_local_host_probe: false,
+        },
+        Arc::new(acp::NoopXcodeRuntimeObservationSink),
+        Arc::new(ReadyBackend),
+    );
+    let req = brokered_xcode_request(&tmp, "claude");
+    let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    pool.warm_up_brokered_xcode_leases(&attachment.lease_ids)
+        .await
+        .unwrap();
+
+    assert!(
+        pool.cleanup_first_connect_timeouts().await.unwrap().is_empty(),
+        "successful broker warmup must not leave the reserved lease expired before provider session/new"
+    );
 }
 
 #[cfg(unix)]
@@ -3833,6 +4741,86 @@ async fn runtime_manager_attaches_brokered_xcode_http_lease_before_session_new()
 
 #[cfg(unix)]
 #[tokio::test]
+async fn runtime_manager_warms_brokered_xcode_lease_before_session_new() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::{
+        AcpMcpServerPayload, AcpRuntimeManager, BrokeredXcodeLeaseAttachment, ExecutionRequest,
+        ResolvedMcpServerTransport, XcodeBrokerLeaseAttacher,
+    };
+    use domain::agent::AgentStatus;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    struct WarmupLeaseAttacher {
+        warmup_marker: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeBrokerLeaseAttacher for WarmupLeaseAttacher {
+        async fn attach_brokered_xcode_leases(
+            &self,
+            req: &ExecutionRequest,
+        ) -> anyhow::Result<BrokeredXcodeLeaseAttachment> {
+            let mut attached = req.clone();
+            for server in &mut attached.mcp_servers {
+                if let ResolvedMcpServerTransport::XcodeBrokerIntent { intent } = &server.transport
+                {
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "Authorization".to_string(),
+                        "Bearer fixture-redacted".to_string(),
+                    );
+                    *server = AcpMcpServerPayload {
+                        id: intent.runtime_id.clone(),
+                        extension_id: intent.extension_id.clone(),
+                        transport: ResolvedMcpServerTransport::Http {
+                            url: "http://127.0.0.1:8123/xcode-mcp/lease-warmup".to_string(),
+                            headers,
+                        },
+                    };
+                }
+            }
+            Ok(BrokeredXcodeLeaseAttachment {
+                request: attached,
+                lease_ids: vec!["lease-warmup".to_string()],
+            })
+        }
+
+        async fn warm_up_brokered_xcode_leases(&self, lease_ids: &[String]) -> anyhow::Result<()> {
+            std::fs::write(&self.warmup_marker, lease_ids.join("\n"))?;
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_path = tmp.path().join("captured-session-new.json");
+    let warmup_marker = tmp.path().join("warmup-ready.txt");
+    let script = fixture::create_broker_attach_requires_warmup_script(
+        tmp.path(),
+        &capture_path,
+        &warmup_marker,
+    );
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script));
+    let manager = AcpRuntimeManager::new_with_adapters(vec![adapter]);
+    manager.set_xcode_broker_lease_attacher(Arc::new(WarmupLeaseAttacher {
+        warmup_marker: warmup_marker.clone(),
+    }));
+
+    let req = brokered_xcode_request(&tmp, "claude");
+    let result = manager.start_session(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(
+        std::fs::read_to_string(warmup_marker).unwrap(),
+        "lease-warmup"
+    );
+    let captured: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(capture_path).unwrap()).unwrap();
+    assert_eq!(captured["mcpServers"][0]["type"], "http");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn runtime_manager_close_all_sessions_releases_brokered_xcode_leases_before_blocked_close() {
     use acp::adapters::claude::ClaudeAgentAdapter;
     use acp::{
@@ -4115,6 +5103,8 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4174,6 +5164,8 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let error = adapter
@@ -4255,6 +5247,8 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4310,6 +5304,8 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4370,6 +5366,8 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4453,6 +5451,8 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4535,6 +5535,8 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4600,6 +5602,8 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4661,6 +5665,8 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -4737,6 +5743,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -4784,6 +5792,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -4800,6 +5810,108 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         .close_session(&session_generation_id)
         .await
         .expect("manager should close the reused live session");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::{
+        AcpPromptProgressKind, AcpPromptProgressSink, AcpPromptProgressUpdate, AcpRuntimeManager,
+        ExecutionRequest,
+    };
+    use anyhow::Result;
+    use domain::ids::RunId;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    struct RecordingPromptProgressSink {
+        tx: mpsc::UnboundedSender<AcpPromptProgressUpdate>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpPromptProgressSink for RecordingPromptProgressSink {
+        async fn record_acp_prompt_progress(&self, update: AcpPromptProgressUpdate) -> Result<()> {
+            self.tx.send(update).unwrap();
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_delayed_prompt_progress_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let manager = Arc::new(AcpRuntimeManager::new_with_adapters(vec![
+        Arc::new(adapter) as Arc<dyn AcpAdapter>,
+    ]));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    manager.set_prompt_progress_sink(Arc::new(RecordingPromptProgressSink { tx }));
+
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_progress".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "progress-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "stream progress before terminal response".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: Some("generation-progress".into()),
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let manager_for_task = Arc::clone(&manager);
+    let task = tokio::spawn(async move { manager_for_task.start_session(req).await });
+    let update = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("prompt progress should be reported before terminal response")
+        .expect("progress sink should receive an update");
+    assert!(
+        !task.is_finished(),
+        "progress must be observable while session/prompt is still running"
+    );
+    assert_eq!(update.stage_id, "stage_progress");
+    assert_eq!(update.agent_id, "progress-agent");
+    assert_eq!(
+        update.session_generation_id.as_deref(),
+        Some("generation-progress")
+    );
+    assert!(matches!(
+        update.kind,
+        AcpPromptProgressKind::PromptSent
+            | AcpPromptProgressKind::MessageReceived
+            | AcpPromptProgressKind::MeaningfulProgress
+            | AcpPromptProgressKind::ProviderLocalActivity
+    ));
+
+    let result = task
+        .await
+        .expect("prompt task should not panic")
+        .expect("prompt should finish after delayed progress");
+    assert_eq!(result.status, domain::agent::AgentStatus::Completed);
 }
 
 #[cfg(unix)]
@@ -4854,6 +5966,8 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let execution = {
@@ -4937,6 +6051,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -4985,6 +6101,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -5040,6 +6158,8 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5141,6 +6261,8 @@ sys.exit(0)
         origin_stage_id: None,
         origin_stage_execution_id: None,
         mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
     };
 
     let _ = adapter.execute(req).await;

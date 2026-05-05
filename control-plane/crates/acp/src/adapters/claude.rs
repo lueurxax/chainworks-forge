@@ -88,8 +88,14 @@ impl AcpAdapter for ClaudeAgentAdapter {
             .as_deref()
             .unwrap_or(default_config.model)
             .to_string();
+        let required_config_options = req
+            .model
+            .as_ref()
+            .map(|model| vec![("model".to_string(), model.to_string())])
+            .unwrap_or_default();
         let config = AcpSessionConfig {
             model: &model_str,
+            required_config_options,
             set_mode_after_session_new: self.set_mode_after_session_new,
             ..default_config
         };

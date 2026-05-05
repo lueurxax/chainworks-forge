@@ -95,13 +95,13 @@ This document records the key architecture decisions made during the foundation 
 
 **Context:** The macOS operator app traditionally read from SwiftData and issued commands through multiple paths (MCP, local services). This created ambiguity about the source of truth and allowed the UI to become a second control plane.
 
-**Decision:** The macOS UI is narrowed to a thin, GraphQL-only read client.
+**Decision:** P031 narrows the current macOS UI stop-state to a thin, GraphQL-only read client.
 1. Governed SwiftUI surfaces render workflow truth from server-owned GraphQL projections only.
-2. The UI is read-only: no MCP writes, no GraphQL mutations, no local mutation fallback.
-3. Every removed write control (Start, Cancel, Retry, Resolve Approval) is replaced with diagnostic guidance and identifiers for external CLI/MCP workflows.
+2. The P031 stop-state UI is read-only: no MCP writes, no GraphQL mutations, no local mutation fallback.
+3. Every removed write control (Start, Cancel, Retry, Resolve Approval) is replaced with diagnostic guidance and identifiers for external workflows.
 4. UI state is limited to presentation, server-derived caches, read-refresh state, and freshness handling.
 
-**Consequence:** Single authoritative read plane (GraphQL). Commands move outside the macOS UI to validated external workflows. Static guards and a machine-readable UI inventory enforce the read-only boundary.
+**Consequence:** Single authoritative read plane (GraphQL). Non-approval operational commands move outside the macOS UI to validated MCP workflows. P072 supersedes P031 for the target action boundary: SwiftUI remains GraphQL-only, approval decisions are the only allowed GraphQL mutations, and all non-approval commands remain MCP-only. Static guards and a machine-readable UI inventory enforce the P031 read-only stop-state until P072 updates that boundary.
 
 ## ARCH-037: Owner-aware execution identity
 
@@ -118,3 +118,15 @@ This document records the key architecture decisions made during the foundation 
 **Decision:** Use `ImplementationHandoffStatus` to track engine-owned handoff truth (`ready`, `blocked_before_code`, `running`).
 
 **Consequence:** Handoff remains engine-owned and deterministic, independent of advisory agent hints.
+
+## ARCH-072: Governed GraphQL Approval Mutations
+
+**Context:** ARCH-031 established a strictly read-only macOS UI. While this ensured a clean boundary, it forced operators to use a separate terminal for every approval gate resolution, even when the UI was already the primary inspection surface.
+
+**Decision:** The thin macOS UI boundary is expanded to include a single governed mutation path for human gate resolution.
+1. SwiftUI may resolve pending stage approvals via two specific GraphQL mutations: `approveApproval` and `rejectApproval`.
+2. All other operational commands (Start, Cancel, Retry, Reset, Compact, etc.) remain prohibited in the UI and must use MCP/CLI.
+3. The server-side routing matrix is the canonical authority for which mutations are allowed for the `ui_operator` principal.
+4. The UI remains a "thin client": it renders server-published truth and performs only these governed mutations.
+
+**Consequence:** Improved operator experience for the most common human-in-the-loop action without expanding the UI into a general command-and-control plane. The thin UI boundary is now "read-side and human-gate mutation consumer".

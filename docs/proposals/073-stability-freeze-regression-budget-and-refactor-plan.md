@@ -5,7 +5,7 @@
 | Date | 2026-04-25 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Current implemented baseline, Proposal 031, Proposal 038, [Xcode MCP bridge pool](../reference/xcode-mcp-bridge-pool.md), Proposal 070, Proposal 072 |
+| Depends on | Current implemented baseline, Proposal 031, Proposal 038, [Xcode MCP bridge pool](../reference/xcode-mcp-bridge-pool.md), Proposal 070, [UI action boundary](../reference/ui-action-boundary.md) |
 | Goal | Stop feature sprawl temporarily and introduce a stabilization protocol that reduces active architectural seams, artifact noise, projection drift, provider/runtime churn, and UI/control-plane ambiguity. |
 
 ---
@@ -46,7 +46,7 @@ Allowed:
 - P051 Xcode MCP bridge pool core only
 - P038 run compaction
 - P070 boundary/typed contract refactor
-- P072 action-routing boundary
+- UI action boundary
 - bug fixes and regression fixes
 
 Frozen:
@@ -90,7 +90,7 @@ Introduce or update gates:
 - `proposal-038-compaction`
 - `proposal-051|p051`
 - `proposal-068-boundary`
-- `proposal-072-action-routing`
+- `proposal-072|p072`
 - `proposal-073-stability`
 
 The stability gate should fail when:
@@ -138,7 +138,7 @@ The stabilization window can end when:
 1. P031 boundary is implemented and enforced;
 2. P038 compaction reduces artifact noise on real runs;
 3. P051 bridge pool is either stable or feature-flag disabled;
-4. P072 action routing is implemented in docs/gates;
+4. the UI action boundary is implemented in docs/gates;
 5. projection lag and stale active execution counts are below threshold;
 6. no agent-facing docs require GraphQL or SQLite fallbacks;
 7. the system feels less noisy and easier to inspect.

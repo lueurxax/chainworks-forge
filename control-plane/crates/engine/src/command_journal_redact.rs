@@ -99,6 +99,10 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         }
         Command::ResolveWorkflowConflictTransition(_) => {
             // Operator conflict-resolution selections are audit material.
+            // P065-style free-form retry instructions are redacted.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "operator_instruction");
+            }
         }
         Command::OverrideLegacyDiscoveryPolicy(_) => {
             // P053: preserve typed override fields for operator audit.
@@ -139,6 +143,13 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
                 redact_field_if_present(obj, "comment");
             }
         }
+        Command::ResolveApproval(_) => {
+            // P072: redact rationale (may contain operator-submitted text).
+            // Preserve approval_id, run_id, stage_id, decision for auditability.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "rationale");
+            }
+        }
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| payload_json.to_string())
@@ -176,12 +187,12 @@ fn redact_field_if_present(obj: &mut serde_json::Map<String, Value>, field: &str
 mod tests {
     use super::*;
     use domain::commands::{
-        ApproveStageCmd, CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
-        MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
-        MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-        OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
-        ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
-        RunStewardAnalysisCmd, StartRunCmd,
+        ApprovalResolutionDecision, ApproveStageCmd, CancelRunCmd, Command,
+        KnowledgeCapsuleIgnoreCmd, MainSyncMode, MainSyncRecordRecoveryDecisionCmd,
+        MainSyncRecoveryDecision, MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd,
+        MainSyncSetRunOverrideCmd, MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd,
+        RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
+        ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -380,6 +391,35 @@ mod tests {
         assert_eq!(inner["stage_id"], Value::String("state_7".into()));
     }
 
+    #[test]
+    fn test_redact_workflow_conflict_resolution_redacts_operator_instruction() {
+        let run_id = RunId::new();
+        let cmd =
+            Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
+                run_id,
+                conflict_id: "conflict-1".into(),
+                selected_transition_id: "review__to__refine__0".into(),
+                resolution_reason: "operator selected one extra refine".into(),
+                operator_instruction: Some("Focus only on the P041 CLI rendering blocker".into()),
+            });
+
+        let v = round_trip(&cmd);
+        let inner = inner(&v);
+        assert_eq!(
+            inner["operator_instruction"],
+            Value::String(REDACTED.to_string()),
+            "workflow conflict operator_instruction must be redacted"
+        );
+        let serialized = serde_json::to_string(&v).unwrap();
+        assert!(!serialized.contains("P041 CLI rendering blocker"));
+        assert_eq!(inner["run_id"], serde_json::json!(run_id));
+        assert_eq!(inner["conflict_id"], Value::String("conflict-1".into()));
+        assert_eq!(
+            inner["selected_transition_id"],
+            Value::String("review__to__refine__0".into())
+        );
+    }
+
     // ── CancelRun / ResetSession / RunStewardAnalysis ────────────────
     //    (preserve-all variants)
 
@@ -482,6 +522,7 @@ mod tests {
                 conflict_id: "conflict-1".into(),
                 selected_transition_id: "review__to__refine__0".into(),
                 resolution_reason: "operator selected loop-budget continuation".into(),
+                operator_instruction: Some("Focus on the requested blocker only".into()),
             }),
             Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
                 run_id: RunId::new(),
@@ -544,6 +585,20 @@ mod tests {
                 conflict_fingerprint: "sha256:abc".into(),
                 idempotency_key: "idem-1".into(),
             }),
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: domain::ids::ApprovalId::new(),
+                decision: ApprovalResolutionDecision::Approved,
+                rationale: Some("LGTM".into()),
+                run_id: RunId::new(),
+                stage_id: "state_6".into(),
+            }),
+            Command::ResolveApproval(ResolveApprovalCmd {
+                approval_id: domain::ids::ApprovalId::new(),
+                decision: ApprovalResolutionDecision::Rejected,
+                rationale: Some("Needs rework".into()),
+                run_id: RunId::new(),
+                stage_id: "state_3".into(),
+            }),
         ];
 
         for cmd in &samples {
@@ -577,6 +632,7 @@ mod tests {
                 Command::RunStewardAnalysis(_) => {}
                 Command::OverrideArtifactContract(_) => {}
                 Command::ResolveLeadMediationConfirmation(_) => {}
+                Command::ResolveApproval(_) => {}
             }
         }
     }

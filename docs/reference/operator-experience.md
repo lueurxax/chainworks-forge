@@ -20,22 +20,23 @@ Related stable docs:
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
+- [ui-action-boundary.md](ui-action-boundary.md)
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 
 ## Scope
 
-This reference covers the **read-only** and repo-agnostic operator layer (per P031-r18):
+This reference covers the primarily **read-side** and repo-agnostic operator layer (per the [UI action boundary](ui-action-boundary.md)):
 
 - `RunsHomeView` as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries (metadata inspection only)
-- diagnostic-only guidance for approvals and recovery
+- diagnostic-only guidance for non-approval actions; in-app resolution for approvals
 - deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
 - notifications, dock badge, and menu bar presence
 
-It does **NOT** define in-app write/recovery. Every write control (Start, Cancel, Retry, Resolve Approval) is removed or replaced with diagnostic guidance for external workflows.
+It does **NOT** define broad in-app write/recovery. Recovery, retry, reset, compact, run start/cancel, clone, experiment, runtime, and context actions remain external MCP-only actions. Approval resolution is the only exception, supported via governed GraphQL mutations.
 
 ## Runs Home
 
@@ -62,18 +63,25 @@ Each row shows:
 - runtime provenance,
 - **Freshness state** (Live, Refreshing, Stale, etc.).
 
-### Proposal Review Routing (P060)
+### Proposal Review Routing
 
-The Proposal Reviewed stage card includes detailed routing information:
-- **Routing Progress**: Spinner and label ("Selecting reviewers...") during selection.
-- **Reviewer Rows**: 2-5 dynamic rows showing agent name, mandatory/optional status, score, rationale, and evidence IDs.
-- **Timeline Popovers**: Detailed routing rationale, score terms, evidence IDs, and materialization status are visible for each reviewer row.
-- **Advanced Routing Disclosure**: Optional view for rejected alternatives and ineligible candidates.
-- **Under-specified Selection**: Caution banner when falling back to fixed reviewers.
+Reviewer routing is artifact/readback truth rather than a bespoke routing dashboard.
+For dynamically routed proposal-review stages, operator surfaces read:
 
-**Actions are diagnostic-only:**
+- `agent_selection_plan_v1` for selected, rejected, and ineligible reviewers,
+- `routing_receipt` for terminal routing status, rationale, warnings, and hashes,
+- `SystemExecution` for system-task lifecycle state,
+- `ReviewCorpusBundle` for the selected reviewer outputs consumed by aggregate
+  review and proposal refinement.
+
+The macOS app keeps typed parity DTOs for these payloads and redacts raw repository
+evidence by default. Dedicated UI affordances must consume these artifacts and
+projections; they are not the source of routing truth.
+
+**Actions are primarily diagnostic:**
 - `Open` is available for drill-down.
-- Primary buttons for `Open gate`, `Recover`, or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
+- `Open gate` is an active in-app control for resolving approvals via governed GraphQL mutations.
+- Primary buttons for `Recover` or `Start` are replaced with diagnostic banners or technical details for use in external MCP/CLI workflows.
 
 ## Scheduler Health and Backpressure
 
@@ -99,15 +107,16 @@ GroupBox appears immediately after the Blocker Summary. It provides:
 
 - **Reason & Status**: Plain-language explanation (e.g., "Ambiguous next step")
   plus status capsule.
-- **Routing Conflict**: Specifically for deterministic routing failures (P060),
-  showing matching mandatory reviewers, overflow rationale, and evidence IDs.
+- **Routing Evidence**: For deterministic routing, the plan shows selected
+  reviewers, rejected alternatives, warnings such as
+  `mandatory_overflow_pruned`, and the evidence IDs behind those decisions.
 - **Current State**: The authoritative graph state where the run is anchored.
 - **Lead & Mediation**: The system lead agent assigned to the conflict and
   active mediation progress.
 - **Advisory Suggestion**: Redacted summary of the rejected agent hint.
 - **Terminal Failure**: Detailed reason if the conflict reached `terminal_unverifiable`.
 
-### Evidence Projection (P060)
+### Evidence Projection
 
 Repo-backed evidence references (path, symbol, span) in routing rationale default
 to hash-only projection for privacy and security.
@@ -185,13 +194,17 @@ Report content includes:
 
 ### Recovery
 
-The P031 thin UI does not execute recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing external workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
+The governed thin UI does not execute non-approval recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing MCP-owned workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
 Diagnostic guidance is provided for:
 1. `Retry Agent`
 2. `Retry Stage`
 3. `Resume from Approval Gate`
 4. `Clone Run`
+
+Approval resolution is the exception: approval surfaces are operator-actionable
+through GraphQL approval mutations. Recovery, retry, reset, compact, run
+start/cancel, clone, and runtime/context changes remain MCP-only.
 
 **Workflow Conflict Actions (Read-Only):**
 - **Mediation Progress**: View sanitized live status updates (queued,

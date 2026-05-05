@@ -11,19 +11,19 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 | Alias | `./scripts/test-gate.sh p043` |
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
 | Historical proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
-| Scope | Rust control-plane GraphQL **read** contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract. |
-| Current UI boundary | Thin macOS UI (**read-only** consumer over server-owned projections). |
+| Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. See [ui-action-boundary.md](ui-action-boundary.md). |
+| Current UI boundary | Thin macOS UI (read-side and human-gate mutation consumer over server-owned projections). |
 | Stabilization owners | P032 for release/dogfood/stabilization evidence; P036 for visual/navigation restoration over this read model. |
 
 ## Thin UI Boundary
 
 The original P043/P031 gate labels are retained for compatibility. The active content below is the current thin UI boundary:
 
-The macOS thin UI is a **read-only consumer** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and maintains freshness annotations.
+The macOS thin UI is a **read-side consumer and human-gate resolver** of the GraphQL surface defined here. It renders run / stage / artifact / report / approval / health state and resolves pending approvals via governed GraphQL mutations. The short canonical action boundary lives in [ui-action-boundary.md](ui-action-boundary.md).
 
 **PROHIBITED ACTIONS for governed macOS UI:**
 - It does **NOT** issue MCP mutations.
-- It does **NOT** use GraphQL mutations.
+- It does **NOT** use GraphQL mutations EXCEPT for the `approveApproval` and `rejectApproval` human-gate path.
 - It does **NOT** use local workflow mutation fallback.
 - It does **NOT** probe raw truth from SwiftData or filesystem (except for authorized artifact display).
 
@@ -43,7 +43,7 @@ Every visible governed workflow field must have one named GraphQL source or one 
 | --- | --- | --- |
 | `freshnessState` | `FreshnessState` | `live`, `refreshing`, `projection_lag`, `stale`, `unavailable`, `unauthorized`. |
 | `disabledReasonCode` | `DisabledReasonCode` | `WRITE_PATH_NOT_AVAILABLE`, `MANAGED_OUTSIDE_UI`, `AMBIGUOUS_APPROVAL_IDENTITY`, `STALE_READ`, `PROJECTION_LAG`, `UNAUTHORIZED`, `UNSUPPORTED_ACTION`. |
-| `writePathState` | `WritePathState` | `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
+| `writePathState` | `WritePathState` | `available`, `read_only_diagnostic`, `write_path_not_available`, `external_transport_required`, `hidden`. |
 | `diagnosticId` | `String` | Unique identifier for the row/approval/report used for external write workflows. |
 | `payloadAvailabilityState` | `PayloadAvailabilityState` | `available`, `metadata_only`, `payload_deferred`, `generating`, `unavailable`. |
 | `payloadUnavailableReasonCode` | `PayloadUnavailableReasonCode` | `PAYLOAD_DEFERRED_BY_P031`, `GENERATING`, `NOT_INDEXED`, `NOT_AUTHORIZED`, `NOT_AVAILABLE`, `UNKNOWN`. |
@@ -82,22 +82,22 @@ The client must not infer:
 
 | Surface | GraphQL entrypoint | Server owner / source | Status | Client rule |
 |---|---|---|---|---|
-| Runs home | `runs(ideaID:)` and `runs` | `db::repos::projections::{list_by_idea_projection,list_active_projection}` | Implemented | Render run list from projection-backed `GqlRun`; do not compute state from local rows or files. |
+| Runs home | `runs(ideaId:)` and `runs` | `db::repos::projections::{list_by_idea_projection,list_active_projection}` | Implemented | Render run list from projection-backed `GqlRun`; do not compute state from local rows or files. |
 | Run detail | `run(id:)` with projection enrichment | Canonical run row enriched by `db::repos::projections::find_run_projection` | Implemented | Use projection-backed counters and summaries; show projection lag when projection truth is missing or stale. **P065 expansion**: includes compact retry-instruction provenance. |
-| Stage list / progress | `stages(runID:)` | `db::repos::projections::list_stages_projection` | Implemented | Use projection-owned decision flags; disable dependent actions when `projectionLag` is true. |
-| Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionID:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. **P065 expansion**: includes `retry_instruction` group and delivery status. |
-| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution (`approvals.resolve`) is an operator-side MCP action on a separate surface; the thin UI renders the inbox read-only. |
-| Artifact viewer | `artifacts(runID:)` | artifact index projection / `db::repos::projections::list_artifacts_projection` | Implemented | Browse the server artifact hierarchy only; direct file open/export may happen only after server selection. |
+| Stage list / progress | `stages(runId:)` | `db::repos::projections::list_stages_projection` | Implemented | Use projection-owned decision flags; disable dependent actions when `projectionLag` is true. |
+| Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionId:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. **P065 expansion**: includes `retry_instruction` group and delivery status. |
+| Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution is supported via governed GraphQL mutations or operator-side MCP action (`approvals.resolve`). |
+| Artifact viewer | `artifacts(runId:)` | artifact index projection / `db::repos::projections::list_artifacts_projection` | Implemented | Browse the server artifact hierarchy only; direct file open/export may happen only after server selection. |
 | Scheduler health | `schedulerHealthSummary` | `scheduler_health_snapshots` projection | Implemented | Render system-wide capacity, pressure, and latency health. |
 | Startup recovery | `startupRecoverySummary` | `startup_recovery_readbacks` projection | Implemented | Render startup recovery progress, counts, and backpressure state. |
 | Command latency | `commandLatencySummary` | `scheduler_health_snapshots` projection | Implemented | Render p95 latency for operator commands (approve, retry, cancel). |
 | DB contention | `dbWriterContentionSummary` | `scheduler_health_snapshots` projection | Implemented | Render SQLite write wait p95 and transaction contention. |
 | Provider capacity | `activeExecutionCountsByProvider` | `agent_executions` active counts | Implemented | Render active execution counts per canonical provider family. |
 | Global queue depth | `oldestQueuedAge` and `queuedBackpressuredCountsByProviderAndReason` | `scheduler_queue_summaries` | Implemented | Render system-wide oldest queued item age and counts by reason. |
-| Run/Stage queue | `runQueueSummary(runID:)` and `stageQueueSummary(stageExecutionID:)` | `scheduler_queue_summaries` projection | Implemented | Render queued/backpressured work counts and reasons. |
+| Run/Stage queue | `runQueueSummary(runId:)` and `stageQueueSummary(stageExecutionId:)` | `scheduler_queue_summaries` projection | Implemented | Render queued/backpressured work counts and reasons. |
 | Queue position | `queuePositionHint` | `scheduler_queue_summaries` | Implemented | Render non-ETA position hint for queued work. |
 | Host interruption | `hostInterruptionEpochs` and `hostInterruptionAffectedExecutions` | `host_interruption_epochs` / `affected_executions` | Implemented | Render host sleep/wake and network migration history and impact. |
-| Report viewer | report metadata through `artifacts(runID:)`; dedicated report payload query remains future work | artifact/report projection and future payload owner | Partial | Report metadata can render; payload rendering stays disabled unless a server-owned GraphQL payload path exists. |
+| Report viewer | report metadata through `artifacts(runId:)`; dedicated report payload query remains future work | artifact/report projection and future payload owner | Partial | Report metadata can render; payload rendering stays disabled unless a server-owned GraphQL payload path exists. |
 | Daemon lifecycle | `daemonStatus` and `daemonStatusChanged` | [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) | Implemented | Render daemon live/degraded/failed/unavailable state from the lifecycle read model; do not infer lifecycle state from arbitrary request failures. |
 | Experiment comparison | future comparison read query | future comparison/report owner | Deferred | Keep comparison disabled or placeholder-only. |
 
@@ -161,8 +161,8 @@ Recognized subscription names for this contract:
 
 | Subscription | Payload contract | Thin UI consumption rule |
 |---|---|---|
-| `runStatusChanged(runID:)` | Projection-enriched `GqlRun` via `find_run_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch displayed run summary fields; refresh after command completion still required. |
-| `stageStatusChanged(runID:)` | Projection-enriched `GqlStageExecution` via `list_stages_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch stage decision flags; controls remain disabled during `projection_lag`. |
+| `runStatusChanged(runId:)` | Projection-enriched `GqlRun` via `find_run_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch displayed run summary fields; refresh after command completion still required. |
+| `stageStatusChanged(runId:)` | Projection-enriched `GqlStageExecution` via `list_stages_projection`, including `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | May patch stage decision flags; controls remain disabled during `projection_lag`. |
 | `approvalRequested` | Emits current approval row for the requested approval. | May update approval inbox; command completion refresh still required after decisions. |
 | `approvalResolved` | Emits current approval row for the resolved approval. | May remove/update approval row; bounded refresh fallback remains valid if subscription is unavailable. |
 | `schedulerBackpressureChanged` | Emits sustained-backpressure events when thresholds are crossed. | May trigger UI health alerts or banner changes. |
@@ -191,14 +191,14 @@ The control-plane read contract owns server-published facts. The thin macOS UI o
 |---|---|---|
 | Runs home | Projection-backed list query through `list_by_idea_projection` and `list_active_projection`. | Sufficient for thin UI consumption. |
 | Run detail | `run(id:)` returns projection-enriched counters, summaries, `workflowConflict`, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag` from `find_run_projection`. | Sufficient for thin UI consumption. |
-| Stage list / progress | `stages(runID:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for thin UI consumption. |
+| Stage list / progress | `stages(runId:)` reads stage projection rows with decision flags, `projectionPresent`, `projectionUpdatedAt`, and `projectionLag`. | Sufficient for thin UI consumption. |
 | Stage detail | `stage(id:)` returns projection-enriched decision flags and projection freshness while preserving canonical evidence/recovery payloads. | Sufficient for thin UI consumption. |
 | Missing projection rows | Missing `run_summaries` or `stage_summaries` rows surface as `projectionPresent=false` and `projectionLag=true`, not normal zero/false truth. | Sufficient for projection-lag rendering. |
-| Run status subscription | `runStatusChanged(runID:)` emits projection-enriched run summary and freshness fields. | Sufficient for thin UI event patching. |
-| Stage status subscription | `stageStatusChanged(runID:)` emits projection-enriched stage decision and freshness fields. | Sufficient for thin UI event patching. |
-| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for thin UI event patching. |
+| Run status subscription | `runStatusChanged(runId:)` emits projection-enriched run summary and freshness fields. | Sufficient for P031 event patching. |
+| Stage status subscription | `stageStatusChanged(runId:)` emits projection-enriched stage decision and freshness fields. | Sufficient for P031 event patching. |
+| Approval resolved subscription | `approvalResolved` emits current resolved approval rows. | Sufficient for P031 event patching. |
 | Approval inbox | `approvalInbox` is projection-backed. | Sufficient for thin UI consumption. |
-| Artifact viewer | `artifacts(runID:)` | is projection-backed. | Sufficient for thin UI consumption. |
+| Artifact viewer | `artifacts(runId:)` | is projection-backed. | Sufficient for thin UI consumption. |
 | Scheduler health | `schedulerHealthSummary` returns global capacity, active counts, oldest queued age, and sustained backpressure state. | Sufficient for thin UI health alerts. |
 | Startup recovery | `startupRecoverySummary` returns recovered items, backpressured recovery counts, and affected runs. | Sufficient for thin UI recovery UI. |
 | Command latency | `commandLatencySummary` returns p95 latency for approve, retry, and cancel. | Sufficient for thin UI diagnostics. |
@@ -246,7 +246,7 @@ Future non-operator read expansion must be explicit in auth/capability policy an
 
 ## Thin UI Consumption Contract
 
-Governed macOS UI surfaces may ship from this contract:
+P031 may ship governed macOS UI surfaces from this contract:
 
 - Runs home;
 - Run detail;
@@ -263,6 +263,8 @@ The macOS thin UI owns the UI-side evidence for the **read-side** client contrac
 - live / refreshing_disconnected / stale / projection_lag / unavailable / unauthorized rendering on each surface (as badges or inline annotations, not disabled controls because the governed thin UI has no write controls);
 - no SwiftData / local-service fallback for workflow truth;
 - subscription patching rules from the "Refresh and subscription posture" section.
+
+Scope boundary: P031 remains a read-only consumer for workflow truth and non-approval commands. The UI action boundary adds only the approval-resolution mutation exception; it does not make P031 responsible for MCP command-control behavior, command receipts, or broad UI writes.
 
 The thin UI boundary does NOT own:
 

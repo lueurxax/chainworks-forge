@@ -5,10 +5,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::ids::{RoutingReceiptId, RunId, SystemExecutionId};
 use domain::routing::{SystemExecution, SystemExecutionStatus};
 
-pub async fn insert_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    exec: &SystemExecution,
-) -> Result<()> {
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &SystemExecution) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO system_executions (id, run_id, stage_id, attempt_id, task_id, task_type,
@@ -37,7 +34,9 @@ pub async fn insert_tx(
 pub async fn insert(pool: &SqlitePool, exec: &SystemExecution) -> Result<()> {
     let mut tx = crate::pool::begin_immediate_with_retry(pool, "system_executions.insert").await?;
     insert_tx(&mut tx, exec).await?;
-    tx.commit().await.context("commit insert system_execution")?;
+    tx.commit()
+        .await
+        .context("commit insert system_execution")?;
     Ok(())
 }
 

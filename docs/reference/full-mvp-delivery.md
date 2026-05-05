@@ -173,6 +173,12 @@ loop.
 - `blocked`: code work is finished, but verification is not green (release readiness must be held).
 
 `needs_code_fixes` or `invalid` statuses keep the `code_writer` in the loop.
+The contract parser does not treat a non-blocking code tail as a reason to stay
+in the loop: if `verification_green` is true and every `remaining_code_tasks`
+entry is `blocking=false`, the summary leaves the code loop as
+`handoff_required` even when the raw artifact says `implementation_complete=false`.
+This keeps deferred rollout, evidence, and advisory cleanup from producing an
+infinite code-writer loop.
 
 **Migration and Retirement:**
 The system supports a bounded migration from the legacy `v1` (based on `seemingly_complete`) to the `v2` structured contract:
@@ -226,6 +232,13 @@ The slice does not treat "looks good locally" as enough.
 The exit condition is canonical artifact-backed review status. The implementation gate
 reads normalized `audit_report`, `security_report`, `prepush_review_report`,
 `docs_report`, and `tests_result_v1.status` truth from the active artifact index.
+After `state_9_implementation_reviewed`, the release/refine decision is owned by
+`implementation_review_summary_v1.status`: `code_complete` may enter manual
+release, `needs_code_fixes` and `invalid` return to implementation refinement, and
+`release_evidence_blocked` returns to implementation refinement so release
+evidence gaps remain part of orchestrator-owned closeout work. The
+workflow must not route to manual release from
+`implementation_self_assessment_v2.blocking_remaining_code_tasks == 0` alone.
 
 ## Manual release
 

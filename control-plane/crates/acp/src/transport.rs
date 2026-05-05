@@ -1,7 +1,6 @@
 //! ACP JSON-RPC 2.0 subprocess transport.
 //!
-//! Implements the wire protocol documented in `ClaudeAgentACPTransport.swift` and
-//! `CodexACPTransport.swift`:
+//! Implements the Rust control-plane ACP wire protocol:
 //! - ndjson over stdio (one JSON object per line, `\n` delimited)
 //! - Three-phase handshake: `initialize` → `session/new` → `session/prompt`
 //! - Streaming `session/update` notifications during the prompt phase
@@ -24,9 +23,10 @@ use domain::discovery::{
 use domain::xcode_runtime::XcodeShimWarningEvent;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
-use std::io::Read;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
@@ -35,8 +35,9 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    AcpCloseDiagnostic, AcpMcpServerPayload, DiscoveredArtifact, DiscoveredArtifactSourceKind,
-    ExecutionRequest, McpActualObservation, ResolvedMcpServerTransport, UsageSnapshot,
+    AcpCloseDiagnostic, AcpMcpServerPayload, AcpPromptProgressKind, AcpPromptProgressSink,
+    AcpPromptProgressUpdate, DiscoveredArtifact, DiscoveredArtifactSourceKind, ExecutionRequest,
+    McpActualObservation, NoopAcpPromptProgressSink, ResolvedMcpServerTransport, UsageSnapshot,
 };
 
 /// Strip ANSI escape sequences from a string for clean log output.
@@ -73,7 +74,10 @@ fn strip_ansi(s: &str) -> String {
 /// duplicating the rest of the transport logic.
 pub struct AcpSessionConfig<'a> {
     /// Model identifier for the provider's model catalog.
-    /// Claude: `"default"` / `"sonnet"` / `"haiku"` / `"opus"`.
+    /// Claude: request aliases may include `"opus"`, but current
+    /// `claude-agent-acp` advertises Opus as the `"default"` config option.
+    /// Required model selection is resolved against `session/new.configOptions`
+    /// before `session/set_config_option` is sent.
     /// Codex: base model id without effort suffix (e.g. `"gpt-5.4"`).
     ///        Reasoning effort is set separately via `config_options`.
     pub model: &'a str,
@@ -87,7 +91,7 @@ pub struct AcpSessionConfig<'a> {
     /// Claude requires `_meta.claudeCode.options`; Codex uses `None`.
     pub extra: Option<serde_json::Value>,
 
-    /// Session config options to apply after `session/new` via
+    /// Best-effort session config options to apply after `session/new` via
     /// `session/set_config_option`.
     ///
     /// Used by the Codex adapter to set `reasoning_effort` (the only reliable
@@ -99,6 +103,10 @@ pub struct AcpSessionConfig<'a> {
     /// Errors are logged but do not fail the session (providers that don't
     /// support the method respond with `Method not found`).
     pub config_options: Vec<(String, String)>,
+
+    /// Required session config options. A send or provider rejection fails
+    /// session startup instead of silently falling back to provider defaults.
+    pub required_config_options: Vec<(String, String)>,
 
     /// Some ACP providers expose a mode catalog in `session/new` but do not
     /// apply `session/new.params.mode`. For those providers, send
@@ -123,6 +131,7 @@ impl Default for AcpSessionConfig<'_> {
                 }
             })),
             config_options: Vec::new(),
+            required_config_options: Vec::new(),
             set_mode_after_session_new: false,
         }
     }
@@ -217,6 +226,113 @@ fn mcp_servers_wire_value(servers: &[AcpMcpServerPayload]) -> Result<Value> {
     Ok(Value::Array(wire_servers))
 }
 
+#[derive(Debug)]
+struct SessionConfigOptionValue {
+    value: String,
+    name: String,
+    description: String,
+}
+
+fn resolve_session_config_option_value(
+    session_new_result: &Value,
+    config_id: &str,
+    requested: &str,
+) -> Option<String> {
+    let options = session_new_result
+        .get("configOptions")
+        .or_else(|| session_new_result.get("config_options"))?
+        .as_array()?;
+    let option = options.iter().find(|option| {
+        option
+            .get("id")
+            .or_else(|| option.get("configId"))
+            .and_then(Value::as_str)
+            == Some(config_id)
+    })?;
+
+    let mut values = Vec::new();
+    collect_session_config_option_values(option, &mut values);
+    resolve_session_config_value_from_values(&values, requested)
+}
+
+fn collect_session_config_option_values(
+    option: &Value,
+    values: &mut Vec<SessionConfigOptionValue>,
+) {
+    if let Some(value) = option.get("value").and_then(Value::as_str) {
+        values.push(SessionConfigOptionValue {
+            value: value.to_string(),
+            name: option
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            description: option
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    if let Some(children) = option.get("options").and_then(Value::as_array) {
+        for child in children {
+            collect_session_config_option_values(child, values);
+        }
+    }
+}
+
+fn resolve_session_config_value_from_values(
+    values: &[SessionConfigOptionValue],
+    requested: &str,
+) -> Option<String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    let requested_lower = requested.to_lowercase();
+    if let Some(direct) = values.iter().find(|candidate| {
+        candidate.value == requested
+            || candidate.value.to_lowercase() == requested_lower
+            || candidate.name.to_lowercase() == requested_lower
+    }) {
+        return Some(direct.value.clone());
+    }
+    if let Some(includes) = values.iter().find(|candidate| {
+        let value = candidate.value.to_lowercase();
+        let name = candidate.name.to_lowercase();
+        value.contains(&requested_lower)
+            || name.contains(&requested_lower)
+            || requested_lower.contains(&value)
+    }) {
+        return Some(includes.value.clone());
+    }
+
+    let tokens: Vec<String> = requested_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty() && *token != "claude" && *token != "default")
+        .map(ToOwned::to_owned)
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    values
+        .iter()
+        .filter_map(|candidate| {
+            let haystack = format!(
+                "{} {} {}",
+                candidate.value, candidate.name, candidate.description
+            )
+            .to_lowercase();
+            let score = tokens
+                .iter()
+                .filter(|token| haystack.contains(token.as_str()))
+                .count();
+            (score > 0).then_some((score, candidate))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, candidate)| candidate.value.clone())
+}
+
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const GEMINI_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const HANDSHAKE_TIMEOUT: Duration = DEFAULT_HANDSHAKE_TIMEOUT;
@@ -226,11 +342,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Max time without meaningful agent progress while the transport remains alive.
 /// Keepalive/status-only ACP messages reset transport idleness, but not progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
+const PROMPT_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+const CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES: u64 = 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
 
 enum AcpPromptReadOutcome {
-    Read(std::result::Result<Result<usize>, tokio::time::error::Elapsed>),
+    Read(Result<usize>),
+    PollElapsed,
     CloseRequested,
 }
 
@@ -248,6 +368,288 @@ const ACP_NDJSON_LINE_OVERHEAD_BYTES: usize = 64 * 1024;
 const MAX_STREAMED_TRANSCRIPT_BYTES: usize = 10 * 1024 * 1024;
 const STREAMED_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[chainworks transcript truncated at 10485760 bytes]\n";
+
+#[derive(Clone, Debug, Default)]
+struct ClaudeLocalActivitySummary {
+    event_count: u64,
+    assistant_messages: u64,
+    tool_uses: u64,
+    tool_results: u64,
+    user_tool_results: u64,
+    last_prompts: u64,
+    type_counts: HashMap<String, u64>,
+    last_event_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClaudeLocalActivityObservation {
+    should_extend_watchdog: bool,
+    new_event_count: u64,
+}
+
+#[derive(Debug)]
+struct ClaudeLocalActivityMonitor {
+    transcript_path: PathBuf,
+    offset: u64,
+    summary: ClaudeLocalActivitySummary,
+    open_tool_use_ids: HashSet<String>,
+}
+
+impl ClaudeLocalActivityMonitor {
+    fn for_request(req: &ExecutionRequest, session_id: &str) -> Option<Self> {
+        if !req.provider.eq_ignore_ascii_case("claude") {
+            return None;
+        }
+        let projects_root = claude_projects_root()?;
+        let cwd = effective_claude_cwd(req);
+        let project_key = claude_project_key(cwd);
+        let transcript_path = projects_root
+            .join(project_key)
+            .join(format!("{session_id}.jsonl"));
+        Some(Self::new_for_path(transcript_path))
+    }
+
+    fn new_for_path(transcript_path: PathBuf) -> Self {
+        let offset = std::fs::metadata(&transcript_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Self {
+            transcript_path,
+            offset,
+            summary: ClaudeLocalActivitySummary::default(),
+            open_tool_use_ids: HashSet::new(),
+        }
+    }
+
+    fn poll(&mut self, _now: Instant) -> Result<ClaudeLocalActivityObservation> {
+        let mut new_event_count = 0;
+        let metadata = match std::fs::metadata(&self.transcript_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ClaudeLocalActivityObservation {
+                    should_extend_watchdog: self.has_open_tool_use(),
+                    new_event_count: 0,
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Claude local activity: stat transcript {}",
+                        self.transcript_path.display()
+                    )
+                });
+            }
+        };
+        let len = metadata.len();
+        if len < self.offset {
+            self.offset = 0;
+        }
+        if len > self.offset {
+            let bytes_to_read = (len - self.offset).min(CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES);
+            let mut file = std::fs::File::open(&self.transcript_path).with_context(|| {
+                format!(
+                    "Claude local activity: open transcript {}",
+                    self.transcript_path.display()
+                )
+            })?;
+            file.seek(SeekFrom::Start(self.offset)).with_context(|| {
+                format!(
+                    "Claude local activity: seek transcript {}",
+                    self.transcript_path.display()
+                )
+            })?;
+            let mut reader = file.take(bytes_to_read);
+            let mut chunk = String::new();
+            reader.read_to_string(&mut chunk).with_context(|| {
+                format!(
+                    "Claude local activity: read transcript {}",
+                    self.transcript_path.display()
+                )
+            })?;
+            self.offset = self.offset.saturating_add(bytes_to_read);
+            for line in chunk.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                if let Ok(entry) = serde_json::from_str::<Value>(line) {
+                    if self.observe_entry(&entry) {
+                        new_event_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(ClaudeLocalActivityObservation {
+            should_extend_watchdog: new_event_count > 0 || self.has_open_tool_use(),
+            new_event_count,
+        })
+    }
+
+    fn observe_entry(&mut self, entry: &Value) -> bool {
+        let entry_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        *self
+            .summary
+            .type_counts
+            .entry(entry_type.to_string())
+            .or_insert(0) += 1;
+
+        let mut relevant = false;
+        match entry_type {
+            "assistant" => {
+                self.summary.assistant_messages += 1;
+                self.summary.last_event_type = Some("assistant".to_string());
+                relevant = true;
+            }
+            "last-prompt" | "last_prompt" => {
+                self.summary.last_prompts += 1;
+                self.summary.last_event_type = Some("last-prompt".to_string());
+                relevant = true;
+            }
+            _ => {}
+        }
+
+        let mut tool_use_ids = Vec::new();
+        collect_claude_tool_use_ids(entry, &mut tool_use_ids);
+        if !tool_use_ids.is_empty() {
+            self.summary.tool_uses += tool_use_ids.len() as u64;
+            self.summary.last_event_type = Some("tool_use".to_string());
+            relevant = true;
+            for id in tool_use_ids {
+                self.open_tool_use_ids.insert(id);
+            }
+        }
+
+        let mut tool_result_ids = Vec::new();
+        collect_claude_tool_result_ids(entry, &mut tool_result_ids);
+        if !tool_result_ids.is_empty() {
+            self.summary.tool_results += tool_result_ids.len() as u64;
+            if entry_type == "user" {
+                self.summary.user_tool_results += tool_result_ids.len() as u64;
+            }
+            self.summary.last_event_type = Some("tool_result".to_string());
+            relevant = true;
+            for id in tool_result_ids {
+                self.open_tool_use_ids.remove(&id);
+            }
+        }
+
+        if relevant {
+            self.summary.event_count += 1;
+        }
+        relevant
+    }
+
+    fn has_open_tool_use(&self) -> bool {
+        !self.open_tool_use_ids.is_empty()
+    }
+
+    fn open_tool_use_count(&self) -> usize {
+        self.open_tool_use_ids.len()
+    }
+
+    fn summary(&self) -> &ClaudeLocalActivitySummary {
+        &self.summary
+    }
+
+    fn summary_for_error(&self) -> String {
+        format!(
+            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, open_tool_uses={}, last_event_type={}",
+            self.summary.event_count,
+            self.summary.assistant_messages,
+            self.summary.tool_uses,
+            self.summary.tool_results,
+            self.open_tool_use_count(),
+            self.summary
+                .last_event_type
+                .as_deref()
+                .unwrap_or("none")
+        )
+    }
+
+    fn has_observed_activity(&self) -> bool {
+        self.summary.event_count > 0
+    }
+}
+
+fn claude_projects_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("CHAINWORKS_CLAUDE_PROJECTS_DIR") {
+        return Some(PathBuf::from(root));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".claude").join("projects"))
+}
+
+fn effective_claude_cwd(req: &ExecutionRequest) -> &str {
+    let uses_worktree_cwd = req.worktree_write_enabled
+        || matches!(
+            req.worktree_strategy.as_deref(),
+            Some("dedicated") | Some("shared_implementation_worktree")
+        );
+    if uses_worktree_cwd {
+        req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
+    } else {
+        &req.workspace_root
+    }
+}
+
+fn claude_project_key(cwd: &str) -> String {
+    cwd.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn collect_claude_tool_use_ids(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("tool_use") {
+                if let Some(id) = map.get("id").and_then(Value::as_str) {
+                    ids.push(id.to_string());
+                }
+            }
+            for nested in map.values() {
+                collect_claude_tool_use_ids(nested, ids);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_claude_tool_use_ids(item, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_claude_tool_result_ids(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if let Some(id) = map.get("tool_use_id").and_then(Value::as_str) {
+                    ids.push(id.to_string());
+                }
+            }
+            for nested in map.values() {
+                collect_claude_tool_result_ids(nested, ids);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_claude_tool_result_ids(item, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn max_instant_option(base: Instant, candidate: Option<Instant>) -> Instant {
+    candidate.filter(|instant| *instant > base).unwrap_or(base)
+}
 
 pub(crate) fn handshake_timeout_for_provider(provider: &str) -> Duration {
     if provider.eq_ignore_ascii_case("gemini") {
@@ -518,6 +920,17 @@ fn merge_usage_snapshot(existing: &mut Option<UsageSnapshot>, incoming: UsageSna
 
 fn non_empty_transcript(text: String) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn transcript_with_prompt_error(mut streamed_text: String, err_msg: &str) -> Option<String> {
+    let diagnostic = format!("ACP session/prompt error: {err_msg}");
+    if streamed_text.trim().is_empty() {
+        Some(diagnostic)
+    } else {
+        streamed_text.push_str("\n\n");
+        streamed_text.push_str(&diagnostic);
+        Some(streamed_text)
+    }
 }
 
 fn truncate_string_to_byte_len(text: &mut String, max_len: usize) {
@@ -1113,7 +1526,6 @@ pub(crate) async fn probe_initialize_with_timeout(
 
 /// Build a JSON-RPC result response that grants the first `allow_once` option
 /// (or `approved` as a fallback) found in `session/request_permission` params.
-/// Matches ACPProtocolSupport.swift `permissionSelectionResponse`.
 fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
     // Options may be at params["options"] or params["toolCall"]["options"]
     let options: Vec<&Value> = params["options"]
@@ -1170,7 +1582,93 @@ pub struct AcpTransportSession {
     closed: bool,
 }
 
+async fn record_prompt_progress_for_session(
+    req: &ExecutionRequest,
+    progress_sink: &Arc<dyn AcpPromptProgressSink>,
+    provider_session_id: &str,
+    kind: AcpPromptProgressKind,
+) {
+    let update = AcpPromptProgressUpdate {
+        run_id: req.run_id,
+        stage_execution_id: req.stage_execution_id.clone(),
+        stage_id: req.stage_id.clone(),
+        agent_id: req.agent_id.clone(),
+        provider: req.provider.clone(),
+        session_generation_id: req.session_generation_id.clone(),
+        provider_session_id: provider_session_id.to_string(),
+        kind,
+    };
+    if let Err(error) = progress_sink.record_acp_prompt_progress(update).await {
+        warn!(
+            session_id = %provider_session_id,
+            error = %error,
+            "ACP: prompt progress sink failed"
+        );
+    }
+}
+
+async fn poll_claude_local_activity_watchdog(
+    monitor: Option<&mut ClaudeLocalActivityMonitor>,
+    req: &ExecutionRequest,
+    progress_sink: &Arc<dyn AcpPromptProgressSink>,
+    provider_session_id: &str,
+    last_provider_local_activity: &mut Option<Instant>,
+    last_provider_local_progress: &mut Option<Instant>,
+    last_prompt_progress_reported: &mut Option<Instant>,
+) {
+    let Some(monitor) = monitor else {
+        return;
+    };
+    match monitor.poll(Instant::now()) {
+        Ok(observation) if observation.should_extend_watchdog => {
+            let now = Instant::now();
+            *last_provider_local_activity = Some(now);
+            *last_provider_local_progress = Some(now);
+            if observation.new_event_count > 0 {
+                debug!(
+                    session_id = %provider_session_id,
+                    local_event_count = monitor.summary().event_count,
+                    tool_uses = monitor.summary().tool_uses,
+                    tool_results = monitor.summary().tool_results,
+                    open_tool_uses = monitor.open_tool_use_count(),
+                    "Claude local activity observed while ACP stream is quiet"
+                );
+            }
+            if last_prompt_progress_reported
+                .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
+                .unwrap_or(true)
+            {
+                record_prompt_progress_for_session(
+                    req,
+                    progress_sink,
+                    provider_session_id,
+                    AcpPromptProgressKind::ProviderLocalActivity,
+                )
+                .await;
+                *last_prompt_progress_reported = Some(Instant::now());
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                session_id = %provider_session_id,
+                error = %error,
+                "Claude local activity monitor failed; falling back to ACP stream activity"
+            );
+        }
+    }
+}
+
 impl AcpTransportSession {
+    async fn record_prompt_progress(
+        &self,
+        req: &ExecutionRequest,
+        progress_sink: &Arc<dyn AcpPromptProgressSink>,
+        kind: AcpPromptProgressKind,
+    ) {
+        record_prompt_progress_for_session(req, progress_sink, &self.session_id, kind).await;
+    }
+
     pub async fn start(
         child: Child,
         req: &ExecutionRequest,
@@ -1370,6 +1868,8 @@ impl AcpTransportSession {
         }
 
         for (config_id, value) in &config.config_options {
+            let resolved_value = resolve_session_config_option_value(&sn_result, config_id, value)
+                .unwrap_or_else(|| value.to_string());
             let sco_id = next_id!();
             if let Err(e) = send_ndjson(
                 &mut stdin,
@@ -1380,7 +1880,7 @@ impl AcpTransportSession {
                     "params": {
                         "sessionId": session_id,
                         "configId": config_id,
-                        "value": value,
+                        "value": resolved_value,
                     }
                 }),
             )
@@ -1399,7 +1899,7 @@ impl AcpTransportSession {
                     debug!(
                         session_id = %session_id,
                         config_id = %config_id,
-                        value = %value,
+                        value = %resolved_value,
                         "ACP: session/set_config_option applied"
                     );
                 }
@@ -1407,11 +1907,44 @@ impl AcpTransportSession {
                     warn!(
                         session_id = %session_id,
                         config_id = %config_id,
-                        value = %value,
+                        value = %resolved_value,
                         "ACP: session/set_config_option rejected: {e}"
                     );
                 }
             }
+        }
+
+        for (config_id, value) in &config.required_config_options {
+            let resolved_value = resolve_session_config_option_value(&sn_result, config_id, value)
+                .unwrap_or_else(|| value.to_string());
+            let sco_id = next_id!();
+            send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": sco_id,
+                    "method": "session/set_config_option",
+                    "params": {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": resolved_value,
+                    }
+                }),
+            )
+            .await
+            .with_context(|| format!("ACP: send required session/set_config_option {config_id}"))?;
+
+            await_response(&mut reader, sco_id, HANDSHAKE_TIMEOUT)
+                .await
+                .with_context(|| {
+                    format!("ACP: required session/set_config_option rejected for {config_id}")
+                })?;
+            debug!(
+                session_id = %session_id,
+                config_id = %config_id,
+                value = %resolved_value,
+                "ACP: required session/set_config_option applied"
+            );
         }
 
         Ok(Self {
@@ -1511,7 +2044,33 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
-        self.prompt_with_optional_close_signal(req, None).await
+        self.prompt_with_optional_close_signal(req, None, Arc::new(NoopAcpPromptProgressSink))
+            .await
+    }
+
+    pub async fn prompt_with_progress_sink(
+        &mut self,
+        req: &ExecutionRequest,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
+        self.prompt_with_optional_close_signal(req, None, progress_sink)
+            .await
     }
 
     pub async fn prompt_with_close_signal(
@@ -1535,7 +2094,37 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
-        self.prompt_with_optional_close_signal(req, Some(close_rx))
+        self.prompt_with_optional_close_signal(
+            req,
+            Some(close_rx),
+            Arc::new(NoopAcpPromptProgressSink),
+        )
+        .await
+    }
+
+    pub async fn prompt_with_close_signal_and_progress_sink(
+        &mut self,
+        req: &ExecutionRequest,
+        close_rx: &mut watch::Receiver<bool>,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
+    ) -> Result<(
+        AgentStatus,
+        Vec<String>,
+        Vec<DiscoveredArtifact>,
+        Vec<PrePromptExpectedOutputMetadata>,
+        Option<String>,
+        Option<UsageSnapshot>,
+        Vec<XcodeShimWarningEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        bool,
+        u64,
+        Option<LegacyBroadDiscoverySnapshot>,
+    )> {
+        self.prompt_with_optional_close_signal(req, Some(close_rx), progress_sink)
             .await
     }
 
@@ -1543,6 +2132,7 @@ impl AcpTransportSession {
         &mut self,
         req: &ExecutionRequest,
         mut close_rx: Option<&mut watch::Receiver<bool>>,
+        progress_sink: Arc<dyn AcpPromptProgressSink>,
     ) -> Result<(
         AgentStatus,
         Vec<String>,
@@ -1640,6 +2230,8 @@ impl AcpTransportSession {
             req.legacy_broad_discovery_policy.allows_broad_discovery();
         let broad_baseline = self.baseline_files.clone();
         let prompt_started_at = SystemTime::now();
+        let mut claude_local_activity =
+            ClaudeLocalActivityMonitor::for_request(req, &self.session_id);
         send_ndjson(
             &mut self.stdin,
             &serde_json::json!({
@@ -1654,10 +2246,15 @@ impl AcpTransportSession {
         )
         .await
         .context("ACP: send session/prompt")?;
+        self.record_prompt_progress(req, &progress_sink, AcpPromptProgressKind::PromptSent)
+            .await;
 
         let mut line = String::new();
-        let mut last_activity = Instant::now();
-        let mut last_progress = Instant::now();
+        let mut last_acp_activity = Instant::now();
+        let mut last_acp_progress = Instant::now();
+        let mut last_provider_local_activity: Option<Instant> = None;
+        let mut last_provider_local_progress: Option<Instant> = None;
+        let mut last_prompt_progress_reported = Some(Instant::now());
         let mut streamed_text = String::new();
         let mut streamed_text_truncated = false;
         let mut latest_usage_snapshot = None;
@@ -1665,60 +2262,198 @@ impl AcpTransportSession {
         let mut seen_xcode_warning_keys = HashSet::new();
 
         'streaming: loop {
-            let idle = last_activity.elapsed();
+            poll_claude_local_activity_watchdog(
+                claude_local_activity.as_mut(),
+                req,
+                &progress_sink,
+                &self.session_id,
+                &mut last_provider_local_activity,
+                &mut last_provider_local_progress,
+                &mut last_prompt_progress_reported,
+            )
+            .await;
+
+            let effective_last_activity =
+                max_instant_option(last_acp_activity, last_provider_local_activity);
+            let idle = effective_last_activity.elapsed();
             if idle >= IDLE_TIMEOUT {
+                let classification = claude_local_activity
+                    .as_ref()
+                    .map(|monitor| {
+                        if monitor.has_observed_activity() {
+                            "provider_stream_silent_with_local_activity"
+                        } else {
+                            "provider_stream_silent_no_local_activity"
+                        }
+                    })
+                    .unwrap_or("idle_hang_before_first_progress");
+                let local_summary = claude_local_activity
+                    .as_ref()
+                    .map(|monitor| monitor.summary_for_error())
+                    .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
                 bail!(
-                    "ACP session idle timeout: no message for {}s (session={})",
+                    "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
                     IDLE_TIMEOUT.as_secs(),
-                    self.session_id
+                    self.session_id,
+                    last_acp_activity.elapsed().as_secs(),
+                    last_provider_local_activity
+                        .map(|instant| instant.elapsed().as_secs().to_string())
+                        .unwrap_or_else(|| "none".to_string())
                 );
             }
-            let progress_idle = last_progress.elapsed();
+            let effective_last_progress =
+                max_instant_option(last_acp_progress, last_provider_local_progress);
+            let progress_idle = effective_last_progress.elapsed();
             if progress_idle >= PROGRESS_TIMEOUT {
+                let classification = claude_local_activity
+                    .as_ref()
+                    .map(|monitor| {
+                        if monitor.has_observed_activity() {
+                            "provider_stream_silent_with_local_activity"
+                        } else {
+                            "provider_stream_silent_no_local_activity"
+                        }
+                    })
+                    .unwrap_or("idle_hang_before_first_progress");
                 bail!(
-                    "ACP session progress timeout: no meaningful progress for {}s (session={})",
+                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={})",
                     PROGRESS_TIMEOUT.as_secs(),
                     self.session_id
                 );
             }
-            let remaining = IDLE_TIMEOUT - idle;
+            let remaining_idle = IDLE_TIMEOUT - idle;
+            let remaining_progress = PROGRESS_TIMEOUT - progress_idle;
+            let remaining = remaining_idle.min(remaining_progress);
+            let read_wait = if claude_local_activity.is_some() {
+                remaining.min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
+            } else {
+                remaining
+            };
 
-            line.clear();
-            let read_outcome = {
-                let read_line = timeout(
-                    remaining,
-                    read_capped_ndjson_line(
-                        &mut self.reader,
-                        &mut line,
-                        ndjson_line_cap_bytes(&req.expected_outputs),
-                        "ACP prompt stream read_line",
-                    ),
+            let mut close_requested = false;
+            let n_result: Result<usize> = {
+                line.clear();
+                let session_id = self.session_id.clone();
+                let read_line = read_capped_ndjson_line(
+                    &mut self.reader,
+                    &mut line,
+                    ndjson_line_cap_bytes(&req.expected_outputs),
+                    "ACP prompt stream read_line",
                 );
-                match close_rx.as_deref_mut() {
-                    Some(close_rx) => {
-                        if *close_rx.borrow() {
-                            AcpPromptReadOutcome::CloseRequested
-                        } else {
-                            tokio::select! {
-                                _ = close_rx.changed() => AcpPromptReadOutcome::CloseRequested,
-                                result = read_line => AcpPromptReadOutcome::Read(result),
+                tokio::pin!(read_line);
+                loop {
+                    let sleep = tokio::time::sleep(read_wait);
+                    tokio::pin!(sleep);
+                    let read_outcome = match close_rx.as_deref_mut() {
+                        Some(close_rx) => {
+                            if *close_rx.borrow() {
+                                AcpPromptReadOutcome::CloseRequested
+                            } else {
+                                tokio::select! {
+                                    _ = close_rx.changed() => AcpPromptReadOutcome::CloseRequested,
+                                    result = &mut read_line => AcpPromptReadOutcome::Read(result),
+                                    _ = &mut sleep => AcpPromptReadOutcome::PollElapsed,
+                                }
                             }
                         }
-                    }
-                    None => AcpPromptReadOutcome::Read(read_line.await),
-                }
-            };
+                        None => {
+                            tokio::select! {
+                                result = &mut read_line => AcpPromptReadOutcome::Read(result),
+                                _ = &mut sleep => AcpPromptReadOutcome::PollElapsed,
+                            }
+                        }
+                    };
 
-            let n = match read_outcome {
-                AcpPromptReadOutcome::CloseRequested => {
-                    let session_id = self.session_id.clone();
-                    let _ = self.close().await;
-                    bail!("ACP session closed during active prompt (session={session_id})");
+                    match read_outcome {
+                        AcpPromptReadOutcome::CloseRequested => {
+                            close_requested = true;
+                            break Err(anyhow::anyhow!(
+                                "ACP session closed during active prompt (session={session_id})"
+                            ));
+                        }
+                        AcpPromptReadOutcome::Read(Ok(read_result)) => break Ok(read_result),
+                        AcpPromptReadOutcome::Read(Err(error)) => {
+                            break Err(error).context("ACP prompt stream read_line error");
+                        }
+                        AcpPromptReadOutcome::PollElapsed if claude_local_activity.is_some() => {
+                            debug!(
+                                session_id = %session_id,
+                                "ACP prompt stream read poll elapsed; checking Claude local activity"
+                            );
+                            poll_claude_local_activity_watchdog(
+                                claude_local_activity.as_mut(),
+                                req,
+                                &progress_sink,
+                                &session_id,
+                                &mut last_provider_local_activity,
+                                &mut last_provider_local_progress,
+                                &mut last_prompt_progress_reported,
+                            )
+                            .await;
+                            let effective_last_activity =
+                                max_instant_option(last_acp_activity, last_provider_local_activity);
+                            let idle = effective_last_activity.elapsed();
+                            if idle >= IDLE_TIMEOUT {
+                                let classification = claude_local_activity
+                                    .as_ref()
+                                    .map(|monitor| {
+                                        if monitor.has_observed_activity() {
+                                            "provider_stream_silent_with_local_activity"
+                                        } else {
+                                            "provider_stream_silent_no_local_activity"
+                                        }
+                                    })
+                                    .unwrap_or("idle_hang_before_first_progress");
+                                let local_summary = claude_local_activity
+                                    .as_ref()
+                                    .map(|monitor| monitor.summary_for_error())
+                                    .unwrap_or_else(|| {
+                                        "provider_local_activity=unavailable".to_string()
+                                    });
+                                break Err(anyhow::anyhow!(
+                                    "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
+                                    IDLE_TIMEOUT.as_secs(),
+                                    session_id,
+                                    last_acp_activity.elapsed().as_secs(),
+                                    last_provider_local_activity
+                                        .map(|instant| instant.elapsed().as_secs().to_string())
+                                        .unwrap_or_else(|| "none".to_string())
+                                ));
+                            }
+                            let effective_last_progress =
+                                max_instant_option(last_acp_progress, last_provider_local_progress);
+                            let progress_idle = effective_last_progress.elapsed();
+                            if progress_idle >= PROGRESS_TIMEOUT {
+                                let classification = claude_local_activity
+                                    .as_ref()
+                                    .map(|monitor| {
+                                        if monitor.has_observed_activity() {
+                                            "provider_stream_silent_with_local_activity"
+                                        } else {
+                                            "provider_stream_silent_no_local_activity"
+                                        }
+                                    })
+                                    .unwrap_or("idle_hang_before_first_progress");
+                                break Err(anyhow::anyhow!(
+                                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={})",
+                                    PROGRESS_TIMEOUT.as_secs(),
+                                    session_id
+                                ));
+                            }
+                            continue;
+                        }
+                        AcpPromptReadOutcome::PollElapsed => {
+                            break Err(anyhow::anyhow!(
+                                "ACP session idle timeout — no message received"
+                            ));
+                        }
+                    }
                 }
-                AcpPromptReadOutcome::Read(result) => result
-                    .context("ACP session idle timeout — no message received")?
-                    .context("ACP prompt stream read_line error")?,
             };
+            if close_requested {
+                let _ = self.close().await;
+            }
+            let n = n_result?;
 
             if n == 0 {
                 bail!(
@@ -1736,8 +2471,20 @@ impl AcpTransportSession {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            last_activity = Instant::now();
+            last_acp_activity = Instant::now();
             debug!(msg = %trimmed, "ACP ← subprocess (stream)");
+            if last_prompt_progress_reported
+                .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
+                .unwrap_or(true)
+            {
+                self.record_prompt_progress(
+                    req,
+                    &progress_sink,
+                    AcpPromptProgressKind::MessageReceived,
+                )
+                .await;
+                last_prompt_progress_reported = Some(Instant::now());
+            }
             if let Some(snapshot) = extract_usage_snapshot(&parsed) {
                 merge_usage_snapshot(&mut latest_usage_snapshot, snapshot);
             }
@@ -1764,7 +2511,21 @@ impl AcpTransportSession {
                                         "ACP: failed to send permission grant: {e}"
                                     );
                                 }
-                                last_progress = Instant::now();
+                                last_acp_progress = Instant::now();
+                                if last_prompt_progress_reported
+                                    .map(|reported_at| {
+                                        reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    self.record_prompt_progress(
+                                        req,
+                                        &progress_sink,
+                                        AcpPromptProgressKind::MeaningfulProgress,
+                                    )
+                                    .await;
+                                    last_prompt_progress_reported = Some(Instant::now());
+                                }
                             }
                         }
                         continue;
@@ -1782,7 +2543,21 @@ impl AcpTransportSession {
                         }
                         if let Some(chunk) = extract_text_chunk(&parsed) {
                             if !strip_ansi(&chunk).trim().is_empty() {
-                                last_progress = Instant::now();
+                                last_acp_progress = Instant::now();
+                                if last_prompt_progress_reported
+                                    .map(|reported_at| {
+                                        reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    self.record_prompt_progress(
+                                        req,
+                                        &progress_sink,
+                                        AcpPromptProgressKind::MeaningfulProgress,
+                                    )
+                                    .await;
+                                    last_prompt_progress_reported = Some(Instant::now());
+                                }
                             }
                             push_streamed_transcript_chunk(
                                 &mut streamed_text,
@@ -1812,7 +2587,7 @@ impl AcpTransportSession {
                             vec![],
                             vec![],
                             pre_prompt_expected_outputs,
-                            non_empty_transcript(streamed_text),
+                            transcript_with_prompt_error(streamed_text, err_msg),
                             latest_usage_snapshot,
                             xcode_shim_warning_events,
                             self.acp_pre_initialize_local_latency_ms,
@@ -2191,6 +2966,7 @@ impl Drop for AcpTransportSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn gemini_uses_longer_handshake_timeout() {
@@ -2223,6 +2999,86 @@ mod tests {
         ));
         assert!(stderr_line_is_diagnostic_warning("code: 'EPIPE'"));
         assert!(!stderr_line_is_diagnostic_warning("ordinary debug detail"));
+    }
+
+    #[test]
+    fn claude_local_activity_detects_open_tool_use_as_progress() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path);
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"./scripts/test-gate.sh proposal-066"}}}}]}}}}"#
+        )
+        .expect("write transcript");
+        file.flush().expect("flush transcript");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(monitor.summary().event_count, 1);
+        assert_eq!(monitor.summary().tool_uses, 1);
+        assert_eq!(monitor.open_tool_use_count(), 1);
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(
+            observation.should_extend_watchdog,
+            "an unresolved Claude tool_use keeps the provider locally active while ACP is quiet"
+        );
+    }
+
+    #[test]
+    fn claude_local_activity_clears_open_tool_use_on_tool_result() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path.clone());
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"./scripts/test-gate.sh proposal-066"}}}}]}}}}"#
+        )
+        .expect("write tool_use");
+        file.flush().expect("flush tool_use");
+
+        assert!(
+            monitor
+                .poll(Instant::now())
+                .expect("poll")
+                .should_extend_watchdog
+        );
+
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}}]}}}}"#
+        )
+        .expect("write tool_result");
+        file.flush().expect("flush transcript");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(monitor.summary().tool_results, 1);
+        assert_eq!(monitor.open_tool_use_count(), 0);
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(
+            !observation.should_extend_watchdog,
+            "after tool_result and no new JSONL entries, Claude local activity no longer masks ACP silence"
+        );
+    }
+
+    #[test]
+    fn claude_local_activity_missing_or_still_jsonl_does_not_extend_watchdog() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("missing-session.jsonl");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path);
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(!observation.should_extend_watchdog);
+        assert_eq!(monitor.summary().event_count, 0);
+        assert_eq!(monitor.open_tool_use_count(), 0);
     }
 
     #[test]
@@ -2292,6 +3148,8 @@ mod tests {
             origin_stage_id: None,
             origin_stage_execution_id: None,
             mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
         };
 
         let captured = capture_pre_prompt_expected_outputs(&fake, &req, &context);
@@ -2347,6 +3205,27 @@ mod tests {
         let len_after_truncation = transcript.len();
         push_streamed_transcript_chunk(&mut transcript, "ignored", &mut truncated);
         assert_eq!(transcript.len(), len_after_truncation);
+    }
+
+    #[test]
+    fn prompt_error_is_returned_as_failure_transcript() {
+        let transcript = transcript_with_prompt_error(
+            String::new(),
+            "Internal error: You've hit your limit · resets 11:40pm (Asia/Nicosia)",
+        )
+        .expect("prompt error should be preserved");
+
+        assert!(transcript.contains("ACP session/prompt error"));
+        assert!(transcript.contains("hit your limit"));
+    }
+
+    #[test]
+    fn prompt_error_appends_to_existing_streamed_transcript() {
+        let transcript = transcript_with_prompt_error("partial progress".into(), "quota exceeded")
+            .expect("prompt error should be preserved");
+
+        assert!(transcript.starts_with("partial progress\n\nACP session/prompt error"));
+        assert!(transcript.ends_with("quota exceeded"));
     }
 
     #[test]

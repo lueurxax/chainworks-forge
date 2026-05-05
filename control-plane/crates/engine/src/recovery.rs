@@ -1,11 +1,15 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, artifact_contracts, projections, runs, stages,
-    startup_repairs, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, artifact_contracts, projections, runs,
+    sessions, stages, startup_repairs, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
@@ -170,6 +174,19 @@ async fn stage_has_pending_or_running_invoke_work(
     }))
 }
 
+async fn run_has_pending_or_running_work(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> Result<bool> {
+    let items = work_items::list_by_run(pool, run_id).await?;
+    Ok(items.iter().any(|item| {
+        matches!(
+            item.status,
+            WorkItemStatus::Pending | WorkItemStatus::Running
+        )
+    }))
+}
+
 impl RecoveryService {
     pub fn new(pool: SqlitePool, work_queue: WorkQueue, events: EventSender) -> Self {
         Self {
@@ -295,15 +312,38 @@ impl RecoveryService {
             "Startup recovery complete"
         );
 
-        let readback = if work_items_requeued > 0 {
-            self.work_queue.refresh_scheduler_projection().await?;
-            let readback = startup_repairs::build_startup_recovery_readback(
+        // P066 T14: Optional toolchain cache startup sweep.
+        // Only runs if CHAINWORKS_TOOLCHAIN_HOME is set. On first daemon start
+        // after a crash, this reclaims orphan Go session-scoped roots and quarantines
+        // stale Xcode run-scoped roots that can't be proven safe.
+        let toolchain_cache = if let Ok(home) = std::env::var("CHAINWORKS_TOOLCHAIN_HOME") {
+            let sweep_started_at = Utc::now();
+            let result =
+                sweep_toolchain_cache_roots(&self.pool, Path::new(&home), sweep_started_at).await;
+            match result {
+                Ok(tc) => tc,
+                Err(e) => {
+                    warn!(error = %e, "Toolchain cache startup sweep failed");
+                    startup_repairs::ToolchainCacheRecoveryReadback::default()
+                }
+            }
+        } else {
+            startup_repairs::ToolchainCacheRecoveryReadback::default()
+        };
+
+        let has_toolchain_sweep = toolchain_cache.last_sweep_started_at.is_some();
+        let readback = if work_items_requeued > 0 || has_toolchain_sweep {
+            if work_items_requeued > 0 {
+                self.work_queue.refresh_scheduler_projection().await?;
+            }
+            let mut readback = startup_repairs::build_startup_recovery_readback(
                 &self.pool,
                 work_items_requeued as i64,
                 runs_repaired as i64,
                 Utc::now(),
             )
             .await?;
+            readback.toolchain_cache = toolchain_cache;
             startup_repairs::record_startup_recovery_readback(&self.pool, &readback).await?;
             Some(readback)
         } else {
@@ -339,6 +379,40 @@ impl RecoveryService {
                 .as_ref()
                 .and_then(|readback| readback.next_retry_or_backoff_time),
         })
+    }
+
+    pub async fn repair_stale_invoke_agent_startups(
+        &self,
+        now: DateTime<Utc>,
+        stale_after: ChronoDuration,
+    ) -> Result<u64> {
+        let stale_cutoff = now - stale_after;
+        let xcode_stale_cutoff = now - ChronoDuration::minutes(12);
+        let mut requeued = work_items::requeue_stale_starting_invoke_agent_sessions(
+            &self.pool,
+            now,
+            stale_cutoff,
+            xcode_stale_cutoff,
+            "startup_repair_stale_acp_startup",
+        )
+        .await?;
+        requeued += work_items::requeue_stale_pre_session_invoke_agents(
+            &self.pool,
+            now,
+            stale_cutoff,
+            xcode_stale_cutoff,
+            "startup_repair_stale_acp_pre_session_startup",
+        )
+        .await?;
+        if requeued > 0 {
+            self.work_queue.refresh_scheduler_projection().await?;
+            warn!(
+                requeued = requeued,
+                stale_cutoff = %stale_cutoff,
+                "Startup recovery requeued stale ACP startup InvokeAgent work items"
+            );
+        }
+        Ok(requeued)
     }
 
     async fn repair_run(&self, run: &Run) -> Result<usize> {
@@ -421,6 +495,33 @@ impl RecoveryService {
                     stage_execution_id = %stage.id,
                     "Startup repair left running stage open because recovered InvokeAgent work is queued"
                 );
+                continue;
+            }
+
+            let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+            if executions.is_empty() {
+                if !run_has_pending_or_running_work(&self.pool, run.id).await? {
+                    info!(
+                        run_id = %run.id,
+                        stage_id = %stage.stage_id,
+                        stage_execution_id = %stage.id,
+                        "Startup repair kickstarting empty running stage"
+                    );
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run.id),
+                            None,
+                            serde_json::json!({
+                                "run_id": run.id.to_string(),
+                                "reason": "startup_empty_running_stage_kickstart",
+                                "stage_execution_id": stage.id.to_string(),
+                                "stage_id": stage.stage_id,
+                            }),
+                        )
+                        .await?;
+                    requeued += 1;
+                }
                 continue;
             }
 
@@ -531,17 +632,8 @@ impl RecoveryService {
             // enqueuing the follow-up AdvanceRun. Unconditionally enqueue
             // an AdvanceRun for any active run. The advance handler is
             // idempotent — if nothing needs doing, it returns Ok(()).
-            let has_pending_work = db::repos::work_items::list_by_run(&self.pool, run.id)
+            let has_pending_work = run_has_pending_or_running_work(&self.pool, run.id)
                 .await
-                .map(|items| {
-                    items.iter().any(|w| {
-                        matches!(
-                            w.status,
-                            db::work_item::WorkItemStatus::Pending
-                                | db::work_item::WorkItemStatus::Running
-                        )
-                    })
-                })
                 .unwrap_or(false);
 
             if !has_pending_work {
@@ -615,6 +707,156 @@ impl RecoveryService {
             ))
         }
     }
+}
+
+/// P066 T14: Scan TOOLCHAIN_HOME at daemon startup and:
+/// 1. Reclaim orphan Go session-scoped roots (session_generation_id not live, age > 30 min).
+/// 2. Quarantine Xcode run-scoped roots for active runs (in-memory lease state lost on crash).
+///
+/// Records counts in ToolchainCacheRecoveryReadback for persistence in startup_recovery_readbacks.
+/// Tolerates missing TOOLCHAIN_HOME (first run, no agents executed yet).
+async fn sweep_toolchain_cache_roots(
+    pool: &SqlitePool,
+    toolchain_home: &Path,
+    sweep_started_at: chrono::DateTime<Utc>,
+) -> Result<startup_repairs::ToolchainCacheRecoveryReadback> {
+    const ORPHAN_THRESHOLD_MINUTES: i64 = 30;
+    let orphan_threshold = Duration::from_secs(ORPHAN_THRESHOLD_MINUTES as u64 * 60);
+    let now = SystemTime::now();
+
+    let mut roots_seen = 0i64;
+    let mut roots_reclaimed = 0i64;
+    let mut cleanup_failures = 0i64;
+
+    // ── Go session-scoped roots ──────────────────────────────────────────────
+    let live_ids: HashSet<String> = sessions::list_live_session_generation_ids(pool)
+        .await
+        .unwrap_or_default();
+
+    let go_dir = toolchain_home.join("providers").join("go");
+    if let Ok(entries) = std::fs::read_dir(&go_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(gen_id) = dir_name(&path) else {
+                continue;
+            };
+            roots_seen += 1;
+
+            if live_ids.contains(gen_id.as_str()) {
+                continue; // Live session — do not touch.
+            }
+
+            let age = dir_age(&path, now);
+            if age < orphan_threshold {
+                continue; // Too young to reclaim.
+            }
+
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    roots_reclaimed += 1;
+                    info!(
+                        session_generation_id = %gen_id,
+                        "Startup recovery reclaimed orphan Go session-scoped toolchain root"
+                    );
+                }
+                Err(e) => {
+                    cleanup_failures += 1;
+                    warn!(
+                        session_generation_id = %gen_id,
+                        error = %e,
+                        "Failed to reclaim orphan Go session-scoped toolchain root"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Xcode run-scoped roots ───────────────────────────────────────────────
+    // On crash, in-memory XcodeRunLeaseRegistry state is lost. Any run-scoped
+    // xcode/ directory for an ACTIVE run cannot be proven safe → quarantine.
+    let xcode_dir = toolchain_home.join("providers").join("xcode");
+    if let Ok(entries) = std::fs::read_dir(&xcode_dir) {
+        let epoch_ms = sweep_started_at.timestamp_millis().to_string();
+        for entry in entries.flatten() {
+            let run_dir = entry.path();
+            if !run_dir.is_dir() {
+                continue;
+            }
+            let xcode_root = run_dir.join("xcode");
+            if !xcode_root.is_dir() {
+                continue;
+            }
+            let Some(run_id_str) = dir_name(&run_dir) else {
+                continue;
+            };
+
+            if !is_active_run(pool, &run_id_str).await {
+                continue; // Terminal run — housekeeping handles prune.
+            }
+
+            // Quarantine: move xcode/ → quarantine/{startup_epoch_ms}/
+            let quarantine_dir = run_dir.join("quarantine").join(&epoch_ms);
+            if let Some(parent) = quarantine_dir.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::rename(&xcode_root, &quarantine_dir) {
+                Ok(()) => {
+                    warn!(
+                        run_id = %run_id_str,
+                        quarantine_dir = %quarantine_dir.display(),
+                        "Startup recovery quarantined Xcode run-scoped root after crash restart"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run_id_str,
+                        error = %e,
+                        "Failed to quarantine Xcode run-scoped root during startup recovery"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(startup_repairs::ToolchainCacheRecoveryReadback {
+        session_scoped_roots_seen: Some(roots_seen),
+        session_scoped_roots_reclaimed: Some(roots_reclaimed),
+        session_scoped_cleanup_failures: Some(cleanup_failures),
+        orphan_threshold_minutes: Some(ORPHAN_THRESHOLD_MINUTES),
+        last_sweep_started_at: Some(sweep_started_at),
+    })
+}
+
+/// Return the directory name (last path component) as a String.
+fn dir_name(path: &PathBuf) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+}
+
+/// Return the age of a directory based on its mtime. Falls back to 0 if stat fails.
+fn dir_age(path: &PathBuf, now: SystemTime) -> Duration {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| now.duration_since(mtime).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Return true if the run exists in DB and is not in a terminal state.
+async fn is_active_run(pool: &SqlitePool, run_id_str: &str) -> bool {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?1")
+        .bind(run_id_str)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    status
+        .map(|s| !matches!(s.as_str(), "completed" | "failed" | "cancelled"))
+        .unwrap_or(false)
 }
 
 async fn rebuild_operator_read_projections(

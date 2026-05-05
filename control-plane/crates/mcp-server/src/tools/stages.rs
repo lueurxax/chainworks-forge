@@ -75,7 +75,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "run_id": { "type": "string" },
                     "conflict_id": { "type": "string" },
                     "selected_transition_id": { "type": "string" },
-                    "resolution_reason": { "type": "string" }
+                    "resolution_reason": { "type": "string" },
+                    "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." }
                 }
             }),
         },
@@ -213,6 +214,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'resolution_reason'"))?
                 .to_string();
+            let operator_instruction = params["operator_instruction"].as_str().map(String::from);
 
             let caller = mcp_caller(
                 &principal.id,
@@ -225,16 +227,20 @@ pub async fn execute(
                     conflict_id,
                     selected_transition_id,
                     resolution_reason,
+                    operator_instruction,
                 });
             let commanded = cmd_handler.handle(cmd, caller).await?;
-            let (selected_transition_id, selected_next_state_id) = match &commanded.result {
+            let (selected_transition_id, selected_next_state_id, retry_instruction_binding_id) =
+                match &commanded.result {
                 engine::command_handler::CommandResult::WorkflowConflictTransitionSelected {
                     selected_transition_id,
                     selected_next_state_id,
+                    retry_instruction_binding_id,
                     ..
                 } => (
                     selected_transition_id.clone(),
                     selected_next_state_id.clone(),
+                    retry_instruction_binding_id.clone(),
                 ),
                 _ => anyhow::bail!("Unexpected command result"),
             };
@@ -242,6 +248,7 @@ pub async fn execute(
                 "resolved": true,
                 "selected_transition_id": selected_transition_id,
                 "selected_next_state_id": selected_next_state_id,
+                "retry_instruction_binding_id": retry_instruction_binding_id,
                 "journal_id": commanded.journal_id,
             }))
         }
@@ -271,6 +278,20 @@ fn parse_target_attempt_number(value: Option<&serde_json::Value>) -> Result<i64>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use db::pool::create_pool;
+    use db::repos::{ideas, runs, stages, workflow_conflicts};
+    use domain::idea::{Idea, IdeaStatus};
+    use domain::ids::{IdeaId, StageExecutionId};
+    use domain::run::{Run, RunStatus};
+    use domain::stage::{StageExecution, StageStatus};
+    use domain::workflow_conflict::{
+        candidate_transition_hash, workflow_conflict_fingerprint, CandidateTransitionEvaluation,
+        CandidateTransitionResult, WorkflowConflictReason, WorkflowConflictRecord,
+        WorkflowConflictStatus,
+    };
+    use engine::event_bus;
+    use engine::work_queue::WorkQueue;
 
     #[test]
     fn parse_target_attempt_number_rejects_non_positive_values() {
@@ -279,6 +300,194 @@ mod tests {
         assert_eq!(
             parse_target_attempt_number(Some(&serde_json::json!(1))).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn workflow_conflicts_resolve_schema_accepts_operator_instruction() {
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "workflow_conflicts.resolve")
+            .expect("workflow_conflicts.resolve tool spec exists");
+        assert_eq!(
+            spec.input_schema["properties"]["operator_instruction"]["type"],
+            serde_json::json!("string")
+        );
+        assert!(
+            !spec.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "operator_instruction"),
+            "operator_instruction must remain optional"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_conflicts_resolve_response_includes_retry_instruction_binding_id() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let state_id = "state_8_implementation_continued";
+        let transition_id =
+            "state_8_implementation_continued__to__state_8_implementation_continued__0";
+
+        ideas::insert(
+            &pool,
+            &Idea {
+                id: idea_id,
+                title: "Test idea".into(),
+                body: "body".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: IdeaStatus::Active,
+                created_at: Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let run = Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Blocked,
+            workflow_id: "wf-test".into(),
+            workflow_title: "Test Workflow".into(),
+            workspace_root: "/tmp/ws".into(),
+            artifact_root: "/tmp/art".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some(state_id.into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+        };
+        runs::insert(&pool, &run).await.unwrap();
+
+        let completed_stage_id = StageExecutionId::new();
+        stages::insert(
+            &pool,
+            &StageExecution {
+                id: completed_stage_id,
+                run_id,
+                stage_id: state_id.into(),
+                label: "Implementation Continued".into(),
+                status: StageStatus::Completed,
+                iteration: 50,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                owner_agent: None,
+                provider: None,
+                model: None,
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let candidates = vec![CandidateTransitionEvaluation {
+            transition_id: transition_id.into(),
+            from_state_id: state_id.into(),
+            to_state_id: state_id.into(),
+            condition_expression_id: Some("implementation_self_assessment_needs_code_fixes".into()),
+            result: CandidateTransitionResult::NotMatched,
+            required_artifacts: vec!["implementation_self_assessment_v2".into()],
+            missing_artifacts: Vec::new(),
+            missing_fields: Vec::new(),
+            source_artifact_ids: vec!["implementation_self_assessment_v2".into()],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(
+                "Loop budget exhausted for implementation_progress_count: 50/50 iterations".into(),
+            ),
+        }];
+        let reason = WorkflowConflictReason::NoDeclarativeTransitionMatched;
+        let candidate_hash = candidate_transition_hash(&candidates);
+        let conflict = WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: workflow_conflict_fingerprint(
+                &run_id.to_string(),
+                state_id,
+                &reason,
+                &candidate_hash,
+                &[],
+            ),
+            run_id: run_id.to_string(),
+            stage_execution_id: Some(completed_stage_id.to_string()),
+            lineage_id: None,
+            current_state_id: state_id.into(),
+            reason,
+            operator_label: "No declarative workflow transition matched".into(),
+            status: WorkflowConflictStatus::OperatorConfirmationRequired,
+            candidate_transitions: candidates,
+            candidate_transition_hash: candidate_hash,
+            advisory_evidence_refs: Vec::new(),
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".into(),
+        };
+        let conflict_id = conflict.conflict_id.clone();
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let handler = CommandHandler::new(
+            pool.clone(),
+            event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let response = execute(
+            "workflow_conflicts.resolve",
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "conflict_id": conflict_id,
+                "selected_transition_id": transition_id,
+                "resolution_reason": "operator selected one more refine",
+                "operator_instruction": "Refine only the requested blockers."
+            }),
+            &pool,
+            &handler,
+            &auth::Principal::new("operator-test", auth::PrincipalClass::Operator),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["resolved"], serde_json::json!(true));
+        assert!(
+            response["retry_instruction_binding_id"].as_str().is_some(),
+            "MCP response should surface retry instruction binding id"
         );
     }
 }

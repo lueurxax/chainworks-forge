@@ -11,6 +11,17 @@ app:
     - codex_acp
     - claude_acp
     - gemini_acp
+    - junie
+x_p060_score_weights: &p060_score_weights
+  force_include: 5
+  stack_matches: 4
+  surface_matches: 3
+  risk_matches: 3
+  strong_keyword_matches: 2
+  repo_signal_matches: 2
+  cross_stack_dependency_matches: 2
+  baseline_gap_matches: 1
+  overlap_penalty: 3
 paths:
   repo_root: ${CHAINWORKS_REPO_ROOT:-.}
   meta_root: ${CHAINWORKS_META_ROOT:-.chainworks}
@@ -26,6 +37,8 @@ artifacts:
   proposal_review_architect: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/architect.json
   proposal_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json
   review_corpus_bundle: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/review-corpus-bundle.json
+  agent_selection_plan_v1: ${CHAINWORKS_META_ROOT:-.chainworks}/routing/agent-selection-plan.v1.json
+  review_corpus_bundle_v2: ${CHAINWORKS_META_ROOT:-.chainworks}/routing/review-corpus-bundle.v2.json
   score_lift_backlog: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json
   proposal_feedback_coverage: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/feedback-coverage.json
   proposal_fact_digest: ${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/fact-digest.json
@@ -76,6 +89,9 @@ skills:
     type: external_skill
     path: ../skills/proposal-review-triad
     notes: Shared skill for PO / UX / UI / Architect proposal review lenses.
+  proposal_review_router_skill:
+    type: inline_skill
+    description: Deterministic proposal reviewer routing. Build evidence-backed stack, surface, and risk tags, then select the smallest sufficient reviewer set.
   proposal_implementation_audit:
     type: external_skill
     path: ../skills/proposal-implementation-audit
@@ -164,6 +180,37 @@ contracts:
       - source_proposal_artifact
       - raw_review_artifacts
       - aggregate_summary_artifact
+  agent_selection_plan_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: agent_selection_plan_raw
+    normalized_artifact_name: agent_selection_plan_v1
+    required_fields:
+      - schema_version
+      - routing_rules_version
+      - proposal_md5
+      - plan_hash
+      - mode
+      - fingerprint
+      - selected_agents
+      - rejected_alternatives
+      - ineligible_candidates
+      - warnings
+      - input_snapshot_hashes
+  review_corpus_bundle_v2:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    raw_artifact_name: review_corpus_bundle_v2_raw
+    normalized_artifact_name: review_corpus_bundle_v2
+    required_fields:
+      - selected_review_artifacts
+      - selected_reviewer_ids
+      - reviewer_count
+      - selection_plan_hash
+      - selection_plan
+      - legacy_fixed_mode
   score_lift_backlog_v1:
     format: json
     machine_format: json
@@ -1098,7 +1145,7 @@ agents:
     title: Lead / Orchestrator
     mode: orchestration
     system_role: lead
-    backend_profile: claude_orchestrator_high
+    backend_profile: junie_orchestrator_acp
     permission_profile: ORCH
     lead_resolution_contract: LeadResolutionContract
     skill_ref: orchestrator_core
@@ -1109,12 +1156,14 @@ agents:
       - proposal_current
       - proposal_review_summary
       - review_corpus_bundle
+      - review_corpus_bundle_v2
       - approved_proposal
       - implementation_review_summary
       - run_state
     outputs:
       - proposal_review_summary
       - review_corpus_bundle
+      - review_corpus_bundle_v2
       - score_lift_backlog
       - proposal_fact_digest
       - reviewer_scope_plan
@@ -1158,6 +1207,22 @@ agents:
       - proposal_review_po
     output_contract: proposal_review_v1
     requires_human_approval: false
+    routing:
+      routing_id: product_owner
+      family: product
+      capabilities: [product, rollout, user-trust]
+      stacks: [any]
+      surfaces: [ux, rollout]
+      risks: [user-trust]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [user-trust]
+      usually_pair_with: [proposal_reviewer_ux, proposal_reviewer_observability_rollout]
+      close_alternatives: [proposal_reviewer_ux]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
     prompt: "Review the proposal as a product owner.
 
       Focus on user problem clarity, business value, scope discipline, acceptance criteria, rollout risk, metrics, and dependency realism.
@@ -1184,6 +1249,22 @@ agents:
       - proposal_review_ux
     output_contract: proposal_review_v1
     requires_human_approval: false
+    routing:
+      routing_id: ux
+      family: design
+      capabilities: [ux, accessibility, navigation]
+      stacks: [apple-client, cross-stack]
+      surfaces: [ux, navigation, accessibility]
+      risks: [user-trust, privacy-sensitive]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [ux, accessibility]
+      usually_pair_with: [proposal_reviewer_ui]
+      close_alternatives: [proposal_reviewer_product_owner, proposal_reviewer_ui]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
     prompt: "Review the proposal as a UX designer.
 
       Focus on task flow, user friction, discoverability, error states, accessibility implications, onboarding, and edge cases across the journey.
@@ -1210,6 +1291,22 @@ agents:
       - proposal_review_ui
     output_contract: proposal_review_v1
     requires_human_approval: false
+    routing:
+      routing_id: ui
+      family: design
+      capabilities: [ui, swiftui, macos]
+      stacks: [ios, macos, apple-client]
+      surfaces: [ui, navigation]
+      risks: [platform-mismatch]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [ui]
+      usually_pair_with: [proposal_reviewer_ux, proposal_reviewer_apple_architect]
+      close_alternatives: [proposal_reviewer_ux]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
     prompt: "Review the proposal as a UI designer.
 
       Focus on component consistency, screen states, empty/loading/error states, visual hierarchy, density, and cross-screen coherence.
@@ -1236,6 +1333,22 @@ agents:
       - proposal_review_architect
     output_contract: proposal_review_v1
     requires_human_approval: false
+    routing:
+      routing_id: architect
+      family: architecture
+      capabilities: [architecture, state-management, integration]
+      stacks: [any, cross-stack]
+      surfaces: [architecture, state-management]
+      risks: [availability-sensitive, backward-compatibility]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [architecture]
+      usually_pair_with: [proposal_reviewer_reliability]
+      close_alternatives: [proposal_reviewer_rust_architect, proposal_reviewer_apple_architect]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
     prompt: "Review the proposal as a software architect.
 
       Focus on architecture fit, component boundaries, data flow, operational risk, migration cost, testability, failure modes, and implementation sequencing.
@@ -1245,6 +1358,245 @@ agents:
       Output only the structured review contract with a numeric score from 0 to 10.
 
       Prefer practical implementation concerns over theoretical purity."
+  - id: proposal_review_router
+    title: Proposal Review Router
+    mode: system.routing
+    backend_profile: junie_orchestrator_acp
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_router_skill
+    inputs:
+      - proposal_current
+      - idea_brief
+      - agent_catalog_snapshot
+    outputs:
+      - agent_selection_plan_v1
+    output_contract: agent_selection_plan_v1
+    requires_human_approval: false
+    prompt: "System routing task. Build an evidence-backed proposal fingerprint and emit AgentSelectionPlanV1. This agent is catalog truth for P060; the runtime executes the deterministic system.routing implementation without invoking a provider."
+  - id: proposal_reviewer_apple_architect
+    title: Proposal Reviewer / Apple Architecture
+    mode: proposal_review.apple_architecture
+    backend_profile: codex_architect_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: architect
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_architect]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: apple_architect
+      family: architecture
+      capabilities: [apple-client, swiftui, appkit, concurrency, persistence]
+      stacks: [ios, macos, apple-client]
+      surfaces: [architecture, state-management, concurrency, persistence, ui]
+      risks: [platform-mismatch, data-loss]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [apple-client, macos, ios]
+      usually_pair_with: [proposal_reviewer_ui, proposal_reviewer_ux]
+      close_alternatives: [proposal_reviewer_architect]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as an Apple platform architect. Focus on SwiftUI/AppKit boundaries, state ownership, concurrency, persistence, platform conventions, and migration risk. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_macos
+    title: Proposal Reviewer / macOS
+    mode: proposal_review.macos
+    backend_profile: gemini_review_pro
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: ui_designer
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_ui]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: macos
+      family: platform
+      capabilities: [macos, swiftui, appkit, ui, accessibility]
+      stacks: [macos, apple-client]
+      surfaces: [ui, navigation, accessibility, architecture]
+      risks: [platform-mismatch, user-trust]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [macos]
+      usually_pair_with: [proposal_reviewer_apple_architect, proposal_reviewer_ui]
+      close_alternatives: [proposal_reviewer_ui]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as a macOS specialist. Focus on native macOS interaction patterns, SwiftUI/AppKit fit, accessibility, windowing, menus, keyboard workflows, and platform-specific UX risk. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_rust_architect
+    title: Proposal Reviewer / Rust Architecture
+    mode: proposal_review.rust_architecture
+    backend_profile: codex_architect_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: architect
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_architect]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: rust_architect
+      family: architecture
+      capabilities: [rust-backend, async, persistence, api-contract]
+      stacks: [rust-backend]
+      surfaces: [architecture, concurrency, persistence, api-contract]
+      risks: [availability-sensitive, backward-compatibility]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [rust-backend]
+      usually_pair_with: [proposal_reviewer_reliability, proposal_reviewer_api_contract]
+      close_alternatives: [proposal_reviewer_architect]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as a Rust control-plane architect. Focus on ownership boundaries, async execution, storage contracts, migration safety, and API compatibility. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_reliability
+    title: Proposal Reviewer / Reliability
+    mode: proposal_review.reliability
+    backend_profile: claude_product_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: architect
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_architect]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: reliability
+      family: reliability
+      capabilities: [retry, idempotency, cancellation, backpressure, recovery]
+      stacks: [any, rust-backend, cross-stack]
+      surfaces: [background-work, concurrency, persistence]
+      risks: [idempotency, availability-sensitive, operability-sensitive, data-loss]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [background-work, idempotency, availability-sensitive]
+      usually_pair_with: [proposal_reviewer_rust_architect, proposal_reviewer_observability_rollout]
+      close_alternatives: [proposal_reviewer_architect]
+      strong_proposal_keywords: [retry, retries, idempotency, cancellation, backpressure, recovery, resume, stuck, timeout, sleep, wake, queue, scheduler]
+      strong_repo_files: [control-plane/crates/engine/src/executor.rs, control-plane/crates/engine/src/orchestrator.rs, control-plane/crates/engine/src/work_queue.rs, control-plane/crates/domain/src/routing.rs]
+      strong_repo_symbols: [WorkQueue, BackgroundExecutor, advance_run, retry_stage, cancellation_requested_at, ReviewRoutingMode]
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as a reliability engineer. Focus on retries, idempotency, cancellation, deadlines, backpressure, shutdown, recovery, and stuck-state risks. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_performance
+    title: Proposal Reviewer / Performance
+    mode: proposal_review.performance
+    backend_profile: claude_product_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: architect
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_architect]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: performance
+      family: performance
+      capabilities: [latency, throughput, allocation, lock-contention]
+      stacks: [any, rust-backend, apple-client]
+      surfaces: [performance-hot-path, concurrency]
+      risks: [latency-sensitive, availability-sensitive]
+      enabled_for_proposal_review: false
+      rollout_wave: later_wave
+      mandatory_when: [performance-hot-path, latency-sensitive]
+      usually_pair_with: [proposal_reviewer_rust_architect]
+      close_alternatives: [proposal_reviewer_reliability]
+      strong_proposal_keywords: []
+      strong_repo_files: []
+      strong_repo_symbols: []
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as a performance engineer. Focus on latency, throughput, allocation, lock contention, serialization hot paths, and load behavior. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_security
+    title: Proposal Reviewer / Security
+    mode: proposal_review.security
+    backend_profile: claude_product_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: architect
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_architect]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: security
+      family: security
+      capabilities: [auth, secrets, unsafe, deserialization, trust-boundary]
+      stacks: [any, rust-backend, shared-api]
+      surfaces: [auth, security-boundary, api-contract]
+      risks: [security-sensitive, privacy-sensitive]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [auth, security-sensitive, privacy-sensitive]
+      usually_pair_with: [proposal_reviewer_api_contract]
+      close_alternatives: [proposal_reviewer_rust_architect]
+      strong_proposal_keywords: [auth, authorization, permission, secret, secrets, token, redaction, trust-boundary, unsafe, deserialization, privacy]
+      strong_repo_files: [control-plane/crates/auth/src/lib.rs, control-plane/crates/mcp-server/src/request_context.rs, control-plane/crates/domain/src/routing.rs, Chainworks Forge/Providers/KeychainSecretStore.swift]
+      strong_repo_symbols: [Principal, PrincipalClass, CapabilityToolId, KeychainSecretStore, trust_boundary]
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as a security engineer. Focus on auth, secrets, trust boundaries, unsafe/FFI, deserialization, public interfaces, and leakage risk. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_api_contract
+    title: Proposal Reviewer / API Contract
+    mode: proposal_review.api_contract
+    backend_profile: codex_architect_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: architect
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_architect]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: api_contract
+      family: api_contract
+      capabilities: [graphql, mcp, yaml, artifact-contract, migration]
+      stacks: [shared-api, cross-stack, rust-backend]
+      surfaces: [api-contract, migration, persistence]
+      risks: [backward-compatibility, multi-service-coordination]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [api-contract, backward-compatibility]
+      usually_pair_with: [proposal_reviewer_rust_architect, proposal_reviewer_security]
+      close_alternatives: [proposal_reviewer_architect]
+      strong_proposal_keywords: [graphql, mcp, yaml, artifact-contract, schema, migration, contract, wire-shape, backward-compatible, compatibility]
+      strong_repo_files: [control-plane/crates/graphql-server/src/schema.rs, control-plane/crates/mcp-server/src/tools/runs.rs, control-plane/crates/workflow/src/compiler.rs, examples/workflows/workflow.yaml, examples/agents/agents.yaml]
+      strong_repo_symbols: [StartRunCmd, ReviewRoutingOptions, selected_outputs_from, agent_selection_plan_v1, review_corpus_bundle_v2]
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as an API contract reviewer. Focus on GraphQL, MCP, YAML, artifact contracts, migrations, compatibility, and versioning. Output only the proposal_review_v1 contract."
+  - id: proposal_reviewer_observability_rollout
+    title: Proposal Reviewer / Observability and Rollout
+    mode: proposal_review.observability_rollout
+    backend_profile: claude_product_high
+    permission_profile: RO_REVIEW
+    skill_ref: proposal_review_triad
+    skill_role: product_owner
+    inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
+    outputs: [proposal_review_po]
+    output_contract: proposal_review_v1
+    requires_human_approval: false
+    routing:
+      routing_id: observability_rollout
+      family: rollout
+      capabilities: [telemetry, feature-flag, rollout, rollback, support]
+      stacks: [any, cross-stack]
+      surfaces: [telemetry, feature-flag, rollout, migration]
+      risks: [operability-sensitive, user-trust]
+      enabled_for_proposal_review: true
+      rollout_wave: phase_3_core
+      mandatory_when: [rollout, telemetry, feature-flag, operability-sensitive]
+      usually_pair_with: [proposal_reviewer_reliability]
+      close_alternatives: [proposal_reviewer_product_owner]
+      strong_proposal_keywords: [telemetry, metrics, rollout, rollback, feature-flag, release, evidence, support, diagnostics, gate]
+      strong_repo_files: [scripts/test-gate.sh, docs/reference/test-gates.md, control-plane/crates/db/src/repos/routing_receipts.rs, control-plane/crates/db/src/repos/system_executions.rs]
+      strong_repo_symbols: [RoutingReceipt, SystemExecution, p060_dispatch_mode, proposal_060, rollout_wave]
+      score_weights: *p060_score_weights
+    prompt: "Review the proposal as an observability and rollout reviewer. Focus on telemetry, feature flags, migration evidence, rollback, supportability, and operator confidence. Output only the proposal_review_v1 contract."
   - id: code_writer
     title: Code Writer
     mode: implementation
@@ -1291,6 +1643,8 @@ agents:
 
       Put code-writer-owned source or test blockers only in remaining_code_tasks; each entry must be an object with summary, owner, blocking, and evidence.
 
+      If all remaining_code_tasks are blocking=false and verification_green is true, do not report the implementation as needs_code_fixes or keep implementation_complete=false just to hold deferred rollout/non-code work; move downstream work to handoff_tasks and let the contract settle as handoff_required.
+
       Put docs, manual evidence, release, ops, product, or human-operator work in handoff_tasks; each entry must be an object with summary, owner_class, target_stage, blocking_review, and evidence.
 
       Use only these owner_class values: docs, manual_evidence, release, ops, product, human_operator, unknown. Do not use docs-agent, docs_agent, operator, security-owner, release-owner, or slash-qualified owner_class values.
@@ -1323,6 +1677,7 @@ agents:
       - proposal_review_architect
       - proposal_review_summary
       - review_corpus_bundle
+      - review_corpus_bundle_v2
       - score_lift_backlog
       - proposal_fact_digest
     outputs:

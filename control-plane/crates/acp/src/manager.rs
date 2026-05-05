@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use anyhow::{bail, Result};
 use domain::agent::AgentStatus;
+use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate, XcodeShimEvent,
 };
@@ -20,8 +22,8 @@ use crate::adapters::{
 };
 use crate::session::AcpSessionHandle;
 use crate::{
-    ExecutionRequest, ExecutionResult, NoopXcodeRuntimeObservationSink,
-    XcodeRuntimeObservationSink, XcodeShimGrantStore,
+    AcpPromptProgressSink, ExecutionRequest, ExecutionResult, NoopAcpPromptProgressSink,
+    NoopXcodeRuntimeObservationSink, XcodeRuntimeObservationSink, XcodeShimGrantStore,
 };
 
 #[derive(Debug)]
@@ -45,6 +47,10 @@ pub trait XcodeBrokerLeaseAttacher: Send + Sync {
         &self,
         req: &ExecutionRequest,
     ) -> Result<BrokeredXcodeLeaseAttachment>;
+
+    async fn warm_up_brokered_xcode_leases(&self, _lease_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
 
     async fn release_brokered_xcode_leases(&self, _lease_ids: &[String]) -> Result<()> {
         Ok(())
@@ -81,6 +87,7 @@ pub struct AcpRuntimeManager {
     live_sessions: Mutex<HashMap<String, AcpSessionHandle>>,
     live_xcode_leases: Mutex<HashMap<String, BrokeredXcodeLeaseCleanup>>,
     provider_capability_cache: ProviderCapabilityCache,
+    prompt_progress_sink: RwLock<Arc<dyn AcpPromptProgressSink>>,
     xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
     xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
     xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
@@ -91,6 +98,10 @@ struct XcodeShimRuntimeConfig {
     store: Arc<dyn XcodeShimGrantStore>,
     socket_path: String,
     shim_dir: String,
+}
+
+fn canonical_acp_provider(provider: &str) -> String {
+    ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string())
 }
 
 impl AcpRuntimeManager {
@@ -122,6 +133,7 @@ impl AcpRuntimeManager {
             live_sessions: Mutex::new(HashMap::new()),
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
+            prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -130,7 +142,8 @@ impl AcpRuntimeManager {
 
     /// Retrieve a shared reference to the adapter for the given provider name.
     pub fn get_adapter(&self, provider: &str) -> Option<Arc<dyn AcpAdapter>> {
-        self.adapters.get(provider).cloned()
+        let provider = canonical_acp_provider(provider);
+        self.adapters.get(&provider).cloned()
     }
 
     pub fn set_xcode_runtime_observation_sink(&self, sink: Arc<dyn XcodeRuntimeObservationSink>) {
@@ -139,6 +152,21 @@ impl AcpRuntimeManager {
             .write()
             .expect("xcode runtime observation sink lock poisoned");
         *guard = sink;
+    }
+
+    pub fn set_prompt_progress_sink(&self, sink: Arc<dyn AcpPromptProgressSink>) {
+        let mut guard = self
+            .prompt_progress_sink
+            .write()
+            .expect("prompt progress sink lock poisoned");
+        *guard = sink;
+    }
+
+    fn prompt_progress_sink(&self) -> Arc<dyn AcpPromptProgressSink> {
+        self.prompt_progress_sink
+            .read()
+            .expect("prompt progress sink lock poisoned")
+            .clone()
     }
 
     pub fn xcode_runtime_observation_sink(&self) -> Arc<dyn XcodeRuntimeObservationSink> {
@@ -174,8 +202,9 @@ impl AcpRuntimeManager {
     }
 
     async fn adapter_for(&self, provider: &str) -> Result<Arc<dyn AcpAdapter>> {
+        let provider = canonical_acp_provider(provider);
         self.adapters
-            .get(provider)
+            .get(&provider)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("No adapter registered for provider '{provider}'"))
     }
@@ -219,7 +248,8 @@ impl AcpRuntimeManager {
     }
 
     /// Start a fresh ACP session and keep it alive if requested.
-    pub async fn start_session(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    pub async fn start_session(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
         let adapter = self.adapter_for(&provider).await?;
         info!(
@@ -258,7 +288,10 @@ impl AcpRuntimeManager {
             }
         }
 
-        let mut result = match session.prompt(&session_req).await {
+        let mut result = match session
+            .prompt_with_progress_sink(&session_req, self.prompt_progress_sink())
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 let cleanup = match registered_generation_id.as_ref() {
@@ -344,6 +377,14 @@ impl AcpRuntimeManager {
             return Err(err);
         }
 
+        if let Err(err) = attacher
+            .warm_up_brokered_xcode_leases(&attachment.lease_ids)
+            .await
+        {
+            self.release_xcode_leases(lease_cleanup).await;
+            return Err(err);
+        }
+
         let session_new_spec = match adapter.prepare_session_new_spec(&session_req) {
             Ok(spec) => spec,
             Err(err) => {
@@ -351,6 +392,48 @@ impl AcpRuntimeManager {
                 return Err(err);
             }
         };
+        // P066 T20: Prepare Go session-scoped toolchain mapping root if enabled.
+        // The root is registered with the LaunchResourceGuard so it is removed on
+        // session startup failure (before resources.commit()) AND on session close
+        // (via AcpSession::close → cleanup_paths).
+        if req.toolchain_go_scope_enabled {
+            let Some(toolchain_home) = req.toolchain_home.as_deref() else {
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(anyhow::anyhow!(
+                    "toolchain_mapping_setup_failed for Go session scope: missing toolchain_home"
+                ));
+            };
+            let Some(session_gen_id) = req.session_generation_id.as_deref() else {
+                self.release_xcode_leases(lease_cleanup).await;
+                return Err(anyhow::anyhow!(
+                    "toolchain_mapping_setup_failed for Go session scope: missing session_generation_id"
+                ));
+            };
+
+            match crate::toolchain_mapper::prepare_toolchain_mapping(
+                Path::new(toolchain_home),
+                crate::toolchain_mapper::ToolchainFamily::Go,
+                session_gen_id,
+                crate::toolchain_mapper::DEFAULT_MIN_FREE_BYTES,
+            ) {
+                Ok(result) => {
+                    // Register root for cleanup on session failure or close.
+                    resources.add_cleanup_path(result.root.clone());
+                    // Inject Go env vars into the process launch spec.
+                    for (k, v) in result.env_vars {
+                        launch_spec.env.push((k, v));
+                    }
+                }
+                Err(err) => {
+                    // Fail-closed: setup failure prevents session launch.
+                    self.release_xcode_leases(lease_cleanup).await;
+                    return Err(anyhow::anyhow!(
+                        "toolchain_mapping_setup_failed for Go session scope: {}",
+                        err.reason.as_str()
+                    ));
+                }
+            }
+        }
         launch_spec.cleanup_paths.extend(resources.commit());
         let session = match adapter
             .open_session_with_specs(&session_req, launch_spec, session_new_spec)
@@ -448,7 +531,10 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: reusing live session"
         );
 
-        let mut result = match session.prompt(&req).await {
+        let mut result = match session
+            .prompt_with_progress_sink(&req, self.prompt_progress_sink())
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 self.live_sessions
@@ -521,7 +607,8 @@ impl AcpRuntimeManager {
     }
 
     /// Route an execution request to the matching adapter or live session.
-    pub async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+    pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        req.provider = canonical_acp_provider(&req.provider);
         let result = if req.reuse_existing_session {
             let session_generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -646,6 +733,7 @@ impl AcpRuntimeManager {
             live_sessions: Mutex::new(HashMap::new()),
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
+            prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -709,6 +797,8 @@ impl Default for AcpRuntimeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::{AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
+    use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::AgentExecutionId;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -755,6 +845,139 @@ mod tests {
             self.released.lock().await.extend_from_slice(lease_ids);
             Ok(())
         }
+    }
+
+    struct SpawnMarkerAdapter {
+        script_path: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for SpawnMarkerAdapter {
+        fn provider_name(&self) -> &str {
+            "fixture"
+        }
+
+        fn prepare_launch_spec(
+            &self,
+            _req: &ExecutionRequest,
+            _resources: &mut LaunchResourceGuard,
+        ) -> Result<AcpLaunchSpec> {
+            Ok(AcpLaunchSpec::new(&self.script_path))
+        }
+
+        fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
+            Ok(AcpSessionNewSpec::new("fixture-model", "default"))
+        }
+    }
+
+    fn request_with_go_toolchain_scope() -> ExecutionRequest {
+        ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_go".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_go".to_string(),
+            provider: "fixture".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: "/tmp/workspace".to_string(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: Some("generation-go".to_string()),
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: Some("/tmp/toolchain-home".to_string()),
+            toolchain_go_scope_enabled: true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_marker_script(tmp: &tempfile::TempDir, marker: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = tmp.path().join("spawn_marker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_toolchain_scope_enabled_without_toolchain_home_fails_before_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned.txt");
+        let adapter = Arc::new(SpawnMarkerAdapter {
+            script_path: spawn_marker_script(&tmp, &marker),
+        });
+        let manager = AcpRuntimeManager::new_with_adapters(vec![adapter]);
+        let mut req = request_with_go_toolchain_scope();
+        req.toolchain_home = None;
+
+        let err = manager
+            .start_session(req)
+            .await
+            .expect_err("missing toolchain_home must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("toolchain_mapping_setup_failed for Go session scope"),
+            "error should identify Go toolchain mapping failure: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "manager must fail before spawning provider subprocess"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_toolchain_scope_enabled_without_session_generation_id_fails_before_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned.txt");
+        let adapter = Arc::new(SpawnMarkerAdapter {
+            script_path: spawn_marker_script(&tmp, &marker),
+        });
+        let manager = AcpRuntimeManager::new_with_adapters(vec![adapter]);
+        let mut req = request_with_go_toolchain_scope();
+        req.toolchain_home = Some(tmp.path().join("toolchains").to_string_lossy().into_owned());
+        req.session_generation_id = None;
+
+        let err = manager
+            .start_session(req)
+            .await
+            .expect_err("missing session_generation_id must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("toolchain_mapping_setup_failed for Go session scope"),
+            "error should identify Go toolchain mapping failure: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "manager must fail before spawning provider subprocess"
+        );
     }
 
     #[tokio::test]
@@ -829,6 +1052,8 @@ mod tests {
             origin_stage_id: None,
             origin_stage_execution_id: None,
             mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
         };
 
         manager
@@ -845,5 +1070,14 @@ mod tests {
             Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
             None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
         }
+    }
+
+    #[test]
+    fn provider_aliases_resolve_to_registered_acp_adapters() {
+        let manager = AcpRuntimeManager::new();
+
+        assert!(manager.get_adapter("claude_acp").is_some());
+        assert!(manager.get_adapter("gemini_acp").is_some());
+        assert!(manager.get_adapter("codex_acp").is_some());
     }
 }

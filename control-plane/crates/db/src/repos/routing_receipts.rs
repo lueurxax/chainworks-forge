@@ -5,10 +5,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::ids::{RoutingReceiptId, RunId, SystemExecutionId};
 use domain::routing::{RoutingReceipt, RoutingReceiptStatus};
 
-pub async fn insert_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    receipt: &RoutingReceipt,
-) -> Result<()> {
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, receipt: &RoutingReceipt) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO routing_receipts (receipt_id, run_id, stage_id, attempt_id, system_execution_id,

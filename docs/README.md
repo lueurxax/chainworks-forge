@@ -40,6 +40,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### ACP transport and sessions
 
 - [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, and capacity management
+- [reference/acp-runtime-transport.md#toolchain-cache-mapping](reference/acp-runtime-transport.md#toolchain-cache-mapping) — Provider toolchain cache mapping: Xcode/Go isolation, environment redirection, and exclusive serialization
 - [reference/xcode-mcp-bridge-pool.md](reference/xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, and broker health
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset
 - [reference/live-provider-execution-slice.md](reference/live-provider-execution-slice.md) — Live proposal loop runtime contract
@@ -63,6 +64,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Operator experience
 
+- [reference/ui-action-boundary.md](reference/ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
 - [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client

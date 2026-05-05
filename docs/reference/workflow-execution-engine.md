@@ -11,12 +11,13 @@ interruption.
 All core engine code lives under `Chainworks Forge/Engine/` (SwiftUI client) or
 `control-plane/crates/engine/` (Rust daemon).
 
-**P031 Thin UI Boundary:**
-Per P031-r18, the production macOS UI is a **read-only consumer** of the engine's
-state via GraphQL projections. While the Swift engine remains implemented for
-parity, the governed UI is prohibited from calling mutation paths in
+**Thin UI Boundary:**
+The production macOS UI is a **thin client** focused on read-side truth
+and governed human gates. While the Swift engine remains implemented for
+parity, the governed UI is prohibited from calling most mutation paths in
 `ExecutionService` or `WorkflowOrchestrator` directly. Start, Cancel, and
-Approval actions move to external CLI/MCP workflows.
+other operational commands remain in external CLI/MCP workflows. Approval resolution
+is the only governed mutation path allowed in the macOS UI via GraphQL.
 
 **Rust Daemon Implementation:**
 The Rust control-plane daemon implements the same state machine and transition
@@ -197,13 +198,14 @@ configurable delay. Thread-safe task tracking for test assertions.
 Live executor using the selected ACP runtime transport. Per-execution flow:
 
 1. Validate workspace boundaries.
-2. Capture pre-prompt metadata for the per-execution baseline.
-3. Create an isolated session via `RuntimeSessionBridge`.
-4. **Prompt Augmentation (P065)**: if an operator retry instruction is active, the executor renders a reserved engine-owned prompt section (`## Operator Retry Instruction`) before the task text.
-5. Stream execution events through `ExecutionEventBridge`.
-6. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
-7. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
-8. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
+2. **Toolchain Cache Mapping**: Prepare isolated toolchain roots (Xcode/Go) based on agent policy and session/run scope. Acquire exclusive per-run lease for Xcode work.
+3. Capture pre-prompt metadata for the per-execution baseline.
+4. Create an isolated session via `RuntimeSessionBridge`.
+5. **Prompt Augmentation (P065)**: if an operator retry instruction is active, the executor renders a reserved engine-owned prompt section (`## Operator Retry Instruction`) before the task text.
+6. Stream execution events through `ExecutionEventBridge`.
+7. Build receipt and transcript artifacts (`ExecutionReceiptBuilder`).
+8. Bounded output discovery: read declared output files and meta-root outputs through the discovery settlement pipeline.
+9. Validate required outputs -- missing or rejected (over-cap) outputs fail the stage.
 
 On stream failure, the executor salvages any files the agent already wrote to disk
 before the transport closed, governed by the discovery settlement policy.

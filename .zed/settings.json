@@ -1,0 +1,13 @@
+{
+  "prettier": {
+    "allowed": true
+  },
+  "languages": {
+    "Rust": {
+      "prettier": {
+        "allowed": true
+      },
+      "preferred_line_length": 120
+    }
+  }
+}

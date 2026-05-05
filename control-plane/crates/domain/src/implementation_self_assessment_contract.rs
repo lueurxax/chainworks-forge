@@ -730,16 +730,20 @@ impl SummaryBuilder {
             .filter(|task| task.blocking)
             .count();
 
-        if self.implementation_complete == Some(false) || blocking_code_tasks > 0 {
+        let has_nonblocking_code_tail =
+            !self.remaining_code_tasks.is_empty() && blocking_code_tasks == 0;
+
+        if blocking_code_tasks > 0 {
             self.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
         } else if self.implementation_complete == Some(true)
             && blocking_code_tasks == 0
             && self.verification_green == Some(false)
         {
             self.status = ImplementationSelfAssessmentStatus::Blocked;
-        } else if self.implementation_complete == Some(true)
-            && self.verification_green == Some(true)
-            && !self.handoff_tasks.is_empty()
+        } else if self.verification_green == Some(false) {
+            self.status = ImplementationSelfAssessmentStatus::Blocked;
+        } else if self.verification_green == Some(true)
+            && (!self.handoff_tasks.is_empty() || has_nonblocking_code_tail)
         {
             self.status = ImplementationSelfAssessmentStatus::HandoffRequired;
         } else if self.implementation_complete == Some(true)
@@ -747,6 +751,8 @@ impl SummaryBuilder {
             && blocking_code_tasks == 0
         {
             self.status = ImplementationSelfAssessmentStatus::Complete;
+        } else if self.implementation_complete == Some(false) {
+            self.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
         } else {
             self.status = ImplementationSelfAssessmentStatus::Unknown;
         }

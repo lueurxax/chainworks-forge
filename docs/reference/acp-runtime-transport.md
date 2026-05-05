@@ -139,20 +139,32 @@ backend_profile
 
 ### ACP-native adapters
 
-The currently implemented ACP-native adapters are normalized into canonical 
-provider families (`claude`, `gemini`, `codex`, `auggie`, `junie`) for 
-consistent capacity management and backpressure:
+The Rust control plane owns live ACP subprocess execution. Provider adapters
+are normalized into canonical provider families (`claude`, `gemini`, `codex`,
+`auggie`, `junie`) for consistent capacity management and backpressure:
 
-- `ClaudeAgentACPTransport` (canonical: `claude`)
-- `GeminiCLIACPTransport` (canonical: `gemini`)
-- `CodexACPTransport` (canonical: `codex`)
-- `AuggieCLIACPTransport` (canonical: `auggie`)
-- `JunieCLIACPTransport` (canonical: `junie`)
+- `ClaudeAgentAdapter` (canonical: `claude`)
+- `GeminiCliAdapter` (canonical: `gemini`)
+- `CodexAdapter` (canonical: `codex`)
+- `AuggieAdapter` (canonical: `auggie`)
+- `JunieAdapter` (canonical: `junie`)
 
-Shared ACP plumbing lives in:
+Shared ACP plumbing lives in `control-plane/crates/acp/src/transport.rs`.
+Junie must be launched in explicit ACP mode with `--acp true`; plain `junie`
+does not enter the JSON-RPC ACP handshake.
 
-- `ACPSubprocessManager`
-- `ACPStreamEventMapper`
+The Swift app process does not spawn live ACP providers. It reads durable run
+truth through GraphQL and disk-backed artifacts, and its local transport factory
+rejects live ACP adapter families.
+
+#### Toolchain Cache Mapping
+
+The ACP layer manages the isolation of toolchain-specific build and cache roots, including Xcode DerivedData and Go caches. This section is the stable owner for provider-launched toolchain cache mapping behavior.
+
+- **Environment Redirection**: ACP adapters derive the appropriate toolchain root based on the agent's `toolchain_cache_policy` and session/run scope. They publish `CHAINWORKS_TOOLCHAIN_HOME` and `TOOLCHAIN_HOME` and apply family-specific redirection (e.g., `-derivedDataPath` for Xcode, `GOCACHE` for Go).
+- **Exclusive Serialization**: For run-scoped Xcode work, the host-executor path acquires an exclusive per-run lease to prevent concurrent mutation of the same DerivedData root.
+- **Diagnostics**: Adapters capture setup and mapping metadata, stored as `actualToolchainMappingDiagnostics` on the execution record.
+- **Apple Read Adapter**: Swift operator-facing consumers decode toolchain mapping truth through `ToolchainMappingReadAdapter` to ensure consistent handling of frozen-snapshot compatibility and legacy sentinels.
 
 #### Bounded Discovery and DiscoveryFilesystem
 
@@ -163,17 +175,12 @@ Broad filesystem discovery is not part of the pre-`initialize` path. Instead of 
 - **Pre-Prompt Metadata**: Metadata capture is now a per-execution, per-prompt-turn step for both fresh and reused sessions.
 - **Settlement Pipeline**: An engine-owned pipeline settles discovered artifacts based on typed expected outputs and discovery decisions.
 
-## Current factory behavior
+## Current app factory behavior
 
-`DefaultRuntimeTransportFactory` now resolves only ACP families:
-
-1. `adapterFamily == "claude_agent_acp"` -> `ClaudeAgentACPTransport`
-2. `adapterFamily == "gemini_cli_acp"` -> `GeminiCLIACPTransport`
-3. `adapterFamily == "codex_acp"` -> `CodexACPTransport`
-4. `adapterFamily == "auggie_cli_acp"` -> `AuggieCLIACPTransport`
-5. `adapterFamily == "junie_cli_acp"` -> `JunieCLIACPTransport`
-
-Unknown families fail closed.
+`DefaultRuntimeTransportFactory` is app-local only. It accepts fixture transport
+injection for tests and fails closed for non-empty live adapter families such as
+`claude_agent_acp`, `gemini_cli_acp`, `codex_acp`, `auggie_cli_acp`, and
+`junie_cli_acp`.
 
 ## Persisted runtime truth
 
@@ -237,13 +244,13 @@ The implemented ACP baseline currently guarantees:
 - `Chainworks Forge/Engine/ExecutionService.swift`
 - `Chainworks Forge/Engine/RuntimeSessionBridge.swift`
 - `Chainworks Forge/Engine/RuntimeAgentExecutor.swift`
-- `Chainworks Forge/Engine/ACPAdapters/ClaudeAgentACPTransport.swift`
-- `Chainworks Forge/Engine/ACPAdapters/GeminiCLIACPTransport.swift`
-- `Chainworks Forge/Engine/ACPAdapters/CodexACPTransport.swift`
-- `Chainworks Forge/Engine/ACPAdapters/AuggieCLIACPTransport.swift`
-- `Chainworks Forge/Engine/ACPAdapters/JunieCLIACPTransport.swift`
-- `Chainworks Forge/Engine/ACPAdapters/ACPSubprocessManager.swift`
-- `Chainworks Forge/Engine/ACPAdapters/ACPStreamEventMapper.swift`
+- `control-plane/crates/acp/src/manager.rs`
+- `control-plane/crates/acp/src/transport.rs`
+- `control-plane/crates/acp/src/adapters/claude.rs`
+- `control-plane/crates/acp/src/adapters/gemini.rs`
+- `control-plane/crates/acp/src/adapters/codex.rs`
+- `control-plane/crates/acp/src/adapters/auggie.rs`
+- `control-plane/crates/acp/src/adapters/junie.rs`
 - `Chainworks Forge/Models/AgentExecution.swift`
 - `Chainworks Forge/Engine/RunReportBuilder.swift`
 - `Chainworks Forge/Engine/RunComparisonService.swift`
@@ -252,7 +259,7 @@ The implemented ACP baseline currently guarantees:
 
 Current stable verification for this slice is:
 
-- dedicated ACP transport capability regression coverage on the current tree
+- dedicated Rust ACP adapter and transport regression coverage on the current tree
 - current focused verification summary `71/71` passed
 - capability verification includes both canonical ACP-backed proof flows:
   - proposal loop

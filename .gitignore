@@ -20,6 +20,10 @@ DerivedDataCodex/
 /known-issues.md
 /auto-retry-blocked-runs-known-issues.md
 
+# Local MCP/JSON-RPC response dumps accidentally produced at repo root
+/0
+/1
+
 # Swift Package Manager
 .build/
 control-plane/target/
@@ -36,6 +40,9 @@ traces/
 .forge-codex-acp/
 control-plane/chainworks-control-plane.db
 control-plane/chainworks-control-plane.db-*
+control-plane/chainworks-control-plane.db.backup-*.sqlite
+control-plane/chainworks-control-plane.db.backup-*.sqlite-shm
+control-plane/chainworks-control-plane.db.backup-*.sqlite-wal
 control-plane/crates/daemon/principals.json
 
 # Local SQLite runtime databases at repository root.
@@ -43,6 +50,8 @@ control-plane/crates/daemon/principals.json
 /*.db-shm
 /*.db-wal
 /chainworks-control-plane.db.backup-*.sqlite
+/chainworks-control-plane.db.backup-*.sqlite-shm
+/chainworks-control-plane.db.backup-*.sqlite-wal
 
 # P042 §10.5 release-host credentials (checked via example template only).
 scripts/packaging.env

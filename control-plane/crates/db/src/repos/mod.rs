@@ -21,6 +21,7 @@ pub mod stages;
 pub mod startup_repairs;
 pub mod steward;
 pub mod system_executions;
+pub mod toolchain_cache_housekeeping;
 pub mod validation;
 pub mod work_items;
 pub mod workflow_conflicts;

@@ -4,8 +4,10 @@ use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 
 const GLOBAL_CAP_ENV: &str = "CHAINWORKS_INVOKE_AGENT_GLOBAL_CAP";
 const PER_RUN_CAP_ENV: &str = "CHAINWORKS_INVOKE_AGENT_PER_RUN_CAP";
+const XCODE_MCP_CAP_ENV: &str = "CHAINWORKS_INVOKE_AGENT_XCODE_MCP_CAP";
 const MAX_GLOBAL_CAP: usize = 100;
 const MAX_PER_RUN_CAP: usize = 20;
+const MAX_XCODE_MCP_CAP: usize = 16;
 const MAX_PROVIDER_CAP: usize = 50;
 
 pub fn load_invoke_agent_capacity_config_from_env() -> InvokeAgentCapacityConfig {
@@ -22,6 +24,9 @@ pub fn invoke_agent_capacity_config_from_lookup(
     let per_run_active_agent_executions = lookup_usize(&lookup, PER_RUN_CAP_ENV)
         .map(|value| clamp_cap(PER_RUN_CAP_ENV, value, MAX_PER_RUN_CAP))
         .unwrap_or(defaults.per_run_active_agent_executions);
+    let xcode_mcp_active_invocations = lookup_usize(&lookup, XCODE_MCP_CAP_ENV)
+        .map(|value| clamp_cap(XCODE_MCP_CAP_ENV, value, MAX_XCODE_MCP_CAP))
+        .unwrap_or(defaults.xcode_mcp_active_invocations);
 
     let mut provider_caps = BTreeMap::new();
     for family in ProviderFamily::ALL {
@@ -35,6 +40,7 @@ pub fn invoke_agent_capacity_config_from_lookup(
     InvokeAgentCapacityConfig {
         global_active_agent_executions,
         per_run_active_agent_executions,
+        xcode_mcp_active_invocations,
         provider_caps,
     }
 }
@@ -75,6 +81,7 @@ mod tests {
 
         assert_eq!(config.global_active_agent_executions, 20);
         assert_eq!(config.per_run_active_agent_executions, 4);
+        assert_eq!(config.xcode_mcp_active_invocations, 4);
         assert_eq!(config.provider_cap(ProviderFamily::Claude), 8);
         assert_eq!(config.provider_cap(ProviderFamily::Gemini), 4);
         assert_eq!(config.provider_cap(ProviderFamily::Codex), 10);
@@ -87,6 +94,7 @@ mod tests {
         let config = invoke_agent_capacity_config_from_lookup(|key| match key {
             "CHAINWORKS_INVOKE_AGENT_GLOBAL_CAP" => Some("12".into()),
             "CHAINWORKS_INVOKE_AGENT_PER_RUN_CAP" => Some("3".into()),
+            "CHAINWORKS_INVOKE_AGENT_XCODE_MCP_CAP" => Some("6".into()),
             "CHAINWORKS_INVOKE_AGENT_PROVIDER_CAP_GEMINI" => Some("2".into()),
             "CHAINWORKS_INVOKE_AGENT_PROVIDER_CAP_CODEX" => Some("5".into()),
             _ => None,
@@ -94,6 +102,7 @@ mod tests {
 
         assert_eq!(config.global_active_agent_executions, 12);
         assert_eq!(config.per_run_active_agent_executions, 3);
+        assert_eq!(config.xcode_mcp_active_invocations, 6);
         assert_eq!(config.provider_cap(ProviderFamily::Claude), 8);
         assert_eq!(config.provider_cap(ProviderFamily::Gemini), 2);
         assert_eq!(config.provider_cap(ProviderFamily::Codex), 5);
@@ -104,12 +113,14 @@ mod tests {
         let config = invoke_agent_capacity_config_from_lookup(|key| match key {
             "CHAINWORKS_INVOKE_AGENT_GLOBAL_CAP" => Some("999999".into()),
             "CHAINWORKS_INVOKE_AGENT_PER_RUN_CAP" => Some("999999".into()),
+            "CHAINWORKS_INVOKE_AGENT_XCODE_MCP_CAP" => Some("999999".into()),
             "CHAINWORKS_INVOKE_AGENT_PROVIDER_CAP_CLAUDE" => Some("999999".into()),
             _ => None,
         });
 
         assert_eq!(config.global_active_agent_executions, 100);
         assert_eq!(config.per_run_active_agent_executions, 20);
+        assert_eq!(config.xcode_mcp_active_invocations, 16);
         assert_eq!(config.provider_cap(ProviderFamily::Claude), 50);
     }
 }

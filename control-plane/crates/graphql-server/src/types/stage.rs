@@ -10,6 +10,7 @@ use domain::xcode_runtime::{
     McpBrokerObservation, XcodeHostExecutorEvent, XcodeRuntimeObservation, XcodeShimEvent,
     XcodeShimInvocationEvent, XcodeShimWarningEvent,
 };
+use serde_json::Value as JsonValue;
 
 use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
 
@@ -157,6 +158,9 @@ pub struct GqlAgentExecution {
     pub session_family_id: Option<String>,
     pub session_reuse_disposition: Option<String>,
     pub session_reset_reason: Option<String>,
+    /// P066: Toolchain cache mapping diagnostics. Always non-null — legacy rows
+    /// are synthesized as mapping_state=legacy_row_unavailable.
+    pub actual_toolchain_mapping_diagnostics: GqlToolchainMappingDiagnostics,
 }
 
 impl From<domain::agent::AgentExecution> for GqlAgentExecution {
@@ -199,7 +203,88 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
             session_family_id: execution.session_family_id,
             session_reuse_disposition: execution.session_reuse_disposition,
             session_reset_reason: execution.session_reset_reason,
+            // P066: synthesize legacy sentinel when column is NULL.
+            actual_toolchain_mapping_diagnostics: toolchain_mapping_from_json(
+                execution
+                    .actual_toolchain_mapping_diagnostics_json
+                    .as_deref(),
+            ),
         }
+    }
+}
+
+// ── P066: ToolchainMappingDiagnostics GQL type ───────────────────────────────
+
+/// P066: Key fields from the toolchain mapping diagnostics document.
+/// Absolute paths are redacted; all fields are synthesized non-null
+/// from the stored JSON or a legacy/disabled sentinel.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ToolchainMappingDiagnostics", rename_fields = "camelCase")]
+pub struct GqlToolchainMappingDiagnostics {
+    /// Semantic state of toolchain mapping for this execution.
+    pub mapping_state: String,
+    /// Whether toolchain cache mapping was active.
+    pub mapping_enabled: bool,
+    /// Why mapping is inactive, when mapping_state is not "active".
+    pub inactive_reason: Option<String>,
+    /// Provenance for the policy that drove this diagnostics doc.
+    pub policy_source: String,
+    /// Policy format version, if present.
+    pub policy_version: Option<i64>,
+    /// Provider family string from the diagnostics doc.
+    pub provider_family: String,
+    /// Document schema version.
+    pub version: i64,
+}
+
+/// P066: Build a legacy_row_unavailable sentinel for pre-migration NULL rows.
+pub(crate) fn toolchain_mapping_legacy_sentinel() -> GqlToolchainMappingDiagnostics {
+    GqlToolchainMappingDiagnostics {
+        mapping_state: "legacy_row_unavailable".to_string(),
+        mapping_enabled: false,
+        inactive_reason: Some("legacy_row".to_string()),
+        policy_source: "synthesized_legacy".to_string(),
+        policy_version: None,
+        provider_family: "unknown".to_string(),
+        version: 1,
+    }
+}
+
+/// P066: Parse a stored diagnostics JSON document or synthesize a sentinel.
+/// Absolute paths are never exposed — only the structured fields are returned.
+pub(crate) fn toolchain_mapping_from_json(json: Option<&str>) -> GqlToolchainMappingDiagnostics {
+    let Some(json) = json else {
+        return toolchain_mapping_legacy_sentinel();
+    };
+    let Ok(val) = serde_json::from_str::<JsonValue>(json) else {
+        return toolchain_mapping_legacy_sentinel();
+    };
+    GqlToolchainMappingDiagnostics {
+        mapping_state: val
+            .get("mapping_state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("legacy_row_unavailable")
+            .to_string(),
+        mapping_enabled: val
+            .get("mapping_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        inactive_reason: val
+            .get("inactive_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        policy_source: val
+            .get("policy_source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("synthesized_legacy")
+            .to_string(),
+        policy_version: val.get("policy_version").and_then(|v| v.as_i64()),
+        provider_family: val
+            .get("provider_family")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        version: val.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
     }
 }
 
@@ -809,6 +894,7 @@ mod tests {
             output_tokens: None,
             cached_input_tokens: None,
             transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
         };
 
         let gql = GqlAgentExecution::from(execution);
