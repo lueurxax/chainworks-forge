@@ -592,6 +592,92 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       ])
   }
 
+  @Test("GraphQL documents request P077 closeout readiness through accessor-backed alias")
+  func graphQLDocumentsRequestP077CloseoutReadinessThroughAccessorAlias() {
+    #expect(
+      P031GraphQLDocuments.runsHome.contains(
+        "implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson"
+      ))
+    #expect(
+      P031GraphQLDocuments.runDetail.contains(
+        "implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson"
+      ))
+    #expect(!P031GraphQLDocuments.runsHome.contains("implementation-closeout-readiness.json"))
+    #expect(!P031GraphQLDocuments.runDetail.contains("implementation-closeout-readiness.json"))
+  }
+
+  @Test("Workflow read store decodes P077 closeout readiness from documented and alias fields")
+  func workflowReadStoreDecodesP077CloseoutReadinessFields() async throws {
+    let readTransport = CapturingP031ReadTransport(
+      responses: [
+        "P031RunsHome": Data(
+          """
+          {"data":{"runs":[{"id":"run-ready","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":9,"completedStages":8,"failedStages":0,"pendingApprovals":0,"implementationCloseoutReadinessSummary":\(closeoutReadinessSummaryJSON(status: "ready", decision: "enter_manual_release", generationID: "abcdef1234567890", mode: "enforcement", gateStatus: "passed", primaryUnblock: nil, summary: "Ready for manual release"))}]}}
+          """.utf8),
+        "P031RunDetail": Data(
+          """
+          {"data":{"run":{"id":"run-blocked","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":9,"completedStages":8,"failedStages":0,"pendingApprovals":0,"closeoutReadinessSummaryJson":\(closeoutReadinessSummaryJSON(status: "blocked", decision: "block_with_evidence", generationID: "fedcba9876543210", mode: "advisory", gateStatus: "failed", primaryUnblock: "Resolve proposal gate failure", summary: "Gate failed"))},"stages":[],"artifacts":[],"approvalInbox":[]}}
+          """.utf8),
+      ])
+    let store = P031GraphQLWorkflowReadStore(
+      readTransport: readTransport,
+      subscriptionTransport: CapturingP031SubscriptionTransport()
+    )
+
+    let runs = try await store.fetchRuns()
+    let detail = try await store.fetchRunDetail(runID: "run-blocked")
+
+    #expect(runs.first?.closeoutReadinessSummary?.readinessStatus == .ready)
+    #expect(runs.first?.closeoutReadinessSummary?.generationDisplayID == "abcdef12")
+    #expect(detail.run?.closeoutReadinessSummary?.readinessStatus == .blocked)
+    #expect(detail.run?.closeoutReadinessSummary?.primaryUnblock == "Resolve proposal gate failure")
+    #expect(
+      readTransport.requests.first { $0.operationName == "P031RunDetail" }?.document.contains(
+        "implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson"
+      ) == true)
+  }
+
+  @Test("P077 closeout readiness presenter covers required read-only states")
+  func p077CloseoutReadinessPresenterCoversRequiredStates() throws {
+    let cases: [(String, Bool, String?, String, String)] = [
+      ("ready", true, nil, "Ready", "Ready"),
+      ("ready_with_risks", true, nil, "Ready with Risks", "Accepted risks"),
+      ("handoff_required", true, "Complete docs handoff", "Handoff Required", "Complete docs handoff"),
+      ("not_ready", true, "Fix implementation blockers", "Not Ready", "Fix implementation blockers"),
+      ("blocked", true, "Resolve proposal gate failure", "Blocked", "Resolve proposal gate failure"),
+      ("invalid", true, "Regenerate readiness evidence", "Invalid", "Regenerate readiness evidence"),
+      ("unknown", true, "Awaiting first readiness check", "Awaiting First Generation", "Awaiting first readiness check"),
+      ("unknown", false, nil, "Not Applicable", "Closeout readiness not applicable"),
+    ]
+
+    for (status, isApplicable, primaryUnblock, expectedStatus, expectedPrimaryUnblock) in cases {
+      let summary = try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: status,
+          decision: "await_operator_decision",
+          generationID: isApplicable ? "1234567890abcdef" : "",
+          mode: "advisory",
+          gateStatus: "missing_definition",
+          diagnosticReason: status == "unknown" && isApplicable
+            ? "awaiting_first_generation"
+            : nil,
+          primaryUnblock: primaryUnblock,
+          summary: primaryUnblock,
+          isApplicable: isApplicable,
+          acceptedRiskCount: status == "ready_with_risks" ? 2 : 0
+        )
+      )
+
+      let presentation = P077CloseoutReadinessPresenter.presentation(for: summary)
+
+      #expect(presentation.statusLabel == expectedStatus)
+      #expect(presentation.primaryUnblockText.contains(expectedPrimaryUnblock))
+      #expect(presentation.modeExplainerAccessibilityLabel.contains("Closeout readiness mode"))
+      #expect(presentation.generationCopyAccessibilityLabel.contains("generation id"))
+      #expect(presentation.cardAccessibilityLabel.contains(expectedStatus))
+    }
+  }
+
   @Test("Bulk artifact read documents do not request payload text")
   func bulkArtifactReadDocumentsDoNotRequestPayloadText() {
     #expect(!P031GraphQLDocuments.runDetail.contains("payloadText"))
@@ -2689,6 +2775,66 @@ private func makeArtifact(
     diagnosticID: diagnosticID,
     serverDebugDetail: nil
   )
+}
+
+private func closeoutReadinessSummaryJSON(
+  status: String,
+  decision: String,
+  generationID: String,
+  mode: String,
+  gateStatus: String,
+  diagnosticReason: String? = nil,
+  primaryUnblock: String?,
+  summary: String?,
+  isApplicable: Bool = true,
+  acceptedRiskCount: Int = 0
+) -> String {
+  let fields: [(String, Any?)] = [
+    ("run_id", "run-1"),
+    ("stage_id", "state_9"),
+    ("readiness_status", status),
+    ("readiness_decision", decision),
+    ("readiness_generation_id", generationID),
+    ("readiness_mode", mode),
+    ("gate_status", gateStatus),
+    ("gate_generation_id", "gate-12345678"),
+    ("audit_status", gateStatus),
+    ("diagnostic_reason", diagnosticReason),
+    ("primary_unblock", primaryUnblock),
+    ("code_blocker_count", status == "not_ready" ? 1 : 0),
+    ("handoff_count", status == "handoff_required" ? 1 : 0),
+    ("handoff_owner", status == "handoff_required" ? "release_owner" : nil),
+    ("risk_settlement_required", status == "ready_with_risks"),
+    ("accepted_risk_count", acceptedRiskCount),
+    ("fingerprint_hash", "f00dbabe"),
+    ("summary", summary),
+    ("synthesized_at", "2026-05-06T12:00:00Z"),
+    ("is_applicable", isApplicable),
+  ]
+  let object = Dictionary(uniqueKeysWithValues: fields.map { ($0.0, jsonValue($0.1)) })
+  let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+  return String(data: data, encoding: .utf8)!
+}
+
+private func decodeCloseoutReadinessSummary(_ json: String) throws
+  -> P077CloseoutReadinessSummaryReadModel
+{
+  try JSONDecoder().decode(P077CloseoutReadinessSummaryReadModel.self, from: Data(json.utf8))
+}
+
+private func jsonValue(_ value: Any?) -> Any {
+  switch value {
+  case let value as String:
+    return value
+  case let value as Int:
+    return value
+  case let value as Bool:
+    return value
+  case .some(let value):
+    return value
+  case .none:
+    return NSNull()
+  }
 }
 
 private final class CapturingP031ReadTransport: P031GraphQLReadTransport, @unchecked Sendable {

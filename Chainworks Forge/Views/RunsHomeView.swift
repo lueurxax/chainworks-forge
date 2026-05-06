@@ -176,6 +176,9 @@ struct RunsHomeView: View {
                 switch selectedRunDetailTab {
                 case .overview:
                     P031RunDetailSummaryCard(presentation: runDetail)
+                    if let closeoutReadiness = runDetail.closeoutReadiness {
+                        P077CloseoutReadinessCard(presentation: closeoutReadiness)
+                    }
                     P031IdeaContextCard(presentation: runDetail.ideaContext)
                     P031CatalogContextCard(presentation: runDetail.catalogContext)
                 case .stages:
@@ -963,6 +966,12 @@ private struct P031RunsHomeRowCard: View {
             }
             Text(row.statusLabel)
                 .font(.subheadline.weight(.medium))
+            if let closeoutReadinessSignalLabel = row.closeoutReadinessSignalLabel {
+                Label(closeoutReadinessSignalLabel, systemImage: "checkmark.seal")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p077-closeout-readiness-sidebar-signal")
+            }
             if let progressLabel = row.progressLabel {
                 Text(progressLabel)
                     .font(.caption)
@@ -1000,6 +1009,12 @@ private struct P031RunDetailSummaryCard: View {
         ) {
             HStack(spacing: 10) {
                 P031FreshnessBadge(snapshot: presentation.freshness)
+                if let closeoutReadiness = presentation.closeoutReadiness {
+                    Label(closeoutReadiness.compactSignalLabel, systemImage: "checkmark.seal")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("p077-closeout-readiness-compact-signal")
+                }
                 if let errorDescription = presentation.errorDescription {
                     Text(errorDescription)
                         .font(.caption)
@@ -1020,6 +1035,96 @@ private struct P031RunDetailSummaryCard: View {
         ]
         .compactMap { $0 }
         .joined(separator: " • ")
+    }
+}
+
+private struct P077CloseoutReadinessCard: View {
+    let presentation: P077CloseoutReadinessPresentation
+    @State private var copyFeedback: String?
+
+    var body: some View {
+        P031CalloutCard(
+            title: "Closeout Readiness",
+            bodyText: presentation.detailText,
+            accentColor: accentColor
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Label(presentation.statusLabel, systemImage: statusSymbolName)
+                        .font(.caption.weight(.semibold))
+                    Text(presentation.modeLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        copyGenerationID()
+                    } label: {
+                        Label("Copy generation id", systemImage: "doc.on.doc")
+                    }
+                    .controlSize(.small)
+                    .disabled(presentation.generationCopyValue == nil)
+                    .accessibilityLabel(presentation.generationCopyAccessibilityLabel)
+                    .accessibilityIdentifier("p077-closeout-readiness-generation-copy")
+                }
+
+                Label(presentation.primaryUnblockText, systemImage: "exclamationmark.circle")
+                    .font(.callout.weight(.medium))
+                    .accessibilityLabel("Primary unblock: \(presentation.primaryUnblockText)")
+                    .accessibilityIdentifier("p077-closeout-readiness-primary-unblock")
+
+                Label(presentation.modeExplainerText, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(presentation.modeExplainerAccessibilityLabel)
+                    .accessibilityIdentifier("p077-closeout-readiness-mode-explainer")
+
+                if let copyFeedback {
+                    Text(copyFeedback)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityLabel(presentation.cardAccessibilityLabel)
+        .accessibilityIdentifier("p077-closeout-readiness-card")
+    }
+
+    private var accentColor: Color {
+        switch presentation.visualState {
+        case .positive:
+            return .green
+        case .warning:
+            return .orange
+        case .blocking:
+            return .red
+        case .neutral:
+            return .secondary
+        }
+    }
+
+    private var statusSymbolName: String {
+        switch presentation.visualState {
+        case .positive:
+            return "checkmark.seal"
+        case .warning:
+            return "exclamationmark.triangle"
+        case .blocking:
+            return "xmark.octagon"
+        case .neutral:
+            return "minus.circle"
+        }
+    }
+
+    private func copyGenerationID() {
+        guard let value = presentation.generationCopyValue else {
+            copyFeedback = "No generation id available"
+            return
+        }
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+#endif
+        copyFeedback = "Copied generation \(presentation.generationDisplayID)"
     }
 }
 
