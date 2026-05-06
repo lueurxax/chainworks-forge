@@ -165,6 +165,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StewardGetAnalysis => {
             tool_spec_by_name(steward::tool_specs(), "steward.get_analysis")
         }
+        CapabilityToolId::ProposalGateSettle => {
+            tool_spec_by_name(runs::tool_specs(), "runs.settle_proposal_gate")
+        }
     }
 }
 

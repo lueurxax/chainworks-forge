@@ -23,5 +23,6 @@ pub mod recovery;
 pub mod release;
 pub mod session;
 pub mod steward;
+pub mod synthesizers;
 pub mod work_queue;
 pub mod worktree;

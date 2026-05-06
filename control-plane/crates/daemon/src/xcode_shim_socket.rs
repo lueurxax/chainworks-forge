@@ -317,6 +317,7 @@ mod tests {
             workspace_root: "/tmp".to_string(),
             provider_env: BTreeMap::new(),
             simulator_candidates: Vec::new(),
+            toolchain_mapping_root: None,
         }
     }
 

@@ -119,6 +119,7 @@ fn make_run(id: RunId, idea_id: IdeaId, status: RunStatus) -> Run {
         drift_details_json: None,
         chainworks_meta_root: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     }
 }
 
@@ -4828,6 +4829,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: delivery_configuration_json.clone(),
                 review_routing_json: None,
+                closeout_readiness_mode: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -5775,6 +5777,7 @@ async fn delivery_preflight_success_persists_run_owned_result() {
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
                 review_routing_json: None,
+                closeout_readiness_mode: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -5829,6 +5832,7 @@ async fn delivery_preflight_failure_blocks_before_run_creation() {
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json,
                 review_routing_json: None,
+                closeout_readiness_mode: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -5868,6 +5872,7 @@ async fn release_workflow_without_delivery_configuration_blocks_before_run_creat
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 delivery_configuration_json: None,
                 review_routing_json: None,
+                closeout_readiness_mode: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -6403,6 +6408,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -6698,6 +6704,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -6852,6 +6859,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -7032,6 +7040,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                     .into_owned(),
             ),
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -7233,6 +7242,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                     .into_owned(),
             ),
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -7458,6 +7468,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -7926,6 +7937,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -8349,6 +8361,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -8607,6 +8620,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -8824,6 +8838,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -9537,6 +9552,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -9940,6 +9956,7 @@ sys.exit(0)
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         },
     )
     .await
@@ -11040,6 +11057,7 @@ async fn test_state_11_to_state_12_happy_path() {
         drift_details_json: None,
         chainworks_meta_root: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     };
     runs::insert(&pool, &run).await.unwrap();
 
@@ -11801,6 +11819,7 @@ fn test_runs_start_does_not_accept_chainworks_meta_root_override() {
         agent_catalog_yaml_path: "/tmp/cat.yaml".into(),
         delivery_configuration_json: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     };
     // If this compiles, StartRunCmd has no chainworks_meta_root field — the daemon owns it.
     let _ = cmd;

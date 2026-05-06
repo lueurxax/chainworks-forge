@@ -7,7 +7,8 @@ use tracing::{debug, error, info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    ideas, lead_conflict_mediations, projections, runs, stages, work_items, workflow_conflicts,
+    closeout, ideas, lead_conflict_mediations, projections, runs, stages, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
@@ -16,8 +17,10 @@ use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
     contract_status_allowed_values, ImplementationSelfAssessmentStatus,
 };
+use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, ArtifactId, RunId};
+use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
 use domain::run::RunStatus;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
@@ -29,6 +32,10 @@ use domain::workflow_conflict::{
 
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
+use crate::synthesizers::closeout_readiness::{
+    synthesize_implementation_closeout_readiness_for_state9,
+    SynthesizerInputs as CloseoutSynthesizerInputs,
+};
 use crate::work_queue::WorkQueue;
 
 pub struct Orchestrator {
@@ -691,6 +698,16 @@ impl Orchestrator {
                                     });
                                     return Ok(());
                                 }
+                                // P077: Synthesize and persist closeout readiness before
+                                // transition evaluation so implementation_closeout_readiness_v1
+                                // guards can read an active generation from closeout_gate_generations.
+                                self.synthesize_and_persist_closeout_readiness_if_needed(
+                                    run_id,
+                                    &current_state_id,
+                                    state,
+                                    run,
+                                )
+                                .await?;
                                 return self
                                     .evaluate_and_transition(
                                         run_id,
@@ -712,6 +729,14 @@ impl Orchestrator {
                         return Ok(()); // wait for approval
                     }
                     StageStatus::Completed => {
+                        // P077: synthesize closeout readiness before transition evaluation.
+                        self.synthesize_and_persist_closeout_readiness_if_needed(
+                            run_id,
+                            &current_state_id,
+                            state,
+                            run,
+                        )
+                        .await?;
                         // Stage done — evaluate transitions
                         return self
                             .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
@@ -1400,6 +1425,154 @@ impl Orchestrator {
             return Ok(false);
         };
         Ok(active.summary.status == ImplementationSelfAssessmentStatus::Blocked)
+    }
+
+    /// P077: Synthesize implementation_closeout_readiness_v1 and atomically persist
+    /// both proposal_gate_result_v1 and implementation_closeout_readiness_v1 into
+    /// closeout_gate_generations before transition evaluation fires.
+    ///
+    /// Called at every stage-completion point for states whose transitions reference
+    /// implementation_closeout_readiness_v1.decision. The transaction deactivates
+    /// the previous active generation, so this is safe to call on re-entry.
+    ///
+    /// On DB failure the error is logged and the function returns Ok(()); the
+    /// transition guard will simply not match and the run stays in this state until
+    /// the next AdvanceRun trigger, which retries the synthesis.
+    async fn synthesize_and_persist_closeout_readiness_if_needed(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        state: &workflow::plan::CompiledState,
+        run: &domain::run::Run,
+    ) -> Result<()> {
+        if !state_evaluates_closeout_readiness(state) {
+            return Ok(());
+        }
+
+        let run_id_str = run_id.to_string();
+
+        // Read the active proposal gate result (if the operator has already settled one).
+        // If none, use MissingDefinition — synthesizer routes to AwaitGateDefinition.
+        let gate_result = match closeout::find_active_gate_generation(&self.pool, &run_id_str).await
+        {
+            Ok(Some(row)) => ProposalGateResult {
+                gate_id: format!("p077:{}", &row.generation_id),
+                proposal_id: "077".to_string(),
+                run_id: run_id_str.clone(),
+                stage_id: current_state_id.to_string(),
+                status: row
+                    .status
+                    .parse::<ProposalGateStatus>()
+                    .unwrap_or(ProposalGateStatus::Invalid),
+                generation_id: row.generation_id,
+                diagnostic_reason: row.diagnostic_reason,
+                executor_version: None,
+                evidence_digest: None,
+                exit_code: None,
+                elapsed_ms: None,
+                settled_at: chrono::Utc::now(),
+                authorization_lineage: None,
+                failure_classification: None,
+            },
+            _ => ProposalGateResult::missing_definition(
+                format!("gate-missing:{}", uuid::Uuid::new_v4()),
+                &run_id_str,
+                "077",
+                current_state_id,
+                "no_proposal_gate_settled",
+            ),
+        };
+
+        // Resolve the closeout readiness mode from the frozen run column.
+        let has_enforcement_migration =
+            closeout::has_enforcement_migration_record(&self.pool, &run_id_str)
+                .await
+                .unwrap_or(false);
+        let mode_result = resolve_closeout_readiness_mode(
+            run.closeout_readiness_mode.as_deref(),
+            has_enforcement_migration,
+        );
+
+        // Load the active implementation self-assessment (optional input).
+        let self_assessment_opt =
+            artifact_contracts::find_active_implementation_self_assessment_summary(
+                &self.pool, run_id,
+            )
+            .await
+            .ok()
+            .flatten();
+        let self_assessment_ref = self_assessment_opt.as_ref().map(|a| &a.summary);
+
+        // P077 BLK-006: source controlled_reports_green from active artifact contracts.
+        let controlled_reports_green =
+            closeout::compute_controlled_reports_green(&self.pool, &run_id_str)
+                .await
+                .ok()
+                .flatten();
+
+        // P077 BLK-011: read the prior blocker_digest so the synthesizer can detect
+        // soft-convergence (repeated identical blockers without diff or gate progress).
+        let prior_blocker_digest = closeout::find_active_blocker_digest(&self.pool, &run_id_str)
+            .await
+            .ok()
+            .flatten();
+
+        let inputs = CloseoutSynthesizerInputs {
+            run_id: &run_id_str,
+            stage_id: current_state_id,
+            gate_result: &gate_result,
+            mode_result: &mode_result,
+            self_assessment: self_assessment_ref,
+            accepted_risks: &[],
+            loop_budget_remaining: true,
+            fingerprint: None,
+            fingerprint_latency_exceeded: false,
+            // Sourced from active audit/docs/security/prepush/tests artifact contracts.
+            // None means at least one controlled report is missing — synthesizer fails
+            // closed in enforcement mode while advisory mode is unaffected.
+            controlled_reports_green,
+            previous_blocker_digest: prior_blocker_digest.as_deref(),
+        };
+
+        let synth_result = synthesize_implementation_closeout_readiness_for_state9(inputs);
+
+        let tx_inputs = closeout::CloseoutTransactionInputs {
+            gate_result: &gate_result,
+            readiness: &synth_result.readiness,
+            blocker_digest: synth_result.current_blocker_digest.as_deref(),
+        };
+
+        match closeout::execute_closeout_transaction(&self.pool, tx_inputs).await {
+            Ok(tx_result) => {
+                info!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    decision = %tx_result.readiness_decision,
+                    "P077: closeout readiness synthesized and persisted"
+                );
+                // BLK-006: rebuild projections so active P077 truth is visible to
+                // downstream transition evaluation and readback before the next cycle.
+                // Non-fatal: a rebuild failure is logged and the next AdvanceRun retries.
+                if let Err(e) = projections::rebuild_all_for_run(&self.pool, run_id).await {
+                    error!(
+                        run_id = %run_id,
+                        state = %current_state_id,
+                        error = %e,
+                        "P077: projection rebuild failed after closeout transaction — projections may lag one AdvanceRun cycle"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    error = %e,
+                    "P077: failed to persist closeout readiness — guard will not fire this cycle"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn block_code_writer_handoff_if_unavailable(
@@ -5667,6 +5840,17 @@ fn state_produces_implementation_review(state: &workflow::plan::CompiledState) -
     })
 }
 
+/// P077: Returns true if any of the state's transitions evaluate
+/// implementation_closeout_readiness_v1 fields (e.g. `.decision`).
+/// Used to detect states that require the closeout synthesis to run before
+/// transition evaluation so the active closeout_gate_generations entry exists.
+fn state_evaluates_closeout_readiness(state: &workflow::plan::CompiledState) -> bool {
+    state.transitions.iter().any(|t| {
+        t.condition
+            .contains("implementation_closeout_readiness_v1.")
+    })
+}
+
 fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bool {
     task.agent.agent_id == "code_writer"
         && matches!(
@@ -6791,6 +6975,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: Some(format!(".chainworks/runs/{run_id}")),
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 
@@ -6815,6 +7000,7 @@ mod tests {
             catalog_snapshot_json: "{}".into(),
             dynamic_candidate_bindings: Vec::new(),
             run_plan_snapshot_format_version: None,
+            closeout_readiness_mode: None,
         }
     }
 

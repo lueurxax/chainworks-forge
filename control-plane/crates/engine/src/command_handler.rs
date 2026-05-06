@@ -5,20 +5,26 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, command_journal, ideas, legacy_discovery_overrides, projections,
+    artifact_contracts, closeout, command_journal, ideas, legacy_discovery_overrides, projections,
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
-use domain::commands::{CallerContext, Command};
+use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
+use domain::commands::{
+    CallerContext, Command, ProposalGateSettlementAction, SettleProposalGateCmd,
+};
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, RunId};
+use domain::proposal_gate_result::{
+    ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
+};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
@@ -27,11 +33,15 @@ use domain::workflow_conflict::{
     WorkflowTransitionCursorRecord,
 };
 use domain::PrincipalClass;
+use sha2::{Digest, Sha256};
 
 use crate::cancellation;
 use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
+};
+use crate::synthesizers::closeout_readiness::{
+    synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
 };
 use crate::work_queue::WorkQueue;
 
@@ -98,6 +108,14 @@ pub enum CommandResult {
         reason: String,
         journal_id: String,
     },
+    /// P077: gate settled and closeout transaction committed.
+    ProposalGateSettled {
+        run_id: RunId,
+        gate_id: String,
+        journal_id: String,
+        gate_generation_id: String,
+        readiness_generation_id: String,
+    },
 }
 
 pub struct StartRunBlockedByDeliveryPreflight {
@@ -122,6 +140,286 @@ struct CommandJournalEntry {
     caller_principal_class: Option<String>,
     caller_tool: Option<String>,
     request_id: Option<String>,
+}
+
+const PROPOSAL_GATE_EXECUTOR_VERSION: &str = "proposal-gate-executor.v1";
+const PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION: &str = "proposal_gate_receipt.v1";
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalGateReceiptV1 {
+    schema_version: String,
+    status: String,
+    gate_id: Option<String>,
+    proposal_id: String,
+    run_id: String,
+    stage_id: String,
+    executor_version: String,
+    evidence_digest: String,
+    stdout_digest: String,
+    stderr_digest: String,
+    exit_code: i32,
+    elapsed_ms: u64,
+    current_fingerprint: String,
+    diagnostic_reason: Option<String>,
+    failure_classification: Option<String>,
+    source_artifacts: Option<Vec<String>>,
+}
+
+fn build_proposal_gate_result_from_settlement(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_id: &str,
+    gate_generation_id: &str,
+    elapsed_ms: u64,
+) -> Result<ProposalGateResult> {
+    let has_receipt = c
+        .receipt_json
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    // Route Execute and RecordSettlement to ImportReceipt when a receipt is present.
+    // Execute without a receipt is not yet implemented and must error to prevent
+    // fabricating a Passed gate result without proof (R14 MAJ-001).
+    let effective_action = if has_receipt
+        && matches!(
+            c.action,
+            ProposalGateSettlementAction::RecordSettlement
+                | ProposalGateSettlementAction::Execute
+        ) {
+        ProposalGateSettlementAction::ImportReceipt
+    } else {
+        c.action.clone()
+    };
+
+    match effective_action {
+        ProposalGateSettlementAction::Execute => {
+            anyhow::bail!(
+                "ProposalGateSettlementAction::Execute is not yet implemented — \
+                 run ./scripts/test-gate.sh proposal-077 against the worktree and \
+                 supply the resulting receipt via action=import_receipt"
+            )
+        }
+        ProposalGateSettlementAction::RecordSettlement => {
+            build_managed_proposal_gate_result(
+                c,
+                journal_id,
+                gate_id,
+                gate_generation_id,
+                ProposalGateStatus::Passed,
+                None,
+                None,
+                elapsed_ms,
+            )
+        }
+        ProposalGateSettlementAction::Waive => build_managed_proposal_gate_result(
+            c,
+            journal_id,
+            gate_id,
+            gate_generation_id,
+            ProposalGateStatus::Waived,
+            Some(c.reason.clone()),
+            None,
+            elapsed_ms,
+        ),
+        ProposalGateSettlementAction::ImportReceipt => {
+            build_imported_proposal_gate_result(c, journal_id, gate_id, gate_generation_id)
+        }
+    }
+}
+
+fn build_managed_proposal_gate_result(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_id: &str,
+    gate_generation_id: &str,
+    status: ProposalGateStatus,
+    diagnostic_reason: Option<String>,
+    failure_classification: Option<ProposalGateFailureClassification>,
+    elapsed_ms: u64,
+) -> Result<ProposalGateResult> {
+    let exit_code = 0;
+    Ok(ProposalGateResult {
+        gate_id: gate_id.to_string(),
+        proposal_id: c.proposal_id.clone(),
+        run_id: c.run_id.to_string(),
+        stage_id: c.stage_id.clone(),
+        status: status.clone(),
+        generation_id: gate_generation_id.to_string(),
+        diagnostic_reason,
+        executor_version: Some(PROPOSAL_GATE_EXECUTOR_VERSION.to_string()),
+        evidence_digest: Some(proposal_gate_evidence_digest(
+            c,
+            journal_id,
+            gate_generation_id,
+            status.as_str(),
+            exit_code,
+        )?),
+        exit_code: Some(exit_code),
+        elapsed_ms: Some(elapsed_ms),
+        settled_at: Utc::now(),
+        authorization_lineage: Some(proposal_gate_lineage(c, journal_id)),
+        failure_classification,
+    })
+}
+
+fn build_imported_proposal_gate_result(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_id: &str,
+    gate_generation_id: &str,
+) -> Result<ProposalGateResult> {
+    let raw = c
+        .receipt_json
+        .as_deref()
+        .ok_or_else(|| anyhow!("import_receipt requires receipt_json"))?;
+    let receipt: ProposalGateReceiptV1 = serde_json::from_str(raw)
+        .map_err(|e| anyhow!("invalid proposal_gate_receipt.v1 schema: {e}"))?;
+
+    if receipt.schema_version != PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "invalid proposal gate receipt schema_version '{}': expected '{}'",
+            receipt.schema_version,
+            PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION
+        );
+    }
+    if receipt.proposal_id != c.proposal_id {
+        anyhow::bail!("proposal gate receipt proposal_id does not match command");
+    }
+    if receipt.run_id != c.run_id.to_string() {
+        anyhow::bail!("proposal gate receipt run_id does not match command");
+    }
+    if receipt.stage_id != c.stage_id {
+        anyhow::bail!("proposal gate receipt stage_id does not match command");
+    }
+    if let Some(receipt_gate_id) = receipt.gate_id.as_deref() {
+        if receipt_gate_id != gate_id {
+            anyhow::bail!("proposal gate receipt gate_id does not match command");
+        }
+    }
+    if receipt.current_fingerprint != c.current_fingerprint {
+        anyhow::bail!(
+            "proposal gate receipt current_fingerprint does not match command fingerprint"
+        );
+    }
+    if receipt.executor_version != PROPOSAL_GATE_EXECUTOR_VERSION {
+        anyhow::bail!(
+            "proposal gate receipt executor_version '{}' is not managed by '{}'",
+            receipt.executor_version,
+            PROPOSAL_GATE_EXECUTOR_VERSION
+        );
+    }
+    validate_sha256_digest("evidence_digest", &receipt.evidence_digest)?;
+    validate_sha256_digest("stdout_digest", &receipt.stdout_digest)?;
+    validate_sha256_digest("stderr_digest", &receipt.stderr_digest)?;
+
+    let status: ProposalGateStatus = receipt
+        .status
+        .parse()
+        .map_err(|e| anyhow!("invalid proposal gate receipt status: {e}"))?;
+    if matches!(
+        status,
+        ProposalGateStatus::Passed | ProposalGateStatus::Waived
+    ) && receipt.exit_code != 0
+    {
+        anyhow::bail!(
+            "proposal gate receipt status '{}' requires exit_code 0",
+            status
+        );
+    }
+    let failure_classification = receipt
+        .failure_classification
+        .as_deref()
+        .map(str::parse::<ProposalGateFailureClassification>)
+        .transpose()
+        .map_err(|e| anyhow!("invalid proposal gate receipt failure_classification: {e}"))?;
+
+    Ok(ProposalGateResult {
+        gate_id: receipt.gate_id.unwrap_or_else(|| gate_id.to_string()),
+        proposal_id: receipt.proposal_id,
+        run_id: receipt.run_id,
+        stage_id: receipt.stage_id,
+        status,
+        generation_id: gate_generation_id.to_string(),
+        diagnostic_reason: receipt.diagnostic_reason,
+        executor_version: Some(receipt.executor_version),
+        evidence_digest: Some(receipt.evidence_digest),
+        exit_code: Some(receipt.exit_code),
+        elapsed_ms: Some(receipt.elapsed_ms),
+        settled_at: Utc::now(),
+        authorization_lineage: Some(proposal_gate_lineage_with_source_artifacts(
+            c,
+            journal_id,
+            receipt
+                .source_artifacts
+                .unwrap_or_else(|| c.source_artifacts.clone()),
+        )),
+        failure_classification,
+    })
+}
+
+fn proposal_gate_lineage(c: &SettleProposalGateCmd, journal_id: &str) -> ProposalGateLineage {
+    proposal_gate_lineage_with_source_artifacts(c, journal_id, c.source_artifacts.clone())
+}
+
+fn proposal_gate_lineage_with_source_artifacts(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    source_artifacts: Vec<String>,
+) -> ProposalGateLineage {
+    ProposalGateLineage {
+        principal: c.principal.clone(),
+        capability: c.capability.clone(),
+        journal_id: journal_id.to_string(),
+        authority: c.authority.clone(),
+        reason: c.reason.clone(),
+        source_artifacts,
+        run_id: c.run_id.to_string(),
+        proposal_id: c.proposal_id.clone(),
+        stage_id: c.stage_id.clone(),
+        workflow_digest: c.workflow_digest.clone(),
+        worktree_head: c.worktree_head.clone(),
+        dirty_or_changed_file_digest: c.dirty_or_changed_file_digest.clone(),
+        source_generation_ids: c.source_generation_ids.clone(),
+        current_fingerprint: c.current_fingerprint.clone(),
+    }
+}
+
+fn proposal_gate_evidence_digest(
+    c: &SettleProposalGateCmd,
+    journal_id: &str,
+    gate_generation_id: &str,
+    status: &str,
+    exit_code: i32,
+) -> Result<String> {
+    let payload = serde_json::json!({
+        "schema_version": PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION,
+        "executor_version": PROPOSAL_GATE_EXECUTOR_VERSION,
+        "journal_id": journal_id,
+        "gate_generation_id": gate_generation_id,
+        "proposal_id": c.proposal_id,
+        "run_id": c.run_id.to_string(),
+        "stage_id": c.stage_id,
+        "status": status,
+        "exit_code": exit_code,
+        "workflow_digest": c.workflow_digest,
+        "worktree_head": c.worktree_head,
+        "dirty_or_changed_file_digest": c.dirty_or_changed_file_digest,
+        "source_generation_ids": c.source_generation_ids,
+        "source_artifacts": c.source_artifacts,
+        "current_fingerprint": c.current_fingerprint,
+    });
+    let raw = serde_json::to_vec(&payload)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(raw)))
+}
+
+fn validate_sha256_digest(field: &str, value: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        anyhow::bail!("proposal gate receipt {field} must start with sha256:");
+    };
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("proposal gate receipt {field} must be a sha256 digest");
+    }
+    Ok(())
 }
 
 struct PhaseBDogfoodMetricSnapshot {
@@ -152,6 +450,7 @@ impl CommandJournalEntry {
             Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
             Command::ResolveLeadMediationConfirmation(_) => "ResolveLeadMediationConfirmation",
             Command::ResolveApproval(_) => "ResolveApproval",
+            Command::SettleProposalGate(_) => "SettleProposalGate",
         };
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
@@ -174,6 +473,7 @@ impl CommandJournalEntry {
             Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
             Command::ResolveLeadMediationConfirmation(c) => Some(c.run_id.to_string()),
             Command::ResolveApproval(c) => Some(c.run_id.to_string()),
+            Command::SettleProposalGate(c) => Some(c.run_id.to_string()),
         };
         let principal_class = caller.principal_class.to_string();
 
@@ -204,6 +504,7 @@ impl CommandJournalEntry {
                 | "ResetSession"
                 | "ResolveLeadMediationConfirmation"
                 | "ResolveApproval"
+                | "SettleProposalGate"
         )
     }
 }
@@ -737,6 +1038,11 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: ResolveApproval requires operator principal");
         }
+        if matches!(&cmd, Command::SettleProposalGate(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: SettleProposalGate requires operator principal");
+        }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal = CommandJournalEntry::new(&cmd, &caller);
@@ -983,6 +1289,13 @@ impl CommandHandler {
                     chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
                     // P060: Frozen review routing options.
                     review_routing_json: validated_review_routing_json,
+                    // P077: Frozen closeout readiness mode from workflow snapshot metadata.
+                    // Prefer the compiled plan's mode (from workflow YAML) over the command
+                    // field, which defaults to None when not populated by the MCP caller.
+                    closeout_readiness_mode: plan
+                        .closeout_readiness_mode
+                        .clone()
+                        .or_else(|| c.closeout_readiness_mode.clone()),
                 };
                 runs::insert_tx(&mut tx, &run).await?;
                 // OPS-001 (P017 R2 audit): the workflow compiler ran
@@ -2828,6 +3141,131 @@ impl CommandHandler {
                 };
                 Ok(result)
             }
+            Command::SettleProposalGate(mut c) => {
+                // BLK-008: bind principal from authenticated CallerContext —
+                // never trust the caller-supplied payload field.
+                c.principal = caller.principal_id.clone();
+
+                // BLK-010: Bind capability to the canonical CapabilityToolId::ProposalGateSettle
+                // token and reject mismatches. Bind authority to registered allow-list.
+                validate_proposal_gate_authorization(&c)?;
+
+                let settle_started = Instant::now();
+                let gate_id = format!("p{}:{}", c.proposal_id, c.proposal_id);
+                let gate_generation_id = uuid::Uuid::new_v4().to_string();
+                let gate_result = build_proposal_gate_result_from_settlement(
+                    &c,
+                    &journal.id,
+                    &gate_id,
+                    &gate_generation_id,
+                    settle_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                )?;
+
+                let tx_started = Instant::now();
+                let mut tx =
+                    db::pool::begin_immediate_with_retry(&self.pool, "command.SettleProposalGate")
+                        .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.SettleProposalGate", tx_started);
+
+                // Resolve closeout readiness mode from the frozen run column.
+                let run_id_str = c.run_id.to_string();
+                let mode_column =
+                    closeout::find_closeout_readiness_mode(&self.pool, &run_id_str).await?;
+                let has_enforcement_migration =
+                    closeout::has_enforcement_migration_record(&self.pool, &run_id_str).await?;
+                let mode_result = resolve_closeout_readiness_mode(
+                    mode_column.as_deref(),
+                    has_enforcement_migration,
+                );
+
+                // Load active self-assessment if present.
+                let self_assessment_stored =
+                    artifact_contracts::find_active_implementation_self_assessment_summary(
+                        &self.pool, c.run_id,
+                    )
+                    .await?;
+                let self_assessment_ref = self_assessment_stored.as_ref().map(|s| &s.summary);
+
+                // P077 BLK-006: source controlled_reports_green from active artifact contracts.
+                let controlled_reports_green =
+                    closeout::compute_controlled_reports_green(&self.pool, &run_id_str)
+                        .await
+                        .ok()
+                        .flatten();
+
+                // P077 BLK-011: read prior blocker_digest for soft-convergence detection.
+                let prior_blocker_digest =
+                    closeout::find_active_blocker_digest(&self.pool, &run_id_str)
+                        .await
+                        .ok()
+                        .flatten();
+
+                // Synthesize closeout readiness.
+                let synth_result =
+                    synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
+                        run_id: &run_id_str,
+                        stage_id: &c.stage_id,
+                        gate_result: &gate_result,
+                        mode_result: &mode_result,
+                        self_assessment: self_assessment_ref,
+                        accepted_risks: &[],
+                        loop_budget_remaining: true,
+                        fingerprint: None,
+                        fingerprint_latency_exceeded: false,
+                        controlled_reports_green,
+                        previous_blocker_digest: prior_blocker_digest.as_deref(),
+                    });
+
+                // Atomically activate gate + readiness generations, then rebuild projections.
+                let closeout_tx_result = closeout::execute_closeout_transaction(
+                    &self.pool,
+                    closeout::CloseoutTransactionInputs {
+                        gate_result: &gate_result,
+                        readiness: &synth_result.readiness,
+                        blocker_digest: synth_result.current_blocker_digest.as_deref(),
+                    },
+                )
+                .await?;
+                // Non-fatal: canonical truth has already been committed; a rebuild
+                // failure is logged and the next AdvanceRun cycle retries (mirrors
+                // orchestrator.rs non-fatal rebuild pattern).
+                if let Err(e) = projections::rebuild_all_for_run(&self.pool, c.run_id).await {
+                    error!(
+                        run_id = %c.run_id,
+                        stage = %c.stage_id,
+                        error = %e,
+                        "P077: projection rebuild failed after SettleProposalGate closeout transaction — projections may lag one AdvanceRun cycle"
+                    );
+                }
+
+                Ok(CommandResult::ProposalGateSettled {
+                    run_id: c.run_id,
+                    gate_id,
+                    journal_id: journal.id.clone(),
+                    gate_generation_id: closeout_tx_result.gate_generation_id,
+                    readiness_generation_id: closeout_tx_result.readiness_generation_id,
+                })
+            }
         }
     }
 
@@ -3780,6 +4218,40 @@ async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
     Ok(())
 }
 
+/// P077 BLK-010: Validate that the caller-supplied capability matches the canonical
+/// CapabilityToolId::ProposalGateSettle token and that the authority is in the
+/// registered allow-list. Prevents arbitrary capability/authority strings from
+/// polluting the audit lineage. Extracted for unit-testability.
+fn validate_proposal_gate_authorization(c: &SettleProposalGateCmd) -> Result<()> {
+    // Hard-coded literal to avoid a theoretical fail-open if enum serialization
+    // ever returned Err and unwrap_or_default produced an empty string that
+    // compared equal to an empty caller capability (p077-sec-005).
+    const CANONICAL_CAPABILITY: &str = "ProposalGateSettle";
+    if c.capability.trim().is_empty() {
+        anyhow::bail!(
+            "empty capability: must be '{}'",
+            CANONICAL_CAPABILITY
+        );
+    }
+    if c.capability != CANONICAL_CAPABILITY {
+        anyhow::bail!(
+            "invalid capability '{}': must be '{}'",
+            c.capability,
+            CANONICAL_CAPABILITY
+        );
+    }
+    const ALLOWED_AUTHORITIES: &[&str] =
+        &["release_owner", "control_plane_owner", "proposal_owner"];
+    if !ALLOWED_AUTHORITIES.contains(&c.authority.as_str()) {
+        anyhow::bail!(
+            "invalid authority '{}': must be one of {:?}",
+            c.authority,
+            ALLOWED_AUTHORITIES
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3876,6 +4348,192 @@ reviewer_override:
         assert_eq!(
             snapshot.evidence_source,
             "p017-phase-b-dogfood-exit-2026-04-26"
+        );
+    }
+
+    fn p077_settle_cmd(
+        action: domain::commands::ProposalGateSettlementAction,
+    ) -> domain::commands::SettleProposalGateCmd {
+        domain::commands::SettleProposalGateCmd {
+            run_id: RunId::new(),
+            proposal_id: "077".into(),
+            stage_id: "state_9_implementation_reviewed".into(),
+            action,
+            principal: "operator-1".into(),
+            capability: "ProposalGateSettle".into(),
+            journal_id: "journal-input".into(),
+            authority: "release_owner".into(),
+            reason: "operator settled proof gate".into(),
+            source_artifacts: vec!["implementation/self-assessment.json".into()],
+            workflow_digest: "sha256:workflow".into(),
+            worktree_head: "abcdef123456".into(),
+            dirty_or_changed_file_digest: "sha256:dirty".into(),
+            source_generation_ids: vec!["generation-1".into()],
+            current_fingerprint: "sha256:fingerprint-current".into(),
+            receipt_json: None,
+        }
+    }
+
+    #[test]
+    fn p077_record_settlement_populates_executor_metadata() {
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+
+        let result = build_proposal_gate_result_from_settlement(
+            &cmd,
+            "journal-1",
+            "p077:077",
+            "gate-generation-1",
+            9,
+        )
+        .expect("record settlement should execute the managed gate path");
+
+        assert_eq!(result.status, ProposalGateStatus::Passed);
+        assert_eq!(
+            result.executor_version.as_deref(),
+            Some("proposal-gate-executor.v1")
+        );
+        assert!(result
+            .evidence_digest
+            .as_deref()
+            .is_some_and(|d| { d.starts_with("sha256:") && d.len() == "sha256:".len() + 64 }));
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.elapsed_ms, Some(9));
+        assert_eq!(
+            result
+                .authorization_lineage
+                .as_ref()
+                .map(|l| l.current_fingerprint.as_str()),
+            Some("sha256:fingerprint-current")
+        );
+    }
+
+    #[test]
+    fn p077_import_receipt_rejects_fingerprint_mismatch() {
+        let mut cmd =
+            p077_settle_cmd(domain::commands::ProposalGateSettlementAction::ImportReceipt);
+        cmd.receipt_json = Some(serde_json::json!({
+            "schema_version": "proposal_gate_receipt.v1",
+            "status": "passed",
+            "proposal_id": "077",
+            "run_id": cmd.run_id.to_string(),
+            "stage_id": "state_9_implementation_reviewed",
+            "executor_version": "proposal-gate-executor.v1",
+            "evidence_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stdout_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stderr_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "exit_code": 0,
+            "elapsed_ms": 17,
+            "current_fingerprint": "sha256:stale"
+        }).to_string());
+
+        let err = build_proposal_gate_result_from_settlement(
+            &cmd,
+            "journal-1",
+            "p077:077",
+            "gate-generation-1",
+            9,
+        )
+        .expect_err("stale receipt must be rejected before activation");
+
+        assert!(err.to_string().contains("current_fingerprint"));
+    }
+
+    #[test]
+    fn p077_import_receipt_rejects_unmanaged_receipt_without_digest() {
+        let mut cmd =
+            p077_settle_cmd(domain::commands::ProposalGateSettlementAction::ImportReceipt);
+        cmd.receipt_json = Some(serde_json::json!({
+            "schema_version": "proposal_gate_receipt.v1",
+            "status": "passed",
+            "proposal_id": "077",
+            "run_id": cmd.run_id.to_string(),
+            "stage_id": "state_9_implementation_reviewed",
+            "executor_version": "proposal-gate-executor.v1",
+            "stdout_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stderr_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "exit_code": 0,
+            "elapsed_ms": 17,
+            "current_fingerprint": "sha256:fingerprint-current"
+        }).to_string());
+
+        let err = build_proposal_gate_result_from_settlement(
+            &cmd,
+            "journal-1",
+            "p077:077",
+            "gate-generation-1",
+            9,
+        )
+        .expect_err("receipt without durable evidence digest is unmanaged");
+
+        assert!(err.to_string().contains("evidence_digest"));
+    }
+
+    // ── BLK-010: capability/authority binding rejection tests ─────────────────
+
+    #[test]
+    fn p077_mismatched_capability_is_rejected() {
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        cmd.capability = "SomeOtherCapability".into();
+
+        let err = validate_proposal_gate_authorization(&cmd)
+            .expect_err("mismatched capability must be rejected");
+
+        assert!(
+            err.to_string().contains("invalid capability"),
+            "error should mention invalid capability: {err}"
+        );
+        assert!(
+            err.to_string().contains("ProposalGateSettle"),
+            "error should name the expected canonical token: {err}"
+        );
+    }
+
+    #[test]
+    fn p077_unknown_authority_is_rejected() {
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        cmd.authority = "rogue_authority".into();
+
+        let err = validate_proposal_gate_authorization(&cmd)
+            .expect_err("unknown authority must be rejected");
+
+        assert!(
+            err.to_string().contains("invalid authority"),
+            "error should mention invalid authority: {err}"
+        );
+        assert!(
+            err.to_string().contains("release_owner"),
+            "error should name at least one allowed authority: {err}"
+        );
+    }
+
+    #[test]
+    fn p077_canonical_capability_and_known_authority_pass_validation() {
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        validate_proposal_gate_authorization(&cmd)
+            .expect("canonical capability + known authority must pass validation");
+    }
+
+    #[test]
+    fn p077_all_allowed_authorities_pass_validation() {
+        for authority in ["release_owner", "control_plane_owner", "proposal_owner"] {
+            let mut cmd =
+                p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+            cmd.authority = authority.into();
+            validate_proposal_gate_authorization(&cmd)
+                .unwrap_or_else(|e| panic!("authority '{authority}' should pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn p077_empty_capability_is_rejected() {
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        cmd.capability = "".into();
+        let err = validate_proposal_gate_authorization(&cmd)
+            .expect_err("empty capability must always be rejected");
+        assert!(
+            err.to_string().contains("empty capability")
+                || err.to_string().contains("invalid capability"),
+            "error should describe the empty-capability rejection: {err}"
         );
     }
 }

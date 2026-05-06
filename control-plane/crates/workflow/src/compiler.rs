@@ -123,6 +123,12 @@ fn compile_loaded(
             }
         })
         .unwrap_or_default();
+    // P077: Extract closeout_readiness_mode from workflow metadata.
+    // Accepted values: "advisory" | "enforcement". Absent means advisory.
+    let closeout_readiness_mode = wf
+        .workflow
+        .as_ref()
+        .and_then(|m| m.closeout_readiness_mode.clone());
     let workflow_snapshot_json = match snapshots.as_ref() {
         Some(snapshot) => snapshot.workflow_json.clone(),
         None => canonical_json_string(&wf).context("serializing canonical workflow snapshot")?,
@@ -200,6 +206,7 @@ fn compile_loaded(
         catalog_snapshot_json,
         dynamic_candidate_bindings,
         run_plan_snapshot_format_version,
+        closeout_readiness_mode,
     })
 }
 

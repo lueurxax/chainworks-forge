@@ -87,6 +87,13 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 | `StewardRunAnalysis` | `steward.run_analysis` | yes |
 | `StewardListAnalyses` | `steward.list_analyses` | no (direct) |
 | `StewardGetAnalysis` | `steward.get_analysis` | no (direct) |
+| `RunsMainSyncRequest` | `runs.main_sync.request` | yes |
+| `RunsMainSyncRetry` | `runs.main_sync.retry` | yes |
+| `RunsMainSyncSetOverride` | `runs.main_sync.set_override` | yes |
+| `RunsMainSyncRepairState` | `runs.main_sync.repair_state` | yes |
+| `RunsMainSyncRecordRecoveryDecision` | `runs.main_sync.record_recovery_decision` | yes |
+| `RunsKnowledgeCapsuleIgnore` | `runs.knowledge_capsule.ignore` | yes |
+| `ProposalGateSettle` | `runs.settle_proposal_gate` | yes |
 
 Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
 
@@ -275,6 +282,9 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `steward.run_analysis` | yes | no | no |
 | `steward.list_analyses` | yes | no | yes |
 | `steward.get_analysis` | yes | no | yes |
+| `runs.main_sync.*` | yes | no | no | (Includes request, retry, set_override, repair_state, record_recovery_decision) |
+| `runs.knowledge_capsule.ignore` | yes | no | no |
+| `runs.settle_proposal_gate` | yes | no | no |
 
 Rationale for the Steward trio: `run_analysis` queues compute work and drives the quality-gate pipeline, so only operators can trigger it. `list_analyses` and `get_analysis` are read-only over persisted analysis records and are visible to the operational/audit (observer) class. Agents are scoped to executing their own run and have no legitimate cross-cohort read surface, so they see none of the three.
 

@@ -51,6 +51,11 @@ pub enum Command {
     /// through this command. CallerContext carries identity; the command
     /// carries only domain data and server-resolved provenance.
     ResolveApproval(ResolveApprovalCmd),
+    /// P077: Phase 0 gate-settlement command (journaled-only; no orchestrator side effects).
+    /// MCP settle_proposal_gate tool routes through this command.
+    /// CallerContext.principal_id overrides the command's principal field at the engine
+    /// boundary (BLK-008: bind from authenticated context, not caller-supplied payload).
+    SettleProposalGate(SettleProposalGateCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,6 +77,10 @@ pub struct StartRunCmd {
     /// When present, controls how proposal reviewers are selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_routing_json: Option<String>,
+    /// P077: Closeout readiness mode frozen at run admission from workflow snapshot metadata.
+    /// Values: "advisory" | "enforcement". NULL → advisory (legacy fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closeout_readiness_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,6 +316,48 @@ pub struct ResolveApprovalCmd {
     pub stage_id: String,
 }
 
+// ── P077: Gate settlement command ──────────────────────────────────────
+
+/// Action for `SettleProposalGateCmd`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalGateSettlementAction {
+    /// Compatibility alias for the managed gate executor path.
+    RecordSettlement,
+    /// Run the managed gate executor and activate its result.
+    Execute,
+    /// Import a typed `proposal_gate_receipt.v1` emitted by the managed executor.
+    ImportReceipt,
+    /// Operator-authorized waiver with full lineage.
+    Waive,
+}
+
+/// P077 Phase 0: settle a proposal gate result.
+/// The `principal` field is server-overridden from CallerContext at the engine
+/// boundary — do NOT trust the caller-supplied value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettleProposalGateCmd {
+    pub run_id: RunId,
+    pub proposal_id: String,
+    pub stage_id: String,
+    pub action: ProposalGateSettlementAction,
+    /// Server-overridden from CallerContext.principal_id at engine boundary (BLK-008).
+    pub principal: String,
+    pub capability: String,
+    pub journal_id: String,
+    pub authority: String,
+    pub reason: String,
+    pub source_artifacts: Vec<String>,
+    pub workflow_digest: String,
+    pub worktree_head: String,
+    pub dirty_or_changed_file_digest: String,
+    pub source_generation_ids: Vec<String>,
+    pub current_fingerprint: String,
+    /// Raw JSON receipt from the gate executor (max 256KiB enforced at MCP boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_json: Option<String>,
+}
+
 // ── P029: Caller identity for audit journaling ──────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -413,6 +464,7 @@ mod tests {
                 r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#.into(),
             ),
             review_routing_json: None,
+            closeout_readiness_mode: None,
         };
 
         let json = serde_json::to_value(&cmd).unwrap();
