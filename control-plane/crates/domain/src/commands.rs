@@ -354,6 +354,10 @@ pub struct SettleProposalGateCmd {
     pub dirty_or_changed_file_digest: String,
     pub source_generation_ids: Vec<String>,
     pub current_fingerprint: String,
+    /// Optional managed gate executor timeout in milliseconds. The engine applies
+    /// a bounded default when omitted and clamps unsafe values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     /// Raw JSON receipt from the gate executor (max 256KiB enforced at MCP boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_json: Option<String>,

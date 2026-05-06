@@ -1,6 +1,37 @@
 use chrono::Utc;
 use domain::closeout_readiness::CloseoutFingerprint;
 use domain::run::Run;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tokio::process::Command as TokioCommand;
+use tokio::time::timeout;
+
+pub const CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS: u64 = 5_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseoutWorktreeTruth {
+    pub worktree_head: String,
+    pub dirty_or_changed_file_digest: String,
+    pub latency_ms: u64,
+    pub unavailable: bool,
+    pub latency_exceeded: bool,
+    pub diagnostic_reason: Option<String>,
+}
+
+impl CloseoutWorktreeTruth {
+    fn unavailable(reason: impl Into<String>, latency_ms: u64) -> Self {
+        let reason = reason.into();
+        Self {
+            worktree_head: unavailable_digest("worktree-head", &reason),
+            dirty_or_changed_file_digest: unavailable_digest("worktree-dirty", &reason),
+            latency_ms,
+            unavailable: true,
+            latency_exceeded: latency_ms >= CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
+            diagnostic_reason: Some(reason),
+        }
+    }
+}
 
 pub fn build_closeout_fingerprint(
     run: &Run,
@@ -38,6 +69,100 @@ pub fn build_closeout_fingerprint(
         computed_at: Utc::now(),
         latency_ms,
     }
+}
+
+pub async fn resolve_closeout_worktree_truth(run: &Run) -> CloseoutWorktreeTruth {
+    let started = Instant::now();
+    let Some(root) = worktree_root(run) else {
+        return CloseoutWorktreeTruth::unavailable("closeout worktree root unavailable", 0);
+    };
+    match timeout(
+        Duration::from_millis(CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS),
+        read_worktree_truth(root),
+    )
+    .await
+    {
+        Ok(Ok(mut truth)) => {
+            truth.latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            truth.latency_exceeded = truth.latency_ms > CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS;
+            truth
+        }
+        Ok(Err(error)) => CloseoutWorktreeTruth::unavailable(
+            format!("closeout worktree truth unavailable: {error}"),
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        ),
+        Err(_) => CloseoutWorktreeTruth::unavailable(
+            "closeout worktree truth timed out",
+            CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
+        ),
+    }
+}
+
+fn worktree_root(run: &Run) -> Option<PathBuf> {
+    run.worktree_root
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let root = run.workspace_root.trim();
+            (!root.is_empty()).then_some(root)
+        })
+        .map(PathBuf::from)
+}
+
+async fn read_worktree_truth(root: PathBuf) -> anyhow::Result<CloseoutWorktreeTruth> {
+    if !root.is_dir() {
+        anyhow::bail!("{} is not a directory", root.display());
+    }
+    let head = run_git_text(&root, ["rev-parse", "HEAD"]).await?;
+    let status = run_git_bytes(
+        &root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await?;
+    let diff = run_git_bytes(&root, ["diff", "--binary", "HEAD"]).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"git-status-porcelain-v1-z\0");
+    hasher.update(&status);
+    hasher.update(b"git-diff-binary-head\0");
+    hasher.update(&diff);
+
+    Ok(CloseoutWorktreeTruth {
+        worktree_head: head.trim().to_string(),
+        dirty_or_changed_file_digest: format!("sha256:{:x}", hasher.finalize()),
+        latency_ms: 0,
+        unavailable: false,
+        latency_exceeded: false,
+        diagnostic_reason: None,
+    })
+}
+
+async fn run_git_text<const N: usize>(root: &Path, args: [&str; N]) -> anyhow::Result<String> {
+    let bytes = run_git_bytes(root, args).await?;
+    String::from_utf8(bytes).map_err(Into::into)
+}
+
+async fn run_git_bytes<const N: usize>(root: &Path, args: [&str; N]) -> anyhow::Result<Vec<u8>> {
+    let output = TokioCommand::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git command failed in {} with status {:?}",
+            root.display(),
+            output.status.code()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn unavailable_digest(kind: &str, reason: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(reason.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -110,5 +235,48 @@ mod tests {
         );
         assert_eq!(fingerprint.latency_ms, 12);
         assert_eq!(fingerprint.short_hash().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn closeout_worktree_truth_uses_live_head_and_dirty_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        std::fs::write(temp.path().join("tracked.txt"), "one\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let mut run = run();
+        run.worktree_root = Some(temp.path().display().to_string());
+        let clean = resolve_closeout_worktree_truth(&run).await;
+        assert!(!clean.unavailable);
+        assert_eq!(clean.worktree_head.len(), 40);
+        assert!(clean.dirty_or_changed_file_digest.starts_with("sha256:"));
+
+        std::fs::write(temp.path().join("tracked.txt"), "two\n").unwrap();
+        let dirty = resolve_closeout_worktree_truth(&run).await;
+        assert_ne!(
+            dirty.dirty_or_changed_file_digest,
+            clean.dirty_or_changed_file_digest
+        );
     }
 }

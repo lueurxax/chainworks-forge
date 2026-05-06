@@ -28,6 +28,7 @@ use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::closeout_readiness_summary_accessor::{
     CloseoutReadinessAccessorInputs, CloseoutReadinessSummary, CloseoutReadinessSummaryAccessor,
 };
+use domain::ids::RunId;
 use domain::proposal_gate_result::{
     ProposalGateResult, ProposalGateStatus, PROPOSAL_GATE_RESULT_V1_CONTRACT_ID,
 };
@@ -150,6 +151,24 @@ pub async fn execute_closeout_transaction(
         readiness_status: inputs.readiness.status.clone(),
         readiness_decision: inputs.readiness.decision.clone(),
     })
+}
+
+/// Execute closeout activation and rebuild exported projections before
+/// returning success to transition evaluation/readback callers.
+pub async fn execute_closeout_transaction_with_projection_rebuild(
+    pool: &SqlitePool,
+    inputs: CloseoutTransactionInputs<'_>,
+) -> Result<CloseoutTransactionResult> {
+    let run_id: RunId = inputs
+        .readiness
+        .run_id
+        .parse()
+        .context("parse closeout readiness run_id for projection rebuild")?;
+    let result = execute_closeout_transaction(pool, inputs).await?;
+    crate::repos::projections::rebuild_all_for_run(pool, run_id)
+        .await
+        .context("rebuild projections after closeout transaction")?;
+    Ok(result)
 }
 
 /// Read the active gate generation for a run (if any).
@@ -672,6 +691,7 @@ pub struct ActiveReadinessRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repos::artifact_contracts;
     use chrono::Utc;
     use domain::closeout_readiness::{
         CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
@@ -1199,13 +1219,12 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// P077 projection parity: after execute_closeout_transaction + rebuild_run_state_projection,
+    /// P077 projection parity: after execute_closeout_transaction_with_projection_rebuild,
     /// the exported run-state active_artifacts map must contain both proposal_gate_result_v1
     /// and implementation_closeout_readiness_v1 so downstream consumers (GraphQL, MCP runs.get)
     /// observe P077 truth via the canonical projection path.
     #[tokio::test]
     async fn p077_projection_parity_after_closeout_transaction() {
-        use crate::repos::artifact_contracts;
         use domain::closeout_readiness::CloseoutFingerprint;
 
         let pool = setup_test_db().await;
@@ -1237,7 +1256,7 @@ mod tests {
         let gate_gen_id = gate.generation_id.clone();
         let readiness_gen_id = readiness.generation_id.clone();
 
-        execute_closeout_transaction(
+        execute_closeout_transaction_with_projection_rebuild(
             &pool,
             CloseoutTransactionInputs {
                 gate_result: &gate,
@@ -1248,10 +1267,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        artifact_contracts::rebuild_run_state_projection(&pool, run_id)
-            .await
-            .unwrap();
 
         let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
             .await
@@ -1327,7 +1342,7 @@ mod tests {
         let gate2_gen_id = gate2.generation_id.clone();
         let readiness2_gen_id = readiness2.generation_id.clone();
 
-        execute_closeout_transaction(
+        execute_closeout_transaction_with_projection_rebuild(
             &pool,
             CloseoutTransactionInputs {
                 gate_result: &gate2,
@@ -1338,10 +1353,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        artifact_contracts::rebuild_run_state_projection(&pool, run_id)
-            .await
-            .unwrap();
 
         let projection2 = artifact_contracts::find_run_state_projection(&pool, run_id)
             .await

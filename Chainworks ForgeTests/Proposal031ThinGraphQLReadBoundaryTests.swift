@@ -674,8 +674,37 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       #expect(presentation.primaryUnblockText.contains(expectedPrimaryUnblock))
       #expect(presentation.modeExplainerAccessibilityLabel.contains("Closeout readiness mode"))
       #expect(presentation.generationCopyAccessibilityLabel.contains("generation id"))
+      #expect(presentation.diagnosticsAccessibilityLabel.contains(expectedStatus))
+      #expect(presentation.compactActivationAccessibilityLabel.contains(expectedStatus))
+      #expect(!presentation.diagnosticRows.isEmpty)
+      #expect(presentation.recoveryLifecycleText.contains("Recovery"))
+      #expect(!presentation.backlinkRouteLabel.isEmpty)
       #expect(presentation.cardAccessibilityLabel.contains(expectedStatus))
     }
+  }
+
+  @Test("P077 closeout readiness presenter exposes blocker and diagnostics rows")
+  func p077CloseoutReadinessPresenterExposesBlockerAndDiagnosticsRows() throws {
+    let notReady = try decodeCloseoutReadinessSummary(
+      closeoutReadinessSummaryJSON(
+        status: "not_ready",
+        decision: "return_to_code_refine",
+        generationID: "1234567890abcdef",
+        mode: "enforcement",
+        gateStatus: "failed",
+        diagnosticReason: "proposal-077 gate failed",
+        primaryUnblock: "Fix implementation blockers",
+        summary: "Fix implementation blockers"
+      )
+    )
+
+    let presentation = P077CloseoutReadinessPresenter.presentation(for: notReady)
+
+    #expect(presentation.secondaryBlockerRows.contains { $0.contains("code blocker") })
+    #expect(presentation.diagnosticRows.contains("Decision: return_to_code_refine"))
+    #expect(presentation.diagnosticRows.contains("Gate: failed"))
+    #expect(presentation.recoveryLifecycleText.contains("return to code refine"))
+    #expect(presentation.backlinkRouteLabel == "Closeout diagnostics")
   }
 
   @Test("Bulk artifact read documents do not request payload text")

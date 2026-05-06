@@ -184,7 +184,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "action": {
                         "type": "string",
                         "enum": ["execute", "import_receipt", "waive"],
-                        "description": "Defaults to import_receipt when receipt_json is supplied; required otherwise. Use import_receipt with a governed gate receipt, waive to waive with lineage, or execute (not yet implemented — requires a real ProposalGateExecutor receipt)."
+                        "description": "Defaults to import_receipt when receipt_json is supplied; required otherwise. Use import_receipt with a governed gate receipt, waive to waive with lineage, or execute to run the bounded managed ProposalGateExecutor."
                     },
                     "capability": { "type": "string", "maxLength": 1024 },
                     "journal_id": { "type": "string", "maxLength": 1024 },
@@ -204,6 +204,12 @@ pub fn tool_specs() -> Vec<McpTool> {
                         "maxItems": 64
                     },
                     "current_fingerprint": { "type": "string", "maxLength": 1024 },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600000,
+                        "description": "Optional bounded timeout for action=execute. The engine applies a default when omitted."
+                    },
                     "accepted_risks": {
                         "type": "array",
                         "description": "Optional typed RiskAcceptanceLineage rows for governed risk settlement.",
@@ -624,6 +630,18 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'current_fingerprint'"))?
                 .to_string();
+            let timeout_ms = match params.get("timeout_ms") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let timeout = value
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("'timeout_ms' must be an integer"))?;
+                    if !(1..=600_000).contains(&timeout) {
+                        anyhow::bail!("'timeout_ms' must be between 1 and 600000");
+                    }
+                    Some(timeout)
+                }
+            };
             // sec-002: cap receipt_json at 256 KiB
             let receipt_json = params["receipt_json"].as_str().map(str::to_string);
             if let Some(ref r) = receipt_json {
@@ -692,6 +710,7 @@ pub async fn execute(
                         dirty_or_changed_file_digest,
                         source_generation_ids,
                         current_fingerprint,
+                        timeout_ms,
                         receipt_json,
                         accepted_risks,
                     }),

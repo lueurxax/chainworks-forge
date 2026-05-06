@@ -676,7 +676,10 @@ async fn proposal_041_handoff_artifact_contract_is_ready() -> Result<()> {
     let published = read_json(&path)?;
     assert_eq!(published["overall_status"], "ready_same_tree_verified");
     assert_eq!(published["schema_version"], "p031-p041-parity-evidence.v1");
-    assert_eq!(published["provenance"]["gate"], "./scripts/test-gate.sh proposal-041");
+    assert_eq!(
+        published["provenance"]["gate"],
+        "./scripts/test-gate.sh proposal-041"
+    );
     let published_fixtures = published["fixtures"]
         .as_array()
         .ok_or_else(|| anyhow!("published parity evidence must list fixtures"))?;

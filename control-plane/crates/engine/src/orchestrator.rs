@@ -30,7 +30,10 @@ use domain::workflow_conflict::{
     WorkflowConflictRecord, WorkflowConflictStatus, WorkflowTransitionCursorRecord,
 };
 
-use crate::closeout_fingerprint::build_closeout_fingerprint;
+use crate::closeout_fingerprint::{
+    build_closeout_fingerprint, resolve_closeout_worktree_truth,
+    CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
+};
 use crate::closeout_loop_budget::{
     closeout_loop_budget_exhaustion, closeout_loop_budget_remaining,
 };
@@ -1529,25 +1532,30 @@ impl Orchestrator {
             .await
             .ok()
             .flatten();
-        let fingerprint_started = std::time::Instant::now();
         let upstream_generation_ids =
             closeout::list_closeout_fingerprint_source_generation_ids(&self.pool, &run_id_str)
                 .await
                 .unwrap_or_default();
-        let fingerprint_latency_ms = fingerprint_started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let worktree_truth = resolve_closeout_worktree_truth(run).await;
+        if let Some(reason) = worktree_truth.diagnostic_reason.as_deref() {
+            warn!(
+                run_id = %run_id,
+                state = %current_state_id,
+                reason,
+                "P077: current worktree fingerprint truth unavailable; closeout will fail closed"
+            );
+        }
         let closeout_fingerprint = build_closeout_fingerprint(
             run,
             current_state_id,
-            run.base_revision
-                .clone()
-                .unwrap_or_else(|| "sha256:unknown-head".into()),
-            "sha256:unknown-dirty",
+            worktree_truth.worktree_head.clone(),
+            worktree_truth.dirty_or_changed_file_digest.clone(),
             upstream_generation_ids,
-            fingerprint_latency_ms,
+            worktree_truth.latency_ms,
         );
+        let fingerprint_latency_exceeded = worktree_truth.unavailable
+            || worktree_truth.latency_exceeded
+            || worktree_truth.latency_ms > CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS;
         let loop_budget_remaining =
             closeout_loop_budget_remaining(plan, all_stages, "state_10_implementation_refined");
 
@@ -1560,7 +1568,7 @@ impl Orchestrator {
             accepted_risks: &accepted_risks,
             loop_budget_remaining,
             fingerprint: Some(closeout_fingerprint),
-            fingerprint_latency_exceeded: fingerprint_latency_ms > 5_000,
+            fingerprint_latency_exceeded,
             // Sourced from active audit/docs/security/prepush/tests artifact contracts.
             // None means at least one controlled report is missing — synthesizer fails
             // closed in enforcement mode while advisory mode is unaffected.
@@ -1577,7 +1585,9 @@ impl Orchestrator {
             blocker_digest: synth_result.current_blocker_digest.as_deref(),
         };
 
-        match closeout::execute_closeout_transaction(&self.pool, tx_inputs).await {
+        match closeout::execute_closeout_transaction_with_projection_rebuild(&self.pool, tx_inputs)
+            .await
+        {
             Ok(tx_result) => {
                 info!(
                     run_id = %run_id,
@@ -1585,17 +1595,6 @@ impl Orchestrator {
                     decision = %tx_result.readiness_decision,
                     "P077: closeout readiness synthesized and persisted"
                 );
-                // BLK-006: rebuild projections so active P077 truth is visible to
-                // downstream transition evaluation and readback before the next cycle.
-                // Non-fatal: a rebuild failure is logged and the next AdvanceRun retries.
-                if let Err(e) = projections::rebuild_all_for_run(&self.pool, run_id).await {
-                    error!(
-                        run_id = %run_id,
-                        state = %current_state_id,
-                        error = %e,
-                        "P077: projection rebuild failed after closeout transaction — projections may lag one AdvanceRun cycle"
-                    );
-                }
             }
             Err(e) => {
                 error!(
@@ -6373,12 +6372,14 @@ fn build_task_prompt(
         parts.push(context.to_string());
     }
 
-    // Required outputs with resolved target paths — agent must write here
+    // Required outputs with resolved target paths. Agents return these through
+    // CHAINWORKS_OUTPUT; the engine validates and materializes canonical files.
     if !task.outputs.is_empty() {
         parts.push(String::from("\n### Required Outputs"));
         parts.push(String::from(
-            "Write each output to its canonical path below. \
-             Create parent directories if missing.",
+            "Return each required output through the final `CHAINWORKS_OUTPUT` \
+             object using the canonical path keys below; the engine will \
+             materialize canonical files after contract validation.",
         ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
@@ -6489,13 +6490,13 @@ fn build_task_prompt(
                  - Do NOT write files outside the worktree root.\n\
                  - Read source from the worktree, not the original workspace.\n\
                  - Do not commit, push, or modify git state.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Do not write run artifact outputs directly into the run meta-root; return them through `CHAINWORKS_OUTPUT`.\n\
                  - Do not rely on implicit working directory."
             ));
         } else {
             parts.push(String::from(
                 "- Use explicit absolute paths from the workspace root above.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Return required outputs through `CHAINWORKS_OUTPUT`; the engine materializes canonical files.\n\
                  - Do not rely on implicit working directory.\n\
                  - Do not perform git operations unless the task explicitly requests them.",
             ));
@@ -6506,14 +6507,14 @@ fn build_task_prompt(
                 "- Read source from the implementation worktree, not the original workspace.\n\
                  - Treat `Run meta-root (absolute)` as the only valid base for run artifacts; do not use `.chainworks/runs/...` relative to the implementation worktree.\n\
                  - Use meta-root input and output paths exactly as listed above.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Return required outputs through `CHAINWORKS_OUTPUT`; the engine materializes canonical files.\n\
                  - Do not rely on implicit working directory.\n\
                  - Do not perform git operations unless the task explicitly requests them.",
             ));
         } else {
             parts.push(String::from(
                 "- Use explicit absolute paths from the workspace root above.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Return required outputs through `CHAINWORKS_OUTPUT`; the engine materializes canonical files.\n\
                  - Do not rely on implicit working directory.\n\
                  - Do not perform git operations unless the task explicitly requests them.",
             ));
@@ -6761,14 +6762,10 @@ fn append_task_specific_guidance(
              contents, and continue with the smallest viable edit.",
         ));
         parts.push(String::from(
-            "Never emit shell commands that write required outputs into the run \
-             artifact directory. Required outputs must be returned only through \
-             the final JSON object envelope.",
-        ));
-        parts.push(String::from(
-            "Use exactly this final response shape, with no surrounding prose, \
-             markdown, or code fences:\n\
-             {\"CHAINWORKS_OUTPUT\":{\"<canonical path from Required Outputs>\":{\"status\":\"complete\"}}}",
+            "Do not write run artifact outputs directly into the run meta-root \
+             with shell commands. Required outputs must be returned through the \
+             final `CHAINWORKS_OUTPUT` JSON object so the engine can validate and \
+             materialize them.",
         ));
         parts.push(String::from(
             "Use the exact canonical output paths from Required Outputs as \
@@ -6776,28 +6773,13 @@ fn append_task_specific_guidance(
              fallback when a canonical path is unavailable.",
         ));
         parts.push(String::from(
-            "Set `seemingly_complete` based only on remaining code-writer-owned \
-             source or test work.",
-        ));
-        parts.push(String::from(
-            "If the code changes and code-owned verification for the approved \
-             proposal are done, set `seemingly_complete` to true even when manual \
-             evidence, release evidence, documentation-only work, CloudKit \
-             signed-in smoke checks, calendar/go-no-go decisions, or other \
-             operator/ops tasks remain.",
-        ));
-        parts.push(String::from(
-            "Do not make cosmetic polishing edits or rerun already-green tests \
-             solely to avoid returning `seemingly_complete: true`.",
-        ));
-        parts.push(String::from(
-            "Put non-code blockers into `remaining_tasks` or `known_risks` as \
-             handoff tasks with owner labels.",
-        ));
-        parts.push(String::from(
-            "When useful, include optional JSON fields `remaining_code_tasks`, \
-             `handoff_tasks`, `blocked_by_non_code_evidence`, and \
-             `verification_green` in the implementation self-assessment.",
+            "Each `CHAINWORKS_OUTPUT` value must be the full JSON object for that \
+             output contract, including every field listed in Structured Output \
+             Requirements. For `implementation_self_assessment_v2`, use \
+             `implementation_complete`, `verification_green`, \
+             `remaining_code_tasks`, `handoff_tasks`, `known_risks`, \
+             `tests_run`, and `docs_impacted`; do not use legacy self-assessment \
+             field names.",
         ));
 
         // Source context: changed files manifest (Proposal 007 SourceContextBuilder).
@@ -7611,6 +7593,107 @@ mod tests {
         assert!(prompt.contains(&format!(
             "/workspace/.chainworks/runs/{run_id}/implementation/changed-files.json"
         )));
+    }
+
+    #[test]
+    fn code_writer_prompt_uses_envelope_output_contract_not_direct_meta_writes() {
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.worktree_root = Some("/workspace/.chainworks/worktrees/implementation".into());
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "implementation_progress".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/progress.json".into(),
+        );
+        plan.artifact_paths.insert(
+            "implementation_self_assessment".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json".into(),
+        );
+        plan.artifact_paths.insert(
+            "tests_result".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/tests-result.json".into(),
+        );
+        let mut task = reviewer_task();
+        task.agent.agent_id = "code_writer".into();
+        task.agent.worktree_write_enabled = true;
+        task.agent.output_contract = Some("implementation_self_assessment_v2".into());
+        task.task_name = "continue_implementation".into();
+        task.outputs = vec![
+            "implementation_progress".into(),
+            "implementation_self_assessment".into(),
+            "tests_result".into(),
+        ];
+        task.output_schemas.clear();
+        task.output_schemas.insert(
+            "implementation_progress".into(),
+            OutputSchema {
+                contract_id: "implementation_progress".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "status".into(),
+                    "current_phase".into(),
+                    "completed_items".into(),
+                    "deferred_items".into(),
+                    "notes".into(),
+                ],
+            },
+        );
+        task.output_schemas.insert(
+            "implementation_self_assessment".into(),
+            OutputSchema {
+                contract_id: "implementation_self_assessment_v2".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "status".into(),
+                    "implementation_complete".into(),
+                    "verification_green".into(),
+                    "remaining_code_tasks".into(),
+                    "handoff_tasks".into(),
+                    "known_risks".into(),
+                    "tests_run".into(),
+                    "docs_impacted".into(),
+                ],
+            },
+        );
+        task.output_schemas.insert(
+            "tests_result".into(),
+            OutputSchema {
+                contract_id: "tests_result_v1".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["status".into(), "summary".into()],
+            },
+        );
+
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+
+        assert!(
+            prompt.contains("Return each required output through the final `CHAINWORKS_OUTPUT`")
+        );
+        assert!(prompt.contains("the engine will materialize canonical files"));
+        assert!(prompt.contains("Do not write run artifact outputs directly"));
+        assert!(prompt.contains("implementation_complete"));
+        assert!(prompt.contains("remaining_code_tasks"));
+        assert!(!prompt.contains("Write each output to its canonical path below"));
+        assert!(!prompt
+            .contains("Write required outputs to the canonical paths listed in Required Outputs"));
+        assert!(!prompt.contains("<canonical path from Required Outputs>"));
+        assert!(!prompt.contains("seemingly_complete"));
+        assert!(!prompt.contains("remaining_tasks"));
     }
 
     #[test]

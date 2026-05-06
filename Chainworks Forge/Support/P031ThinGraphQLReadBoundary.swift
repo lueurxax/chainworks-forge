@@ -3684,11 +3684,18 @@ struct P077CloseoutReadinessPresentation: Equatable, Sendable {
   let compactSignalLabel: String
   let detailText: String
   let primaryUnblockText: String
+  let secondaryBlockerRows: [String]
   let modeLabel: String
   let modeExplainerText: String
+  let diagnosticRows: [String]
+  let recoveryLifecycleText: String
+  let backlinkRouteLabel: String
+  let focusReturnLabel: String
   let generationDisplayID: String
   let generationCopyValue: String?
   let generationCopyAccessibilityLabel: String
+  let diagnosticsAccessibilityLabel: String
+  let compactActivationAccessibilityLabel: String
   let cardAccessibilityLabel: String
   let modeExplainerAccessibilityLabel: String
   let visualState: P077CloseoutReadinessVisualState
@@ -3770,6 +3777,11 @@ enum P077CloseoutReadinessPresenter {
       ? "No generation yet"
       : "Generation \(summary.generationDisplayID)"
     let detailText = detailText(for: state, summary: summary, generationText: generationText)
+    let secondaryBlockerRows = secondaryBlockers(for: state, summary: summary)
+    let diagnosticRows = diagnostics(for: state, summary: summary, generationText: generationText)
+    let recoveryLifecycleText = recoveryLifecycle(for: state, summary: summary)
+    let backlinkRouteLabel = backlinkRoute(for: state, summary: summary)
+    let focusReturnLabel = "Returns focus to Closeout Readiness after copy or diagnostics dismissal."
     let compactSignalLabel = "Closeout: \(statusLabel)"
     let cardAccessibilityParts = [
       "Closeout readiness",
@@ -3777,6 +3789,7 @@ enum P077CloseoutReadinessPresenter {
       primaryUnblockText,
       modeLabel,
       generationText,
+      recoveryLifecycleText,
     ]
 
     return P077CloseoutReadinessPresentation(
@@ -3784,13 +3797,22 @@ enum P077CloseoutReadinessPresenter {
       compactSignalLabel: compactSignalLabel,
       detailText: detailText,
       primaryUnblockText: primaryUnblockText,
+      secondaryBlockerRows: secondaryBlockerRows,
       modeLabel: modeLabel,
       modeExplainerText: modeExplainerText,
+      diagnosticRows: diagnosticRows,
+      recoveryLifecycleText: recoveryLifecycleText,
+      backlinkRouteLabel: backlinkRouteLabel,
+      focusReturnLabel: focusReturnLabel,
       generationDisplayID: summary.generationDisplayID,
       generationCopyValue: generationCopyValue,
       generationCopyAccessibilityLabel: generationCopyValue == nil
         ? "No closeout readiness generation id to copy"
         : "Copy closeout readiness generation id \(summary.generationDisplayID)",
+      diagnosticsAccessibilityLabel:
+        "Show closeout readiness diagnostics for \(statusLabel)",
+      compactActivationAccessibilityLabel:
+        "Closeout readiness compact signal, \(statusLabel), \(primaryUnblockText)",
       cardAccessibilityLabel: cardAccessibilityParts.joined(separator: ", "),
       modeExplainerAccessibilityLabel: modeExplainerText,
       visualState: visualState(for: state, summary: summary)
@@ -3893,6 +3915,86 @@ enum P077CloseoutReadinessPresenter {
       ].compactMap { $0 }.joined(separator: ", ")
       let evidenceText = blockerText.isEmpty ? "No counted blockers" : blockerText
       return "\(summary.readinessDecision) via \(summary.gateStatus). \(evidenceText). \(generationText)."
+    }
+  }
+
+  private nonisolated static func secondaryBlockers(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> [String] {
+    var rows: [String] = []
+    if summary.codeBlockerCount > 0 {
+      rows.append("\(summary.codeBlockerCount) code blocker\(summary.codeBlockerCount == 1 ? "" : "s") remain")
+    }
+    if summary.handoffCount > 0 {
+      let owner = normalizedText(summary.handoffOwner).map { " for \($0)" } ?? ""
+      rows.append("\(summary.handoffCount) handoff item\(summary.handoffCount == 1 ? "" : "s")\(owner)")
+    }
+    if summary.riskSettlementRequired {
+      rows.append("Risk settlement is required before release")
+    }
+    if summary.acceptedRiskCount > 0 {
+      rows.append("\(summary.acceptedRiskCount) accepted risk\(summary.acceptedRiskCount == 1 ? "" : "s") recorded")
+    }
+    if case .awaitingFirstGeneration = state {
+      rows.append("No active readiness generation has been published yet")
+    }
+    if case .notApplicable = state {
+      rows.append("This run is outside the P077 closeout-readiness scope")
+    }
+    return rows
+  }
+
+  private nonisolated static func diagnostics(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel,
+    generationText: String
+  ) -> [String] {
+    [
+      "Decision: \(summary.readinessDecision)",
+      "Gate: \(summary.gateStatus)",
+      normalizedText(summary.auditStatus).map { "Audit: \($0)" },
+      normalizedText(summary.diagnosticReason).map { "Diagnostic: \($0)" },
+      normalizedText(summary.fingerprintHash).map { "Fingerprint: \($0)" },
+      "Mode: \(summary.readinessMode)",
+      generationText,
+    ].compactMap { $0 }
+  }
+
+  private nonisolated static func recoveryLifecycle(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Recovery: enter manual release through governed control surfaces."
+    case .applicable(.notReady):
+      return "Recovery: return to code refine and rerun closeout readiness."
+    case .applicable(.handoffRequired):
+      return "Recovery: complete handoff owner action, then rerun closeout readiness."
+    case .applicable(.blocked), .applicable(.invalid), .applicable(.unknown),
+         .awaitingFirstGeneration:
+      return "Recovery: inspect diagnostics, settle the gate, or rerun the readiness check."
+    case .notApplicable:
+      return "Recovery: no P077 action is available for this run."
+    }
+  }
+
+  private nonisolated static func backlinkRoute(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Manual release evidence"
+    case .applicable(.handoffRequired):
+      return normalizedText(summary.handoffOwner).map { "Handoff owner: \($0)" }
+        ?? "Handoff owner"
+    case .applicable(.notReady), .applicable(.blocked), .applicable(.invalid),
+         .applicable(.unknown), .awaitingFirstGeneration:
+      return "Closeout diagnostics"
+    case .notApplicable:
+      return "Run detail"
     }
   }
 

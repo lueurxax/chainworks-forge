@@ -3,10 +3,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::{error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
@@ -37,7 +37,10 @@ use domain::PrincipalClass;
 use sha2::{Digest, Sha256};
 
 use crate::cancellation;
-use crate::closeout_fingerprint::build_closeout_fingerprint;
+use crate::closeout_fingerprint::{
+    build_closeout_fingerprint, resolve_closeout_worktree_truth,
+    CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
+};
 use crate::closeout_loop_budget::closeout_loop_budget_remaining;
 use crate::event_bus::EventSender;
 use crate::preflight::{
@@ -147,6 +150,10 @@ struct CommandJournalEntry {
 
 const PROPOSAL_GATE_EXECUTOR_VERSION: &str = "proposal-gate-executor.v1";
 const PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION: &str = "proposal_gate_receipt.v1";
+const PROPOSAL_GATE_EXECUTOR_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const PROPOSAL_GATE_EXECUTOR_MAX_TIMEOUT_MS: u64 = 600_000;
+const PROPOSAL_GATE_EXECUTOR_POLL_MS: u64 = 25;
+const PROPOSAL_GATE_EXECUTOR_TIMEOUT_EXIT_CODE: i32 = 124;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +176,12 @@ struct ProposalGateReceiptV1 {
     source_artifacts: Option<Vec<String>>,
 }
 
+struct ManagedProposalGateProcessResult {
+    exit_code: i32,
+    timed_out: bool,
+    elapsed_ms: u64,
+}
+
 fn build_proposal_gate_result_from_settlement(
     c: &SettleProposalGateCmd,
     journal_id: &str,
@@ -181,8 +194,8 @@ fn build_proposal_gate_result_from_settlement(
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
     // Route Execute and RecordSettlement to ImportReceipt when a receipt is present.
-    // Execute without a receipt is not yet implemented and must error to prevent
-    // fabricating a Passed gate result without proof (R14 MAJ-001).
+    // Execute without a receipt must only reach this helper after the bounded
+    // managed executor has produced a receipt; never fabricate a Passed result.
     let effective_action = if has_receipt
         && matches!(
             c.action,
@@ -196,9 +209,7 @@ fn build_proposal_gate_result_from_settlement(
     match effective_action {
         ProposalGateSettlementAction::Execute => {
             anyhow::bail!(
-                "ProposalGateSettlementAction::Execute is not yet implemented — \
-                 run ./scripts/test-gate.sh proposal-077 against the worktree and \
-                 supply the resulting receipt via action=import_receipt"
+                "ProposalGateSettlementAction::Execute requires the managed executor receipt path"
             )
         }
         ProposalGateSettlementAction::RecordSettlement => build_managed_proposal_gate_result(
@@ -242,25 +253,32 @@ fn execute_managed_proposal_gate_receipt(
     }
 
     let started = Instant::now();
-    let output = ProcessCommand::new(&gate_script)
+    let child = ProcessCommand::new(&gate_script)
         .arg("proposal-077")
         .current_dir(execution_root)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .with_context(|| {
             format!(
                 "managed proposal gate executor failed to launch {}",
                 gate_script.display()
             )
         })?;
-    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let exit_code = output.status.code().unwrap_or(1);
-    let status = if output.status.success() {
+    let process_result = wait_for_managed_proposal_gate(
+        child,
+        Duration::from_millis(proposal_gate_executor_timeout_ms(c)),
+        started,
+    )?;
+    let elapsed_ms = process_result.elapsed_ms;
+    let exit_code = process_result.exit_code;
+    let status = if !process_result.timed_out && exit_code == 0 {
         "passed"
     } else {
         "failed"
     };
-    let stdout_digest = sha256_digest(&output.stdout);
-    let stderr_digest = sha256_digest(&output.stderr);
+    let stdout_digest = sha256_digest(&[]);
+    let stderr_digest = sha256_digest(&[]);
     let evidence_digest = proposal_gate_executor_evidence_digest(
         c,
         gate_id,
@@ -271,15 +289,26 @@ fn execute_managed_proposal_gate_receipt(
         &stderr_digest,
     )?;
 
-    let diagnostic_reason = if output.status.success() {
+    let diagnostic_reason = if status == "passed" {
         None
+    } else if process_result.timed_out {
+        Some(format!(
+            "proposal-077 gate timed out after {} ms",
+            proposal_gate_executor_timeout_ms(c)
+        ))
     } else {
         Some(format!(
             "proposal-077 gate failed with exit code {exit_code}"
         ))
     };
-    let failure_classification = if output.status.success() {
+    let failure_classification = if status == "passed" {
         None
+    } else if process_result.timed_out {
+        Some(
+            ProposalGateFailureClassification::UnclearOrNonCodeOwned
+                .as_str()
+                .to_string(),
+        )
     } else {
         Some(
             ProposalGateFailureClassification::CodeOwnedBudgetRemaining
@@ -307,6 +336,38 @@ fn execute_managed_proposal_gate_receipt(
         "source_artifacts": c.source_artifacts.clone(),
     });
     Ok(receipt.to_string())
+}
+
+fn proposal_gate_executor_timeout_ms(c: &SettleProposalGateCmd) -> u64 {
+    c.timeout_ms
+        .unwrap_or(PROPOSAL_GATE_EXECUTOR_DEFAULT_TIMEOUT_MS)
+        .clamp(1, PROPOSAL_GATE_EXECUTOR_MAX_TIMEOUT_MS)
+}
+
+fn wait_for_managed_proposal_gate(
+    mut child: Child,
+    timeout: Duration,
+    started: Instant,
+) -> Result<ManagedProposalGateProcessResult> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(ManagedProposalGateProcessResult {
+                exit_code: status.code().unwrap_or(1),
+                timed_out: false,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(ManagedProposalGateProcessResult {
+                exit_code: PROPOSAL_GATE_EXECUTOR_TIMEOUT_EXIT_CODE,
+                timed_out: true,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(PROPOSAL_GATE_EXECUTOR_POLL_MS));
+    }
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -3334,6 +3395,41 @@ impl CommandHandler {
                 let run = runs::find_by_id(&self.pool, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("SettleProposalGate run not found"))?;
+                let run_id_str = c.run_id.to_string();
+                let mut upstream_generation_ids =
+                    closeout::list_closeout_fingerprint_source_generation_ids(
+                        &self.pool,
+                        &run_id_str,
+                    )
+                    .await
+                    .unwrap_or_else(|_| c.source_generation_ids.clone());
+                if upstream_generation_ids.is_empty() {
+                    upstream_generation_ids = c.source_generation_ids.clone();
+                }
+                let worktree_truth = resolve_closeout_worktree_truth(&run).await;
+                if let Some(reason) = worktree_truth.diagnostic_reason.as_deref() {
+                    warn!(
+                        run_id = %run_id_str,
+                        reason,
+                        "P077: current worktree fingerprint truth unavailable; closeout will fail closed"
+                    );
+                }
+                let closeout_fingerprint = build_closeout_fingerprint(
+                    &run,
+                    &c.stage_id,
+                    worktree_truth.worktree_head.clone(),
+                    worktree_truth.dirty_or_changed_file_digest.clone(),
+                    upstream_generation_ids.clone(),
+                    worktree_truth.latency_ms,
+                );
+                let fingerprint_latency_exceeded = worktree_truth.unavailable
+                    || worktree_truth.latency_exceeded
+                    || worktree_truth.latency_ms > CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS;
+                c.worktree_head = closeout_fingerprint.worktree_head.clone();
+                c.dirty_or_changed_file_digest =
+                    closeout_fingerprint.dirty_or_changed_file_digest.clone();
+                c.source_generation_ids = upstream_generation_ids.clone();
+                c.current_fingerprint = closeout_fingerprint.short_hash();
                 if matches!(c.action, ProposalGateSettlementAction::Execute)
                     && c.receipt_json
                         .as_deref()
@@ -3381,7 +3477,6 @@ impl CommandHandler {
                 db::pool::log_write_transaction("command.SettleProposalGate", tx_started);
 
                 // Resolve closeout readiness mode from the frozen run column.
-                let run_id_str = c.run_id.to_string();
                 let mode_column =
                     closeout::find_closeout_readiness_mode(&self.pool, &run_id_str).await?;
                 let has_enforcement_migration =
@@ -3412,30 +3507,6 @@ impl CommandHandler {
                         .await
                         .ok()
                         .flatten();
-                let fingerprint_started = Instant::now();
-                let upstream_generation_ids =
-                    closeout::list_closeout_fingerprint_source_generation_ids(
-                        &self.pool,
-                        &run_id_str,
-                    )
-                    .await
-                    .unwrap_or_else(|_| c.source_generation_ids.clone());
-                let fingerprint_latency_ms = fingerprint_started
-                    .elapsed()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                let closeout_fingerprint = build_closeout_fingerprint(
-                    &run,
-                    &c.stage_id,
-                    c.worktree_head.clone(),
-                    c.dirty_or_changed_file_digest.clone(),
-                    if upstream_generation_ids.is_empty() {
-                        c.source_generation_ids.clone()
-                    } else {
-                        upstream_generation_ids
-                    },
-                    fingerprint_latency_ms,
-                );
                 let loop_budget_remaining = closeout_loop_budget_remaining_for_run(
                     &self.pool,
                     &run,
@@ -3462,33 +3533,23 @@ impl CommandHandler {
                         accepted_risks: &c.accepted_risks,
                         loop_budget_remaining,
                         fingerprint: Some(closeout_fingerprint),
-                        fingerprint_latency_exceeded: fingerprint_latency_ms > 5_000,
+                        fingerprint_latency_exceeded,
                         controlled_reports_green,
                         previous_blocker_digest: prior_blocker_digest.as_deref(),
                     });
 
                 // Atomically activate gate + readiness generations, then rebuild projections.
-                let closeout_tx_result = closeout::execute_closeout_transaction(
-                    &self.pool,
-                    closeout::CloseoutTransactionInputs {
-                        gate_result: &gate_result,
-                        readiness: &synth_result.readiness,
-                        accepted_risks: &c.accepted_risks,
-                        blocker_digest: synth_result.current_blocker_digest.as_deref(),
-                    },
-                )
-                .await?;
-                // Non-fatal: canonical truth has already been committed; a rebuild
-                // failure is logged and the next AdvanceRun cycle retries (mirrors
-                // orchestrator.rs non-fatal rebuild pattern).
-                if let Err(e) = projections::rebuild_all_for_run(&self.pool, c.run_id).await {
-                    error!(
-                        run_id = %c.run_id,
-                        stage = %c.stage_id,
-                        error = %e,
-                        "P077: projection rebuild failed after SettleProposalGate closeout transaction — projections may lag one AdvanceRun cycle"
-                    );
-                }
+                let closeout_tx_result =
+                    closeout::execute_closeout_transaction_with_projection_rebuild(
+                        &self.pool,
+                        closeout::CloseoutTransactionInputs {
+                            gate_result: &gate_result,
+                            readiness: &synth_result.readiness,
+                            accepted_risks: &c.accepted_risks,
+                            blocker_digest: synth_result.current_blocker_digest.as_deref(),
+                        },
+                    )
+                    .await?;
 
                 Ok(CommandResult::ProposalGateSettled {
                     run_id: c.run_id,
@@ -4612,6 +4673,7 @@ reviewer_override:
             dirty_or_changed_file_digest: "sha256:dirty".into(),
             source_generation_ids: vec!["generation-1".into()],
             current_fingerprint: "sha256:fingerprint-current".into(),
+            timeout_ms: None,
             receipt_json: None,
             accepted_risks: Vec::new(),
         }
@@ -4767,6 +4829,42 @@ reviewer_override:
             .diagnostic_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("proposal-077 gate failed")));
+    }
+
+    #[test]
+    fn p077_execute_gate_generates_failed_receipt_for_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let gate = scripts.join("test-gate.sh");
+        std::fs::write(&gate, "#!/usr/bin/env bash\nset -euo pipefail\nsleep 2\n").unwrap();
+        make_executable(&gate);
+
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        cmd.timeout_ms = Some(10);
+        let raw = execute_managed_proposal_gate_receipt(&cmd, "p077:077", temp.path())
+            .expect("managed executor timeout should preserve a failed receipt");
+        let receipt: ProposalGateReceiptV1 = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(receipt.status, "failed");
+        assert_eq!(receipt.exit_code, PROPOSAL_GATE_EXECUTOR_TIMEOUT_EXIT_CODE);
+        assert_eq!(
+            receipt.failure_classification.as_deref(),
+            Some("unclear_or_non_code_owned")
+        );
+        assert!(receipt
+            .diagnostic_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("timed out")));
+    }
+
+    #[test]
+    fn p077_execute_gate_errors_when_script_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        let err = execute_managed_proposal_gate_receipt(&cmd, "p077:077", temp.path())
+            .expect_err("missing managed executor script must fail before settlement");
+        assert!(err.to_string().contains("could not find"));
     }
 
     #[cfg(unix)]

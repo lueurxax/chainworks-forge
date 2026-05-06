@@ -47,6 +47,12 @@ The Rust control plane now implements the structured-output substrate for this s
 
 The detailed owner chain for that substrate lives in [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md). This document treats that substrate as implemented baseline, then defines how failure evidence, retry truth, and narrow recovery consume it.
 
+### Required outputs flow through one materialization path
+
+Agent-authored required outputs should enter the system through the final `CHAINWORKS_OUTPUT` object returned by the provider session. Prompt generation must provide contract-complete skeletons for each declared output; repair prompts must use the same contract-complete skeletons for failed outputs.
+
+The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
+
 ### One contract authority
 
 `AgentCatalog.contracts` remains the single contract authority for this slice.

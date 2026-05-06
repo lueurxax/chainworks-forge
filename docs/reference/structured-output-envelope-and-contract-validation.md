@@ -19,6 +19,7 @@ For this slice, the system must be able to answer:
 This reference covers:
 
 - `<<<CHAINWORKS_OUTPUT:name>>>...<<<END_CHAINWORKS_OUTPUT>>>` envelope extraction from ACP responses,
+- final-result JSON object extraction for `{"CHAINWORKS_OUTPUT": {...}}`,
 - canonical rebinding of discovered outputs to compiled plan metadata,
 - contract resolution and validation-mode enforcement,
 - companion-artifact handling for machine-plus-human outputs,
@@ -35,6 +36,18 @@ It does not replace:
 
 ## Core Rules
 
+### Final `CHAINWORKS_OUTPUT` is the primary agent output channel
+
+For required outputs, the runtime prompt instructs agents to return one final JSON object:
+
+```json
+{"CHAINWORKS_OUTPUT":{"<canonical target path>":{"status":"complete","current_phase":"","completed_items":[],"deferred_items":[],"notes":""}}}
+```
+
+The key should be the declared canonical target path. Output-name keys remain accepted as a compatibility fallback when a provider or agent cannot preserve the path key, but prompt generation must prefer canonical paths.
+
+Each value is the full machine payload for that output contract. It must include every declared required field and use the contract-specific shape from `AgentCatalog.contracts`. The executor owns materializing those payloads to canonical files after validation; write-enabled agents should not shell-write run artifact outputs directly into the run meta-root.
+
 ### Envelope outputs are canonical named discoveries
 
 ACP responses may contain named structured output blocks:
@@ -45,7 +58,7 @@ ACP responses may contain named structured output blocks:
 <<<END_CHAINWORKS_OUTPUT>>>
 ```
 
-The transport layer extracts these blocks into named discovered artifacts.
+The transport layer extracts these blocks into named discovered artifacts. These block envelopes are compatibility input to the same settlement path as final-result `CHAINWORKS_OUTPUT` JSON.
 
 #### Output Caps and Rejection
 
@@ -65,6 +78,8 @@ If the same canonical output name appears in both:
 - a bounded filesystem discovery,
 
 the envelope-owned discovery wins.
+
+Final-result `CHAINWORKS_OUTPUT` payloads and named block envelopes both outrank exact-path filesystem readback. Exact-path files remain compatibility evidence and diagnostic readback, not the primary instruction channel for write-enabled ACP agents.
 
 ### Discovery binds to compiled metadata before persistence
 

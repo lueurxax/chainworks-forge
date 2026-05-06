@@ -98,7 +98,7 @@ Minimum MVP policy:
 The system uses a bounded discovery model to minimize startup latency and ensure artifact integrity.
 
 - **Meta-root Bounding**: Discovery is restricted to the run-owned meta-root.
-- **Exact-path Reads**: Declared expected outputs are read only from their exact paths.
+- **Canonical Materialization and Exact-path Reads**: Declared required outputs are primarily returned through `CHAINWORKS_OUTPUT`; after validation, the engine materializes them to canonical paths. Exact-path reads are bounded compatibility readback, not a requirement that write-enabled agents directly write run artifacts.
 - **Pre-Prompt Metadata**: Metadata is captured per-execution to ensure freshness.
 - **Engine-owned Settlement**: The engine discovery pipeline settles artifacts based on typed expected outputs and discovery decisions.
 

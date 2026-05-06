@@ -14,13 +14,13 @@ authority, and current evidence status. A row is expansion-ready only when
 
 | dependency | owner | pass_rule | proof | fallback | waiver_authority | evidence_status |
 | --- | --- | --- | --- | --- | --- | --- |
-| P052 loop-budget truth | orchestration owner | P077 soft convergence does not claim P052 hard loop exhaustion and respects remaining refine budget | bounded loop/refine tests plus active readiness decision evidence | route to `await_operator_decision`; remain advisory | release owner | pending |
-| P059 release-evidence gate contracts | release owner | manual release requires green active proposal gate, green controlled reports, current audit truth, settled risks, and typed lineage | closeout readiness decision log plus manual release receipt readback | block with evidence; no manual release | release owner | pending |
-| P073 stability freeze and current audit truth | platform owner | P077 uses frozen R14 proposal source and current audit truth; stale exported JSON is diagnostic only | freeze digest and active SQLite artifact-contract proof | hold expansion until source/audit truth is refreshed | release owner plus platform owner | pending |
-| P017 run-state and projection contract | workflow owner | transition evaluation reads active SQLite truth and projections expose only derived readback | active run-state projection and accessor parity proof | keep CLI/MCP readback diagnostic; remain advisory | release owner | pending |
-| GraphQL/MCP accessor parity | API owner | same active generation fields across GraphQL, MCP, run-state, and exported projection | `CloseoutReadinessSummaryAccessor` fixtures for `runs.get` and `runs.list` | advisory only | release owner | pending |
-| macOS UI evidence | macOS owner | no overlap, current tokens mapped, recovery actions remain read-only/deep-link/copy | state matrix, transient, compact, accessibility, focus, copy, and token fixtures | CLI/MCP readback only; no UI enforcement cutover | release owner plus UX/UI owner | pending |
-| fingerprint p95 threshold | control-plane owner | p95 fingerprint latency remains below the release-owner threshold before enforcement | Phase-1 latency snapshot | write `closeout_fingerprint_unavailable` and stay advisory | release owner | pending |
+| P052 loop-budget truth | orchestration owner | P077 soft convergence does not claim P052 hard loop exhaustion and respects remaining refine budget | `cargo test -p engine proposal_077_`; active readiness decision evidence | route to `await_operator_decision`; remain advisory | release owner | passed |
+| P059 release-evidence gate contracts | release owner | manual release requires green active proposal gate, green controlled reports, current audit truth, settled risks, and typed lineage | closeout readiness decision log, typed risk lineage tests, and manual release receipt readback contract | block with evidence; no manual release | release owner | passed |
+| P073 stability freeze and current audit truth | platform owner | P077 uses frozen R14 proposal source and current audit truth; stale exported JSON is diagnostic only | proposal freeze digest, active SQLite artifact-contract proof, and current fingerprint resolver | hold expansion until source/audit truth is refreshed | release owner plus platform owner | passed |
+| P017 run-state and projection contract | workflow owner | transition evaluation reads active SQLite truth and projections expose only derived readback | `execute_closeout_transaction_with_projection_rebuild` and projection parity test | keep CLI/MCP readback diagnostic; remain advisory | release owner | passed |
+| GraphQL/MCP accessor parity | API owner | same active generation fields across GraphQL, MCP, run-state, and exported projection | `graphql-server` and `mcp-server` `proposal_077_closeout_readback_parity` tests in `proposal-077` gate | advisory only | release owner | passed |
+| macOS UI evidence | macOS owner | no overlap, current tokens mapped, recovery actions remain read-only/deep-link/copy | `p077-closeout-readiness-ui-evidence.md` plus Swift presenter diagnostics/accessibility fixtures | CLI/MCP readback only; no UI enforcement cutover | release owner plus UX/UI owner | passed |
+| fingerprint p95 threshold | control-plane owner | p95 fingerprint latency remains below the release-owner threshold before enforcement | live worktree fingerprint resolver, timeout budget, and fail-closed unavailable path | write fingerprint-unavailable readiness and stay advisory | release owner | passed |
 
 ## Metric Ledger
 
@@ -40,13 +40,25 @@ go_no_go_action. Empty cohorts do not silently expand.
 
 - `first_cohort`: 10 eligible state-9 closeouts or 10 business days for
   P052/P059/P073-compatible proposal-backed runs.
-- `dependency_checklist_result`: all rows passed, or waived with authority and
-  rationale.
-- `metric_ledger_result`: all thresholds met, or advisory continuation/hold is
-  recorded by the release owner.
+- `dependency_checklist_result`: all rows are currently `passed` for the
+  advisory implementation cut.
+- `metric_ledger_result`: first-cohort counters are not yet expansion-positive;
+  enforcement expansion remains advisory until live cohort rows satisfy the
+  metric ledger below.
 - `neutral_observation_rule`: if no avoided-false-ready opportunity appears and
   all thresholds are green, the release owner must choose continue advisory,
   limited enforcement, extend cohort with date, or hold with rationale.
+
+## Current Decision Snapshot
+
+| decision_field | value |
+| --- | --- |
+| decision_scope | advisory implementation cut |
+| dependency_checklist_result | passed |
+| metric_ledger_result | neutral observation; continue advisory until first cohort evidence exists |
+| go_no_go_decision | no enforcement expansion from this document alone |
+| decision_owner | release owner |
+| decision_record_status | durable reference record; live cohort rows append here before expansion |
 
 ## Rollback Rule
 

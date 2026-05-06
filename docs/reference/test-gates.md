@@ -1011,12 +1011,14 @@ Command:
 
 ### `proposal-077|p077`
 
-Bounded implementation closeout readiness gate — Phase-1 Rust slice.
+Bounded implementation closeout readiness gate.
 
 Scope (what this gate actually covers):
 
 - static presence and required-field checks for
   `docs/reference/p077-rollout-dependency-evidence.md`
+- static presence and required-field checks for
+  `docs/reference/p077-closeout-readiness-ui-evidence.md`
 - `implementation_closeout_readiness_v1` decision-matrix validation (Rust domain/db/engine)
 - proposal gate domain contracts and status normalization
 - audit verdict policy enforcement (synthesizer unit tests)
@@ -1024,11 +1026,13 @@ Scope (what this gate actually covers):
 - closeout fingerprinting and latency budget validation
 - DB closeout transaction atomicity (db integration tests)
 - accessor routing proof (in-memory, not against live orchestrator graph)
+- GraphQL readback parity through the canonical closeout-readiness accessor
+- MCP `runs.get`/`runs.list` readback parity through the same accessor and
+  exported projection shape
 
 NOT covered by this gate (require additional integration gates or manual evidence):
 
 - integrated orchestrator transition guard against live SQLite (state_9 real run)
-- GraphQL/MCP runs.get/list closeout-readiness readback parity tests
 - macOS UI/accessibility surfaces and VoiceOver fixtures
 - Swift workspace tests
 
@@ -1051,9 +1055,13 @@ Command:
 
 Important:
 
-- this gate covers the Phase-1 Rust domain/db/engine slice of Proposal 077; full R14 acceptance requires additional integrated transition, GraphQL/MCP parity, and macOS fixture coverage
+- this gate covers the Rust domain/db/engine slice and GraphQL/MCP readback
+  parity of Proposal 077; full R14 acceptance still requires additional
+  integrated transition and macOS fixture evidence
 - it fails fast when the P077 rollout/dependency evidence document is missing
   required dependency checklist, metric ledger, or rollback fields
+- it fails fast when the P077 UI evidence document is missing token, contrast,
+  diagnostics, recovery, route, or accessibility mappings
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
 - it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
 

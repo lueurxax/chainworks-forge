@@ -19,6 +19,7 @@ UNSIGNED_BUILD_ARGS=(
 )
 
 P077_ROLLOUT_EVIDENCE_PATH="docs/reference/p077-rollout-dependency-evidence.md"
+P077_UI_EVIDENCE_PATH="docs/reference/p077-closeout-readiness-ui-evidence.md"
 
 FAST_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
@@ -442,6 +443,27 @@ require_p077_rollout_dependency_evidence() {
   for pattern in "${required_patterns[@]}"; do
     if ! grep -Fq "$pattern" "$evidence_file"; then
       die "P077 rollout/dependency evidence is missing required field: $pattern"
+    fi
+  done
+}
+
+require_p077_ui_evidence() {
+  local evidence_file="$ROOT_DIR/$P077_UI_EVIDENCE_PATH"
+  [[ -f "$evidence_file" ]] || die "Missing P077 UI evidence: $P077_UI_EVIDENCE_PATH"
+
+  local required_patterns=(
+    "readiness_state | tone_token | icon | typography | surface | breakpoint_behavior | interaction"
+    "contrast_decision"
+    "compactActivationAccessibilityLabel"
+    "diagnosticsAccessibilityLabel"
+    "recoveryLifecycleText"
+    "backlinkRouteLabel"
+  )
+
+  local pattern
+  for pattern in "${required_patterns[@]}"; do
+    if ! grep -Fq "$pattern" "$evidence_file"; then
+      die "P077 UI evidence is missing required field: $pattern"
     fi
   done
 }
@@ -2106,7 +2128,7 @@ Available gates:
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
-  proposal-077,p077  Proposal 077 Phase-1 closeout readiness gates (Rust domain/db/engine only; GraphQL/MCP/UI surfaces deferred)
+  proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -5422,22 +5444,23 @@ PLIST
     fi
     ;;
   proposal-077|p077)
-    # P077 Phase-1 gate: Rust domain/db/engine unit and proof-gate tests.
-    # Covers: typed domain contracts, closeout synthesizer decision matrix,
-    # DB closeout transaction, and accessor routing (memory-level).
-    # NOT covered: integrated orchestrator transition guard against live SQLite,
-    # GraphQL/MCP readback parity, macOS UI/accessibility surfaces.
+    # P077 closeout readiness gate: Rust domain/db/engine unit and proof-gate
+    # tests plus GraphQL/MCP readback parity through the shared accessor.
+    # NOT covered: macOS UI/accessibility remote-host evidence.
     # See docs/reference/test-gates.md for narrowed coverage statement.
     require_p077_rollout_dependency_evidence
-    log "Proposal 077 Phase-1 closeout readiness gate (Rust domain/db/engine)"
+    require_p077_ui_evidence
+    log "Proposal 077 closeout readiness gate (Rust domain/db/engine + GraphQL/MCP parity)"
     (
       cd "$ROOT_DIR/control-plane"
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p domain proposal_077_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p db closeout_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p engine proposal_077_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p graphql-server --test proposal_077_closeout_readback_parity -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p mcp-server --test proposal_077_closeout_readback_parity -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test --test p077_proof_gate -- --nocapture
     )
-    log "Proposal 077 Phase-1 gate passed"
+    log "Proposal 077 closeout readiness gate passed"
     ;;
   *)
     print_usage >&2

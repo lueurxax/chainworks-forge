@@ -1041,6 +1041,7 @@ private struct P031RunDetailSummaryCard: View {
 private struct P077CloseoutReadinessCard: View {
     let presentation: P077CloseoutReadinessPresentation
     @State private var copyFeedback: String?
+    @State private var isDiagnosticsPresented = false
 
     var body: some View {
         P031CalloutCard(
@@ -1050,12 +1051,29 @@ private struct P077CloseoutReadinessCard: View {
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
+                    Label(presentation.compactSignalLabel, systemImage: statusSymbolName)
+                        .font(.caption.weight(.semibold))
+                        .accessibilityLabel(presentation.compactActivationAccessibilityLabel)
+                        .accessibilityIdentifier("p077-closeout-readiness-compact-signal")
+                    Spacer()
+                }
+
+                HStack(spacing: 8) {
                     Label(presentation.statusLabel, systemImage: statusSymbolName)
                         .font(.caption.weight(.semibold))
                     Text(presentation.modeLabel)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
+                    Button {
+                        isDiagnosticsPresented = true
+                    } label: {
+                        Label("Diagnostics", systemImage: "stethoscope")
+                    }
+                    .controlSize(.small)
+                    .accessibilityLabel(presentation.diagnosticsAccessibilityLabel)
+                    .accessibilityIdentifier("p077-closeout-readiness-diagnostics")
+
                     Button {
                         copyGenerationID()
                     } label: {
@@ -1072,6 +1090,27 @@ private struct P077CloseoutReadinessCard: View {
                     .accessibilityLabel("Primary unblock: \(presentation.primaryUnblockText)")
                     .accessibilityIdentifier("p077-closeout-readiness-primary-unblock")
 
+                if !presentation.secondaryBlockerRows.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(presentation.secondaryBlockerRows, id: \.self) { row in
+                            Label(row, systemImage: "smallcircle.filled.circle")
+                                .font(.caption)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("p077-closeout-readiness-secondary-blockers")
+                }
+
+                Label(presentation.recoveryLifecycleText, systemImage: "arrow.clockwise.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p077-closeout-readiness-recovery")
+
+                Label(presentation.backlinkRouteLabel, systemImage: "arrowshape.turn.up.right")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p077-closeout-readiness-backlink-route")
+
                 Label(presentation.modeExplainerText, systemImage: "info.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1087,6 +1126,9 @@ private struct P077CloseoutReadinessCard: View {
         }
         .accessibilityLabel(presentation.cardAccessibilityLabel)
         .accessibilityIdentifier("p077-closeout-readiness-card")
+        .sheet(isPresented: $isDiagnosticsPresented) {
+            P077CloseoutReadinessDiagnosticsSheet(presentation: presentation)
+        }
     }
 
     private var accentColor: Color {
@@ -1125,6 +1167,39 @@ private struct P077CloseoutReadinessCard: View {
         NSPasteboard.general.setString(value, forType: .string)
 #endif
         copyFeedback = "Copied generation \(presentation.generationDisplayID)"
+    }
+}
+
+private struct P077CloseoutReadinessDiagnosticsSheet: View {
+    let presentation: P077CloseoutReadinessPresentation
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Closeout Diagnostics")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+
+            ForEach(presentation.diagnosticRows, id: \.self) { row in
+                Label(row, systemImage: "checklist")
+                    .font(.callout)
+            }
+
+            Text(presentation.focusReturnLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .frame(minWidth: 420, idealWidth: 480, maxWidth: 560, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(presentation.diagnosticsAccessibilityLabel)
+        .accessibilityIdentifier("p077-closeout-readiness-diagnostics-sheet")
     }
 }
 
