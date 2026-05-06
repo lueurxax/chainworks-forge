@@ -14,7 +14,9 @@ use domain::artifact_contracts::{
     SourceGenerationImportDecision, ValidationIssue, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
-use domain::closeout_readiness::IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID;
+use domain::closeout_readiness::{
+    CloseoutFingerprint, IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID,
+};
 use domain::ids::{AgentExecutionId, ArtifactId, RunId};
 use domain::mediation::OwnerKind;
 use domain::proposal_gate_result::PROPOSAL_GATE_RESULT_V1_CONTRACT_ID;
@@ -1230,7 +1232,7 @@ pub async fn rebuild_run_state_projection_tx(
     // active_artifact_contracts but must appear in the exported projection so that
     // downstream consumers (run-state JSON, GraphQL, MCP runs.get) see P077 truth.
     let p077_rows = sqlx::query(
-        r#"SELECT contract_id, status, decision, generation_id, created_at
+        r#"SELECT contract_id, status, decision, generation_id, fingerprint_json, created_at
            FROM closeout_gate_generations
            WHERE run_id = ?1 AND active = 1
            ORDER BY contract_id"#,
@@ -1246,7 +1248,12 @@ pub async fn rebuild_run_state_projection_tx(
         let status: String = p077_row.get("status");
         let decision: Option<String> = p077_row.get("decision");
         let generation_id: String = p077_row.get("generation_id");
+        let fingerprint_json: Option<String> = p077_row.get("fingerprint_json");
         let created_at: String = p077_row.get("created_at");
+        let fingerprint_hash: Option<String> = fingerprint_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<CloseoutFingerprint>(j).ok())
+            .map(|fp| fp.short_hash());
         contracts.insert(
             contract_id.clone(),
             serde_json::json!({
@@ -1256,6 +1263,7 @@ pub async fn rebuild_run_state_projection_tx(
                 "status": status,
                 "db_status": status,
                 "decision": decision,
+                "fingerprint_hash": fingerprint_hash,
                 "status_overridden": false,
                 "active_override_id": serde_json::Value::Null,
                 "generation_id": generation_id,

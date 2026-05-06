@@ -5,7 +5,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
@@ -178,15 +178,29 @@ fn build_proposal_gate_result_from_settlement(
         .receipt_json
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
-    let effective_action =
-        if has_receipt && c.action == ProposalGateSettlementAction::RecordSettlement {
-            ProposalGateSettlementAction::ImportReceipt
-        } else {
-            c.action.clone()
-        };
+    // Route Execute and RecordSettlement to ImportReceipt when a receipt is present.
+    // Execute without a receipt is not yet implemented and must error to prevent
+    // fabricating a Passed gate result without proof (R14 MAJ-001).
+    let effective_action = if has_receipt
+        && matches!(
+            c.action,
+            ProposalGateSettlementAction::RecordSettlement
+                | ProposalGateSettlementAction::Execute
+        ) {
+        ProposalGateSettlementAction::ImportReceipt
+    } else {
+        c.action.clone()
+    };
 
     match effective_action {
-        ProposalGateSettlementAction::RecordSettlement | ProposalGateSettlementAction::Execute => {
+        ProposalGateSettlementAction::Execute => {
+            anyhow::bail!(
+                "ProposalGateSettlementAction::Execute is not yet implemented — \
+                 run ./scripts/test-gate.sh proposal-077 against the worktree and \
+                 supply the resulting receipt via action=import_receipt"
+            )
+        }
+        ProposalGateSettlementAction::RecordSettlement => {
             build_managed_proposal_gate_result(
                 c,
                 journal_id,
@@ -3233,7 +3247,17 @@ impl CommandHandler {
                     },
                 )
                 .await?;
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+                // Non-fatal: canonical truth has already been committed; a rebuild
+                // failure is logged and the next AdvanceRun cycle retries (mirrors
+                // orchestrator.rs non-fatal rebuild pattern).
+                if let Err(e) = projections::rebuild_all_for_run(&self.pool, c.run_id).await {
+                    error!(
+                        run_id = %c.run_id,
+                        stage = %c.stage_id,
+                        error = %e,
+                        "P077: projection rebuild failed after SettleProposalGate closeout transaction — projections may lag one AdvanceRun cycle"
+                    );
+                }
 
                 Ok(CommandResult::ProposalGateSettled {
                     run_id: c.run_id,
@@ -4197,17 +4221,24 @@ async fn supersede_current_workflow_conflict_for_manual_release_rejection_tx(
 
 /// P077 BLK-010: Validate that the caller-supplied capability matches the canonical
 /// CapabilityToolId::ProposalGateSettle token and that the authority is in the
-/// registered allow-list.  Extracted for unit-testability.
+/// registered allow-list. Prevents arbitrary capability/authority strings from
+/// polluting the audit lineage. Extracted for unit-testability.
 fn validate_proposal_gate_authorization(c: &SettleProposalGateCmd) -> Result<()> {
-    let canonical_capability =
-        serde_json::to_string(&CapabilityToolId::ProposalGateSettle).unwrap_or_default();
-    // serde_json serializes enum variant names as "ProposalGateSettle" (with quotes).
-    let canonical_capability = canonical_capability.trim_matches('"');
-    if c.capability != canonical_capability {
+    // Hard-coded literal to avoid a theoretical fail-open if enum serialization
+    // ever returned Err and unwrap_or_default produced an empty string that
+    // compared equal to an empty caller capability (p077-sec-005).
+    const CANONICAL_CAPABILITY: &str = "ProposalGateSettle";
+    if c.capability.trim().is_empty() {
+        anyhow::bail!(
+            "empty capability: must be '{}'",
+            CANONICAL_CAPABILITY
+        );
+    }
+    if c.capability != CANONICAL_CAPABILITY {
         anyhow::bail!(
             "invalid capability '{}': must be '{}'",
             c.capability,
-            canonical_capability
+            CANONICAL_CAPABILITY
         );
     }
     const ALLOWED_AUTHORITIES: &[&str] =
@@ -4442,7 +4473,7 @@ reviewer_override:
 
     #[test]
     fn p077_mismatched_capability_is_rejected() {
-        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
         cmd.capability = "SomeOtherCapability".into();
 
         let err = validate_proposal_gate_authorization(&cmd)
@@ -4460,7 +4491,7 @@ reviewer_override:
 
     #[test]
     fn p077_unknown_authority_is_rejected() {
-        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
         cmd.authority = "rogue_authority".into();
 
         let err = validate_proposal_gate_authorization(&cmd)
@@ -4478,7 +4509,7 @@ reviewer_override:
 
     #[test]
     fn p077_canonical_capability_and_known_authority_pass_validation() {
-        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
         validate_proposal_gate_authorization(&cmd)
             .expect("canonical capability + known authority must pass validation");
     }
@@ -4487,10 +4518,23 @@ reviewer_override:
     fn p077_all_allowed_authorities_pass_validation() {
         for authority in ["release_owner", "control_plane_owner", "proposal_owner"] {
             let mut cmd =
-                p077_settle_cmd(domain::commands::ProposalGateSettlementAction::RecordSettlement);
+                p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
             cmd.authority = authority.into();
             validate_proposal_gate_authorization(&cmd)
                 .unwrap_or_else(|e| panic!("authority '{authority}' should pass: {e}"));
         }
+    }
+
+    #[test]
+    fn p077_empty_capability_is_rejected() {
+        let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        cmd.capability = "".into();
+        let err = validate_proposal_gate_authorization(&cmd)
+            .expect_err("empty capability must always be rejected");
+        assert!(
+            err.to_string().contains("empty capability")
+                || err.to_string().contains("invalid capability"),
+            "error should describe the empty-capability rejection: {err}"
+        );
     }
 }

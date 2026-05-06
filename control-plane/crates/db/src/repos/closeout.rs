@@ -1029,17 +1029,36 @@ mod tests {
     #[tokio::test]
     async fn p077_projection_parity_after_closeout_transaction() {
         use crate::repos::artifact_contracts;
+        use domain::closeout_readiness::CloseoutFingerprint;
 
         let pool = setup_test_db().await;
         let run_id_str = insert_test_run(&pool).await;
         let run_id: domain::ids::RunId = run_id_str.parse().unwrap();
 
+        // Supply a fingerprint on the readiness so fingerprint_hash propagation can be asserted.
+        let test_fingerprint = CloseoutFingerprint {
+            proposal_or_freeze_digest: "sha256:aabbcc".into(),
+            run_id: run_id_str.clone(),
+            stage_id: "state_9".into(),
+            workflow_digest: "sha256:workflow1".into(),
+            worktree_head: "abc123".into(),
+            dirty_or_changed_file_digest: "sha256:dirty1".into(),
+            upstream_active_generation_ids: vec!["gen-a".into()],
+            contract_version: "v1".into(),
+            computed_at: Utc::now(),
+            latency_ms: 5,
+        };
+        let expected_fingerprint_hash = test_fingerprint.short_hash();
+
         let gate = make_gate(&run_id_str, ProposalGateStatus::Passed);
-        let readiness = make_readiness(
+        let mut readiness = make_readiness(
             &run_id_str,
             CloseoutReadinessStatus::Ready,
             CloseoutReadinessDecision::EnterManualRelease,
         );
+        readiness.fingerprint = Some(test_fingerprint);
+        let gate_gen_id = gate.generation_id.clone();
+        let readiness_gen_id = readiness.generation_id.clone();
 
         execute_closeout_transaction(
             &pool,
@@ -1075,20 +1094,110 @@ mod tests {
             "implementation_closeout_readiness_v1 must be present in projected active_artifacts"
         );
 
-        // Verify the projected gate status is correct.
+        // generation_id round-trip: projected generation_id must match what was committed.
         let gate_entry = &active["proposal_gate_result_v1"];
+        assert_eq!(
+            gate_entry.get("generation_id").and_then(|v| v.as_str()),
+            Some(gate_gen_id.as_str()),
+            "projected gate generation_id must round-trip through the transaction"
+        );
+        let readiness_entry = &active["implementation_closeout_readiness_v1"];
+        assert_eq!(
+            readiness_entry.get("generation_id").and_then(|v| v.as_str()),
+            Some(readiness_gen_id.as_str()),
+            "projected readiness generation_id must round-trip through the transaction"
+        );
+
+        // Projected gate status and readiness decision must be correct.
         assert_eq!(
             gate_entry.get("raw_status").and_then(|v| v.as_str()),
             Some("passed"),
             "projected gate status must be 'passed'"
         );
-
-        // Verify the projected readiness decision is correct.
-        let readiness_entry = &active["implementation_closeout_readiness_v1"];
         assert_eq!(
             readiness_entry.get("decision").and_then(|v| v.as_str()),
             Some("enter_manual_release"),
             "projected readiness decision must be 'enter_manual_release'"
+        );
+
+        // fingerprint_hash propagation: readiness was given a fingerprint, so hash must appear.
+        assert_eq!(
+            readiness_entry
+                .get("fingerprint_hash")
+                .and_then(|v| v.as_str()),
+            Some(expected_fingerprint_hash.as_str()),
+            "projected readiness fingerprint_hash must match the committed fingerprint short_hash"
+        );
+        // Gate row has no fingerprint, so fingerprint_hash must be null/absent.
+        assert!(
+            gate_entry
+                .get("fingerprint_hash")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "projected gate fingerprint_hash must be null when no fingerprint was supplied"
+        );
+
+        // Supersession: a second closeout transaction must supersede the first pair in the projection.
+        let gate2 = make_gate(&run_id_str, ProposalGateStatus::Waived);
+        let readiness2 = make_readiness(
+            &run_id_str,
+            CloseoutReadinessStatus::ReadyWithRisks,
+            CloseoutReadinessDecision::EnterManualRelease,
+        );
+        let gate2_gen_id = gate2.generation_id.clone();
+        let readiness2_gen_id = readiness2.generation_id.clone();
+
+        execute_closeout_transaction(
+            &pool,
+            CloseoutTransactionInputs {
+                gate_result: &gate2,
+                readiness: &readiness2,
+                blocker_digest: Some("digest-pass-2"),
+            },
+        )
+        .await
+        .unwrap();
+
+        artifact_contracts::rebuild_run_state_projection(&pool, run_id)
+            .await
+            .unwrap();
+
+        let projection2 = artifact_contracts::find_run_state_projection(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("projection must exist after second rebuild");
+
+        let active2 = projection2
+            .run_state_json
+            .get("active_artifacts")
+            .expect("run_state_json must have active_artifacts after second transaction");
+
+        // Second generation IDs must now be active.
+        let gate2_entry = &active2["proposal_gate_result_v1"];
+        assert_eq!(
+            gate2_entry.get("generation_id").and_then(|v| v.as_str()),
+            Some(gate2_gen_id.as_str()),
+            "second closeout transaction must supersede gate: projection must show new generation_id"
+        );
+        let readiness2_entry = &active2["implementation_closeout_readiness_v1"];
+        assert_eq!(
+            readiness2_entry.get("generation_id").and_then(|v| v.as_str()),
+            Some(readiness2_gen_id.as_str()),
+            "second closeout transaction must supersede readiness: projection must show new generation_id"
+        );
+
+        // First generation IDs must NOT appear in the projection (superseded, active=0).
+        assert_ne!(
+            gate2_entry.get("generation_id").and_then(|v| v.as_str()),
+            Some(gate_gen_id.as_str()),
+            "first gate generation_id must not appear after supersession"
+        );
+        assert_ne!(
+            readiness2_entry
+                .get("generation_id")
+                .and_then(|v| v.as_str()),
+            Some(readiness_gen_id.as_str()),
+            "first readiness generation_id must not appear after supersession"
         );
     }
 }

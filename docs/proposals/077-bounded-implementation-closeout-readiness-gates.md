@@ -322,3 +322,17 @@ To prevent decision consistency issues between synthesizer execution and transac
 ### 11.2 Latency Budget
 A **5,000ms latency budget** is enforced for fingerprint computation. If the budget is exceeded, the synthesizer fails closed with `status: unknown` and `decision: block_with_evidence` to avoid blocking the engine with expensive state scans.
 
+### 11.3 Projection Rebuild After Closeout Transaction
+After the state-9 closeout transaction commits the active gate/readiness pair, the orchestrator rebuilds run-state projections so downstream transition evaluation, GraphQL `runs.get`, and MCP `runs.get` see current P077 truth in the same `AdvanceRun` cycle. A rebuild failure is logged and retried on the next cycle rather than being treated as fatal: active SQLite truth remains the authority, and projections are eventually consistent.
+
+The exported run-state projection includes a derived `fingerprint_hash` short hash for each P077 row, sourced from the readiness `fingerprint_json` via `CloseoutFingerprint::short_hash`. The hash is the operator-facing identifier used in tooltips, copy-to-clipboard, and VoiceOver announcements; the full fingerprint payload is available only through artifact readback. Rows without a fingerprint expose `fingerprint_hash: null`.
+
+### 11.4 Proposal Gate Settlement Authorization
+`SettleProposalGateCmd` validation hard-codes the canonical `ProposalGateSettle` capability literal rather than serializing the capability enum at runtime, eliminating a fail-open path if enum serialization ever produced an empty string. Empty caller capabilities are rejected with an explicit error, and the authority allow-list (`release_owner`, `control_plane_owner`, `proposal_owner`) is enforced before the command emits a `command_journal` row.
+
+### 11.5 Advisory Mode Decision Capping (R14 Phase 1)
+Advisory mode (and the `legacy_fallback` diagnostic variant) is implemented as a synthesizer-side cap rather than a transition-time bypass. When the resolved mode is not `enforcement`, `synthesize_implementation_closeout_readiness_for_state9` rewrites any `enter_manual_release` or `return_to_code_refine` decision to `await_operator_decision` and records a `diagnostic_reason` of the form `advisory_mode: <effective_mode> — diagnostic-only; no transition side effects until cutover to enforcement`. Status, blocker counts, gate status, audit status, and other observability fields are preserved verbatim so operators see what the full decision matrix would have produced under enforcement.
+
+### 11.6 Settlement Action Surface Hardening
+`ProposalGateSettlementAction::Execute` no longer auto-builds a `Passed` gate result without proof: when a receipt is supplied it is routed to `ImportReceipt`, and when no receipt is present the command bails with an explicit error directing the operator to run `./scripts/test-gate.sh proposal-077` and supply the receipt via `action=import_receipt`. The MCP `runs.settle_proposal_gate` tool drops `record_settlement` from its action enum entirely (callers passing it receive a hard error pointing at `import_receipt`), and the tool now requires `action` to be specified explicitly when `receipt_json` is absent rather than silently defaulting to a settlement that lacks proof.
+

@@ -369,24 +369,27 @@ fn p077_proof_gate_repeated_identical_blockers_trigger_soft_convergence_checkpoi
     // (Failed gate is routed by route_gate_cause before blockers are checked.)
     let g = gate(ProposalGateStatus::Passed);
 
+    // Enforcement mode required: advisory caps ReturnToCodeRefine to AwaitOperatorDecision.
+    let mode = enforcement_mode();
+
     // First invocation: no previous digest → returns to code refine.
     let r1 = synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
         run_id: "run-1",
         stage_id: "state_9",
         gate_result: &g,
-        mode_result: &advisory_mode(),
+        mode_result: &mode,
         self_assessment: Some(&assessment),
         accepted_risks: &[],
         loop_budget_remaining: true,
         fingerprint: None,
         fingerprint_latency_exceeded: false,
-        controlled_reports_green: None,
+        controlled_reports_green: Some(true),
         previous_blocker_digest: None,
     });
     assert_eq!(
         r1.readiness.decision,
         CloseoutReadinessDecision::ReturnToCodeRefine,
-        "first blocker occurrence must return to code_refine"
+        "first blocker occurrence must return to code_refine (enforcement mode)"
     );
 
     // Compute blocker digest matching the first assessment.
@@ -399,13 +402,13 @@ fn p077_proof_gate_repeated_identical_blockers_trigger_soft_convergence_checkpoi
         run_id: "run-1",
         stage_id: "state_9",
         gate_result: &g,
-        mode_result: &advisory_mode(),
+        mode_result: &mode,
         self_assessment: Some(&assessment),
         accepted_risks: &[],
         loop_budget_remaining: true, // budget NOT exhausted (no P052 claim)
         fingerprint: None,
         fingerprint_latency_exceeded: false,
-        controlled_reports_green: None,
+        controlled_reports_green: Some(true),
         previous_blocker_digest: Some(&digest), // same set as before
     });
     assert_eq!(

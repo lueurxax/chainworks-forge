@@ -192,7 +192,7 @@ implementation audit, proposal gates, and release evidence handoff.
 #### Readiness Mode
 
 Closeout readiness is governed by a per-run **closeout readiness mode** frozen at run admission:
-- **`advisory`**: Diagnostic-only mode. Closeout readiness is synthesized and visible to operators, but the stricter Proposal 077 transition guards are not enforced.
+- **`advisory`** (and the `legacy_fallback` diagnostic variant): Diagnostic-only mode. Closeout readiness is synthesized and visible to operators, but the synthesizer caps any decision that would trigger a workflow transition (`enter_manual_release`, `return_to_code_refine`) to `await_operator_decision` and records a `diagnostic_reason` explaining the cap. Observability fields (status, blocker counts, gate status) are preserved unchanged so operators see what the matrix would have decided in enforcement.
 - **`enforcement`**: Strict gating mode. Transition to manual release requires a resolved `enter_manual_release` decision.
 
 #### Decision and Gating
@@ -219,6 +219,8 @@ If the same set of code blockers recurs across repeated audit/refine cycles with
 #### Closeout Fingerprint and Latency Budget
 
 To ensure decision consistency, the synthesizer consumes a **Closeout Fingerprint** that captures the state of the run at the time of evaluation. If the fingerprint computation exceeds the **5,000ms latency budget**, the synthesizer fails closed with `status: unknown` and `decision: block_with_evidence`, preventing a transition based on potentially stale or inconsistent state.
+
+After the state-9 closeout transaction commits the active gate/readiness pair, the orchestrator rebuilds run-state projections so transition evaluation, GraphQL `runs.get`, and MCP `runs.get` see current P077 truth in the same `AdvanceRun` cycle. A rebuild failure is logged and retried on the next cycle: active SQLite truth remains authoritative and projections are eventually consistent. The exported run-state projection includes a derived `fingerprint_hash` short hash for each P077 row (sourced from `fingerprint_json` via `CloseoutFingerprint::short_hash`); it is the operator-facing identifier used in tooltips, copy-to-clipboard, and VoiceOver announcements, while the full fingerprint payload remains available only through artifact readback. Rows without a fingerprint expose `fingerprint_hash: null`.
 
 #### Risk Lineage
 

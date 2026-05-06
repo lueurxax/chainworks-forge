@@ -182,8 +182,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "stage_id": { "type": "string", "maxLength": 128 },
                     "action": {
                         "type": "string",
-                        "enum": ["record_settlement", "execute", "import_receipt", "waive"],
-                        "description": "Defaults to import_receipt when receipt_json is supplied, otherwise record_settlement"
+                        "enum": ["execute", "import_receipt", "waive"],
+                        "description": "Defaults to import_receipt when receipt_json is supplied; required otherwise. Use import_receipt with a governed gate receipt, waive to waive with lineage, or execute (not yet implemented — requires a real ProposalGateExecutor receipt)."
                     },
                     "capability": { "type": "string", "maxLength": 1024 },
                     "journal_id": { "type": "string", "maxLength": 1024 },
@@ -624,16 +624,25 @@ pub async fn execute(
                     anyhow::bail!("'receipt_json' exceeds maximum length of 256 KiB");
                 }
             }
-            let default_action = if receipt_json
+            let has_receipt = receipt_json
                 .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
-            {
-                "import_receipt"
-            } else {
-                "record_settlement"
+                .is_some_and(|s| !s.trim().is_empty());
+            let action_str = params["action"].as_str();
+            // When receipt is present, default to import_receipt.
+            // When receipt is absent, action must be specified explicitly.
+            let resolved_action = match (action_str, has_receipt) {
+                (Some(a), _) => a,
+                (None, true) => "import_receipt",
+                (None, false) => anyhow::bail!(
+                    "action is required when receipt_json is absent; \
+                     use action=waive with lineage or provide a governed gate receipt and action=import_receipt"
+                ),
             };
-            let action = match params["action"].as_str().unwrap_or(default_action) {
-                "record_settlement" => ProposalGateSettlementAction::RecordSettlement,
+            let action = match resolved_action {
+                "record_settlement" => anyhow::bail!(
+                    "record_settlement is no longer supported; \
+                     use import_receipt with a governed gate receipt from ./scripts/test-gate.sh proposal-077"
+                ),
                 "execute" => ProposalGateSettlementAction::Execute,
                 "import_receipt" => ProposalGateSettlementAction::ImportReceipt,
                 "waive" => ProposalGateSettlementAction::Waive,

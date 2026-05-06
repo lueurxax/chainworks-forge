@@ -1550,6 +1550,17 @@ impl Orchestrator {
                     decision = %tx_result.readiness_decision,
                     "P077: closeout readiness synthesized and persisted"
                 );
+                // BLK-006: rebuild projections so active P077 truth is visible to
+                // downstream transition evaluation and readback before the next cycle.
+                // Non-fatal: a rebuild failure is logged and the next AdvanceRun retries.
+                if let Err(e) = projections::rebuild_all_for_run(&self.pool, run_id).await {
+                    error!(
+                        run_id = %run_id,
+                        state = %current_state_id,
+                        error = %e,
+                        "P077: projection rebuild failed after closeout transaction — projections may lag one AdvanceRun cycle"
+                    );
+                }
             }
             Err(e) => {
                 error!(

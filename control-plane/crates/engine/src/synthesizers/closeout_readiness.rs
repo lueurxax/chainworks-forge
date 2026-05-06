@@ -159,11 +159,18 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
         };
     }
 
+    // Capture mode reference before inputs is consumed by gate_routed_readiness /
+    // apply_decision_matrix so the advisory cap can reference it afterward.
+    let mode_result = inputs.mode_result;
+
     // Gate cause routing per R14 §architecture.gate_cause_routing.
     let gate_decision = route_gate_cause(inputs.gate_result, inputs.loop_budget_remaining);
     if let Some(gate_routed) = gate_decision {
+        let readiness = gate_routed_readiness(inputs, generation_id, gate_routed);
+        // R14 Phase 1: advisory mode is diagnostic-only — cap transition decisions.
+        let readiness = maybe_cap_advisory_decision(readiness, mode_result);
         return SynthesizerResult {
-            readiness: gate_routed_readiness(inputs, generation_id, gate_routed),
+            readiness,
             current_blocker_digest,
         };
     }
@@ -171,10 +178,38 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
     // Gate allows entry (passed or waived with valid fingerprint).
     // Apply the full decision matrix.
     let readiness = apply_decision_matrix(inputs, generation_id);
+    // R14 Phase 1: advisory mode is diagnostic-only — cap transition decisions.
+    let readiness = maybe_cap_advisory_decision(readiness, mode_result);
     SynthesizerResult {
         readiness,
         current_blocker_digest,
     }
+}
+
+/// R14 Phase 1: advisory/legacy-fallback mode is diagnostic-only.
+/// Cap any decision that would trigger a workflow transition so that advisory
+/// mode produces no state_9 side effects. Readiness observability fields
+/// (status, code_blocker_count, etc.) are preserved unchanged.
+fn maybe_cap_advisory_decision(
+    mut r: CloseoutReadiness,
+    mode_result: &CloseoutReadinessModeResult,
+) -> CloseoutReadiness {
+    if mode_result.is_enforcement() {
+        return r;
+    }
+    match r.decision {
+        CloseoutReadinessDecision::EnterManualRelease
+        | CloseoutReadinessDecision::ReturnToCodeRefine => {
+            let mode_str = mode_result.effective_mode().as_str();
+            r.decision = CloseoutReadinessDecision::AwaitOperatorDecision;
+            r.diagnostic_reason = Some(format!(
+                "advisory_mode: {mode_str} — diagnostic-only; \
+                 no transition side effects until cutover to enforcement"
+            ));
+        }
+        _ => {}
+    }
+    r
 }
 
 /// Gate cause routing — returns Some if the gate status itself determines the decision.
@@ -736,7 +771,8 @@ mod tests {
         let mut assessment = complete_assessment();
         assessment.blocking_remaining_code_task_count = Some(2);
         assessment.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
-        let mode = advisory_mode();
+        // Enforcement mode required: advisory caps ReturnToCodeRefine to AwaitOperatorDecision.
+        let mode = enforcement_mode();
 
         let result = synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
             run_id: "run-1",
@@ -748,14 +784,14 @@ mod tests {
             loop_budget_remaining: true,
             fingerprint: None,
             fingerprint_latency_exceeded: false,
-            controlled_reports_green: None,
+            controlled_reports_green: Some(true),
             previous_blocker_digest: None,
         });
 
         assert_eq!(
             result.readiness.decision,
             CloseoutReadinessDecision::ReturnToCodeRefine,
-            "code blockers + budget remaining must return to code refine"
+            "code blockers + budget remaining must return to code refine (enforcement mode)"
         );
         assert_eq!(result.readiness.code_blocker_count, 2);
     }
@@ -1243,12 +1279,13 @@ mod tests {
     }
 
     #[test]
-    fn advisory_mode_without_controlled_reports_can_enter_manual_release() {
+    fn advisory_mode_is_diagnostic_only_no_transition_side_effects() {
         let gate = passed_gate();
         let assessment = complete_assessment();
         let mode = advisory_mode();
 
-        // Advisory mode doesn't require controlled_reports_green.
+        // R14 Phase 1: advisory mode must NOT trigger transitions even when the full
+        // decision matrix would otherwise produce EnterManualRelease.
         let result = synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
             run_id: "run-1",
             stage_id: "state_9",
@@ -1265,8 +1302,13 @@ mod tests {
 
         assert_eq!(
             result.readiness.decision,
-            CloseoutReadinessDecision::EnterManualRelease,
-            "advisory mode can enter manual release without controlled reports"
+            CloseoutReadinessDecision::AwaitOperatorDecision,
+            "advisory mode must produce AwaitOperatorDecision, never EnterManualRelease"
+        );
+        let reason = result.readiness.diagnostic_reason.unwrap_or_default();
+        assert!(
+            reason.contains("advisory_mode"),
+            "diagnostic_reason must explain advisory cap: got {reason}"
         );
     }
 
@@ -1276,7 +1318,9 @@ mod tests {
         let mut assessment = complete_assessment();
         assessment.blocking_remaining_code_task_count = Some(1);
         assessment.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
-        let mode = advisory_mode();
+        // Enforcement mode required: advisory caps ReturnToCodeRefine to AwaitOperatorDecision,
+        // which would make the first-invocation assertion ambiguous.
+        let mode = enforcement_mode();
 
         // First invocation without previous digest → returns to code refine.
         let r1 = synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
@@ -1289,13 +1333,13 @@ mod tests {
             loop_budget_remaining: true,
             fingerprint: None,
             fingerprint_latency_exceeded: false,
-            controlled_reports_green: None,
+            controlled_reports_green: Some(true),
             previous_blocker_digest: None, // no prior digest
         });
         assert_eq!(
             r1.readiness.decision,
             CloseoutReadinessDecision::ReturnToCodeRefine,
-            "first occurrence with no previous digest must return to code refine"
+            "first occurrence with no previous digest must return to code refine (enforcement)"
         );
 
         // Compute the blocker digest from the first result to simulate a repeat.
@@ -1312,7 +1356,7 @@ mod tests {
             loop_budget_remaining: true, // budget NOT exhausted
             fingerprint: None,
             fingerprint_latency_exceeded: false,
-            controlled_reports_green: None,
+            controlled_reports_green: Some(true),
             previous_blocker_digest: Some(&digest), // same blockers as before
         });
         assert_eq!(
@@ -1339,7 +1383,8 @@ mod tests {
         assessment1.blocking_remaining_code_task_count = Some(1);
         let mut assessment2 = complete_assessment();
         assessment2.blocking_remaining_code_task_count = Some(2);
-        let mode = advisory_mode();
+        // Enforcement mode required: advisory caps ReturnToCodeRefine to AwaitOperatorDecision.
+        let mode = enforcement_mode();
 
         let digest1 = compute_blocker_digest(&assessment1, &gate);
 
@@ -1354,13 +1399,13 @@ mod tests {
             loop_budget_remaining: true,
             fingerprint: None,
             fingerprint_latency_exceeded: false,
-            controlled_reports_green: None,
+            controlled_reports_green: Some(true),
             previous_blocker_digest: Some(&digest1),
         });
         assert_eq!(
             result.readiness.decision,
             CloseoutReadinessDecision::ReturnToCodeRefine,
-            "different blockers must not trigger soft convergence"
+            "different blockers must not trigger soft convergence (enforcement mode)"
         );
     }
 }
