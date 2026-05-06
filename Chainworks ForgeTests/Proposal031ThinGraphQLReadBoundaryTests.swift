@@ -678,6 +678,12 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       #expect(presentation.compactActivationAccessibilityLabel.contains(expectedStatus))
       #expect(!presentation.diagnosticRows.isEmpty)
       #expect(presentation.recoveryLifecycleText.contains("Recovery"))
+      #expect(presentation.recoveryLifecycleAcknowledgementText.contains("Acknowledgement"))
+      #expect(presentation.recoveryLifecycleCorrelationText.contains("Correlation"))
+      #expect(presentation.recoveryLifecycleFreshnessBudgetText.contains("Freshness budget"))
+      #expect(!presentation.recoveryLifecycleActionRows.isEmpty)
+      #expect(presentation.recoveryLifecycleCopyTemplate.contains("P077 recovery escalation"))
+      #expect(presentation.recoveryLifecycleAccessibilityLabel.contains("non-dismissible"))
       #expect(!presentation.backlinkRouteLabel.isEmpty)
       #expect(presentation.backlinkRouteAccessibilityLabel.contains(presentation.backlinkRouteLabel))
       #expect(presentation.copyFailureFallbackText.contains(presentation.generationDisplayID))
@@ -688,6 +694,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         "copy generation id",
         "primary unblock",
         "recovery lifecycle",
+        "copy recovery template",
         "readback route",
         "mode explainer",
       ])
@@ -716,6 +723,11 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(presentation.diagnosticRows.contains("Decision: return_to_code_refine"))
     #expect(presentation.diagnosticRows.contains("Gate: failed"))
     #expect(presentation.recoveryLifecycleText.contains("return to code refine"))
+    #expect(presentation.recoveryLifecycleAcknowledgementText.contains("2026-05-06T12:00:00Z"))
+    #expect(presentation.recoveryLifecycleCorrelationText.contains("gate-12345678"))
+    #expect(presentation.recoveryLifecycleFreshnessBudgetText.contains("stalled"))
+    #expect(presentation.recoveryLifecycleActionRows.contains("Re-issue closeout readiness after recovery action"))
+    #expect(presentation.recoveryLifecycleCopyTemplate.contains("command=return to code refine"))
     #expect(presentation.backlinkRouteLabel == "Closeout diagnostics")
   }
 

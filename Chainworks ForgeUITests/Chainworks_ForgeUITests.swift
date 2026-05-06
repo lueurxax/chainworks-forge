@@ -1932,6 +1932,40 @@ final class Chainworks_ForgeUITests: XCTestCase {
             "secondary blockers must be visible and ordered after the primary unblock"
         )
 
+        let recoveryLifecycle = anyElement(app, identifier: "p077-closeout-readiness-recovery")
+        XCTAssertTrue(
+            recoveryLifecycle.waitForExistence(timeout: 5),
+            "stalled recovery lifecycle must be visible as a non-dismissible row"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p077-closeout-readiness-recovery-non-dismissible")
+                .waitForExistence(timeout: 5),
+            "stalled recovery lifecycle must expose the required non-dismissible row"
+        )
+
+        let recoveryCopy = app.buttons[
+            "p077-closeout-readiness-recovery-copy-template"
+        ].firstMatch
+        XCTAssertTrue(
+            recoveryCopy.waitForExistence(timeout: 5) && recoveryCopy.isEnabled,
+            "recovery lifecycle must expose a copyable escalation template"
+        )
+        recoveryCopy.click()
+        XCTAssertNotNil(
+            waitForStaticTextValueContaining(
+                ["Copied recovery template", "Recovery template remains visible"],
+                in: app,
+                timeout: 5
+            ),
+            "recovery copy command must expose success or fallback feedback"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p077-closeout-readiness-announcement-priority")
+                .waitForExistence(timeout: 5),
+            "closeout readiness must expose runtime announcement priority readback"
+        )
+
         let diagnostics = app.buttons["p077-closeout-readiness-diagnostics"].firstMatch
         XCTAssertTrue(
             diagnostics.waitForExistence(timeout: 5) && diagnostics.isEnabled,

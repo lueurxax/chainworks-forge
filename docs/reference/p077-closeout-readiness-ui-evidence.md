@@ -69,8 +69,19 @@ Fixture-backed presentation requirements:
 - focus return copy: `focusReturnLabel`
 - copy failure fallback: `copyFailureFallbackText`
 - VoiceOver announcement policy: `voiceOverAnnouncementPolicy`
+- runtime announcement priority marker:
+  `p077-closeout-readiness-announcement-priority`
 - keyboard traversal proof order: `keyboardTraversalOrder`
 - recovery lifecycle row: `recoveryLifecycleText`
+- recovery lifecycle acknowledgement/correlation/freshness state:
+  `recoveryLifecycleAcknowledgementText`,
+  `recoveryLifecycleCorrelationText`, and
+  `recoveryLifecycleFreshnessBudgetText`
+- recovery lifecycle actions and copy template:
+  `recoveryLifecycleActionRows`,
+  `recoveryLifecycleCopyTemplate`,
+  `p077-closeout-readiness-recovery-non-dismissible`, and
+  `p077-closeout-readiness-recovery-copy-template`
 - backlink/readback row: `backlinkRouteLabel` and
   `backlinkRouteAccessibilityLabel`
 - compact activation action: `p077-closeout-readiness-compact-action`
@@ -80,6 +91,16 @@ Fixture-backed presentation requirements:
 
 The surface remains read-only. It exposes copy, diagnostics/readback, recovery
 guidance, and route labels, but it does not add local write/control buttons.
+
+The stalled recovery row is non-dismissible and remains below the primary
+unblock while the active generation is blocked, invalid, not ready, handoff
+required, unknown, or awaiting first generation. It exposes the observed
+acknowledgement state, run/stage/generation/gate/fingerprint correlation, and
+freshness-budget stall rule in the read-only card. Operators can re-copy the
+generation id, copy the governed recovery escalation template, re-issue through
+the governed control path, or escalate to the relevant owner; those affordances
+are rendered as read-only guidance/copy actions, not local write controls. After
+copying the recovery template, focus returns to the stalled recovery row.
 
 ## Runtime Proof
 
@@ -96,5 +117,27 @@ The Swift runtime surface also keeps VoiceOver refreshes bounded by
 field-hash refreshes are coalesced, polite announcements are suppressed while
 the diagnostics sheet owns focus, and blocking enforcement updates remain
 assertive. Unit fixtures cover the coalescing and blocking-priority behavior;
-the remote UI gate proves the compact, focus, backlink, and copy paths in the
-macOS app process.
+the macOS view posts `NSAccessibility.Notification.announcementRequested` with
+the computed polite/assertive priority and keeps a hidden readback marker with
+that priority for runtime proof. The remote UI gate proves the compact, focus,
+backlink, stalled recovery, announcement-priority readback, and copy paths in
+the macOS app process.
+
+Latest remote runtime evidence:
+
+| field | value |
+| --- | --- |
+| evidence_status | pending rerun after R6 fixes |
+| gate | `./scripts/test-gate.sh proposal-077-ui` |
+| host | `test@SMacBook.local` |
+| required screenshot | `P077_Closeout_Readiness_Runtime_A11Y` |
+
+Prior runtime proof:
+
+| field | value |
+| --- | --- |
+| commit | `8ac3a4e5` |
+| host | `test@SMacBook.local` |
+| result bundle | `/var/folders/hh/ztmrr5z96xnbxvlcxyf1vxsc0000gp/T/chainworks-test-gates/proposal-077-ui-20260506-215737.xcresult` |
+| log | `/tmp/p077-ui-8ac3a4e5-signed-terminal.log` |
+| outcome | `** TEST SUCCEEDED **`; 67 Swift tests plus `testProposal077CloseoutReadinessRuntimeAccessibilityProof` passed |

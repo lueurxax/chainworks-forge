@@ -3689,6 +3689,12 @@ struct P077CloseoutReadinessPresentation: Equatable, Sendable {
   let modeExplainerText: String
   let diagnosticRows: [String]
   let recoveryLifecycleText: String
+  let recoveryLifecycleAcknowledgementText: String
+  let recoveryLifecycleCorrelationText: String
+  let recoveryLifecycleFreshnessBudgetText: String
+  let recoveryLifecycleActionRows: [String]
+  let recoveryLifecycleCopyTemplate: String
+  let recoveryLifecycleAccessibilityLabel: String
   let backlinkRouteLabel: String
   let backlinkRouteAccessibilityLabel: String
   let focusReturnLabel: String
@@ -3708,6 +3714,15 @@ struct P077CloseoutReadinessPresentation: Equatable, Sendable {
 enum P077CloseoutReadinessAnnouncementPriority: String, Equatable, Sendable {
   case polite
   case assertive
+
+  nonisolated var accessibilityPriorityLabel: String {
+    switch self {
+    case .polite:
+      return "polite"
+    case .assertive:
+      return "assertive"
+    }
+  }
 }
 
 struct P077CloseoutReadinessAnnouncement: Equatable, Sendable {
@@ -3857,6 +3872,23 @@ enum P077CloseoutReadinessPresenter {
     let secondaryBlockerRows = secondaryBlockers(for: state, summary: summary)
     let diagnosticRows = diagnostics(for: state, summary: summary, generationText: generationText)
     let recoveryLifecycleText = recoveryLifecycle(for: state, summary: summary)
+    let recoveryLifecycleAcknowledgementText = recoveryAcknowledgement(for: state, summary: summary)
+    let recoveryLifecycleCorrelationText = recoveryCorrelation(for: summary)
+    let recoveryLifecycleFreshnessBudgetText = recoveryFreshnessBudget(for: state, summary: summary)
+    let recoveryLifecycleActionRows = recoveryActions(for: state, summary: summary)
+    let recoveryLifecycleCopyTemplate = recoveryCopyTemplate(
+      for: state,
+      summary: summary,
+      primaryUnblockText: primaryUnblockText
+    )
+    let recoveryLifecycleAccessibilityLabel = [
+      "Recovery lifecycle, non-dismissible",
+      recoveryLifecycleText,
+      recoveryLifecycleAcknowledgementText,
+      recoveryLifecycleCorrelationText,
+      recoveryLifecycleFreshnessBudgetText,
+      "Actions: \(recoveryLifecycleActionRows.joined(separator: ", "))",
+    ].joined(separator: ". ")
     let backlinkRouteLabel = backlinkRoute(for: state, summary: summary)
     let backlinkRouteAccessibilityLabel =
       "Closeout readiness readback route: \(backlinkRouteLabel)"
@@ -3871,6 +3903,7 @@ enum P077CloseoutReadinessPresenter {
       "copy generation id",
       "primary unblock",
       "recovery lifecycle",
+      "copy recovery template",
       "readback route",
       "mode explainer",
     ]
@@ -3894,6 +3927,12 @@ enum P077CloseoutReadinessPresenter {
       modeExplainerText: modeExplainerText,
       diagnosticRows: diagnosticRows,
       recoveryLifecycleText: recoveryLifecycleText,
+      recoveryLifecycleAcknowledgementText: recoveryLifecycleAcknowledgementText,
+      recoveryLifecycleCorrelationText: recoveryLifecycleCorrelationText,
+      recoveryLifecycleFreshnessBudgetText: recoveryLifecycleFreshnessBudgetText,
+      recoveryLifecycleActionRows: recoveryLifecycleActionRows,
+      recoveryLifecycleCopyTemplate: recoveryLifecycleCopyTemplate,
+      recoveryLifecycleAccessibilityLabel: recoveryLifecycleAccessibilityLabel,
       backlinkRouteLabel: backlinkRouteLabel,
       backlinkRouteAccessibilityLabel: backlinkRouteAccessibilityLabel,
       focusReturnLabel: focusReturnLabel,
@@ -4063,17 +4102,125 @@ enum P077CloseoutReadinessPresenter {
   ) -> String {
     switch state {
     case .applicable(.ready), .applicable(.readyWithRisks):
-      return "Recovery: enter manual release through governed control surfaces."
+      return "Recovery lifecycle: enter manual release through governed control surfaces."
     case .applicable(.notReady):
-      return "Recovery: return to code refine and rerun closeout readiness."
+      return "Recovery lifecycle: return to code refine and rerun closeout readiness."
     case .applicable(.handoffRequired):
-      return "Recovery: complete handoff owner action, then rerun closeout readiness."
+      return "Recovery lifecycle: complete handoff owner action, then rerun closeout readiness."
     case .applicable(.blocked), .applicable(.invalid), .applicable(.unknown),
          .awaitingFirstGeneration:
-      return "Recovery: inspect diagnostics, settle the gate, or rerun the readiness check."
+      return "Recovery lifecycle: inspect diagnostics, settle the gate, or rerun the readiness check."
     case .notApplicable:
-      return "Recovery: no P077 action is available for this run."
+      return "Recovery lifecycle: no P077 action is available for this run."
     }
+  }
+
+  private nonisolated static func recoveryAcknowledgement(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .notApplicable:
+      return "Acknowledgement: not applicable for this run."
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Acknowledgement: current generation is settled for release review."
+    case .awaitingFirstGeneration:
+      return "Acknowledgement: no governed recovery acknowledgement has been recorded yet."
+    case .applicable:
+      let timestamp = normalizedText(summary.synthesizedAt) ?? "unknown time"
+      return "Acknowledgement: blocker observed at \(timestamp); wait for governed channel acknowledgement before release."
+    }
+  }
+
+  private nonisolated static func recoveryCorrelation(
+    for summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    let gate = normalizedText(summary.gateGenerationID) ?? "missing gate generation"
+    let fingerprint = normalizedText(summary.fingerprintHash) ?? "missing fingerprint"
+    return "Correlation: run \(summary.runID), stage \(summary.stageID), readiness generation \(summary.generationDisplayID), gate \(gate), fingerprint \(fingerprint)."
+  }
+
+  private nonisolated static func recoveryFreshnessBudget(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Freshness budget: keep release evidence current before manual release."
+    case .notApplicable:
+      return "Freshness budget: no P077 freshness budget applies."
+    case .awaitingFirstGeneration:
+      return "Freshness budget: publish the first closeout readiness generation before release review."
+    case .applicable:
+      let synthesizedAt = normalizedText(summary.synthesizedAt) ?? "unknown generation time"
+      return "Freshness budget: if no new generation replaces this blocker after \(synthesizedAt), treat recovery as stalled and re-issue through governed control."
+    }
+  }
+
+  private nonisolated static func recoveryActions(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> [String] {
+    switch state {
+    case .notApplicable:
+      return ["Return to run detail"]
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return ["Re-copy generation id", "Open manual-release evidence route"]
+    case .applicable(.handoffRequired):
+      let owner = normalizedText(summary.handoffOwner) ?? "handoff owner"
+      return [
+        "Re-copy generation id",
+        "Re-issue closeout readiness after handoff settlement",
+        "Escalate to \(owner)",
+      ]
+    case .awaitingFirstGeneration:
+      return [
+        "Re-issue closeout readiness",
+        "Escalate missing generation to release owner",
+      ]
+    case .applicable:
+      return [
+        "Re-copy generation id",
+        "Re-issue closeout readiness after recovery action",
+        "Escalate to release owner",
+      ]
+    }
+  }
+
+  private nonisolated static func recoveryCopyTemplate(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel,
+    primaryUnblockText: String
+  ) -> String {
+    let owner = normalizedText(summary.handoffOwner) ?? "release owner"
+    let commandLabel: String
+    switch state {
+    case .applicable(.notReady):
+      commandLabel = "return to code refine and rerun closeout readiness"
+    case .applicable(.handoffRequired):
+      commandLabel = "complete handoff settlement and rerun closeout readiness"
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      commandLabel = "enter manual release through governed control"
+    case .applicable(.blocked), .applicable(.invalid), .applicable(.unknown),
+         .awaitingFirstGeneration:
+      commandLabel = "settle proposal gate or rerun readiness check"
+    case .notApplicable:
+      commandLabel = "no P077 action"
+    }
+
+    return [
+      "P077 recovery escalation",
+      "run=\(summary.runID)",
+      "stage=\(summary.stageID)",
+      "generation=\(summary.generationDisplayID)",
+      "decision=\(summary.readinessDecision)",
+      "status=\(summary.readinessStatus.rawValue)",
+      "command=\(commandLabel)",
+      "owner=\(owner)",
+      "primary_unblock=\(primaryUnblockText)",
+      "diagnostic=\(normalizedText(summary.diagnosticReason) ?? "none")",
+      "fingerprint=\(normalizedText(summary.fingerprintHash) ?? "missing")",
+    ].joined(separator: "; ")
   }
 
   private nonisolated static func backlinkRoute(

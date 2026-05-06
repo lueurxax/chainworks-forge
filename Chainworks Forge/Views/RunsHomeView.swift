@@ -303,6 +303,9 @@ private enum P077CloseoutReadinessFocus: Hashable {
     case primaryUnblock
     case secondaryBlocker(String)
     case copyFallback
+    case recoveryLifecycle
+    case copyRecoveryTemplate
+    case recoveryCopyFeedback
     case backlinkRoute
     case modeExplainer
 }
@@ -1166,7 +1169,14 @@ private struct P077CloseoutReadinessCard: View {
                 P031RunsHomeAccessibilityMarker(
                     identifier: "p077-closeout-readiness-card",
                     label: presentation.cardAccessibilityLabel,
-                    value: latestAnnouncement?.text
+                    value: latestAnnouncement.map {
+                        "\($0.priority.accessibilityPriorityLabel): \($0.text)"
+                    }
+                )
+                P031RunsHomeAccessibilityMarker(
+                    identifier: "p077-closeout-readiness-announcement-priority",
+                    label: presentation.voiceOverAnnouncementPolicy,
+                    value: latestAnnouncement?.priority.accessibilityPriorityLabel
                 )
 
                 HStack(spacing: 8) {
@@ -1231,10 +1241,7 @@ private struct P077CloseoutReadinessCard: View {
                     .accessibilityIdentifier("p077-closeout-readiness-secondary-blockers")
                 }
 
-                Label(presentation.recoveryLifecycleText, systemImage: "arrow.clockwise.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("p077-closeout-readiness-recovery")
+                recoveryLifecycleSection
 
                 Label(presentation.backlinkRouteLabel, systemImage: "arrowshape.turn.up.right")
                     .font(.caption)
@@ -1258,6 +1265,7 @@ private struct P077CloseoutReadinessCard: View {
                         .foregroundStyle(.secondary)
                         .focusable(true)
                         .focused(closeoutFocus, equals: .copyFallback)
+                        .focused(closeoutFocus, equals: .recoveryCopyFeedback)
                         .accessibilityIdentifier("p077-closeout-readiness-copy-fallback")
                 }
             }
@@ -1319,20 +1327,98 @@ private struct P077CloseoutReadinessCard: View {
         if !didCopy {
             closeoutFocus.wrappedValue = .copyFallback
         }
-        return
-#endif
+#else
         copyFeedback = "Copied generation \(presentation.generationDisplayID)"
+#endif
+    }
+
+    private var recoveryLifecycleSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(presentation.recoveryLifecycleText, systemImage: "arrow.clockwise.circle")
+                .font(.caption.weight(.semibold))
+                .focusable(true)
+                .focused(closeoutFocus, equals: .recoveryLifecycle)
+                .accessibilityIdentifier("p077-closeout-readiness-recovery-non-dismissible")
+
+            Text(presentation.recoveryLifecycleAcknowledgementText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(presentation.recoveryLifecycleCorrelationText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(presentation.recoveryLifecycleFreshnessBudgetText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(presentation.recoveryLifecycleActionRows, id: \.self) { action in
+                Label(action, systemImage: "arrow.right.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                copyRecoveryTemplate()
+            } label: {
+                Label("Copy recovery template", systemImage: "doc.on.clipboard")
+            }
+            .controlSize(.small)
+            .accessibilityLabel("Copy P077 stalled recovery escalation template")
+            .accessibilityIdentifier("p077-closeout-readiness-recovery-copy-template")
+            .focused(closeoutFocus, equals: .copyRecoveryTemplate)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(presentation.recoveryLifecycleAccessibilityLabel)
+        .accessibilityIdentifier("p077-closeout-readiness-recovery")
+    }
+
+    private func copyRecoveryTemplate() {
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        let didCopy = NSPasteboard.general.setString(
+            presentation.recoveryLifecycleCopyTemplate,
+            forType: .string
+        )
+        copyFeedback = didCopy
+            ? "Copied recovery template for generation \(presentation.generationDisplayID)"
+            : "Copy failed. Recovery template remains visible in diagnostics."
+        closeoutFocus.wrappedValue = didCopy ? .recoveryLifecycle : .recoveryCopyFeedback
+#else
+        copyFeedback = "Copied recovery template for generation \(presentation.generationDisplayID)"
+        closeoutFocus.wrappedValue = .recoveryLifecycle
+#endif
     }
 
     private func recordCloseoutAnnouncement(sheetOwnsFocus: Bool) {
         var state = announcementState
-        latestAnnouncement = P077CloseoutReadinessAnnouncementPolicy.announcement(
+        let announcement = P077CloseoutReadinessAnnouncementPolicy.announcement(
             for: presentation,
             previous: &state,
             now: Date(),
             sheetOwnsFocus: sheetOwnsFocus
         )
+        latestAnnouncement = announcement
         announcementState = state
+        if let announcement {
+            postCloseoutAccessibilityAnnouncement(announcement)
+        }
+    }
+
+    private func postCloseoutAccessibilityAnnouncement(
+        _ announcement: P077CloseoutReadinessAnnouncement
+    ) {
+#if os(macOS)
+        let priority: NSAccessibilityPriorityLevel =
+            announcement.priority == .assertive ? .high : .medium
+        let element: Any = NSApp.keyWindow ?? NSApp as Any
+        NSAccessibility.post(
+            element: element,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement.text,
+                .priority: priority.rawValue,
+            ]
+        )
+#endif
     }
 }
 
