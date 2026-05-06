@@ -7,7 +7,8 @@ use tracing::{debug, error, info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    ideas, lead_conflict_mediations, projections, runs, stages, work_items, workflow_conflicts,
+    closeout, ideas, lead_conflict_mediations, projections, runs, stages, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
@@ -16,8 +17,10 @@ use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
     contract_status_allowed_values, ImplementationSelfAssessmentStatus,
 };
+use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
 use domain::ids::{ApprovalId, ArtifactId, RunId};
+use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
 use domain::run::RunStatus;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
@@ -27,8 +30,19 @@ use domain::workflow_conflict::{
     WorkflowConflictRecord, WorkflowConflictStatus, WorkflowTransitionCursorRecord,
 };
 
+use crate::closeout_fingerprint::{
+    build_closeout_fingerprint, resolve_closeout_worktree_truth,
+    CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
+};
+use crate::closeout_loop_budget::{
+    closeout_loop_budget_exhaustion, closeout_loop_budget_remaining,
+};
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
+use crate::synthesizers::closeout_readiness::{
+    synthesize_implementation_closeout_readiness_for_state9,
+    SynthesizerInputs as CloseoutSynthesizerInputs,
+};
 use crate::work_queue::WorkQueue;
 
 pub struct Orchestrator {
@@ -691,6 +705,18 @@ impl Orchestrator {
                                     });
                                     return Ok(());
                                 }
+                                // P077: Synthesize and persist closeout readiness before
+                                // transition evaluation so implementation_closeout_readiness_v1
+                                // guards can read an active generation from closeout_gate_generations.
+                                self.synthesize_and_persist_closeout_readiness_if_needed(
+                                    run_id,
+                                    &current_state_id,
+                                    state,
+                                    run,
+                                    &plan,
+                                    &all_stages,
+                                )
+                                .await?;
                                 return self
                                     .evaluate_and_transition(
                                         run_id,
@@ -712,6 +738,16 @@ impl Orchestrator {
                         return Ok(()); // wait for approval
                     }
                     StageStatus::Completed => {
+                        // P077: synthesize closeout readiness before transition evaluation.
+                        self.synthesize_and_persist_closeout_readiness_if_needed(
+                            run_id,
+                            &current_state_id,
+                            state,
+                            run,
+                            &plan,
+                            &all_stages,
+                        )
+                        .await?;
                         // Stage done — evaluate transitions
                         return self
                             .evaluate_and_transition(run_id, &current_state_id, &plan, &all_stages)
@@ -1400,6 +1436,177 @@ impl Orchestrator {
             return Ok(false);
         };
         Ok(active.summary.status == ImplementationSelfAssessmentStatus::Blocked)
+    }
+
+    /// P077: Synthesize implementation_closeout_readiness_v1 and atomically persist
+    /// both proposal_gate_result_v1 and implementation_closeout_readiness_v1 into
+    /// closeout_gate_generations before transition evaluation fires.
+    ///
+    /// Called at every stage-completion point for states whose transitions reference
+    /// implementation_closeout_readiness_v1.decision. The transaction deactivates
+    /// the previous active generation, so this is safe to call on re-entry.
+    ///
+    /// On DB failure the error is logged and the function returns Ok(()); the
+    /// transition guard will simply not match and the run stays in this state until
+    /// the next AdvanceRun trigger, which retries the synthesis.
+    async fn synthesize_and_persist_closeout_readiness_if_needed(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        state: &workflow::plan::CompiledState,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        all_stages: &[StageExecution],
+    ) -> Result<()> {
+        if !state_evaluates_closeout_readiness(state) {
+            return Ok(());
+        }
+
+        let run_id_str = run_id.to_string();
+
+        // Read the active proposal gate result (if the operator has already settled one).
+        // If none, use MissingDefinition — synthesizer routes to AwaitGateDefinition.
+        let gate_result = match closeout::find_active_gate_generation(&self.pool, &run_id_str).await
+        {
+            Ok(Some(row)) => ProposalGateResult {
+                gate_id: format!("p077:{}", &row.generation_id),
+                proposal_id: "077".to_string(),
+                run_id: run_id_str.clone(),
+                stage_id: current_state_id.to_string(),
+                status: row
+                    .status
+                    .parse::<ProposalGateStatus>()
+                    .unwrap_or(ProposalGateStatus::Invalid),
+                generation_id: row.generation_id,
+                diagnostic_reason: row.diagnostic_reason,
+                executor_version: None,
+                evidence_digest: None,
+                exit_code: None,
+                elapsed_ms: None,
+                settled_at: chrono::Utc::now(),
+                authorization_lineage: None,
+                failure_classification: None,
+            },
+            _ => ProposalGateResult::missing_definition(
+                format!("gate-missing:{}", uuid::Uuid::new_v4()),
+                &run_id_str,
+                "077",
+                current_state_id,
+                "no_proposal_gate_settled",
+            ),
+        };
+
+        // Resolve the closeout readiness mode from the frozen run column.
+        let has_enforcement_migration =
+            closeout::has_enforcement_migration_record(&self.pool, &run_id_str)
+                .await
+                .unwrap_or(false);
+        let mode_result = resolve_closeout_readiness_mode(
+            run.closeout_readiness_mode.as_deref(),
+            has_enforcement_migration,
+        );
+
+        // Load the active implementation self-assessment (optional input).
+        let self_assessment_opt =
+            artifact_contracts::find_active_implementation_self_assessment_summary(
+                &self.pool, run_id,
+            )
+            .await
+            .ok()
+            .flatten();
+        let self_assessment_ref = self_assessment_opt.as_ref().map(|a| &a.summary);
+
+        // P077 BLK-006: source controlled_reports_green from active artifact contracts.
+        let controlled_reports_green =
+            closeout::compute_controlled_reports_green(&self.pool, &run_id_str)
+                .await
+                .ok()
+                .flatten();
+        let accepted_risks = closeout::find_active_accepted_risks(&self.pool, &run_id_str)
+            .await
+            .unwrap_or_default();
+
+        // P077 BLK-011: read the prior blocker_digest so the synthesizer can detect
+        // soft-convergence (repeated identical blockers without diff or gate progress).
+        let prior_blocker_digest = closeout::find_active_blocker_digest(&self.pool, &run_id_str)
+            .await
+            .ok()
+            .flatten();
+        let upstream_generation_ids =
+            closeout::list_closeout_fingerprint_source_generation_ids(&self.pool, &run_id_str)
+                .await
+                .unwrap_or_default();
+        let worktree_truth = resolve_closeout_worktree_truth(run).await;
+        if let Some(reason) = worktree_truth.diagnostic_reason.as_deref() {
+            warn!(
+                run_id = %run_id,
+                state = %current_state_id,
+                reason,
+                "P077: current worktree fingerprint truth unavailable; closeout will fail closed"
+            );
+        }
+        let closeout_fingerprint = build_closeout_fingerprint(
+            run,
+            current_state_id,
+            worktree_truth.worktree_head.clone(),
+            worktree_truth.dirty_or_changed_file_digest.clone(),
+            upstream_generation_ids,
+            worktree_truth.latency_ms,
+        );
+        let fingerprint_latency_exceeded = worktree_truth.unavailable
+            || worktree_truth.latency_exceeded
+            || worktree_truth.latency_ms > CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS;
+        let loop_budget_remaining =
+            closeout_loop_budget_remaining(plan, all_stages, "state_10_implementation_refined");
+
+        let inputs = CloseoutSynthesizerInputs {
+            run_id: &run_id_str,
+            stage_id: current_state_id,
+            gate_result: &gate_result,
+            mode_result: &mode_result,
+            self_assessment: self_assessment_ref,
+            accepted_risks: &accepted_risks,
+            loop_budget_remaining,
+            fingerprint: Some(closeout_fingerprint),
+            fingerprint_latency_exceeded,
+            // Sourced from active audit/docs/security/prepush/tests artifact contracts.
+            // None means at least one controlled report is missing — synthesizer fails
+            // closed in enforcement mode while advisory mode is unaffected.
+            controlled_reports_green,
+            previous_blocker_digest: prior_blocker_digest.as_deref(),
+        };
+
+        let synth_result = synthesize_implementation_closeout_readiness_for_state9(inputs);
+
+        let tx_inputs = closeout::CloseoutTransactionInputs {
+            gate_result: &gate_result,
+            readiness: &synth_result.readiness,
+            accepted_risks: &accepted_risks,
+            blocker_digest: synth_result.current_blocker_digest.as_deref(),
+        };
+
+        match closeout::execute_closeout_transaction_with_projection_rebuild(&self.pool, tx_inputs)
+            .await
+        {
+            Ok(tx_result) => {
+                info!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    decision = %tx_result.readiness_decision,
+                    "P077: closeout readiness synthesized and persisted"
+                );
+            }
+            Err(e) => {
+                error!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    error = %e,
+                    "P077: failed to persist closeout readiness — guard will not fire this cycle"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn block_code_writer_handoff_if_unavailable(
@@ -3490,7 +3697,7 @@ impl Orchestrator {
                 .await;
             if evaluation.result == CandidateTransitionResult::Matched {
                 if let Some(exhaustion) =
-                    loop_budget_exhaustion_for_transition_target(transition, plan, all_stages)
+                    closeout_loop_budget_exhaustion(plan, all_stages, &transition.to)
                 {
                     debug!(
                         run_id = %run_id,
@@ -3768,11 +3975,9 @@ impl Orchestrator {
             "implementation_review_summary.status={status_label} routes back to implementation refinement, not manual release"
         ));
 
-        if let Some(exhaustion) = loop_budget_exhaustion_for_transition_target(
-            &state.transitions[refine_index],
-            plan,
-            all_stages,
-        ) {
+        if let Some(exhaustion) =
+            closeout_loop_budget_exhaustion(plan, all_stages, &state.transitions[refine_index].to)
+        {
             candidate_evaluations[refine_index].result = CandidateTransitionResult::NotMatched;
             candidate_evaluations[refine_index].sanitized_diagnostic = Some(format!(
                 "implementation_review_summary.status={status_label} requires refinement, but loop budget exhausted for {}: {}/{} iterations",
@@ -5543,36 +5748,6 @@ fn json_value_is_empty_collection(value: &serde_json::Value) -> bool {
     }
 }
 
-struct LoopBudgetExhaustion {
-    counter: String,
-    iterations: u64,
-    max: u64,
-}
-
-fn loop_budget_exhaustion_for_transition_target(
-    transition: &workflow::plan::CompiledTransition,
-    plan: &workflow::plan::RunPlan,
-    all_stages: &[StageExecution],
-) -> Option<LoopBudgetExhaustion> {
-    let target_state = plan.states.get(&transition.to)?;
-    let loop_config = target_state.loop_config.as_ref()?;
-    let iterations = loop_iterations_for_state(all_stages, &transition.to);
-    (iterations >= loop_config.max).then(|| LoopBudgetExhaustion {
-        counter: loop_config.counter.clone(),
-        iterations,
-        max: loop_config.max,
-    })
-}
-
-fn loop_iterations_for_state(all_stages: &[StageExecution], state_id: &str) -> u64 {
-    all_stages
-        .iter()
-        .filter(|stage| stage.stage_id == state_id)
-        .filter_map(|stage| u64::try_from(stage.iteration).ok())
-        .max()
-        .unwrap_or(0)
-}
-
 /// Split on a connective keyword, respecting parentheses depth.
 fn split_connective<'a>(expr: &'a str, connective: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0i32;
@@ -5667,6 +5842,17 @@ fn state_produces_implementation_review(state: &workflow::plan::CompiledState) -
     })
 }
 
+/// P077: Returns true if any of the state's transitions evaluate
+/// implementation_closeout_readiness_v1 fields (e.g. `.decision`).
+/// Used to detect states that require the closeout synthesis to run before
+/// transition evaluation so the active closeout_gate_generations entry exists.
+fn state_evaluates_closeout_readiness(state: &workflow::plan::CompiledState) -> bool {
+    state.transitions.iter().any(|t| {
+        t.condition
+            .contains("implementation_closeout_readiness_v1.")
+    })
+}
+
 fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bool {
     task.agent.agent_id == "code_writer"
         && matches!(
@@ -5691,8 +5877,7 @@ fn is_health_fallback_eligible_task(
                 .any(|output| output == "proposal_current"))
         || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
         || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
-        || (agent_id == "prepush_code_reviewer"
-            && output_contract == Some("prepush_review_v1"))
+        || (agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1"))
 }
 
 fn is_health_fallback_source_provider(provider: &str) -> bool {
@@ -5790,7 +5975,11 @@ fn run_local_health_fallback_profile_candidates(
     }
     if agent_id == "security_checker" && output_contract == Some("security_report_v1") {
         if matches!(source_provider, "claude" | "claude_acp") {
-            return vec!["codex_architect_high", "codex_audit_high", "codex_writer_high"];
+            return vec![
+                "codex_architect_high",
+                "codex_audit_high",
+                "codex_writer_high",
+            ];
         }
         return vec!["claude_security_high", "claude_product_high"];
     }
@@ -6183,12 +6372,14 @@ fn build_task_prompt(
         parts.push(context.to_string());
     }
 
-    // Required outputs with resolved target paths — agent must write here
+    // Required outputs with resolved target paths. Agents return these through
+    // CHAINWORKS_OUTPUT; the engine validates and materializes canonical files.
     if !task.outputs.is_empty() {
         parts.push(String::from("\n### Required Outputs"));
         parts.push(String::from(
-            "Write each output to its canonical path below. \
-             Create parent directories if missing.",
+            "Return each required output through the final `CHAINWORKS_OUTPUT` \
+             object using the canonical path keys below; the engine will \
+             materialize canonical files after contract validation.",
         ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
@@ -6299,13 +6490,13 @@ fn build_task_prompt(
                  - Do NOT write files outside the worktree root.\n\
                  - Read source from the worktree, not the original workspace.\n\
                  - Do not commit, push, or modify git state.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Do not write run artifact outputs directly into the run meta-root; return them through `CHAINWORKS_OUTPUT`.\n\
                  - Do not rely on implicit working directory."
             ));
         } else {
             parts.push(String::from(
                 "- Use explicit absolute paths from the workspace root above.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Return required outputs through `CHAINWORKS_OUTPUT`; the engine materializes canonical files.\n\
                  - Do not rely on implicit working directory.\n\
                  - Do not perform git operations unless the task explicitly requests them.",
             ));
@@ -6316,14 +6507,14 @@ fn build_task_prompt(
                 "- Read source from the implementation worktree, not the original workspace.\n\
                  - Treat `Run meta-root (absolute)` as the only valid base for run artifacts; do not use `.chainworks/runs/...` relative to the implementation worktree.\n\
                  - Use meta-root input and output paths exactly as listed above.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Return required outputs through `CHAINWORKS_OUTPUT`; the engine materializes canonical files.\n\
                  - Do not rely on implicit working directory.\n\
                  - Do not perform git operations unless the task explicitly requests them.",
             ));
         } else {
             parts.push(String::from(
                 "- Use explicit absolute paths from the workspace root above.\n\
-                 - Write required outputs to the canonical paths listed in Required Outputs.\n\
+                 - Return required outputs through `CHAINWORKS_OUTPUT`; the engine materializes canonical files.\n\
                  - Do not rely on implicit working directory.\n\
                  - Do not perform git operations unless the task explicitly requests them.",
             ));
@@ -6571,43 +6762,24 @@ fn append_task_specific_guidance(
              contents, and continue with the smallest viable edit.",
         ));
         parts.push(String::from(
-            "Never emit shell commands that write required outputs into the run \
-             artifact directory. Required outputs must be returned only through \
-             the final JSON object envelope.",
-        ));
-        parts.push(String::from(
-            "Use exactly this final response shape, with no surrounding prose, \
-             markdown, or code fences:\n\
-             {\"CHAINWORKS_OUTPUT\":{\"<canonical path from Required Outputs>\":{...}}}",
+            "Do not write run artifact outputs directly into the run meta-root \
+             with shell commands. Required outputs must be returned through the \
+             final `CHAINWORKS_OUTPUT` JSON object so the engine can validate and \
+             materialize them.",
         ));
         parts.push(String::from(
             "Use the exact canonical output paths from Required Outputs as \
-             `CHAINWORKS_OUTPUT` keys. Do not use output names as keys unless \
-             a canonical path is unavailable.",
+             `CHAINWORKS_OUTPUT` keys. Output-name keys are accepted only as \
+             fallback when a canonical path is unavailable.",
         ));
         parts.push(String::from(
-            "Set `seemingly_complete` based only on remaining code-writer-owned \
-             source or test work.",
-        ));
-        parts.push(String::from(
-            "If the code changes and code-owned verification for the approved \
-             proposal are done, set `seemingly_complete` to true even when manual \
-             evidence, release evidence, documentation-only work, CloudKit \
-             signed-in smoke checks, calendar/go-no-go decisions, or other \
-             operator/ops tasks remain.",
-        ));
-        parts.push(String::from(
-            "Do not make cosmetic polishing edits or rerun already-green tests \
-             solely to avoid returning `seemingly_complete: true`.",
-        ));
-        parts.push(String::from(
-            "Put non-code blockers into `remaining_tasks` or `known_risks` as \
-             handoff tasks with owner labels.",
-        ));
-        parts.push(String::from(
-            "When useful, include optional JSON fields `remaining_code_tasks`, \
-             `handoff_tasks`, `blocked_by_non_code_evidence`, and \
-             `verification_green` in the implementation self-assessment.",
+            "Each `CHAINWORKS_OUTPUT` value must be the full JSON object for that \
+             output contract, including every field listed in Structured Output \
+             Requirements. For `implementation_self_assessment_v2`, use \
+             `implementation_complete`, `verification_green`, \
+             `remaining_code_tasks`, `handoff_tasks`, `known_risks`, \
+             `tests_run`, and `docs_impacted`; do not use legacy self-assessment \
+             field names.",
         ));
 
         // Source context: changed files manifest (Proposal 007 SourceContextBuilder).
@@ -6788,6 +6960,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: Some(format!(".chainworks/runs/{run_id}")),
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 
@@ -6812,6 +6985,7 @@ mod tests {
             catalog_snapshot_json: "{}".into(),
             dynamic_candidate_bindings: Vec::new(),
             run_plan_snapshot_format_version: None,
+            closeout_readiness_mode: None,
         }
     }
 
@@ -7422,6 +7596,107 @@ mod tests {
     }
 
     #[test]
+    fn code_writer_prompt_uses_envelope_output_contract_not_direct_meta_writes() {
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.worktree_root = Some("/workspace/.chainworks/worktrees/implementation".into());
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "implementation_progress".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/progress.json".into(),
+        );
+        plan.artifact_paths.insert(
+            "implementation_self_assessment".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json".into(),
+        );
+        plan.artifact_paths.insert(
+            "tests_result".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/tests-result.json".into(),
+        );
+        let mut task = reviewer_task();
+        task.agent.agent_id = "code_writer".into();
+        task.agent.worktree_write_enabled = true;
+        task.agent.output_contract = Some("implementation_self_assessment_v2".into());
+        task.task_name = "continue_implementation".into();
+        task.outputs = vec![
+            "implementation_progress".into(),
+            "implementation_self_assessment".into(),
+            "tests_result".into(),
+        ];
+        task.output_schemas.clear();
+        task.output_schemas.insert(
+            "implementation_progress".into(),
+            OutputSchema {
+                contract_id: "implementation_progress".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "status".into(),
+                    "current_phase".into(),
+                    "completed_items".into(),
+                    "deferred_items".into(),
+                    "notes".into(),
+                ],
+            },
+        );
+        task.output_schemas.insert(
+            "implementation_self_assessment".into(),
+            OutputSchema {
+                contract_id: "implementation_self_assessment_v2".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "status".into(),
+                    "implementation_complete".into(),
+                    "verification_green".into(),
+                    "remaining_code_tasks".into(),
+                    "handoff_tasks".into(),
+                    "known_risks".into(),
+                    "tests_run".into(),
+                    "docs_impacted".into(),
+                ],
+            },
+        );
+        task.output_schemas.insert(
+            "tests_result".into(),
+            OutputSchema {
+                contract_id: "tests_result_v1".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["status".into(), "summary".into()],
+            },
+        );
+
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+
+        assert!(
+            prompt.contains("Return each required output through the final `CHAINWORKS_OUTPUT`")
+        );
+        assert!(prompt.contains("the engine will materialize canonical files"));
+        assert!(prompt.contains("Do not write run artifact outputs directly"));
+        assert!(prompt.contains("implementation_complete"));
+        assert!(prompt.contains("remaining_code_tasks"));
+        assert!(!prompt.contains("Write each output to its canonical path below"));
+        assert!(!prompt
+            .contains("Write required outputs to the canonical paths listed in Required Outputs"));
+        assert!(!prompt.contains("<canonical path from Required Outputs>"));
+        assert!(!prompt.contains("seemingly_complete"));
+        assert!(!prompt.contains("remaining_tasks"));
+    }
+
+    #[test]
     fn declared_output_target_path_uses_task_alias_not_normalized_identity() {
         let run_id = RunId::new();
         let run = test_run(run_id);
@@ -7831,7 +8106,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let wf_path = temp_dir.path().join("wf.yaml");
         let cat_path = temp_dir.path().join("catalog.yaml");
-        std::fs::write(&wf_path, "
+        std::fs::write(
+            &wf_path,
+            "
 workflow:
   id: test_wf
 initial_state: state_9
@@ -7848,8 +8125,12 @@ states:
     transitions:
       - to: state_9
         when: 'true'
-").unwrap();
-        std::fs::write(&cat_path, "
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &cat_path,
+            "
 agents:
   - id: reviewer
     backend_profile: reviewer_profile
@@ -7869,7 +8150,9 @@ contracts:
     format: json
 permission_profiles:
   default: {}
-").unwrap();
+",
+        )
+        .unwrap();
 
         let run_id = RunId::new();
         let mut run = test_run(run_id);
@@ -7900,7 +8183,9 @@ permission_profiles:
             recovery_snapshot_json: None,
             retry_reason: None,
         };
-        db::repos::stages::insert(&pool, &failed_state_9).await.unwrap();
+        db::repos::stages::insert(&pool, &failed_state_9)
+            .await
+            .unwrap();
 
         // 2. Successful stage for state_10 (more recent)
         let completed_state_10 = StageExecution {
@@ -7923,16 +8208,25 @@ permission_profiles:
             recovery_snapshot_json: None,
             retry_reason: None,
         };
-        db::repos::stages::insert(&pool, &completed_state_10).await.unwrap();
+        db::repos::stages::insert(&pool, &completed_state_10)
+            .await
+            .unwrap();
 
         // Advance workflow
         orchestrator.advance_run(run_id).await.unwrap();
 
         // Check if a NEW stage for state_9 was created
         let all_stages = db::repos::stages::list_by_run(&pool, run_id).await.unwrap();
-        let state_9_stages: Vec<_> = all_stages.iter().filter(|s| s.stage_id == "state_9").collect();
+        let state_9_stages: Vec<_> = all_stages
+            .iter()
+            .filter(|s| s.stage_id == "state_9")
+            .collect();
 
-        assert_eq!(state_9_stages.len(), 2, "Should have created a new stage for state_9 because the old one is stale");
+        assert_eq!(
+            state_9_stages.len(),
+            2,
+            "Should have created a new stage for state_9 because the old one is stale"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

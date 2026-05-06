@@ -1705,6 +1705,17 @@ fn is_reused_live_session_transport_error(message: &str) -> bool {
         || lower.contains("session closed during active prompt")
 }
 
+fn should_keep_invocation_session_alive(policy_session_present: bool) -> bool {
+    policy_session_present
+}
+
+fn should_reuse_existing_invocation_session(
+    policy_should_reuse_live_session: bool,
+    xcode_shim_required: bool,
+) -> bool {
+    policy_should_reuse_live_session && !xcode_shim_required
+}
+
 fn is_active_prompt_closed_transport_error(message: &str) -> bool {
     message
         .to_ascii_lowercase()
@@ -3763,12 +3774,16 @@ impl BackgroundExecutor {
                     worktree_strategy,
                     expected_output_paths,
                     expected_outputs: expected_outputs.clone(),
-                    keep_session_alive: policy_decision.is_some() && !xcode_shim_required,
-                    reuse_existing_session: policy_decision
-                        .as_ref()
-                        .map(|decision| decision.should_reuse_live_session)
-                        .unwrap_or(false)
-                        && !xcode_shim_required,
+                    keep_session_alive: should_keep_invocation_session_alive(
+                        policy_decision.is_some(),
+                    ),
+                    reuse_existing_session: should_reuse_existing_invocation_session(
+                        policy_decision
+                            .as_ref()
+                            .map(|decision| decision.should_reuse_live_session)
+                            .unwrap_or(false),
+                        xcode_shim_required,
+                    ),
                     session_generation_id: policy_decision
                         .as_ref()
                         .map(|decision| decision.generation.id.clone()),
@@ -6847,6 +6862,7 @@ fn prompt_with_runtime_invocation_contract(
          keys. You must not finish this turn without `CHAINWORKS_OUTPUT` when required outputs are \
          listed.\n",
     );
+    append_chainworks_output_contract_example(&mut prompt, input.declared_outputs);
     append_docs_noop_contract_guidance(&mut prompt, input.declared_outputs);
     prompt
 }
@@ -6872,13 +6888,13 @@ fn append_status_allowed_values_for_declared_output(prompt: &mut String, output:
 }
 
 fn append_docs_noop_contract_guidance(prompt: &mut String, declared_outputs: &[DeclaredOutput]) {
-    let has_docs_report = declared_outputs
+    let docs_report = declared_outputs
         .iter()
-        .any(|output| output.output_name == "docs_report");
-    let has_docs_delta = declared_outputs
+        .find(|output| output.output_name == "docs_report");
+    let docs_delta = declared_outputs
         .iter()
-        .any(|output| output.output_name == "docs_delta");
-    if !(has_docs_report || has_docs_delta) {
+        .find(|output| output.output_name == "docs_delta");
+    if docs_report.is_none() && docs_delta.is_none() {
         return;
     }
 
@@ -6886,15 +6902,111 @@ fn append_docs_noop_contract_guidance(prompt: &mut String, declared_outputs: &[D
         "\nDocumentation no-op is a valid structured result. If documentation is already aligned, \
          still emit the required outputs instead of omitting them:\n",
     );
-    if has_docs_report {
-        prompt.push_str(
-            "<<<CHAINWORKS_OUTPUT:docs_report>>>{\"status\":\"not_needed\",\"changed_docs\":[],\"missing_docs\":[],\"followups\":[]}<<<END_CHAINWORKS_OUTPUT>>>\n",
+    let mut outputs = serde_json::Map::new();
+    if let Some(output) = docs_report {
+        outputs.insert(
+            output.target_path.clone(),
+            serde_json::json!({
+                "status": "not_needed",
+                "changed_docs": [],
+                "missing_docs": [],
+                "followups": []
+            }),
         );
     }
-    if has_docs_delta {
-        prompt.push_str(
-            "<<<CHAINWORKS_OUTPUT:docs_delta>>>{\"files\":[],\"summary\":\"No documentation changes required.\"}<<<END_CHAINWORKS_OUTPUT>>>\n",
+    if let Some(output) = docs_delta {
+        outputs.insert(
+            output.target_path.clone(),
+            serde_json::json!({
+                "files": [],
+                "summary": "No documentation changes required."
+            }),
         );
+    }
+    let example = serde_json::json!({ "CHAINWORKS_OUTPUT": outputs });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
+    }
+}
+
+fn append_chainworks_output_contract_example(
+    prompt: &mut String,
+    declared_outputs: &[DeclaredOutput],
+) {
+    let example = chainworks_output_contract_example(declared_outputs);
+    if example.is_empty() {
+        return;
+    }
+    prompt.push_str(
+        "\nExample `CHAINWORKS_OUTPUT` skeleton. Replace placeholder values with truthful values, \
+         but keep every required field for each contract:\n",
+    );
+    let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
+    }
+}
+
+fn chainworks_output_contract_example(
+    declared_outputs: &[DeclaredOutput],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut outputs = serde_json::Map::new();
+    for output in declared_outputs {
+        outputs.insert(
+            output.target_path.clone(),
+            declared_output_contract_example_value(output),
+        );
+    }
+    outputs
+}
+
+fn declared_output_contract_example_value(output: &DeclaredOutput) -> serde_json::Value {
+    let Some(schema) = output.schema.as_ref() else {
+        return serde_json::Value::String(format!("<{} content>", output.output_name));
+    };
+
+    let mut object = serde_json::Map::new();
+    for field in &schema.required_fields {
+        object.insert(
+            field.clone(),
+            contract_example_field_value(&schema.contract_id, field),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+fn contract_example_field_value(contract_id: &str, field: &str) -> serde_json::Value {
+    match field {
+        "status" => serde_json::Value::String(
+            contract_status_allowed_values(contract_id)
+                .and_then(|values| values.first().copied())
+                .unwrap_or("complete")
+                .to_string(),
+        ),
+        "implementation_complete"
+        | "verification_green"
+        | "blocking"
+        | "blocking_review"
+        | "blocked_by_non_code_evidence" => serde_json::Value::Bool(false),
+        "completed_items"
+        | "deferred_items"
+        | "remaining_code_tasks"
+        | "handoff_tasks"
+        | "known_risks"
+        | "tests_run"
+        | "docs_impacted"
+        | "changed_docs"
+        | "missing_docs"
+        | "followups"
+        | "files"
+        | "changed_files"
+        | "commands"
+        | "validation_errors"
+        | "code_blockers"
+        | "handoff_blockers" => serde_json::Value::Array(Vec::new()),
+        _ => serde_json::Value::String(String::new()),
     }
 }
 
@@ -6940,12 +7052,33 @@ fn output_contract_repair_prompt(
         }
         prompt.push('\n');
     }
-    prompt.push_str("\nRequired corrected output envelopes:\n");
-    for output in declared_outputs {
-        prompt.push_str(&format!("<<<CHAINWORKS_OUTPUT:{}>>>\n", output.output_name));
+    prompt.push_str(
+        "\nReturn exactly one final JSON object. Use canonical target paths as \
+         `CHAINWORKS_OUTPUT` keys; output-name keys are accepted only as fallback:\n",
+    );
+    let failed_outputs: Vec<DeclaredOutput> = declared_outputs
+        .iter()
+        .filter(|output| {
+            validation.output_results.iter().any(|result| {
+                result.output_name == output.output_name
+                    && result.status != domain::validation::ValidationStatus::Passed
+            })
+        })
+        .cloned()
+        .collect();
+    let outputs_for_example = if failed_outputs.is_empty() {
+        declared_outputs.to_vec()
+    } else {
+        failed_outputs
+    };
+    for output in &outputs_for_example {
         append_status_allowed_values_for_declared_output(&mut prompt, output);
-        prompt.push_str("{ /* valid JSON matching the declared contract */ }\n");
-        prompt.push_str("<<<END_CHAINWORKS_OUTPUT>>>\n");
+    }
+    let example_outputs = chainworks_output_contract_example(&outputs_for_example);
+    let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example_outputs });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
     }
     append_docs_noop_contract_guidance(&mut prompt, declared_outputs);
     prompt
@@ -7045,6 +7178,10 @@ mod tests {
         assert!(prompt.contains("stale"));
         assert!(prompt.contains("CHAINWORKS_OUTPUT"));
         assert!(prompt.contains("must not finish this turn without"));
+        assert!(prompt.contains(
+            "\"/workspace/.chainworks/runs/run-1/proposals/current.md\":\"<proposal_current content>\""
+        ));
+        assert!(!prompt.contains("{\"status\":\"complete\"}"));
     }
 
     #[test]
@@ -7083,9 +7220,60 @@ mod tests {
         );
 
         assert!(prompt.contains("\"status\":\"not_needed\""));
-        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:docs_report>>>"));
-        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:docs_delta>>>"));
+        assert!(prompt.contains("\"CHAINWORKS_OUTPUT\""));
+        assert!(prompt.contains("\"/workspace/.chainworks/docs/report.json\""));
+        assert!(prompt.contains("\"/workspace/.chainworks/docs/changed-files.json\""));
+        assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:docs_report>>>"));
+        assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:docs_delta>>>"));
         assert!(prompt.contains("\"files\":[]"));
+    }
+
+    #[test]
+    fn runtime_invocation_contract_includes_contract_complete_skeletons() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "implementation_progress".to_string(),
+            target_path: "/workspace/.chainworks/implementation/progress.json".to_string(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "implementation_progress".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "status".to_string(),
+                    "current_phase".to_string(),
+                    "completed_items".to_string(),
+                    "deferred_items".to_string(),
+                    "notes".to_string(),
+                ],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Implement".to_string(),
+            RuntimeInvocationContractInput {
+                run_id: RunId::new().to_string(),
+                stage_id: "state_8_implemented".to_string(),
+                stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
+                agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                work_item_id: "work-code".to_string(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        assert!(prompt.contains("Example `CHAINWORKS_OUTPUT` skeleton"));
+        assert!(prompt.contains("\"current_phase\":\"\""));
+        assert!(prompt.contains("\"completed_items\":[]"));
+        assert!(prompt.contains("\"deferred_items\":[]"));
+        assert!(prompt.contains("\"notes\":\"\""));
+        assert!(!prompt.contains("{\"status\":\"complete\"}"));
     }
 
     #[test]
@@ -7122,8 +7310,137 @@ mod tests {
         ));
         assert!(prompt.contains("implementation_review_summary"));
         assert!(prompt.contains("required output was not produced"));
-        assert!(prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
+        assert!(prompt.contains(
+            "{\"CHAINWORKS_OUTPUT\":{\"/workspace/.chainworks/review/implementation-summary.json\""
+        ));
+        assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
         assert!(prompt.contains("Do not redo unrelated implementation work"));
+    }
+
+    #[test]
+    fn output_contract_repair_prompt_uses_contract_complete_skeletons() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: "/workspace/.chainworks/implementation/progress.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_progress".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "current_phase".to_string(),
+                        "completed_items".to_string(),
+                        "deferred_items".to_string(),
+                        "notes".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: "/workspace/.chainworks/implementation/self-assessment.json"
+                    .to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_self_assessment_v2".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "implementation_complete".to_string(),
+                        "verification_green".to_string(),
+                        "remaining_code_tasks".to_string(),
+                        "handoff_tasks".to_string(),
+                        "known_risks".to_string(),
+                        "tests_run".to_string(),
+                        "docs_impacted".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "tests_result".to_string(),
+                target_path: "/workspace/.chainworks/implementation/tests-result.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "tests_result_v1".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string(), "summary".to_string()],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let validation = TaskValidationSummary {
+            output_results: declared_outputs
+                .iter()
+                .map(|output| domain::validation::OutputValidationResult {
+                    output_name: output.output_name.clone(),
+                    contract_id: output
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.contract_id.clone()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: output
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.required_fields.clone())
+                        .unwrap_or_default(),
+                    validation_error: Some("missing required fields".to_string()),
+                    raw_payload_size: 8,
+                })
+                .collect(),
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("missing required fields".to_string()),
+        };
+
+        let prompt = output_contract_repair_prompt(&validation, &declared_outputs);
+
+        assert!(prompt.contains("\"current_phase\":\"\""));
+        assert!(prompt.contains("\"completed_items\":[]"));
+        assert!(prompt.contains("\"deferred_items\":[]"));
+        assert!(prompt.contains("\"notes\":\"\""));
+        assert!(prompt.contains("\"implementation_complete\":false"));
+        assert!(prompt.contains("\"verification_green\":false"));
+        assert!(prompt.contains("\"remaining_code_tasks\":[]"));
+        assert!(prompt.contains("\"handoff_tasks\":[]"));
+        assert!(prompt.contains("\"known_risks\":[]"));
+        assert!(prompt.contains("\"tests_run\":[]"));
+        assert!(prompt.contains("\"docs_impacted\":[]"));
+        assert!(prompt.contains("\"summary\":\"\""));
+        assert!(prompt.contains("\"status\":\"green\""));
+        assert!(!prompt.contains("{\"status\":\"complete\"}"));
+    }
+
+    #[test]
+    fn output_contract_repair_keeps_xcode_shim_session_alive_without_cross_invocation_reuse() {
+        assert!(
+            should_keep_invocation_session_alive(true),
+            "output contract repair needs the just-finished session even when Xcode shim was used"
+        );
+        assert!(
+            !should_reuse_existing_invocation_session(true, true),
+            "Xcode shim sessions remain isolated across separate invocation claims"
+        );
     }
 
     #[test]

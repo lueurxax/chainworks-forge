@@ -1,6 +1,6 @@
 {
   "schema_version": "p031-phase-0-artifact-manifest-v1",
-  "status": "phase0d_runtime_evidence_attached_phase3_dogfood_signoff_pending",
+  "status": "closeout_ready_with_ui_polish_deferred",
   "entries": [
     {
       "id": "governing_contract",
@@ -48,7 +48,14 @@
       "id": "degraded_state_evidence",
       "path": "docs/evidence/p031-degraded-state-evidence.md",
       "owner_role": "P031 release owner",
-      "validation_status": "ready_with_scripted_drill_or_waiver_pending",
+      "validation_status": "ready_scripted_drill_verified",
+      "blocking_phase": "Phase 0d"
+    },
+    {
+      "id": "degraded_state_remote_ui_drill",
+      "path": "docs/evidence/p031-runtime/p031-degraded-state-remote-ui-drill-2026-05-05.json",
+      "owner_role": "P031 macOS thin UI owner",
+      "validation_status": "ready_scripted_drill_verified",
       "blocking_phase": "Phase 0d"
     },
     {
@@ -62,7 +69,7 @@
       "id": "freshness_baseline",
       "path": "docs/evidence/p031-freshness-baseline.md",
       "owner_role": "P031 macOS thin UI owner",
-      "validation_status": "ready_with_dogfood_confirmation_pending",
+      "validation_status": "ready_release_owner_accepted",
       "blocking_phase": "Phase 0d"
     },
     {
@@ -83,7 +90,7 @@
       "id": "ux_accessibility_signoff",
       "path": "docs/evidence/p031-ux-accessibility-signoff.md",
       "owner_role": "P031 macOS thin UI owner",
-      "validation_status": "validated_with_assistive_access_limitation",
+      "validation_status": "signed_human_accessibility_check",
       "blocking_phase": "Phase 0d"
     },
     {
@@ -99,7 +106,7 @@
       "id": "dogfood_signoff_template",
       "path": "docs/evidence/p031-dogfood-signoff.md",
       "owner_role": "P031 release owner",
-      "validation_status": "ready_template_with_runtime_prereqs_attached",
+      "validation_status": "signed_with_ui_polish_deferred",
       "blocking_phase": "Phase 3"
     }
   ]

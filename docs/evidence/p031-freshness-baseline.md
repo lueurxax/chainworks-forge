@@ -1,10 +1,10 @@
 # P031 Freshness Baseline
 
-Status: READY_WITH_DOGFOOD_CONFIRMATION_PENDING
+Status: READY_RELEASE_OWNER_ACCEPTED
 Owner: P031 macOS thin UI owner
 Blocking Phase: Phase 0d
 Blocker Recorded: 2026-04-24
-Last Updated: 2026-04-25T04:27:00Z
+Last Updated: 2026-05-05T22:42:00+03:00
 
 ## Required Measurements
 
@@ -37,9 +37,10 @@ The live app rendered restored run rows and server freshness badges. This confir
 Limitations:
 
 - This is not the Phase 3 two-run dogfood signoff.
-- The measurement did not force a synthetic projection-lag condition; lag/stale behavior remains covered by static/API tests and needs dogfood/degraded-state confirmation.
+- The measurement did not force a synthetic projection-lag condition; lag/stale behavior remains covered by static/API tests and the scripted remote degraded-state drill.
 - Approval diagnostic comprehension was not measured because there were no pending approval rows in the current copied DB.
+- The release owner accepted this freshness baseline for P031 technical closeout on 2026-05-05, with broader operator dogfood and UI polish deferred to follow-up proposals P036/P085.
 
 ## Results
 
-Phase 0d freshness baseline is attached for the restored local packaged daemon. Dogfood-specific freshness confirmation remains open for Phase 3.
+Phase 0d freshness baseline is attached for the restored local packaged daemon and accepted for P031 technical closeout.

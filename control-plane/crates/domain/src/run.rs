@@ -152,4 +152,9 @@ pub struct Run {
     /// Controls how proposal reviewers are selected for this run.
     /// NULL for runs that use legacy fixed routing.
     pub review_routing_json: Option<String>,
+    // ── P077: Frozen closeout readiness mode ────────────────────────────
+    /// Closeout readiness mode frozen from workflow snapshot metadata at run admission.
+    /// NULL → LegacyFallbackAdvisory (accessor default).
+    /// Values: "advisory" | "enforcement"
+    pub closeout_readiness_mode: Option<String>,
 }

@@ -47,7 +47,7 @@ This slice proves the control-plane model without introducing writable repo side
 - live-mode execution for the proposal loop only
 - `RuntimeAgentExecutor`, `RuntimeSessionBridge`, runtime adapters, and `ExecutionEventBridge`
 - fixture-backed live transport used by the app and tests
-- read-only/diagnostic Start Run, Run Progress, approval, and artifact-inspection surfaces (per P031-r18)
+- read-only/diagnostic Start Run, Run Progress, approval, and artifact-inspection surfaces over the governed thin UI boundary
 - durable transcript, receipt, proposal, review, and summary artifacts
 - fail-closed read-only launch policy
 - structured artifact validation before success and transition evaluation
@@ -206,7 +206,7 @@ The point is to make a live run inspectable after the fact without relying on hi
 
 ### 7.1 Start Run
 
-The Start Run surface (Diagnostic-only placeholder in P031) exposes:
+The Start Run surface exposes diagnostic-only guidance:
 
 - workflow selection
 - simulated vs live mode
@@ -217,7 +217,7 @@ The Start Run surface (Diagnostic-only placeholder in P031) exposes:
 
 ### 7.2 Run Progress
 
-The live run surface (GraphQL read-only in P031) keeps the important state above the fold:
+The live run surface keeps GraphQL read-only state above the fold:
 
 - current phase
 - live agent activity

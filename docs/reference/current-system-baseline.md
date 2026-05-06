@@ -23,7 +23,7 @@ At the current baseline, the product includes:
 
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
-- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections,
+- GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections,
 - lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - DbWriter scaffold and evidence spool metadata schema (P075 Phase 1; runtime routing, file spooling, and storageHealth diagnostics deferred to Phases 2–8),

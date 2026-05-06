@@ -580,6 +580,8 @@ mod tests {
             origin_stage_id: None,
             origin_stage_execution_id: None,
             mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
         }
     }
 }

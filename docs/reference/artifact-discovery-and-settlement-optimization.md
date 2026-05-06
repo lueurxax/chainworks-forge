@@ -52,7 +52,8 @@ Policy construction and high-level discovery coordination remain engine-owned.
 | Boundary | Rule |
 |---|---|
 | **Meta-root** | Discovery is restricted to the run-owned meta-root directory. |
-| **Exact-path outputs** | Only declared expected output paths are read back from the workspace/worktree. |
+| **Declared outputs** | Agent-authored required outputs should arrive through final `CHAINWORKS_OUTPUT`; the engine validates and materializes them to declared target paths. |
+| **Exact-path outputs** | Only declared expected output paths are read back from the workspace/worktree as bounded compatibility evidence. |
 | **Broad discovery** | Repository, workspace, and worktree-wide scanning is removed from the default path. |
 
 ### Generated-State Exclusion Denylist
@@ -116,7 +117,7 @@ The engine-owned settlement pipeline converts discovery decisions into active ar
 
 ### Output Caps and Rejection
 
-Declared-output byte caps and aggregate caps apply to provider envelopes, `CHAINWORKS_OUTPUT` payloads, and exact-path outputs. Over-cap outputs are rejected with `oversized_rejection`.
+Declared-output byte caps and aggregate caps apply to provider envelopes, `CHAINWORKS_OUTPUT` payloads, and exact-path outputs. Over-cap outputs are rejected with `oversized_rejection`. When both `CHAINWORKS_OUTPUT` and exact-path filesystem content are available for the same declared output, the engine-owned envelope payload is the primary candidate and exact-path content remains diagnostic compatibility evidence.
 
 ### Output Discovery Decisions
 

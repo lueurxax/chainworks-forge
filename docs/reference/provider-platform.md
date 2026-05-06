@@ -198,7 +198,7 @@ Overrides apply to the current run only and never mutate YAML/catalog definition
 
 ## Preflight and diagnostics
 
-The operator should learn about problems before issuing a run command externally. In P031, the macOS UI provides diagnostic preflight readback but does not host the `Start Run` action.
+The operator should learn about problems before issuing a run command externally. The governed macOS UI provides diagnostic preflight readback but does not host the `Start Run` action.
 
 Preflight categories:
 

@@ -22,6 +22,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), persisted runtime truth, provider toolchain cache mapping, and capacity management
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, and durable validation-failure substrate
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
+- [p077-rollout-dependency-evidence.md](p077-rollout-dependency-evidence.md) — Proposal 077 dependency checklist, rollout metric ledger, expansion decision fields, and rollback evidence contract
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
@@ -40,11 +41,12 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
 - [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs Home, reports, recovery guidance, comparison, artifact inspection, notifications, **mediation resolution**, backpressure visibility, and host interruption labels
-- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls (P031)
+- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) — Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
+- [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — P077 closeout-readiness token, contrast, diagnostic, and accessibility evidence
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
 - [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, and `delivery_receipt` settlement

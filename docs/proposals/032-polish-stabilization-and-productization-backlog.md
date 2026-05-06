@@ -76,20 +76,17 @@ It is supposed to stay partially open and grow over time.
 - migration docs
 - internal troubleshooting docs
 
-### 2.8 P031 stop-tail stabilization
+### 2.8 Thin UI productization and dogfood
 
-P031 is stopped at the GraphQL-only read-boundary cutover, and that boundary is now treated as repository truth through [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). The following tails move here instead of keeping P031 open:
+The GraphQL-only read boundary is implemented and documented as repository truth in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). The technical closeout evidence is complete; this backlog owns the remaining productization and operator-acceptance work over that boundary.
 
-- Phase 3 dogfood/sign-off for the thin read UI after P036 restores enough operator ergonomics to dogfood honestly.
-- Degraded-state drill or explicit release-owner waiver for daemon/schema/projection unavailable states.
-- Human VoiceOver/Assistive Access spot check or explicit dated waiver.
-- Projection freshness evidence, including p50/p95 read freshness under representative local runs.
-- Release-readiness evidence for daemon lifecycle behavior, schema mismatch detection, and the operator-facing "update daemon" flow.
-- Documentation cleanup after the P031 stop decision, including references that still imply P031 must restore full visual parity or interactive write paths.
-- Readiness gate cleanup so `proposal-031-readiness` can distinguish architectural cutover evidence from deferred product polish.
-- Audit closeout notes that explain why visual polish moved to P036 and why remaining write-path restoration requires separate transport proposals.
+- Honest operator dogfood after P036 restores enough inspection ergonomics to evaluate real workflows.
+- Follow-up workflow-completion notes from the release-owner sign-off.
+- Release-candidate readiness for daemon lifecycle behavior, schema mismatch detection, and the operator-facing update-daemon flow.
+- Productization of the read-only write-path guidance so operators understand which actions are external, unavailable, or approval-only.
+- Coordination with later write-path proposals when create/start/cancel/retry/reset/clone/recover/context actions need approved transports.
 
-These items are stabilization/productization work. They must not reintroduce MCP reads/writes, GraphQL mutations, local workflow truth, or old Swift-local execution paths into the governed macOS UI.
+These items are stabilization/productization work. They must not reintroduce MCP reads/writes, non-approval GraphQL mutations, local workflow truth, or old Swift-local execution paths into the governed macOS UI.
 
 ## 3. How to use this proposal
 

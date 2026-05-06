@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | [068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md](068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md), [ui-action-boundary.md](../reference/ui-action-boundary.md), [current-system-baseline.md](../reference/current-system-baseline.md) |
-| Related | P031, P072, PR #3 review findings from 2026-04-29 |
+| Related | GraphQL thin UI read boundary, P072, PR #3 review findings from 2026-04-29 |
 | Scope | Define a single executable boundary matrix for caller identity, transport, authoritative record, allowed actions, deny behavior, read-model deltas, and proof tests across MCP, GraphQL, auth, approvals, and UI affordances. |
 | Goal | Stop boundary drift before another UI-write or approval-actionability slice by making every caller/transport/action combination explicit and testable. |
 

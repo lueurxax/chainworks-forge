@@ -9,8 +9,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, ideas, projections, runs, steward as steward_repo,
-    workflow_conflicts,
+    approvals, artifact_contracts, artifacts, closeout, ideas, projections, runs,
+    steward as steward_repo, workflow_conflicts,
 };
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
 use domain::events::DomainEvent;
@@ -143,6 +143,14 @@ async fn enrich_run_with_artifact_contracts(
     gql.knowledge_capsule_readback_json = Some(async_graphql::Json(
         proposal_064_knowledge_capsule_readback(pool, run_id).await?,
     ));
+    // P077: Populate closeout readiness summary via CloseoutReadinessSummaryAccessor.
+    if let Some(summary) =
+        closeout::load_closeout_readiness_summary(pool, &run_id.to_string()).await?
+    {
+        let summary_json = async_graphql::Json(serde_json::to_value(&summary)?);
+        gql.closeout_readiness_summary_json = Some(summary_json.clone());
+        gql.implementation_closeout_readiness_summary = Some(summary_json);
+    }
     Ok(())
 }
 
@@ -840,6 +848,13 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     } else {
         None
     };
+    // P077: Populate closeout readiness summary via CloseoutReadinessSummaryAccessor.
+    let run_id_str = run_id.to_string();
+    if let Some(summary) = closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
+        let summary_json = async_graphql::Json(serde_json::to_value(&summary)?);
+        run.closeout_readiness_summary_json = Some(summary_json.clone());
+        run.implementation_closeout_readiness_summary = Some(summary_json);
+    }
     Ok(run)
 }
 
@@ -1838,6 +1853,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

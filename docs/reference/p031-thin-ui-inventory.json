@@ -3,6 +3,10 @@
   "status": "ready",
   "governed_swift_files": [
     {
+      "path": "Chainworks Forge/ContentView.swift",
+      "description": "Top-level tab shell and P031 compatibility/daemon-backed Ideas route selection; normal Ideas reads daemon projections while UI-test fixtures remain isolated behind explicit seed environment."
+    },
+    {
       "path": "Chainworks Forge/Views/RunsHomeView.swift",
       "description": "Primary GraphQL-only run list and run detail shell."
     },
@@ -26,6 +30,7 @@
       "owner": "P031GraphQLDocuments",
       "operation_names": [
         "P031RunsHome",
+        "P031Ideas",
         "P031RunDetail",
         "P031StageDetail",
         "P031Stages",
@@ -252,6 +257,12 @@
       "group_id": "removed_write_controls",
       "line_contains": "(\"runs.start\", [\"idea_id\"]),",
       "reason": "The write-path guide decoder enumerates removed controls as contract data."
+    },
+    {
+      "path": "Chainworks Forge/ContentView.swift",
+      "group_id": "removed_write_controls",
+      "line_contains": "Button(\"Start Run\") {}",
+      "reason": "This button is confined to the P031 UI-test compatibility fixture selected only by explicit CHAINWORKS_UI_TEST_* seed environment; normal Ideas routing uses daemon-backed GraphQL reads."
     },
     {
       "path": "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift",

@@ -26,6 +26,7 @@
 //   a lifecycle state — §5.3 forbids that).
 
 import Combine
+import Darwin
 import Foundation
 
 // MARK: - Wire types (mirror domain::lifecycle)
@@ -276,6 +277,15 @@ func daemonJSONDecoder() -> JSONDecoder {
 
 // MARK: - Port file (§7.3)
 
+private enum ChainworksUserHome {
+    static func url() -> URL {
+        if let entry = getpwuid(getuid()) {
+            return URL(fileURLWithPath: String(cString: entry.pointee.pw_dir), isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+}
+
 nonisolated enum DaemonPortFileError: Error, Equatable, CustomStringConvertible {
     case empty(url: URL)
     case nonUtf8(url: URL)
@@ -301,8 +311,7 @@ nonisolated struct DaemonPortFile {
     }
 
     static func appSupportDirectory() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
+        ChainworksUserHome.url()
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
             .appendingPathComponent("Chainworks Forge", isDirectory: true)
@@ -365,11 +374,11 @@ struct DaemonClientEndpoint: Sendable, Equatable {
     var baseURL: URL
     var bearerToken: String
 
-    var graphqlURL: URL {
+    nonisolated var graphqlURL: URL {
         baseURL.appendingPathComponent("graphql", isDirectory: false)
     }
 
-    var graphqlWSURL: URL {
+    nonisolated var graphqlWSURL: URL {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
         components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
         components.path = "/graphql/ws"
@@ -910,8 +919,12 @@ enum DaemonOperatorTokenStore {
     /// `class == "operator"`. Returns `nil` when the file is absent,
     /// malformed, or contains no operator.
     static func resolveOperatorToken() -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let path = home
+        if let token = ProcessInfo.processInfo.environment["CHAINWORKS_OPERATOR_BEARER_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty {
+            return token
+        }
+        let path = ChainworksUserHome.url()
             .appendingPathComponent(".chainworks", isDirectory: true)
             .appendingPathComponent("auth", isDirectory: true)
             .appendingPathComponent("principals.json", isDirectory: false)
@@ -964,8 +977,10 @@ final class DaemonStatusViewModel: ObservableObject {
             self.status = try await client.snapshot()
             self.lastError = nil
         } catch let error as DaemonClientError {
+            self.status = nil
             self.lastError = error
         } catch {
+            self.status = nil
             self.lastError = .transport(error)
         }
     }

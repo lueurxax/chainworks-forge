@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | [execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md), [078-durable-side-effect-ledger-release-settlement-and-reconciliation.md](078-durable-side-effect-ledger-release-settlement-and-reconciliation.md), [081-boundary-first-api-auth-contract-matrix.md](081-boundary-first-api-auth-contract-matrix.md) |
-| Related | P017 closure follow-ups, P031 artifact hierarchy, P064, P072 approval provenance findings |
+| Related | P017 closure follow-ups, thin UI artifact hierarchy, P064, P072 approval provenance findings |
 | Scope | Define single-source ownership for lifecycle identifiers and artifact linkage, then add invariant tests proving downstream code does not trust caller-owned copies. |
 | Goal | Stop provenance and lineage drift from appearing after implementation is nominally complete. |
 

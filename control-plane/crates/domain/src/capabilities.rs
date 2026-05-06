@@ -24,6 +24,8 @@ pub enum CapabilityToolId {
     StewardRunAnalysis,
     StewardListAnalyses,
     StewardGetAnalysis,
+    /// P077: settle a proposal gate result via runs.settle_proposal_gate.
+    ProposalGateSettle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

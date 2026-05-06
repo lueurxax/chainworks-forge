@@ -143,7 +143,7 @@ Run surfaces must distinguish:
 
 A run with `cancellation_requested_at != nil` and `cancellation_settled_at == nil` is not allowed to present as ordinary terminal `cancelled`.
 
-The operator path for stopping a run (P031 external workflow):
+The operator path for stopping a run from the governed thin UI:
 
 1. open idea in the macOS UI,
 2. copy `run_id` or `diagnosticId` from the diagnostic banner,

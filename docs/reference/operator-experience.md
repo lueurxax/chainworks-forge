@@ -194,7 +194,7 @@ Report content includes:
 
 ### Recovery
 
-The governed thin UI does not execute non-approval recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing MCP-owned workflows. See the [Operator Write-Path Guide (P031)](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
+The governed thin UI does not execute non-approval recovery actions. Instead, it provides diagnostic identifiers to assist operators in executing MCP-owned workflows. See the [Governed Thin UI External Write-Path Guide](p031-operator-write-path-guide.md) for a complete mapping of removed controls to external workflows.
 
 Diagnostic guidance is provided for:
 1. `Retry Agent`

@@ -13,6 +13,12 @@ If you are new to the repo, read these in order:
 5. [reference/README.md](reference/README.md) — implemented-system reference index
 6. [../examples/README.md](../examples/README.md) — runnable YAML examples and presets
 
+## Planning and Roadmap
+
+- [ROADMAP.md](ROADMAP.md) — short active sequencing index
+- [roadmap/](roadmap) — dated roadmap updates and planning context
+- [roadmap/2026-05-06-main-roadmap-update.md](roadmap/2026-05-06-main-roadmap-update.md) — current sequencing update after the latest `main` stabilization work
+
 ## Features
 
 The canonical source of truth for implemented behavior is [`reference/`](reference). High-signal entry points grouped by feature area:
@@ -48,7 +54,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Outputs, contracts, and feedback
 
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, narrow recovery
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, bounded closeout readiness (Proposal 077), failed-stage evidence, narrow recovery
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry
 
@@ -66,7 +72,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/ui-action-boundary.md](reference/ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
-- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls
+- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Workflow topology and agent-activity surface
@@ -96,7 +102,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 Design intent and work-in-progress lives under [`proposals/`](proposals). When a proposal reaches implemented/ready status, its content is folded into `reference/` and the proposal file is retired.
 
-The durable thin UI boundary has been folded into [`reference/query-projections-and-client-consumption-contract.md`](reference/query-projections-and-client-consumption-contract.md). New macOS UI proposals should depend on that reference contract and the P032/P036 handoff docs rather than treating historical proposal text as the active architecture source.
+The durable thin UI boundary lives in [`reference/query-projections-and-client-consumption-contract.md`](reference/query-projections-and-client-consumption-contract.md). New macOS UI proposals should depend on that reference contract and the UI action boundary, not on retired proposal text.
 
 ## Examples
 

@@ -1,14 +1,15 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use db::repos::{artifact_contracts, legacy_discovery_overrides, projections, runs};
+use db::repos::{artifact_contracts, closeout, legacy_discovery_overrides, projections, runs};
 use domain::commands::{
     CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    StartRunCmd,
+    ProposalGateSettlementAction, SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
+use domain::risk_lineage::RiskAcceptanceLineage;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
@@ -162,6 +163,63 @@ pub fn tool_specs() -> Vec<McpTool> {
                 }
             }),
         },
+        McpTool {
+            name: "runs.settle_proposal_gate".to_string(),
+            description: "P077: Execute, import, or waive a proposal gate settlement result. \
+                Requires operator principal. The principal field is bound from the authenticated \
+                caller context at the engine boundary."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": [
+                    "run_id", "proposal_id", "stage_id", "capability", "journal_id",
+                    "authority", "reason", "source_artifacts", "workflow_digest",
+                    "worktree_head", "dirty_or_changed_file_digest",
+                    "source_generation_ids", "current_fingerprint"
+                ],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "proposal_id": { "type": "string", "maxLength": 64 },
+                    "stage_id": { "type": "string", "maxLength": 128 },
+                    "action": {
+                        "type": "string",
+                        "enum": ["execute", "import_receipt", "waive"],
+                        "description": "Defaults to import_receipt when receipt_json is supplied; required otherwise. Use import_receipt with a governed gate receipt, waive to waive with lineage, or execute to run the bounded managed ProposalGateExecutor."
+                    },
+                    "capability": { "type": "string", "maxLength": 1024 },
+                    "journal_id": { "type": "string", "maxLength": 1024 },
+                    "authority": { "type": "string", "maxLength": 1024 },
+                    "reason": { "type": "string", "maxLength": 4096 },
+                    "source_artifacts": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 1024 },
+                        "maxItems": 64
+                    },
+                    "workflow_digest": { "type": "string", "maxLength": 1024 },
+                    "worktree_head": { "type": "string", "maxLength": 1024 },
+                    "dirty_or_changed_file_digest": { "type": "string", "maxLength": 1024 },
+                    "source_generation_ids": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 1024 },
+                        "maxItems": 64
+                    },
+                    "current_fingerprint": { "type": "string", "maxLength": 1024 },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600000,
+                        "description": "Optional bounded timeout for action=execute. The engine applies a default when omitted."
+                    },
+                    "accepted_risks": {
+                        "type": "array",
+                        "description": "Optional typed RiskAcceptanceLineage rows for governed risk settlement.",
+                        "items": { "type": "object" },
+                        "maxItems": 64
+                    },
+                    "receipt_json": { "type": "string", "description": "Raw JSON receipt from the gate executor (max 256KiB)" }
+                }
+            }),
+        },
     ]
 }
 
@@ -219,6 +277,7 @@ pub async fn execute(
                 workflow_yaml_path,
                 agent_catalog_yaml_path,
                 review_routing_json,
+                closeout_readiness_mode: None,
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let run_id = match &commanded.result {
@@ -282,7 +341,9 @@ pub async fn execute(
                             )?,
                         );
                     }
-                    attach_implementation_self_assessment_summary(pool, value).await
+                    let value = attach_implementation_self_assessment_summary(pool, value).await?;
+                    // P077 BLK-004: attach closeout_readiness_summary parity on runs.get.
+                    attach_closeout_readiness_summary(pool, value).await
                 }
                 None => Ok(serde_json::Value::Null),
             }
@@ -292,13 +353,13 @@ pub async fn execute(
             let items = projections::list_active_projection(pool).await?;
             let mut values = Vec::with_capacity(items.len());
             for item in items {
-                values.push(
-                    attach_implementation_self_assessment_summary(
-                        pool,
-                        serde_json::to_value(&item)?,
-                    )
-                    .await?,
-                );
+                let value = attach_implementation_self_assessment_summary(
+                    pool,
+                    serde_json::to_value(&item)?,
+                )
+                .await?;
+                // P077 BLK-004: attach closeout_readiness_summary parity on runs.list.
+                values.push(attach_closeout_readiness_summary(pool, value).await?);
             }
             Ok(serde_json::Value::Array(values))
         }
@@ -481,6 +542,200 @@ pub async fn execute(
             );
         }
 
+        "runs.settle_proposal_gate" => {
+            let run_id = parse_run_id(&params)?;
+            let proposal_id = params["proposal_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'proposal_id'"))?
+                .to_string();
+            let stage_id = params["stage_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
+                .to_string();
+            let capability = params["capability"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'capability'"))?
+                .to_string();
+            let journal_id = params["journal_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'journal_id'"))?
+                .to_string();
+            let authority = params["authority"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'authority'"))?
+                .to_string();
+            // sec-002: cap reason at 4 KiB
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            if reason.len() > 4096 {
+                anyhow::bail!("'reason' exceeds maximum length of 4096 bytes");
+            }
+            // sec-002: cap source_artifacts at 64 entries, each string ≤ 1 KiB
+            let source_artifacts: Vec<String> = params["source_artifacts"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'source_artifacts'"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| anyhow::anyhow!("source_artifacts entry is not a string"))
+                        .map(str::to_string)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if source_artifacts.len() > 64 {
+                anyhow::bail!("'source_artifacts' exceeds maximum of 64 entries");
+            }
+            for s in &source_artifacts {
+                if s.len() > 1024 {
+                    anyhow::bail!("source_artifacts entry exceeds maximum length of 1024 bytes");
+                }
+            }
+            let workflow_digest = params["workflow_digest"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'workflow_digest'"))?
+                .to_string();
+            let worktree_head = params["worktree_head"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'worktree_head'"))?
+                .to_string();
+            let dirty_or_changed_file_digest = params["dirty_or_changed_file_digest"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'dirty_or_changed_file_digest'"))?
+                .to_string();
+            // sec-002: cap source_generation_ids at 64 entries, each string ≤ 1 KiB
+            let source_generation_ids: Vec<String> = params["source_generation_ids"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'source_generation_ids'"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("source_generation_ids entry is not a string")
+                        })
+                        .map(str::to_string)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if source_generation_ids.len() > 64 {
+                anyhow::bail!("'source_generation_ids' exceeds maximum of 64 entries");
+            }
+            for s in &source_generation_ids {
+                if s.len() > 1024 {
+                    anyhow::bail!(
+                        "source_generation_ids entry exceeds maximum length of 1024 bytes"
+                    );
+                }
+            }
+            let current_fingerprint = params["current_fingerprint"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'current_fingerprint'"))?
+                .to_string();
+            let timeout_ms = match params.get("timeout_ms") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let timeout = value
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("'timeout_ms' must be an integer"))?;
+                    if !(1..=600_000).contains(&timeout) {
+                        anyhow::bail!("'timeout_ms' must be between 1 and 600000");
+                    }
+                    Some(timeout)
+                }
+            };
+            // sec-002: cap receipt_json at 256 KiB
+            let receipt_json = params["receipt_json"].as_str().map(str::to_string);
+            if let Some(ref r) = receipt_json {
+                if r.len() > 262_144 {
+                    anyhow::bail!("'receipt_json' exceeds maximum length of 256 KiB");
+                }
+            }
+            let accepted_risks = match params.get("accepted_risks") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(value) => {
+                    let raw = serde_json::to_string(value)?;
+                    if raw.len() > 262_144 {
+                        anyhow::bail!("'accepted_risks' exceeds maximum length of 256 KiB");
+                    }
+                    let risks: Vec<RiskAcceptanceLineage> =
+                        serde_json::from_value(value.clone())
+                            .map_err(|error| anyhow::anyhow!("invalid accepted_risks: {error}"))?;
+                    if risks.len() > 64 {
+                        anyhow::bail!("'accepted_risks' exceeds maximum of 64 entries");
+                    }
+                    risks
+                }
+            };
+            let has_receipt = receipt_json
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let action_str = params["action"].as_str();
+            // When receipt is present, default to import_receipt.
+            // When receipt is absent, action must be specified explicitly.
+            let resolved_action = match (action_str, has_receipt) {
+                (Some(a), _) => a,
+                (None, true) => "import_receipt",
+                (None, false) => anyhow::bail!(
+                    "action is required when receipt_json is absent; \
+                     use action=waive with lineage or provide a governed gate receipt and action=import_receipt"
+                ),
+            };
+            let action = match resolved_action {
+                "record_settlement" => anyhow::bail!(
+                    "record_settlement is no longer supported; \
+                     use import_receipt with a governed gate receipt from ./scripts/test-gate.sh proposal-077"
+                ),
+                "execute" => ProposalGateSettlementAction::Execute,
+                "import_receipt" => ProposalGateSettlementAction::ImportReceipt,
+                "waive" => ProposalGateSettlementAction::Waive,
+                other => anyhow::bail!("invalid proposal gate settlement action '{other}'"),
+            };
+
+            let caller = mcp_caller(&principal.id, &principal.class, "runs.settle_proposal_gate");
+            let commanded = cmd_handler
+                .handle(
+                    Command::SettleProposalGate(SettleProposalGateCmd {
+                        run_id,
+                        proposal_id,
+                        stage_id,
+                        action,
+                        // Overridden at engine boundary from CallerContext (BLK-008)
+                        principal: String::new(),
+                        capability,
+                        journal_id,
+                        authority,
+                        reason,
+                        source_artifacts,
+                        workflow_digest,
+                        worktree_head,
+                        dirty_or_changed_file_digest,
+                        source_generation_ids,
+                        current_fingerprint,
+                        timeout_ms,
+                        receipt_json,
+                        accepted_risks,
+                    }),
+                    caller,
+                )
+                .await?;
+            match commanded.result {
+                engine::command_handler::CommandResult::ProposalGateSettled {
+                    run_id,
+                    gate_id,
+                    journal_id: settled_journal_id,
+                    gate_generation_id,
+                    readiness_generation_id,
+                } => Ok(serde_json::json!({
+                    "settled": true,
+                    "run_id": run_id.to_string(),
+                    "gate_id": gate_id,
+                    "journal_id": settled_journal_id,
+                    "gate_generation_id": gate_generation_id,
+                    "readiness_generation_id": readiness_generation_id,
+                })),
+                _ => Err(anyhow::anyhow!("Unexpected result from SettleProposalGate")),
+            }
+        }
+
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }
 }
@@ -551,6 +806,44 @@ async fn attach_implementation_self_assessment_summary(
         object.insert(
             "implementation_self_assessment_summary".to_string(),
             summary.unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    Ok(value)
+}
+
+/// P077 BLK-004: Attach closeout_readiness_summary to a run JSON value.
+///
+/// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor)
+/// so GraphQL, MCP runs.get/list, and exported projections all share one typed shape.
+async fn attach_closeout_readiness_summary(
+    pool: &SqlitePool,
+    mut value: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let run_id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| id.parse::<RunId>().ok());
+
+    let summary_value = match run_id {
+        Some(run_id) => {
+            let run_id_str = run_id.to_string();
+            match closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
+                Some(summary) => serde_json::to_value(&summary)?,
+                None => serde_json::Value::Null,
+            }
+        }
+        None => serde_json::Value::Null,
+    };
+
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "closeout_readiness_summary".to_string(),
+            summary_value.clone(),
+        );
+        object.insert(
+            "implementation_closeout_readiness_summary".to_string(),
+            summary_value,
         );
     }
 
@@ -632,6 +925,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    artifact_contracts, artifacts, lead_conflict_mediations, legacy_discovery_overrides, sessions,
-    validation, workflow_conflicts,
+    artifact_contracts, artifacts, closeout, lead_conflict_mediations, legacy_discovery_overrides,
+    sessions, validation, workflow_conflicts,
 };
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
@@ -67,6 +67,7 @@ pub async fn execute(
                     reports.push(artifact_report_json(pool, &artifact).await?);
                 }
             }
+            let closeout_readiness_summary = closeout_readiness_summary_json(pool, run_id).await?;
             reports.push(serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "run_id": run_id.to_string(),
@@ -93,6 +94,8 @@ pub async fn execute(
                 "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
+                "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
+                "closeout_readiness_summary": closeout_readiness_summary,
             }));
             if let Some(projection) =
                 db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
@@ -716,6 +719,20 @@ pub(crate) async fn implementation_self_assessment_summary_json(
         .map_err(Into::into)
 }
 
+/// P077: Serialize the active closeout readiness generation for MCP readback.
+/// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor).
+/// Returns null when no active generation exists (run not yet at state_9 or gate not settled).
+pub(crate) async fn closeout_readiness_summary_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let run_id_str = run_id.to_string();
+    match closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
+        Some(summary) => Ok(serde_json::to_value(&summary)?),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
 pub(crate) fn public_artifact_path(path: &str) -> String {
     if path.ends_with("implementation/self-assessment.json") {
         "implementation/self-assessment.json".to_string()
@@ -1266,6 +1283,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 
