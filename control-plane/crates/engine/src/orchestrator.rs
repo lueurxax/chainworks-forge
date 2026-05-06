@@ -32,6 +32,7 @@ use domain::workflow_conflict::{
 
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
+use crate::closeout_fingerprint::build_closeout_fingerprint;
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9,
     SynthesizerInputs as CloseoutSynthesizerInputs,
@@ -1516,6 +1517,27 @@ impl Orchestrator {
             .await
             .ok()
             .flatten();
+        let fingerprint_started = std::time::Instant::now();
+        let upstream_generation_ids = closeout::list_closeout_fingerprint_source_generation_ids(
+            &self.pool,
+            &run_id_str,
+        )
+        .await
+        .unwrap_or_default();
+        let fingerprint_latency_ms = fingerprint_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let closeout_fingerprint = build_closeout_fingerprint(
+            run,
+            current_state_id,
+            run.base_revision
+                .clone()
+                .unwrap_or_else(|| "sha256:unknown-head".into()),
+            "sha256:unknown-dirty",
+            upstream_generation_ids,
+            fingerprint_latency_ms,
+        );
 
         let inputs = CloseoutSynthesizerInputs {
             run_id: &run_id_str,
@@ -1525,8 +1547,8 @@ impl Orchestrator {
             self_assessment: self_assessment_ref,
             accepted_risks: &[],
             loop_budget_remaining: true,
-            fingerprint: None,
-            fingerprint_latency_exceeded: false,
+            fingerprint: Some(closeout_fingerprint),
+            fingerprint_latency_exceeded: fingerprint_latency_ms > 5_000,
             // Sourced from active audit/docs/security/prepush/tests artifact contracts.
             // None means at least one controlled report is missing — synthesizer fails
             // closed in enforcement mode while advisory mode is unaffected.

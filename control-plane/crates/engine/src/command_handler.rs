@@ -1,8 +1,9 @@
 use acp::AcpRuntimeManager;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -36,6 +37,7 @@ use domain::PrincipalClass;
 use sha2::{Digest, Sha256};
 
 use crate::cancellation;
+use crate::closeout_fingerprint::build_closeout_fingerprint;
 use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
@@ -227,6 +229,119 @@ fn build_proposal_gate_result_from_settlement(
     }
 }
 
+fn execute_managed_proposal_gate_receipt(
+    c: &SettleProposalGateCmd,
+    gate_id: &str,
+    execution_root: impl AsRef<Path>,
+) -> Result<String> {
+    let execution_root = execution_root.as_ref();
+    let gate_script = execution_root.join("scripts").join("test-gate.sh");
+    if !gate_script.is_file() {
+        anyhow::bail!(
+            "managed proposal gate executor could not find {}",
+            gate_script.display()
+        );
+    }
+
+    let started = Instant::now();
+    let output = ProcessCommand::new(&gate_script)
+        .arg("proposal-077")
+        .current_dir(execution_root)
+        .output()
+        .with_context(|| {
+            format!(
+                "managed proposal gate executor failed to launch {}",
+                gate_script.display()
+            )
+        })?;
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let exit_code = output.status.code().unwrap_or(1);
+    let status = if output.status.success() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let stdout_digest = sha256_digest(&output.stdout);
+    let stderr_digest = sha256_digest(&output.stderr);
+    let evidence_digest = proposal_gate_executor_evidence_digest(
+        c,
+        gate_id,
+        status,
+        exit_code,
+        elapsed_ms,
+        &stdout_digest,
+        &stderr_digest,
+    )?;
+
+    let diagnostic_reason = if output.status.success() {
+        None
+    } else {
+        Some(format!(
+            "proposal-077 gate failed with exit code {exit_code}"
+        ))
+    };
+    let failure_classification = if output.status.success() {
+        None
+    } else {
+        Some(ProposalGateFailureClassification::CodeOwnedBudgetRemaining.as_str().to_string())
+    };
+
+    let receipt = serde_json::json!({
+        "schema_version": PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION,
+        "status": status,
+        "gate_id": gate_id,
+        "proposal_id": c.proposal_id.clone(),
+        "run_id": c.run_id.to_string(),
+        "stage_id": c.stage_id.clone(),
+        "executor_version": PROPOSAL_GATE_EXECUTOR_VERSION,
+        "evidence_digest": evidence_digest,
+        "stdout_digest": stdout_digest,
+        "stderr_digest": stderr_digest,
+        "exit_code": exit_code,
+        "elapsed_ms": elapsed_ms,
+        "current_fingerprint": c.current_fingerprint.clone(),
+        "diagnostic_reason": diagnostic_reason,
+        "failure_classification": failure_classification,
+        "source_artifacts": c.source_artifacts.clone(),
+    });
+    Ok(receipt.to_string())
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn proposal_gate_executor_evidence_digest(
+    c: &SettleProposalGateCmd,
+    gate_id: &str,
+    status: &str,
+    exit_code: i32,
+    elapsed_ms: u64,
+    stdout_digest: &str,
+    stderr_digest: &str,
+) -> Result<String> {
+    let payload = serde_json::json!({
+        "schema_version": PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION,
+        "executor_version": PROPOSAL_GATE_EXECUTOR_VERSION,
+        "gate_id": gate_id,
+        "proposal_id": c.proposal_id.clone(),
+        "run_id": c.run_id.to_string(),
+        "stage_id": c.stage_id.clone(),
+        "status": status,
+        "exit_code": exit_code,
+        "elapsed_ms": elapsed_ms,
+        "stdout_digest": stdout_digest,
+        "stderr_digest": stderr_digest,
+        "workflow_digest": c.workflow_digest.clone(),
+        "worktree_head": c.worktree_head.clone(),
+        "dirty_or_changed_file_digest": c.dirty_or_changed_file_digest.clone(),
+        "source_generation_ids": c.source_generation_ids.clone(),
+        "source_artifacts": c.source_artifacts.clone(),
+        "current_fingerprint": c.current_fingerprint.clone(),
+    });
+    Ok(sha256_digest(&serde_json::to_vec(&payload)?))
+}
+
 fn build_managed_proposal_gate_result(
     c: &SettleProposalGateCmd,
     journal_id: &str,
@@ -410,6 +525,21 @@ fn proposal_gate_evidence_digest(
     });
     let raw = serde_json::to_vec(&payload)?;
     Ok(format!("sha256:{:x}", Sha256::digest(raw)))
+}
+
+fn proposal_gate_execution_root(run: &Run) -> PathBuf {
+    if let Some(worktree_root) = run
+        .worktree_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(worktree_root);
+        if path.is_absolute() {
+            return path;
+        }
+        return Path::new(&run.workspace_root).join(path);
+    }
+    PathBuf::from(&run.workspace_root)
 }
 
 fn validate_sha256_digest(field: &str, value: &str) -> Result<()> {
@@ -3153,6 +3283,21 @@ impl CommandHandler {
                 let settle_started = Instant::now();
                 let gate_id = format!("p{}:{}", c.proposal_id, c.proposal_id);
                 let gate_generation_id = uuid::Uuid::new_v4().to_string();
+                let run = runs::find_by_id(&self.pool, c.run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("SettleProposalGate run not found"))?;
+                if matches!(c.action, ProposalGateSettlementAction::Execute)
+                    && c.receipt_json
+                        .as_deref()
+                        .is_none_or(|raw| raw.trim().is_empty())
+                {
+                    let execution_root = proposal_gate_execution_root(&run);
+                    c.receipt_json = Some(execute_managed_proposal_gate_receipt(
+                        &c,
+                        &gate_id,
+                        &execution_root,
+                    )?);
+                }
                 let gate_result = build_proposal_gate_result_from_settlement(
                     &c,
                     &journal.id,
@@ -3219,6 +3364,30 @@ impl CommandHandler {
                         .await
                         .ok()
                         .flatten();
+                let fingerprint_started = Instant::now();
+                let upstream_generation_ids =
+                    closeout::list_closeout_fingerprint_source_generation_ids(
+                        &self.pool,
+                        &run_id_str,
+                    )
+                    .await
+                    .unwrap_or_else(|_| c.source_generation_ids.clone());
+                let fingerprint_latency_ms = fingerprint_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let closeout_fingerprint = build_closeout_fingerprint(
+                    &run,
+                    &c.stage_id,
+                    c.worktree_head.clone(),
+                    c.dirty_or_changed_file_digest.clone(),
+                    if upstream_generation_ids.is_empty() {
+                        c.source_generation_ids.clone()
+                    } else {
+                        upstream_generation_ids
+                    },
+                    fingerprint_latency_ms,
+                );
 
                 // Synthesize closeout readiness.
                 let synth_result =
@@ -3230,8 +3399,8 @@ impl CommandHandler {
                         self_assessment: self_assessment_ref,
                         accepted_risks: &[],
                         loop_budget_remaining: true,
-                        fingerprint: None,
-                        fingerprint_latency_exceeded: false,
+                        fingerprint: Some(closeout_fingerprint),
+                        fingerprint_latency_exceeded: fingerprint_latency_ms > 5_000,
                         controlled_reports_green,
                         previous_blocker_digest: prior_blocker_digest.as_deref(),
                     });
@@ -4467,6 +4636,75 @@ reviewer_override:
 
         assert!(err.to_string().contains("evidence_digest"));
     }
+
+    #[test]
+    fn p077_execute_gate_generates_passed_managed_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let gate = scripts.join("test-gate.sh");
+        std::fs::write(
+            &gate,
+            "#!/usr/bin/env bash\nset -euo pipefail\necho proposal-077-ok\n",
+        )
+        .unwrap();
+        make_executable(&gate);
+
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        let raw = execute_managed_proposal_gate_receipt(&cmd, "p077:077", temp.path())
+            .expect("managed executor should produce a receipt");
+        let receipt: ProposalGateReceiptV1 = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(receipt.schema_version, PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION);
+        assert_eq!(receipt.executor_version, PROPOSAL_GATE_EXECUTOR_VERSION);
+        assert_eq!(receipt.status, "passed");
+        assert_eq!(receipt.exit_code, 0);
+        assert!(receipt.stdout_digest.starts_with("sha256:"));
+        assert!(receipt.stderr_digest.starts_with("sha256:"));
+        assert!(receipt.evidence_digest.starts_with("sha256:"));
+        assert_eq!(receipt.current_fingerprint, "sha256:fingerprint-current");
+    }
+
+    #[test]
+    fn p077_execute_gate_generates_failed_receipt_for_nonzero_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let gate = scripts.join("test-gate.sh");
+        std::fs::write(
+            &gate,
+            "#!/usr/bin/env bash\nset -euo pipefail\necho p077-failed >&2\nexit 17\n",
+        )
+        .unwrap();
+        make_executable(&gate);
+
+        let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+        let raw = execute_managed_proposal_gate_receipt(&cmd, "p077:077", temp.path())
+            .expect("managed executor should preserve failed receipts");
+        let receipt: ProposalGateReceiptV1 = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(receipt.status, "failed");
+        assert_eq!(receipt.exit_code, 17);
+        assert_eq!(
+            receipt.failure_classification.as_deref(),
+            Some("code_owned_budget_remaining")
+        );
+        assert!(receipt
+            .diagnostic_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("proposal-077 gate failed")));
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &std::path::Path) {}
 
     // ── BLK-010: capability/authority binding rejection tests ─────────────────
 

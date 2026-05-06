@@ -1,6 +1,7 @@
 pub mod cancellation;
 pub mod parity_control;
 pub mod capacity;
+pub mod closeout_fingerprint;
 pub mod command_handler;
 pub mod command_journal_redact;
 pub mod contracts;

@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use domain::closeout_readiness::{
     CloseoutFingerprint, CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
-    IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID,
+    IMPLEMENTATION_CLOSEOUT_INPUTS_V1_CONTRACT_ID, IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID,
 };
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::closeout_readiness_summary_accessor::{
@@ -418,6 +418,31 @@ pub async fn find_active_blocker_digest(pool: &SqlitePool, run_id: &str) -> Resu
     .await
     .context("find_active_blocker_digest")?;
     Ok(row.flatten())
+}
+
+/// Return active artifact-contract generation IDs that feed closeout fingerprinting.
+/// Excludes P077 closeout rows themselves, which are derived from these inputs.
+pub async fn list_closeout_fingerprint_source_generation_ids(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT a.generation_id
+        FROM active_artifact_contracts a
+        WHERE a.run_id = ?1
+          AND a.contract_id NOT IN (?2, ?3, ?4)
+        ORDER BY a.contract_id ASC, a.generation_id ASC
+        "#,
+    )
+    .bind(run_id)
+    .bind(PROPOSAL_GATE_RESULT_V1_CONTRACT_ID)
+    .bind(IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID)
+    .bind(IMPLEMENTATION_CLOSEOUT_INPUTS_V1_CONTRACT_ID)
+    .fetch_all(pool)
+    .await
+    .context("list_closeout_fingerprint_source_generation_ids")?;
+    Ok(rows)
 }
 
 /// Read the closeout_readiness_mode for a run from the frozen column.
