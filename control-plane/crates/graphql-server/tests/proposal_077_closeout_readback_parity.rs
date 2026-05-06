@@ -128,6 +128,7 @@ async fn seed_run_with_closeout_summary() -> (sqlx::SqlitePool, RunId, String) {
         closeout::CloseoutTransactionInputs {
             gate_result: &gate,
             readiness: &readiness,
+            accepted_risks: &[],
             blocker_digest: None,
         },
     )

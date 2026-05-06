@@ -64,6 +64,7 @@ pub struct CloseoutReadinessAccessorInputs<'a> {
     pub gate_result: &'a ProposalGateResult,
     pub mode_result: &'a CloseoutReadinessModeResult,
     pub accepted_risks: &'a [RiskAcceptanceLineage],
+    pub audit_status: Option<&'a str>,
 }
 
 /// The single typed accessor for closeout readiness.
@@ -82,6 +83,7 @@ impl CloseoutReadinessSummaryAccessor {
             gate_result,
             mode_result,
             accepted_risks,
+            audit_status,
         } = inputs;
 
         let fingerprint_hash = readiness.fingerprint.as_ref().map(|fp| fp.short_hash());
@@ -100,7 +102,7 @@ impl CloseoutReadinessSummaryAccessor {
             readiness_mode: mode_result.effective_mode().as_str().to_string(),
             gate_status: gate_result.status.clone(),
             gate_generation_id: gate_result.generation_id.clone(),
-            audit_status: Some(gate_result.status.as_str().to_string()),
+            audit_status: audit_status.map(str::to_string),
             diagnostic_reason: readiness.diagnostic_reason.clone(),
             primary_unblock: readiness.primary_unblock.clone(),
             code_blocker_count: readiness.code_blocker_count,
@@ -249,12 +251,13 @@ mod tests {
                 gate_result: &gate,
                 mode_result: &mode,
                 accepted_risks: &[],
+                audit_status: Some("implemented"),
             });
 
         assert_eq!(summary.readiness_status, CloseoutReadinessStatus::Ready);
         assert_eq!(summary.gate_status, ProposalGateStatus::Passed);
         assert_eq!(summary.readiness_mode, "enforcement");
-        assert_eq!(summary.audit_status.as_deref(), Some("passed"));
+        assert_eq!(summary.audit_status.as_deref(), Some("implemented"));
         assert_eq!(summary.handoff_count, 0);
         assert_eq!(summary.summary.as_deref(), Some("ready"));
         assert!(summary.is_applicable);
@@ -293,6 +296,7 @@ mod tests {
                 gate_result: &gate,
                 mode_result: &mode,
                 accepted_risks: &[],
+                audit_status: None,
             });
 
         let decision = route_transition_decision(&summary);
@@ -314,6 +318,7 @@ mod tests {
                 gate_result: &gate,
                 mode_result: &mode,
                 accepted_risks: &[],
+                audit_status: None,
             });
         assert_eq!(summary.generation_hash_display().len(), 8);
     }

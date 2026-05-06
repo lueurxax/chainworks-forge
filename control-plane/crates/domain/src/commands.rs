@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::discovery::LegacyBroadDiscoveryPolicy;
 use crate::ids::{AgentExecutionId, ApprovalId, IdeaId, RunId, StageExecutionId};
 use crate::mediation::MediationConfirmationDecision;
+use crate::risk_lineage::RiskAcceptanceLineage;
 
 // ── P029: Canonical PrincipalClass definition (owned by domain) ────────
 
@@ -356,6 +357,10 @@ pub struct SettleProposalGateCmd {
     /// Raw JSON receipt from the gate executor (max 256KiB enforced at MCP boundary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_json: Option<String>,
+    /// P077: typed accepted risk lineage supplied through the governed command path.
+    /// Free-form known_risks text never satisfies release entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_risks: Vec<RiskAcceptanceLineage>,
 }
 
 // ── P029: Caller identity for audit journaling ──────────────────────────

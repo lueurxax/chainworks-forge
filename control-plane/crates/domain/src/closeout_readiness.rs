@@ -365,7 +365,10 @@ mod tests {
                 "await_operator_decision",
                 CloseoutReadinessDecision::AwaitOperatorDecision,
             ),
-            ("block_with_evidence", CloseoutReadinessDecision::BlockWithEvidence),
+            (
+                "block_with_evidence",
+                CloseoutReadinessDecision::BlockWithEvidence,
+            ),
         ];
         for (s, expected) in &cases {
             let parsed: CloseoutReadinessDecision = s.parse().unwrap();

@@ -461,6 +461,7 @@ fn p077_proof_gate_transition_evaluation_reads_active_truth_not_stale_json() {
             gate_result: &g,
             mode_result: &mode,
             accepted_risks: &[],
+            audit_status: Some("implemented"),
         });
 
     // route_transition_decision must return EnterManualRelease for a ready run
@@ -504,6 +505,7 @@ fn p077_proof_gate_accessor_exposes_same_fields_for_graphql_mcp_and_transition()
             gate_result: &g,
             mode_result: &mode,
             accepted_risks: &[],
+            audit_status: Some("implemented"),
         });
 
     // These fields must be present for all three surfaces (GraphQL, MCP, transition)
@@ -512,7 +514,7 @@ fn p077_proof_gate_accessor_exposes_same_fields_for_graphql_mcp_and_transition()
     assert_eq!(summary.readiness_status, CloseoutReadinessStatus::Ready);
     assert_eq!(summary.gate_status, ProposalGateStatus::Passed);
     assert_eq!(summary.readiness_mode, "enforcement");
-    assert_eq!(summary.audit_status.as_deref(), Some("passed"));
+    assert_eq!(summary.audit_status.as_deref(), Some("implemented"));
     assert_eq!(summary.handoff_count, 0);
     assert_eq!(summary.summary.as_deref(), Some("ready"));
     assert_eq!(summary.code_blocker_count, 0);

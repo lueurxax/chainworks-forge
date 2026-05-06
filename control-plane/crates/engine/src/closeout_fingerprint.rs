@@ -13,7 +13,11 @@ pub fn build_closeout_fingerprint(
     let workflow_digest = run
         .workflow_snapshot_hash
         .clone()
-        .or_else(|| run.workflow_id.strip_prefix("sha256:").map(|_| run.workflow_id.clone()))
+        .or_else(|| {
+            run.workflow_id
+                .strip_prefix("sha256:")
+                .map(|_| run.workflow_id.clone())
+        })
         .unwrap_or_else(|| "sha256:unknown-workflow".into());
     let proposal_or_freeze_digest = run
         .workflow_snapshot_hash
@@ -100,7 +104,10 @@ mod tests {
         assert_eq!(fingerprint.proposal_or_freeze_digest, "sha256:workflow");
         assert_eq!(fingerprint.worktree_head, "abcdef");
         assert_eq!(fingerprint.dirty_or_changed_file_digest, "sha256:dirty");
-        assert_eq!(fingerprint.upstream_active_generation_ids, vec!["gen-a", "gen-b"]);
+        assert_eq!(
+            fingerprint.upstream_active_generation_ids,
+            vec!["gen-a", "gen-b"]
+        );
         assert_eq!(fingerprint.latency_ms, 12);
         assert_eq!(fingerprint.short_hash().len(), 8);
     }

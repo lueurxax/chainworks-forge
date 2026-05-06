@@ -63,7 +63,7 @@ pub enum RiskAcceptanceSource {
 
 /// Fully typed risk acceptance lineage record.
 /// All required fields must be present; free-form text is insufficient.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskAcceptanceLineage {
     pub risk_id: String,
     pub title: String,

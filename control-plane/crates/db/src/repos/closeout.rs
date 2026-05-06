@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use domain::closeout_readiness::{
     CloseoutFingerprint, CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
-    IMPLEMENTATION_CLOSEOUT_INPUTS_V1_CONTRACT_ID, IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID,
+    IMPLEMENTATION_CLOSEOUT_INPUTS_V1_CONTRACT_ID,
+    IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID,
 };
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::closeout_readiness_summary_accessor::{
@@ -30,6 +31,7 @@ use domain::closeout_readiness_summary_accessor::{
 use domain::proposal_gate_result::{
     ProposalGateResult, ProposalGateStatus, PROPOSAL_GATE_RESULT_V1_CONTRACT_ID,
 };
+use domain::risk_lineage::RiskAcceptanceLineage;
 
 use crate::pool::begin_immediate_with_retry;
 
@@ -37,6 +39,7 @@ use crate::pool::begin_immediate_with_retry;
 pub struct CloseoutTransactionInputs<'a> {
     pub gate_result: &'a ProposalGateResult,
     pub readiness: &'a CloseoutReadiness,
+    pub accepted_risks: &'a [RiskAcceptanceLineage],
     /// P077 BLK-011: persisted on the readiness generation row so the next
     /// synthesis can pass it as `previous_blocker_digest` and detect soft
     /// convergence. None means the assessment was unavailable at synth time.
@@ -101,6 +104,8 @@ pub async fn execute_closeout_transaction(
         .fingerprint
         .as_ref()
         .and_then(|fp| serde_json::to_string(fp).ok());
+    let accepted_risks_json =
+        serde_json::to_string(inputs.accepted_risks).context("serialize accepted risk lineage")?;
 
     sqlx::query(
         r#"
@@ -108,8 +113,9 @@ pub async fn execute_closeout_transaction(
             (id, run_id, stage_id, contract_id, status, decision, generation_id,
              readiness_mode, diagnostic_reason, primary_unblock, code_blocker_count,
              handoff_owner, risk_settlement_required, fingerprint_json, blocker_digest,
+             accepted_risks_json,
              active, superseded_by_generation_id, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1, NULL, ?16, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1, NULL, ?17, ?17)
         "#,
     )
     .bind(&readiness_row_id)
@@ -127,6 +133,7 @@ pub async fn execute_closeout_transaction(
     .bind(inputs.readiness.risk_settlement_required as i64)
     .bind(&fingerprint_json)
     .bind(inputs.blocker_digest)
+    .bind(&accepted_risks_json)
     .bind(&now)
     .execute(&mut *tx)
     .await
@@ -252,7 +259,8 @@ pub async fn load_closeout_readiness_summary(
         r#"
         SELECT status, decision, generation_id, stage_id, readiness_mode,
                diagnostic_reason, primary_unblock, code_blocker_count,
-               handoff_owner, risk_settlement_required, fingerprint_json, created_at
+               handoff_owner, risk_settlement_required, fingerprint_json, accepted_risks_json,
+               created_at
         FROM closeout_gate_generations
         WHERE run_id = ?1 AND contract_id = ?2 AND active = 1
         ORDER BY created_at DESC
@@ -290,6 +298,9 @@ pub async fn load_closeout_readiness_summary(
         .context("risk_settlement_required")?;
     let fingerprint_json: Option<String> =
         r.try_get("fingerprint_json").context("fingerprint_json")?;
+    let accepted_risks_json: Option<String> = r
+        .try_get("accepted_risks_json")
+        .context("accepted_risks_json")?;
     let created_at_str: String = r.try_get("created_at").context("readiness created_at")?;
 
     let status =
@@ -302,6 +313,7 @@ pub async fn load_closeout_readiness_summary(
     let synthesized_at: DateTime<Utc> = created_at_str
         .parse::<DateTime<Utc>>()
         .unwrap_or_else(|_| Utc::now());
+    let accepted_risks = parse_accepted_risks_json(accepted_risks_json.as_deref())?;
 
     let readiness = CloseoutReadiness {
         run_id: run_id.to_string(),
@@ -388,16 +400,48 @@ pub async fn load_closeout_readiness_summary(
 
     let mode_result =
         resolve_closeout_readiness_mode(mode_column.as_deref(), has_enforcement_migration);
+    let audit_status = find_active_contract_status(pool, run_id, "audit_report_v1").await?;
 
     let summary =
         CloseoutReadinessSummaryAccessor::build_summary(CloseoutReadinessAccessorInputs {
             readiness: &readiness,
             gate_result: &gate_result,
             mode_result: &mode_result,
-            accepted_risks: &[],
+            accepted_risks: &accepted_risks,
+            audit_status: audit_status.as_deref(),
         });
 
     Ok(Some(summary))
+}
+
+fn parse_accepted_risks_json(raw: Option<&str>) -> Result<Vec<RiskAcceptanceLineage>> {
+    match raw {
+        None => Ok(Vec::new()),
+        Some(raw) if raw.trim().is_empty() => Ok(Vec::new()),
+        Some(raw) => serde_json::from_str(raw).context("parse accepted_risks_json"),
+    }
+}
+
+async fn find_active_contract_status(
+    pool: &SqlitePool,
+    run_id: &str,
+    contract_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT g.canonical_status
+        FROM active_artifact_contracts a
+        JOIN artifact_contract_generations g ON g.generation_id = a.generation_id
+        WHERE a.run_id = ?1 AND a.contract_id = ?2
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id)
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await
+    .context("find active contract status")?;
+    Ok(row)
 }
 
 /// P077 BLK-011: Read the blocker_digest persisted on the most recent active
@@ -418,6 +462,27 @@ pub async fn find_active_blocker_digest(pool: &SqlitePool, run_id: &str) -> Resu
     .await
     .context("find_active_blocker_digest")?;
     Ok(row.flatten())
+}
+
+/// P077: Read typed accepted risk lineage from the active closeout readiness
+/// generation. Empty or missing JSON means no governed risk settlement exists.
+pub async fn find_active_accepted_risks(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<RiskAcceptanceLineage>> {
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        r#"SELECT accepted_risks_json
+           FROM closeout_gate_generations
+           WHERE run_id = ?1 AND contract_id = ?2 AND active = 1
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id)
+    .bind(IMPLEMENTATION_CLOSEOUT_READINESS_V1_CONTRACT_ID)
+    .fetch_optional(pool)
+    .await
+    .context("find_active_accepted_risks")?;
+    parse_accepted_risks_json(row.flatten().as_deref())
 }
 
 /// Return active artifact-contract generation IDs that feed closeout fingerprinting.
@@ -612,6 +677,7 @@ mod tests {
         CloseoutReadiness, CloseoutReadinessDecision, CloseoutReadinessStatus,
     };
     use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
+    use domain::risk_lineage::{RiskAcceptanceLineage, RiskAcceptanceSource, RiskClassification};
 
     async fn setup_test_db() -> SqlitePool {
         crate::pool::create_pool("sqlite::memory:")
@@ -657,6 +723,20 @@ mod tests {
             risk_settlement_required: false,
             fingerprint: None,
             synthesized_at: Utc::now(),
+        }
+    }
+
+    fn make_risk_lineage() -> RiskAcceptanceLineage {
+        RiskAcceptanceLineage {
+            risk_id: "RISK-P077-001".into(),
+            title: "Accepted release-owner risk".into(),
+            classification: RiskClassification::Medium,
+            authority: "release_owner".into(),
+            journal_or_decision_id: "journal-risk-1".into(),
+            source_generation_ids: vec!["gate-gen-1".into()],
+            settled_at: Utc::now(),
+            acceptance_source: RiskAcceptanceSource::GovernedWaiverOrSettlement,
+            rationale: Some("release owner accepted the remaining risk".into()),
         }
     }
 
@@ -735,6 +815,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate,
                 readiness: &readiness,
+                accepted_risks: &[],
                 blocker_digest: None,
             },
         )
@@ -776,6 +857,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate1,
                 readiness: &readiness1,
+                accepted_risks: &[],
                 blocker_digest: Some("digest-attempt-1"),
             },
         )
@@ -793,6 +875,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate2,
                 readiness: &readiness2,
+                accepted_risks: &[],
                 blocker_digest: Some("digest-attempt-2"),
             },
         )
@@ -964,6 +1047,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closeout_summary_reads_audit_status_from_active_audit_report_contract() {
+        let pool = setup_test_db().await;
+        let run_id = insert_test_run(&pool).await;
+
+        let gate = make_gate(&run_id, ProposalGateStatus::Passed);
+        let readiness = make_readiness(
+            &run_id,
+            CloseoutReadinessStatus::NotReady,
+            CloseoutReadinessDecision::ReturnToCodeRefine,
+        );
+        execute_closeout_transaction(
+            &pool,
+            CloseoutTransactionInputs {
+                gate_result: &gate,
+                readiness: &readiness,
+                accepted_risks: &[],
+                blocker_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert_active_contract(&pool, &run_id, "audit_report_v1", "needs_code_fixes").await;
+
+        let summary = load_closeout_readiness_summary(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.gate_status, ProposalGateStatus::Passed);
+        assert_eq!(summary.audit_status.as_deref(), Some("needs_code_fixes"));
+    }
+
+    #[tokio::test]
+    async fn closeout_summary_reads_accepted_risk_lineage_from_active_readiness_generation() {
+        let pool = setup_test_db().await;
+        let run_id = insert_test_run(&pool).await;
+        let risks = vec![make_risk_lineage()];
+
+        let gate = make_gate(&run_id, ProposalGateStatus::Waived);
+        let readiness = make_readiness(
+            &run_id,
+            CloseoutReadinessStatus::ReadyWithRisks,
+            CloseoutReadinessDecision::EnterManualRelease,
+        );
+        execute_closeout_transaction(
+            &pool,
+            CloseoutTransactionInputs {
+                gate_result: &gate,
+                readiness: &readiness,
+                accepted_risks: &risks,
+                blocker_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let summary = load_closeout_readiness_summary(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.accepted_risk_count, 1);
+        assert_eq!(
+            find_active_accepted_risks(&pool, &run_id).await.unwrap(),
+            risks
+        );
+    }
+
+    #[tokio::test]
     async fn controlled_reports_green_definitive_block_overrides_missing() {
         let pool = setup_test_db().await;
         let run_id = insert_test_run(&pool).await;
@@ -1001,6 +1151,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate1,
                 readiness: &readiness1,
+                accepted_risks: &[],
                 blocker_digest: Some("abc123"),
             },
         )
@@ -1022,6 +1173,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate2,
                 readiness: &readiness2,
+                accepted_risks: &[],
                 blocker_digest: Some("def456"),
             },
         )
@@ -1090,6 +1242,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate,
                 readiness: &readiness,
+                accepted_risks: &[],
                 blocker_digest: None,
             },
         )
@@ -1128,7 +1281,9 @@ mod tests {
         );
         let readiness_entry = &active["implementation_closeout_readiness_v1"];
         assert_eq!(
-            readiness_entry.get("generation_id").and_then(|v| v.as_str()),
+            readiness_entry
+                .get("generation_id")
+                .and_then(|v| v.as_str()),
             Some(readiness_gen_id.as_str()),
             "projected readiness generation_id must round-trip through the transaction"
         );
@@ -1177,6 +1332,7 @@ mod tests {
             CloseoutTransactionInputs {
                 gate_result: &gate2,
                 readiness: &readiness2,
+                accepted_risks: &[],
                 blocker_digest: Some("digest-pass-2"),
             },
         )

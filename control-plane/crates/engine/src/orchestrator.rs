@@ -30,9 +30,12 @@ use domain::workflow_conflict::{
     WorkflowConflictRecord, WorkflowConflictStatus, WorkflowTransitionCursorRecord,
 };
 
+use crate::closeout_fingerprint::build_closeout_fingerprint;
+use crate::closeout_loop_budget::{
+    closeout_loop_budget_exhaustion, closeout_loop_budget_remaining,
+};
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
-use crate::closeout_fingerprint::build_closeout_fingerprint;
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9,
     SynthesizerInputs as CloseoutSynthesizerInputs,
@@ -707,6 +710,8 @@ impl Orchestrator {
                                     &current_state_id,
                                     state,
                                     run,
+                                    &plan,
+                                    &all_stages,
                                 )
                                 .await?;
                                 return self
@@ -736,6 +741,8 @@ impl Orchestrator {
                             &current_state_id,
                             state,
                             run,
+                            &plan,
+                            &all_stages,
                         )
                         .await?;
                         // Stage done — evaluate transitions
@@ -1445,6 +1452,8 @@ impl Orchestrator {
         current_state_id: &str,
         state: &workflow::plan::CompiledState,
         run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+        all_stages: &[StageExecution],
     ) -> Result<()> {
         if !state_evaluates_closeout_readiness(state) {
             return Ok(());
@@ -1510,6 +1519,9 @@ impl Orchestrator {
                 .await
                 .ok()
                 .flatten();
+        let accepted_risks = closeout::find_active_accepted_risks(&self.pool, &run_id_str)
+            .await
+            .unwrap_or_default();
 
         // P077 BLK-011: read the prior blocker_digest so the synthesizer can detect
         // soft-convergence (repeated identical blockers without diff or gate progress).
@@ -1518,12 +1530,10 @@ impl Orchestrator {
             .ok()
             .flatten();
         let fingerprint_started = std::time::Instant::now();
-        let upstream_generation_ids = closeout::list_closeout_fingerprint_source_generation_ids(
-            &self.pool,
-            &run_id_str,
-        )
-        .await
-        .unwrap_or_default();
+        let upstream_generation_ids =
+            closeout::list_closeout_fingerprint_source_generation_ids(&self.pool, &run_id_str)
+                .await
+                .unwrap_or_default();
         let fingerprint_latency_ms = fingerprint_started
             .elapsed()
             .as_millis()
@@ -1538,6 +1548,8 @@ impl Orchestrator {
             upstream_generation_ids,
             fingerprint_latency_ms,
         );
+        let loop_budget_remaining =
+            closeout_loop_budget_remaining(plan, all_stages, "state_10_implementation_refined");
 
         let inputs = CloseoutSynthesizerInputs {
             run_id: &run_id_str,
@@ -1545,8 +1557,8 @@ impl Orchestrator {
             gate_result: &gate_result,
             mode_result: &mode_result,
             self_assessment: self_assessment_ref,
-            accepted_risks: &[],
-            loop_budget_remaining: true,
+            accepted_risks: &accepted_risks,
+            loop_budget_remaining,
             fingerprint: Some(closeout_fingerprint),
             fingerprint_latency_exceeded: fingerprint_latency_ms > 5_000,
             // Sourced from active audit/docs/security/prepush/tests artifact contracts.
@@ -1561,6 +1573,7 @@ impl Orchestrator {
         let tx_inputs = closeout::CloseoutTransactionInputs {
             gate_result: &gate_result,
             readiness: &synth_result.readiness,
+            accepted_risks: &accepted_risks,
             blocker_digest: synth_result.current_blocker_digest.as_deref(),
         };
 
@@ -3685,7 +3698,7 @@ impl Orchestrator {
                 .await;
             if evaluation.result == CandidateTransitionResult::Matched {
                 if let Some(exhaustion) =
-                    loop_budget_exhaustion_for_transition_target(transition, plan, all_stages)
+                    closeout_loop_budget_exhaustion(plan, all_stages, &transition.to)
                 {
                     debug!(
                         run_id = %run_id,
@@ -3963,11 +3976,9 @@ impl Orchestrator {
             "implementation_review_summary.status={status_label} routes back to implementation refinement, not manual release"
         ));
 
-        if let Some(exhaustion) = loop_budget_exhaustion_for_transition_target(
-            &state.transitions[refine_index],
-            plan,
-            all_stages,
-        ) {
+        if let Some(exhaustion) =
+            closeout_loop_budget_exhaustion(plan, all_stages, &state.transitions[refine_index].to)
+        {
             candidate_evaluations[refine_index].result = CandidateTransitionResult::NotMatched;
             candidate_evaluations[refine_index].sanitized_diagnostic = Some(format!(
                 "implementation_review_summary.status={status_label} requires refinement, but loop budget exhausted for {}: {}/{} iterations",
@@ -5736,36 +5747,6 @@ fn json_value_is_empty_collection(value: &serde_json::Value) -> bool {
         serde_json::Value::String(value) => value.trim().is_empty(),
         _ => false,
     }
-}
-
-struct LoopBudgetExhaustion {
-    counter: String,
-    iterations: u64,
-    max: u64,
-}
-
-fn loop_budget_exhaustion_for_transition_target(
-    transition: &workflow::plan::CompiledTransition,
-    plan: &workflow::plan::RunPlan,
-    all_stages: &[StageExecution],
-) -> Option<LoopBudgetExhaustion> {
-    let target_state = plan.states.get(&transition.to)?;
-    let loop_config = target_state.loop_config.as_ref()?;
-    let iterations = loop_iterations_for_state(all_stages, &transition.to);
-    (iterations >= loop_config.max).then(|| LoopBudgetExhaustion {
-        counter: loop_config.counter.clone(),
-        iterations,
-        max: loop_config.max,
-    })
-}
-
-fn loop_iterations_for_state(all_stages: &[StageExecution], state_id: &str) -> u64 {
-    all_stages
-        .iter()
-        .filter(|stage| stage.stage_id == state_id)
-        .filter_map(|stage| u64::try_from(stage.iteration).ok())
-        .max()
-        .unwrap_or(0)
 }
 
 /// Split on a connective keyword, respecting parentheses depth.

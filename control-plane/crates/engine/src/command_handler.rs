@@ -38,6 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cancellation;
 use crate::closeout_fingerprint::build_closeout_fingerprint;
+use crate::closeout_loop_budget::closeout_loop_budget_remaining;
 use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
@@ -185,8 +186,7 @@ fn build_proposal_gate_result_from_settlement(
     let effective_action = if has_receipt
         && matches!(
             c.action,
-            ProposalGateSettlementAction::RecordSettlement
-                | ProposalGateSettlementAction::Execute
+            ProposalGateSettlementAction::RecordSettlement | ProposalGateSettlementAction::Execute
         ) {
         ProposalGateSettlementAction::ImportReceipt
     } else {
@@ -201,18 +201,16 @@ fn build_proposal_gate_result_from_settlement(
                  supply the resulting receipt via action=import_receipt"
             )
         }
-        ProposalGateSettlementAction::RecordSettlement => {
-            build_managed_proposal_gate_result(
-                c,
-                journal_id,
-                gate_id,
-                gate_generation_id,
-                ProposalGateStatus::Passed,
-                None,
-                None,
-                elapsed_ms,
-            )
-        }
+        ProposalGateSettlementAction::RecordSettlement => build_managed_proposal_gate_result(
+            c,
+            journal_id,
+            gate_id,
+            gate_generation_id,
+            ProposalGateStatus::Passed,
+            None,
+            None,
+            elapsed_ms,
+        ),
         ProposalGateSettlementAction::Waive => build_managed_proposal_gate_result(
             c,
             journal_id,
@@ -283,7 +281,11 @@ fn execute_managed_proposal_gate_receipt(
     let failure_classification = if output.status.success() {
         None
     } else {
-        Some(ProposalGateFailureClassification::CodeOwnedBudgetRemaining.as_str().to_string())
+        Some(
+            ProposalGateFailureClassification::CodeOwnedBudgetRemaining
+                .as_str()
+                .to_string(),
+        )
     };
 
     let receipt = serde_json::json!({
@@ -701,6 +703,51 @@ fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Res
             .iter()
             .any(|task| is_release_agent(&task.agent.agent_id))
     }))
+}
+
+fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
+    match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json))
+            if !workflow_snapshot_json.trim().is_empty()
+                && !catalog_snapshot_json.trim().is_empty() =>
+        {
+            let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+            Ok(Some(workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                catalog_path,
+            )?))
+        }
+        _ => match (
+            run.workflow_yaml_path.as_deref(),
+            run.agent_catalog_yaml_path.as_deref(),
+        ) {
+            (Some(workflow_path), Some(catalog_path)) => Ok(Some(workflow::compiler::compile(
+                workflow_path,
+                catalog_path,
+            )?)),
+            _ => Ok(None),
+        },
+    }
+}
+
+async fn closeout_loop_budget_remaining_for_run(
+    pool: &SqlitePool,
+    run: &Run,
+    refine_state_id: &str,
+) -> Result<bool> {
+    let Some(plan) = compile_run_plan_for_run(run)? else {
+        return Ok(true);
+    };
+    let stages = stages::list_by_run(pool, run.id).await?;
+    Ok(closeout_loop_budget_remaining(
+        &plan,
+        &stages,
+        refine_state_id,
+    ))
 }
 
 fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error {
@@ -3279,6 +3326,7 @@ impl CommandHandler {
                 // BLK-010: Bind capability to the canonical CapabilityToolId::ProposalGateSettle
                 // token and reject mismatches. Bind authority to registered allow-list.
                 validate_proposal_gate_authorization(&c)?;
+                validate_accepted_risk_lineage(&c)?;
 
                 let settle_started = Instant::now();
                 let gate_id = format!("p{}:{}", c.proposal_id, c.proposal_id);
@@ -3388,6 +3436,20 @@ impl CommandHandler {
                     },
                     fingerprint_latency_ms,
                 );
+                let loop_budget_remaining = closeout_loop_budget_remaining_for_run(
+                    &self.pool,
+                    &run,
+                    "state_10_implementation_refined",
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(
+                        run_id = %run_id_str,
+                        error = %error,
+                        "failed to resolve P077 loop budget; failing closeout readiness closed"
+                    );
+                    false
+                });
 
                 // Synthesize closeout readiness.
                 let synth_result =
@@ -3397,8 +3459,8 @@ impl CommandHandler {
                         gate_result: &gate_result,
                         mode_result: &mode_result,
                         self_assessment: self_assessment_ref,
-                        accepted_risks: &[],
-                        loop_budget_remaining: true,
+                        accepted_risks: &c.accepted_risks,
+                        loop_budget_remaining,
                         fingerprint: Some(closeout_fingerprint),
                         fingerprint_latency_exceeded: fingerprint_latency_ms > 5_000,
                         controlled_reports_green,
@@ -3411,6 +3473,7 @@ impl CommandHandler {
                     closeout::CloseoutTransactionInputs {
                         gate_result: &gate_result,
                         readiness: &synth_result.readiness,
+                        accepted_risks: &c.accepted_risks,
                         blocker_digest: synth_result.current_blocker_digest.as_deref(),
                     },
                 )
@@ -4397,10 +4460,7 @@ fn validate_proposal_gate_authorization(c: &SettleProposalGateCmd) -> Result<()>
     // compared equal to an empty caller capability (p077-sec-005).
     const CANONICAL_CAPABILITY: &str = "ProposalGateSettle";
     if c.capability.trim().is_empty() {
-        anyhow::bail!(
-            "empty capability: must be '{}'",
-            CANONICAL_CAPABILITY
-        );
+        anyhow::bail!("empty capability: must be '{}'", CANONICAL_CAPABILITY);
     }
     if c.capability != CANONICAL_CAPABILITY {
         anyhow::bail!(
@@ -4417,6 +4477,19 @@ fn validate_proposal_gate_authorization(c: &SettleProposalGateCmd) -> Result<()>
             c.authority,
             ALLOWED_AUTHORITIES
         );
+    }
+    Ok(())
+}
+
+fn validate_accepted_risk_lineage(c: &SettleProposalGateCmd) -> Result<()> {
+    for risk in &c.accepted_risks {
+        if let Err(errors) = risk.validate() {
+            anyhow::bail!(
+                "invalid accepted risk lineage for '{}': {}",
+                risk.risk_id,
+                errors.join("; ")
+            );
+        }
     }
     Ok(())
 }
@@ -4540,6 +4613,7 @@ reviewer_override:
             source_generation_ids: vec!["generation-1".into()],
             current_fingerprint: "sha256:fingerprint-current".into(),
             receipt_json: None,
+            accepted_risks: Vec::new(),
         }
     }
 
@@ -4754,8 +4828,7 @@ reviewer_override:
     #[test]
     fn p077_all_allowed_authorities_pass_validation() {
         for authority in ["release_owner", "control_plane_owner", "proposal_owner"] {
-            let mut cmd =
-                p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+            let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
             cmd.authority = authority.into();
             validate_proposal_gate_authorization(&cmd)
                 .unwrap_or_else(|e| panic!("authority '{authority}' should pass: {e}"));

@@ -9,6 +9,7 @@ use domain::commands::{
     ProposalGateSettlementAction, SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
+use domain::risk_lineage::RiskAcceptanceLineage;
 use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
@@ -203,6 +204,12 @@ pub fn tool_specs() -> Vec<McpTool> {
                         "maxItems": 64
                     },
                     "current_fingerprint": { "type": "string", "maxLength": 1024 },
+                    "accepted_risks": {
+                        "type": "array",
+                        "description": "Optional typed RiskAcceptanceLineage rows for governed risk settlement.",
+                        "items": { "type": "object" },
+                        "maxItems": 64
+                    },
                     "receipt_json": { "type": "string", "description": "Raw JSON receipt from the gate executor (max 256KiB)" }
                 }
             }),
@@ -624,6 +631,22 @@ pub async fn execute(
                     anyhow::bail!("'receipt_json' exceeds maximum length of 256 KiB");
                 }
             }
+            let accepted_risks = match params.get("accepted_risks") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(value) => {
+                    let raw = serde_json::to_string(value)?;
+                    if raw.len() > 262_144 {
+                        anyhow::bail!("'accepted_risks' exceeds maximum length of 256 KiB");
+                    }
+                    let risks: Vec<RiskAcceptanceLineage> =
+                        serde_json::from_value(value.clone())
+                            .map_err(|error| anyhow::anyhow!("invalid accepted_risks: {error}"))?;
+                    if risks.len() > 64 {
+                        anyhow::bail!("'accepted_risks' exceeds maximum of 64 entries");
+                    }
+                    risks
+                }
+            };
             let has_receipt = receipt_json
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty());
@@ -670,6 +693,7 @@ pub async fn execute(
                         source_generation_ids,
                         current_fingerprint,
                         receipt_json,
+                        accepted_risks,
                     }),
                     caller,
                 )

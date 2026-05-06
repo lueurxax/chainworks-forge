@@ -1,7 +1,7 @@
 pub mod cancellation;
-pub mod parity_control;
 pub mod capacity;
 pub mod closeout_fingerprint;
+pub mod closeout_loop_budget;
 pub mod command_handler;
 pub mod command_journal_redact;
 pub mod contracts;
@@ -18,6 +18,7 @@ pub mod main_sync_fixtures;
 pub mod mcp;
 pub mod mediation;
 pub mod orchestrator;
+pub mod parity_control;
 pub mod preflight;
 pub mod proposal_review_router;
 pub mod recovery;
