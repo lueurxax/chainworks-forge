@@ -5,7 +5,7 @@
 //
 // Decisions:
 //   enter_manual_release, return_to_code_refine, await_non_code_handoff,
-//   await_gate_definition, await_operator_decision
+//   await_gate_definition, await_operator_decision, block_with_evidence
 //
 // Schema-invalid payloads are contract-invalid (do not become active).
 // Well-formed fail-closed domain statuses (invalid/unknown/blocked) ARE valid active generations.
@@ -94,6 +94,7 @@ pub enum CloseoutReadinessDecision {
     AwaitNonCodeHandoff,
     AwaitGateDefinition,
     AwaitOperatorDecision,
+    BlockWithEvidence,
 }
 
 impl CloseoutReadinessDecision {
@@ -104,6 +105,7 @@ impl CloseoutReadinessDecision {
             CloseoutReadinessDecision::AwaitNonCodeHandoff => "await_non_code_handoff",
             CloseoutReadinessDecision::AwaitGateDefinition => "await_gate_definition",
             CloseoutReadinessDecision::AwaitOperatorDecision => "await_operator_decision",
+            CloseoutReadinessDecision::BlockWithEvidence => "block_with_evidence",
         }
     }
 }
@@ -123,6 +125,7 @@ impl std::str::FromStr for CloseoutReadinessDecision {
             "await_non_code_handoff" => Ok(CloseoutReadinessDecision::AwaitNonCodeHandoff),
             "await_gate_definition" => Ok(CloseoutReadinessDecision::AwaitGateDefinition),
             "await_operator_decision" => Ok(CloseoutReadinessDecision::AwaitOperatorDecision),
+            "block_with_evidence" => Ok(CloseoutReadinessDecision::BlockWithEvidence),
             other => Err(format!("unknown CloseoutReadinessDecision: {other}")),
         }
     }
@@ -362,6 +365,7 @@ mod tests {
                 "await_operator_decision",
                 CloseoutReadinessDecision::AwaitOperatorDecision,
             ),
+            ("block_with_evidence", CloseoutReadinessDecision::BlockWithEvidence),
         ];
         for (s, expected) in &cases {
             let parsed: CloseoutReadinessDecision = s.parse().unwrap();

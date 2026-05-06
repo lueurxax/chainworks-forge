@@ -32,7 +32,6 @@ use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
-use domain::CapabilityToolId;
 use domain::PrincipalClass;
 use sha2::{Digest, Sha256};
 

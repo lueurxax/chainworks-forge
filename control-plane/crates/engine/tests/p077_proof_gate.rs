@@ -512,6 +512,9 @@ fn p077_proof_gate_accessor_exposes_same_fields_for_graphql_mcp_and_transition()
     assert_eq!(summary.readiness_status, CloseoutReadinessStatus::Ready);
     assert_eq!(summary.gate_status, ProposalGateStatus::Passed);
     assert_eq!(summary.readiness_mode, "enforcement");
+    assert_eq!(summary.audit_status.as_deref(), Some("passed"));
+    assert_eq!(summary.handoff_count, 0);
+    assert_eq!(summary.summary.as_deref(), Some("ready"));
     assert_eq!(summary.code_blocker_count, 0);
     assert!(!summary.risk_settlement_required);
     // generation hash must be 8 characters (operator-facing identifier)

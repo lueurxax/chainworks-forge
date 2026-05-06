@@ -31,13 +31,16 @@ pub struct CloseoutReadinessSummary {
     pub readiness_mode: String,
     pub gate_status: ProposalGateStatus,
     pub gate_generation_id: String,
+    pub audit_status: Option<String>,
     pub diagnostic_reason: Option<String>,
     pub primary_unblock: Option<String>,
     pub code_blocker_count: u32,
+    pub handoff_count: u32,
     pub handoff_owner: Option<String>,
     pub risk_settlement_required: bool,
     pub accepted_risk_count: u32,
     pub fingerprint_hash: Option<String>,
+    pub summary: Option<String>,
     pub synthesized_at: DateTime<Utc>,
     /// True iff the run is P077-applicable (state_9 closeout with an active accessor generation).
     pub is_applicable: bool,
@@ -82,6 +85,11 @@ impl CloseoutReadinessSummaryAccessor {
         } = inputs;
 
         let fingerprint_hash = readiness.fingerprint.as_ref().map(|fp| fp.short_hash());
+        let summary = readiness
+            .primary_unblock
+            .clone()
+            .or_else(|| readiness.diagnostic_reason.clone())
+            .or_else(|| Some(readiness.status.as_str().to_string()));
 
         CloseoutReadinessSummary {
             run_id: readiness.run_id.clone(),
@@ -92,13 +100,16 @@ impl CloseoutReadinessSummaryAccessor {
             readiness_mode: mode_result.effective_mode().as_str().to_string(),
             gate_status: gate_result.status.clone(),
             gate_generation_id: gate_result.generation_id.clone(),
+            audit_status: Some(gate_result.status.as_str().to_string()),
             diagnostic_reason: readiness.diagnostic_reason.clone(),
             primary_unblock: readiness.primary_unblock.clone(),
             code_blocker_count: readiness.code_blocker_count,
+            handoff_count: u32::from(readiness.handoff_owner.is_some()),
             handoff_owner: readiness.handoff_owner.clone(),
             risk_settlement_required: readiness.risk_settlement_required,
             accepted_risk_count: accepted_risks.len() as u32,
             fingerprint_hash,
+            summary,
             synthesized_at: readiness.synthesized_at,
             is_applicable: true,
         }
@@ -119,13 +130,16 @@ impl CloseoutReadinessSummaryAccessor {
             readiness_mode: "advisory".into(),
             gate_status: ProposalGateStatus::MissingDefinition,
             gate_generation_id: String::new(),
+            audit_status: None,
             diagnostic_reason: None,
             primary_unblock: None,
             code_blocker_count: 0,
+            handoff_count: 0,
             handoff_owner: None,
             risk_settlement_required: false,
             accepted_risk_count: 0,
             fingerprint_hash: None,
+            summary: None,
             synthesized_at: Utc::now(),
             is_applicable: false,
         }
@@ -146,13 +160,16 @@ impl CloseoutReadinessSummaryAccessor {
             readiness_mode: "advisory".into(),
             gate_status: ProposalGateStatus::MissingDefinition,
             gate_generation_id: String::new(),
+            audit_status: Some("missing_definition".into()),
             diagnostic_reason: Some("awaiting_first_generation".into()),
             primary_unblock: Some("Awaiting first readiness check".into()),
             code_blocker_count: 0,
+            handoff_count: 0,
             handoff_owner: None,
             risk_settlement_required: false,
             accepted_risk_count: 0,
             fingerprint_hash: None,
+            summary: Some("Awaiting first readiness check".into()),
             synthesized_at: Utc::now(),
             is_applicable: true,
         }
@@ -237,6 +254,9 @@ mod tests {
         assert_eq!(summary.readiness_status, CloseoutReadinessStatus::Ready);
         assert_eq!(summary.gate_status, ProposalGateStatus::Passed);
         assert_eq!(summary.readiness_mode, "enforcement");
+        assert_eq!(summary.audit_status.as_deref(), Some("passed"));
+        assert_eq!(summary.handoff_count, 0);
+        assert_eq!(summary.summary.as_deref(), Some("ready"));
         assert!(summary.is_applicable);
         assert_eq!(summary.generation_hash_display().len(), 8);
     }

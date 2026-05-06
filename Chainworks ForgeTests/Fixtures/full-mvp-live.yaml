@@ -306,10 +306,10 @@ states:
         - orchestrator_summary
         - run_state
     transitions:
-    - to: state_10_implementation_refined
-      when: audit_report.status != vars.implementation_target_status or implementation_review_summary.status == 'release_evidence_blocked'
     - to: state_11_manual_release
-      when: audit_report.status == vars.implementation_target_status and security_report.status == 'pass' and prepush_review_report.status == 'pass' and implementation_review_summary.status != 'release_evidence_blocked'
+      when: implementation_closeout_readiness_v1.decision == 'enter_manual_release'
+    - to: state_10_implementation_refined
+      when: implementation_closeout_readiness_v1.decision == 'return_to_code_refine'
 
   state_10_implementation_refined:
     label: Implementation refined

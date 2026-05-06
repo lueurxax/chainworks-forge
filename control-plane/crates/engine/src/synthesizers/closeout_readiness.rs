@@ -111,7 +111,7 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
                 run_id: inputs.run_id.to_string(),
                 stage_id: inputs.stage_id.to_string(),
                 status: CloseoutReadinessStatus::Unknown,
-                decision: CloseoutReadinessDecision::AwaitOperatorDecision,
+                decision: CloseoutReadinessDecision::BlockWithEvidence,
                 generation_id,
                 readiness_mode: inputs.mode_result.effective_mode().as_str().to_string(),
                 diagnostic_reason: Some(
@@ -937,6 +937,11 @@ mod tests {
         });
 
         assert_eq!(result.readiness.status, CloseoutReadinessStatus::Unknown);
+        assert_eq!(
+            result.readiness.decision,
+            CloseoutReadinessDecision::BlockWithEvidence,
+            "fingerprint latency breach must fail closed with a typed evidence-blocking decision"
+        );
         let reason = result.readiness.diagnostic_reason.unwrap_or_default();
         assert!(
             reason.contains("closeout_fingerprint_unavailable"),
