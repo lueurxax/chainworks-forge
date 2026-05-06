@@ -127,10 +127,14 @@ Latest remote runtime evidence:
 
 | field | value |
 | --- | --- |
-| evidence_status | pending rerun after R6 fixes |
+| evidence_status | passed |
+| commit | `ec85185f` |
 | gate | `./scripts/test-gate.sh proposal-077-ui` |
 | host | `test@SMacBook.local` |
-| required screenshot | `P077_Closeout_Readiness_Runtime_A11Y` |
+| result bundle | `/var/folders/hh/ztmrr5z96xnbxvlcxyf1vxsc0000gp/T/chainworks-test-gates/proposal-077-ui-20260506-224708.xcresult` |
+| log | `/tmp/p077-ui-ec85185f-signed-terminal.log` |
+| outcome | `** TEST SUCCEEDED **`; 67 Swift tests plus `testProposal077CloseoutReadinessRuntimeAccessibilityProof` passed |
+| screenshot | `P077_Closeout_Readiness_Runtime_A11Y` attachment captured in the result bundle |
 
 Prior runtime proof:
 
