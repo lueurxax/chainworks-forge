@@ -13,6 +13,12 @@ If you are new to the repo, read these in order:
 5. [reference/README.md](reference/README.md) — implemented-system reference index
 6. [../examples/README.md](../examples/README.md) — runnable YAML examples and presets
 
+## Planning and Roadmap
+
+- [ROADMAP.md](ROADMAP.md) — short active sequencing index
+- [roadmap/](roadmap) — dated roadmap updates and planning context
+- [roadmap/2026-05-06-main-roadmap-update.md](roadmap/2026-05-06-main-roadmap-update.md) — current sequencing update after the latest `main` stabilization work
+
 ## Features
 
 The canonical source of truth for implemented behavior is [`reference/`](reference). High-signal entry points grouped by feature area:
