@@ -226,8 +226,10 @@ After the state-9 closeout transaction commits the active gate/readiness pair, t
 
 For states such as `ready_with_risks`, enforcement mode requires **typed risk lineage** (accepted lineage or governed settlement) for each risk. Free-form `known_risks` text alone never satisfies the requirement to `enter_manual_release`.
 
-GraphQL exposes a nullable `implementationCloseoutReadinessSummary` field on run read models. MCP run detail/list
-responses expose the same projection as `implementation_closeout_readiness_summary`.
+GraphQL exposes nullable `implementationCloseoutReadinessSummary` and compatibility
+`closeoutReadinessSummaryJson` fields on run read models. MCP run detail/list and
+report readbacks expose the same projection as `implementation_closeout_readiness_summary`
+and compatibility `closeout_readiness_summary`.
 
 After implementation review aggregation, `implementation_review_summary_v1.status`
 is an input to closeout readiness rather than direct transition authority. A canonical

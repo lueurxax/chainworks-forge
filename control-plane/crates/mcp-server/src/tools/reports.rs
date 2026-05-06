@@ -67,6 +67,7 @@ pub async fn execute(
                     reports.push(artifact_report_json(pool, &artifact).await?);
                 }
             }
+            let closeout_readiness_summary = closeout_readiness_summary_json(pool, run_id).await?;
             reports.push(serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "run_id": run_id.to_string(),
@@ -93,6 +94,8 @@ pub async fn execute(
                 "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
+                "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
+                "closeout_readiness_summary": closeout_readiness_summary,
             }));
             if let Some(projection) =
                 db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?

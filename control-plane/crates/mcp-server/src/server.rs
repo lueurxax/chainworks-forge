@@ -493,6 +493,8 @@ impl McpServer {
                 artifact_payloads
                     .push(tools::reports::artifact_report_json(&self.pool, artifact).await?);
             }
+            let closeout_readiness_summary =
+                tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?;
 
             return Ok(serde_json::json!({
                 "run_id": run_id,
@@ -510,7 +512,8 @@ impl McpServer {
                 .await?,
                 "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
-                "closeout_readiness_summary": tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?,
+                "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
+                "closeout_readiness_summary": closeout_readiness_summary,
                 "artifact_index": artifact_rows,
                 "artifacts": artifact_payloads,
             }));

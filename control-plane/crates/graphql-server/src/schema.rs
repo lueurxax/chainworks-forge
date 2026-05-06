@@ -147,8 +147,9 @@ async fn enrich_run_with_artifact_contracts(
     if let Some(summary) =
         closeout::load_closeout_readiness_summary(pool, &run_id.to_string()).await?
     {
-        gql.closeout_readiness_summary_json =
-            Some(async_graphql::Json(serde_json::to_value(&summary)?));
+        let summary_json = async_graphql::Json(serde_json::to_value(&summary)?);
+        gql.closeout_readiness_summary_json = Some(summary_json.clone());
+        gql.implementation_closeout_readiness_summary = Some(summary_json);
     }
     Ok(())
 }
@@ -850,8 +851,9 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     // P077: Populate closeout readiness summary via CloseoutReadinessSummaryAccessor.
     let run_id_str = run_id.to_string();
     if let Some(summary) = closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
-        run.closeout_readiness_summary_json =
-            Some(async_graphql::Json(serde_json::to_value(&summary)?));
+        let summary_json = async_graphql::Json(serde_json::to_value(&summary)?);
+        run.closeout_readiness_summary_json = Some(summary_json.clone());
+        run.implementation_closeout_readiness_summary = Some(summary_json);
     }
     Ok(run)
 }

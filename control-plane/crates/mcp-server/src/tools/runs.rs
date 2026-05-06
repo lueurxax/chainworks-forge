@@ -794,7 +794,14 @@ async fn attach_closeout_readiness_summary(
     };
 
     if let Some(object) = value.as_object_mut() {
-        object.insert("closeout_readiness_summary".to_string(), summary_value);
+        object.insert(
+            "closeout_readiness_summary".to_string(),
+            summary_value.clone(),
+        );
+        object.insert(
+            "implementation_closeout_readiness_summary".to_string(),
+            summary_value,
+        );
     }
 
     Ok(value)
