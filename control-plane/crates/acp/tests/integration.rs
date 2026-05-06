@@ -796,6 +796,155 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server script that emits a CHAINWORKS_OUTPUT
+    /// envelope only in the terminal session/prompt result output field.
+    pub fn create_terminal_output_envelope_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_terminal_output_envelope.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-terminal-output-envelope"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+send({
+    "jsonrpc": "2.0",
+    "id": msg["id"],
+    "result": {
+        "stopReason": "end_turn",
+        "sessionId": session_id,
+        "output": [
+            {
+                "type": "text",
+                "text": "<<<CHAINWORKS_OUTPUT:proposal_review>>>{\"status\":\"green\"}<<<END_CHAINWORKS_OUTPUT>>>"
+            }
+        ]
+    }
+})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Write a fixture ACP server script that emits P084-like required
+    /// outputs as stringified JSON in the terminal session/prompt result
+    /// output field.
+    pub fn create_p084_like_stringified_terminal_output_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_p084_like_stringified_terminal_output.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "fixture-session-p084-like-stringified-output"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+payload = {
+    "CHAINWORKS_OUTPUT": {
+        "implementation_progress": {
+            "status": "in_progress",
+            "summary": "P084 retry reached output materialization",
+            "completed_tasks": [],
+            "remaining_tasks": ["finish rollout readback"]
+        },
+        "implementation_self_assessment": {
+            "status": "needs_code_fixes",
+            "seemingly_complete": False,
+            "remaining_code_tasks": [],
+            "handoff_tasks": [],
+            "known_risks": [],
+            "tests_run": [],
+            "docs_impacted": [],
+            "verification_green": True
+        },
+        "tests_result": {
+            "status": "passed",
+            "commands": ["./scripts/test-gate.sh proposal-084"],
+            "failures": []
+        }
+    }
+}
+stringified_payload = json.dumps(json.dumps(payload, separators=(",", ":")))
+send({
+    "jsonrpc": "2.0",
+    "id": msg["id"],
+    "result": {
+        "stopReason": "end_turn",
+        "sessionId": session_id,
+        "output": [
+            {
+                "type": "text",
+                "text": stringified_payload
+            }
+        ]
+    }
+})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that emits a JSON-object
     /// CHAINWORKS_OUTPUT envelope over `session/update`.
     pub fn create_json_object_envelope_script(tmpdir: &std::path::Path) -> String {
@@ -5620,6 +5769,196 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         std::str::from_utf8(&result.discovered_artifacts[0].content).unwrap(),
         "{\"status\":\"green\"}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_claude_adapter_extracts_chainworks_output_from_terminal_result_output_field() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_terminal_output_envelope_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_terminal_output_envelope".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "test-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "emit proposal review in terminal result output".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(
+        result.artifact_paths.is_empty(),
+        "terminal output envelope should not require filesystem artifacts: {:?}",
+        result.artifact_paths
+    );
+    assert_eq!(result.discovered_artifacts.len(), 1);
+    assert_eq!(result.discovered_artifacts[0].name, "proposal_review");
+    assert_eq!(
+        std::str::from_utf8(&result.discovered_artifacts[0].content).unwrap(),
+        "{\"status\":\"green\"}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p084_like_stringified_terminal_output_materializes_required_outputs() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::discovery::{
+        ExpectedOutputRole, ExpectedOutputSpec, OutputReusePolicy, SourceGenerationOwner,
+    };
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_p084_like_stringified_terminal_output_script(tmp.path());
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let expected_outputs = vec![
+        ExpectedOutputSpec {
+            output_name: "implementation_progress".to_string(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: tmp
+                .path()
+                .join("implementation/progress.json")
+                .to_string_lossy()
+                .into_owned(),
+            companion_of: None,
+            display_label: "implementation progress".to_string(),
+            contract_id: Some("implementation_progress".to_string()),
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 16 * 1024,
+            aggregate_acceptance_cap_bytes: 128 * 1024,
+            authorized_roots: Vec::new(),
+            source_generation_owner: SourceGenerationOwner::Agent,
+        },
+        ExpectedOutputSpec {
+            output_name: "implementation_self_assessment".to_string(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: tmp
+                .path()
+                .join("implementation/self-assessment.json")
+                .to_string_lossy()
+                .into_owned(),
+            companion_of: None,
+            display_label: "implementation self assessment".to_string(),
+            contract_id: Some("implementation_self_assessment_v2".to_string()),
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 64 * 1024,
+            aggregate_acceptance_cap_bytes: 128 * 1024,
+            authorized_roots: Vec::new(),
+            source_generation_owner: SourceGenerationOwner::Agent,
+        },
+        ExpectedOutputSpec {
+            output_name: "tests_result".to_string(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: tmp
+                .path()
+                .join("implementation/tests-result.json")
+                .to_string_lossy()
+                .into_owned(),
+            companion_of: None,
+            display_label: "tests result".to_string(),
+            contract_id: Some("tests_result".to_string()),
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 16 * 1024,
+            aggregate_acceptance_cap_bytes: 128 * 1024,
+            authorized_roots: Vec::new(),
+            source_generation_owner: SourceGenerationOwner::Agent,
+        },
+    ];
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "state_8_implementation_continued".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "code_writer".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "emit P084-like required outputs".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs,
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(result.artifact_paths.is_empty());
+    assert_eq!(result.discovered_artifacts.len(), 3);
+    for output_name in [
+        "implementation_progress",
+        "implementation_self_assessment",
+        "tests_result",
+    ] {
+        assert!(
+            result
+                .discovered_artifacts
+                .iter()
+                .any(|artifact| artifact.name == output_name),
+            "missing discovered output {output_name}: {:?}",
+            result.discovered_artifacts
+        );
+    }
 }
 
 #[cfg(unix)]

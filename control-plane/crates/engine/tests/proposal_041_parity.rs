@@ -429,6 +429,7 @@ fn make_start_cmd(
         agent_catalog_yaml_path: agent_catalog_yaml_path.display().to_string(),
         review_routing_json: None,
         rollout_contract_preflight_policy_json: None,
+        closeout_readiness_mode: None,
     })
 }
 
@@ -672,19 +673,24 @@ async fn proposal_041_handoff_artifact_contract_is_ready() -> Result<()> {
         }
     }
 
-    let path = workspace_root().join(
-        "docs/proposals/031-thin-ui-rewrite-over-projections-and-mcp.evidence/p041-parity.md",
+    let path = workspace_root().join("docs/reference/p031-p041-parity-evidence.json");
+    let published = read_json(&path)?;
+    assert_eq!(published["overall_status"], "ready_same_tree_verified");
+    assert_eq!(published["schema_version"], "p031-p041-parity-evidence.v1");
+    assert_eq!(
+        published["provenance"]["gate"],
+        "./scripts/test-gate.sh proposal-041"
     );
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    assert!(
-        raw.contains("| Status | Ready |"),
-        "handoff artifact must be ready"
-    );
-    assert!(raw.contains("| Gate | `./scripts/test-gate.sh proposal-041` |"));
+    let published_fixtures = published["fixtures"]
+        .as_array()
+        .ok_or_else(|| anyhow!("published parity evidence must list fixtures"))?;
     for fixture_id in REQUIRED_FIXTURES {
         assert!(
-            raw.contains(fixture_id),
-            "handoff artifact missing fixture {fixture_id}"
+            published_fixtures
+                .iter()
+                .any(|fixture| fixture["fixture_id"] == json!(fixture_id)
+                    && fixture["verdict"] == json!("ready")),
+            "published parity evidence missing ready fixture {fixture_id}"
         );
         let report_path = target_parity_reports_root()
             .join(fixture_id)
@@ -699,8 +705,10 @@ async fn proposal_041_handoff_artifact_contract_is_ready() -> Result<()> {
         assert_eq!(report["verdict"], "ready");
         assert_eq!(report["summary"]["blocking_count"], 0);
         assert!(
-            raw.contains(fixture_id),
-            "handoff artifact does not name fixture {fixture_id}"
+            published_fixtures
+                .iter()
+                .any(|fixture| fixture["fixture_id"] == json!(fixture_id)),
+            "published parity evidence does not name fixture {fixture_id}"
         );
         let replay_path = target_parity_work_root()
             .join(fixture_id)

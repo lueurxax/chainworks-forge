@@ -286,6 +286,41 @@ final class DaemonLifecycleClientTests: XCTestCase {
         XCTAssertNotNil(vm.lastError, "transport error is surfaced as-is")
     }
 
+    @MainActor
+    func test_refresh_clears_stale_ready_snapshot_on_transport_failure() async {
+        let ready = DaemonStatus(
+            state: .ready,
+            schemaVersion: 1,
+            binarySchemaVersion: 1,
+            buildSha: "test-build",
+            startedAt: nil,
+            lastStateChangeAt: Date(),
+            degraded: [],
+            failure: nil,
+            restartCountSinceBoot: 0,
+            pid: 123
+        )
+        let endpoint = DaemonClientEndpoint(
+            baseURL: URL(string: "http://127.0.0.1:1")!,
+            bearerToken: "test"
+        )
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 0.5
+        config.timeoutIntervalForResource = 0.5
+        let client = DaemonLifecycleClient(
+            endpoint: endpoint,
+            urlSession: URLSession(configuration: config)
+        )
+        let vm = DaemonStatusViewModel(client: client)
+
+        vm.apply(frame: ready)
+        await vm.refresh()
+
+        XCTAssertNil(vm.status, "transport failure must not leave stale Ready rendered")
+        XCTAssertTrue(vm.isUnavailable, "UI should move to the Unavailable banner")
+        XCTAssertNotNil(vm.lastError, "the transport error remains visible for diagnostics")
+    }
+
     // MARK: - WS URL derivation
 
     func test_endpoint_graphqlWSURL_rewrites_scheme_to_ws() {

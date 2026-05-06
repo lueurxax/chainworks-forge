@@ -428,7 +428,7 @@ protocol P031GraphQLReadTransport: Sendable {
 }
 
 protocol P031GraphQLSubscriptionTransport: Sendable {
-  func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error>
+  nonisolated func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error>
 }
 
 enum P031GraphQLWebSocketFrameAction: Equatable, Sendable {
@@ -549,7 +549,7 @@ struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable
 struct P031GraphQLSubscriptionClient<Transport: P031GraphQLSubscriptionTransport>: Sendable {
   let transport: Transport
 
-  func subscribe(
+  nonisolated func subscribe(
     operationName: String,
     document: String,
     variables: [String: P031GraphQLVariableValue] = [:]
@@ -565,7 +565,7 @@ struct P031GraphQLSubscriptionClient<Transport: P031GraphQLSubscriptionTransport
     return transport.subscribe(request)
   }
 
-  func subscribe<Payload: Decodable>(
+  nonisolated func subscribe<Payload: Decodable>(
     _ payloadType: Payload.Type,
     operationName: String,
     document: String,
@@ -654,7 +654,7 @@ struct P031URLSessionGraphQLSubscriptionTransport: P031GraphQLSubscriptionTransp
     self.urlSession = urlSession
   }
 
-  func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error> {
+  nonisolated func subscribe(_ request: P031GraphQLReadRequest) -> AsyncThrowingStream<Data, Error> {
     let socket = urlSession.webSocketTask(with: Self.subscribeRequest(for: endpoint))
     return AsyncThrowingStream { continuation in
       let task = Task {
@@ -672,7 +672,7 @@ struct P031URLSessionGraphQLSubscriptionTransport: P031GraphQLSubscriptionTransp
     }
   }
 
-  static func subscribeRequest(for endpoint: DaemonClientEndpoint) -> URLRequest {
+  nonisolated static func subscribeRequest(for endpoint: DaemonClientEndpoint) -> URLRequest {
     var request = URLRequest(url: endpoint.graphqlWSURL)
     request.setValue("graphql-transport-ws", forHTTPHeaderField: "Sec-WebSocket-Protocol")
     return request
@@ -809,17 +809,17 @@ extension URLSessionWebSocketTask.Message {
   }
 }
 
-private struct P031GraphQLResponseEnvelope<Payload: Decodable>: Decodable {
+nonisolated private struct P031GraphQLResponseEnvelope<Payload: Decodable>: Decodable {
   let data: Payload?
   let errors: [P031GraphQLResponseError]?
 }
 
-private struct P031GraphQLResponseError: Decodable {
+nonisolated private struct P031GraphQLResponseError: Decodable {
   let message: String
 }
 
 enum P031GraphQLResponseDecoder {
-  static func decode<Payload: Decodable>(
+  nonisolated static func decode<Payload: Decodable>(
     _ payloadType: Payload.Type,
     from data: Data,
     operationName: String
@@ -1301,6 +1301,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let completedStages: Int?
   let failedStages: Int?
   let pendingApprovals: Int?
+  let closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel?
 
   nonisolated init(
     id: String,
@@ -1316,7 +1317,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     totalStages: Int?,
     completedStages: Int?,
     failedStages: Int?,
-    pendingApprovals: Int?
+    pendingApprovals: Int?,
+    closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel? = nil
   ) {
     self.id = id
     self.status = status
@@ -1332,6 +1334,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     self.completedStages = completedStages
     self.failedStages = failedStages
     self.pendingApprovals = pendingApprovals
+    self.closeoutReadinessSummary = closeoutReadinessSummary
   }
 
   enum CodingKeys: String, CodingKey {
@@ -1349,6 +1352,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     case completedStages
     case failedStages
     case pendingApprovals
+    case implementationCloseoutReadinessSummary
+    case closeoutReadinessSummaryJson
   }
 
   init(from decoder: Decoder) throws {
@@ -1367,7 +1372,15 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       totalStages: try container.decodeIfPresent(Int.self, forKey: .totalStages),
       completedStages: try container.decodeIfPresent(Int.self, forKey: .completedStages),
       failedStages: try container.decodeIfPresent(Int.self, forKey: .failedStages),
-      pendingApprovals: try container.decodeIfPresent(Int.self, forKey: .pendingApprovals)
+      pendingApprovals: try container.decodeIfPresent(Int.self, forKey: .pendingApprovals),
+      closeoutReadinessSummary: try container.decodeIfPresent(
+        P077CloseoutReadinessSummaryReadModel.self,
+        forKey: .implementationCloseoutReadinessSummary
+      )
+        ?? container.decodeIfPresent(
+          P077CloseoutReadinessSummaryReadModel.self,
+          forKey: .closeoutReadinessSummaryJson
+        )
     )
   }
 
@@ -1386,7 +1399,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       totalStages: totalStages,
       completedStages: completedStages,
       failedStages: failedStages,
-      pendingApprovals: pendingApprovals
+      pendingApprovals: pendingApprovals,
+      closeoutReadinessSummary: closeoutReadinessSummary
     )
   }
 }
@@ -1452,6 +1466,166 @@ struct P031DaemonStatusReadModel: Equatable, Sendable {
   let rawJSON: String
 }
 
+enum P077CloseoutReadinessStatus: String, Equatable, Sendable, Decodable {
+  case ready
+  case readyWithRisks = "ready_with_risks"
+  case handoffRequired = "handoff_required"
+  case notReady = "not_ready"
+  case blocked
+  case invalid
+  case unknown
+}
+
+struct P077CloseoutReadinessSummaryReadModel: Decodable, Equatable, Sendable {
+  let runID: String
+  let stageID: String
+  let readinessStatus: P077CloseoutReadinessStatus
+  let readinessDecision: String
+  let readinessGenerationID: String
+  let readinessMode: String
+  let gateStatus: String
+  let gateGenerationID: String
+  let auditStatus: String?
+  let diagnosticReason: String?
+  let primaryUnblock: String?
+  let codeBlockerCount: Int
+  let handoffCount: Int
+  let handoffOwner: String?
+  let riskSettlementRequired: Bool
+  let acceptedRiskCount: Int
+  let fingerprintHash: String?
+  let summary: String?
+  let synthesizedAt: String?
+  let isApplicable: Bool
+
+  nonisolated var generationDisplayID: String {
+    guard !readinessGenerationID.isEmpty else { return "none" }
+    return String(readinessGenerationID.prefix(8))
+  }
+
+  nonisolated var hasGenerationID: Bool {
+    !readinessGenerationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: P031FlexibleCodingKey.self)
+    runID = try container.decodeFlexible(String.self, keys: ["run_id", "runId"])
+    stageID = try container.decodeFlexible(String.self, keys: ["stage_id", "stageId"])
+    readinessStatus = try container.decodeFlexible(
+      P077CloseoutReadinessStatus.self,
+      keys: ["readiness_status", "readinessStatus"]
+    )
+    readinessDecision = try container.decodeFlexible(
+      String.self,
+      keys: ["readiness_decision", "readinessDecision"]
+    )
+    readinessGenerationID = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["readiness_generation_id", "readinessGenerationId", "readinessGenerationID"]
+    ) ?? ""
+    readinessMode = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["readiness_mode", "readinessMode"]
+    ) ?? "advisory"
+    gateStatus = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["gate_status", "gateStatus"]
+    ) ?? "missing_definition"
+    gateGenerationID = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["gate_generation_id", "gateGenerationId", "gateGenerationID"]
+    ) ?? ""
+    auditStatus = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["audit_status", "auditStatus"]
+    )
+    diagnosticReason = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["diagnostic_reason", "diagnosticReason"]
+    )
+    primaryUnblock = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["primary_unblock", "primaryUnblock"]
+    )
+    codeBlockerCount = try container.decodeFlexibleIfPresent(
+      Int.self,
+      keys: ["code_blocker_count", "codeBlockerCount"]
+    ) ?? 0
+    handoffCount = try container.decodeFlexibleIfPresent(
+      Int.self,
+      keys: ["handoff_count", "handoffCount"]
+    ) ?? 0
+    handoffOwner = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["handoff_owner", "handoffOwner"]
+    )
+    riskSettlementRequired = try container.decodeFlexibleIfPresent(
+      Bool.self,
+      keys: ["risk_settlement_required", "riskSettlementRequired"]
+    ) ?? false
+    acceptedRiskCount = try container.decodeFlexibleIfPresent(
+      Int.self,
+      keys: ["accepted_risk_count", "acceptedRiskCount"]
+    ) ?? 0
+    fingerprintHash = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["fingerprint_hash", "fingerprintHash"]
+    )
+    summary = try container.decodeFlexibleIfPresent(String.self, keys: ["summary"])
+    synthesizedAt = try container.decodeFlexibleIfPresent(
+      String.self,
+      keys: ["synthesized_at", "synthesizedAt"]
+    )
+    isApplicable = try container.decodeFlexibleIfPresent(
+      Bool.self,
+      keys: ["is_applicable", "isApplicable"]
+    ) ?? true
+  }
+}
+
+struct P031FlexibleCodingKey: CodingKey {
+  let stringValue: String
+  let intValue: Int?
+
+  init?(stringValue: String) {
+    self.stringValue = stringValue
+    intValue = nil
+  }
+
+  init?(intValue: Int) {
+    stringValue = String(intValue)
+    self.intValue = intValue
+  }
+}
+
+extension KeyedDecodingContainer where Key == P031FlexibleCodingKey {
+  func decodeFlexible<Value: Decodable>(_ type: Value.Type, keys: [String]) throws -> Value {
+    for key in keys {
+      guard let codingKey = P031FlexibleCodingKey(stringValue: key), contains(codingKey) else {
+        continue
+      }
+      return try decode(type, forKey: codingKey)
+    }
+    throw DecodingError.keyNotFound(
+      P031FlexibleCodingKey(stringValue: keys.first ?? "<empty>")!,
+      DecodingError.Context(
+        codingPath: codingPath,
+        debugDescription: "Missing any of keys: \(keys.joined(separator: ", "))"
+      )
+    )
+  }
+
+  func decodeFlexibleIfPresent<Value: Decodable>(_ type: Value.Type, keys: [String]) throws -> Value? {
+    for key in keys {
+      guard let codingKey = P031FlexibleCodingKey(stringValue: key), contains(codingKey) else {
+        continue
+      }
+      return try decodeIfPresent(type, forKey: codingKey)
+    }
+    return nil
+  }
+}
+
 struct P031StageReadModel: Decodable, Equatable, Sendable {
   let id: String
   let runID: String
@@ -1471,7 +1645,7 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
   let projectionLag: Bool
   let freshnessState: P031FreshnessState
 
-  init(
+  nonisolated init(
     id: String,
     runID: String,
     stageID: String,
@@ -1552,7 +1726,7 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
   let diagnosticID: String?
   let serverDebugDetail: String?
 
-  init(
+  nonisolated init(
     id: String,
     runID: String,
     stageID: String,
@@ -1714,6 +1888,7 @@ struct P031StageDetailReadModel: Decodable, Equatable, Sendable {
 }
 
 protocol P031WorkflowReadStore: Sendable {
+  func fetchIdeas(includeArchived: Bool) async throws -> [P031IdeaReadModel]
   func fetchRuns() async throws -> [P031RunRowReadModel]
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel
   func fetchIdea(id: String) async throws -> P031IdeaReadModel?
@@ -1731,6 +1906,7 @@ protocol P031WorkflowReadStore: Sendable {
 }
 
 struct P031GraphQLDocumentSet: Equatable, Sendable {
+  let ideas: String
   let runsHome: String
   let runDetail: String
   let stageDetail: String
@@ -1746,6 +1922,21 @@ struct P031GraphQLDocumentSet: Equatable, Sendable {
 }
 
 enum P031GraphQLDocuments {
+  static let ideas = """
+    query P031Ideas($includeArchived: Boolean) {
+      ideas(includeArchived: $includeArchived) {
+        id
+        title
+        body
+        workspaceRootPath
+        projectKey
+        status
+        createdAt
+        archivedAt
+      }
+    }
+    """
+
   static let runsHome = """
     query P031RunsHome {
       runs {
@@ -1762,6 +1953,7 @@ enum P031GraphQLDocuments {
         completedStages
         failedStages
         pendingApprovals
+        implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
       }
     }
     """
@@ -1782,6 +1974,7 @@ enum P031GraphQLDocuments {
         completedStages
         failedStages
         pendingApprovals
+        implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
       }
       stages(runId: $runId) {
         id
@@ -2060,7 +2253,8 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let defaultSet = P031GraphQLDocumentSet(
+  nonisolated static let defaultSet = P031GraphQLDocumentSet(
+    ideas: ideas,
     runsHome: runsHome,
     runDetail: runDetail,
     stageDetail: stageDetail,
@@ -2083,7 +2277,7 @@ struct P031GraphQLWorkflowReadStore<
   private let subscriptionClient: P031GraphQLSubscriptionClient<SubscriptionTransport>
   private let documents: P031GraphQLDocumentSet
 
-  init(
+  nonisolated init(
     readTransport: ReadTransport,
     subscriptionTransport: SubscriptionTransport,
     documents: P031GraphQLDocumentSet = P031GraphQLDocuments.defaultSet
@@ -2091,6 +2285,16 @@ struct P031GraphQLWorkflowReadStore<
     self.readClient = P031GraphQLReadClient(transport: readTransport)
     self.subscriptionClient = P031GraphQLSubscriptionClient(transport: subscriptionTransport)
     self.documents = documents
+  }
+
+  func fetchIdeas(includeArchived: Bool = false) async throws -> [P031IdeaReadModel] {
+    let payload = try await readClient.execute(
+      IdeasPayload.self,
+      operationName: "P031Ideas",
+      document: documents.ideas,
+      variables: ["includeArchived": .bool(includeArchived)]
+    )
+    return payload.ideas
   }
 
   func fetchRuns() async throws -> [P031RunRowReadModel] {
@@ -2294,6 +2498,10 @@ struct P031GraphQLWorkflowReadStore<
     let runs: [P031RunRowReadModel]
   }
 
+  private struct IdeasPayload: Decodable {
+    let ideas: [P031IdeaReadModel]
+  }
+
   private struct IdeaPayload: Decodable {
     let idea: P031IdeaReadModel?
   }
@@ -2322,15 +2530,15 @@ struct P031GraphQLWorkflowReadStore<
     let daemonStatus: DaemonStatusJSONPayload
   }
 
-  private struct RunStatusChangedPayload: Decodable {
+  nonisolated private struct RunStatusChangedPayload: Decodable {
     let runStatusChanged: P031RunStatusChangedReadModel
   }
 
-  private struct DaemonStatusChangedPayload: Decodable {
+  nonisolated private struct DaemonStatusChangedPayload: Decodable {
     let daemonStatusChanged: DaemonStatusJSONPayload
   }
 
-  private struct DaemonStatusJSONPayload: Decodable {
+  nonisolated private struct DaemonStatusJSONPayload: Decodable {
     let json: String
   }
 }
@@ -2376,6 +2584,23 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
 
   func fetchRuns() async throws -> [P031RunRowReadModel] {
     runs
+  }
+
+  func fetchIdeas(includeArchived: Bool = false) async throws -> [P031IdeaReadModel] {
+    Array(ideasByID.values)
+      .filter { includeArchived || $0.archivedAt == nil }
+      .sorted { lhs, rhs in
+        switch (lhs.createdAt, rhs.createdAt) {
+        case let (lhs?, rhs?):
+          return lhs > rhs
+        case (_?, nil):
+          return true
+        case (nil, _?):
+          return false
+        case (nil, nil):
+          return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+        }
+      }
   }
 
   func fetchRunDetail(runID: String) async throws -> P031RunDetailReadModel {
@@ -3293,8 +3518,31 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
   let statusLabel: String
   let progressLabel: String?
   let pendingApprovalsLabel: String?
+  let closeoutReadinessSignalLabel: String?
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
+
+  nonisolated init(
+    runID: String,
+    title: String,
+    workflowLabel: String?,
+    statusLabel: String,
+    progressLabel: String?,
+    pendingApprovalsLabel: String?,
+    closeoutReadinessSignalLabel: String? = nil,
+    freshnessState: P031FreshnessState,
+    accessibilityLabel: String
+  ) {
+    self.runID = runID
+    self.title = title
+    self.workflowLabel = workflowLabel
+    self.statusLabel = statusLabel
+    self.progressLabel = progressLabel
+    self.pendingApprovalsLabel = pendingApprovalsLabel
+    self.closeoutReadinessSignalLabel = closeoutReadinessSignalLabel
+    self.freshnessState = freshnessState
+    self.accessibilityLabel = accessibilityLabel
+  }
 }
 
 struct P031RunsHomePresentation: Equatable, Sendable {
@@ -3424,6 +3672,127 @@ struct P031CatalogContextPresentation: Equatable, Sendable {
   let accessibilityLabel: String
 }
 
+enum P077CloseoutReadinessVisualState: Equatable, Sendable {
+  case positive
+  case warning
+  case blocking
+  case neutral
+}
+
+struct P077CloseoutReadinessPresentation: Equatable, Sendable {
+  let statusLabel: String
+  let compactSignalLabel: String
+  let detailText: String
+  let primaryUnblockText: String
+  let secondaryBlockerRows: [String]
+  let modeLabel: String
+  let modeExplainerText: String
+  let diagnosticRows: [String]
+  let recoveryLifecycleText: String
+  let recoveryLifecycleAcknowledgementText: String
+  let recoveryLifecycleCorrelationText: String
+  let recoveryLifecycleFreshnessBudgetText: String
+  let recoveryLifecycleActionRows: [String]
+  let recoveryLifecycleCopyTemplate: String
+  let recoveryLifecycleAccessibilityLabel: String
+  let backlinkRouteLabel: String
+  let backlinkRouteAccessibilityLabel: String
+  let focusReturnLabel: String
+  let copyFailureFallbackText: String
+  let voiceOverAnnouncementPolicy: String
+  let keyboardTraversalOrder: [String]
+  let generationDisplayID: String
+  let generationCopyValue: String?
+  let generationCopyAccessibilityLabel: String
+  let diagnosticsAccessibilityLabel: String
+  let compactActivationAccessibilityLabel: String
+  let cardAccessibilityLabel: String
+  let modeExplainerAccessibilityLabel: String
+  let visualState: P077CloseoutReadinessVisualState
+}
+
+enum P077CloseoutReadinessAnnouncementPriority: String, Equatable, Sendable {
+  case polite
+  case assertive
+
+  nonisolated var accessibilityPriorityLabel: String {
+    switch self {
+    case .polite:
+      return "polite"
+    case .assertive:
+      return "assertive"
+    }
+  }
+}
+
+struct P077CloseoutReadinessAnnouncement: Equatable, Sendable {
+  let generationID: String
+  let text: String
+  let priority: P077CloseoutReadinessAnnouncementPriority
+}
+
+struct P077CloseoutReadinessAnnouncementState: Equatable, Sendable {
+  var lastGenerationID: String?
+  var lastFieldHash: String?
+  var lastAnnouncementAt: Date?
+}
+
+enum P077CloseoutReadinessAnnouncementPolicy {
+  static let coalescingWindow: TimeInterval = 3
+
+  nonisolated static func announcement(
+    for presentation: P077CloseoutReadinessPresentation,
+    previous state: inout P077CloseoutReadinessAnnouncementState,
+    now: Date,
+    sheetOwnsFocus: Bool
+  ) -> P077CloseoutReadinessAnnouncement? {
+    guard let generationID = presentation.generationCopyValue, !generationID.isEmpty else {
+      return nil
+    }
+    guard state.lastGenerationID != generationID else {
+      return nil
+    }
+
+    let fieldHash = [
+      presentation.statusLabel,
+      presentation.primaryUnblockText,
+      presentation.modeLabel,
+    ].joined(separator: "|")
+    if state.lastFieldHash == fieldHash,
+       let lastAnnouncementAt = state.lastAnnouncementAt,
+       now.timeIntervalSince(lastAnnouncementAt) < coalescingWindow {
+      return nil
+    }
+
+    let priority = announcementPriority(for: presentation)
+    if sheetOwnsFocus && priority == .polite {
+      return nil
+    }
+
+    state.lastGenerationID = generationID
+    state.lastFieldHash = fieldHash
+    state.lastAnnouncementAt = now
+    return P077CloseoutReadinessAnnouncement(
+      generationID: generationID,
+      text: presentation.compactActivationAccessibilityLabel,
+      priority: priority
+    )
+  }
+
+  private nonisolated static func announcementPriority(
+    for presentation: P077CloseoutReadinessPresentation
+  ) -> P077CloseoutReadinessAnnouncementPriority {
+    if presentation.visualState == .blocking,
+       presentation.modeLabel.localizedCaseInsensitiveContains("enforcement") {
+      return .assertive
+    }
+    if presentation.primaryUnblockText.localizedCaseInsensitiveContains("authority") {
+      return .assertive
+    }
+    return .polite
+  }
+}
+
 struct P031RunDetailPresentation: Equatable, Sendable {
   let title: String
   let workflowLabel: String?
@@ -3438,10 +3807,462 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let artifactViewerRows: [P031ArtifactViewerPresentation]
   let reportRows: [P031ReportMetadataRowPresentation]
   let catalogContext: P031CatalogContextPresentation?
+  let closeoutReadiness: P077CloseoutReadinessPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
   let errorDescription: String?
+
+  nonisolated init(
+    title: String,
+    workflowLabel: String?,
+    statusLabel: String,
+    progressLabel: String?,
+    pendingApprovalsLabel: String?,
+    ideaContext: P031IdeaContextPresentation?,
+    stageRows: [P031StageSummaryPresentation],
+    stageTransitions: [P031StageTransitionPresentation],
+    approvalRows: [P031ApprovalInboxRowPresentation],
+    artifactRows: [P031ArtifactSummaryPresentation],
+    artifactViewerRows: [P031ArtifactViewerPresentation],
+    reportRows: [P031ReportMetadataRowPresentation],
+    catalogContext: P031CatalogContextPresentation?,
+    closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
+    freshness: P031FreshnessSnapshot,
+    refreshFeedbackText: String,
+    emptyStateTitle: String?,
+    errorDescription: String?
+  ) {
+    self.title = title
+    self.workflowLabel = workflowLabel
+    self.statusLabel = statusLabel
+    self.progressLabel = progressLabel
+    self.pendingApprovalsLabel = pendingApprovalsLabel
+    self.ideaContext = ideaContext
+    self.stageRows = stageRows
+    self.stageTransitions = stageTransitions
+    self.approvalRows = approvalRows
+    self.artifactRows = artifactRows
+    self.artifactViewerRows = artifactViewerRows
+    self.reportRows = reportRows
+    self.catalogContext = catalogContext
+    self.closeoutReadiness = closeoutReadiness
+    self.freshness = freshness
+    self.refreshFeedbackText = refreshFeedbackText
+    self.emptyStateTitle = emptyStateTitle
+    self.errorDescription = errorDescription
+  }
+}
+
+enum P077CloseoutReadinessPresenter {
+  nonisolated static func presentation(
+    for summary: P077CloseoutReadinessSummaryReadModel
+  ) -> P077CloseoutReadinessPresentation {
+    let state = displayState(for: summary)
+    let statusLabel = statusText(for: state, summary: summary)
+    let primaryUnblockText = primaryUnblock(for: state, summary: summary)
+    let modeLabel = "Mode: \(P031ThinPresentationFormatting.titleCase(summary.readinessMode))"
+    let modeExplainerText =
+      "Closeout readiness mode: \(P031ThinPresentationFormatting.titleCase(summary.readinessMode)). This view is read-only; closeout actions run through governed CLI, MCP, orchestrator, or approval paths."
+    let generationCopyValue = summary.hasGenerationID ? summary.readinessGenerationID : nil
+    let generationText = generationCopyValue == nil
+      ? "No generation yet"
+      : "Generation \(summary.generationDisplayID)"
+    let detailText = detailText(for: state, summary: summary, generationText: generationText)
+    let secondaryBlockerRows = secondaryBlockers(for: state, summary: summary)
+    let diagnosticRows = diagnostics(for: state, summary: summary, generationText: generationText)
+    let recoveryLifecycleText = recoveryLifecycle(for: state, summary: summary)
+    let recoveryLifecycleAcknowledgementText = recoveryAcknowledgement(for: state, summary: summary)
+    let recoveryLifecycleCorrelationText = recoveryCorrelation(for: summary)
+    let recoveryLifecycleFreshnessBudgetText = recoveryFreshnessBudget(for: state, summary: summary)
+    let recoveryLifecycleActionRows = recoveryActions(for: state, summary: summary)
+    let recoveryLifecycleCopyTemplate = recoveryCopyTemplate(
+      for: state,
+      summary: summary,
+      primaryUnblockText: primaryUnblockText
+    )
+    let recoveryLifecycleAccessibilityLabel = [
+      "Recovery lifecycle, non-dismissible",
+      recoveryLifecycleText,
+      recoveryLifecycleAcknowledgementText,
+      recoveryLifecycleCorrelationText,
+      recoveryLifecycleFreshnessBudgetText,
+      "Actions: \(recoveryLifecycleActionRows.joined(separator: ", "))",
+    ].joined(separator: ". ")
+    let backlinkRouteLabel = backlinkRoute(for: state, summary: summary)
+    let backlinkRouteAccessibilityLabel =
+      "Closeout readiness readback route: \(backlinkRouteLabel)"
+    let focusReturnLabel = "Returns focus to Closeout Readiness after copy or diagnostics dismissal."
+    let copyFailureFallbackText =
+      "Copy failed. Generation \(summary.generationDisplayID) remains visible in diagnostics."
+    let voiceOverAnnouncementPolicy =
+      "No automatic repeating announcements; VoiceOver reads compact signal, card summary, and diagnostics on demand."
+    let keyboardTraversalOrder = [
+      "compact signal",
+      "diagnostics",
+      "copy generation id",
+      "primary unblock",
+      "recovery lifecycle",
+      "copy recovery template",
+      "readback route",
+      "mode explainer",
+    ]
+    let compactSignalLabel = "Closeout: \(statusLabel)"
+    let cardAccessibilityParts = [
+      "Closeout readiness",
+      statusLabel,
+      primaryUnblockText,
+      modeLabel,
+      generationText,
+      recoveryLifecycleText,
+    ]
+
+    return P077CloseoutReadinessPresentation(
+      statusLabel: statusLabel,
+      compactSignalLabel: compactSignalLabel,
+      detailText: detailText,
+      primaryUnblockText: primaryUnblockText,
+      secondaryBlockerRows: secondaryBlockerRows,
+      modeLabel: modeLabel,
+      modeExplainerText: modeExplainerText,
+      diagnosticRows: diagnosticRows,
+      recoveryLifecycleText: recoveryLifecycleText,
+      recoveryLifecycleAcknowledgementText: recoveryLifecycleAcknowledgementText,
+      recoveryLifecycleCorrelationText: recoveryLifecycleCorrelationText,
+      recoveryLifecycleFreshnessBudgetText: recoveryLifecycleFreshnessBudgetText,
+      recoveryLifecycleActionRows: recoveryLifecycleActionRows,
+      recoveryLifecycleCopyTemplate: recoveryLifecycleCopyTemplate,
+      recoveryLifecycleAccessibilityLabel: recoveryLifecycleAccessibilityLabel,
+      backlinkRouteLabel: backlinkRouteLabel,
+      backlinkRouteAccessibilityLabel: backlinkRouteAccessibilityLabel,
+      focusReturnLabel: focusReturnLabel,
+      copyFailureFallbackText: copyFailureFallbackText,
+      voiceOverAnnouncementPolicy: voiceOverAnnouncementPolicy,
+      keyboardTraversalOrder: keyboardTraversalOrder,
+      generationDisplayID: summary.generationDisplayID,
+      generationCopyValue: generationCopyValue,
+      generationCopyAccessibilityLabel: generationCopyValue == nil
+        ? "No closeout readiness generation id to copy"
+        : "Copy closeout readiness generation id \(summary.generationDisplayID)",
+      diagnosticsAccessibilityLabel:
+        "Show closeout readiness diagnostics for \(statusLabel)",
+      compactActivationAccessibilityLabel:
+        "Closeout readiness compact signal, \(statusLabel), \(primaryUnblockText)",
+      cardAccessibilityLabel: cardAccessibilityParts.joined(separator: ", "),
+      modeExplainerAccessibilityLabel: modeExplainerText,
+      visualState: visualState(for: state, summary: summary)
+    )
+  }
+
+  private enum DisplayState: Equatable {
+    case applicable(P077CloseoutReadinessStatus)
+    case awaitingFirstGeneration
+    case notApplicable
+  }
+
+  private nonisolated static func displayState(
+    for summary: P077CloseoutReadinessSummaryReadModel
+  ) -> DisplayState {
+    guard summary.isApplicable else {
+      return .notApplicable
+    }
+    if summary.diagnosticReason == "awaiting_first_generation" {
+      return .awaitingFirstGeneration
+    }
+    return .applicable(summary.readinessStatus)
+  }
+
+  private nonisolated static func statusText(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .notApplicable:
+      return "Not Applicable"
+    case .awaitingFirstGeneration:
+      return "Awaiting First Generation"
+    case .applicable(.ready):
+      return "Ready"
+    case .applicable(.readyWithRisks):
+      return "Ready with Risks"
+    case .applicable(.handoffRequired):
+      return "Handoff Required"
+    case .applicable(.notReady):
+      return "Not Ready"
+    case .applicable(.blocked):
+      return "Blocked"
+    case .applicable(.invalid):
+      return "Invalid"
+    case .applicable(.unknown):
+      return "Unknown"
+    }
+  }
+
+  private nonisolated static func primaryUnblock(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    let explicit = [summary.primaryUnblock, summary.summary, summary.diagnosticReason]
+      .compactMap { normalizedText($0) }
+      .first
+    switch state {
+    case .notApplicable:
+      return "Closeout readiness not applicable for this run."
+    case .awaitingFirstGeneration:
+      return explicit ?? "Awaiting first readiness check."
+    case .applicable(.ready):
+      return explicit ?? "Ready for manual release."
+    case .applicable(.readyWithRisks):
+      if let explicit {
+        return explicit
+      }
+      return summary.acceptedRiskCount > 0
+        ? "Accepted risks: \(summary.acceptedRiskCount)"
+        : "Accepted risks require release-owner review."
+    case .applicable(.handoffRequired):
+      return explicit ?? "Complete non-code handoff before release."
+    case .applicable(.notReady):
+      return explicit ?? "Resolve code blockers before closeout."
+    case .applicable(.blocked):
+      return explicit ?? "Resolve blocking closeout evidence."
+    case .applicable(.invalid):
+      return explicit ?? "Regenerate valid closeout readiness evidence."
+    case .applicable(.unknown):
+      return explicit ?? "Closeout readiness is unknown."
+    }
+  }
+
+  private nonisolated static func detailText(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel,
+    generationText: String
+  ) -> String {
+    switch state {
+    case .notApplicable:
+      return "Closeout readiness not applicable for this run. \(generationText)."
+    case .awaitingFirstGeneration:
+      return "Awaiting first readiness check. \(generationText)."
+    case .applicable:
+      let blockerText = [
+        summary.codeBlockerCount > 0 ? "\(summary.codeBlockerCount) code blockers" : nil,
+        summary.handoffCount > 0 ? "\(summary.handoffCount) handoff items" : nil,
+        summary.acceptedRiskCount > 0 ? "\(summary.acceptedRiskCount) accepted risks" : nil,
+      ].compactMap { $0 }.joined(separator: ", ")
+      let evidenceText = blockerText.isEmpty ? "No counted blockers" : blockerText
+      return "\(summary.readinessDecision) via \(summary.gateStatus). \(evidenceText). \(generationText)."
+    }
+  }
+
+  private nonisolated static func secondaryBlockers(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> [String] {
+    var rows: [String] = []
+    if summary.codeBlockerCount > 0 {
+      rows.append("\(summary.codeBlockerCount) code blocker\(summary.codeBlockerCount == 1 ? "" : "s") remain")
+    }
+    if summary.handoffCount > 0 {
+      let owner = normalizedText(summary.handoffOwner).map { " for \($0)" } ?? ""
+      rows.append("\(summary.handoffCount) handoff item\(summary.handoffCount == 1 ? "" : "s")\(owner)")
+    }
+    if summary.riskSettlementRequired {
+      rows.append("Risk settlement is required before release")
+    }
+    if summary.acceptedRiskCount > 0 {
+      rows.append("\(summary.acceptedRiskCount) accepted risk\(summary.acceptedRiskCount == 1 ? "" : "s") recorded")
+    }
+    if case .awaitingFirstGeneration = state {
+      rows.append("No active readiness generation has been published yet")
+    }
+    if case .notApplicable = state {
+      rows.append("This run is outside the P077 closeout-readiness scope")
+    }
+    return rows
+  }
+
+  private nonisolated static func diagnostics(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel,
+    generationText: String
+  ) -> [String] {
+    [
+      "Decision: \(summary.readinessDecision)",
+      "Gate: \(summary.gateStatus)",
+      normalizedText(summary.auditStatus).map { "Audit: \($0)" },
+      normalizedText(summary.diagnosticReason).map { "Diagnostic: \($0)" },
+      normalizedText(summary.fingerprintHash).map { "Fingerprint: \($0)" },
+      "Mode: \(summary.readinessMode)",
+      generationText,
+    ].compactMap { $0 }
+  }
+
+  private nonisolated static func recoveryLifecycle(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Recovery lifecycle: enter manual release through governed control surfaces."
+    case .applicable(.notReady):
+      return "Recovery lifecycle: return to code refine and rerun closeout readiness."
+    case .applicable(.handoffRequired):
+      return "Recovery lifecycle: complete handoff owner action, then rerun closeout readiness."
+    case .applicable(.blocked), .applicable(.invalid), .applicable(.unknown),
+         .awaitingFirstGeneration:
+      return "Recovery lifecycle: inspect diagnostics, settle the gate, or rerun the readiness check."
+    case .notApplicable:
+      return "Recovery lifecycle: no P077 action is available for this run."
+    }
+  }
+
+  private nonisolated static func recoveryAcknowledgement(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .notApplicable:
+      return "Acknowledgement: not applicable for this run."
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Acknowledgement: current generation is settled for release review."
+    case .awaitingFirstGeneration:
+      return "Acknowledgement: no governed recovery acknowledgement has been recorded yet."
+    case .applicable:
+      let timestamp = normalizedText(summary.synthesizedAt) ?? "unknown time"
+      return "Acknowledgement: blocker observed at \(timestamp); wait for governed channel acknowledgement before release."
+    }
+  }
+
+  private nonisolated static func recoveryCorrelation(
+    for summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    let gate = normalizedText(summary.gateGenerationID) ?? "missing gate generation"
+    let fingerprint = normalizedText(summary.fingerprintHash) ?? "missing fingerprint"
+    return "Correlation: run \(summary.runID), stage \(summary.stageID), readiness generation \(summary.generationDisplayID), gate \(gate), fingerprint \(fingerprint)."
+  }
+
+  private nonisolated static func recoveryFreshnessBudget(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Freshness budget: keep release evidence current before manual release."
+    case .notApplicable:
+      return "Freshness budget: no P077 freshness budget applies."
+    case .awaitingFirstGeneration:
+      return "Freshness budget: publish the first closeout readiness generation before release review."
+    case .applicable:
+      let synthesizedAt = normalizedText(summary.synthesizedAt) ?? "unknown generation time"
+      return "Freshness budget: if no new generation replaces this blocker after \(synthesizedAt), treat recovery as stalled and re-issue through governed control."
+    }
+  }
+
+  private nonisolated static func recoveryActions(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> [String] {
+    switch state {
+    case .notApplicable:
+      return ["Return to run detail"]
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return ["Re-copy generation id", "Open manual-release evidence route"]
+    case .applicable(.handoffRequired):
+      let owner = normalizedText(summary.handoffOwner) ?? "handoff owner"
+      return [
+        "Re-copy generation id",
+        "Re-issue closeout readiness after handoff settlement",
+        "Escalate to \(owner)",
+      ]
+    case .awaitingFirstGeneration:
+      return [
+        "Re-issue closeout readiness",
+        "Escalate missing generation to release owner",
+      ]
+    case .applicable:
+      return [
+        "Re-copy generation id",
+        "Re-issue closeout readiness after recovery action",
+        "Escalate to release owner",
+      ]
+    }
+  }
+
+  private nonisolated static func recoveryCopyTemplate(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel,
+    primaryUnblockText: String
+  ) -> String {
+    let owner = normalizedText(summary.handoffOwner) ?? "release owner"
+    let commandLabel: String
+    switch state {
+    case .applicable(.notReady):
+      commandLabel = "return to code refine and rerun closeout readiness"
+    case .applicable(.handoffRequired):
+      commandLabel = "complete handoff settlement and rerun closeout readiness"
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      commandLabel = "enter manual release through governed control"
+    case .applicable(.blocked), .applicable(.invalid), .applicable(.unknown),
+         .awaitingFirstGeneration:
+      commandLabel = "settle proposal gate or rerun readiness check"
+    case .notApplicable:
+      commandLabel = "no P077 action"
+    }
+
+    return [
+      "P077 recovery escalation",
+      "run=\(summary.runID)",
+      "stage=\(summary.stageID)",
+      "generation=\(summary.generationDisplayID)",
+      "decision=\(summary.readinessDecision)",
+      "status=\(summary.readinessStatus.rawValue)",
+      "command=\(commandLabel)",
+      "owner=\(owner)",
+      "primary_unblock=\(primaryUnblockText)",
+      "diagnostic=\(normalizedText(summary.diagnosticReason) ?? "none")",
+      "fingerprint=\(normalizedText(summary.fingerprintHash) ?? "missing")",
+    ].joined(separator: "; ")
+  }
+
+  private nonisolated static func backlinkRoute(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> String {
+    switch state {
+    case .applicable(.ready), .applicable(.readyWithRisks):
+      return "Manual release evidence"
+    case .applicable(.handoffRequired):
+      return normalizedText(summary.handoffOwner).map { "Handoff owner: \($0)" }
+        ?? "Handoff owner"
+    case .applicable(.notReady), .applicable(.blocked), .applicable(.invalid),
+         .applicable(.unknown), .awaitingFirstGeneration:
+      return "Closeout diagnostics"
+    case .notApplicable:
+      return "Run detail"
+    }
+  }
+
+  private nonisolated static func visualState(
+    for state: DisplayState,
+    summary: P077CloseoutReadinessSummaryReadModel
+  ) -> P077CloseoutReadinessVisualState {
+    switch state {
+    case .notApplicable:
+      return .neutral
+    case .awaitingFirstGeneration:
+      return .warning
+    case .applicable(.ready):
+      return .positive
+    case .applicable(.readyWithRisks), .applicable(.handoffRequired), .applicable(.unknown):
+      return .warning
+    case .applicable(.notReady), .applicable(.blocked), .applicable(.invalid):
+      return .blocking
+    }
+  }
+
+  private nonisolated static func normalizedText(_ value: String?) -> String? {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed?.isEmpty == false ? trimmed : nil
+  }
 }
 
 struct P031StageDetailPresentation: Equatable, Sendable {
@@ -3560,12 +4381,16 @@ enum P031RunsHomePresenter {
       pendingApprovals > 0
       ? "\(pendingApprovals) approvals pending"
       : nil
+    let closeoutReadiness = run.closeoutReadinessSummary.map {
+      P077CloseoutReadinessPresenter.presentation(for: $0)
+    }
     let accessibilityParts = [
       displayTitle,
       workflowLabel,
       statusLabel,
       progressLabel,
       pendingApprovalsLabel,
+      closeoutReadiness?.compactSignalLabel,
       P031ThinPresentationFormatting.freshnessAccessibilityLabel(run.freshnessState),
     ].compactMap { $0 }
 
@@ -3576,6 +4401,7 @@ enum P031RunsHomePresenter {
       statusLabel: statusLabel,
       progressLabel: progressLabel,
       pendingApprovalsLabel: pendingApprovalsLabel,
+      closeoutReadinessSignalLabel: closeoutReadiness?.compactSignalLabel,
       freshnessState: run.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
     )
@@ -3724,6 +4550,9 @@ enum P031RunDetailPresenter {
     }
     let pendingApprovals = run?.pendingApprovals ?? 0
     let pendingApprovalsLabel = pendingApprovals > 0 ? "\(pendingApprovals) approvals pending" : nil
+    let closeoutReadiness = run?.closeoutReadinessSummary.map {
+      P077CloseoutReadinessPresenter.presentation(for: $0)
+    }
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -3746,6 +4575,7 @@ enum P031RunDetailPresenter {
       artifactViewerRows: artifactViewerRows,
       reportRows: reportRows,
       catalogContext: run.map(P031CatalogContextPresenter.presentation),
+      closeoutReadiness: closeoutReadiness,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -3776,6 +4606,7 @@ enum P031RunDetailPresenter {
       artifactViewerRows: [],
       reportRows: [],
       catalogContext: nil,
+      closeoutReadiness: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))

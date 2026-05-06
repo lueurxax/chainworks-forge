@@ -10,10 +10,9 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 | Gate | `./scripts/test-gate.sh proposal-043` |
 | Alias | `./scripts/test-gate.sh p043` |
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
-| Historical proposal | [031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md) |
 | Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. See [ui-action-boundary.md](ui-action-boundary.md). |
 | Current UI boundary | Thin macOS UI (read-side and human-gate mutation consumer over server-owned projections). |
-| Stabilization owners | P032 for release/dogfood/stabilization evidence; P036 for visual/navigation restoration over this read model. |
+| Stabilization owners | P032 for productization and honest operator dogfood; P036 for visual/navigation restoration over this read model. |
 
 ## Thin UI Boundary
 
@@ -247,7 +246,7 @@ Future non-operator read expansion must be explicit in auth/capability policy an
 
 ## Thin UI Consumption Contract
 
-P031 may ship governed macOS UI surfaces from this contract:
+Governed macOS UI surfaces ship from this contract:
 
 - Runs home;
 - Run detail;
@@ -265,7 +264,7 @@ The macOS thin UI owns the UI-side evidence for the **read-side** client contrac
 - no SwiftData / local-service fallback for workflow truth;
 - subscription patching rules from the "Refresh and subscription posture" section.
 
-Scope boundary: P031 remains a read-only consumer for workflow truth and non-approval commands. The UI action boundary adds only the approval-resolution mutation exception; it does not make P031 responsible for MCP command-control behavior, command receipts, or broad UI writes.
+Scope boundary: the governed thin UI remains a read-only consumer for workflow truth and non-approval commands. The UI action boundary adds only the approval-resolution mutation exception; it does not make SwiftUI responsible for MCP command-control behavior, command receipts, or broad UI writes.
 
 The thin UI boundary does NOT own:
 
@@ -306,4 +305,4 @@ The gate fails closed when this reference document omits required surfaces, stat
 - Report payload rendering needs a server-owned GraphQL payload path before it can be a full thin-client surface.
 - Adapter/runtime health beyond the daemon lifecycle read model remains deferred unless a future server-owned read surface publishes it.
 - Experiment comparison has no current GraphQL read owner and stays deferred.
-- Release/dogfood/stabilization evidence is owned by P032, and visual/navigation restoration is owned by P036. Those tails do not change the thin UI boundary for new feature work.
+- Broader operator dogfood/productization is owned by P032, and visual/navigation restoration is owned by P036. Those tails do not change the thin UI boundary for new feature work.

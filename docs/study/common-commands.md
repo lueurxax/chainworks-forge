@@ -208,8 +208,8 @@ open docs/README.md
 # View specific reference doc
 cat docs/reference/current-system-baseline.md | head -100
 
-# View proposal
-cat docs/proposals/031-thin-graphql-read-boundary.md | head -200
+# View thin UI read contract
+cat docs/reference/query-projections-and-client-consumption-contract.md | head -200
 
 # Search docs for keyword
 grep -r "RunPlanSnapshot" docs --include="*.md"

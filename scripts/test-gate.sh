@@ -18,6 +18,9 @@ UNSIGNED_BUILD_ARGS=(
   CODE_SIGN_IDENTITY=
 )
 
+P077_ROLLOUT_EVIDENCE_PATH="docs/reference/p077-rollout-dependency-evidence.md"
+P077_UI_EVIDENCE_PATH="docs/reference/p077-closeout-readiness-ui-evidence.md"
+
 FAST_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
   "Chainworks ForgeTests/OrchestratorTests"
@@ -34,6 +37,11 @@ UI_SMOKE_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testStartRunSheetUI"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testLiveRuntimeUnavailableShowsRecoveryGuidance"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
+)
+
+P077_UI_TESTS=(
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal077CloseoutReadinessRuntimeAccessibilityProof"
 )
 
 PROPOSAL_006_TESTS=(
@@ -420,6 +428,89 @@ PROPOSAL_042_TESTS=(
   "graphql-server missing_inbound_request_id_still_produces_and_persists_a_fresh_uuid"
   "graphql-server request_id_propagates_through_graphql_and_mcp_and_journal"
 )
+
+require_p077_rollout_dependency_evidence() {
+  local evidence_file="$ROOT_DIR/$P077_ROLLOUT_EVIDENCE_PATH"
+  [[ -f "$evidence_file" ]] || die "Missing P077 rollout/dependency evidence: $P077_ROLLOUT_EVIDENCE_PATH"
+
+  local required_patterns=(
+    "dependency | owner | pass_rule | proof | fallback | waiver_authority | evidence_status"
+    "metric | numerator | denominator | threshold | owner | source | go_no_go_action"
+    "false_ready_prevented"
+    "post_release_closeout_gap_reversals"
+    "false_blocks"
+    "pause_to_action"
+    "code_writer_loops_avoided"
+    "rollback_trigger_false_blocks"
+    "rollback_trigger_closeout_gap_reversal"
+    "rollback_action"
+    "p077_rollout_metric_events"
+    "p077_rollout_decisions"
+    "p077_rollout_advisory_migrations"
+    "decision_type"
+    "cohort"
+    "eligible_closeouts"
+    "primary_metric_values_json"
+    "diagnostic_metric_snapshot_json"
+    "dependency_checklist_snapshot_id"
+    "fingerprint_p95_threshold_ms"
+    "measurement_window"
+    "waivers_json"
+    "next_review_date"
+    "readiness_links_json"
+    "rollback_execution_fixture"
+    "in_flight_policy"
+    "neutral_observation_rule"
+  )
+
+  local pattern
+  for pattern in "${required_patterns[@]}"; do
+    if ! grep -Fq "$pattern" "$evidence_file"; then
+      die "P077 rollout/dependency evidence is missing required field: $pattern"
+    fi
+  done
+}
+
+require_p077_ui_evidence() {
+  local evidence_file="$ROOT_DIR/$P077_UI_EVIDENCE_PATH"
+  [[ -f "$evidence_file" ]] || die "Missing P077 UI evidence: $P077_UI_EVIDENCE_PATH"
+
+  local required_patterns=(
+    "readiness_state | tone_token | icon | typography | surface | breakpoint_behavior | interaction"
+    "contrast_decision"
+    "measured_contrast_ratio"
+    "cardElevated"
+    "compactCapsule"
+    "High Contrast"
+    "Reduce Transparency"
+    "Differentiate Without Color"
+    "compactActivationAccessibilityLabel"
+    "diagnosticsAccessibilityLabel"
+    "copyFailureFallbackText"
+    "voiceOverAnnouncementPolicy"
+    "p077-closeout-readiness-announcement-priority"
+    "keyboardTraversalOrder"
+    "recoveryLifecycleText"
+    "recoveryLifecycleAcknowledgementText"
+    "recoveryLifecycleCorrelationText"
+    "recoveryLifecycleFreshnessBudgetText"
+    "recoveryLifecycleActionRows"
+    "recoveryLifecycleCopyTemplate"
+    "p077-closeout-readiness-recovery-copy-template"
+    "backlinkRouteLabel"
+    "p077-closeout-readiness-compact-action"
+    "p077-closeout-readiness-compact-status"
+    "p077-closeout-readiness-return"
+    "proposal-077-ui"
+  )
+
+  local pattern
+  for pattern in "${required_patterns[@]}"; do
+    if ! grep -Fq "$pattern" "$evidence_file"; then
+      die "P077 UI evidence is missing required field: $pattern"
+    fi
+  done
+}
 
 PROPOSAL_054_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal025Tests/implementationSelfAssessmentAdapterDerivesBlockedVerificationStatus()"
@@ -1056,7 +1147,7 @@ approved_remote_ui_hosts() {
 
 gate_requires_remote_ui_host() {
   case "${1:-}" in
-    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|full)
+    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-077-ui|p077-ui|full)
       return 0
       ;;
     *)
@@ -2079,9 +2170,11 @@ Available gates:
   proposal-027r   Proposal 027 unified read-only JSON/markdown rendering gate (legacy renderer)
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
-  proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
-  proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
+  proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
+  proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
+  proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
@@ -4082,7 +4175,7 @@ for phrase in [
     "operator-only V1",
     "Projection parity",
     "Known holds",
-    "P031 may ship",
+    "Governed macOS UI surfaces ship",
     # Scope narrowing: P031 is a read-only consumer. It does not issue
     # MCP mutations, so rows that reference disabled controls apply to a
     # future command-UI consumer, not to P031.
@@ -4102,7 +4195,7 @@ PY
     log "Proposal 043 control-plane gate passed"
     ;;
   proposal-031|p031)
-    log "Proposal 031 gate: GraphQL-only thin UI inventory/static guard/write-path guide"
+    log "Thin UI gate: GraphQL-only inventory/static guard/write-path guide"
     "$0" proposal-043
 
     python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
@@ -4134,7 +4227,7 @@ for entry in manifest.get("entries", []):
     require_file(entry["path"])
 PY
     )
-    log "Proposal 031 gate passed"
+    log "Thin UI gate passed"
     ;;
   proposal-072|p072)
     log "UI action boundary gate: approval-only GraphQL UI mutation boundary"
@@ -4160,24 +4253,26 @@ PY
       python3 - <<'PY'
 from pathlib import Path
 
-p031 = Path("docs/proposals/031-thin-graphql-ui-rewrite.md").read_text()
+contract = Path("docs/reference/query-projections-and-client-consumption-contract.md").read_text()
+boundary = Path("docs/reference/ui-action-boundary.md").read_text()
+combined = contract + "\n" + boundary
 required = [
-    "UI action boundary supersedes the original P031 all-mutation ban",
+    "The governed SwiftUI app is a GraphQL-only observer and approval console.",
     "approveApproval",
     "rejectApproval",
-    "0 non-approval GraphQL mutations",
+    "Non-approval GraphQL mutations are prohibited from governed UI code.",
 ]
 for phrase in required:
-    if phrase not in p031:
-        raise SystemExit(f"proposal-072: P031 text missing UI action boundary reconciliation phrase: {phrase}")
+    if phrase not in combined:
+        raise SystemExit(f"proposal-072: stable UI boundary docs missing reconciliation phrase: {phrase}")
 
 for forbidden in [
     "Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.",
     "Governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.",
     "GraphQL mutation usage: 0 GraphQL mutations defined or invoked by governed UI code.",
 ]:
-    if forbidden in p031:
-        raise SystemExit(f"proposal-072: P031 still contains stale P031/UI action boundary text: {forbidden}")
+    if forbidden in combined:
+        raise SystemExit(f"proposal-072: stable UI boundary docs contain stale approval-boundary text: {forbidden}")
 
 inventory = Path("docs/reference/p031-thin-ui-inventory.json").read_text()
 for operation in ["P072ApproveApproval", "P072RejectApproval"]:
@@ -4189,7 +4284,7 @@ PY
     log "UI action boundary gate passed"
     ;;
   proposal-031-readiness|p031-readiness)
-    log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"
+    log "Thin UI readiness gate: closeout evidence"
     "$0" proposal-031
 
     (
@@ -4243,7 +4338,7 @@ if failures:
     raise SystemExit("proposal-031-readiness failed:\n- " + "\n- ".join(failures))
 PY
     )
-    log "Proposal 031 readiness gate passed"
+    log "Thin UI readiness gate passed"
     ;;
   proposal-044|p044)
     log "Proposal 044 control-plane gate: post-approval + N-phase + end-state"
@@ -5528,6 +5623,39 @@ PY
     else
       run_full_suite
     fi
+    ;;
+  proposal-077|p077)
+    # P077 closeout readiness gate: Rust domain/db/engine unit and proof-gate
+    # tests plus GraphQL/MCP readback parity through the shared accessor.
+    # NOT covered: macOS UI/accessibility remote-host evidence.
+    # See docs/reference/test-gates.md for narrowed coverage statement.
+    require_p077_rollout_dependency_evidence
+    require_p077_ui_evidence
+    log "Proposal 077 closeout readiness gate (Rust domain/db/engine + GraphQL/MCP parity)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p domain proposal_077_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p db closeout_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p db p077_rollout -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p engine proposal_077_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p graphql-server --test proposal_077_closeout_readback_parity -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p mcp-server --test proposal_077_closeout_readback_parity -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test --test p077_proof_gate -- --nocapture
+    )
+    log "Proposal 077 closeout readiness gate passed"
+    ;;
+  proposal-077-ui|p077-ui)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    require_p077_ui_evidence
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
+    log "Proposal 077 remote macOS closeout-readiness UI gate passed"
     ;;
   *)
     print_usage >&2

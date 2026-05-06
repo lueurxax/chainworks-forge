@@ -5,7 +5,7 @@
 | Date | 2026-04-25 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Current implemented baseline, Proposal 031, Proposal 038, [Xcode MCP bridge pool](../reference/xcode-mcp-bridge-pool.md), Proposal 070, [UI action boundary](../reference/ui-action-boundary.md) |
+| Depends on | Current implemented baseline, [GraphQL thin UI read contract](../reference/query-projections-and-client-consumption-contract.md), Proposal 038, [Xcode MCP bridge pool](../reference/xcode-mcp-bridge-pool.md), Proposal 070, [UI action boundary](../reference/ui-action-boundary.md) |
 | Goal | Stop feature sprawl temporarily and introduce a stabilization protocol that reduces active architectural seams, artifact noise, projection drift, provider/runtime churn, and UI/control-plane ambiguity. |
 
 ---
@@ -42,7 +42,7 @@ For the next stabilization window, allow only work that reduces complexity or cl
 
 Allowed:
 
-- P031 GraphQL thin UI boundary stabilization
+- GraphQL thin UI boundary stabilization
 - P051 Xcode MCP bridge pool core only
 - P038 run compaction
 - P070 boundary/typed contract refactor
@@ -86,7 +86,7 @@ Minimum metrics:
 
 Introduce or update gates:
 
-- `proposal-031-boundary`
+- `proposal-031|p031`
 - `proposal-038-compaction`
 - `proposal-051|p051`
 - `proposal-068-boundary`
@@ -135,7 +135,7 @@ Do not use this proposal to:
 
 The stabilization window can end when:
 
-1. P031 boundary is implemented and enforced;
+1. the GraphQL thin UI boundary is implemented and enforced;
 2. P038 compaction reduces artifact noise on real runs;
 3. P051 bridge pool is either stable or feature-flag disabled;
 4. the UI action boundary is implemented in docs/gates;

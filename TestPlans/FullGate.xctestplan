@@ -9,6 +9,13 @@
     }
   ],
   "defaultOptions" : {
+    "environmentVariableEntries" : [
+      {
+        "enabled" : true,
+        "key" : "CHAINWORKS_P031_DEGRADED_DRILL",
+        "value" : "$(CHAINWORKS_P031_DEGRADED_DRILL)"
+      }
+    ],
     "targetForVariableExpansion" : {
       "containerPath" : "container:Chainworks Forge.xcodeproj",
       "identifier" : "CE8913472F6FC30A006EC77C",
@@ -21,6 +28,13 @@
         "containerPath" : "container:Chainworks Forge.xcodeproj",
         "identifier" : "CE8913472F6FC30A006EC77C",
         "name" : "Chainworks ForgeTests"
+      }
+    },
+    {
+      "target" : {
+        "containerPath" : "container:Chainworks Forge.xcodeproj",
+        "identifier" : "CE8913512F6FC30A006EC77C",
+        "name" : "Chainworks ForgeUITests"
       }
     }
   ],

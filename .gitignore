@@ -38,6 +38,7 @@ control-plane/control-plane/
 .chainworks/
 traces/
 .forge-codex-acp/
+control-plane/.junie/
 control-plane/chainworks-control-plane.db
 control-plane/chainworks-control-plane.db-*
 control-plane/chainworks-control-plane.db.backup-*.sqlite

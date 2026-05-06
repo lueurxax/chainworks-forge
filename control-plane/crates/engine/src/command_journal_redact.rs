@@ -151,6 +151,14 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
                 redact_field_if_present(obj, "rationale");
             }
         }
+        Command::SettleProposalGate(_) => {
+            // P077: redact reason and receipt_json (may contain operator-submitted text).
+            // Preserve run_id, proposal_id, stage_id, action, lineage fields for auditability.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "reason");
+                redact_field_if_present(obj, "receipt_json");
+            }
+        }
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| payload_json.to_string())
@@ -230,6 +238,7 @@ mod tests {
             agent_catalog_yaml_path: "examples/agents/a.yaml".into(),
             review_routing_json: None,
             rollout_contract_preflight_policy_json: None,
+            closeout_readiness_mode: None,
         })
     }
 
@@ -635,6 +644,7 @@ mod tests {
                 Command::OverrideArtifactContract(_) => {}
                 Command::ResolveLeadMediationConfirmation(_) => {}
                 Command::ResolveApproval(_) => {}
+                Command::SettleProposalGate(_) => {}
             }
         }
     }

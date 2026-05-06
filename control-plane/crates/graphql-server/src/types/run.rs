@@ -61,6 +61,10 @@ pub struct GqlRun {
     pub main_sync_readback_json: Option<Json<serde_json::Value>>,
     pub knowledge_capsule_readback_json: Option<Json<serde_json::Value>>,
     pub rollout_contract_readback_json: Option<Json<serde_json::Value>>,
+    /// P077: Active closeout readiness summary (via CloseoutReadinessSummaryAccessor).
+    pub closeout_readiness_summary_json: Option<Json<serde_json::Value>>,
+    /// P077: Documented alias for the implementation closeout readiness summary.
+    pub implementation_closeout_readiness_summary: Option<Json<serde_json::Value>>,
 }
 
 impl From<Run> for GqlRun {
@@ -109,6 +113,8 @@ impl From<Run> for GqlRun {
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
+            closeout_readiness_summary_json: None,
+            implementation_closeout_readiness_summary: None,
         }
     }
 }
@@ -177,6 +183,8 @@ impl From<RunProjectionRow> for GqlRun {
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
+            closeout_readiness_summary_json: None,
+            implementation_closeout_readiness_summary: None,
         }
     }
 }

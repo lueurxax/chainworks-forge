@@ -39,7 +39,7 @@ This reference covers:
 - the work queue and recovery service
 - daemon startup and configuration
 
-It does not cover the SwiftUI operator shell or the thin-client cutover (P031). The server parity harness is a specialized engine extension described in [test-gates.md](test-gates.md) and [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md).
+It does not cover the SwiftUI operator shell or the implemented thin-client read boundary. The server parity harness is a specialized engine extension described in [test-gates.md](test-gates.md) and [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md).
 
 ## Architecture
 
@@ -146,7 +146,7 @@ Tools are namespaced:
 | Namespace | Tools |
 |---|---|
 | `ideas.*` | `ideas.create`, `ideas.list` |
-| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore` |
+| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
 | `stages.*` | `stages.retry` |
 | `reports.*` | `reports.get` |
@@ -705,7 +705,7 @@ These decisions are fixed for the baseline and are not under reconsideration. Ac
 
 6. **Lazy stage creation.** Stages are created only when the orchestrator enters a state, not upfront when the run starts.
 
-7. **Client remains canonical during parity.** The SwiftUI app owns user-visible behavior until the thin-client cutover (P031). The daemon provides verifiable shadow truth.
+7. **Client remained canonical during parity.** The SwiftUI app owned user-visible behavior during parity. The implemented thin-client boundary now consumes daemon-owned GraphQL projections for governed workflow truth.
 
 8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. The daemon keeps SQLite as the source of truth and uses explicit write serialization plus executor backpressure instead of relying on more writer concurrency.
 
@@ -724,8 +724,8 @@ The retained gate aliases are operational:
 
 The following items are explicitly out of scope for this baseline:
 
-- **Thin-client cutover** -- authority transfer from client to daemon (P031).
-- **Thin-client UI cutover** -- P043 finalized the GraphQL projection read contract, but user-visible macOS cutover remains owned by P031.
+- **Broad command UI writes** -- governed SwiftUI remains read-only for non-approval commands; command transports require separate boundary work.
+- **Product-polish UI restoration** -- visual/navigation restoration over the GraphQL read model is owned outside the Rust control-plane baseline.
 - **Northbound MCP command plane** -- full external command surface (P029).
 - **Multi-host or distributed deployment** -- no remote workflow platformization.
 - **Proposal-loop telemetry projections** -- the `proposal_loop_metrics` table from the original design is deferred to a future telemetry slice.

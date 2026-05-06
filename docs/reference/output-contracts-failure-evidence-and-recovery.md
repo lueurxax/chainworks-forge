@@ -47,6 +47,12 @@ The Rust control plane now implements the structured-output substrate for this s
 
 The detailed owner chain for that substrate lives in [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md). This document treats that substrate as implemented baseline, then defines how failure evidence, retry truth, and narrow recovery consume it.
 
+### Required outputs flow through one materialization path
+
+Agent-authored required outputs should enter the system through the final `CHAINWORKS_OUTPUT` object returned by the provider session. Prompt generation must provide contract-complete skeletons for each declared output; repair prompts must use the same contract-complete skeletons for failed outputs.
+
+The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
+
 ### One contract authority
 
 `AgentCatalog.contracts` remains the single contract authority for this slice.
@@ -125,6 +131,8 @@ The current controlled contracts are:
 | `security_report_v1` | `security/report.json` | `pass`, `block`, `invalid`, `unknown` |
 | `prepush_review_v1` | `review/prepush.json` | `pass`, `block`, `invalid`, `unknown` |
 | `docs_report_v1` | `docs/report.json` | `pass`, `not_needed`, `block`, `invalid`, `unknown` |
+| `docs_delta_v1` | `docs/changed-files.json` | generated evidence |
+| `implementation_closeout_readiness_v1` | `review/implementation-closeout-readiness.json` | `ready`, `ready_with_risks`, `handoff_required`, `not_ready`, `blocked`, `invalid`, `unknown` |
 | `implementation_self_assessment_v2` | `implementation/self-assessment.json` | `complete`, `handoff_required`, `needs_code_fixes`, `blocked`, `unknown`, `invalid` |
 | `tests_result_v1` | `implementation/tests.json` | `green`, `red`, `blocked`, `unknown` |
 | `implementation_review_summary_v1` | `review/implementation-summary.json` | `code_complete`, `needs_code_fixes`, `release_evidence_blocked`, `invalid` |
@@ -181,15 +189,61 @@ review, release, or operator decision surfaces that own the remaining work. Lega
 artifacts remain readable as compatibility evidence, but `seemingly_complete` is not transition authority for new
 implementation-loop decisions.
 
-After implementation review aggregation, `implementation_review_summary_v1.status`
-is the closeout transition authority. `state_9_implementation_reviewed` must not
-advance to `state_11_manual_release` from the self-assessment's zero
-`blocking_remaining_code_tasks` alone. A canonical `needs_code_fixes` or `invalid`
-review summary routes to `state_10_implementation_refined`; `code_complete` can
-enter manual release. `release_evidence_blocked` routes back to
-`state_10_implementation_refined` so the orchestrator keeps closing the approved
-proposal instead of converting release-evidence gaps into a release approval.
+### Implementation closeout readiness
 
+`implementation_closeout_readiness_v1` is the decision contract for moving from implementation review
+to manual release or handoff. It evaluates proposal-specific readiness by combining self-assessment,
+implementation audit, proposal gates, and release evidence handoff.
+
+#### Readiness Mode
+
+Closeout readiness is governed by a per-run **closeout readiness mode** frozen at run admission:
+- **`advisory`** (and the `legacy_fallback` diagnostic variant): Diagnostic-only mode. Closeout readiness is synthesized and visible to operators, but the synthesizer caps any decision that would trigger a workflow transition (`enter_manual_release`, `return_to_code_refine`) to `await_operator_decision` and records a `diagnostic_reason` explaining the cap. Observability fields (status, blocker counts, gate status) are preserved unchanged so operators see what the matrix would have decided in enforcement.
+- **`enforcement`**: Strict gating mode. Transition to manual release requires a resolved `enter_manual_release` decision.
+
+#### Decision and Gating
+
+The canonical artifact path is `review/implementation-closeout-readiness.json`. The artifact contains:
+
+- `status`: the readiness status (`ready`, `ready_with_risks`, `handoff_required`, `not_ready`, `blocked`, `invalid`, `unknown`).
+- `decision`: the workflow routing decision (`enter_manual_release`, `await_non_code_handoff`, `return_to_code_refine`, `await_gate_definition`, `await_operator_decision`, `block_with_evidence`).
+- `proposal_gate`: status of the required canonical proposal gate.
+- `audit`: status and reference to the implementation audit report.
+- `code_blockers`: list of proposal-critical code blockers.
+- `handoff_blockers`: list of non-code handoff blockers.
+- `loop_policy`: current refine cycles used, remaining budget, and whether a soft convergence checkpoint was reached.
+- `fingerprint_json`: optional snapshot of the run state used to detect stale or replayed results.
+
+The closeout decision distinguishes code-owned blockers from non-code blockers to prevent infinite
+code/review loops. If code blockers exist and budget remains, the run returns to code refine.
+If only handoff blockers remain, the run moves to a handoff or operator-decision state.
+
+#### Soft Convergence Checkpoint
+
+If the same set of code blockers recurs across repeated audit/refine cycles without meaningful progress or a change in the blocker set, the synthesizer marks a **soft convergence checkpoint**. This routes the run to `await_operator_decision` instead of looping silently back to code refinement, even if the hard loop budget (P052) is not yet exhausted.
+
+#### Closeout Fingerprint and Latency Budget
+
+To ensure decision consistency, the synthesizer consumes a **Closeout Fingerprint** that captures the state of the run at the time of evaluation. If the fingerprint computation exceeds the **5,000ms latency budget**, the synthesizer fails closed with `status: unknown` and `decision: block_with_evidence`, preventing a transition based on potentially stale or inconsistent state.
+
+After the state-9 closeout transaction commits the active gate/readiness pair, the orchestrator rebuilds run-state projections so transition evaluation, GraphQL `runs.get`, and MCP `runs.get` see current P077 truth in the same `AdvanceRun` cycle. A rebuild failure is logged and retried on the next cycle: active SQLite truth remains authoritative and projections are eventually consistent. The exported run-state projection includes a derived `fingerprint_hash` short hash for each P077 row (sourced from `fingerprint_json` via `CloseoutFingerprint::short_hash`); it is the operator-facing identifier used in tooltips, copy-to-clipboard, and VoiceOver announcements, while the full fingerprint payload remains available only through artifact readback. Rows without a fingerprint expose `fingerprint_hash: null`.
+
+#### Risk Lineage
+
+For states such as `ready_with_risks`, enforcement mode requires **typed risk lineage** (accepted lineage or governed settlement) for each risk. Free-form `known_risks` text alone never satisfies the requirement to `enter_manual_release`.
+
+GraphQL exposes nullable `implementationCloseoutReadinessSummary` and compatibility
+`closeoutReadinessSummaryJson` fields on run read models. MCP run detail/list and
+report readbacks expose the same projection as `implementation_closeout_readiness_summary`
+and compatibility `closeout_readiness_summary`.
+
+After implementation review aggregation, `implementation_review_summary_v1.status`
+is an input to closeout readiness rather than direct transition authority. A canonical
+`needs_code_fixes` or `invalid` review summary feeds `return_to_code_refine`;
+`code_complete` can feed `enter_manual_release`, and `release_evidence_blocked`
+is preserved as a separate release-hold/manual decision input.
+
+### Generated run-state projection
 GraphQL exposes a nullable `implementationSelfAssessmentSummary` field on run read models. MCP run detail/list
 responses expose the same projection as `implementation_self_assessment_summary`. `null` means no v2/v1 projection
 exists yet; raw artifact readback remains available for evidence inspection.

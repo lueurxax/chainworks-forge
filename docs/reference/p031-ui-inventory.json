@@ -1,7 +1,7 @@
 {
   "schema_version": "p031-ui-inventory.v2",
   "proposal_revision": "031-2026-04-24-r19-degraded-state-correction",
-  "governing_contract": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+  "governing_contract": "docs/reference/query-projections-and-client-consumption-contract.md",
   "scope_boundary": "graphql_read_only_mac_ui",
   "generated_at": "2026-04-24",
   "governed_swift_paths": [

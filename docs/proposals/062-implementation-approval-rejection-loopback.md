@@ -15,7 +15,7 @@
 
 ## 1. Context and Motivation
 
-During dogfooding on 2026-04-20, P031 reached `state_6_implementation_approval` after review. The operator then materially changed the proposal scope: the macOS UI must be GraphQL-only for reads, must not use MCP from UI, and must not add write paths except approval-related controls under a separately approved transport.
+During dogfooding on 2026-04-20, the thin UI cutover run reached `state_6_implementation_approval` after review. The operator then materially changed the scope: the macOS UI must be GraphQL-only for reads, must not use MCP from UI, and must not add write paths except approval-related controls under a separately approved transport.
 
 The correct product action was to reject the stale implementation approval and send the proposal back through refinement and review. The current full-MVP workflow could not do that directly:
 

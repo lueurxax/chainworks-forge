@@ -452,6 +452,10 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
   func workflowReadStoreUsesGraphQLReadContracts() async throws {
     let readTransport = CapturingP031ReadTransport(
       responses: [
+        "P031Ideas": Data(
+          """
+          {"data":{"ideas":[{"id":"idea-1","title":"Daemon idea","body":"Read from GraphQL","workspaceRootPath":"/tmp/daemon","projectKey":"P999","status":"active","createdAt":"2026-05-05T18:00:00Z","archivedAt":null}]}}
+          """.utf8),
         "P031RunsHome": Data(
           """
           {"data":{"runs":[{"id":"run-1","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":4,"completedStages":2,"failedStages":0,"pendingApprovals":1}]}}
@@ -481,6 +485,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       subscriptionTransport: subscriptionTransport
     )
 
+    let ideas = try await store.fetchIdeas(includeArchived: false)
     let runs = try await store.fetchRuns()
     let approvals = try await store.fetchApprovalInbox()
     let reports = try await store.fetchReportMetadata(runID: "run-1")
@@ -488,6 +493,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     let statusStream = try store.subscribeToRunStatus(runID: "run-1")
     let statusEvent = try await firstValue(from: statusStream)
 
+    #expect(ideas.map(\.title) == ["Daemon idea"])
     #expect(runs.map(\.id) == ["run-1"])
     #expect(approvals.map(\.id) == ["approval-1"])
     #expect(reports.map(\.id) == ["report-1"])
@@ -496,7 +502,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(statusEvent?.status == "completed")
     #expect(
       readTransport.requests.map(\.operationName) == [
-        "P031RunsHome", "P031ApprovalInbox", "P031ReportMetadata", "P031DaemonStatus",
+        "P031Ideas", "P031RunsHome", "P031ApprovalInbox", "P031ReportMetadata", "P031DaemonStatus",
       ])
     #expect(
       readTransport.requests.first { $0.operationName == "P031ReportMetadata" }?.variables == [
@@ -584,6 +590,235 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         ["runId": "run-1"],
         ["runId": "run-1"],
       ])
+  }
+
+  @Test("GraphQL documents request P077 closeout readiness through accessor-backed alias")
+  func graphQLDocumentsRequestP077CloseoutReadinessThroughAccessorAlias() {
+    #expect(
+      P031GraphQLDocuments.runsHome.contains(
+        "implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson"
+      ))
+    #expect(
+      P031GraphQLDocuments.runDetail.contains(
+        "implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson"
+      ))
+    #expect(!P031GraphQLDocuments.runsHome.contains("implementation-closeout-readiness.json"))
+    #expect(!P031GraphQLDocuments.runDetail.contains("implementation-closeout-readiness.json"))
+  }
+
+  @Test("Workflow read store decodes P077 closeout readiness from documented and alias fields")
+  func workflowReadStoreDecodesP077CloseoutReadinessFields() async throws {
+    let readTransport = CapturingP031ReadTransport(
+      responses: [
+        "P031RunsHome": Data(
+          """
+          {"data":{"runs":[{"id":"run-ready","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":9,"completedStages":8,"failedStages":0,"pendingApprovals":0,"implementationCloseoutReadinessSummary":\(closeoutReadinessSummaryJSON(status: "ready", decision: "enter_manual_release", generationID: "abcdef1234567890", mode: "enforcement", gateStatus: "passed", primaryUnblock: nil, summary: "Ready for manual release"))}]}}
+          """.utf8),
+        "P031RunDetail": Data(
+          """
+          {"data":{"run":{"id":"run-blocked","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":9,"completedStages":8,"failedStages":0,"pendingApprovals":0,"closeoutReadinessSummaryJson":\(closeoutReadinessSummaryJSON(status: "blocked", decision: "block_with_evidence", generationID: "fedcba9876543210", mode: "advisory", gateStatus: "failed", primaryUnblock: "Resolve proposal gate failure", summary: "Gate failed"))},"stages":[],"artifacts":[],"approvalInbox":[]}}
+          """.utf8),
+      ])
+    let store = P031GraphQLWorkflowReadStore(
+      readTransport: readTransport,
+      subscriptionTransport: CapturingP031SubscriptionTransport()
+    )
+
+    let runs = try await store.fetchRuns()
+    let detail = try await store.fetchRunDetail(runID: "run-blocked")
+
+    #expect(runs.first?.closeoutReadinessSummary?.readinessStatus == .ready)
+    #expect(runs.first?.closeoutReadinessSummary?.generationDisplayID == "abcdef12")
+    #expect(detail.run?.closeoutReadinessSummary?.readinessStatus == .blocked)
+    #expect(detail.run?.closeoutReadinessSummary?.primaryUnblock == "Resolve proposal gate failure")
+    #expect(
+      readTransport.requests.first { $0.operationName == "P031RunDetail" }?.document.contains(
+        "implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson"
+      ) == true)
+  }
+
+  @Test("P077 closeout readiness presenter covers required read-only states")
+  func p077CloseoutReadinessPresenterCoversRequiredStates() throws {
+    let cases: [(String, Bool, String?, String, String)] = [
+      ("ready", true, nil, "Ready", "Ready"),
+      ("ready_with_risks", true, nil, "Ready with Risks", "Accepted risks"),
+      ("handoff_required", true, "Complete docs handoff", "Handoff Required", "Complete docs handoff"),
+      ("not_ready", true, "Fix implementation blockers", "Not Ready", "Fix implementation blockers"),
+      ("blocked", true, "Resolve proposal gate failure", "Blocked", "Resolve proposal gate failure"),
+      ("invalid", true, "Regenerate readiness evidence", "Invalid", "Regenerate readiness evidence"),
+      ("unknown", true, "Awaiting first readiness check", "Awaiting First Generation", "Awaiting first readiness check"),
+      ("unknown", false, nil, "Not Applicable", "Closeout readiness not applicable"),
+    ]
+
+    for (status, isApplicable, primaryUnblock, expectedStatus, expectedPrimaryUnblock) in cases {
+      let summary = try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: status,
+          decision: "await_operator_decision",
+          generationID: isApplicable ? "1234567890abcdef" : "",
+          mode: "advisory",
+          gateStatus: "missing_definition",
+          diagnosticReason: status == "unknown" && isApplicable
+            ? "awaiting_first_generation"
+            : nil,
+          primaryUnblock: primaryUnblock,
+          summary: primaryUnblock,
+          isApplicable: isApplicable,
+          acceptedRiskCount: status == "ready_with_risks" ? 2 : 0
+        )
+      )
+
+      let presentation = P077CloseoutReadinessPresenter.presentation(for: summary)
+
+      #expect(presentation.statusLabel == expectedStatus)
+      #expect(presentation.primaryUnblockText.contains(expectedPrimaryUnblock))
+      #expect(presentation.modeExplainerAccessibilityLabel.contains("Closeout readiness mode"))
+      #expect(presentation.generationCopyAccessibilityLabel.contains("generation id"))
+      #expect(presentation.diagnosticsAccessibilityLabel.contains(expectedStatus))
+      #expect(presentation.compactActivationAccessibilityLabel.contains(expectedStatus))
+      #expect(!presentation.diagnosticRows.isEmpty)
+      #expect(presentation.recoveryLifecycleText.contains("Recovery"))
+      #expect(presentation.recoveryLifecycleAcknowledgementText.contains("Acknowledgement"))
+      #expect(presentation.recoveryLifecycleCorrelationText.contains("Correlation"))
+      #expect(presentation.recoveryLifecycleFreshnessBudgetText.contains("Freshness budget"))
+      #expect(!presentation.recoveryLifecycleActionRows.isEmpty)
+      #expect(presentation.recoveryLifecycleCopyTemplate.contains("P077 recovery escalation"))
+      #expect(presentation.recoveryLifecycleAccessibilityLabel.contains("non-dismissible"))
+      #expect(!presentation.backlinkRouteLabel.isEmpty)
+      #expect(presentation.backlinkRouteAccessibilityLabel.contains(presentation.backlinkRouteLabel))
+      #expect(presentation.copyFailureFallbackText.contains(presentation.generationDisplayID))
+      #expect(presentation.voiceOverAnnouncementPolicy.contains("on demand"))
+      #expect(presentation.keyboardTraversalOrder == [
+        "compact signal",
+        "diagnostics",
+        "copy generation id",
+        "primary unblock",
+        "recovery lifecycle",
+        "copy recovery template",
+        "readback route",
+        "mode explainer",
+      ])
+      #expect(presentation.cardAccessibilityLabel.contains(expectedStatus))
+    }
+  }
+
+  @Test("P077 closeout readiness presenter exposes blocker and diagnostics rows")
+  func p077CloseoutReadinessPresenterExposesBlockerAndDiagnosticsRows() throws {
+    let notReady = try decodeCloseoutReadinessSummary(
+      closeoutReadinessSummaryJSON(
+        status: "not_ready",
+        decision: "return_to_code_refine",
+        generationID: "1234567890abcdef",
+        mode: "enforcement",
+        gateStatus: "failed",
+        diagnosticReason: "proposal-077 gate failed",
+        primaryUnblock: "Fix implementation blockers",
+        summary: "Fix implementation blockers"
+      )
+    )
+
+    let presentation = P077CloseoutReadinessPresenter.presentation(for: notReady)
+
+    #expect(presentation.secondaryBlockerRows.contains { $0.contains("code blocker") })
+    #expect(presentation.diagnosticRows.contains("Decision: return_to_code_refine"))
+    #expect(presentation.diagnosticRows.contains("Gate: failed"))
+    #expect(presentation.recoveryLifecycleText.contains("return to code refine"))
+    #expect(presentation.recoveryLifecycleAcknowledgementText.contains("2026-05-06T12:00:00Z"))
+    #expect(presentation.recoveryLifecycleCorrelationText.contains("gate-12345678"))
+    #expect(presentation.recoveryLifecycleFreshnessBudgetText.contains("stalled"))
+    #expect(presentation.recoveryLifecycleActionRows.contains("Re-issue closeout readiness after recovery action"))
+    #expect(presentation.recoveryLifecycleCopyTemplate.contains("command=return to code refine"))
+    #expect(presentation.backlinkRouteLabel == "Closeout diagnostics")
+  }
+
+  @Test("P077 announcement policy coalesces rapid refreshes and suppresses polite sheet refresh")
+  func p077AnnouncementPolicyCoalescesRapidRefreshes() throws {
+    let first = P077CloseoutReadinessPresenter.presentation(
+      for: try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: "ready",
+          decision: "enter_manual_release",
+          generationID: "gen-ready-0001",
+          mode: "advisory",
+          gateStatus: "passed",
+          primaryUnblock: nil,
+          summary: "Ready"
+        )
+      )
+    )
+    let second = P077CloseoutReadinessPresenter.presentation(
+      for: try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: "ready",
+          decision: "enter_manual_release",
+          generationID: "gen-ready-0002",
+          mode: "advisory",
+          gateStatus: "passed",
+          primaryUnblock: nil,
+          summary: "Ready"
+        )
+      )
+    )
+
+    let start = Date(timeIntervalSince1970: 1_000)
+    var state = P077CloseoutReadinessAnnouncementState()
+    let firstAnnouncement = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: first,
+      previous: &state,
+      now: start,
+      sheetOwnsFocus: false
+    )
+    let duplicate = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: first,
+      previous: &state,
+      now: start.addingTimeInterval(1),
+      sheetOwnsFocus: false
+    )
+    let coalesced = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: second,
+      previous: &state,
+      now: start.addingTimeInterval(2),
+      sheetOwnsFocus: false
+    )
+    let suppressedBySheet = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: second,
+      previous: &state,
+      now: start.addingTimeInterval(4),
+      sheetOwnsFocus: true
+    )
+
+    #expect(firstAnnouncement?.priority == .polite)
+    #expect(duplicate == nil)
+    #expect(coalesced == nil)
+    #expect(suppressedBySheet == nil)
+  }
+
+  @Test("P077 announcement policy keeps newly blocking enforcement assertive")
+  func p077AnnouncementPolicyKeepsBlockingEnforcementAssertive() throws {
+    let blocked = P077CloseoutReadinessPresenter.presentation(
+      for: try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: "blocked",
+          decision: "await_operator_decision",
+          generationID: "gen-blocked-0001",
+          mode: "enforcement",
+          gateStatus: "failed",
+          primaryUnblock: "Operator decision required",
+          summary: "Operator decision required"
+        )
+      )
+    )
+
+    var state = P077CloseoutReadinessAnnouncementState()
+    let announcement = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: blocked,
+      previous: &state,
+      now: Date(timeIntervalSince1970: 2_000),
+      sheetOwnsFocus: true
+    )
+
+    #expect(announcement?.priority == .assertive)
+    #expect(announcement?.text.contains("Blocked") == true)
   }
 
   @Test("Bulk artifact read documents do not request payload text")
@@ -709,6 +944,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
   @Test("Workflow read store accepts injected P031 document sets")
   func workflowReadStoreUsesInjectedDocuments() async throws {
     let customDocuments = P031GraphQLDocumentSet(
+      ideas: P031GraphQLDocuments.ideas,
       runsHome:
         "query P031RunsHome { runs { id status workflowTitle freshnessState totalStages completedStages failedStages pendingApprovals } }",
       runDetail: P031GraphQLDocuments.runDetail,
@@ -2684,6 +2920,66 @@ private func makeArtifact(
   )
 }
 
+private func closeoutReadinessSummaryJSON(
+  status: String,
+  decision: String,
+  generationID: String,
+  mode: String,
+  gateStatus: String,
+  diagnosticReason: String? = nil,
+  primaryUnblock: String?,
+  summary: String?,
+  isApplicable: Bool = true,
+  acceptedRiskCount: Int = 0
+) -> String {
+  let fields: [(String, Any?)] = [
+    ("run_id", "run-1"),
+    ("stage_id", "state_9"),
+    ("readiness_status", status),
+    ("readiness_decision", decision),
+    ("readiness_generation_id", generationID),
+    ("readiness_mode", mode),
+    ("gate_status", gateStatus),
+    ("gate_generation_id", "gate-12345678"),
+    ("audit_status", gateStatus),
+    ("diagnostic_reason", diagnosticReason),
+    ("primary_unblock", primaryUnblock),
+    ("code_blocker_count", status == "not_ready" ? 1 : 0),
+    ("handoff_count", status == "handoff_required" ? 1 : 0),
+    ("handoff_owner", status == "handoff_required" ? "release_owner" : nil),
+    ("risk_settlement_required", status == "ready_with_risks"),
+    ("accepted_risk_count", acceptedRiskCount),
+    ("fingerprint_hash", "f00dbabe"),
+    ("summary", summary),
+    ("synthesized_at", "2026-05-06T12:00:00Z"),
+    ("is_applicable", isApplicable),
+  ]
+  let object = Dictionary(uniqueKeysWithValues: fields.map { ($0.0, jsonValue($0.1)) })
+  let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+  return String(data: data, encoding: .utf8)!
+}
+
+private func decodeCloseoutReadinessSummary(_ json: String) throws
+  -> P077CloseoutReadinessSummaryReadModel
+{
+  try JSONDecoder().decode(P077CloseoutReadinessSummaryReadModel.self, from: Data(json.utf8))
+}
+
+private func jsonValue(_ value: Any?) -> Any {
+  switch value {
+  case let value as String:
+    return value
+  case let value as Int:
+    return value
+  case let value as Bool:
+    return value
+  case .some(let value):
+    return value
+  case .none:
+    return NSNull()
+  }
+}
+
 private final class CapturingP031ReadTransport: P031GraphQLReadTransport, @unchecked Sendable {
   private let responseData: Data
   private let responses: [String: Data]
@@ -2736,6 +3032,10 @@ private final class P031DaemonRestartRecorder {
 }
 
 private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
+  func fetchIdeas(includeArchived: Bool) async throws -> [P031IdeaReadModel] {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
   func fetchRuns() async throws -> [P031RunRowReadModel] {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }

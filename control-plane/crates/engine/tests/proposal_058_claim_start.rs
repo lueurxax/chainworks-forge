@@ -60,6 +60,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
         drift_details_json: None,
         chainworks_meta_root: None,
         review_routing_json: None,
+        closeout_readiness_mode: None,
     }
 }
 

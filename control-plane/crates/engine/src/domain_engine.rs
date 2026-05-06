@@ -183,6 +183,7 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 

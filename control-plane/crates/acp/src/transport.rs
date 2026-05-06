@@ -753,7 +753,7 @@ fn extract_text_from_value(value: &Value) -> Option<String> {
             (!parts.is_empty()).then(|| parts.join(""))
         }
         Value::Object(map) => {
-            for key in ["text", "content", "message", "delta", "parts"] {
+            for key in ["text", "content", "message", "delta", "parts", "output"] {
                 if let Some(text) = map.get(key).and_then(extract_text_from_value) {
                     return Some(text);
                 }
@@ -1109,6 +1109,11 @@ fn extract_output_envelopes(
             artifacts.push(artifact);
         }
     }
+    for artifact in extract_labeled_expected_output_json_blocks(stream_text, expected_outputs) {
+        if seen.insert(artifact.name.clone()) {
+            artifacts.push(artifact);
+        }
+    }
 
     artifacts
 }
@@ -1118,6 +1123,11 @@ fn extract_json_object_output_envelopes(
     expected_outputs: &[ExpectedOutputSpec],
 ) -> Vec<DiscoveredArtifact> {
     let mut artifacts = Vec::new();
+    append_json_value_output_envelopes_from_text(stream_text, expected_outputs, &mut artifacts, 0);
+    let mut seen: HashSet<String> = artifacts
+        .iter()
+        .map(|artifact| artifact.name.clone())
+        .collect();
     let mut cursor = 0usize;
     while let Some(found_rel) = stream_text[cursor..].find("\"CHAINWORKS_OUTPUT\"") {
         let found = cursor + found_rel;
@@ -1129,13 +1139,44 @@ fn extract_json_object_output_envelopes(
             cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
             continue;
         };
-        artifacts.extend(chainworks_output_artifacts_from_value(
-            &value,
-            expected_outputs,
-        ));
+        for artifact in chainworks_output_artifacts_from_value(&value, expected_outputs) {
+            if seen.insert(artifact.name.clone()) {
+                artifacts.push(artifact);
+            }
+        }
         cursor = found + "\"CHAINWORKS_OUTPUT\"".len();
     }
     artifacts
+}
+
+fn append_json_value_output_envelopes_from_text(
+    text: &str,
+    expected_outputs: &[ExpectedOutputSpec],
+    artifacts: &mut Vec<DiscoveredArtifact>,
+    depth: usize,
+) {
+    if depth > 2 || !text.contains("CHAINWORKS_OUTPUT") {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+        return;
+    };
+    match value {
+        Value::String(inner) => {
+            append_json_value_output_envelopes_from_text(
+                &inner,
+                expected_outputs,
+                artifacts,
+                depth + 1,
+            );
+        }
+        other => {
+            artifacts.extend(chainworks_output_artifacts_from_value(
+                &other,
+                expected_outputs,
+            ));
+        }
+    }
 }
 
 fn parse_enclosing_json_object_with_chainworks_output(
@@ -1191,6 +1232,181 @@ fn chainworks_output_artifacts_from_value(
             })
         })
         .collect()
+}
+
+fn extract_labeled_expected_output_json_blocks(
+    stream_text: &str,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Vec<DiscoveredArtifact> {
+    let ascii_lower = stream_text.to_ascii_lowercase();
+    expected_outputs
+        .iter()
+        .filter_map(|spec| {
+            let labels = labeled_output_candidates(spec);
+            let payload = labels
+                .iter()
+                .find_map(|label| labeled_json_payload_after(stream_text, &ascii_lower, label))?;
+            let bytes = bounded_envelope_payload_bytes(
+                &spec.output_name,
+                payload.as_bytes(),
+                expected_outputs,
+            );
+            Some(DiscoveredArtifact {
+                name: spec.output_name.clone(),
+                content: bytes,
+                source_path: None,
+                source_kind: DiscoveredArtifactSourceKind::ChainworksOutput,
+            })
+        })
+        .collect()
+}
+
+fn labeled_output_candidates(spec: &ExpectedOutputSpec) -> Vec<String> {
+    let mut labels = Vec::new();
+    push_label_candidate(&mut labels, &spec.output_name);
+    push_label_candidate(&mut labels, &spec.output_name.replace('_', " "));
+    push_label_candidate(&mut labels, &spec.display_label);
+    if let Some(contract_id) = spec.contract_id.as_deref() {
+        push_label_candidate(&mut labels, contract_id);
+    }
+    labels
+}
+
+fn push_label_candidate(labels: &mut Vec<String>, candidate: &str) {
+    let normalized = candidate.trim().to_ascii_lowercase();
+    if !normalized.is_empty() && !labels.iter().any(|existing| existing == &normalized) {
+        labels.push(normalized);
+    }
+}
+
+fn labeled_json_payload_after<'a>(
+    stream_text: &'a str,
+    ascii_lower: &str,
+    label: &str,
+) -> Option<&'a str> {
+    let mut cursor = 0usize;
+    while let Some(found_rel) = ascii_lower[cursor..].find(label) {
+        let label_start = cursor + found_rel;
+        let label_end = label_start + label.len();
+        cursor = label_end;
+        if !valid_label_start_boundary(stream_text.as_bytes(), label_start) {
+            continue;
+        }
+        let mut payload_start = skip_horizontal_whitespace(stream_text, label_end);
+        let Some(after_separator) = consume_optional_label_separator(stream_text, payload_start)
+        else {
+            continue;
+        };
+        payload_start = after_separator;
+        payload_start = skip_ascii_whitespace(stream_text, payload_start);
+        if let Some(payload) = fenced_json_payload_at(stream_text, payload_start) {
+            return Some(payload);
+        }
+        if let Some(payload) = inline_json_payload_at(stream_text, payload_start) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn valid_label_start_boundary(bytes: &[u8], start: usize) -> bool {
+    start == 0
+        || matches!(
+            bytes[start.saturating_sub(1)],
+            b'\n' | b'\r' | b'\t' | b' ' | b'#' | b'*' | b'-' | b'`'
+        )
+}
+
+fn skip_horizontal_whitespace(text: &str, mut index: usize) -> usize {
+    while matches!(text.as_bytes().get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    index
+}
+
+fn skip_ascii_whitespace(text: &str, mut index: usize) -> usize {
+    while text
+        .as_bytes()
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    index
+}
+
+fn consume_optional_label_separator(text: &str, index: usize) -> Option<usize> {
+    match text.as_bytes().get(index) {
+        Some(b':') => Some(index + 1),
+        Some(b'\n' | b'\r') => Some(index),
+        Some(b'-') if text.as_bytes().get(index + 1) == Some(&b' ') => Some(index + 1),
+        Some(b'`') | Some(b'{') => Some(index),
+        _ => None,
+    }
+}
+
+fn fenced_json_payload_at(text: &str, start: usize) -> Option<&str> {
+    let rest = text.get(start..)?;
+    let after_ticks = rest.strip_prefix("```")?;
+    let content_start_rel = after_ticks.find('\n')? + 1;
+    let content_start = start + 3 + content_start_rel;
+    let content_rest = text.get(content_start..)?;
+    let end_rel = content_rest
+        .find("\n```")
+        .or_else(|| content_rest.find("```"))?;
+    let payload = content_rest[..end_rel].trim();
+    serde_json::from_str::<Value>(payload).ok()?;
+    Some(payload)
+}
+
+fn inline_json_payload_at(text: &str, start: usize) -> Option<&str> {
+    let rest = text.get(start..)?;
+    let end = json_value_prefix_len(rest)?;
+    let payload = rest[..end].trim();
+    serde_json::from_str::<Value>(payload).ok()?;
+    Some(payload)
+}
+
+fn json_value_prefix_len(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    let (_, first) = chars.next()?;
+    let expected_close = match first {
+        '{' => '}',
+        '[' => ']',
+        _ => return None,
+    };
+    let mut stack = vec![expected_close];
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in chars {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop()? != ch {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Return cap + 1 bytes on truncation so settlement can distinguish an
@@ -3229,6 +3445,28 @@ mod tests {
     }
 
     #[test]
+    fn final_prompt_response_output_field_is_captured_as_text() {
+        let parsed = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "stopReason": "end_turn",
+                "sessionId": "codex-session",
+                "output": [
+                    {
+                        "type": "text",
+                        "text": "<<<CHAINWORKS_OUTPUT:implementation_progress>>>{\"status\":\"done\"}<<<END_CHAINWORKS_OUTPUT>>>"
+                    }
+                ]
+            }
+        });
+
+        let chunk = extract_text_chunk(&parsed).expect("final output text should be captured");
+
+        assert!(chunk.contains("<<<CHAINWORKS_OUTPUT:implementation_progress>>>"));
+    }
+
+    #[test]
     fn json_chainworks_output_extraction_caps_declared_payload_before_settlement() {
         let output_path = "/tmp/run/implementation/progress.md";
         let expected_outputs = vec![ExpectedOutputSpec {
@@ -3264,5 +3502,151 @@ mod tests {
             artifacts[0].source_kind,
             DiscoveredArtifactSourceKind::ChainworksOutput
         );
+    }
+
+    #[test]
+    fn json_chainworks_output_is_extracted_from_fenced_final_text_with_trailing_prose() {
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "tests_result".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/run/implementation/tests-result.json".to_string(),
+            companion_of: None,
+            display_label: "tests result".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let stream = "done\n```json\n{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"passed\",\"commands\":[]}}}\n```\nthanks";
+
+        let artifacts = extract_output_envelopes(stream, &expected_outputs);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "tests_result");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&artifacts[0].content).unwrap(),
+            serde_json::json!({"status": "passed", "commands": []})
+        );
+        assert_eq!(
+            artifacts[0].source_kind,
+            DiscoveredArtifactSourceKind::ChainworksOutput
+        );
+    }
+
+    #[test]
+    fn stringified_json_chainworks_output_is_extracted_from_final_text() {
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "implementation_self_assessment".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/run/implementation/self-assessment.json".to_string(),
+            companion_of: None,
+            display_label: "implementation self assessment".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let stream = serde_json::json!(
+            "{\"CHAINWORKS_OUTPUT\":{\"implementation_self_assessment\":{\"status\":\"needs_code_fixes\",\"remaining_code_tasks\":[]}}}"
+        )
+        .to_string();
+
+        let artifacts = extract_output_envelopes(&stream, &expected_outputs);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "implementation_self_assessment");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&artifacts[0].content).unwrap(),
+            serde_json::json!({"status": "needs_code_fixes", "remaining_code_tasks": []})
+        );
+        assert_eq!(
+            artifacts[0].source_kind,
+            DiscoveredArtifactSourceKind::ChainworksOutput
+        );
+    }
+
+    #[test]
+    fn labeled_expected_output_json_fences_are_extracted_without_chainworks_envelope() {
+        let expected_outputs = vec![
+            ExpectedOutputSpec {
+                output_name: "implementation_progress".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: "/tmp/run/implementation/progress.json".to_string(),
+                companion_of: None,
+                display_label: "implementation progress".to_string(),
+                contract_id: Some("implementation_progress".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 1024,
+                aggregate_acceptance_cap_bytes: 4096,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "implementation_self_assessment".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: "/tmp/run/implementation/self-assessment.json".to_string(),
+                companion_of: None,
+                display_label: "implementation self assessment".to_string(),
+                contract_id: Some("implementation_self_assessment_v2".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 1024,
+                aggregate_acceptance_cap_bytes: 4096,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "tests_result".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: "/tmp/run/implementation/tests-result.json".to_string(),
+                companion_of: None,
+                display_label: "tests result".to_string(),
+                contract_id: Some("tests_result".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 1024,
+                aggregate_acceptance_cap_bytes: 4096,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+        ];
+        let stream = r#"
+Implementation progress:
+```json
+{"status":"in_progress","summary":"continued P084","completed_tasks":[],"remaining_tasks":["swift readback"]}
+```
+
+implementation_self_assessment
+```json
+{"status":"needs_code_fixes","implementation_complete":false,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":[],"docs_impacted":[]}
+```
+
+Tests result:
+```json
+{"status":"passed","commands":["./scripts/test-gate.sh proposal-084"],"failures":[]}
+```
+"#;
+
+        let artifacts = extract_output_envelopes(stream, &expected_outputs);
+
+        for output_name in [
+            "implementation_progress",
+            "implementation_self_assessment",
+            "tests_result",
+        ] {
+            assert!(
+                artifacts
+                    .iter()
+                    .any(|artifact| artifact.name == output_name),
+                "missing labeled output {output_name}: {artifacts:?}"
+            );
+        }
     }
 }

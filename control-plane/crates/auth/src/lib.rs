@@ -491,7 +491,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 22] {
+fn all_tool_capabilities() -> [CapabilityToolId; 23] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -515,6 +515,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 22] {
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
+        CapabilityToolId::ProposalGateSettle,
     ]
 }
 
@@ -556,6 +557,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::StewardGetAnalysis => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
+        CapabilityToolId::ProposalGateSettle => matches!(class, PrincipalClass::Operator),
     }
 }
 

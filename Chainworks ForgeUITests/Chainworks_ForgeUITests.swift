@@ -6,9 +6,12 @@
 //
 
 import XCTest
+import Darwin
 
 final class Chainworks_ForgeUITests: XCTestCase {
     private static let defaultApprovedRemoteHosts = ["SMacBook.local", "SMacBook"]
+    private static let p031DegradedDrillFlag = "CHAINWORKS_P031_DEGRADED_DRILL"
+    private static let packagedDaemonLabel = "com.chainworks.forge.daemon"
     private var launchedApplications: Set<ObjectIdentifier> = []
 
     override func setUpWithError() throws {
@@ -70,6 +73,214 @@ final class Chainworks_ForgeUITests: XCTestCase {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    private func requireP031DegradedDrillEnabled() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment[Self.p031DegradedDrillFlag] == "1",
+            "Skipping P031 degraded-state drill: set \(Self.p031DegradedDrillFlag)=1 on the remote UI host. This test intentionally stops the packaged/test daemon."
+        )
+    }
+
+    private var posixHomeDirectory: URL {
+        let homePath = getpwuid(getuid()).map { String(cString: $0.pointee.pw_dir) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        return URL(fileURLWithPath: homePath, isDirectory: true)
+    }
+
+    private var appSupportDirectory: URL {
+        posixHomeDirectory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("Chainworks Forge", isDirectory: true)
+    }
+
+    private var packagedControlPlaneDBURL: URL {
+        appSupportDirectory.appendingPathComponent("control-plane.db", isDirectory: false)
+    }
+
+    private func operatorBearerToken() -> String? {
+        let path = posixHomeDirectory
+            .appendingPathComponent(".chainworks", isDirectory: true)
+            .appendingPathComponent("auth", isDirectory: true)
+            .appendingPathComponent("principals.json", isDirectory: false)
+        guard let data = try? Data(contentsOf: path),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let principals = root["principals"] as? [[String: Any]]
+        else {
+            return nil
+        }
+        return principals.first { $0["class"] as? String == "operator" }?["token"] as? String
+    }
+
+    private func daemonPort() -> Int {
+        let portFile = appSupportDirectory.appendingPathComponent("daemon.port", isDirectory: false)
+        guard let raw = try? String(contentsOf: portFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              let port = Int(raw),
+              (1...65_535).contains(port)
+        else {
+            return 4000
+        }
+        return port
+    }
+
+    private func daemonHealthBody(timeout: TimeInterval = 2) -> String? {
+        guard let url = URL(string: "http://127.0.0.1:\(daemonPort())/health") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        let semaphore = DispatchSemaphore(value: 0)
+        var body: String?
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            if let data {
+                body = String(data: data, encoding: .utf8)
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + timeout + 0.5)
+        return body
+    }
+
+    private func waitForDaemonReady(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let body = daemonHealthBody(timeout: 1),
+               body.contains("\"state\":\"ready\"") || body.contains("\"ready\":true") {
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        return false
+    }
+
+    private func waitForDaemonUnavailable(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if daemonHealthBody(timeout: 1) == nil {
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        return false
+    }
+
+    private func daemonPID() -> Int32? {
+        let pidFile = appSupportDirectory.appendingPathComponent("daemon.pid", isDirectory: false)
+        guard let raw = try? String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              let pid = Int32(raw)
+        else {
+            return nil
+        }
+        return pid
+    }
+
+    private func processPath(pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private func processIsRunning(pid: Int32) -> Bool {
+        kill(pid, 0) == 0
+    }
+
+    private func stopPackagedDaemonForP031Drill() throws {
+        guard let pid = daemonPID() else {
+            XCTFail("P031 degraded drill requires a daemon.pid owned by the packaged/test daemon")
+            return
+        }
+        let path = processPath(pid: pid) ?? ""
+        XCTAssertTrue(
+            path.hasSuffix("/chainworks-forge-daemon"),
+            "Refusing to stop unexpected daemon PID \(pid) at path \(path)"
+        )
+        guard path.hasSuffix("/chainworks-forge-daemon") else { return }
+
+        XCTAssertEqual(kill(pid, SIGTERM), 0, "SIGTERM should be delivered to packaged/test daemon PID \(pid)")
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if !processIsRunning(pid: pid) {
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        XCTFail("packaged/test daemon PID \(pid) did not exit after SIGTERM")
+    }
+
+    @discardableResult
+    private func runTool(
+        _ executable: String,
+        _ arguments: [String],
+        timeout: TimeInterval = 10
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        if process.isRunning {
+            process.terminate()
+            XCTFail("\(executable) \(arguments.joined(separator: " ")) timed out")
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (
+            process.terminationStatus,
+            String(data: data, encoding: .utf8) ?? ""
+        )
+    }
+
+    private func kickstartPackagedDaemonIfRegistered() {
+        _ = try? runTool(
+            "/bin/launchctl",
+            [
+                "kickstart",
+                "-k",
+                "gui/\(getuid())/\(Self.packagedDaemonLabel)",
+            ],
+            timeout: 10
+        )
+    }
+
+    private func commandJournalCount() -> Int? {
+        guard FileManager.default.fileExists(atPath: packagedControlPlaneDBURL.path) else { return nil }
+        guard let result = try? runTool(
+            "/usr/bin/sqlite3",
+            [packagedControlPlaneDBURL.path, "SELECT COUNT(*) FROM command_journal;"],
+            timeout: 5
+        ), result.status == 0 else {
+            return nil
+        }
+        return Int(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func requireP031DegradedDrillRunSeeded() throws {
+        guard FileManager.default.fileExists(atPath: packagedControlPlaneDBURL.path) else {
+            XCTFail("P031 degraded drill requires packaged control-plane DB at \(packagedControlPlaneDBURL.path)")
+            return
+        }
+        let existingRuns = try runTool(
+            "/usr/bin/sqlite3",
+            [
+                packagedControlPlaneDBURL.path,
+                "SELECT COUNT(*) FROM runs WHERE status NOT IN ('completed', 'failed', 'cancelled');",
+            ],
+            timeout: 5
+        )
+        XCTAssertGreaterThan(
+            Int(existingRuns.output.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0,
+            0,
+            "P031 degraded drill requires an active run seeded in the packaged GraphQL store before launch"
+        )
+    }
+
     private func makeApp(
         seededIdeaTitle: String? = nil,
         seededIdeaBody: String = "Seeded UI test idea",
@@ -89,7 +300,8 @@ final class Chainworks_ForgeUITests: XCTestCase {
         increaseContrast: Bool = false,
         reduceTransparency: Bool = false,
         focusProof: Bool = false,
-        forceLiveRuntimeUnavailable: Bool = false
+        forceLiveRuntimeUnavailable: Bool = false,
+        useInMemoryStore: Bool = true
     ) -> XCUIApplication {
         let app = XCUIApplication()
         let resolvedRepoRoot = seededIdeaWorkspaceRoot ?? repoRootPath()
@@ -104,7 +316,7 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchArguments += ["-NSQuitAlwaysKeepsWindows", "NO"]
         app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         app.launchEnvironment["CHAINWORKS_UI_TEST_SESSION_ID"] = UUID().uuidString
-        app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = "1"
+        app.launchEnvironment["CHAINWORKS_IN_MEMORY_STORE"] = useInMemoryStore ? "1" : ""
         app.launchEnvironment["CHAINWORKS_ALLOW_ENV_OVERRIDE"] = "1"
         app.launchEnvironment["CHAINWORKS_UI_TEST_INITIAL_TAB"] = initialTab
         app.launchEnvironment["CHAINWORKS_DISABLE_XCODE_MCP"] = "1"
@@ -125,6 +337,9 @@ final class Chainworks_ForgeUITests: XCTestCase {
         app.launchEnvironment["CHAINWORKS_WORKFLOW_SOURCE_PATH"] = workflowSourcePath
         app.launchEnvironment["CHAINWORKS_AGENT_CATALOG_SOURCE_PATH"] = catalogSourcePath
         app.launchEnvironment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"] = uiTestExportDirectory().path
+        if let operatorToken = operatorBearerToken() {
+            app.launchEnvironment["CHAINWORKS_OPERATOR_BEARER_TOKEN"] = operatorToken
+        }
         let mcpFixturePath = URL(fileURLWithPath: resolvedRepoRoot)
             .appendingPathComponent("examples/mcp/mcp-config-fixture.yaml")
             .path
@@ -279,6 +494,20 @@ final class Chainworks_ForgeUITests: XCTestCase {
             .firstMatch
     }
 
+    private func waitForAnyIdentifier(
+        _ identifiers: [String],
+        in app: XCUIApplication,
+        timeout: TimeInterval
+    ) -> XCUIElement? {
+        let predicate = NSCompoundPredicate(
+            orPredicateWithSubpredicates: identifiers.map {
+                NSPredicate(format: "identifier == %@", $0)
+            }
+        )
+        let element = app.descendants(matching: .any).matching(predicate).firstMatch
+        return element.waitForExistence(timeout: timeout) ? element : nil
+    }
+
     private func anyElementInPrimaryWindow(_ app: XCUIApplication, identifier: String) -> XCUIElement {
         let primaryWindow = app.windows.firstMatch
         if primaryWindow.exists {
@@ -287,6 +516,56 @@ final class Chainworks_ForgeUITests: XCTestCase {
                 .firstMatch
         }
         return anyElement(app, identifier: identifier)
+    }
+
+    private func waitForLabelContaining(
+        _ fragments: [String],
+        in app: XCUIApplication,
+        timeout: TimeInterval
+    ) -> XCUIElement? {
+        let predicates = fragments.map {
+            NSPredicate(format: "label CONTAINS[c] %@", $0)
+        }
+        let predicate = NSCompoundPredicate(orPredicateWithSubpredicates: predicates)
+        let element = app.descendants(matching: .any).matching(predicate).firstMatch
+        return element.waitForExistence(timeout: timeout) ? element : nil
+    }
+
+    private func waitForStaticTextValueContaining(
+        _ fragments: [String],
+        in app: XCUIApplication,
+        timeout: TimeInterval
+    ) -> XCUIElement? {
+        let predicates = fragments.flatMap {
+            [
+                NSPredicate(format: "label CONTAINS[c] %@", $0),
+                NSPredicate(format: "value CONTAINS[c] %@", $0),
+            ]
+        }
+        let predicate = NSCompoundPredicate(orPredicateWithSubpredicates: predicates)
+        let element = app.staticTexts.matching(predicate).firstMatch
+        return element.waitForExistence(timeout: timeout) ? element : nil
+    }
+
+    private func assertNoEnabledButtons(
+        _ labels: [String],
+        in app: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        for label in labels {
+            let predicate = NSPredicate(format: "label CONTAINS[c] %@", label)
+            let enabledButtons = app.buttons
+                .matching(predicate)
+                .allElementsBoundByIndex
+                .filter { $0.exists && $0.isEnabled }
+            XCTAssertTrue(
+                enabledButtons.isEmpty,
+                "Expected no enabled button containing '\(label)', found \(enabledButtons.map(\.label))",
+                file: file,
+                line: line
+            )
+        }
     }
 
     private func labeledElement(_ app: XCUIApplication, label: String) -> XCUIElement {
@@ -1508,6 +1787,223 @@ final class Chainworks_ForgeUITests: XCTestCase {
         )
 
         screenshot(app, name: "P022_App_Proof")
+    }
+
+    func testProposal031DegradedStateDrillShowsReadOnlyUnavailableAndRecovers() throws {
+        try requireP031DegradedDrillEnabled()
+
+        let initialJournalCount = commandJournalCount()
+        let app = makeApp(initialTab: "Runs Home", useInMemoryStore: false)
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let screen = AppScreen(app: app)
+        XCTAssertTrue(
+            screen.selectTab("Runs Home", timeout: 30),
+            "P031 degraded drill must be able to open Runs Home"
+        )
+        XCTAssertNotNil(
+            waitForAnyIdentifier(
+                ["runs-home-owner-view", "runs-home-list", "run-detail-panel"],
+                in: app,
+                timeout: 30
+            ),
+            "P031 Runs Home owner surface must render"
+        )
+        XCTAssertTrue(
+            waitForDaemonReady(timeout: 30),
+            "P031 degraded drill requires the packaged/test daemon to reach /health ready"
+        )
+        try requireP031DegradedDrillRunSeeded()
+        let initialRefreshButton = app.buttons["Refresh"].firstMatch
+        if initialRefreshButton.waitForExistence(timeout: 5), initialRefreshButton.isEnabled {
+            initialRefreshButton.click()
+        }
+        XCTAssertNotNil(
+            waitForAnyIdentifier(["p031-run-detail-summary-live"], in: app, timeout: 30),
+            "P031 degraded drill requires the GraphQL-backed seeded run before the outage"
+        )
+        screenshot(app, name: "P031_Degraded_Drill_01_ready")
+
+        try stopPackagedDaemonForP031Drill()
+        XCTAssertTrue(
+            waitForDaemonUnavailable(timeout: 15),
+            "daemon /health should become unreachable after the drill stops it"
+        )
+
+        let refreshButton = app.buttons["Refresh"].firstMatch
+        if refreshButton.waitForExistence(timeout: 5), refreshButton.isEnabled {
+            refreshButton.click()
+        }
+
+        XCTAssertNotNil(
+            waitForStaticTextValueContaining(["Daemon unavailable"], in: app, timeout: 60),
+            "UI must move to a Daemon unavailable state within 60 seconds"
+        )
+        XCTAssertFalse(
+            anyElement(app, identifier: "p031-run-detail-summary-live").exists,
+            "P031 degraded state must not fall back to local workflow truth"
+        )
+        assertNoEnabledButtons(
+            ["Start Run", "Cancel Run", "Retry Stage", "Approve", "Reject"],
+            in: app
+        )
+        if let initialJournalCount, let degradedJournalCount = commandJournalCount() {
+            XCTAssertEqual(
+                degradedJournalCount,
+                initialJournalCount,
+                "P031 degraded drill must not create command_journal rows while only read UI is visible"
+            )
+        }
+        screenshot(app, name: "P031_Degraded_Drill_02_unavailable")
+
+        terminateIfRunning(app)
+        kickstartPackagedDaemonIfRegistered()
+
+        let recoveredApp = makeApp(initialTab: "Runs Home", useInMemoryStore: false)
+        defer { terminateIfRunning(recoveredApp) }
+        launchClean(recoveredApp)
+        let recoveredScreen = AppScreen(app: recoveredApp)
+        XCTAssertTrue(
+            recoveredScreen.selectTab("Runs Home", timeout: 30),
+            "P031 degraded drill must be able to reopen Runs Home after daemon recovery"
+        )
+        XCTAssertTrue(
+            waitForDaemonReady(timeout: 45),
+            "packaged/test daemon should recover after launchd kickstart or app relaunch"
+        )
+        let recoveryRefreshButton = recoveredApp.buttons["Refresh"].firstMatch
+        if recoveryRefreshButton.waitForExistence(timeout: 5), recoveryRefreshButton.isEnabled {
+            recoveryRefreshButton.click()
+        }
+        XCTAssertNotNil(
+            waitForAnyIdentifier(["p031-run-detail-summary-live"], in: recoveredApp, timeout: 30),
+            "Runs Home must return to GraphQL-backed server projections after daemon recovery"
+        )
+        if let initialJournalCount, let recoveredJournalCount = commandJournalCount() {
+            XCTAssertEqual(
+                recoveredJournalCount,
+                initialJournalCount,
+                "P031 degraded/recovery drill must not write command_journal rows"
+            )
+        }
+        screenshot(recoveredApp, name: "P031_Degraded_Drill_03_recovered")
+    }
+
+    func testProposal077CloseoutReadinessRuntimeAccessibilityProof() throws {
+        let app = makeApp(
+            directSurface: "p077_closeout_readiness",
+            disableEagerBootstrap: true,
+            focusProof: true
+        )
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(
+            app,
+            identifier: "ui-test-direct-surface-ready-p077_closeout_readiness"
+        )
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "P077 direct closeout readiness surface must render"
+        )
+
+        let compactSignal = anyElement(app, identifier: "p077-closeout-readiness-compact-action")
+        XCTAssertTrue(
+            compactSignal.waitForExistence(timeout: 10) && compactSignal.isHittable,
+            "P077 compact signal must be present and activatable"
+        )
+        compactSignal.click()
+
+        let card = anyElement(app, identifier: "p077-closeout-readiness-card")
+        let primaryUnblock = anyElement(app, identifier: "p077-closeout-readiness-primary-unblock")
+        XCTAssertTrue(card.waitForExistence(timeout: 5), "compact activation must reveal the card")
+        XCTAssertTrue(
+            primaryUnblock.waitForExistence(timeout: 5),
+            "compact activation must reveal the primary unblock"
+        )
+
+        let secondaryBlockers = anyElement(
+            app,
+            identifier: "p077-closeout-readiness-secondary-blockers"
+        )
+        XCTAssertTrue(
+            secondaryBlockers.waitForExistence(timeout: 5),
+            "secondary blockers must be visible and ordered after the primary unblock"
+        )
+
+        let recoveryLifecycle = anyElement(app, identifier: "p077-closeout-readiness-recovery")
+        XCTAssertTrue(
+            recoveryLifecycle.waitForExistence(timeout: 5),
+            "stalled recovery lifecycle must be visible as a non-dismissible row"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p077-closeout-readiness-recovery-non-dismissible")
+                .waitForExistence(timeout: 5),
+            "stalled recovery lifecycle must expose the required non-dismissible row"
+        )
+
+        let recoveryCopy = app.buttons[
+            "p077-closeout-readiness-recovery-copy-template"
+        ].firstMatch
+        XCTAssertTrue(
+            recoveryCopy.waitForExistence(timeout: 5) && recoveryCopy.isEnabled,
+            "recovery lifecycle must expose a copyable escalation template"
+        )
+        recoveryCopy.click()
+        XCTAssertNotNil(
+            waitForStaticTextValueContaining(
+                ["Copied recovery template", "Recovery template remains visible"],
+                in: app,
+                timeout: 5
+            ),
+            "recovery copy command must expose success or fallback feedback"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p077-closeout-readiness-announcement-priority")
+                .waitForExistence(timeout: 5),
+            "closeout readiness must expose runtime announcement priority readback"
+        )
+
+        let diagnostics = app.buttons["p077-closeout-readiness-diagnostics"].firstMatch
+        XCTAssertTrue(
+            diagnostics.waitForExistence(timeout: 5) && diagnostics.isEnabled,
+            "diagnostics trigger must be keyboard/action reachable"
+        )
+        diagnostics.click()
+
+        let sheet = anyElement(app, identifier: "p077-closeout-readiness-diagnostics-sheet")
+        XCTAssertTrue(sheet.waitForExistence(timeout: 5), "diagnostics sheet must open")
+
+        let returnButton = app.buttons["p077-closeout-readiness-return"].firstMatch
+        XCTAssertTrue(
+            returnButton.waitForExistence(timeout: 5) && returnButton.isEnabled,
+            "diagnostics sheet must expose Return to Closeout Readiness"
+        )
+        returnButton.click()
+        XCTAssertTrue(
+            primaryUnblock.waitForExistence(timeout: 5),
+            "return backlink must route back to the closeout primary unblock"
+        )
+
+        let copyButton = app.buttons["p077-closeout-readiness-generation-copy"].firstMatch
+        XCTAssertTrue(
+            copyButton.waitForExistence(timeout: 5) && copyButton.isEnabled,
+            "generation copy command must be reachable"
+        )
+        copyButton.click()
+        XCTAssertNotNil(
+            waitForStaticTextValueContaining(["Copied generation", "Copy failed"], in: app, timeout: 5),
+            "copy command must expose success or fallback feedback"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p077-closeout-readiness-backlink-route")
+                .waitForExistence(timeout: 5),
+            "readback/backlink route must remain visible"
+        )
+        screenshot(app, name: "P077_Closeout_Readiness_Runtime_A11Y")
     }
 
     func testProposal012AppendixAMinWindowOwnersAt1024x768() throws {

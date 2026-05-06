@@ -86,7 +86,7 @@ This proposal does **not** include:
 - New features beyond reorganization (no new data surfaces, no new actions).
 - Mobile or compact layout adaptation (macOS primary).
 
-### 3.1 P031 visual-parity handoff
+### 3.1 Thin UI visual-parity handoff
 
 The GraphQL-only thin UI boundary is established in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). P036 now owns the visual and navigation restoration work over that read model.
 
@@ -104,7 +104,7 @@ Before implementation changes, P036 must produce a short prep artifact under `do
 
 The prep artifact must include file/symbol references for current screens, git references for baseline screens, and a decision rationale for every old affordance that is not carried forward. The backlog must avoid two separate visual migrations: P036 should move directly from the current UI to the final proposal-shaped UI, not first recreate the old UI and then redesign it.
 
-P036 must restore or consciously replace these P031 stop-tail surfaces:
+P036 must restore or consciously replace these thin-client stop-tail surfaces:
 
 | Area | Required visual/product outcome |
 | --- | --- |
@@ -116,7 +116,7 @@ P036 must restore or consciously replace these P031 stop-tail surfaces:
 | Artifact rendering | Preserve content-based format detection: a `.json` artifact may contain markdown/plain text and must render by payload shape, not filename alone. Markdown and JSON rendering should remain readable in a split inspector. |
 | Ideas/catalog surfaces | Restore GraphQL-only idea browsing and catalog/definitions inspection so the operator can identify the idea/run context and inspect workflow/agent definitions without leaving the app. |
 | Definitions | Fold Agent Catalog and Workflow Inspector into the P036 Definitions design, including agent grouping and workflow execution-order sorting. |
-| Approvals | Keep P031's read-only/diagnostic rule until a write-path proposal exists, but make approval context visually useful in the Runs flow. |
+| Approvals | Keep the governed thin UI read-only for non-approval commands, with only the approval mutation exception defined by [ui-action-boundary.md](../reference/ui-action-boundary.md), while making approval context visually useful in the Runs flow. |
 
 Acceptance for this handoff:
 

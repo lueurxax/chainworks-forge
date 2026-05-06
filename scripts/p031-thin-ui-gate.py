@@ -1647,7 +1647,7 @@ class P031ThinUIGateTests(unittest.TestCase):
                     "entries": [
                         {
                             "id": "governing_contract",
-                            "path": "docs/proposals/031-thin-graphql-ui-rewrite.md",
+                            "path": "docs/reference/query-projections-and-client-consumption-contract.md",
                             "owner_role": "P031 release owner",
                             "validation_status": "ready",
                             "blocking_phase": "Phase 1",

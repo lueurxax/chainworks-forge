@@ -8,6 +8,7 @@ be invoked from SwiftUI, GraphQL, MCP, agents, and automation.
 ## Core Rule
 
 The governed SwiftUI app is a GraphQL-only observer and approval console.
+Non-approval GraphQL mutations are prohibited from governed UI code.
 
 SwiftUI may use:
 
@@ -74,4 +75,3 @@ SQLite is internal daemon storage, not an automation API.
 - GraphQL projection read shape: [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
 - MCP command/control surface: [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
 - Operator shell behavior: [operator-experience.md](operator-experience.md)
-- Historical thin UI proposal: [../proposals/031-thin-graphql-ui-rewrite.md](../proposals/031-thin-graphql-ui-rewrite.md)

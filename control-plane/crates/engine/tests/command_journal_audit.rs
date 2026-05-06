@@ -86,6 +86,7 @@ fn start_run_cmd() -> Command {
         agent_catalog_yaml_path: catalog.to_string_lossy().into_owned(),
         review_routing_json: None,
         rollout_contract_preflight_policy_json: None,
+        closeout_readiness_mode: None,
     })
 }
 

@@ -35,6 +35,10 @@ pub struct WorkflowMeta {
     pub required_providers: Option<Vec<String>>,
     pub execution: Option<serde_yaml::Value>,
     pub idea_input: Option<serde_yaml::Value>,
+    /// P077: closeout readiness enforcement mode for this workflow.
+    /// Accepted values: "advisory" | "enforcement". Absent means advisory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closeout_readiness_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

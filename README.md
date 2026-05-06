@@ -93,7 +93,7 @@ The current MVP provider set is:
 The repository is past the scaffold stage. The implemented system now includes:
 
 - lead-mediated workflow conflict resolution and mandatory lead validation
-- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
+- GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
 - declarative workflow authority, typed workflow conflicts, and advisory rejection history
 - operator-facing run, approval, report, recovery, and comparison surfaces
@@ -103,6 +103,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - provider toolchain cache mapping ensuring isolated writable roots for Xcode and Go
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
+- bounded implementation closeout readiness gates (Proposal 077) ensuring proposal-specific proof and audit coverage before release
 - fail-closed server parity harness with generation-scoped storage and runtime publication
 - deterministic reviewer routing and expanded proposal reviewer catalog
 - stable reference documentation under [`docs/reference`](docs/reference)

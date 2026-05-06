@@ -1,10 +1,10 @@
 # P031 Degraded-State Evidence
 
-Status: READY_WITH_SCRIPTED_DRILL_OR_WAIVER_PENDING
+Status: READY_SCRIPTED_DRILL_VERIFIED
 Owner: P031 release owner
 Blocking Phase: Phase 0d
 Blocker Recorded: 2026-04-24
-Last Updated: 2026-04-25T04:27:00Z
+Last Updated: 2026-05-05T21:02:39+03:00
 
 ## Evidence Criteria
 - Affected thin UI surfaces visibly enter disabled/degraded state within 60 seconds from the triggering degraded condition.
@@ -33,15 +33,41 @@ Observed against criteria:
 - No local orchestrator, MCP UI call, GraphQL mutation, or local UI write control became visible.
 - After recovery, restored run rows were read through GraphQL and displayed as live server projections.
 
+## Scripted Remote UI Drill
+
+Scripted degraded-state drill passed on 2026-05-05 against the remote macOS UI runner:
+
+- Remote host: `SMacBook.local`
+- Remote workspace: `/Users/test/chainworks-p031-drill`
+- Test: `Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal031DegradedStateDrillShowsReadOnlyUnavailableAndRecovers`
+- Result bundle: `/tmp/p031-degraded-drill-signed.xcresult`
+- Evidence receipt: `docs/evidence/p031-runtime/p031-degraded-state-remote-ui-drill-2026-05-05.json`
+- Seed run: `bb1620b5-bb27-46dc-96a5-9c817fcde47f`, `P031 Degraded-State Drill`
+- Result: 1 test executed, 0 failures, test duration 21.999 seconds.
+
+The drill verified:
+
+- Runs Home opens against the packaged daemon with local in-memory fixture data disabled.
+- The seeded active run renders from GraphQL-backed projections with live freshness.
+- The packaged daemon is stopped and `/health` becomes unavailable.
+- After operator refresh, the UI reaches `Daemon unavailable` within 60 seconds.
+- No local run-detail fallback remains visible during the outage.
+- No `Start Run`, `Cancel Run`, `Retry Stage`, `Approve`, or `Reject` write controls are enabled during the outage.
+- `command_journal` remains unchanged at 0 rows.
+- After app relaunch, the packaged daemon returns to `/health` ready and the seeded run returns as a live GraphQL-backed projection.
+
+Critical write-path readiness:
+
+- The release owner confirmed on 2026-05-05 that the P031 thin macOS UI is accepted as a GraphQL read surface for release.
+- Local workflow/control writes must remain unavailable from the P031 UI.
+- Command/control operations remain outside the thin UI, with approval-only GraphQL mutations allowed only for approval decisions.
+- This sign-off confirms the write-path readiness item. It does not waive the separate degraded-state scripted drill or degraded-state release waiver requirement.
+
 Limitations:
 
-- This was an incidental restart/degraded sequence, not a scripted fault-injection drill.
 - The release-suitable degraded screenshot is sanitized to the Forge window; the original full-desktop capture is retained only as local audit context.
-- No signed release-owner waiver is present.
-- No operator dogfood confirmation has been recorded.
-
-Required owner action: P031 release owner must either accept this partial degraded-state evidence with a dated waiver or run a scripted degraded-state drill during Phase 3 dogfood.
+- Full dogfood workflow-completion signoff remains tracked separately in `docs/evidence/p031-dogfood-signoff.md`.
 
 ## Results
 
-Restart/degraded-state runtime evidence is attached and is sufficient for Phase 0d implementation handoff. Release-owner acceptance/waiver or a scripted dogfood drill remains required before Phase 3 closeout.
+Restart/degraded-state runtime evidence and a scripted remote UI drill are attached. The degraded-state evidence item is ready for release closeout.
