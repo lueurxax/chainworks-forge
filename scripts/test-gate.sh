@@ -39,6 +39,11 @@ UI_SMOKE_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testRunProgressViewSurface"
 )
 
+P077_UI_TESTS=(
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal077CloseoutReadinessRuntimeAccessibilityProof"
+)
+
 PROPOSAL_006_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProviderSettingsWizardFlowSurface"
@@ -438,6 +443,17 @@ require_p077_rollout_dependency_evidence() {
     "p077_rollout_metric_events"
     "p077_rollout_decisions"
     "p077_rollout_advisory_migrations"
+    "decision_type"
+    "cohort"
+    "eligible_closeouts"
+    "primary_metric_values_json"
+    "diagnostic_metric_snapshot_json"
+    "dependency_checklist_snapshot_id"
+    "fingerprint_p95_threshold_ms"
+    "measurement_window"
+    "waivers_json"
+    "next_review_date"
+    "readiness_links_json"
     "rollback_execution_fixture"
     "in_flight_policy"
     "neutral_observation_rule"
@@ -471,6 +487,10 @@ require_p077_ui_evidence() {
     "keyboardTraversalOrder"
     "recoveryLifecycleText"
     "backlinkRouteLabel"
+    "p077-closeout-readiness-compact-action"
+    "p077-closeout-readiness-compact-status"
+    "p077-closeout-readiness-return"
+    "proposal-077-ui"
   )
 
   local pattern
@@ -1116,7 +1136,7 @@ approved_remote_ui_hosts() {
 
 gate_requires_remote_ui_host() {
   case "${1:-}" in
-    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|full)
+    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-077-ui|p077-ui|full)
       return 0
       ;;
     *)
@@ -2142,6 +2162,7 @@ Available gates:
   proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
+  proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -5475,6 +5496,19 @@ PLIST
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test --test p077_proof_gate -- --nocapture
     )
     log "Proposal 077 closeout readiness gate passed"
+    ;;
+  proposal-077-ui|p077-ui)
+    check_idle_environment strict
+    require_remote_ui_host
+    prepare_codesign_keychain
+    require_p077_ui_evidence
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
+    log "Proposal 077 remote macOS closeout-readiness UI gate passed"
     ;;
   *)
     print_usage >&2

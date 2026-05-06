@@ -3705,6 +3705,79 @@ struct P077CloseoutReadinessPresentation: Equatable, Sendable {
   let visualState: P077CloseoutReadinessVisualState
 }
 
+enum P077CloseoutReadinessAnnouncementPriority: String, Equatable, Sendable {
+  case polite
+  case assertive
+}
+
+struct P077CloseoutReadinessAnnouncement: Equatable, Sendable {
+  let generationID: String
+  let text: String
+  let priority: P077CloseoutReadinessAnnouncementPriority
+}
+
+struct P077CloseoutReadinessAnnouncementState: Equatable, Sendable {
+  var lastGenerationID: String?
+  var lastFieldHash: String?
+  var lastAnnouncementAt: Date?
+}
+
+enum P077CloseoutReadinessAnnouncementPolicy {
+  static let coalescingWindow: TimeInterval = 3
+
+  nonisolated static func announcement(
+    for presentation: P077CloseoutReadinessPresentation,
+    previous state: inout P077CloseoutReadinessAnnouncementState,
+    now: Date,
+    sheetOwnsFocus: Bool
+  ) -> P077CloseoutReadinessAnnouncement? {
+    guard let generationID = presentation.generationCopyValue, !generationID.isEmpty else {
+      return nil
+    }
+    guard state.lastGenerationID != generationID else {
+      return nil
+    }
+
+    let fieldHash = [
+      presentation.statusLabel,
+      presentation.primaryUnblockText,
+      presentation.modeLabel,
+    ].joined(separator: "|")
+    if state.lastFieldHash == fieldHash,
+       let lastAnnouncementAt = state.lastAnnouncementAt,
+       now.timeIntervalSince(lastAnnouncementAt) < coalescingWindow {
+      return nil
+    }
+
+    let priority = announcementPriority(for: presentation)
+    if sheetOwnsFocus && priority == .polite {
+      return nil
+    }
+
+    state.lastGenerationID = generationID
+    state.lastFieldHash = fieldHash
+    state.lastAnnouncementAt = now
+    return P077CloseoutReadinessAnnouncement(
+      generationID: generationID,
+      text: presentation.compactActivationAccessibilityLabel,
+      priority: priority
+    )
+  }
+
+  private nonisolated static func announcementPriority(
+    for presentation: P077CloseoutReadinessPresentation
+  ) -> P077CloseoutReadinessAnnouncementPriority {
+    if presentation.visualState == .blocking,
+       presentation.modeLabel.localizedCaseInsensitiveContains("enforcement") {
+      return .assertive
+    }
+    if presentation.primaryUnblockText.localizedCaseInsensitiveContains("authority") {
+      return .assertive
+    }
+    return .polite
+  }
+}
+
 struct P031RunDetailPresentation: Equatable, Sendable {
   let title: String
   let workflowLabel: String?

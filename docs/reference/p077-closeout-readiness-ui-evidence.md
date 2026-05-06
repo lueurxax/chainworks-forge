@@ -73,6 +73,28 @@ Fixture-backed presentation requirements:
 - recovery lifecycle row: `recoveryLifecycleText`
 - backlink/readback row: `backlinkRouteLabel` and
   `backlinkRouteAccessibilityLabel`
+- compact activation action: `p077-closeout-readiness-compact-action`
+- compact status signal: `p077-closeout-readiness-compact-status`
+- diagnostics sheet return action: `p077-closeout-readiness-return`
+- remote runtime gate: `proposal-077-ui`
 
 The surface remains read-only. It exposes copy, diagnostics/readback, recovery
 guidance, and route labels, but it does not add local write/control buttons.
+
+## Runtime Proof
+
+`./scripts/test-gate.sh proposal-077-ui` is the remote macOS proof gate for this
+surface. It runs the presenter/accessibility policy fixtures, launches the
+direct P077 closeout-readiness fixture, activates the compact signal, verifies
+the full card and primary unblock are revealed, opens the diagnostics sheet,
+follows the return/backlink route back to the closeout card, exercises the
+generation-id copy command including fallback feedback, and captures the
+`P077_Closeout_Readiness_Runtime_A11Y` screenshot.
+
+The Swift runtime surface also keeps VoiceOver refreshes bounded by
+`voiceOverAnnouncementPolicy`: duplicate generations are suppressed, rapid
+field-hash refreshes are coalesced, polite announcements are suppressed while
+the diagnostics sheet owns focus, and blocking enforcement updates remain
+assertive. Unit fixtures cover the coalescing and blocking-priority behavior;
+the remote UI gate proves the compact, focus, backlink, and copy paths in the
+macOS app process.

@@ -719,6 +719,96 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(presentation.backlinkRouteLabel == "Closeout diagnostics")
   }
 
+  @Test("P077 announcement policy coalesces rapid refreshes and suppresses polite sheet refresh")
+  func p077AnnouncementPolicyCoalescesRapidRefreshes() throws {
+    let first = P077CloseoutReadinessPresenter.presentation(
+      for: try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: "ready",
+          decision: "enter_manual_release",
+          generationID: "gen-ready-0001",
+          mode: "advisory",
+          gateStatus: "passed",
+          primaryUnblock: nil,
+          summary: "Ready"
+        )
+      )
+    )
+    let second = P077CloseoutReadinessPresenter.presentation(
+      for: try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: "ready",
+          decision: "enter_manual_release",
+          generationID: "gen-ready-0002",
+          mode: "advisory",
+          gateStatus: "passed",
+          primaryUnblock: nil,
+          summary: "Ready"
+        )
+      )
+    )
+
+    let start = Date(timeIntervalSince1970: 1_000)
+    var state = P077CloseoutReadinessAnnouncementState()
+    let firstAnnouncement = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: first,
+      previous: &state,
+      now: start,
+      sheetOwnsFocus: false
+    )
+    let duplicate = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: first,
+      previous: &state,
+      now: start.addingTimeInterval(1),
+      sheetOwnsFocus: false
+    )
+    let coalesced = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: second,
+      previous: &state,
+      now: start.addingTimeInterval(2),
+      sheetOwnsFocus: false
+    )
+    let suppressedBySheet = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: second,
+      previous: &state,
+      now: start.addingTimeInterval(4),
+      sheetOwnsFocus: true
+    )
+
+    #expect(firstAnnouncement?.priority == .polite)
+    #expect(duplicate == nil)
+    #expect(coalesced == nil)
+    #expect(suppressedBySheet == nil)
+  }
+
+  @Test("P077 announcement policy keeps newly blocking enforcement assertive")
+  func p077AnnouncementPolicyKeepsBlockingEnforcementAssertive() throws {
+    let blocked = P077CloseoutReadinessPresenter.presentation(
+      for: try decodeCloseoutReadinessSummary(
+        closeoutReadinessSummaryJSON(
+          status: "blocked",
+          decision: "await_operator_decision",
+          generationID: "gen-blocked-0001",
+          mode: "enforcement",
+          gateStatus: "failed",
+          primaryUnblock: "Operator decision required",
+          summary: "Operator decision required"
+        )
+      )
+    )
+
+    var state = P077CloseoutReadinessAnnouncementState()
+    let announcement = P077CloseoutReadinessAnnouncementPolicy.announcement(
+      for: blocked,
+      previous: &state,
+      now: Date(timeIntervalSince1970: 2_000),
+      sheetOwnsFocus: true
+    )
+
+    #expect(announcement?.priority == .assertive)
+    #expect(announcement?.text.contains("Blocked") == true)
+  }
+
   @Test("Bulk artifact read documents do not request payload text")
   func bulkArtifactReadDocumentsDoNotRequestPayloadText() {
     #expect(!P031GraphQLDocuments.runDetail.contains("payloadText"))

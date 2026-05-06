@@ -26,6 +26,7 @@ struct ContentView: View {
 
     enum UISurface: String {
         case completedExportHub = "completed_export_hub"
+        case p077CloseoutReadiness = "p077_closeout_readiness"
     }
 
     init() {
@@ -178,6 +179,20 @@ struct ContentView: View {
         switch surface {
         case .completedExportHub:
             P031CompletedExportHubCompatibilitySurface()
+        case .p077CloseoutReadiness:
+#if DEBUG
+            ZStack(alignment: .topLeading) {
+                RunsHomeView(
+                    model: P031ThinReadDashboardModel.previewLoadedWithCloseoutReadiness(),
+                    initialTab: .overview
+                )
+                P031AccessibilityMarker(identifier: "ui-test-direct-surface-ready-p077_closeout_readiness")
+                    .frame(width: 1, height: 1)
+                    .opacity(0.01)
+            }
+#else
+            RunsHomeView()
+#endif
         }
     }
 

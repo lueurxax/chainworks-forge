@@ -1890,6 +1890,88 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(recoveredApp, name: "P031_Degraded_Drill_03_recovered")
     }
 
+    func testProposal077CloseoutReadinessRuntimeAccessibilityProof() throws {
+        let app = makeApp(
+            directSurface: "p077_closeout_readiness",
+            disableEagerBootstrap: true,
+            focusProof: true
+        )
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let directSurface = anyElement(
+            app,
+            identifier: "ui-test-direct-surface-ready-p077_closeout_readiness"
+        )
+        XCTAssertTrue(
+            directSurface.waitForExistence(timeout: 20),
+            "P077 direct closeout readiness surface must render"
+        )
+
+        let compactSignal = anyElement(app, identifier: "p077-closeout-readiness-compact-action")
+        XCTAssertTrue(
+            compactSignal.waitForExistence(timeout: 10) && compactSignal.isHittable,
+            "P077 compact signal must be present and activatable"
+        )
+        compactSignal.click()
+
+        let card = anyElement(app, identifier: "p077-closeout-readiness-card")
+        let primaryUnblock = anyElement(app, identifier: "p077-closeout-readiness-primary-unblock")
+        XCTAssertTrue(card.waitForExistence(timeout: 5), "compact activation must reveal the card")
+        XCTAssertTrue(
+            primaryUnblock.waitForExistence(timeout: 5),
+            "compact activation must reveal the primary unblock"
+        )
+
+        let secondaryBlockers = anyElement(
+            app,
+            identifier: "p077-closeout-readiness-secondary-blockers"
+        )
+        XCTAssertTrue(
+            secondaryBlockers.waitForExistence(timeout: 5),
+            "secondary blockers must be visible and ordered after the primary unblock"
+        )
+
+        let diagnostics = app.buttons["p077-closeout-readiness-diagnostics"].firstMatch
+        XCTAssertTrue(
+            diagnostics.waitForExistence(timeout: 5) && diagnostics.isEnabled,
+            "diagnostics trigger must be keyboard/action reachable"
+        )
+        diagnostics.click()
+
+        let sheet = anyElement(app, identifier: "p077-closeout-readiness-diagnostics-sheet")
+        XCTAssertTrue(sheet.waitForExistence(timeout: 5), "diagnostics sheet must open")
+
+        let returnButton = app.buttons["p077-closeout-readiness-return"].firstMatch
+        XCTAssertTrue(
+            returnButton.waitForExistence(timeout: 5) && returnButton.isEnabled,
+            "diagnostics sheet must expose Return to Closeout Readiness"
+        )
+        returnButton.click()
+        XCTAssertTrue(
+            primaryUnblock.waitForExistence(timeout: 5),
+            "return backlink must route back to the closeout primary unblock"
+        )
+
+        let copyButton = app.buttons["p077-closeout-readiness-generation-copy"].firstMatch
+        XCTAssertTrue(
+            copyButton.waitForExistence(timeout: 5) && copyButton.isEnabled,
+            "generation copy command must be reachable"
+        )
+        copyButton.click()
+        XCTAssertNotNil(
+            waitForStaticTextValueContaining(["Copied generation", "Copy failed"], in: app, timeout: 5),
+            "copy command must expose success or fallback feedback"
+        )
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "p077-closeout-readiness-backlink-route")
+                .waitForExistence(timeout: 5),
+            "readback/backlink route must remain visible"
+        )
+        screenshot(app, name: "P077_Closeout_Readiness_Runtime_A11Y")
+    }
+
     func testProposal012AppendixAMinWindowOwnersAt1024x768() throws {
         let runsTitle = "P012 Runs Home Owner Proof"
         let runsApp = makeApp(

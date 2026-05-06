@@ -1035,7 +1035,6 @@ Scope (what this gate actually covers):
 NOT covered by this gate (require additional integration gates or manual evidence):
 
 - integrated orchestrator transition guard against live SQLite (state_9 real run)
-- remote macOS UI/VoiceOver runtime proof
 - Swift workspace tests
 
 Use when:
@@ -1067,6 +1066,30 @@ Important:
   diagnostics, recovery, route, or accessibility mappings
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
 - it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
+
+### `proposal-077-ui|p077-ui`
+
+Remote macOS runtime proof for the P077 closeout readiness surface.
+
+Scope:
+
+- direct P077 closeout-readiness fixture launch
+- compact signal activation into the full closeout card
+- primary unblock and secondary blocker focus/read order
+- diagnostics sheet open plus explicit return/backlink route
+- generation-id copy command success or fallback feedback
+- closeout readiness screenshot evidence capture
+
+Host policy:
+
+- remote macOS UI host required
+- runs through the same signed XCUITest path as other repository UI gates
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-077-ui
+```
 
 ### `p051-scaffold`
 

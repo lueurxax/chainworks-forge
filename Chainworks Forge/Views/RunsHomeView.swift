@@ -8,6 +8,8 @@ struct RunsHomeView: View {
     @StateObject private var model: P031ThinReadDashboardModel
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
+    @State private var closeoutReadinessScrollRequest = 0
+    @FocusState private var closeoutReadinessFocus: P077CloseoutReadinessFocus?
 
     @MainActor
     init() {
@@ -171,52 +173,83 @@ struct RunsHomeView: View {
 
     @ViewBuilder
     private func runDetailTabContent(_ runDetail: P031RunDetailPresentation) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                switch selectedRunDetailTab {
-                case .overview:
-                    P031RunDetailSummaryCard(presentation: runDetail)
-                    if let closeoutReadiness = runDetail.closeoutReadiness {
-                        P077CloseoutReadinessCard(presentation: closeoutReadiness)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    switch selectedRunDetailTab {
+                    case .overview:
+                        P031RunDetailSummaryCard(
+                            presentation: runDetail,
+                            onCompactCloseoutActivated: activateCloseoutReadinessFromCompactSignal
+                        )
+                        if let closeoutReadiness = runDetail.closeoutReadiness {
+                            P077CloseoutReadinessCard(
+                                presentation: closeoutReadiness,
+                                closeoutFocus: $closeoutReadinessFocus,
+                                onReturnToCloseoutReadiness: focusCloseoutPrimaryUnblock
+                            )
+                            .id(P077CloseoutReadinessAnchor.card)
+                        }
+                        P031IdeaContextCard(presentation: runDetail.ideaContext)
+                        P031CatalogContextCard(presentation: runDetail.catalogContext)
+                    case .stages:
+                        P031StageTransitionMapCard(
+                            rows: runDetail.stageTransitions,
+                            artifactCountsByStageID: artifactCountsByStageID(for: runDetail),
+                            onArtifactsSelected: { stageID in
+                                focusedArtifactStageID = stageID
+                                selectedRunDetailTab = .artifacts
+                            }
+                        )
+                    case .artifacts:
+                        P031ArtifactViewerCard(
+                            rows: runDetail.artifactViewerRows,
+                            focusedStageID: focusedArtifactStageID,
+                            loadArtifactPreview: model.loadArtifactPreview
+                        )
+                    case .approvals:
+                        P031ApprovalInboxCard(
+                            presentation: model.approvalInbox,
+                            actionError: model.approvalActionError,
+                            isResolving: { model.isResolvingApproval($0) },
+                            onApprove: { approvalID in
+                                Task { await model.settleApproval(approvalID, action: .approve) }
+                            },
+                            onReject: { approvalID in
+                                Task { await model.settleApproval(approvalID, action: .reject(reason: "Rejected from Chainworks Forge UI")) }
+                            }
+                        )
+                    case .reports:
+                        P031ReportMetadataCard(rows: runDetail.reportRows)
+                    case .system:
+                        P031DaemonLifecycleCard(presentation: model.daemonLifecycle)
                     }
-                    P031IdeaContextCard(presentation: runDetail.ideaContext)
-                    P031CatalogContextCard(presentation: runDetail.catalogContext)
-                case .stages:
-                    P031StageTransitionMapCard(
-                        rows: runDetail.stageTransitions,
-                        artifactCountsByStageID: artifactCountsByStageID(for: runDetail),
-                        onArtifactsSelected: { stageID in
-                            focusedArtifactStageID = stageID
-                            selectedRunDetailTab = .artifacts
-                        }
-                    )
-                case .artifacts:
-                    P031ArtifactViewerCard(
-                        rows: runDetail.artifactViewerRows,
-                        focusedStageID: focusedArtifactStageID,
-                        loadArtifactPreview: model.loadArtifactPreview
-                    )
-                case .approvals:
-                    P031ApprovalInboxCard(
-                        presentation: model.approvalInbox,
-                        actionError: model.approvalActionError,
-                        isResolving: { model.isResolvingApproval($0) },
-                        onApprove: { approvalID in
-                            Task { await model.settleApproval(approvalID, action: .approve) }
-                        },
-                        onReject: { approvalID in
-                            Task { await model.settleApproval(approvalID, action: .reject(reason: "Rejected from Chainworks Forge UI")) }
-                        }
-                    )
-                case .reports:
-                    P031ReportMetadataCard(rows: runDetail.reportRows)
-                case .system:
-                    P031DaemonLifecycleCard(presentation: model.daemonLifecycle)
                 }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .onChange(of: closeoutReadinessScrollRequest) { _, _ in
+                guard selectedRunDetailTab == .overview else { return }
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    proxy.scrollTo(P077CloseoutReadinessAnchor.card, anchor: .top)
+                }
+                closeoutReadinessFocus = .primaryUnblock
+            }
+        }
+    }
+
+    private func activateCloseoutReadinessFromCompactSignal() {
+        selectedRunDetailTab = .overview
+        DispatchQueue.main.async {
+            closeoutReadinessScrollRequest += 1
+        }
+    }
+
+    private func focusCloseoutPrimaryUnblock() {
+        selectedRunDetailTab = .overview
+        DispatchQueue.main.async {
+            closeoutReadinessScrollRequest += 1
         }
     }
 
@@ -257,6 +290,21 @@ enum P031RunDetailTab: String, CaseIterable, Identifiable {
             return "System"
         }
     }
+}
+
+private enum P077CloseoutReadinessAnchor: Hashable {
+    case card
+}
+
+private enum P077CloseoutReadinessFocus: Hashable {
+    case compactSignal
+    case diagnosticsTrigger
+    case copyGeneration
+    case primaryUnblock
+    case secondaryBlocker(String)
+    case copyFallback
+    case backlinkRoute
+    case modeExplainer
 }
 
 @MainActor
@@ -396,10 +444,24 @@ final class P031ThinReadDashboardModel: ObservableObject {
 
 #if DEBUG
     static func previewLoaded() -> P031ThinReadDashboardModel {
+        previewLoaded(includeCloseoutReadiness: false)
+    }
+
+    static func previewLoadedWithCloseoutReadiness() -> P031ThinReadDashboardModel {
+        previewLoaded(includeCloseoutReadiness: true)
+    }
+
+    private static func previewLoaded(includeCloseoutReadiness: Bool) -> P031ThinReadDashboardModel {
         let freshness = P031FreshnessSnapshot(state: .live, lastCheckedAt: Date())
         let runID = "preview-run-proposal-review"
         let artifacts = previewArtifacts(freshness: freshness)
-        let detail = previewRunDetail(runID: runID, freshness: freshness, artifacts: artifacts)
+        let detail = previewRunDetail(
+            runID: runID,
+            freshness: freshness,
+            artifacts: artifacts,
+            includeCloseoutReadiness: includeCloseoutReadiness
+        )
+        let closeoutSignal = detail.closeoutReadiness?.compactSignalLabel
         let runsHome = P031RunsHomePresentation(
             orientation: nil,
             rows: [
@@ -410,6 +472,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                     statusLabel: "Running",
                     progressLabel: "13 stages, 48 artifacts",
                     pendingApprovalsLabel: nil,
+                    closeoutReadinessSignalLabel: closeoutSignal,
                     freshnessState: .live,
                     accessibilityLabel: "Proposal review run, running"
                 ),
@@ -494,7 +557,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private static func previewRunDetail(
         runID: String,
         freshness: P031FreshnessSnapshot,
-        artifacts: [P031ArtifactViewerPresentation]
+        artifacts: [P031ArtifactViewerPresentation],
+        includeCloseoutReadiness: Bool = false
     ) -> P031RunDetailPresentation {
         let transitions = [
             P031StageTransitionPresentation(
@@ -555,11 +619,46 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 statusText: "Catalog snapshot available",
                 accessibilityLabel: "Proposal review catalog snapshot available"
             ),
+            closeoutReadiness: includeCloseoutReadiness
+                ? previewCloseoutReadiness(runID: runID)
+                : nil,
             freshness: freshness,
             refreshFeedbackText: "Live projection",
             emptyStateTitle: nil,
             errorDescription: nil
         )
+    }
+
+    private static func previewCloseoutReadiness(runID: String) -> P077CloseoutReadinessPresentation? {
+        let json = """
+        {
+          "run_id": "\(runID)",
+          "stage_id": "state_9_implementation_reviewed",
+          "readiness_status": "not_ready",
+          "readiness_decision": "return_to_code_refine",
+          "readiness_generation_id": "abcdef1234567890",
+          "readiness_mode": "enforcement",
+          "gate_status": "failed",
+          "gate_generation_id": "gateabcdef123456",
+          "audit_status": "not_ready",
+          "diagnostic_reason": "proposal-077 gate failed",
+          "primary_unblock": "Fix implementation blockers",
+          "code_blocker_count": 2,
+          "handoff_count": 0,
+          "risk_settlement_required": false,
+          "accepted_risk_count": 0,
+          "fingerprint_hash": "sha256:fixture",
+          "summary": "Fix implementation blockers",
+          "synthesized_at": "2026-05-06T09:55:45Z",
+          "is_applicable": true
+        }
+        """
+        guard let data = json.data(using: .utf8),
+              let summary = try? JSONDecoder().decode(P077CloseoutReadinessSummaryReadModel.self, from: data)
+        else {
+            return nil
+        }
+        return P077CloseoutReadinessPresenter.presentation(for: summary)
     }
 
     private static func previewArtifacts(
@@ -1000,6 +1099,7 @@ private struct P031RunsHomeRowCard: View {
 
 private struct P031RunDetailSummaryCard: View {
     let presentation: P031RunDetailPresentation
+    let onCompactCloseoutActivated: () -> Void
 
     var body: some View {
         P031CalloutCard(
@@ -1008,6 +1108,10 @@ private struct P031RunDetailSummaryCard: View {
             accentColor: .accentColor
         ) {
             HStack(spacing: 10) {
+                P031RunsHomeAccessibilityMarker(
+                    identifier: "p031-run-detail-summary-\(presentation.freshness.state.rawValue)",
+                    label: presentation.title
+                )
                 P031FreshnessBadge(snapshot: presentation.freshness)
                 if let closeoutReadiness = presentation.closeoutReadiness {
                     P077CompactSignalCapsule(
@@ -1017,7 +1121,8 @@ private struct P031RunDetailSummaryCard: View {
                             for: closeoutReadiness.visualState
                         ),
                         accessibilityLabel: closeoutReadiness.compactActivationAccessibilityLabel,
-                        accessibilityIdentifier: "p077-closeout-readiness-compact-signal"
+                        accessibilityIdentifier: "p077-closeout-readiness-compact-action",
+                        action: onCompactCloseoutActivated
                     )
                 }
                 if let errorDescription = presentation.errorDescription {
@@ -1027,7 +1132,6 @@ private struct P031RunDetailSummaryCard: View {
                 }
             }
         }
-        .accessibilityIdentifier("p031-run-detail-summary-\(presentation.freshness.state.rawValue)")
     }
 
     private var detailBody: String {
@@ -1045,8 +1149,12 @@ private struct P031RunDetailSummaryCard: View {
 
 private struct P077CloseoutReadinessCard: View {
     let presentation: P077CloseoutReadinessPresentation
+    let closeoutFocus: FocusState<P077CloseoutReadinessFocus?>.Binding
+    let onReturnToCloseoutReadiness: () -> Void
     @State private var copyFeedback: String?
     @State private var isDiagnosticsPresented = false
+    @State private var announcementState = P077CloseoutReadinessAnnouncementState()
+    @State private var latestAnnouncement: P077CloseoutReadinessAnnouncement?
 
     var body: some View {
         P031CalloutCard(
@@ -1055,14 +1163,21 @@ private struct P077CloseoutReadinessCard: View {
             accentColor: accentColor
         ) {
             VStack(alignment: .leading, spacing: 10) {
+                P031RunsHomeAccessibilityMarker(
+                    identifier: "p077-closeout-readiness-card",
+                    label: presentation.cardAccessibilityLabel,
+                    value: latestAnnouncement?.text
+                )
+
                 HStack(spacing: 8) {
                     P077CompactSignalCapsule(
                         label: presentation.compactSignalLabel,
                         systemImage: statusSymbolName,
                         accentColor: accentColor,
                         accessibilityLabel: presentation.compactActivationAccessibilityLabel,
-                        accessibilityIdentifier: "p077-closeout-readiness-compact-signal"
+                        accessibilityIdentifier: "p077-closeout-readiness-compact-status"
                     )
+                    .focused(closeoutFocus, equals: .compactSignal)
                     Spacer()
                 }
 
@@ -1081,6 +1196,7 @@ private struct P077CloseoutReadinessCard: View {
                     .controlSize(.small)
                     .accessibilityLabel(presentation.diagnosticsAccessibilityLabel)
                     .accessibilityIdentifier("p077-closeout-readiness-diagnostics")
+                    .focused(closeoutFocus, equals: .diagnosticsTrigger)
 
                     Button {
                         copyGenerationID()
@@ -1091,10 +1207,13 @@ private struct P077CloseoutReadinessCard: View {
                     .disabled(presentation.generationCopyValue == nil)
                     .accessibilityLabel(presentation.generationCopyAccessibilityLabel)
                     .accessibilityIdentifier("p077-closeout-readiness-generation-copy")
+                    .focused(closeoutFocus, equals: .copyGeneration)
                 }
 
                 Label(presentation.primaryUnblockText, systemImage: "exclamationmark.circle")
                     .font(.callout.weight(.medium))
+                    .focusable(true)
+                    .focused(closeoutFocus, equals: .primaryUnblock)
                     .accessibilityLabel("Primary unblock: \(presentation.primaryUnblockText)")
                     .accessibilityIdentifier("p077-closeout-readiness-primary-unblock")
 
@@ -1103,6 +1222,9 @@ private struct P077CloseoutReadinessCard: View {
                         ForEach(presentation.secondaryBlockerRows, id: \.self) { row in
                             Label(row, systemImage: "smallcircle.filled.circle")
                                 .font(.caption)
+                                .focusable(true)
+                                .focused(closeoutFocus, equals: .secondaryBlocker(row))
+                                .accessibilityLabel("Queued behind \(presentation.primaryUnblockText): \(row)")
                         }
                     }
                     .accessibilityElement(children: .combine)
@@ -1117,12 +1239,16 @@ private struct P077CloseoutReadinessCard: View {
                 Label(presentation.backlinkRouteLabel, systemImage: "arrowshape.turn.up.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .focusable(true)
+                    .focused(closeoutFocus, equals: .backlinkRoute)
                     .accessibilityLabel(presentation.backlinkRouteAccessibilityLabel)
                     .accessibilityIdentifier("p077-closeout-readiness-backlink-route")
 
                 Label(presentation.modeExplainerText, systemImage: "info.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .focusable(true)
+                    .focused(closeoutFocus, equals: .modeExplainer)
                     .accessibilityLabel(presentation.modeExplainerAccessibilityLabel)
                     .accessibilityIdentifier("p077-closeout-readiness-mode-explainer")
 
@@ -1130,13 +1256,32 @@ private struct P077CloseoutReadinessCard: View {
                     Text(copyFeedback)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .focusable(true)
+                        .focused(closeoutFocus, equals: .copyFallback)
+                        .accessibilityIdentifier("p077-closeout-readiness-copy-fallback")
                 }
             }
         }
-        .accessibilityLabel(presentation.cardAccessibilityLabel)
-        .accessibilityIdentifier("p077-closeout-readiness-card")
-        .sheet(isPresented: $isDiagnosticsPresented) {
-            P077CloseoutReadinessDiagnosticsSheet(presentation: presentation)
+        .onAppear {
+            recordCloseoutAnnouncement(sheetOwnsFocus: isDiagnosticsPresented)
+        }
+        .onChange(of: presentation) { _, _ in
+            recordCloseoutAnnouncement(sheetOwnsFocus: isDiagnosticsPresented)
+        }
+        .onChange(of: isDiagnosticsPresented) { _, sheetOwnsFocus in
+            recordCloseoutAnnouncement(sheetOwnsFocus: sheetOwnsFocus)
+        }
+        .sheet(
+            isPresented: $isDiagnosticsPresented,
+            onDismiss: { closeoutFocus.wrappedValue = .diagnosticsTrigger }
+        ) {
+            P077CloseoutReadinessDiagnosticsSheet(
+                presentation: presentation,
+                onReturnToCloseoutReadiness: {
+                    isDiagnosticsPresented = false
+                    onReturnToCloseoutReadiness()
+                }
+            )
         }
     }
 
@@ -1171,9 +1316,39 @@ private struct P077CloseoutReadinessCard: View {
         copyFeedback = didCopy
             ? "Copied generation \(presentation.generationDisplayID)"
             : presentation.copyFailureFallbackText
+        if !didCopy {
+            closeoutFocus.wrappedValue = .copyFallback
+        }
         return
 #endif
         copyFeedback = "Copied generation \(presentation.generationDisplayID)"
+    }
+
+    private func recordCloseoutAnnouncement(sheetOwnsFocus: Bool) {
+        var state = announcementState
+        latestAnnouncement = P077CloseoutReadinessAnnouncementPolicy.announcement(
+            for: presentation,
+            previous: &state,
+            now: Date(),
+            sheetOwnsFocus: sheetOwnsFocus
+        )
+        announcementState = state
+    }
+}
+
+private struct P031RunsHomeAccessibilityMarker: View {
+    let identifier: String
+    let label: String
+    var value: String? = nil
+
+    var body: some View {
+        Text(" ")
+            .font(.system(size: 1))
+            .frame(width: 1, height: 1)
+            .foregroundStyle(.clear)
+            .accessibilityLabel(label)
+            .accessibilityValue(value ?? "")
+            .accessibilityIdentifier(identifier)
     }
 }
 
@@ -1198,8 +1373,24 @@ private struct P077CompactSignalCapsule: View {
     let accentColor: Color
     let accessibilityLabel: String
     let accessibilityIdentifier: String
+    var action: (() -> Void)? = nil
 
     var body: some View {
+        if let action {
+            Button(action: action) {
+                capsuleContent
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityIdentifier(accessibilityIdentifier)
+        } else {
+            capsuleContent
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityIdentifier(accessibilityIdentifier)
+        }
+    }
+
+    private var capsuleContent: some View {
         Label(label, systemImage: systemImage)
             .font(.caption.weight(.semibold))
             .foregroundStyle(.primary)
@@ -1212,25 +1403,34 @@ private struct P077CompactSignalCapsule: View {
                 Capsule()
                     .stroke(accentColor.opacity(0.35), lineWidth: 1)
             )
-            .accessibilityLabel(accessibilityLabel)
-            .accessibilityIdentifier(accessibilityIdentifier)
     }
 }
 
 private struct P077CloseoutReadinessDiagnosticsSheet: View {
     let presentation: P077CloseoutReadinessPresentation
+    let onReturnToCloseoutReadiness: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
+                Button {
+                    dismiss()
+                    DispatchQueue.main.async {
+                        onReturnToCloseoutReadiness()
+                    }
+                } label: {
+                    Label("Closeout Readiness", systemImage: "chevron.left")
+                }
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("p077-closeout-readiness-return")
+
                 Text("Closeout Diagnostics")
                     .font(.headline)
                 Spacer()
                 Button("Done") {
                     dismiss()
                 }
-                .keyboardShortcut(.cancelAction)
             }
 
             ForEach(presentation.diagnosticRows, id: \.self) { row in

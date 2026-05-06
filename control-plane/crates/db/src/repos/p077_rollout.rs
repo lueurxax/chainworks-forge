@@ -26,6 +26,16 @@ pub struct P077RolloutDecisionInput {
     pub principal: String,
     pub reason: String,
     pub metric_snapshot_json: Value,
+    pub cohort: String,
+    pub eligible_closeouts: i64,
+    pub primary_metric_values_json: Value,
+    pub diagnostic_metric_snapshot_json: Value,
+    pub dependency_checklist_snapshot_id: String,
+    pub fingerprint_p95_threshold_ms: i64,
+    pub measurement_window: String,
+    pub waivers_json: Value,
+    pub next_review_date: String,
+    pub readiness_links_json: Value,
     pub rollback_trigger: Option<String>,
     pub rollback_action: Option<String>,
     pub affected_run_ids: Vec<String>,
@@ -70,6 +80,7 @@ pub async fn record_decision(
     pool: &SqlitePool,
     input: P077RolloutDecisionInput,
 ) -> Result<P077RolloutDecisionResult> {
+    validate_decision_payload(&input)?;
     if input.decision == "rollback_to_advisory" {
         if input.rollback_trigger.as_deref().unwrap_or("").is_empty() {
             bail!("p077 rollback_to_advisory requires rollback_trigger");
@@ -90,8 +101,13 @@ pub async fn record_decision(
     sqlx::query(
         r#"INSERT INTO p077_rollout_decisions
            (id, decision_scope, decision, principal, reason, metric_snapshot_json,
-            rollback_trigger, rollback_action, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            decision_type, cohort, eligible_closeouts, primary_metric_values_json,
+            diagnostic_metric_snapshot_json, dependency_checklist_snapshot_id,
+            fingerprint_p95_threshold_ms, measurement_window, waivers_json,
+            next_review_date, readiness_links_json, rollback_trigger, rollback_action,
+            created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
     )
     .bind(&decision_id)
     .bind(&input.decision_scope)
@@ -99,6 +115,19 @@ pub async fn record_decision(
     .bind(&input.principal)
     .bind(&input.reason)
     .bind(serde_json::to_string(&input.metric_snapshot_json)?)
+    .bind(&input.decision)
+    .bind(&input.cohort)
+    .bind(input.eligible_closeouts)
+    .bind(serde_json::to_string(&input.primary_metric_values_json)?)
+    .bind(serde_json::to_string(
+        &input.diagnostic_metric_snapshot_json,
+    )?)
+    .bind(&input.dependency_checklist_snapshot_id)
+    .bind(input.fingerprint_p95_threshold_ms)
+    .bind(&input.measurement_window)
+    .bind(serde_json::to_string(&input.waivers_json)?)
+    .bind(&input.next_review_date)
+    .bind(serde_json::to_string(&input.readiness_links_json)?)
     .bind(&input.rollback_trigger)
     .bind(&input.rollback_action)
     .bind(&created_at)
@@ -147,6 +176,65 @@ pub async fn record_decision(
         decision_id,
         advisory_migration_count,
     })
+}
+
+fn validate_decision_payload(input: &P077RolloutDecisionInput) -> Result<()> {
+    require_non_empty("decision_scope", &input.decision_scope)?;
+    require_non_empty("decision_type", &input.decision)?;
+    require_non_empty("rationale", &input.reason)?;
+    require_non_empty("cohort", &input.cohort)?;
+    require_non_empty(
+        "dependency_checklist_snapshot_id",
+        &input.dependency_checklist_snapshot_id,
+    )?;
+    require_non_empty("measurement_window", &input.measurement_window)?;
+    require_non_empty("next_review_date", &input.next_review_date)?;
+
+    if input.eligible_closeouts < 0 {
+        bail!("p077 rollout decision payload eligible_closeouts must be non-negative");
+    }
+    if input.fingerprint_p95_threshold_ms <= 0 {
+        bail!("p077 rollout decision payload fingerprint_p95_threshold_ms must be positive");
+    }
+    if !input.metric_snapshot_json.is_object() {
+        bail!("p077 rollout decision payload diagnostic metric snapshot must be an object");
+    }
+    if !input.primary_metric_values_json.is_object()
+        || input
+            .primary_metric_values_json
+            .as_object()
+            .is_some_and(|v| v.is_empty())
+    {
+        bail!("p077 rollout decision payload primary metric values are required");
+    }
+    if !input.diagnostic_metric_snapshot_json.is_object()
+        || input
+            .diagnostic_metric_snapshot_json
+            .as_object()
+            .is_some_and(|v| v.is_empty())
+    {
+        bail!("p077 rollout decision payload diagnostic metric snapshot is required");
+    }
+    if !input.waivers_json.is_array() {
+        bail!("p077 rollout decision payload waivers must be an array");
+    }
+    if !input.readiness_links_json.is_array()
+        || input
+            .readiness_links_json
+            .as_array()
+            .is_some_and(|v| v.is_empty())
+    {
+        bail!("p077 rollout decision payload readiness links are required");
+    }
+
+    Ok(())
+}
+
+fn require_non_empty(field: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("p077 rollout decision payload {field} is required");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -217,6 +305,35 @@ mod tests {
         run_id
     }
 
+    fn decision_input(decision: &str) -> P077RolloutDecisionInput {
+        P077RolloutDecisionInput {
+            decision_scope: "first cohort fixture".into(),
+            decision: decision.into(),
+            principal: "release-owner".into(),
+            reason: "neutral observation until cohort is complete".into(),
+            metric_snapshot_json: serde_json::json!({"false_blocks": "1/20"}),
+            cohort: "p077-first-cohort".into(),
+            eligible_closeouts: 10,
+            primary_metric_values_json: serde_json::json!({
+                "false_ready_prevented": "0/10",
+                "false_blocks": "1/20"
+            }),
+            diagnostic_metric_snapshot_json: serde_json::json!({
+                "pause_to_action": "4h",
+                "code_writer_loops_avoided": "100%"
+            }),
+            dependency_checklist_snapshot_id: "dependency-snapshot-1".into(),
+            fingerprint_p95_threshold_ms: 250,
+            measurement_window: "2026-05-01/2026-05-10".into(),
+            waivers_json: serde_json::json!([]),
+            next_review_date: "2026-05-11".into(),
+            readiness_links_json: serde_json::json!(["closeout-readiness-generation:fixture"]),
+            rollback_trigger: None,
+            rollback_action: None,
+            affected_run_ids: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn p077_rollout_records_live_metric_and_continue_decision() {
         let pool = setup_test_db().await;
@@ -249,24 +366,27 @@ mod tests {
         .unwrap();
         assert_eq!(metric_count, 1);
 
-        let decision = record_decision(
-            &pool,
-            P077RolloutDecisionInput {
-                decision_scope: "first cohort fixture".into(),
-                decision: "continue_advisory".into(),
-                principal: "release-owner".into(),
-                reason: "neutral observation until cohort is complete".into(),
-                metric_snapshot_json: serde_json::json!({"false_blocks": "1/20"}),
-                rollback_trigger: None,
-                rollback_action: None,
-                affected_run_ids: vec![],
-            },
-        )
-        .await
-        .unwrap();
+        let decision = record_decision(&pool, decision_input("continue_advisory"))
+            .await
+            .unwrap();
 
         assert_eq!(decision.advisory_migration_count, 0);
         assert!(!decision.decision_id.is_empty());
+
+        let stored: (String, i64, String, String) = sqlx::query_as(
+            r#"SELECT cohort, eligible_closeouts, dependency_checklist_snapshot_id,
+                      next_review_date
+               FROM p077_rollout_decisions
+               WHERE id = ?1"#,
+        )
+        .bind(&decision.decision_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, "p077-first-cohort");
+        assert_eq!(stored.1, 10);
+        assert_eq!(stored.2, "dependency-snapshot-1");
+        assert_eq!(stored.3, "2026-05-11");
     }
 
     #[tokio::test]
@@ -275,21 +395,15 @@ mod tests {
         let first_run_id = insert_test_run(&pool, Some("enforcement")).await;
         let second_run_id = insert_test_run(&pool, Some("enforcement")).await;
 
-        let decision = record_decision(
-            &pool,
-            P077RolloutDecisionInput {
-                decision_scope: "false-block breach fixture".into(),
-                decision: "rollback_to_advisory".into(),
-                principal: "release-owner".into(),
-                reason: "false block threshold breached".into(),
-                metric_snapshot_json: serde_json::json!({"false_blocks": "3/20"}),
-                rollback_trigger: Some("rollback_trigger_false_blocks".into()),
-                rollback_action: Some("rollback_action".into()),
-                affected_run_ids: vec![first_run_id.clone(), second_run_id.clone()],
-            },
-        )
-        .await
-        .unwrap();
+        let mut input = decision_input("rollback_to_advisory");
+        input.decision_scope = "false-block breach fixture".into();
+        input.reason = "false block threshold breached".into();
+        input.metric_snapshot_json = serde_json::json!({"false_blocks": "3/20"});
+        input.rollback_trigger = Some("rollback_trigger_false_blocks".into());
+        input.rollback_action = Some("rollback_action".into());
+        input.affected_run_ids = vec![first_run_id.clone(), second_run_id.clone()];
+
+        let decision = record_decision(&pool, input).await.unwrap();
 
         assert_eq!(decision.advisory_migration_count, 2);
         for run_id in [&first_run_id, &second_run_id] {
@@ -317,22 +431,29 @@ mod tests {
         let pool = setup_test_db().await;
         let run_id = insert_test_run(&pool, Some("enforcement")).await;
 
-        let err = record_decision(
-            &pool,
-            P077RolloutDecisionInput {
-                decision_scope: "invalid rollback".into(),
-                decision: "rollback_to_advisory".into(),
-                principal: "release-owner".into(),
-                reason: "missing trigger".into(),
-                metric_snapshot_json: serde_json::json!({}),
-                rollback_trigger: None,
-                rollback_action: Some("rollback_action".into()),
-                affected_run_ids: vec![run_id],
-            },
-        )
-        .await
-        .expect_err("rollback requires a trigger");
+        let mut input = decision_input("rollback_to_advisory");
+        input.decision_scope = "invalid rollback".into();
+        input.reason = "missing trigger".into();
+        input.rollback_action = Some("rollback_action".into());
+        input.affected_run_ids = vec![run_id];
+
+        let err = record_decision(&pool, input)
+            .await
+            .expect_err("rollback requires a trigger");
 
         assert!(err.to_string().contains("requires rollback_trigger"));
+    }
+
+    #[tokio::test]
+    async fn p077_rollout_rejects_incomplete_decision_payload() {
+        let pool = setup_test_db().await;
+        let mut input = decision_input("expand_enforcement");
+        input.dependency_checklist_snapshot_id = " ".into();
+
+        let err = record_decision(&pool, input)
+            .await
+            .expect_err("dependency checklist snapshot id is required");
+
+        assert!(err.to_string().contains("dependency_checklist_snapshot_id"));
     }
 }

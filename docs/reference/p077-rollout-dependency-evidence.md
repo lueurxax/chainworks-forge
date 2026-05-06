@@ -44,7 +44,7 @@ now has an executable P077 rollout store:
 | storage | purpose | rollback_execution_fixture | evidence_status |
 | --- | --- | --- | --- |
 | `p077_rollout_metric_events` | durable metric rows for `false_ready_prevented`, `post_release_closeout_gap_reversals`, `false_blocks`, `pause_to_action`, and `code_writer_loops_avoided` | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
-| `p077_rollout_decisions` | governed release-owner go/no-go decisions with metric snapshots and optional rollback trigger/action | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
+| `p077_rollout_decisions` | governed release-owner go/no-go decisions with full decision payload snapshots and optional rollback trigger/action | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
 | `p077_rollout_advisory_migrations` | affected-run migration records for rollback to advisory mode | `cargo test -p db p077_rollout_rollback_to_advisory_updates_runs_and_records_migrations` | passed |
 
 The canonical `proposal-077` gate runs these fixtures through
@@ -52,6 +52,17 @@ The canonical `proposal-077` gate runs these fixtures through
 `rollback_to_advisory` decision requires `rollback_trigger`, `rollback_action`,
 and affected run ids, updates each affected `runs.closeout_readiness_mode` to
 `advisory`, and records one migration row per run.
+
+`p077_rollout_decisions` enforces the full proposal decision payload at write
+time. A durable decision row must carry non-empty `decision_scope`,
+`decision_type`, `cohort`, `dependency_checklist_snapshot_id`,
+`measurement_window`, `next_review_date`, and release-owner rationale, plus
+non-negative `eligible_closeouts`, positive `fingerprint_p95_threshold_ms`,
+object-shaped `metric_snapshot_json`, non-empty object-shaped
+`primary_metric_values_json` and `diagnostic_metric_snapshot_json`,
+array-shaped `waivers_json`, and non-empty array-shaped
+`readiness_links_json`. Incomplete payloads fail before storage, so a rollout
+decision cannot silently degrade to static advisory prose.
 
 ## Expansion Decision
 
