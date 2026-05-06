@@ -2075,9 +2075,9 @@ Available gates:
   proposal-027r   Proposal 027 unified read-only JSON/markdown rendering gate (legacy renderer)
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
-  proposal-031,p031  Proposal 031 thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
-  proposal-031-readiness,p031-readiness  Proposal 031 closeout readiness gate (expected to fail before Phase 3 signoff)
+  proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
@@ -4077,7 +4077,7 @@ for phrase in [
     "operator-only V1",
     "Projection parity",
     "Known holds",
-    "P031 may ship",
+    "Governed macOS UI surfaces ship",
     # Scope narrowing: P031 is a read-only consumer. It does not issue
     # MCP mutations, so rows that reference disabled controls apply to a
     # future command-UI consumer, not to P031.
@@ -4097,7 +4097,7 @@ PY
     log "Proposal 043 control-plane gate passed"
     ;;
   proposal-031|p031)
-    log "Proposal 031 gate: GraphQL-only thin UI inventory/static guard/write-path guide"
+    log "Thin UI gate: GraphQL-only inventory/static guard/write-path guide"
     "$0" proposal-043
 
     python3 "$ROOT_DIR/scripts/p031-thin-ui-gate.py" --repo-root "$ROOT_DIR"
@@ -4129,7 +4129,7 @@ for entry in manifest.get("entries", []):
     require_file(entry["path"])
 PY
     )
-    log "Proposal 031 gate passed"
+    log "Thin UI gate passed"
     ;;
   proposal-072|p072)
     log "UI action boundary gate: approval-only GraphQL UI mutation boundary"
@@ -4155,24 +4155,26 @@ PY
       python3 - <<'PY'
 from pathlib import Path
 
-p031 = Path("docs/proposals/031-thin-graphql-ui-rewrite.md").read_text()
+contract = Path("docs/reference/query-projections-and-client-consumption-contract.md").read_text()
+boundary = Path("docs/reference/ui-action-boundary.md").read_text()
+combined = contract + "\n" + boundary
 required = [
-    "UI action boundary supersedes the original P031 all-mutation ban",
+    "The governed SwiftUI app is a GraphQL-only observer and approval console.",
     "approveApproval",
     "rejectApproval",
-    "0 non-approval GraphQL mutations",
+    "Non-approval GraphQL mutations are prohibited from governed UI code.",
 ]
 for phrase in required:
-    if phrase not in p031:
-        raise SystemExit(f"proposal-072: P031 text missing UI action boundary reconciliation phrase: {phrase}")
+    if phrase not in combined:
+        raise SystemExit(f"proposal-072: stable UI boundary docs missing reconciliation phrase: {phrase}")
 
 for forbidden in [
     "Approval rows are diagnostic-read-only in P031. Interactive approval decisions require a separate non-MCP, non-GraphQL UI transport proposal.",
     "Governed macOS UI has no MCP calls, no GraphQL mutations, and no local mutation fallback.",
     "GraphQL mutation usage: 0 GraphQL mutations defined or invoked by governed UI code.",
 ]:
-    if forbidden in p031:
-        raise SystemExit(f"proposal-072: P031 still contains stale P031/UI action boundary text: {forbidden}")
+    if forbidden in combined:
+        raise SystemExit(f"proposal-072: stable UI boundary docs contain stale approval-boundary text: {forbidden}")
 
 inventory = Path("docs/reference/p031-thin-ui-inventory.json").read_text()
 for operation in ["P072ApproveApproval", "P072RejectApproval"]:
@@ -4184,7 +4186,7 @@ PY
     log "UI action boundary gate passed"
     ;;
   proposal-031-readiness|p031-readiness)
-    log "Proposal 031 readiness gate: Phase 0d + Phase 3 closeout evidence"
+    log "Thin UI readiness gate: closeout evidence"
     "$0" proposal-031
 
     (
@@ -4238,7 +4240,7 @@ if failures:
     raise SystemExit("proposal-031-readiness failed:\n- " + "\n- ".join(failures))
 PY
     )
-    log "Proposal 031 readiness gate passed"
+    log "Thin UI readiness gate passed"
     ;;
   proposal-044|p044)
     log "Proposal 044 control-plane gate: post-approval + N-phase + end-state"

@@ -40,7 +40,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
 - [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs Home, reports, recovery guidance, comparison, artifact inspection, notifications, **mediation resolution**, backpressure visibility, and host interruption labels
-- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls (P031)
+- [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces

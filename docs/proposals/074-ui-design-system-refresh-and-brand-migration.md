@@ -5,8 +5,8 @@
 | Date | 2026-04-26 |
 | Status | Draft |
 | Author | Engineering + Design-led implementation |
-| Depends on | Proposal 031, Proposal 068, [UI action boundary](../reference/ui-action-boundary.md) |
-| Target State | Native macOS SwiftUI client over GraphQL read projections + MCP control |
+| Depends on | [GraphQL thin UI read contract](../reference/query-projections-and-client-consumption-contract.md), Proposal 068, [UI action boundary](../reference/ui-action-boundary.md) |
+| Target State | Native macOS SwiftUI client over GraphQL read projections, with MCP control kept outside governed UI except where later boundary docs explicitly allow it |
 | Goal | Migrate the Chainworks Forge operator app from the previous visual shell to the new `docs/brand` design system, with Apple HIG-aligned tokens, copy, and surfaces while preserving existing product behaviour and control boundaries. |
 
 ---

@@ -93,7 +93,7 @@ The current MVP provider set is:
 The repository is past the scaffold stage. The implemented system now includes:
 
 - lead-mediated workflow conflict resolution and mandatory lead validation
-- thin GraphQL-only UI rewrite (P031) ensuring all production truth is read from server projections
+- GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections
 - frozen run snapshots, YAML validation, provenance, and deterministic execution truth
 - declarative workflow authority, typed workflow conflicts, and advisory rejection history
 - operator-facing run, approval, report, recovery, and comparison surfaces

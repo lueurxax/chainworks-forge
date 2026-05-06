@@ -669,7 +669,7 @@ Important:
 
 ### `proposal-031|p031`
 
-Proposal 031 thin GraphQL-only UI inventory, static guard, and write-path guide gate.
+Historical gate alias for the implemented thin GraphQL-only UI inventory, static guard, and write-path guide gate.
 
 Scope:
 
@@ -682,7 +682,7 @@ Use when:
 
 - changing the GraphQL-only thin macOS client boundary
 - updating the UI inventory, operator write-path guide, or Phase 0 artifact manifest
-- modifying GraphQL read/subscription authorization boundaries for P031 UI
+- modifying GraphQL read/subscription authorization boundaries for the governed thin UI
 
 Host policy:
 
@@ -699,8 +699,8 @@ Important:
 
 - `p031` is accepted as an alias
 - the gate fails closed if governed Swift/GraphQL files violate the GraphQL-only read boundary plus the approval-only mutation exception, or if required Phase 0 artifacts are missing or invalid
-- later Phase 0d / Phase 3 evidence entries may remain blocked while implementation is in progress, but the manifest must not mark blocked evidence as `ready`
-- dogfood sign-off evidence is outside this gate; this gate only requires the Phase 3 dogfood checklist artifact to exist
+- the manifest must represent the real closeout state and must not mark blocked evidence as `ready`
+- dogfood sign-off details are outside this gate; this gate only requires the evidence artifact contract to be present and internally consistent
 
 ### `proposal-072|p072`
 
@@ -712,13 +712,13 @@ Scope:
 - Swift unit tests for the governed GraphQL request boundary, including `approveApproval` / `rejectApproval`
 - Rust domain/auth tests for the UI action routing registry and principal surface policies
 - Rust GraphQL tests proving `ui_operator` can execute only approval mutations and is denied non-approval command mutations
-- docs/inventory checks proving P031 is reconciled with the approval-only exception
+- docs/inventory checks proving the stable thin UI boundary is reconciled with the approval-only exception
 
 Use when:
 
 - changing governed SwiftUI approval actions
 - changing GraphQL mutation authorization or principal surface policies
-- changing the P031/static UI action boundary or inventory
+- changing the thin UI/static UI action boundary or inventory
 - changing docs that describe whether UI approvals are diagnostic-only or actionable
 
 Host policy:
@@ -741,25 +741,24 @@ Important:
 
 ### `proposal-031-readiness|p031-readiness`
 
-Proposal 031 closeout readiness gate.
+Historical gate alias for thin UI closeout readiness.
 
 Scope:
 
 - composes `proposal-031`
 - verifies release evidence files are tracked, including report-payload runtime JSON and sanitized degraded-state screenshot evidence
-- fails while the Phase 0 manifest, degraded-state evidence, freshness evidence, UX/accessibility evidence, or Phase 3 dogfood sign-off still contain pending/template/limitation states
-- fails while the Phase 3 dogfood checklist has unchecked items
+- fails while the Phase 0 manifest, degraded-state evidence, freshness evidence, UX/accessibility evidence, or dogfood sign-off contain pending/template/limitation states that are not explicitly release-owner deferred
+- fails while the dogfood checklist has unchecked items without an accepted release-owner deferral
 
 Use when:
 
-- deciding whether P031 can be considered implementation-closeout ready
-- re-entering implementation approval after dogfood/sign-off evidence is attached
+- deciding whether the retained thin UI boundary can be considered implementation-closeout ready
+- reproving implementation readiness after dogfood/sign-off evidence or release-owner deferrals are updated
 
 Host policy:
 
 - same as `proposal-031`
 - no live daemon required
-- expected to fail until Phase 3 dogfood and release-owner sign-off are complete
 
 Command:
 
@@ -771,7 +770,7 @@ Important:
 
 - this is intentionally stricter than `proposal-031`
 - `proposal-031` passing means the static/API/read-boundary contract is intact
-- `proposal-031-readiness` passing means P031 release/closeout evidence is no longer known-pending
+- `proposal-031-readiness` passing means the retained thin UI closeout evidence is no longer known-pending
 
 ### `proposal-044`
 

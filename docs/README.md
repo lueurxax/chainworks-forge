@@ -66,7 +66,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/ui-action-boundary.md](reference/ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
-- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls
+- [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Workflow topology and agent-activity surface
@@ -96,7 +96,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 Design intent and work-in-progress lives under [`proposals/`](proposals). When a proposal reaches implemented/ready status, its content is folded into `reference/` and the proposal file is retired.
 
-The durable thin UI boundary has been folded into [`reference/query-projections-and-client-consumption-contract.md`](reference/query-projections-and-client-consumption-contract.md). New macOS UI proposals should depend on that reference contract and the P032/P036 handoff docs rather than treating historical proposal text as the active architecture source.
+The durable thin UI boundary lives in [`reference/query-projections-and-client-consumption-contract.md`](reference/query-projections-and-client-consumption-contract.md). New macOS UI proposals should depend on that reference contract and the UI action boundary, not on retired proposal text.
 
 ## Examples
 

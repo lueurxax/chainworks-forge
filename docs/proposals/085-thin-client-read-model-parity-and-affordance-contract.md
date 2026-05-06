@@ -5,7 +5,7 @@
 | Date | 2026-05-01 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [031-thin-graphql-ui-rewrite.md](031-thin-graphql-ui-rewrite.md), [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [ui-action-boundary.md](../reference/ui-action-boundary.md) |
+| Depends on | [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [ui-action-boundary.md](../reference/ui-action-boundary.md) |
 | Related | P036 UI restoration, P068/P081 boundary matrix, Swift `P031ThinGraphQLReadBoundary.swift`, Swift `RunsHomeView.swift` |
 | Scope | Require every GraphQL field that drives a Swift affordance to define actionable state, disabled reason, fallback text, mutation availability, and preview/readback semantics together. |
 | Goal | Prevent thin-client UI drift where backend read models, actionability, fallback copy, and mutation policy are reviewed in separate passes. |

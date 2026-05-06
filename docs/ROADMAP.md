@@ -7,7 +7,6 @@ replace the reference docs.
 
 - P073 freeze mode.
 - UI action boundary closeout.
-- P031 corrected closeout over the GraphQL thin UI boundary.
 - Provider toolchain cache mapping and P075 persistence-budget infrastructure slice.
 
 ## Next
@@ -19,5 +18,5 @@ replace the reference docs.
 
 ## Backlog
 
-- P032 stabilization, dogfood, release-readiness evidence, degraded drills, and documentation cleanup.
+- P032 productization and honest operator dogfood over the implemented thin UI boundary.
 - P036 visual/navigation polish over the GraphQL read model.
