@@ -10,11 +10,11 @@ Detailed context: [2026-05-06 main roadmap update](roadmap/2026-05-06-main-roadm
 - P073 freeze mode.
 - P084 minimal rollout-gate template.
 - UI action boundary closeout.
-- P066 scoped provider toolchain cache mapping.
 - P075 local persistence write-budget / evidence-spooling infrastructure.
 
 ## Next
 
+- P081 boundary-first API/auth contract matrix.
 - P078 durable side-effect ledger and retry blocking.
 - P082 recovery/retry state-machine test matrix.
 - P076/P080 effect-aware recovery and stale reconciliation.

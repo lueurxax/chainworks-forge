@@ -55,11 +55,11 @@ The durable P031 navigation points are:
 
 This is the correct shape.
 
-#### P066 is now scoped correctly
+#### P066 is already implemented reference truth
 
-P066 is now an implementation-ready R4 proposal.
+P066 is no longer a next implementation candidate. The proposal file has already been retired, while the implemented behavior remains visible through the historical `proposal-066|p066` gate alias, P066-specific tests, and the provider toolchain cache mapping reference.
 
-It clearly owns provider toolchain cache mapping only:
+The implemented scope is provider toolchain cache mapping only:
 
 - Swift/Xcode cache roots,
 - Go cache roots,
@@ -79,7 +79,7 @@ It explicitly does not own:
 - workflow transitions,
 - operator control surfaces.
 
-This is a good correction.
+This is important as context for future work, but it should not be scheduled as a new run.
 
 #### P075 and P078 now address the root durability concern
 
@@ -167,7 +167,7 @@ Run [P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan
 Allowed work:
 
 - boundary cleanup,
-- P066 scoped implementation,
+- provider toolchain cache mapping follow-up only when a regression is found,
 - P075 write budget,
 - P078 side-effect safety,
 - P031 closeout,
@@ -243,30 +243,19 @@ Those remain [P032](../proposals/032-polish-stabilization-and-productization-bac
 
 ### 3.4 Parallel infrastructure slice
 
-#### Step 4 - P066 scoped toolchain cache mapping
+#### Step 4 - P081 boundary-first API/auth matrix
 
-P066 can proceed in parallel with boundary closeout as long as scope remains narrow.
+Do [P081](../proposals/081-boundary-first-api-auth-contract-matrix.md) in parallel with boundary closeout.
 
-Allowed:
+Purpose:
 
-- Swift/Xcode cache mapping,
-- Go cache mapping,
-- `toolchain_cache_policy`,
-- diagnostics,
-- frozen snapshot compatibility,
-- Swift read adapter.
+- create one checked-in caller/transport/action matrix;
+- prove GraphQL approval-only mutation behavior;
+- prove MCP command/control behavior remains external to GraphQL;
+- make approval actionability match backend authorization;
+- prevent future UI/API drift before new write affordances are proposed.
 
-Forbidden:
-
-- side-effect ledger,
-- SQLite write-budget redesign,
-- scheduler language awareness,
-- GraphQL/MCP write surfaces,
-- release settlement logic.
-
-Reference:
-
-- [ACP runtime transport: toolchain cache mapping](../reference/acp-runtime-transport.md#toolchain-cache-mapping)
+This should be a small executable contract and test slice, not a new feature surface.
 
 ### 3.5 Persistence and side-effect safety foundation
 
@@ -442,7 +431,7 @@ The most important progress is:
 
 - UI action boundary is now reference-level truth.
 - P031 is corrected to approval-only mutation stop-state.
-- P066 is correctly scoped and implementation-ready.
+- P066 provider toolchain cache mapping is implemented reference truth, not a next run.
 - P075/P078 now name the real local-control-plane durability problem.
 - P079/P080 are useful but must remain downstream of P075/P078.
 
@@ -454,7 +443,7 @@ The new critical path is:
 P073
 -> P084
 -> P072 closeout
--> P066
+-> P081
 -> P075
 -> P078
 -> P082
@@ -466,4 +455,3 @@ P073
 ```
 
 The system should not expand capabilities again until the write-budget and side-effect safety rails are in place.
-
