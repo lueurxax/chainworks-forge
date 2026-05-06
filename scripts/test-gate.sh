@@ -435,6 +435,10 @@ require_p077_rollout_dependency_evidence() {
     "rollback_trigger_false_blocks"
     "rollback_trigger_closeout_gap_reversal"
     "rollback_action"
+    "p077_rollout_metric_events"
+    "p077_rollout_decisions"
+    "p077_rollout_advisory_migrations"
+    "rollback_execution_fixture"
     "in_flight_policy"
     "neutral_observation_rule"
   )
@@ -454,8 +458,17 @@ require_p077_ui_evidence() {
   local required_patterns=(
     "readiness_state | tone_token | icon | typography | surface | breakpoint_behavior | interaction"
     "contrast_decision"
+    "measured_contrast_ratio"
+    "cardElevated"
+    "compactCapsule"
+    "High Contrast"
+    "Reduce Transparency"
+    "Differentiate Without Color"
     "compactActivationAccessibilityLabel"
     "diagnosticsAccessibilityLabel"
+    "copyFailureFallbackText"
+    "voiceOverAnnouncementPolicy"
+    "keyboardTraversalOrder"
     "recoveryLifecycleText"
     "backlinkRouteLabel"
   )
@@ -5455,6 +5468,7 @@ PLIST
       cd "$ROOT_DIR/control-plane"
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p domain proposal_077_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p db closeout_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p db p077_rollout -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p engine proposal_077_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p graphql-server --test proposal_077_closeout_readback_parity -- --nocapture
       CARGO_TARGET_DIR=target/proposal-077-gate cargo test -p mcp-server --test proposal_077_closeout_readback_parity -- --nocapture

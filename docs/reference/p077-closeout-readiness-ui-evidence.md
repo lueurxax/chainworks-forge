@@ -28,22 +28,33 @@ boundary and preserves the read-only control rule.
 
 ## Contrast Evidence
 
-The P077 card uses `accentColor.opacity(0.12)` as a background tint and
-`accentColor.opacity(0.2)` as a border over the existing macOS control
-background. Primary labels use system foreground color; explanatory text uses
-system secondary foreground color. These are dynamic system colors, so contrast
-is owned by AppKit/SwiftUI semantic color adaptation across light, dark, and
-increased-contrast modes.
+The P077 cardElevated surface uses `accentColor.opacity(0.12)` as a
+background tint and `accentColor.opacity(0.2)` as a border over the macOS
+control background. The compactCapsule surface uses `accentColor.opacity(0.16)`
+with a `0.35` border. Primary labels use system foreground color; supporting
+text uses the same semantic foreground stack and keeps icon/text labels so color
+is not the only state carrier.
 
-Spot-check result for Phase 0 advisory rollout:
+Phase 0 contrast measurement was taken with AppKit semantic colors resolved to
+sRGB for `.aqua`, `.darkAqua`, `.accessibilityHighContrastAqua`, and
+`.accessibilityHighContrastDarkAqua`, compositing the actual tint alpha over
+`NSColor.controlBackgroundColor` and applying WCAG relative luminance. Reduce
+Transparency does not change these non-material tint surfaces; Differentiate
+Without Color is satisfied by the explicit status text and SF Symbol icon in
+the same measured surfaces.
 
-| surface | text_or_signal | color_source | contrast_decision | evidence_status |
-| --- | --- | --- | --- | --- |
-| card title/status | primary foreground over semantic accent tint | SwiftUI primary foreground + accent tint | passes by semantic dynamic color pairing | passed |
-| primary unblock | primary/callout foreground over semantic accent tint | SwiftUI foreground + semantic status accent | passes by semantic dynamic color pairing | passed |
-| secondary blockers | caption foreground over semantic accent tint | SwiftUI foreground + semantic status accent | passes by semantic dynamic color pairing | passed |
-| mode/diagnostic/recovery text | secondary foreground over semantic accent tint | SwiftUI secondary foreground + semantic status accent | acceptable for advisory/supporting text; primary status remains foreground | passed |
-| diagnostics sheet rows | primary foreground over sheet background | SwiftUI primary foreground | passes by platform semantic color pairing | passed |
+| surface | mode | candidate | text_or_signal | measured_contrast_ratio | contrast_decision | evidence_status |
+| --- | --- | --- | --- | --- | --- | --- |
+| cardElevated | standard light | readyWithRisks / amber fallback | primary and supporting text over warning tint | `19.01:1` | passes `4.5:1` text threshold | passed |
+| cardElevated | standard dark | readyWithRisks / amber fallback | primary and supporting text over warning tint | `13.51:1` | passes `4.5:1` text threshold | passed |
+| cardElevated | High Contrast light | readyWithRisks / amber fallback | primary and supporting text over warning tint | `19.01:1` | passes `4.5:1` text threshold | passed |
+| cardElevated | High Contrast dark | readyWithRisks / amber fallback | primary and supporting text over warning tint | `13.51:1` | passes `4.5:1` text threshold | passed |
+| compactCapsule | standard light | readyWithRisks / amber fallback | compact signal text and icon over warning capsule | `18.38:1` | passes `4.5:1` text threshold | passed |
+| compactCapsule | standard dark | readyWithRisks / amber fallback | compact signal text and icon over warning capsule | `12.46:1` | passes `4.5:1` text threshold | passed |
+| compactCapsule | High Contrast light | readyWithRisks / amber fallback | compact signal text and icon over warning capsule | `18.38:1` | passes `4.5:1` text threshold | passed |
+| compactCapsule | High Contrast dark | readyWithRisks / amber fallback | compact signal text and icon over warning capsule | `12.46:1` | passes `4.5:1` text threshold | passed |
+| cardElevated + compactCapsule | Reduce Transparency | readyWithRisks / amber fallback | non-material tint surfaces | minimum measured ratio `12.46:1` | no material/transparency dependency; measured non-material pair passes | passed |
+| cardElevated + compactCapsule | Differentiate Without Color | readyWithRisks / amber fallback | text + SF Symbol + measured warning tint | minimum measured ratio `12.46:1` | color is not sole signal and measured contrast passes | passed |
 
 ## Accessibility and Focus Evidence
 
@@ -56,8 +67,12 @@ Fixture-backed presentation requirements:
 - diagnostics sheet rows: decision, gate, audit, diagnostic reason, fingerprint,
   mode, generation
 - focus return copy: `focusReturnLabel`
+- copy failure fallback: `copyFailureFallbackText`
+- VoiceOver announcement policy: `voiceOverAnnouncementPolicy`
+- keyboard traversal proof order: `keyboardTraversalOrder`
 - recovery lifecycle row: `recoveryLifecycleText`
-- backlink/readback row: `backlinkRouteLabel`
+- backlink/readback row: `backlinkRouteLabel` and
+  `backlinkRouteAccessibilityLabel`
 
 The surface remains read-only. It exposes copy, diagnostics/readback, recovery
 guidance, and route labels, but it does not add local write/control buttons.

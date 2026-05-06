@@ -1010,10 +1010,15 @@ private struct P031RunDetailSummaryCard: View {
             HStack(spacing: 10) {
                 P031FreshnessBadge(snapshot: presentation.freshness)
                 if let closeoutReadiness = presentation.closeoutReadiness {
-                    Label(closeoutReadiness.compactSignalLabel, systemImage: "checkmark.seal")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("p077-closeout-readiness-compact-signal")
+                    P077CompactSignalCapsule(
+                        label: closeoutReadiness.compactSignalLabel,
+                        systemImage: "checkmark.seal",
+                        accentColor: P077CloseoutReadinessChrome.accentColor(
+                            for: closeoutReadiness.visualState
+                        ),
+                        accessibilityLabel: closeoutReadiness.compactActivationAccessibilityLabel,
+                        accessibilityIdentifier: "p077-closeout-readiness-compact-signal"
+                    )
                 }
                 if let errorDescription = presentation.errorDescription {
                     Text(errorDescription)
@@ -1051,10 +1056,13 @@ private struct P077CloseoutReadinessCard: View {
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
-                    Label(presentation.compactSignalLabel, systemImage: statusSymbolName)
-                        .font(.caption.weight(.semibold))
-                        .accessibilityLabel(presentation.compactActivationAccessibilityLabel)
-                        .accessibilityIdentifier("p077-closeout-readiness-compact-signal")
+                    P077CompactSignalCapsule(
+                        label: presentation.compactSignalLabel,
+                        systemImage: statusSymbolName,
+                        accentColor: accentColor,
+                        accessibilityLabel: presentation.compactActivationAccessibilityLabel,
+                        accessibilityIdentifier: "p077-closeout-readiness-compact-signal"
+                    )
                     Spacer()
                 }
 
@@ -1109,6 +1117,7 @@ private struct P077CloseoutReadinessCard: View {
                 Label(presentation.backlinkRouteLabel, systemImage: "arrowshape.turn.up.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .accessibilityLabel(presentation.backlinkRouteAccessibilityLabel)
                     .accessibilityIdentifier("p077-closeout-readiness-backlink-route")
 
                 Label(presentation.modeExplainerText, systemImage: "info.circle")
@@ -1133,14 +1142,8 @@ private struct P077CloseoutReadinessCard: View {
 
     private var accentColor: Color {
         switch presentation.visualState {
-        case .positive:
-            return .green
-        case .warning:
-            return .orange
-        case .blocking:
-            return .red
-        case .neutral:
-            return .secondary
+        case .positive, .warning, .blocking, .neutral:
+            return P077CloseoutReadinessChrome.accentColor(for: presentation.visualState)
         }
     }
 
@@ -1164,9 +1167,53 @@ private struct P077CloseoutReadinessCard: View {
         }
 #if os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(value, forType: .string)
+        let didCopy = NSPasteboard.general.setString(value, forType: .string)
+        copyFeedback = didCopy
+            ? "Copied generation \(presentation.generationDisplayID)"
+            : presentation.copyFailureFallbackText
+        return
 #endif
         copyFeedback = "Copied generation \(presentation.generationDisplayID)"
+    }
+}
+
+private enum P077CloseoutReadinessChrome {
+    static func accentColor(for visualState: P077CloseoutReadinessVisualState) -> Color {
+        switch visualState {
+        case .positive:
+            return .green
+        case .warning:
+            return .orange
+        case .blocking:
+            return .red
+        case .neutral:
+            return .secondary
+        }
+    }
+}
+
+private struct P077CompactSignalCapsule: View {
+    let label: String
+    let systemImage: String
+    let accentColor: Color
+    let accessibilityLabel: String
+    let accessibilityIdentifier: String
+
+    var body: some View {
+        Label(label, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(accentColor.opacity(0.16), in: Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(accentColor.opacity(0.35), lineWidth: 1)
+            )
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityIdentifier(accessibilityIdentifier)
     }
 }
 

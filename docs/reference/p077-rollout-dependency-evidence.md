@@ -36,6 +36,23 @@ go_no_go_action. Empty cohorts do not silently expand.
 | pause_to_action | elapsed business time per paused closeout | paused closeouts | median less than one business day unless release owner waives with reason | operator experience owner | first blocking readiness generation timestamp to acknowledgement, settlement, rerun, or operator decision timestamp | breach requires copy, routing, or ownership fix before expansion |
 | code_writer_loops_avoided | non-code handoff or operator-decision cases that did not invoke `code_writer` | non-code handoff or operator-decision cases | `100%`; any regression blocks expansion | orchestration owner | decision route, blocker classification, and code_writer invocation records | fix routing before enforcement expansion |
 
+## Durable Rollout Execution
+
+Rollout evidence is not only static advisory text. The control-plane database
+now has an executable P077 rollout store:
+
+| storage | purpose | rollback_execution_fixture | evidence_status |
+| --- | --- | --- | --- |
+| `p077_rollout_metric_events` | durable metric rows for `false_ready_prevented`, `post_release_closeout_gap_reversals`, `false_blocks`, `pause_to_action`, and `code_writer_loops_avoided` | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
+| `p077_rollout_decisions` | governed release-owner go/no-go decisions with metric snapshots and optional rollback trigger/action | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
+| `p077_rollout_advisory_migrations` | affected-run migration records for rollback to advisory mode | `cargo test -p db p077_rollout_rollback_to_advisory_updates_runs_and_records_migrations` | passed |
+
+The canonical `proposal-077` gate runs these fixtures through
+`cargo test -p db p077_rollout`. Rollback is transactional: a
+`rollback_to_advisory` decision requires `rollback_trigger`, `rollback_action`,
+and affected run ids, updates each affected `runs.closeout_readiness_mode` to
+`advisory`, and records one migration row per run.
+
 ## Expansion Decision
 
 - `first_cohort`: 10 eligible state-9 closeouts or 10 business days for

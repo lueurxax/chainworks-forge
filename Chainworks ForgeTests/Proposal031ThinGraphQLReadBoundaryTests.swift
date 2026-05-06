@@ -679,6 +679,18 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       #expect(!presentation.diagnosticRows.isEmpty)
       #expect(presentation.recoveryLifecycleText.contains("Recovery"))
       #expect(!presentation.backlinkRouteLabel.isEmpty)
+      #expect(presentation.backlinkRouteAccessibilityLabel.contains(presentation.backlinkRouteLabel))
+      #expect(presentation.copyFailureFallbackText.contains(presentation.generationDisplayID))
+      #expect(presentation.voiceOverAnnouncementPolicy.contains("on demand"))
+      #expect(presentation.keyboardTraversalOrder == [
+        "compact signal",
+        "diagnostics",
+        "copy generation id",
+        "primary unblock",
+        "recovery lifecycle",
+        "readback route",
+        "mode explainer",
+      ])
       #expect(presentation.cardAccessibilityLabel.contains(expectedStatus))
     }
   }

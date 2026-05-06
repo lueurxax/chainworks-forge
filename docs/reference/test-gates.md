@@ -1025,6 +1025,8 @@ Scope (what this gate actually covers):
 - bounded code/refine loop and soft convergence checkpoints (memory-level)
 - closeout fingerprinting and latency budget validation
 - DB closeout transaction atomicity (db integration tests)
+- durable P077 rollout metric, go/no-go decision, and rollback-to-advisory
+  execution fixtures
 - accessor routing proof (in-memory, not against live orchestrator graph)
 - GraphQL readback parity through the canonical closeout-readiness accessor
 - MCP `runs.get`/`runs.list` readback parity through the same accessor and
@@ -1033,7 +1035,7 @@ Scope (what this gate actually covers):
 NOT covered by this gate (require additional integration gates or manual evidence):
 
 - integrated orchestrator transition guard against live SQLite (state_9 real run)
-- macOS UI/accessibility surfaces and VoiceOver fixtures
+- remote macOS UI/VoiceOver runtime proof
 - Swift workspace tests
 
 Use when:
@@ -1059,7 +1061,8 @@ Important:
   parity of Proposal 077; full R14 acceptance still requires additional
   integrated transition and macOS fixture evidence
 - it fails fast when the P077 rollout/dependency evidence document is missing
-  required dependency checklist, metric ledger, or rollback fields
+  required dependency checklist, metric ledger, durable rollout store, or
+  rollback fields
 - it fails fast when the P077 UI evidence document is missing token, contrast,
   diagnostics, recovery, route, or accessibility mappings
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers

@@ -12,6 +12,7 @@ pub mod ideas;
 pub mod lead_conflict_mediations;
 pub mod lead_mediation_confirmations;
 pub mod legacy_discovery_overrides;
+pub mod p077_rollout;
 pub mod projections;
 pub mod retry_operator_instructions;
 pub mod routing_receipts;

@@ -2,9 +2,11 @@ use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -154,6 +156,7 @@ const PROPOSAL_GATE_EXECUTOR_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const PROPOSAL_GATE_EXECUTOR_MAX_TIMEOUT_MS: u64 = 600_000;
 const PROPOSAL_GATE_EXECUTOR_POLL_MS: u64 = 25;
 const PROPOSAL_GATE_EXECUTOR_TIMEOUT_EXIT_CODE: i32 = 124;
+const PROPOSAL_GATE_EXECUTOR_CAPTURE_BUFFER_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +183,8 @@ struct ManagedProposalGateProcessResult {
     exit_code: i32,
     timed_out: bool,
     elapsed_ms: u64,
+    stdout_digest: String,
+    stderr_digest: String,
 }
 
 fn build_proposal_gate_result_from_settlement(
@@ -256,8 +261,8 @@ fn execute_managed_proposal_gate_receipt(
     let child = ProcessCommand::new(&gate_script)
         .arg("proposal-077")
         .current_dir(execution_root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| {
             format!(
@@ -277,8 +282,8 @@ fn execute_managed_proposal_gate_receipt(
     } else {
         "failed"
     };
-    let stdout_digest = sha256_digest(&[]);
-    let stderr_digest = sha256_digest(&[]);
+    let stdout_digest = process_result.stdout_digest.clone();
+    let stderr_digest = process_result.stderr_digest.clone();
     let evidence_digest = proposal_gate_executor_evidence_digest(
         c,
         gate_id,
@@ -349,25 +354,61 @@ fn wait_for_managed_proposal_gate(
     timeout: Duration,
     started: Instant,
 ) -> Result<ManagedProposalGateProcessResult> {
-    loop {
+    let stdout_reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("managed proposal gate stdout pipe unavailable"))?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("managed proposal gate stderr pipe unavailable"))?;
+    let stdout_handle = spawn_digest_reader(stdout_reader);
+    let stderr_handle = spawn_digest_reader(stderr_reader);
+
+    let (exit_code, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(ManagedProposalGateProcessResult {
-                exit_code: status.code().unwrap_or(1),
-                timed_out: false,
-                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            });
+            break (status.code().unwrap_or(1), false);
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(ManagedProposalGateProcessResult {
-                exit_code: PROPOSAL_GATE_EXECUTOR_TIMEOUT_EXIT_CODE,
-                timed_out: true,
-                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            });
+            break (PROPOSAL_GATE_EXECUTOR_TIMEOUT_EXIT_CODE, true);
         }
         std::thread::sleep(Duration::from_millis(PROPOSAL_GATE_EXECUTOR_POLL_MS));
-    }
+    };
+
+    let stdout_digest = stdout_handle
+        .join()
+        .map_err(|_| anyhow!("managed proposal gate stdout digest thread panicked"))??;
+    let stderr_digest = stderr_handle
+        .join()
+        .map_err(|_| anyhow!("managed proposal gate stderr digest thread panicked"))??;
+
+    Ok(ManagedProposalGateProcessResult {
+        exit_code,
+        timed_out,
+        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        stdout_digest,
+        stderr_digest,
+    })
+}
+
+fn spawn_digest_reader<R>(mut reader: R) -> thread::JoinHandle<Result<String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; PROPOSAL_GATE_EXECUTOR_CAPTURE_BUFFER_SIZE];
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    })
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -4795,10 +4836,44 @@ reviewer_override:
         assert_eq!(receipt.executor_version, PROPOSAL_GATE_EXECUTOR_VERSION);
         assert_eq!(receipt.status, "passed");
         assert_eq!(receipt.exit_code, 0);
-        assert!(receipt.stdout_digest.starts_with("sha256:"));
-        assert!(receipt.stderr_digest.starts_with("sha256:"));
+        assert_eq!(receipt.stdout_digest, sha256_digest(b"proposal-077-ok\n"));
+        assert_eq!(receipt.stderr_digest, sha256_digest(b""));
         assert!(receipt.evidence_digest.starts_with("sha256:"));
         assert_eq!(receipt.current_fingerprint, "sha256:fingerprint-current");
+    }
+
+    #[test]
+    fn p077_execute_gate_output_digests_follow_actual_stdout_and_stderr() {
+        let run_with_output = |stdout: &str, stderr: &str| {
+            let temp = tempfile::tempdir().unwrap();
+            let scripts = temp.path().join("scripts");
+            std::fs::create_dir_all(&scripts).unwrap();
+            let gate = scripts.join("test-gate.sh");
+            std::fs::write(
+                &gate,
+                format!(
+                    "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s' '{}'\nprintf '%s' '{}' >&2\n",
+                    stdout, stderr
+                ),
+            )
+            .unwrap();
+            make_executable(&gate);
+
+            let cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
+            let raw = execute_managed_proposal_gate_receipt(&cmd, "p077:077", temp.path())
+                .expect("managed executor should produce receipt");
+            serde_json::from_str::<ProposalGateReceiptV1>(&raw).unwrap()
+        };
+
+        let first = run_with_output("stdout-a", "stderr-a");
+        let second = run_with_output("stdout-b", "stderr-b");
+
+        assert_eq!(first.stdout_digest, sha256_digest(b"stdout-a"));
+        assert_eq!(first.stderr_digest, sha256_digest(b"stderr-a"));
+        assert_eq!(second.stdout_digest, sha256_digest(b"stdout-b"));
+        assert_eq!(second.stderr_digest, sha256_digest(b"stderr-b"));
+        assert_ne!(first.stdout_digest, second.stdout_digest);
+        assert_ne!(first.stderr_digest, second.stderr_digest);
     }
 
     #[test]
@@ -4821,6 +4896,8 @@ reviewer_override:
 
         assert_eq!(receipt.status, "failed");
         assert_eq!(receipt.exit_code, 17);
+        assert_eq!(receipt.stdout_digest, sha256_digest(b""));
+        assert_eq!(receipt.stderr_digest, sha256_digest(b"p077-failed\n"));
         assert_eq!(
             receipt.failure_classification.as_deref(),
             Some("code_owned_budget_remaining")

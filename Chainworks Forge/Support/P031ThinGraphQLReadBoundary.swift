@@ -3690,7 +3690,11 @@ struct P077CloseoutReadinessPresentation: Equatable, Sendable {
   let diagnosticRows: [String]
   let recoveryLifecycleText: String
   let backlinkRouteLabel: String
+  let backlinkRouteAccessibilityLabel: String
   let focusReturnLabel: String
+  let copyFailureFallbackText: String
+  let voiceOverAnnouncementPolicy: String
+  let keyboardTraversalOrder: [String]
   let generationDisplayID: String
   let generationCopyValue: String?
   let generationCopyAccessibilityLabel: String
@@ -3781,7 +3785,22 @@ enum P077CloseoutReadinessPresenter {
     let diagnosticRows = diagnostics(for: state, summary: summary, generationText: generationText)
     let recoveryLifecycleText = recoveryLifecycle(for: state, summary: summary)
     let backlinkRouteLabel = backlinkRoute(for: state, summary: summary)
+    let backlinkRouteAccessibilityLabel =
+      "Closeout readiness readback route: \(backlinkRouteLabel)"
     let focusReturnLabel = "Returns focus to Closeout Readiness after copy or diagnostics dismissal."
+    let copyFailureFallbackText =
+      "Copy failed. Generation \(summary.generationDisplayID) remains visible in diagnostics."
+    let voiceOverAnnouncementPolicy =
+      "No automatic repeating announcements; VoiceOver reads compact signal, card summary, and diagnostics on demand."
+    let keyboardTraversalOrder = [
+      "compact signal",
+      "diagnostics",
+      "copy generation id",
+      "primary unblock",
+      "recovery lifecycle",
+      "readback route",
+      "mode explainer",
+    ]
     let compactSignalLabel = "Closeout: \(statusLabel)"
     let cardAccessibilityParts = [
       "Closeout readiness",
@@ -3803,7 +3822,11 @@ enum P077CloseoutReadinessPresenter {
       diagnosticRows: diagnosticRows,
       recoveryLifecycleText: recoveryLifecycleText,
       backlinkRouteLabel: backlinkRouteLabel,
+      backlinkRouteAccessibilityLabel: backlinkRouteAccessibilityLabel,
       focusReturnLabel: focusReturnLabel,
+      copyFailureFallbackText: copyFailureFallbackText,
+      voiceOverAnnouncementPolicy: voiceOverAnnouncementPolicy,
+      keyboardTraversalOrder: keyboardTraversalOrder,
       generationDisplayID: summary.generationDisplayID,
       generationCopyValue: generationCopyValue,
       generationCopyAccessibilityLabel: generationCopyValue == nil
