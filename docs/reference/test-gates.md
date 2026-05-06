@@ -1015,6 +1015,8 @@ Bounded implementation closeout readiness gate — Phase-1 Rust slice.
 
 Scope (what this gate actually covers):
 
+- static presence and required-field checks for
+  `docs/reference/p077-rollout-dependency-evidence.md`
 - `implementation_closeout_readiness_v1` decision-matrix validation (Rust domain/db/engine)
 - proposal gate domain contracts and status normalization
 - audit verdict policy enforcement (synthesizer unit tests)
@@ -1050,6 +1052,8 @@ Command:
 Important:
 
 - this gate covers the Phase-1 Rust domain/db/engine slice of Proposal 077; full R14 acceptance requires additional integrated transition, GraphQL/MCP parity, and macOS fixture coverage
+- it fails fast when the P077 rollout/dependency evidence document is missing
+  required dependency checklist, metric ledger, or rollback fields
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
 - it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
 

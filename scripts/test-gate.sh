@@ -18,6 +18,8 @@ UNSIGNED_BUILD_ARGS=(
   CODE_SIGN_IDENTITY=
 )
 
+P077_ROLLOUT_EVIDENCE_PATH="docs/reference/p077-rollout-dependency-evidence.md"
+
 FAST_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
   "Chainworks ForgeTests/OrchestratorTests"
@@ -416,6 +418,33 @@ PROPOSAL_042_TESTS=(
   "graphql-server missing_inbound_request_id_still_produces_and_persists_a_fresh_uuid"
   "graphql-server request_id_propagates_through_graphql_and_mcp_and_journal"
 )
+
+require_p077_rollout_dependency_evidence() {
+  local evidence_file="$ROOT_DIR/$P077_ROLLOUT_EVIDENCE_PATH"
+  [[ -f "$evidence_file" ]] || die "Missing P077 rollout/dependency evidence: $P077_ROLLOUT_EVIDENCE_PATH"
+
+  local required_patterns=(
+    "dependency | owner | pass_rule | proof | fallback | waiver_authority | evidence_status"
+    "metric | numerator | denominator | threshold | owner | source | go_no_go_action"
+    "false_ready_prevented"
+    "post_release_closeout_gap_reversals"
+    "false_blocks"
+    "pause_to_action"
+    "code_writer_loops_avoided"
+    "rollback_trigger_false_blocks"
+    "rollback_trigger_closeout_gap_reversal"
+    "rollback_action"
+    "in_flight_policy"
+    "neutral_observation_rule"
+  )
+
+  local pattern
+  for pattern in "${required_patterns[@]}"; do
+    if ! grep -Fq "$pattern" "$evidence_file"; then
+      die "P077 rollout/dependency evidence is missing required field: $pattern"
+    fi
+  done
+}
 
 PROPOSAL_054_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal025Tests/implementationSelfAssessmentAdapterDerivesBlockedVerificationStatus()"
@@ -5399,6 +5428,7 @@ PLIST
     # NOT covered: integrated orchestrator transition guard against live SQLite,
     # GraphQL/MCP readback parity, macOS UI/accessibility surfaces.
     # See docs/reference/test-gates.md for narrowed coverage statement.
+    require_p077_rollout_dependency_evidence
     log "Proposal 077 Phase-1 closeout readiness gate (Rust domain/db/engine)"
     (
       cd "$ROOT_DIR/control-plane"

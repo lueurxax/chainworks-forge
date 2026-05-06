@@ -521,6 +521,11 @@ Introduce one bounded, SQLite-backed closeout-readiness authority before manual 
 
 ### Metric Ledger
 
+Durable rollout and dependency evidence lives in
+`docs/reference/p077-rollout-dependency-evidence.md`. That reference records the
+checkable dependency checklist fields, metric ledger fields, expansion decision,
+and rollback rule used by the P077 gate.
+
 #### Item 1
 - **Denominator:** eligible closeouts
 - **Go No Go Action:** continue advisory, limited enforcement, extend cohort, or hold with written rationale
