@@ -1705,6 +1705,17 @@ fn is_reused_live_session_transport_error(message: &str) -> bool {
         || lower.contains("session closed during active prompt")
 }
 
+fn should_keep_invocation_session_alive(policy_session_present: bool) -> bool {
+    policy_session_present
+}
+
+fn should_reuse_existing_invocation_session(
+    policy_should_reuse_live_session: bool,
+    xcode_shim_required: bool,
+) -> bool {
+    policy_should_reuse_live_session && !xcode_shim_required
+}
+
 fn is_active_prompt_closed_transport_error(message: &str) -> bool {
     message
         .to_ascii_lowercase()
@@ -3763,12 +3774,16 @@ impl BackgroundExecutor {
                     worktree_strategy,
                     expected_output_paths,
                     expected_outputs: expected_outputs.clone(),
-                    keep_session_alive: policy_decision.is_some() && !xcode_shim_required,
-                    reuse_existing_session: policy_decision
-                        .as_ref()
-                        .map(|decision| decision.should_reuse_live_session)
-                        .unwrap_or(false)
-                        && !xcode_shim_required,
+                    keep_session_alive: should_keep_invocation_session_alive(
+                        policy_decision.is_some(),
+                    ),
+                    reuse_existing_session: should_reuse_existing_invocation_session(
+                        policy_decision
+                            .as_ref()
+                            .map(|decision| decision.should_reuse_live_session)
+                            .unwrap_or(false),
+                        xcode_shim_required,
+                    ),
                     session_generation_id: policy_decision
                         .as_ref()
                         .map(|decision| decision.generation.id.clone()),
@@ -7156,6 +7171,18 @@ mod tests {
         ));
         assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
         assert!(prompt.contains("Do not redo unrelated implementation work"));
+    }
+
+    #[test]
+    fn output_contract_repair_keeps_xcode_shim_session_alive_without_cross_invocation_reuse() {
+        assert!(
+            should_keep_invocation_session_alive(true),
+            "output contract repair needs the just-finished session even when Xcode shim was used"
+        );
+        assert!(
+            !should_reuse_existing_invocation_session(true, true),
+            "Xcode shim sessions remain isolated across separate invocation claims"
+        );
     }
 
     #[test]
