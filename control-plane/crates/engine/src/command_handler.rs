@@ -1051,8 +1051,9 @@ fn find_source_invoke_work_item<'a>(
         .max_by_key(|item| item.created_at)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct TargetedRetryProviderFallback {
+    reason: &'static str,
     from_backend_profile_id: Option<String>,
     from_provider: String,
     backend_profile_id: String,
@@ -1060,6 +1061,59 @@ struct TargetedRetryProviderFallback {
     model: Option<String>,
     effort: Option<String>,
     max_turns: Option<i64>,
+    temperature: Option<f64>,
+}
+
+fn targeted_retry_catalog_profile_override(
+    run: &Run,
+    agent_id: &str,
+    retry_payload: &serde_json::Value,
+) -> Option<TargetedRetryProviderFallback> {
+    let catalog: serde_json::Value =
+        serde_json::from_str(run.catalog_snapshot_json.as_deref()?).ok()?;
+    let current_backend_profile_id = catalog
+        .get("agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| agent.get("id").and_then(serde_json::Value::as_str) == Some(agent_id))?
+        .get("backend_profile")?
+        .as_str()?;
+    let from_backend_profile_id = retry_payload
+        .get("backend_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    if from_backend_profile_id.as_deref() == Some(current_backend_profile_id) {
+        return None;
+    }
+
+    let profile = catalog
+        .get("backend_profiles")?
+        .get(current_backend_profile_id)?
+        .as_object()?;
+    let provider = profile.get("provider")?.as_str()?.to_string();
+    Some(TargetedRetryProviderFallback {
+        reason: "current_catalog_binding_changed",
+        from_backend_profile_id,
+        from_provider: retry_payload
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        backend_profile_id: current_backend_profile_id.to_string(),
+        provider,
+        model: profile
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        effort: profile
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+        temperature: profile
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64),
+    })
 }
 
 fn targeted_retry_provider_fallback(
@@ -1164,6 +1218,7 @@ fn targeted_retry_provider_fallback(
     }
 
     Some(TargetedRetryProviderFallback {
+        reason: "source_provider_failed_without_required_output",
         from_backend_profile_id: retry_payload
             .get("backend_profile_id")
             .and_then(serde_json::Value::as_str)
@@ -1180,6 +1235,9 @@ fn targeted_retry_provider_fallback(
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
         max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+        temperature: profile
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64),
     })
 }
 
@@ -4135,12 +4193,16 @@ impl CommandHandler {
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
                 .await?;
-        let provider_fallback = targeted_retry_provider_fallback(
-            &run,
-            &target_exec.agent_id,
-            &retry_payload,
-            runtime_facts.as_ref(),
-        );
+        let provider_fallback =
+            targeted_retry_catalog_profile_override(&run, &target_exec.agent_id, &retry_payload)
+                .or_else(|| {
+                    targeted_retry_provider_fallback(
+                        &run,
+                        &target_exec.agent_id,
+                        &retry_payload,
+                        runtime_facts.as_ref(),
+                    )
+                });
         let next_attempt_number = matching_stages
             .iter()
             .map(|s| s.attempt_number)
@@ -4206,6 +4268,9 @@ impl CommandHandler {
                 if let Some(max_turns) = fallback.max_turns {
                     object.insert("max_turns".into(), serde_json::json!(max_turns));
                 }
+                if let Some(temperature) = fallback.temperature {
+                    object.insert("temperature".into(), serde_json::json!(temperature));
+                }
                 if let Some(targeted_retry) = object
                     .get_mut("targeted_retry")
                     .and_then(serde_json::Value::as_object_mut)
@@ -4213,7 +4278,7 @@ impl CommandHandler {
                     targeted_retry.insert(
                         "provider_fallback".into(),
                         serde_json::json!({
-                            "reason": "source_provider_failed_without_required_output",
+                            "reason": fallback.reason,
                             "from_backend_profile_id": fallback.from_backend_profile_id,
                             "from_provider": fallback.from_provider,
                             "to_backend_profile_id": fallback.backend_profile_id,

@@ -1986,7 +1986,8 @@ impl Orchestrator {
             name: "approved_proposal".to_string(),
             contract_id: "approved_proposal".to_string(),
             format: ArtifactFormat::Markdown,
-            file_path: target_path.to_string_lossy().into_owned(),
+            file_path: Self::workspace_relative_artifact_path(&target_path, &run.workspace_root)
+                .unwrap_or_else(|| target_path.to_string_lossy().into_owned()),
             checksum_sha256: Some(format!("{digest:x}")),
             size_bytes: Some(data.len() as i64),
             provider: "engine".to_string(),
@@ -2008,6 +2009,18 @@ impl Orchestrator {
         } else {
             std::path::Path::new(workspace_root).join(path)
         }
+    }
+
+    fn workspace_relative_artifact_path(
+        path: &std::path::Path,
+        workspace_root: &str,
+    ) -> Option<String> {
+        if !path.is_absolute() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        let workspace_root = std::path::Path::new(workspace_root);
+        let relative = path.strip_prefix(workspace_root).ok()?;
+        Some(relative.to_string_lossy().into_owned())
     }
 
     async fn persist_implementation_handoff_unavailable_conflict(
@@ -6514,6 +6527,12 @@ fn build_task_prompt(
              object using the canonical path keys below; the engine will \
              materialize canonical files after contract validation.",
         ));
+        parts.push(String::from(
+            "Tool stdout is not an output channel. Only the final assistant \
+             message is settled for `CHAINWORKS_OUTPUT`. Do not call shell \
+             `echo`, `printf`, or file-writing commands to return \
+             `CHAINWORKS_OUTPUT`.",
+        ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
             parts.push(format!("- `{output_name}` → `{normalized}`"));
@@ -6558,6 +6577,10 @@ fn build_task_prompt(
              top-level JSON object and nothing else.\n\
              - When returning outputs through `CHAINWORKS_OUTPUT`, the value \
                for each canonical path is treated as that output file content.\n\
+             - Tool stdout is not an output channel; only the final assistant \
+               message is settled.\n\
+             - Do not call shell `echo`, `printf`, or file-writing commands \
+               to return `CHAINWORKS_OUTPUT`.\n\
              - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
              - Do NOT emit markdown, prose, or companion files unless they \
                are explicitly listed as required outputs.\n\
@@ -7057,6 +7080,21 @@ mod tests {
         CompiledLoop, CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
         OutputSchema, ResolvedAgent, RunPlan,
     };
+
+    #[test]
+    fn approved_proposal_snapshot_path_is_workspace_relative() {
+        let stored = Orchestrator::workspace_relative_artifact_path(
+            std::path::Path::new(
+                "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md",
+            ),
+            "/workspace",
+        );
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(".chainworks/runs/run-1/proposals/approved/proposal.md")
+        );
+    }
 
     fn test_run(run_id: RunId) -> Run {
         Run {
@@ -7846,6 +7884,9 @@ mod tests {
             prompt.contains("Return each required output through the final `CHAINWORKS_OUTPUT`")
         );
         assert!(prompt.contains("the engine will materialize canonical files"));
+        assert!(prompt.contains("Tool stdout is not an output channel"));
+        assert!(prompt.contains("Only the final assistant message is settled"));
+        assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains("Do not write run artifact outputs directly"));
         assert!(prompt.contains("implementation_complete"));
         assert!(prompt.contains("remaining_code_tasks"));

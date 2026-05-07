@@ -4932,6 +4932,7 @@ impl BackgroundExecutor {
                     declared_output_settlement
                         .as_ref()
                         .map(|settlement| settlement.decisions.as_slice()),
+                    &run.workspace_root,
                     run_id,
                     &stage_id,
                     &agent_id,
@@ -5706,6 +5707,7 @@ impl BackgroundExecutor {
         &self,
         declared_outputs: &[DeclaredOutput],
         discovery_decisions: Option<&[OutputDiscoveryDecision]>,
+        workspace_root: &str,
         run_id: RunId,
         stage_id: &str,
         agent_id: &str,
@@ -5737,6 +5739,7 @@ impl BackgroundExecutor {
                     provider,
                     model.clone(),
                     None,
+                    workspace_root,
                     created_at,
                 )? {
                     persisted_paths.insert(declared.target_path.clone());
@@ -5765,6 +5768,7 @@ impl BackgroundExecutor {
                         provider,
                         model.clone(),
                         None,
+                        workspace_root,
                         created_at,
                     )? {
                         persisted_paths.insert(companion_path.to_string());
@@ -6462,6 +6466,7 @@ impl BackgroundExecutor {
         provider: &str,
         model: Option<String>,
         report_kind: Option<&str>,
+        workspace_root: &str,
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<domain::artifact::Artifact>> {
         let artifact_path = std::path::Path::new(path);
@@ -6477,7 +6482,7 @@ impl BackgroundExecutor {
             name: name.to_string(),
             contract_id: contract_id.to_string(),
             format,
-            file_path: path.to_string(),
+            file_path: stored_artifact_file_path(name, path, workspace_root),
             checksum_sha256: None,
             size_bytes,
             provider: provider.to_string(),
@@ -6917,6 +6922,23 @@ fn release_artifact_path(artifact_root: &str, name: &str) -> String {
         .into_owned()
 }
 
+fn stored_artifact_file_path(name: &str, path: &str, workspace_root: &str) -> String {
+    if name != "approved_proposal" {
+        return path.to_string();
+    }
+    workspace_relative_artifact_file_path(path, workspace_root).unwrap_or_else(|| path.to_string())
+}
+
+fn workspace_relative_artifact_file_path(path: &str, workspace_root: &str) -> Option<String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    let workspace_root = Path::new(workspace_root);
+    let relative = path.strip_prefix(workspace_root).ok()?;
+    Some(relative.to_string_lossy().into_owned())
+}
+
 /// Copy artifacts from artifact_root to canonical workspace paths from the YAML
 /// artifacts map. Scans artifact_root (and artifact_root/run_id/) for files whose
 /// names match a known artifact name, then copies to the workspace-relative path.
@@ -7036,7 +7058,10 @@ fn prompt_with_runtime_invocation_contract(
          unless they are explicitly accepted by the current output contract. Return a fresh \
          `CHAINWORKS_OUTPUT` object for this invocation, using the exact canonical paths above as \
          keys. You must not finish this turn without `CHAINWORKS_OUTPUT` when required outputs are \
-         listed.\n",
+         listed.\n\
+         Tool stdout is not an output channel. Only the final assistant message is settled for \
+         `CHAINWORKS_OUTPUT`. Do not call shell `echo`, `printf`, or file-writing commands to \
+         return `CHAINWORKS_OUTPUT`.\n",
     );
     append_chainworks_output_contract_example(&mut prompt, input.declared_outputs);
     append_docs_noop_contract_guidance(&mut prompt, input.declared_outputs);
@@ -7248,7 +7273,9 @@ fn output_contract_repair_prompt(
          the immediately preceding turn and do only the minimal synthesis needed to populate these \
          outputs. Do not redo unrelated implementation work. Return only corrected \
          `CHAINWORKS_OUTPUT` payloads for the outputs listed below. Do not include Markdown, \
-         explanations, or extra text. Do not wrap the JSON in code fences.\n",
+         explanations, or extra text. Do not wrap the JSON in code fences. Tool stdout is not an \
+         output channel. Only the final assistant message is settled. Do not call shell `echo`, \
+         `printf`, or file-writing commands to return `CHAINWORKS_OUTPUT`.\n",
     );
     if let Some(summary) = validation.failure_summary.as_deref() {
         prompt.push_str(&format!("- Validation failure: {summary}\n"));
@@ -7361,6 +7388,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn approved_proposal_artifact_path_is_stored_workspace_relative() {
+        let stored = stored_artifact_file_path(
+            "approved_proposal",
+            "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md",
+            "/workspace",
+        );
+
+        assert_eq!(
+            stored,
+            ".chainworks/runs/run-1/proposals/approved/proposal.md"
+        );
+    }
+
+    #[test]
+    fn non_approved_proposal_artifact_path_storage_is_unchanged() {
+        let stored = stored_artifact_file_path(
+            "run_state",
+            "/workspace/.chainworks/runs/run-1/run-state.json",
+            "/workspace",
+        );
+
+        assert_eq!(stored, "/workspace/.chainworks/runs/run-1/run-state.json");
+    }
+
+    #[test]
     fn runtime_invocation_contract_makes_reused_turn_self_contained() {
         let run_id = RunId::new();
         let stage_execution_id = domain::ids::StageExecutionId::new();
@@ -7398,6 +7450,9 @@ mod tests {
         assert!(prompt.contains("stale"));
         assert!(prompt.contains("CHAINWORKS_OUTPUT"));
         assert!(prompt.contains("must not finish this turn without"));
+        assert!(prompt.contains("Tool stdout is not an output channel"));
+        assert!(prompt.contains("Only the final assistant message is settled"));
+        assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains(
             "\"/workspace/.chainworks/runs/run-1/proposals/current.md\":\"<proposal_current content>\""
         ));
@@ -7537,6 +7592,9 @@ mod tests {
         assert!(prompt.contains("Do not redo unrelated implementation work"));
         assert!(prompt.contains("Do not include Markdown"));
         assert!(prompt.contains("Do not wrap the JSON in code fences"));
+        assert!(prompt.contains("Tool stdout is not an output channel"));
+        assert!(prompt.contains("Only the final assistant message is settled"));
+        assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains("Use the context from the immediately preceding turn"));
         assert!(prompt.contains("minimal synthesis needed to populate these outputs"));
     }

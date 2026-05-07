@@ -70,7 +70,11 @@ impl AcpAdapter for GeminiCliAdapter {
             "Spawning Gemini ACP subprocess"
         );
 
-        Ok(AcpLaunchSpec::new(&self.binary_path).with_arg("--acp"))
+        let mut launch_spec = AcpLaunchSpec::new(&self.binary_path);
+        for arg in gemini_args_for_request(req) {
+            launch_spec = launch_spec.with_arg(arg);
+        }
+        Ok(launch_spec)
     }
 
     fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
@@ -165,6 +169,27 @@ mod tests {
         assert_eq!(
             args[2],
             "/workspace/.chainworks/runs/9318de0d-9c75-40ad-9d0a-74c3610b021d"
+        );
+    }
+
+    #[test]
+    fn launch_spec_includes_run_meta_root_as_workspace_directory() {
+        let adapter = GeminiCliAdapter::new_with_binary("/bin/gemini");
+        let req = request_with_meta_root(
+            "/workspace",
+            Some(".chainworks/runs/9318de0d-9c75-40ad-9d0a-74c3610b021d"),
+        );
+        let mut resources = crate::adapters::LaunchResourceGuard::default();
+
+        let spec = adapter.prepare_launch_spec(&req, &mut resources).unwrap();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                "--acp".to_string(),
+                "--include-directories".to_string(),
+                "/workspace/.chainworks/runs/9318de0d-9c75-40ad-9d0a-74c3610b021d".to_string(),
+            ]
         );
     }
 

@@ -3,7 +3,8 @@
 Proposal authors declare rollout intent **before implementation starts**. This template
 defines the three v1 contracts, required fields, enum domains, fixture paths, and
 security/path/authorization guidance. The `lint-rollout-contract` validator enforces
-the contract shape; the `proposal-084|p084` test gate proves all checks pass.
+the contract shape; the retained historical alias `proposal-084|p084` gate proves
+all checks pass.
 
 ## When to fill this in
 
@@ -211,7 +212,7 @@ surface authors declare and are not used as scheduling authority.
   },
   "retry_count": 0,
   "projection_integrity": "valid",
-  "cutover_policy_revision": "p084-cutover-v1",
+  "cutover_policy_revision": "rollout-cutover-v1",
   "redaction_state": "none"
 }
 ```
@@ -285,7 +286,7 @@ operator decision inputs; the 18 fields above are the canonical decision surface
   "operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
   "source_lane": "run_report",
   "projection_integrity": "valid",
-  "cutover_policy_revision": "p084-cutover-v1",
+  "cutover_policy_revision": "rollout-cutover-v1",
   "diagnostic_redaction": "none",
   "next_steps": ["continue_implementation_scheduling"]
 }
@@ -297,9 +298,8 @@ operator decision inputs; the 18 fields above are the canonical decision surface
 across every lane. The fixture **must** include a `parity_lanes` object whose
 `run_report`, `mcp`, and `release_receipt` payloads carry the canonical snake_case
 fields and whose `graphql` payload carries the matching camelCase projection. The
-`proposal-084|p084` gate validates parity-lane shape; the canonical fixture for P084
-itself lives at
-`docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json`.
+retained historical alias `proposal-084|p084` gate validates parity-lane shape. The
+retained historical alias fixture lives at `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json`.
 
 The Swift app decodes operator readback into a read-only `RolloutDecisionSummary`
 projection: `PreflightReportView` consumes the snake_case payload from run reports,
@@ -315,7 +315,7 @@ effective cutover timestamp and enforcement mode transition:
 
 ```json
 "cutover_policy": {
-  "revision": "p084-cutover-v1",
+  "revision": "rollout-cutover-v1",
   "enforcement_mode_at_cutover": "enforce",
   "applicable_to": "post_cutover_implementation_starts",
   "grandfathered_rendering": "not_applicable",
@@ -381,19 +381,20 @@ Run the pure validator:
 ./scripts/lint-rollout-contract <path-to-rollout-contract.json>
 ```
 
-Run the full P084 gate (checks template, fixtures, linter, self-contract):
+Run the full retained historical alias gate (checks template, fixtures, linter,
+self-contract):
 
 ```bash
-./scripts/test-gate.sh proposal-084
-./scripts/test-gate.sh p084
+./scripts/test-gate.sh proposal-084 # retained historical alias
+./scripts/test-gate.sh p084 # retained historical alias
 ```
 
-The gate is registered in `docs/reference/test-gates.md` under `proposal-084|p084`.
+The gate is registered in `docs/reference/test-gates.md` under retained historical alias `proposal-084|p084`.
 
 ---
 
-## P084 Self-Contract
+## Retained Historical Alias Self-Contract
 
-P084 uses `p084_self_contract` as the inline rollout contract field in the proposal JSON.
-The full operator decision surface fixture is at
-`docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json`.
+The retained historical alias self-contract uses `p084_self_contract` as the inline
+rollout contract field in historical proof JSON. The full operator decision surface
+is retained in the retained historical alias fixture `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json`.

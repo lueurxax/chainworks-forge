@@ -2766,6 +2766,132 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
 }
 
 #[tokio::test]
+async fn test_targeted_retry_uses_current_catalog_binding_when_agent_profile_changed() {
+    let pool = test_pool().await;
+    let run_id = RunId::new();
+    let idea_id = IdeaId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("review".into());
+    run.catalog_snapshot_json = Some(
+        serde_json::json!({
+            "agents": [
+                {
+                    "id": "lead_orchestrator",
+                    "backend_profile": "gemini_reasoning_pro_high"
+                }
+            ],
+            "backend_profiles": {
+                "junie_orchestrator_acp": {
+                    "provider": "junie",
+                    "model": "junie-default",
+                    "effort": "medium",
+                    "max_turns": 16
+                },
+                "gemini_reasoning_pro_high": {
+                    "provider": "gemini_acp",
+                    "model": "gemini-2.5-pro",
+                    "effort": "high",
+                    "max_turns": 16,
+                    "temperature": 0.1
+                }
+            }
+        })
+        .to_string(),
+    );
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "review".into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut failed_lead = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_lead.agent_id = "lead_orchestrator".into();
+    failed_lead.provider = "junie".into();
+    failed_lead.model = Some("junie-default".into());
+    failed_lead.completed_at = Some(Utc::now());
+    let failed_lead_id = failed_lead.id;
+    agent_executions::insert(&pool, &failed_lead).await.unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: format!("p058-invoke:{old_stage_exec_id}:0"),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "review",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "agent_id": "lead_orchestrator",
+                "provider": "junie",
+                "backend_profile_id": "junie_orchestrator_acp",
+                "model": "junie-default",
+                "effort": "medium",
+                "max_turns": 16,
+                "task_outputs": ["proposal_review_summary"],
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_lead_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("review".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "review".into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: Some(failed_lead_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let retry_invokes: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == db::work_item::WorkItemKind::InvokeAgent
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(retry_invokes.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+    assert_eq!(
+        payload["backend_profile_id"],
+        serde_json::json!("gemini_reasoning_pro_high")
+    );
+    assert_eq!(payload["provider"], serde_json::json!("gemini_acp"));
+    assert_eq!(payload["model"], serde_json::json!("gemini-2.5-pro"));
+    assert_eq!(payload["effort"], serde_json::json!("high"));
+    assert_eq!(payload["temperature"], serde_json::json!(0.1));
+    assert_eq!(
+        payload.pointer("/targeted_retry/provider_fallback/reason"),
+        Some(&serde_json::json!("current_catalog_binding_changed"))
+    );
+}
+
+#[tokio::test]
 async fn test_targeted_retry_falls_back_from_gemini_docs_guardian_backend() {
     let pool = test_pool().await;
 

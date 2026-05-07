@@ -1850,7 +1850,7 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
-### `proposal-084|p084`
+### `proposal-084|p084` retained historical alias
 
 Executable rollout gates and observability contract gate.
 
@@ -1865,14 +1865,14 @@ Scope:
   - `docs/evidence/rollout-contract/negative/unsafe-path-and-command.json` — fails `unsafe_command` and `unsafe_path`
 - Documentation-only negative fixtures exist as valid JSON where they describe runtime behavior rather than linter input (AC-006 self-contract check)
 - Rust rollout-contract regressions run under the canonical gate: `cargo test -p engine rollout_contract_preflight --lib`, `cargo test -p db rollout_contract_checks --lib`, clean DB migration install, and schema-version parity. The Python phase also verifies the orchestrator keeps the rollout preflight hold path before code_writer enqueue and blocks the stage/run on `RolloutContractPreflightAction::Hold` (AC-005)
-- `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields and a `parity_lanes` object whose `mcp` and `release_receipt` payloads carry the same fields and whose `graphql` payload carries the matching camelCase projection fields (AC-004, AC-006)
+- The retained historical alias fixture `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields and a `parity_lanes` object whose `mcp` and `release_receipt` payloads carry the same fields and whose `graphql` payload carries the matching camelCase projection fields (AC-004, AC-006)
 - `Chainworks ForgeTests/Proposal084Tests` runs as the Swift parity slice, proving `RolloutDecisionSummary` decodes `operator_readback_v1`, `PreflightReport` carries the read-only summary, and the GraphQL run-row read model decodes the camelCase rollout readback without recomputing authority (AC-004, AC-006)
 - This gate documentation section exists in `docs/reference/test-gates.md` and references `rollout_contract_v1`, `negative fixture`, and `lint-rollout-contract` (AC-002)
 
 Use when:
 
 - Changing the rollout gate template, linter logic, or fixture inventory
-- Proving P084 contract compliance on the current tree
+- Proving rollout-contract compliance on the current tree
 - Verifying that unsafe inputs, missing metrics, and missing hold/rollback are rejected with bounded reasons
 
 Host policy:
@@ -1883,14 +1883,14 @@ Host policy:
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-084
-./scripts/test-gate.sh p084
+./scripts/test-gate.sh proposal-084 # retained historical alias
+./scripts/test-gate.sh p084 # retained historical alias
 ```
 
 Important:
 
-- `p084` is accepted as an alias
+- `p084` is accepted as a retained historical alias
 - the gate runs `scripts/lint-rollout-contract` via subprocess; linter exit-0 on a negative fixture is a gate failure
 - documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
 - the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
-- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the p084-full-surface fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
+- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
