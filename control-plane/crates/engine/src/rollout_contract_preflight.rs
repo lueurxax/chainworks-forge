@@ -2926,6 +2926,21 @@ fn projection_mismatches(
 }
 
 fn rollout_contract_check_projection_path(run: &Run) -> std::path::PathBuf {
+    if let Some(meta_root) = run
+        .chainworks_meta_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        let meta_root = std::path::Path::new(meta_root);
+        let root = if meta_root.is_absolute() {
+            meta_root.to_path_buf()
+        } else {
+            std::path::Path::new(&run.workspace_root).join(meta_root)
+        };
+        return root.join("readiness").join("rollout-contract-check.json");
+    }
+
     std::path::Path::new(&run.artifact_root)
         .join("readiness")
         .join("rollout-contract-check.json")
@@ -3437,6 +3452,36 @@ mod tests {
         assert!(!should_retry_preflight_error(&anyhow::anyhow!(
             "invalid_rollout_contract_sidecar: rollout_contract_sidecar must be a string"
         )));
+    }
+
+    #[test]
+    fn rollout_contract_projection_path_uses_per_run_meta_root_when_available() {
+        let mut run = test_run();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{}", run.id));
+
+        let path = rollout_contract_check_projection_path(&run);
+
+        assert_eq!(
+            path,
+            std::path::Path::new(&run.workspace_root)
+                .join(run.chainworks_meta_root.as_deref().unwrap())
+                .join("readiness")
+                .join("rollout-contract-check.json")
+        );
+    }
+
+    #[test]
+    fn rollout_contract_projection_path_preserves_legacy_artifact_root_fallback() {
+        let run = test_run();
+
+        let path = rollout_contract_check_projection_path(&run);
+
+        assert_eq!(
+            path,
+            std::path::Path::new(&run.artifact_root)
+                .join("readiness")
+                .join("rollout-contract-check.json")
+        );
     }
 
     #[tokio::test]
