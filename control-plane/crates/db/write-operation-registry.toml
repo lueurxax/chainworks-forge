@@ -26,6 +26,20 @@ idempotency_key_kind = "(run_id, relative_path) — UNIQUE index enforced at SQL
 duplicate_application_test_path = "crates/db/src/repos/evidence_spool_refs.rs::tests::insert_idempotent_same_checksum"
 
 [[operations]]
+operation_name = "p075_evidence_spool_ref_insert_idempotent"
+class = "C"
+replay_policy = "checksum_idempotent"
+idempotency_key_kind = "(run_id, relative_path) — duplicate insert returns existing result when checksum and size match"
+duplicate_application_test_path = "crates/db/src/repos/evidence_spool_refs.rs::tests::insert_idempotent_same_checksum"
+
+[[operations]]
+operation_name = "p075_evidence_spool_ref_update_status"
+class = "C"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "evidence_spool_ref.id"
+duplicate_application_test_path = "crates/db/src/repos/evidence_spool_refs.rs::tests::update_status_changes_value"
+
+[[operations]]
 operation_name = "p075_evidence_spool_ref_recovery_sweep"
 class = "C"
 replay_policy = "checksum_idempotent"

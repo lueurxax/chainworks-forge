@@ -1,0 +1,22 @@
+{
+  "schema_version": "operator_readback_v1",
+  "status": "pass",
+  "backend_decision": "release",
+  "failure_reasons": [],
+  "waiver_state": "none",
+  "waiver_expires_at": null,
+  "enforcement_mode": "enforce",
+  "hold_conditions": [],
+  "rollback_disposition": {
+    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+    "data_loss_risk": "none"
+  },
+  "enabled_state": "enabled",
+  "disabled_reason_code": null,
+  "action_id": "example-action-uuid-00000001",
+  "operator_message": null,
+  "source_lane": "run_report",
+  "projection_integrity": "valid",
+  "diagnostic_redaction": "none",
+  "next_steps": []
+}

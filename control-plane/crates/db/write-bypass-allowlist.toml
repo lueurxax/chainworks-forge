@@ -74,12 +74,12 @@ expires_after_phase = 8
 [[bypasses]]
 id = "bypass-006"
 owner = "db::repos::evidence_spool_refs"
-reason = "Evidence spool metadata writes are Class C targets; DbWriter routing wired in Phase 2."
+reason = "Evidence spool metadata writes are Class C targets. Phase 2 wired the DbWriter executor scaffold and Class C lane, but full Class C routing requires the evidence file spool module (temp write, checksum, fsync, atomic rename) which is Phase 3 scope. Phase 2 re-scoped: routing deferred to Phase 3."
 scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/evidence_spool_refs.rs"
-allowed_context = "Phase 1 and Phase 2 before DbWriter Class C routing lands."
-retirement_criteria = "insert, insert_tx, insert_idempotent, and update_status in evidence_spool_refs.rs all route through DbWriter. Verify by absence of pool.begin() or execute(&pool) write calls outside #[cfg(test)] in this file."
-expires_after_phase = 2
+allowed_context = "Phase 1 through Phase 3 before DbWriter Class C routing and evidence file spool module land together."
+retirement_criteria = "insert, insert_tx, insert_idempotent, and update_status in evidence_spool_refs.rs all route through DbWriter Class C lane (EvidenceMetadata). Evidence file spool module is implemented. Verify by absence of pool.begin() or execute(&pool) write calls outside #[cfg(test)] in this file."
+expires_after_phase = 3
 
 # ---------------------------------------------------------------------------
 # Phase 3 retirements (Class A canonical transitions, Class B projection writes):
@@ -267,6 +267,20 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/system_executions.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in system_executions.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
+expires_after_phase = 4
+
+# ---------------------------------------------------------------------------
+# Phase 4 retirements (continued): P077 rollout writes
+# ---------------------------------------------------------------------------
+
+[[bypasses]]
+id = "bypass-034"
+owner = "db::repos::p077_rollout"
+reason = "P077 rollout record writes bypass DbWriter; tracked here to satisfy gate audit requirement."
+scope = "temporary_rollout"
+path_pattern = "crates/db/src/repos/p077_rollout.rs"
+allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
+retirement_criteria = "All write functions in p077_rollout.rs route through DbWriter. Verify by absence of pool.begin() or execute(&pool) write calls outside #[cfg(test)]."
 expires_after_phase = 4
 
 # ---------------------------------------------------------------------------

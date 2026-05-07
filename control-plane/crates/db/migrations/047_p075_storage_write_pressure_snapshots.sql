@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS storage_write_pressure_snapshots (
   window_start TEXT NOT NULL,
   window_end   TEXT NOT NULL,
   payload_json TEXT NOT NULL,
-  created_at   TEXT NOT NULL
+  created_at   TEXT NOT NULL,
+  CHECK(length(payload_json) <= 65536)
 );
 
 CREATE INDEX IF NOT EXISTS idx_storage_write_pressure_window_start

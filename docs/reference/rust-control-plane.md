@@ -360,7 +360,7 @@ work rather than by adding external infrastructure:
 
 ### SQLite write serialization and gateway (DbWriter)
 
-> **Phase 1 implemented (Phases 2–8 deferred):** The DbWriter type, write classification types (WriteClass, WriteLane, WriteOperation, WriteResult), priority lane constants, write-bypass allowlist, and operation registry are implemented. The bounded MPSC executor, admission control, coalescing, heartbeat, and storageHealth monitoring are deferred to Phases 2–6. The description below reflects the intended design; behaviors marked with † are not yet active.
+> **Phases 1–2 implemented (Phases 3–8 deferred):** Phase 1 landed the DbWriter type, write classification types (`WriteClass`, `WriteLane`, `WriteOperation`, `WriteResult`), priority lane constants, write-bypass allowlist, and operation registry. Phase 2 wires the real bounded MPSC executor: per-lane channels at the documented capacities, priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes via biased `tokio::select!`), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, and graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS` followed by a Class B sub-budget flush. The Class B coalescing buffer, evidence file spool module, orphan sweep, telemetry rollup persistence, and `storageHealth` GraphQL/MCP diagnostics are still deferred to Phases 3–6. Behaviors not yet active are called out inline.
 
 The engine enforces a single-writer model for all domain mutations through a dedicated
 write coordination layer, the `DbWriter` (Proposal 075):
@@ -373,6 +373,9 @@ write coordination layer, the `DbWriter` (Proposal 075):
     - **Class D (Telemetry rollup)**: Aggregated in-memory summary; droppable under pressure.
 - **Priority Lanes**: Six bounded lanes (CriticalBarrier, OperatorCommand, ProjectionInvalidation, CoalescedProjection, EvidenceMetadata, TelemetryRollup) ensure that critical transitions are not starved by noisy background work.
 - **Shutdown Protocol**: Orderly drain of Class A lanes with specific budgets (e.g., `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`) before termination.
+- **Class A Deadline Override**: `WriteOperation.deadline` defaults to the per-class default (Class A: 2 s) and is hard-capped at `MAX_CLASS_A_DEADLINE` (5 s). Callers requesting a longer Class A deadline must set `WriteOperation.deadline_reason` to a static justification string; unannotated long deadlines are rejected with `WriteRejected{reason="deadline_exceeds_policy"}`. Per proposal 075 §architecture.deadlines_and_results.caller_override.
+- **Idempotency Key Discipline**: `WriteOperation.idempotency_key` rejects NUL and ASCII control characters at validation time (`WriteRejected{reason="idempotency_key_invalid"}`). DbWriter logs emit only an 8-byte SHA-256 fingerprint (`idempotency_key_hash`), never the raw key, so producer-derived path or run identifiers cannot leak into structured logs.
+- **Fail-Closed Admission Validation**: `WriteOperation::validate()` rejects misclassified writes before admission with explicit `WriteRejected` reasons: `class_lane_incompatible` (lane does not accept the declared class), `class_a_barrier_required` (Class A write missing `barrier=true`), and `replay_policy_class_mismatch` (replay policy not permitted for the declared class — e.g. Class A requires `NaturalKey` or `CallerGuarded`, Class B requires `LastWriterWins`, Class C requires `ChecksumIdempotent`, Class D requires `TelemetryMerge`). This prevents a misclassified telemetry or coalesced write from being admitted into a barrier lane.
 - **Transaction Scope**: Multi-row invariants run in a single transaction under
   `BEGIN IMMEDIATE` with bounded retry (P061 primitive).
 - **Atomic Supersession**: Operations like `RetryStage` atomically supersede old
@@ -394,7 +397,10 @@ write coordination layer, the `DbWriter` (Proposal 075):
 High-volume runtime evidence is spooled to the local filesystem instead of being inserted row-by-row into SQLite (Proposal 075):
 
 - **Metadata Pointers**: SQLite stores compact metadata (path, checksum, size, kind, owner) in the `evidence_spool_refs` table.
-- **Path Containment**: `relative_path` is enforced both in Rust (`validate_relative_path`) and at SQL level (migration `041_p075_evidence_path_constraints.sql`): no absolute paths, no `..`/`.` traversal segments, no backslash separators, no empty segments, length capped at 2048 bytes; identity fields (run/stage/agent ids) capped at 512 bytes; checksum capped at 256 bytes.
+- **Path Containment**: `relative_path` is enforced both in Rust (`validate_relative_path`) and at SQL level (migration `048_p075_evidence_path_constraints.sql`): no absolute paths, no `..`/`.` traversal segments, no backslash separators, no empty segments, length capped at 2048 bytes; identity fields (run/stage/agent ids) capped at 512 bytes; checksum capped at 256 bytes. The same path validation is applied symmetrically on reads (`find_by_run_and_path`) so a backslash-spelled path cannot be silently coerced to a forward-slash equivalent on lookup.
+- **Metadata String Hardening**: All producer-supplied identity and label strings (`id`, `run_id`, `stage_execution_id`, `stage_id`, `agent_execution_id`, `agent_id`, `content_type`) reject NUL and ASCII control characters before insertion. `checksum_algorithm = sha256` requires exactly 64 lowercase hex digits. `producer_operation` must be a registry-style ASCII token (letters, digits, `_`, `.`, `-`). Conflict errors emit only `run_id` length and a 12-character checksum prefix, never the raw value.
+- **`summary_json` Compact-Fact Allowlist**: Per proposal §evidence_spool_ref_contract.summary_json, only a closed set of bounded scalar fields is accepted: `line_count`, `chunk_count`, `byte_count` (non-negative integer), `truncated` (boolean), `started_at`/`finished_at`/`first_timestamp`/`last_timestamp` (string ≤ 64 chars), and `producer_label`/`producer` (string ≤ 256 chars). Nested objects, arrays, unknown keys, oversized strings, and negative counts are rejected. Validation errors never echo raw producer-supplied keys or values — only key length and a fixed field-category token — so transcript fragments or log-injection payloads cannot reach diagnostics output.
+- **`summary_json` Canonicalization**: The persisted form is the re-serialized output of the parsed JSON object (`canonicalize_summary_json`), not the raw producer string. This neutralizes duplicate-key smuggling — a payload like `{"line_count":1,"line_count":"<raw transcript>"}` would otherwise round-trip its second value through SQLite even though `serde_json::Map` parsing keeps only the last key. Both `insert_tx` and `insert_idempotent` bind the canonical form.
 - **Filesystem First**: The evidence file must be written, checksummed, and fsynced to disk **before** the Class C metadata write is enqueued to `DbWriter`.
 - **Artifact Integration**: Spooled evidence is integrated into the settlement pipeline and exposed via the `Artifact` domain model.
 - **Categories**: Transcripts, tool-traces, stdout/stderr snippets, and raw runtime events are primary candidates for spooling.
@@ -411,9 +417,9 @@ The system enforces the single-writer model through a strict repository boundary
 
 The system explicitly manages the SQLite Write-Ahead Log (WAL) to prevent unbound growth:
 
-- **PASSIVE Checkpoint**: Requested when WAL exceeds `WARN_WAL_SIZE_BYTES` (128 MiB) and no Class A write is waiting.
-- **HARD Upper Bound**: A barrier-coordinated brief checkpoint window is opened when WAL exceeds `HARD_WAL_UPPER_BOUND_BYTES` (1 GiB).
-- **Shutdown Checkpoint**: A TRUNCATE checkpoint is performed on graceful shutdown after the Class A drain.
+- **PASSIVE Checkpoint**: Requested by a low-priority maintenance task when WAL exceeds `WARN_WAL_SIZE_BYTES` (128 MiB) and no Class A write is waiting.
+- **CRITICAL Threshold**: `CRITICAL_WAL_SIZE_BYTES` (512 MiB) drives the `storageHealth.wal` warn/critical bands. The approved P075 policy authorises only PASSIVE above 128 MiB and TRUNCATE on shutdown or explicit maintenance — no hard barrier-coordinated upper bound is wired.
+- **Shutdown Checkpoint**: A TRUNCATE checkpoint is performed on graceful shutdown after the Class A drain, or via an explicit maintenance command.
 
 ### Provider runtime homes and toolchain caches
 
@@ -457,7 +463,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `039_p075_evidence_spool_refs.sql`, `040_p075_storage_write_pressure_snapshots.sql`, `041_p075_evidence_path_constraints.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`):
 
 | Table | Purpose |
 |---|---|

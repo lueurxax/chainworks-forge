@@ -105,19 +105,22 @@ impl OperationRegistry {
             }
         }
 
-        Ok(Self { entries: file.operations })
+        Ok(Self {
+            entries: file.operations,
+        })
     }
 
     /// Load and parse from a file path.
     pub fn load_file(path: &std::path::Path) -> Result<Self, OperationRegistryError> {
-        let content =
-            std::fs::read_to_string(path).map_err(OperationRegistryError::Io)?;
+        let content = std::fs::read_to_string(path).map_err(OperationRegistryError::Io)?;
         Self::parse(&content)
     }
 
     /// Find an entry by operation name.
     pub fn find(&self, operation_name: &str) -> Option<&OperationEntry> {
-        self.entries.iter().find(|e| e.operation_name == operation_name)
+        self.entries
+            .iter()
+            .find(|e| e.operation_name == operation_name)
     }
 
     /// Returns true if the given operation name is registered.
@@ -216,7 +219,11 @@ duplicate_application_test_path = ""
     #[test]
     fn unregistered_returns_unknown_names() {
         let reg = OperationRegistry::parse(VALID_TOML).unwrap();
-        let observed = ["canonical_stage_transition", "unknown_op", "another_unknown"];
+        let observed = [
+            "canonical_stage_transition",
+            "unknown_op",
+            "another_unknown",
+        ];
         let unknown = reg.unregistered(&observed);
         assert_eq!(unknown.len(), 2);
         assert!(unknown.contains(&"unknown_op"));
@@ -234,7 +241,10 @@ idempotency_key_kind = "some key"
 duplicate_application_test_path = ""
 "#;
         let result = OperationRegistry::parse(bad);
-        assert!(matches!(result, Err(OperationRegistryError::InvalidClass { .. })));
+        assert!(matches!(
+            result,
+            Err(OperationRegistryError::InvalidClass { .. })
+        ));
     }
 
     #[test]
@@ -293,15 +303,22 @@ duplicate_application_test_path = "crates/engine/tests/no_double_apply.rs"
 
     #[test]
     fn canonical_registry_file_parses() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("write-operation-registry.toml");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("write-operation-registry.toml");
         if path.exists() {
-            let reg = OperationRegistry::load_file(&path)
-                .expect("canonical registry should parse");
+            let reg = OperationRegistry::load_file(&path).expect("canonical registry should parse");
             // All entries in the canonical file must be valid.
             for entry in &reg.entries {
-                assert!(entry.is_complete(), "entry {:?} is incomplete", entry.operation_name);
-                assert!(entry.has_valid_class(), "entry {:?} has invalid class", entry.operation_name);
+                assert!(
+                    entry.is_complete(),
+                    "entry {:?} is incomplete",
+                    entry.operation_name
+                );
+                assert!(
+                    entry.has_valid_class(),
+                    "entry {:?} has invalid class",
+                    entry.operation_name
+                );
                 assert!(
                     entry.has_valid_replay_policy(),
                     "entry {:?} has invalid replay_policy",

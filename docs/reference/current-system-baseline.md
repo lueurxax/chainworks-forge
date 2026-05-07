@@ -26,7 +26,7 @@ At the current baseline, the product includes:
 - GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections,
 - lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
-- DbWriter scaffold and evidence spool metadata schema (P075 Phase 1; runtime routing, file spooling, and storageHealth diagnostics deferred to Phases 2–8),
+- DbWriter bounded MPSC executor with priority lanes, deadlines, busy-retry classification, heartbeat, lane-starvation watchdog, graceful shutdown drain, and evidence spool metadata schema (P075 Phases 1–2; Class B coalescing buffer, evidence file spool, orphan sweep, telemetry rollup, and storageHealth diagnostics deferred to Phases 3–8),
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,

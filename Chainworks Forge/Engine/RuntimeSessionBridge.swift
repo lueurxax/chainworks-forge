@@ -626,6 +626,7 @@ final class RuntimeSessionBridge: Sendable {
             parts.append("### Task-Specific Guidance")
             parts.append("The dedicated worktree has already been provisioned by the engine. Do not spend your turn re-provisioning or narrating setup steps.")
             parts.append("Freeze `proposal_current` into `approved_proposal` and treat it as the frozen implementation source of truth.")
+            parts.append("Do not fabricate or emit `approved_proposal` for an applicable proposal unless `proposal_current` already contains a valid strict `rollout_contract_v1`. If it is missing or invalid, surface that proposal refinement is required.")
             parts.append("Use `proposal_review_summary` as the implementation gate verdict and planning context.")
             parts.append("Treat `run_state` as persisted workflow context, not unquestionable authority. If it contains stale stage identifiers or outdated next-step truth, correct it to match the current workflow before returning it.")
             parts.append("Return `implementation_plan`, `implementation_backlog`, and `run_state` together with `approved_proposal` in the final response envelope.")

@@ -1,0 +1,22 @@
+{
+  "fixture_type": "gate_check_documentation",
+  "acceptance_criterion": "ac-001",
+  "check": "template_file_exists_and_contains_required_sections",
+  "expected_failure": "missing_rollout_template",
+  "checked_path": "docs/reference/executable-rollout-gate-template.md",
+  "gate_command": "./scripts/test-gate.sh proposal-084",
+  "required_template_sections": [
+    "rollout_contract_v1",
+    "rollout_contract_check_v1",
+    "operator_readback_v1",
+    "schema_version",
+    "applicability",
+    "gate_aliases",
+    "hold_conditions",
+    "rollback_disposition",
+    "metrics",
+    "cutover",
+    "safe path"
+  ],
+  "description": "The proposal-084 gate fails if docs/reference/executable-rollout-gate-template.md is absent or lacks valid examples for rollout_contract_v1, rollout_contract_check_v1, operator_readback_v1, cutover placeholders, and security/path/authorization guidance. This file documents the gate-level check behavior; it is not a direct linter input."
+}

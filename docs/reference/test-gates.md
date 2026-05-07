@@ -1860,15 +1860,15 @@ Important:
 
 ### `proposal-075|p075`
 
-Proposal 075 Phase 1 local persistence write budget scaffold gate.
+Proposal 075 Phases 1–2 local persistence write budget gate.
 
 Scope:
 
 - `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
-- `writer`: `DbWriter` constants, lane order, phase-1 stub (`submit` returns `WriteRejected{reason: "phase_1_unimplemented"}` so accidental production callers fail loudly until Phase 2 routing lands)
+- `writer`: `DbWriter` constants, lane order, and Phase 2 bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, and graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`. Phase 3+ behaviors (Class B coalescing buffer, evidence file spool, orphan sweep, telemetry rollup persistence, `storageHealth` diagnostics) remain deferred.
 - `bypass_allowlist`: parser, expiry, canonical file validation
 - `operation_registry`: parser, validation, canonical file validation
-- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints
+- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints, `validate_relative_path` symmetry on read/write, `canonicalize_summary_json` allowlist, identity-string control-character rejection
 - `storage_write_pressure_snapshots` migration and validation
 - fails closed if `write-bypass-allowlist.toml` or `write-operation-registry.toml` are missing or invalid
 

@@ -1825,6 +1825,27 @@ impl Orchestrator {
                 return Ok(None);
             };
             let source_path = Self::absolute_artifact_path(&source.file_path, &run.workspace_root);
+            let source_data = std::fs::read(&source_path).with_context(|| {
+                format!(
+                    "read proposal_current before approved_proposal snapshot {}",
+                    source_path.display()
+                )
+            })?;
+            let rollout_contract_failures =
+                crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
+                    &source_data,
+                    &source_path,
+                    &run.workspace_root,
+                )?;
+            if !rollout_contract_failures.is_empty() {
+                warn!(
+                    run_id = %run.id,
+                    stage_id = %stage.stage_id,
+                    failure_reasons = ?rollout_contract_failures,
+                    "approved_proposal snapshot blocked by rollout_contract_v1 invariant"
+                );
+                return Ok(None);
+            }
             if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!(
@@ -1833,10 +1854,9 @@ impl Orchestrator {
                     )
                 })?;
             }
-            std::fs::copy(&source_path, &target_path).with_context(|| {
+            std::fs::write(&target_path, &source_data).with_context(|| {
                 format!(
-                    "snapshot proposal_current {} to approved_proposal {}",
-                    source_path.display(),
+                    "write approved_proposal handoff artifact {}",
                     target_path.display()
                 )
             })?;
@@ -1848,6 +1868,21 @@ impl Orchestrator {
                 target_path.display()
             )
         })?;
+        let rollout_contract_failures =
+            crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
+                &data,
+                &target_path,
+                &run.workspace_root,
+            )?;
+        if !rollout_contract_failures.is_empty() {
+            warn!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                failure_reasons = ?rollout_contract_failures,
+                "approved_proposal artifact registration blocked by rollout_contract_v1 invariant"
+            );
+            return Ok(None);
+        }
         let digest = Sha256::digest(&data);
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -1857,7 +1892,8 @@ impl Orchestrator {
             name: "approved_proposal".to_string(),
             contract_id: "approved_proposal".to_string(),
             format: ArtifactFormat::Markdown,
-            file_path: target_path.to_string_lossy().into_owned(),
+            file_path: Self::workspace_relative_artifact_path(&target_path, &run.workspace_root)
+                .unwrap_or_else(|| target_path.to_string_lossy().into_owned()),
             checksum_sha256: Some(format!("{digest:x}")),
             size_bytes: Some(data.len() as i64),
             provider: "engine".to_string(),
@@ -1879,6 +1915,18 @@ impl Orchestrator {
         } else {
             std::path::Path::new(workspace_root).join(path)
         }
+    }
+
+    fn workspace_relative_artifact_path(
+        path: &std::path::Path,
+        workspace_root: &str,
+    ) -> Option<String> {
+        if !path.is_absolute() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        let workspace_root = std::path::Path::new(workspace_root);
+        let relative = path.strip_prefix(workspace_root).ok()?;
+        Some(relative.to_string_lossy().into_owned())
     }
 
     async fn persist_implementation_handoff_unavailable_conflict(
@@ -6700,6 +6748,11 @@ fn append_task_specific_guidance(
         parts.push(String::from(
             "Freeze `proposal_current` into `approved_proposal` and treat it as \
              the frozen implementation source of truth.",
+        ));
+        parts.push(String::from(
+            "Do not fabricate or emit `approved_proposal` for an applicable proposal \
+             unless `proposal_current` already contains a valid strict `rollout_contract_v1`. \
+             If it is missing or invalid, surface that proposal refinement is required.",
         ));
         parts.push(String::from(
             "Use `proposal_review_summary` as the implementation gate verdict \

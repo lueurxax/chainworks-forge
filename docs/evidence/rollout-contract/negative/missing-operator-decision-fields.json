@@ -1,0 +1,15 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": ["proposal-example"],
+  "metrics": {
+    "adoption_metric": "example_feature_adoption_percent"
+  },
+  "readback_lanes": ["run_report"],
+  "readback_fields": [],
+  "hold_conditions": [],
+  "rollback_disposition": {
+    "mode": "feature_flag_disable",
+    "data_loss_risk": "none"
+  }
+}

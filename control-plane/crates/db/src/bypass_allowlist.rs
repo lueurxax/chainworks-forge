@@ -76,13 +76,14 @@ impl BypassAllowlist {
             }
         }
 
-        Ok(Self { entries: file.bypasses })
+        Ok(Self {
+            entries: file.bypasses,
+        })
     }
 
     /// Load and parse from a file path.
     pub fn load_file(path: &std::path::Path) -> Result<Self, BypassAllowlistError> {
-        let content =
-            std::fs::read_to_string(path).map_err(BypassAllowlistError::Io)?;
+        let content = std::fs::read_to_string(path).map_err(BypassAllowlistError::Io)?;
         Self::parse(&content)
     }
 
@@ -170,7 +171,7 @@ expires_after_phase = 3
         let list = BypassAllowlist::parse(VALID_TOML).unwrap();
         let rollout = list.find_by_id("bypass-002").unwrap();
         assert!(!rollout.is_expired_at_phase(3)); // at phase 3: not yet expired
-        assert!(rollout.is_expired_at_phase(4));  // phase 4 > expires_after_phase=3
+        assert!(rollout.is_expired_at_phase(4)); // phase 4 > expires_after_phase=3
     }
 
     #[test]
@@ -218,11 +219,14 @@ expires_after_phase = 8
 
     #[test]
     fn canonical_allowlist_file_parses() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("write-bypass-allowlist.toml");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("write-bypass-allowlist.toml");
         if path.exists() {
             let list = BypassAllowlist::load_file(&path).expect("canonical allowlist should parse");
-            assert!(!list.entries.is_empty(), "canonical allowlist should have at least one entry");
+            assert!(
+                !list.entries.is_empty(),
+                "canonical allowlist should have at least one entry"
+            );
             // No entry should be incomplete.
             assert!(
                 list.incomplete_entries().is_empty(),
