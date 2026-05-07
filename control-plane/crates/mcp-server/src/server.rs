@@ -98,6 +98,26 @@ async fn rollout_contract_readback_json(
     )
 }
 
+async fn rollout_contract_readback_lanes_json(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> anyhow::Result<(serde_json::Value, serde_json::Value)> {
+    Ok(
+        match rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+            pool,
+            run_id.inner(),
+        )
+        .await?
+        {
+            Some(check) => (
+                check.operator_readback_json_for_lane("mcp"),
+                check.operator_readback_json_for_lane("run_report"),
+            ),
+            None => (serde_json::Value::Null, serde_json::Value::Null),
+        },
+    )
+}
+
 impl McpServer {
     pub fn new(
         pool: SqlitePool,
@@ -500,10 +520,18 @@ impl McpServer {
             let artifact_rows = projections::list_artifacts_projection(&self.pool, run_id).await?;
             let run_artifacts =
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
+            let (mcp_rollout_readback, run_report_rollout_readback) =
+                rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?;
             let mut artifact_payloads = Vec::with_capacity(run_artifacts.len());
             for artifact in &run_artifacts {
-                artifact_payloads
-                    .push(tools::reports::artifact_report_json(&self.pool, artifact).await?);
+                artifact_payloads.push(
+                    tools::reports::artifact_report_json(
+                        &self.pool,
+                        artifact,
+                        Some(&run_report_rollout_readback),
+                    )
+                    .await?,
+                );
             }
             let closeout_readiness_summary =
                 tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?;
@@ -524,7 +552,7 @@ impl McpServer {
                 .await?,
                 "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
-                "rollout_contract_readback": rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
+                "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
                 "closeout_readiness_summary": closeout_readiness_summary,
                 "artifact_index": artifact_rows,

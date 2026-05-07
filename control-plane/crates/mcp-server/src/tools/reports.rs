@@ -61,10 +61,14 @@ pub async fn execute(
                 .parse()?;
 
             let all_artifacts = artifacts::list_by_run(pool, run_id).await?;
+            let rollout_contract_readback = rollout_contract_readback_json(pool, run_id).await?;
             let mut reports = Vec::new();
             for artifact in all_artifacts.into_iter() {
                 if artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name) {
-                    reports.push(artifact_report_json(pool, &artifact).await?);
+                    reports.push(
+                        artifact_report_json(pool, &artifact, Some(&rollout_contract_readback))
+                            .await?,
+                    );
                 }
             }
             let closeout_readiness_summary = closeout_readiness_summary_json(pool, run_id).await?;
@@ -94,7 +98,7 @@ pub async fn execute(
                 "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
-                "rollout_contract_readback": rollout_contract_readback_json(pool, run_id).await?,
+                "rollout_contract_readback": rollout_contract_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
                 "closeout_readiness_summary": closeout_readiness_summary,
             }));
@@ -757,6 +761,7 @@ pub(crate) fn public_artifact_path(path: &str) -> String {
 pub(crate) async fn artifact_report_json(
     pool: &SqlitePool,
     artifact: &Artifact,
+    rollout_contract_readback: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(artifact)?;
     let include_rollout_readback =
@@ -764,10 +769,11 @@ pub(crate) async fn artifact_report_json(
 
     if include_rollout_readback {
         if let serde_json::Value::Object(ref mut map) = value {
-            map.insert(
-                "rollout_contract_readback".to_string(),
-                rollout_contract_readback_json(pool, artifact.run_id).await?,
-            );
+            let readback = match rollout_contract_readback {
+                Some(readback) => readback.clone(),
+                None => rollout_contract_readback_json(pool, artifact.run_id).await?,
+            };
+            map.insert("rollout_contract_readback".to_string(), readback);
         }
     }
 
@@ -1367,7 +1373,7 @@ mod tests {
                 }),
                 projection_integrity: ProjectionIntegrity::Valid,
                 cutover_policy_revision: Some("cutover-p084-test".to_string()),
-                redaction_state: "operator_safe".to_string(),
+                redaction_state: "partial".to_string(),
                 retry_count: 0,
                 preflight_timeout_seconds: 45,
             },

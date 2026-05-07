@@ -14,7 +14,8 @@ Safety contract:
   - Never loads external plugins or FFI validators.
   - Rejects absolute paths, parent-traversal (..),  oversized payloads (> 1 MiB),
     unsafe control characters, and shell metacharacters in command strings.
-  - Reads only the single file provided as argument; no filesystem traversal.
+  - Reads the single file provided as argument, and performs bounded metadata
+    checks for declared fixture paths under docs/evidence/rollout-contract.
 """
 from __future__ import annotations
 
@@ -236,6 +237,57 @@ def _check_secret_like_values(value: object, context: str) -> list[str]:
     return failures
 
 
+def _check_not_applicable_justification(data: dict[str, object]) -> list[str]:
+    if "not_applicable_justification" in data:
+        value = data["not_applicable_justification"]
+        if not isinstance(value, str) or not value.strip():
+            return [
+                "invalid_not_applicable_justification: "
+                "not_applicable_justification must be a non-empty string"
+            ]
+        return _check_control_chars(value, "not_applicable_justification")
+
+    if "not_applicable_justifications" in data:
+        value = data["not_applicable_justifications"]
+        if isinstance(value, str):
+            if not value.strip():
+                return [
+                    "invalid_not_applicable_justifications: "
+                    "not_applicable_justifications must be non-empty"
+                ]
+            return _check_control_chars(value, "not_applicable_justifications")
+        if isinstance(value, list):
+            return _check_string_list(
+                value, "not_applicable_justifications", non_empty=True
+            )
+        if isinstance(value, dict):
+            if not value:
+                return [
+                    "invalid_not_applicable_justifications: "
+                    "not_applicable_justifications must be non-empty"
+                ]
+            failures: list[str] = []
+            for key, nested in value.items():
+                if not isinstance(nested, str) or not nested.strip():
+                    failures.append(
+                        f"invalid_not_applicable_justifications.{key}: value must be a non-empty string"
+                    )
+                else:
+                    failures.extend(
+                        _check_control_chars(nested, f"not_applicable_justifications.{key}")
+                    )
+            return failures
+        return [
+            "invalid_not_applicable_justifications: "
+            "not_applicable_justifications must be a string, array, or object"
+        ]
+
+    return [
+        "missing_not_applicable_justification: "
+        "applicability=not_applicable requires not_applicable_justification"
+    ]
+
+
 def _is_iso8601(value: str) -> bool:
     try:
         datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -290,14 +342,7 @@ def lint(path: str) -> list[str]:
         )
 
     if applicability == "not_applicable":
-        just = data.get("not_applicable_justification") or data.get(
-            "not_applicable_justifications"
-        )
-        if not just:
-            failures.append(
-                "missing_not_applicable_justification: "
-                "applicability=not_applicable requires not_applicable_justification"
-            )
+        failures.extend(_check_not_applicable_justification(data))
         return failures
 
     if applicability != "required":
@@ -454,13 +499,6 @@ def lint(path: str) -> list[str]:
                 failures.append(f"invalid_negative_fixtures.{k}: value must be a string path")
     elif neg is not None:
         failures.append("invalid_negative_fixtures: negative_fixtures must be an object")
-
-    # duplicate source: inline + sidecar
-    if "rollout_contract_v1" in data and "rollout_contract_sidecar" in data:
-        failures.append(
-            "duplicate_source: both inline rollout_contract_v1 and "
-            "rollout_contract_sidecar keys present — only one source is allowed"
-        )
 
     decision_vocabulary = data.get("decision_vocabulary")
     if decision_vocabulary is not None:

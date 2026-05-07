@@ -1019,21 +1019,6 @@ impl Orchestrator {
             self.create_stage_for_state(run_id, &current_state_id, state)
                 .await?
         };
-        stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
-
-        let _ = self.events.send(DomainEvent::StageStatusChanged {
-            run_id,
-            stage_execution_id: stage.id,
-            status: StageStatus::Running,
-        });
-
-        if !matches!(run.status, RunStatus::Running) {
-            runs::update_status(&self.pool, run_id, RunStatus::Running).await?;
-            let _ = self.events.send(DomainEvent::RunStatusChanged {
-                run_id,
-                status: RunStatus::Running,
-            });
-        }
 
         if let Some(task) = implementation_run_start_task {
             if self
@@ -1049,6 +1034,22 @@ impl Orchestrator {
             {
                 return Ok(());
             }
+        }
+
+        stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
+
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Running,
+        });
+
+        if !matches!(run.status, RunStatus::Running) {
+            runs::update_status(&self.pool, run_id, RunStatus::Running).await?;
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Running,
+            });
         }
 
         if needs_git_worktree && run.worktree_root.is_none() {
