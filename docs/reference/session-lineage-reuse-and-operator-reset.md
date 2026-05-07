@@ -193,6 +193,8 @@ Security-, review-, or audit-style agents should remain on `same_invocation_owne
 
 The engine never owns raw ACP subprocess handles. It asks `AcpRuntimeManager` to start a fresh session, submit a prompt into an existing session, close a session, or invalidate and drop a stale handle.
 
+When the engine requests `keep_session_alive`, a live session may remain registered after a `failed` prompt status as well as after `completed`. That failed-session keep-alive exists only for the bounded same-session output repair path documented in [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md#missing-outputs-get-one-same-session-repair-turn). If repair fails, the generation is invalidated and the live handle is closed before normal retry/reuse policy continues.
+
 ### Transport-backed reuse invariant
 
 DB lineage truth is necessary but not sufficient for live reuse. `SessionReuseDisposition::Reused` is valid only when **both**:

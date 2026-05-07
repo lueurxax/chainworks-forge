@@ -1009,24 +1009,23 @@ Command:
 ./scripts/test-gate.sh proposal-049
 ```
 
-### `proposal-077|p077`
+### `proposal-077|p077` - retained historical alias
 
-Bounded implementation closeout readiness gate.
+Bounded implementation closeout readiness gate. The alias name is retained for
+historical compatibility with existing scripts, tests, and receipts.
 
 Scope (what this gate actually covers):
 
-- static presence and required-field checks for
-  `docs/reference/p077-rollout-dependency-evidence.md`
-- static presence and required-field checks for
-  `docs/reference/p077-closeout-readiness-ui-evidence.md`
+- static presence and required-field checks for retained historical alias evidence file `docs/reference/p077-rollout-dependency-evidence.md`
+- static presence and required-field checks for retained historical alias evidence file `docs/reference/p077-closeout-readiness-ui-evidence.md`
 - `implementation_closeout_readiness_v1` decision-matrix validation (Rust domain/db/engine)
 - proposal gate domain contracts and status normalization
 - audit verdict policy enforcement (synthesizer unit tests)
 - bounded code/refine loop and soft convergence checkpoints (memory-level)
 - closeout fingerprinting and latency budget validation
 - DB closeout transaction atomicity (db integration tests)
-- durable P077 rollout metric, go/no-go decision, and rollback-to-advisory
-  execution fixtures
+- durable rollout metric, go/no-go decision, and rollback-to-advisory execution
+  fixtures
 - accessor routing proof (in-memory, not against live orchestrator graph)
 - GraphQL readback parity through the canonical closeout-readiness accessor
 - MCP `runs.get`/`runs.list` readback parity through the same accessor and
@@ -1042,38 +1041,35 @@ Use when:
 - changing implementation closeout readiness logic, status normalization, or decision rules
 - changing proposal gate domain contracts or DB closeout transaction
 - validating bounded loop convergence or soft checkpoint behavior at the synthesizer level
-- reproving the Proposal 077 Phase-1 Rust domain/db/engine slice
+- reproving the closeout readiness Rust domain/db/engine slice
 
 Host policy:
 
 - local Rust target only; no Swift or UI build required
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-077
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-077`.
 
 Important:
 
 - this gate covers the Rust domain/db/engine slice and GraphQL/MCP readback
-  parity of Proposal 077; full R14 acceptance still requires additional
-  integrated transition and macOS fixture evidence
-- it fails fast when the P077 rollout/dependency evidence document is missing
-  required dependency checklist, metric ledger, durable rollout store, or
-  rollback fields
-- it fails fast when the P077 UI evidence document is missing token, contrast,
-  diagnostics, recovery, route, or accessibility mappings
+  parity of closeout readiness; remote macOS runtime proof is the companion UI
+  gate
+- it fails fast when the retained historical alias rollout/dependency evidence
+  document is missing required dependency checklist, metric ledger, durable
+  rollout store, or rollback fields
+- it fails fast when the retained historical alias UI evidence document is
+  missing token, contrast, diagnostics, recovery, route, or accessibility
+  mappings
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
 - it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
 
-### `proposal-077-ui|p077-ui`
+### `proposal-077-ui|p077-ui` - retained historical alias
 
-Remote macOS runtime proof for the P077 closeout readiness surface.
+Remote macOS runtime proof for the closeout readiness surface.
 
 Scope:
 
-- direct P077 closeout-readiness fixture launch
+- direct closeout-readiness fixture launch
 - compact signal activation into the full closeout card
 - primary unblock and secondary blocker focus/read order
 - diagnostics sheet open plus explicit return/backlink route
@@ -1085,11 +1081,7 @@ Host policy:
 - remote macOS UI host required
 - runs through the same signed XCUITest path as other repository UI gates
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-077-ui
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-077-ui`.
 
 ### `p051-scaffold`
 
@@ -1887,3 +1879,54 @@ Command:
 ```bash
 ./scripts/test-gate.sh proposal-075
 ```
+
+Important:
+
+- `p075` is accepted as an alias
+- this is currently a Phases 1–2 inventory/contract gate; Phase 7 promotes direct-write bypass detection to fail-closed enforcement
+- Phase 3+ behaviors must extend this gate before evidence file spooling, coalescing, telemetry rollup, storageHealth diagnostics, and fail-closed bypass enforcement are treated as shipped
+
+### `proposal-084|p084` retained historical alias
+
+Executable rollout gates and observability contract gate.
+
+Scope:
+
+- `docs/reference/executable-rollout-gate-template.md` exists and contains required sections for all three v1 contracts, cutover policy, and security/path guidance (AC-001)
+- `scripts/lint-rollout-contract` pure validator exists and correctly rejects all four linter-testable negative fixtures:
+  - `docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json` — fails `missing_hold_conditions` and `missing_rollback_disposition`
+  - `docs/evidence/rollout-contract/negative/missing-metrics-p017-style.json` — fails `missing_metrics` (P017-style omission caught before closeout)
+  - `docs/evidence/rollout-contract/negative/missing-operator-decision-fields.json` — fails `empty_readback_fields`
+  - `docs/evidence/rollout-contract/negative/invalid-cutover-applicable-to.json` — fails `invalid_cutover_policy.applicable_to`
+  - `docs/evidence/rollout-contract/negative/unsafe-path-and-command.json` — fails `unsafe_command` and `unsafe_path`
+- Documentation-only negative fixtures exist as valid JSON where they describe runtime behavior rather than linter input (AC-006 self-contract check)
+- Rust rollout-contract regressions run under the canonical gate: `cargo test -p engine rollout_contract_preflight --lib`, `cargo test -p db rollout_contract_checks --lib`, clean DB migration install, and schema-version parity. The Python phase also verifies the orchestrator keeps the rollout preflight hold path before code_writer enqueue and blocks the stage/run on `RolloutContractPreflightAction::Hold` (AC-005)
+- The retained historical alias fixture `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields and a `parity_lanes` object whose `mcp` and `release_receipt` payloads carry the same fields and whose `graphql` payload carries the matching camelCase projection fields (AC-004, AC-006)
+- `Chainworks ForgeTests/Proposal084Tests` runs as the Swift parity slice, proving `RolloutDecisionSummary` decodes `operator_readback_v1`, `PreflightReport` carries the read-only summary, and the GraphQL run-row read model decodes the camelCase rollout readback without recomputing authority (AC-004, AC-006)
+- This gate documentation section exists in `docs/reference/test-gates.md` and references `rollout_contract_v1`, `negative fixture`, and `lint-rollout-contract` (AC-002)
+
+Use when:
+
+- Changing the rollout gate template, linter logic, or fixture inventory
+- Proving rollout-contract compliance on the current tree
+- Verifying that unsafe inputs, missing metrics, and missing hold/rollback are rejected with bounded reasons
+
+Host policy:
+
+- local Python 3, Rust toolchain, and Swift Testing host (Xcode toolchain) required for the `Proposal084Tests` slice; no UI host or network required after Swift package cache is warm
+- pure file-system + subprocess validation for the lint and fixture phase; no daemon process required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-084 # retained historical alias
+./scripts/test-gate.sh p084 # retained historical alias
+```
+
+Important:
+
+- `p084` is accepted as a retained historical alias
+- the gate runs `scripts/lint-rollout-contract` via subprocess; linter exit-0 on a negative fixture is a gate failure
+- documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
+- the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
+- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails

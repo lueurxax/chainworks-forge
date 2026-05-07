@@ -20,6 +20,10 @@ pub enum SessionEventType {
     OperatorReset,
     BudgetExceeded,
     Compacted,
+    OutputContractRepairStarted,
+    OutputContractRepairSucceeded,
+    OutputContractRepairFailed,
+    OutputContractRepairSkipped,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

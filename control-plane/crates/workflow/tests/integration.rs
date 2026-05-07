@@ -767,12 +767,15 @@ fn test_compile_full_mvp_live_plan() {
     // Verify provider resolution
     let s1 = &plan.states["state_1_idea_received"];
     assert_eq!(s1.owner.agent_id, "lead_orchestrator");
-    assert_eq!(s1.owner.provider, "junie", "lead_orchestrator uses junie");
+    assert_eq!(
+        s1.owner.provider, "gemini",
+        "lead_orchestrator uses strict structured-output Gemini profile"
+    );
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
     assert_eq!(
-        s4.owner.provider, "junie",
-        "state_4 owner=lead_orchestrator uses junie"
+        s4.owner.provider, "gemini",
+        "state_4 owner=lead_orchestrator uses strict structured-output Gemini profile"
     );
     assert_eq!(
         s4.system_task

@@ -4,7 +4,7 @@ Date: 2026-05-05
 
 ## Problem
 
-P084 remains blocked after the ACP `result.output` extraction fix because required outputs are still settling as `missing_required_outputs`. The observed failure is not malformed output validation. The raw payload size is `0` for `implementation_progress`, `implementation_self_assessment`, and `tests_result`, while the control-plane generated `changed_files_manifest` passes. That points to the ingestion boundary: either the final answer text is not fully collected, or the output envelope shape returned by the agent is not being recognized.
+The retained historical alias P084 run remains blocked after the ACP `result.output` extraction fix because required outputs are still settling as `missing_required_outputs`. The observed failure is not malformed output validation. The raw payload size is `0` for `implementation_progress`, `implementation_self_assessment`, and `tests_result`, while the control-plane generated `changed_files_manifest` passes. That points to the ingestion boundary: either the final answer text is not fully collected, or the output envelope shape returned by the agent is not being recognized.
 
 The fix should not make durable output-contract repair the normal path. Repair can remain an emergency fallback, but the primary path must reliably ingest required outputs from the current ACP final result.
 
@@ -108,12 +108,12 @@ Required regression tests:
 - ACP unit: fenced JSON containing top-level `CHAINWORKS_OUTPUT` is extracted.
 - ACP unit: legacy marker envelope is still extracted.
 - ACP unit: prose without valid `CHAINWORKS_OUTPUT` extracts nothing.
-- Engine/executor fixture: P084-like required outputs `implementation_progress`, `implementation_self_assessment`, and `tests_result` settle as valid from final ACP text; `changed_files_manifest` remains control-plane generated.
+- Engine/executor fixture: retained historical alias P084-like required outputs `implementation_progress`, `implementation_self_assessment`, and `tests_result` settle as valid from final ACP text; `changed_files_manifest` remains control-plane generated.
 - Regression: stale exact-path files are not accepted unless declared reuse policy allows them.
 
 ## Success Criteria
 
-- A P084-like fixture fails before the extraction/prompt fix and passes after it.
+- A retained historical alias P084-like fixture fails before the extraction/prompt fix and passes after it.
 - Existing ACP extraction tests continue to pass.
 - No broad filesystem discovery is reintroduced.
 - Diagnostics identify whether a failure came from missing final text, missing envelope, rejected key, rejected payload, or schema validation.

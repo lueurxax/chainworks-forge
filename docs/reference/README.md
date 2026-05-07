@@ -22,7 +22,8 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), persisted runtime truth, provider toolchain cache mapping, and capacity management
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, and durable validation-failure substrate
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
-- [p077-rollout-dependency-evidence.md](p077-rollout-dependency-evidence.md) — Proposal 077 dependency checklist, rollout metric ledger, expansion decision fields, and rollback evidence contract
+- [implementation-closeout-readiness.md](implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, GraphQL/MCP/macOS readback, rollout evidence, and retained gate aliases
+- [p077-rollout-dependency-evidence.md](p077-rollout-dependency-evidence.md) — Retained historical alias evidence file for closeout readiness dependency checklist, rollout metric ledger, expansion decision fields, and rollback evidence contract
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
@@ -46,10 +47,11 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) — Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
-- [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — P077 closeout-readiness token, contrast, diagnostic, and accessibility evidence
+- [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — Retained historical alias evidence file for closeout-readiness token, contrast, diagnostic, focus, recovery, and accessibility proof
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
 - [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, and `delivery_receipt` settlement
+- [executable-rollout-gate-template.md](executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, security/path/authorization guidance, and retained historical alias self-contract
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling
 - [idea-lifecycle.md](idea-lifecycle.md) — Active vs archived idea contract, archive/restore eligibility, cross-surface truth

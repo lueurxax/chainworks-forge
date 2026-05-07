@@ -48,6 +48,7 @@ That baseline is useful but not yet a complete proposal-level contract. The miss
 - transcript/provider-envelope extraction is not specified;
 - repair attempt evidence/readback is not specified;
 - retry budget interaction is not specified;
+- provider mode mismatch is not classified separately from ordinary missing output;
 - P076 does not have a runtime owner to route repeated output-contract signatures to.
 
 P079 makes this behavior explicit and bounded.
@@ -89,9 +90,19 @@ Same-session repair is allowed only when all of the following are true:
   - `missing_required_outputs`
   - `output_contract_mismatch`
   - `invalid_required_outputs` where the invalidity is schema/enum/field repairable;
+  - `provider_mode_mismatch` when the provider produced work in a mode that cannot satisfy the declared output channel.
 - the source-generation claim for the invocation is still active;
 - the provider session generation is still live or explicitly repairable;
 - no unresolved human approval or workflow conflict is the actual blocking condition.
+
+`provider_mode_mismatch` has typed subtypes:
+
+| Subtype | Meaning |
+|---|---|
+| `plan_event_instead_of_output` | Provider emitted a planning event or plan-mode response instead of a required output payload. |
+| `empty_submit_after_plan` | Provider wrote or described a plan, then submitted an empty or output-less final response. |
+| `file_plan_written_instead_of_payload` | Provider wrote a plan file, such as `.junie/plans/*.md`, but did not emit the required canonical output. |
+| `repair_repeated_plan_behavior` | A repair prompt repeated plan-mode behavior instead of producing the missing output payload. |
 
 ### 5.2 Ineligible Cases
 
@@ -103,6 +114,30 @@ Repair must be skipped when:
 - the missing output belongs to an old attempt;
 - output validation failed because an artifact was intentionally rejected by an operator override;
 - the provider failure class indicates unsafe continuation, such as an unrecoverable transport/session corruption that invalidates session context.
+
+### 5.3 Junie Strict Structured Output Exception
+
+Junie plan-mode behavior is useful evidence, but it is not reliable as a same-session repair path for strict structured outputs.
+
+If all of the following are true:
+
+- adapter family is `junie`;
+- required output mode is `strict_structured`;
+- the failure class is `provider_mode_mismatch` or the captured material only contains provider plan evidence;
+
+then same-session repair must be skipped:
+
+```json
+{
+  "same_session_repair": {
+    "attempted": false,
+    "result": "skipped_ineligible",
+    "reason": "provider_mode_mismatch_risk"
+  }
+}
+```
+
+When an allowed fallback provider is configured, provider fallback is immediately eligible after this skip. The runtime must not spend the single repair turn asking Junie to convert a plan-mode response into a strict structured output, because repeated repair prompts have already shown a risk of producing another plan rather than the required payload.
 
 ## 6. Same-Session Repair
 
@@ -119,6 +154,8 @@ Instead it issues one narrow corrective turn to the same ACP session:
 - reject output that targets a non-canonical path.
 
 The repair turn may produce only corrected outputs. Any additional narrative is ignored unless it is inside the declared output envelope.
+
+If a repair turn produces another provider plan instead of the missing payload, the failure class becomes `provider_mode_mismatch` with subtype `repair_repeated_plan_behavior`.
 
 Default same-session repair budget:
 
@@ -148,6 +185,31 @@ Required safeguards:
 
 Transcript/provider-envelope recovery is not a substitute for contract validation. It is only a parser for material already emitted by the current invocation.
 
+### 7.1 Provider Plan Evidence Is Not Output Truth
+
+Provider plan files are preserved evidence, not canonical required outputs.
+
+For Junie and any future plan-mode provider:
+
+```text
+.junie/plans/*.md
+```
+
+must be handled as:
+
+- human evidence artifact;
+- provider plan evidence;
+- diagnostic context for the next invocation or operator review.
+
+It must not be handled as:
+
+- a valid required output;
+- transition truth;
+- a substitute for `CHAINWORKS_OUTPUT` or another declared strict structured payload;
+- source material that updates active artifact truth without passing the declared output contract.
+
+If `.junie/plans/*.md` is the only material produced for a required output, the settlement result remains missing/invalid output and should be classified as `provider_mode_mismatch:file_plan_written_instead_of_payload`.
+
 ## 8. Controlled Provider Fallback
 
 If same-session repair is unavailable or fails, and the role is in the P079 initial role allowlist, the engine may schedule one controlled provider fallback attempt.
@@ -174,6 +236,14 @@ max_provider_fallback_attempts_per_invocation = 1
 ```
 
 Provider selection is deterministic and policy-driven. The runtime may choose an alternate provider only from the agent catalog/backend profile policy for that role. If no allowed alternate provider exists, fallback is skipped and the original failure proceeds to normal stage failure.
+
+Initial lead-orchestrator fallback policy:
+
+| Role | Failed provider profile | Fallback provider profile |
+|---|---|---|
+| `lead_orchestrator` | `gemini_reasoning_pro_high` | `claude_orchestrator_high` |
+
+This fallback is only for output-contract settlement failures covered by P079, including `provider_mode_mismatch` and Junie strict structured output skips. It is not a general quality retry, capacity retry, or approval bypass.
 
 ## 9. Role Coverage
 
@@ -206,11 +276,15 @@ Minimum evidence fields:
   "agent_execution_id": "...",
   "role": "proposal_writer",
   "initial_failure_class": "missing_required_outputs",
+  "initial_failure_subtype": null,
+  "adapter_family": "codex",
+  "required_output_mode": "strict_structured",
   "required_outputs": ["proposal_current"],
   "same_session_repair": {
     "attempted": true,
     "result": "accepted",
-    "turn_count": 1
+    "turn_count": 1,
+    "reason": null
   },
   "transcript_recovery": {
     "attempted": false,
@@ -219,7 +293,12 @@ Minimum evidence fields:
   "provider_fallback": {
     "attempted": false,
     "result": "not_needed",
-    "fallback_provider": null
+    "fallback_provider": null,
+    "fallback_profile": null
+  },
+  "provider_plan_evidence": {
+    "artifact_paths": [],
+    "accepted_as_output": false
   },
   "final_output_settlement": "valid_outputs_from_completed_execution"
 }
@@ -249,6 +328,9 @@ P076 may then classify repeated output failures as:
 - `fallback_unavailable`
 - `fallback_failed`
 - `repair_succeeded`
+- `provider_mode_mismatch`
+- `provider_plan_evidence_only`
+- `fallback_succeeded_after_provider_mode_mismatch`
 
 instead of treating every recurrence as a generic `missing_required_outputs` retry.
 
@@ -262,6 +344,7 @@ P079 must preserve the existing P057/P058 settlement model.
 - Provider fallback creates a distinct agent execution and source-generation claim.
 - The previous failed execution remains visible with its original validation failure and repair evidence.
 - Stage success requires final required outputs to be contract-valid.
+- Provider plan evidence, including `.junie/plans/*.md`, may be attached to the failed execution as evidence but must not settle required outputs or drive transition truth.
 
 No repair or fallback path may write directly to active artifact truth without going through the existing output discovery, contract validation, and source-generation claim path.
 
@@ -286,6 +369,10 @@ Those are out of scope for P079 unless implementation discovers that automatic r
 ## 13. Acceptance Criteria
 
 - Eligible `proposal_writer`, `proposal_reviewer_*`, and `lead_orchestrator` invocations receive exactly one same-session corrective prompt before durable missing-output failure.
+- `provider_mode_mismatch` is a first-class failure class with subtypes for plan-mode output failures.
+- Junie strict structured output failures skip same-session repair as `skipped_ineligible(provider_mode_mismatch_risk)` and may immediately use configured provider fallback.
+- `.junie/plans/*.md` is preserved as human/provider plan evidence but never accepted as required output or transition truth.
+- `lead_orchestrator` supports `gemini_reasoning_pro_high -> claude_orchestrator_high` fallback for P079 output-contract failures.
 - Same-session repaired output is accepted only when it passes the existing contract validator and source-generation claim checks.
 - Contract-valid output embedded in the current transcript/provider envelope can be recovered without a fresh provider invocation.
 - If same-session repair fails and an allowed alternate provider exists, one controlled fallback attempt is scheduled and attributed as a distinct execution.
@@ -304,6 +391,8 @@ Those are out of scope for P079 unless implementation discovers that automatic r
 - Agent returns stale output path; repair rejects it.
 - Same-session repair fails; deterministic alternate fixture provider succeeds.
 - Same-session repair fails; no alternate provider exists; stage fails with repair evidence.
+- Junie strict structured output fixture writes `.junie/plans/*.md` and no payload; repair is skipped as `provider_mode_mismatch_risk`, plan file is attached as provider plan evidence, and the required output remains unsettled.
+- Lead orchestrator fixture fails under `gemini_reasoning_pro_high` with `provider_mode_mismatch`, then succeeds under `claude_orchestrator_high`.
 
 ### Contract and Settlement Tests
 
@@ -311,10 +400,12 @@ Those are out of scope for P079 unless implementation discovers that automatic r
 - Late repair output after claim supersession is ignored.
 - Provider fallback creates a distinct agent execution/source claim.
 - Previous failed execution retains original failure evidence.
+- Provider plan evidence from `.junie/plans/*.md` is queryable as evidence but is not accepted by the contract validator as a required output.
 
 ### Role and Safety Tests
 
 - `proposal_writer`, `proposal_reviewer_*`, and `lead_orchestrator` are eligible.
+- Junie strict structured output mode is ineligible for same-session repair and eligible for immediate configured fallback.
 - human approval stages are ineligible.
 - workflow-conflict states are ineligible.
 - release agents are ineligible for fallback.
@@ -334,7 +425,7 @@ The gate must use deterministic fixture ACP transports only. It must not require
 1. Ship same-session repair evidence and fixture tests.
 2. Enable same-session repair for the initial role allowlist.
 3. Add transcript/provider-envelope recovery.
-4. Add controlled provider fallback for proposal writer/reviewer/lead roles.
+4. Add controlled provider fallback for proposal writer/reviewer/lead roles, including `lead_orchestrator` fallback from `gemini_reasoning_pro_high` to `claude_orchestrator_high`.
 5. Wire P076 classification to the new evidence fields.
 6. After two dogfood cycles, evaluate whether `docs_guardian` and selected `code_writer` status artifacts should join fallback coverage.
 
@@ -345,6 +436,8 @@ The gate must use deterministic fixture ACP transports only. It must not require
 | Repair prompt causes extra unrelated work | Prompt says “do not redo unrelated work”; executor accepts only declared output envelopes. |
 | Invalid output is accepted because it “looks close” | All repaired/recovered/fallback output must pass the existing contract validator. |
 | Provider fallback hides real proposal defects | Fallback is limited to output-contract failures, records evidence, and does not bypass workflow conflict or approval gates. |
+| Junie plan files are mistaken for output truth | `.junie/plans/*.md` is evidence only; strict structured required outputs remain unsettled until a canonical payload validates. |
+| Same-session repair repeats provider plan-mode behavior | Junie strict structured output failures skip same-session repair and proceed directly to configured fallback. |
 | Retry budget becomes confusing | Repair and provider fallback use separate evidence counters and do not silently consume ordinary operator retry semantics. |
 | Release retry safety is weakened | Release agents are excluded; P078 owns side-effect reconciliation. |
 | P076 keeps retrying despite repair failure | P076 must consume repair/fallback outcome evidence and escalate recurring signatures instead of blind retry. |

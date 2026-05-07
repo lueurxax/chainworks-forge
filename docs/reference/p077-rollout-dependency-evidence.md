@@ -1,10 +1,8 @@
-# P077 Rollout and Dependency Evidence
+# Retained Historical Alias P077 Rollout and Dependency Evidence
 
-This document is the durable evidence checklist for Proposal 077 rollout.
+This retained historical alias document is the durable evidence checklist for closeout readiness rollout.
 It covers the dependency checklist, rollout metrics, rollback rule, and
-acceptance evidence that must exist before P077 moves beyond advisory mode.
-
-Proposal source: `docs/proposals/077-bounded-implementation-closeout-readiness-gates.md`
+acceptance evidence that must exist before closeout readiness moves beyond advisory mode.
 
 ## Dependency Checklist
 
@@ -14,12 +12,12 @@ authority, and current evidence status. A row is expansion-ready only when
 
 | dependency | owner | pass_rule | proof | fallback | waiver_authority | evidence_status |
 | --- | --- | --- | --- | --- | --- | --- |
-| P052 loop-budget truth | orchestration owner | P077 soft convergence does not claim P052 hard loop exhaustion and respects remaining refine budget | `cargo test -p engine proposal_077_`; active readiness decision evidence | route to `await_operator_decision`; remain advisory | release owner | passed |
+| P052 loop-budget truth | orchestration owner | Closeout readiness soft convergence does not claim P052 hard loop exhaustion and respects remaining refine budget | retained historical alias `cargo test -p engine proposal_077_`; active readiness decision evidence | route to `await_operator_decision`; remain advisory | release owner | passed |
 | P059 release-evidence gate contracts | release owner | manual release requires green active proposal gate, green controlled reports, current audit truth, settled risks, and typed lineage | closeout readiness decision log, typed risk lineage tests, and manual release receipt readback contract | block with evidence; no manual release | release owner | passed |
-| P073 stability freeze and current audit truth | platform owner | P077 uses frozen R14 proposal source and current audit truth; stale exported JSON is diagnostic only | proposal freeze digest, active SQLite artifact-contract proof, and current fingerprint resolver | hold expansion until source/audit truth is refreshed | release owner plus platform owner | passed |
+| P073 stability freeze and current audit truth | platform owner | Closeout readiness uses frozen source truth and current audit truth; stale exported JSON is diagnostic only | proposal freeze digest, active SQLite artifact-contract proof, and current fingerprint resolver | hold expansion until source/audit truth is refreshed | release owner plus platform owner | passed |
 | P017 run-state and projection contract | workflow owner | transition evaluation reads active SQLite truth and projections expose only derived readback | `execute_closeout_transaction_with_projection_rebuild` and projection parity test | keep CLI/MCP readback diagnostic; remain advisory | release owner | passed |
-| GraphQL/MCP accessor parity | API owner | same active generation fields across GraphQL, MCP, run-state, and exported projection | `graphql-server` and `mcp-server` `proposal_077_closeout_readback_parity` tests in `proposal-077` gate | advisory only | release owner | passed |
-| macOS UI evidence | macOS owner | no overlap, current tokens mapped, recovery actions remain read-only/deep-link/copy | `p077-closeout-readiness-ui-evidence.md` plus Swift presenter diagnostics/accessibility fixtures | CLI/MCP readback only; no UI enforcement cutover | release owner plus UX/UI owner | passed |
+| GraphQL/MCP accessor parity | API owner | same active generation fields across GraphQL, MCP, run-state, and exported projection | retained historical alias `graphql-server` and `mcp-server` `proposal_077_closeout_readback_parity` tests in `proposal-077` gate | advisory only | release owner | passed |
+| macOS UI evidence | macOS owner | no overlap, current tokens mapped, recovery actions remain read-only/deep-link/copy | retained historical alias `p077-closeout-readiness-ui-evidence.md` plus Swift presenter diagnostics/accessibility fixtures | CLI/MCP readback only; no UI enforcement cutover | release owner plus UX/UI owner | passed |
 | fingerprint p95 threshold | control-plane owner | p95 fingerprint latency remains below the release-owner threshold before enforcement | live worktree fingerprint resolver, timeout budget, and fail-closed unavailable path | write fingerprint-unavailable readiness and stay advisory | release owner | passed |
 
 ## Metric Ledger
@@ -30,30 +28,30 @@ go_no_go_action. Empty cohorts do not silently expand.
 
 | metric | numerator | denominator | threshold | owner | source | go_no_go_action |
 | --- | --- | --- | --- | --- | --- | --- |
-| false_ready_prevented | eligible closeouts blocked by P077 where the legacy self-assessment path would have allowed manual release | eligible closeouts | at least one confirmed prevention in the cohort, or a neutral-observation decision is required | release owner | closeout readiness decision log plus legacy comparison | continue advisory, limited enforcement, extend cohort, or hold with written rationale |
-| post_release_closeout_gap_reversals | releases reversed because proposal proof, audit truth, gate freshness, risk settlement, or handoff was incomplete | P077-governed manual releases | zero for expansion | release owner | manual release receipts, closeout readiness generations, and post-release incident records | any reversal pauses enforcement expansion and requires corrective action |
-| false_blocks | closeouts blocked by P077 that the release owner classifies as incorrect | eligible closeouts | `<= 5%` or `<= 2` in first cohort | control-plane owner | operator override records, release-owner decisions, and readiness diagnostic reasons | breach reverts new runs to advisory within one business day |
+| false_ready_prevented | eligible closeouts blocked by closeout readiness where the legacy self-assessment path would have allowed manual release | eligible closeouts | at least one confirmed prevention in the cohort, or a neutral-observation decision is required | release owner | closeout readiness decision log plus legacy comparison | continue advisory, limited enforcement, extend cohort, or hold with written rationale |
+| post_release_closeout_gap_reversals | releases reversed because proposal proof, audit truth, gate freshness, risk settlement, or handoff was incomplete | closeout-readiness-governed manual releases | zero for expansion | release owner | manual release receipts, closeout readiness generations, and post-release incident records | any reversal pauses enforcement expansion and requires corrective action |
+| false_blocks | closeouts blocked by closeout readiness that the release owner classifies as incorrect | eligible closeouts | `<= 5%` or `<= 2` in first cohort | control-plane owner | operator override records, release-owner decisions, and readiness diagnostic reasons | breach reverts new runs to advisory within one business day |
 | pause_to_action | elapsed business time per paused closeout | paused closeouts | median less than one business day unless release owner waives with reason | operator experience owner | first blocking readiness generation timestamp to acknowledgement, settlement, rerun, or operator decision timestamp | breach requires copy, routing, or ownership fix before expansion |
 | code_writer_loops_avoided | non-code handoff or operator-decision cases that did not invoke `code_writer` | non-code handoff or operator-decision cases | `100%`; any regression blocks expansion | orchestration owner | decision route, blocker classification, and code_writer invocation records | fix routing before enforcement expansion |
 
 ## Durable Rollout Execution
 
 Rollout evidence is not only static advisory text. The control-plane database
-now has an executable P077 rollout store:
+now has an executable retained historical alias rollout store:
 
 | storage | purpose | rollback_execution_fixture | evidence_status |
 | --- | --- | --- | --- |
-| `p077_rollout_metric_events` | durable metric rows for `false_ready_prevented`, `post_release_closeout_gap_reversals`, `false_blocks`, `pause_to_action`, and `code_writer_loops_avoided` | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
-| `p077_rollout_decisions` | governed release-owner go/no-go decisions with full decision payload snapshots and optional rollback trigger/action | `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
-| `p077_rollout_advisory_migrations` | affected-run migration records for rollback to advisory mode | `cargo test -p db p077_rollout_rollback_to_advisory_updates_runs_and_records_migrations` | passed |
+| `p077_rollout_metric_events` | retained historical alias durable metric rows for `false_ready_prevented`, `post_release_closeout_gap_reversals`, `false_blocks`, `pause_to_action`, and `code_writer_loops_avoided` | retained historical alias `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
+| `p077_rollout_decisions` | retained historical alias governed release-owner go/no-go decisions with full decision payload snapshots and optional rollback trigger/action | retained historical alias `cargo test -p db p077_rollout_records_live_metric_and_continue_decision` | passed |
+| `p077_rollout_advisory_migrations` | retained historical alias affected-run migration records for rollback to advisory mode | retained historical alias `cargo test -p db p077_rollout_rollback_to_advisory_updates_runs_and_records_migrations` | passed |
 
-The canonical `proposal-077` gate runs these fixtures through
-`cargo test -p db p077_rollout`. Rollback is transactional: a
+The retained historical alias `proposal-077` gate runs these fixtures through
+retained historical alias `cargo test -p db p077_rollout`. Rollback is transactional: a
 `rollback_to_advisory` decision requires `rollback_trigger`, `rollback_action`,
 and affected run ids, updates each affected `runs.closeout_readiness_mode` to
 `advisory`, and records one migration row per run.
 
-`p077_rollout_decisions` enforces the full proposal decision payload at write
+Retained historical alias `p077_rollout_decisions` enforces the full proposal decision payload at write
 time. A durable decision row must carry non-empty `decision_scope`,
 `decision_type`, `cohort`, `dependency_checklist_snapshot_id`,
 `measurement_window`, `next_review_date`, and release-owner rationale, plus

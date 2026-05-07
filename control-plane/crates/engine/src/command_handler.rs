@@ -743,6 +743,171 @@ impl CommandJournalEntry {
     }
 }
 
+const MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES: usize = 64 * 1024;
+
+fn merge_rollout_contract_preflight_policy(
+    base_json: Option<String>,
+    raw_policy: Option<&str>,
+    journal: &CommandJournalEntry,
+    caller: &CallerContext,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let Some(raw_policy) = raw_policy else {
+        return Ok(base_json);
+    };
+    if raw_policy.len() > MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES {
+        anyhow::bail!(
+            "rollout_contract_preflight_policy_json exceeds maximum length of {} bytes",
+            MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES
+        );
+    }
+    let policy: serde_json::Value = serde_json::from_str(raw_policy)
+        .map_err(|e| anyhow!("rollout_contract_preflight_policy_json: {e}"))?;
+    let policy_object = policy
+        .as_object()
+        .ok_or_else(|| anyhow!("rollout_contract_preflight_policy_json must be an object"))?;
+
+    for key in policy_object.keys() {
+        if key != "waiver" && key != "enforcement_mode" {
+            anyhow::bail!("rollout_contract_preflight_policy_json unknown top-level field: {key}");
+        }
+    }
+
+    let mut stamped = serde_json::Map::new();
+    if let Some(waiver) = policy_object.get("waiver") {
+        stamped.insert(
+            "waiver".to_string(),
+            stamp_rollout_contract_policy_record(
+                waiver,
+                "waiver",
+                &["state", "decision", "reason_code", "expires_at"],
+                journal,
+                caller,
+                now,
+            )?,
+        );
+    }
+    if let Some(enforcement_mode) = policy_object.get("enforcement_mode") {
+        stamped.insert(
+            "enforcement_mode".to_string(),
+            stamp_rollout_contract_policy_record(
+                enforcement_mode,
+                "enforcement_mode",
+                &["mode", "reason_code", "expires_at"],
+                journal,
+                caller,
+                now,
+            )?,
+        );
+    }
+    if stamped.is_empty() {
+        anyhow::bail!("rollout_contract_preflight_policy_json requires waiver or enforcement_mode");
+    }
+
+    let mut root = match base_json {
+        Some(json) => serde_json::from_str::<serde_json::Value>(&json)
+            .map_err(|e| anyhow!("delivery_preflight_json: {e}"))?,
+        None => serde_json::json!({
+            "passed": true,
+            "checks": [],
+            "timestamp": now.to_rfc3339()
+        }),
+    };
+    let root_object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("delivery_preflight_json must be an object"))?;
+    root_object.insert(
+        "rollout_contract_preflight".to_string(),
+        serde_json::Value::Object(stamped),
+    );
+    Ok(Some(serde_json::to_string(&root)?))
+}
+
+fn stamp_rollout_contract_policy_record(
+    value: &serde_json::Value,
+    context: &str,
+    allowed_fields: &[&str],
+    journal: &CommandJournalEntry,
+    caller: &CallerContext,
+    now: DateTime<Utc>,
+) -> Result<serde_json::Value> {
+    let object = value.as_object().ok_or_else(|| {
+        anyhow!("rollout_contract_preflight_policy_json.{context} must be an object")
+    })?;
+    for key in object.keys() {
+        if matches!(
+            key.as_str(),
+            "authorized" | "principal_id" | "principal_class" | "audit_event_id"
+        ) {
+            anyhow::bail!(
+                "rollout_contract_preflight_policy_json.{context}.{key} is server-stamped and must not be supplied"
+            );
+        }
+        if !allowed_fields.contains(&key.as_str()) {
+            anyhow::bail!("rollout_contract_preflight_policy_json.{context} unknown field: {key}");
+        }
+    }
+
+    let reason_code = required_policy_string(object, context, "reason_code")?;
+    let expires_at = required_policy_string(object, context, "expires_at")?;
+    match DateTime::parse_from_rfc3339(expires_at) {
+        Ok(expires_at) if expires_at.with_timezone(&Utc) > now => {}
+        Ok(_) => anyhow::bail!(
+            "rollout_contract_preflight_policy_json.{context}.expires_at must be later than scheduling time"
+        ),
+        Err(_) => anyhow::bail!(
+            "rollout_contract_preflight_policy_json.{context}.expires_at must be an ISO-8601 timestamp"
+        ),
+    }
+
+    if context == "waiver" {
+        if required_policy_string(object, context, "state")? != "active" {
+            anyhow::bail!("rollout_contract_preflight_policy_json.waiver.state must be active");
+        }
+        if required_policy_string(object, context, "decision")? != "waive" {
+            anyhow::bail!("rollout_contract_preflight_policy_json.waiver.decision must be waive");
+        }
+    } else {
+        match required_policy_string(object, context, "mode")? {
+            "enforce" | "permissive" | "disabled" => {}
+            other => anyhow::bail!(
+                "rollout_contract_preflight_policy_json.enforcement_mode.mode is invalid: {other}"
+            ),
+        }
+    }
+
+    let mut stamped = object.clone();
+    stamped.insert("authorized".to_string(), serde_json::json!(true));
+    stamped.insert(
+        "principal_id".to_string(),
+        serde_json::json!(caller.principal_id),
+    );
+    stamped.insert(
+        "principal_class".to_string(),
+        serde_json::json!(caller.principal_class.to_string()),
+    );
+    stamped.insert("audit_event_id".to_string(), serde_json::json!(journal.id));
+    stamped.insert("reason_code".to_string(), serde_json::json!(reason_code));
+    Ok(serde_json::Value::Object(stamped))
+}
+
+fn required_policy_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    context: &str,
+    field: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "rollout_contract_preflight_policy_json.{context}.{field} must be a non-empty string"
+            )
+        })
+}
+
 fn plan_requires_delivery_configuration(plan: &workflow::plan::RunPlan) -> bool {
     plan.states.values().any(|state| {
         state
@@ -886,8 +1051,9 @@ fn find_source_invoke_work_item<'a>(
         .max_by_key(|item| item.created_at)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct TargetedRetryProviderFallback {
+    reason: &'static str,
     from_backend_profile_id: Option<String>,
     from_provider: String,
     backend_profile_id: String,
@@ -895,6 +1061,59 @@ struct TargetedRetryProviderFallback {
     model: Option<String>,
     effort: Option<String>,
     max_turns: Option<i64>,
+    temperature: Option<f64>,
+}
+
+fn targeted_retry_catalog_profile_override(
+    run: &Run,
+    agent_id: &str,
+    retry_payload: &serde_json::Value,
+) -> Option<TargetedRetryProviderFallback> {
+    let catalog: serde_json::Value =
+        serde_json::from_str(run.catalog_snapshot_json.as_deref()?).ok()?;
+    let current_backend_profile_id = catalog
+        .get("agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| agent.get("id").and_then(serde_json::Value::as_str) == Some(agent_id))?
+        .get("backend_profile")?
+        .as_str()?;
+    let from_backend_profile_id = retry_payload
+        .get("backend_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    if from_backend_profile_id.as_deref() == Some(current_backend_profile_id) {
+        return None;
+    }
+
+    let profile = catalog
+        .get("backend_profiles")?
+        .get(current_backend_profile_id)?
+        .as_object()?;
+    let provider = profile.get("provider")?.as_str()?.to_string();
+    Some(TargetedRetryProviderFallback {
+        reason: "current_catalog_binding_changed",
+        from_backend_profile_id,
+        from_provider: retry_payload
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        backend_profile_id: current_backend_profile_id.to_string(),
+        provider,
+        model: profile
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        effort: profile
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+        temperature: profile
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64),
+    })
 }
 
 fn targeted_retry_provider_fallback(
@@ -999,6 +1218,7 @@ fn targeted_retry_provider_fallback(
     }
 
     Some(TargetedRetryProviderFallback {
+        reason: "source_provider_failed_without_required_output",
         from_backend_profile_id: retry_payload
             .get("backend_profile_id")
             .and_then(serde_json::Value::as_str)
@@ -1015,6 +1235,9 @@ fn targeted_retry_provider_fallback(
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
         max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+        temperature: profile
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64),
     })
 }
 
@@ -1273,6 +1496,15 @@ impl CommandHandler {
         }
         if matches!(
             &cmd,
+            Command::StartRun(c) if c.rollout_contract_preflight_policy_json.is_some()
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!(
+                "forbidden: StartRun rollout_contract_preflight_policy_json requires operator principal"
+            );
+        }
+        if matches!(
+            &cmd,
             Command::RetryStage(c) if c.legacy_discovery_override_policy.is_some()
         ) && caller.principal_class != PrincipalClass::Operator
         {
@@ -1420,7 +1652,7 @@ impl CommandHandler {
                     }
                 };
 
-                let delivery_preflight_json =
+                let mut delivery_preflight_json =
                     if let Some(delivery_configuration_json) = &c.delivery_configuration_json {
                         let delivery_config: domain::run::DeliveryConfiguration =
                             match serde_json::from_str(delivery_configuration_json) {
@@ -1470,6 +1702,13 @@ impl CommandHandler {
                     } else {
                         None
                     };
+                delivery_preflight_json = merge_rollout_contract_preflight_policy(
+                    delivery_preflight_json,
+                    c.rollout_contract_preflight_policy_json.as_deref(),
+                    &journal,
+                    caller,
+                    now,
+                )?;
                 let phase_b_dogfood_snapshot =
                     phase_b_dogfood_exit_metric_snapshot(&c.workspace_root);
                 let tx_started = Instant::now();
@@ -3954,12 +4193,16 @@ impl CommandHandler {
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
                 .await?;
-        let provider_fallback = targeted_retry_provider_fallback(
-            &run,
-            &target_exec.agent_id,
-            &retry_payload,
-            runtime_facts.as_ref(),
-        );
+        let provider_fallback =
+            targeted_retry_catalog_profile_override(&run, &target_exec.agent_id, &retry_payload)
+                .or_else(|| {
+                    targeted_retry_provider_fallback(
+                        &run,
+                        &target_exec.agent_id,
+                        &retry_payload,
+                        runtime_facts.as_ref(),
+                    )
+                });
         let next_attempt_number = matching_stages
             .iter()
             .map(|s| s.attempt_number)
@@ -4025,6 +4268,9 @@ impl CommandHandler {
                 if let Some(max_turns) = fallback.max_turns {
                     object.insert("max_turns".into(), serde_json::json!(max_turns));
                 }
+                if let Some(temperature) = fallback.temperature {
+                    object.insert("temperature".into(), serde_json::json!(temperature));
+                }
                 if let Some(targeted_retry) = object
                     .get_mut("targeted_retry")
                     .and_then(serde_json::Value::as_object_mut)
@@ -4032,7 +4278,7 @@ impl CommandHandler {
                     targeted_retry.insert(
                         "provider_fallback".into(),
                         serde_json::json!({
-                            "reason": "source_provider_failed_without_required_output",
+                            "reason": fallback.reason,
                             "from_backend_profile_id": fallback.from_backend_profile_id,
                             "from_provider": fallback.from_provider,
                             "to_backend_profile_id": fallback.backend_profile_id,
@@ -4678,6 +4924,137 @@ reviewer_override:
         let err = resolve_start_run_review_routing_json(Some(&duplicate), "", None, now)
             .expect_err("duplicate include/exclude IDs should fail validation");
         assert!(err.to_string().contains("duplicate agent_id"));
+    }
+
+    #[test]
+    fn p084_rollout_preflight_policy_is_server_stamped_into_delivery_preflight() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let journal = CommandJournalEntry {
+            id: "journal-1".into(),
+            command_type: "StartRun",
+            payload_json: "{}".into(),
+            run_id: None,
+            created_at: now,
+            caller_surface: Some("mcp".into()),
+            caller_principal_id: Some("operator-1".into()),
+            caller_principal_class: Some("operator".into()),
+            caller_tool: Some("runs.start".into()),
+            request_id: None,
+        };
+        let caller = CallerContext::mcp(
+            "operator-1",
+            &domain::PrincipalClass::Operator,
+            "runs.start",
+        );
+        let raw_policy = serde_json::json!({
+            "waiver": {
+                "state": "active",
+                "decision": "waive",
+                "reason_code": "emergency_override",
+                "expires_at": "2026-05-03T12:00:00Z"
+            },
+            "enforcement_mode": {
+                "mode": "permissive",
+                "reason_code": "dogfood_window",
+                "expires_at": "2026-05-03T12:00:00Z"
+            }
+        })
+        .to_string();
+
+        let merged = merge_rollout_contract_preflight_policy(
+            Some(r#"{"passed":true,"checks":[]}"#.into()),
+            Some(&raw_policy),
+            &journal,
+            &caller,
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let waiver = &value["rollout_contract_preflight"]["waiver"];
+
+        assert_eq!(value["passed"], serde_json::json!(true));
+        assert_eq!(waiver["authorized"], serde_json::json!(true));
+        assert_eq!(waiver["principal_id"], serde_json::json!("operator-1"));
+        assert_eq!(waiver["audit_event_id"], serde_json::json!("journal-1"));
+    }
+
+    #[test]
+    fn p084_rollout_preflight_policy_rejects_principal_spoofing() {
+        let now = Utc::now();
+        let journal = CommandJournalEntry {
+            id: "journal-1".into(),
+            command_type: "StartRun",
+            payload_json: "{}".into(),
+            run_id: None,
+            created_at: now,
+            caller_surface: Some("mcp".into()),
+            caller_principal_id: Some("operator-1".into()),
+            caller_principal_class: Some("operator".into()),
+            caller_tool: Some("runs.start".into()),
+            request_id: None,
+        };
+        let caller = CallerContext::mcp(
+            "operator-1",
+            &domain::PrincipalClass::Operator,
+            "runs.start",
+        );
+        let raw_policy = serde_json::json!({
+            "waiver": {
+                "state": "active",
+                "decision": "waive",
+                "reason_code": "emergency_override",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "principal_id": "spoofed"
+            }
+        })
+        .to_string();
+
+        let err = merge_rollout_contract_preflight_policy(
+            None,
+            Some(&raw_policy),
+            &journal,
+            &caller,
+            now,
+        )
+        .expect_err("spoofed principal_id must fail closed");
+        assert!(err.to_string().contains("server-stamped"));
+    }
+
+    #[test]
+    fn p084_rollout_preflight_policy_rejects_oversized_payload() {
+        let now = Utc::now();
+        let journal = CommandJournalEntry {
+            id: "journal-1".into(),
+            command_type: "StartRun",
+            payload_json: "{}".into(),
+            run_id: None,
+            created_at: now,
+            caller_surface: Some("mcp".into()),
+            caller_principal_id: Some("operator-1".into()),
+            caller_principal_class: Some("operator".into()),
+            caller_tool: Some("runs.start".into()),
+            request_id: None,
+        };
+        let caller = CallerContext::mcp(
+            "operator-1",
+            &domain::PrincipalClass::Operator,
+            "runs.start",
+        );
+        let raw_policy = " ".repeat(MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES + 1);
+
+        let err = merge_rollout_contract_preflight_policy(
+            None,
+            Some(&raw_policy),
+            &journal,
+            &caller,
+            now,
+        )
+        .expect_err("oversized policy payload must fail closed");
+
+        assert!(err.to_string().contains("exceeds maximum length"));
     }
 
     #[test]

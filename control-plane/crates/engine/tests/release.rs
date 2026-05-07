@@ -387,8 +387,14 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
         release_mode: Some("sandbox".into()),
     };
 
-    let receipt =
-        DeliveryReceiptBuilder::build_receipt(&run, &delivery_config, None, "Release idea", None);
+    let receipt = DeliveryReceiptBuilder::build_receipt(
+        &run,
+        &delivery_config,
+        None,
+        None,
+        "Release idea",
+        None,
+    );
 
     assert!(
         receipt.is_none(),
@@ -1289,6 +1295,7 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
             failure_stage: Some("sentinel".into()),
             failure_reason: Some("keep me".into()),
         }),
+        rollout_contract_readback: None,
         implementation_review_status: Some("sentinel".into()),
         timestamp: Utc::now(),
     };

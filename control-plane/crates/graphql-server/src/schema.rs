@@ -9,8 +9,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, closeout, ideas, projections, runs,
-    steward as steward_repo, workflow_conflicts,
+    approvals, artifact_contracts, artifacts, closeout, ideas, projections,
+    rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
 };
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
 use domain::events::DomainEvent;
@@ -111,6 +111,10 @@ async fn enrich_run_with_artifact_contracts(
         artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
             .await?
             .map(|stored| stored.summary.into());
+    gql.rollout_contract_readback_json =
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+            .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
     gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
@@ -1692,8 +1696,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, ideas, projections, runs, stages, steward,
-        workflow_conflicts,
+        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, stages,
+        steward, workflow_conflicts,
     };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
@@ -1855,6 +1859,48 @@ mod tests {
             review_routing_json: None,
             closeout_readiness_mode: None,
         }
+    }
+
+    async fn persist_rollout_contract_readback(pool: &SqlitePool, run_id: RunId) {
+        use rollout_contract_checks::{
+            ProjectionIntegrity, RolloutContractDecision, RolloutContractEnforcementMode,
+            RolloutContractLifecycleState, RolloutContractStatus, UpsertRolloutContractCheck,
+        };
+
+        let now = Utc::now();
+        rollout_contract_checks::upsert_rollout_contract_check(
+            pool,
+            &UpsertRolloutContractCheck {
+                id: uuid::Uuid::new_v4(),
+                run_id: run_id.inner(),
+                proposal_id: "proposal-084".into(),
+                proposal_revision_id: "p084-r5".into(),
+                proposal_content_hash: "sha256:proposal".into(),
+                contract_object_hash: "sha256:contract".into(),
+                content_snapshot_id: "snapshot-1".into(),
+                checker_version: "p084-lint-1".into(),
+                status: RolloutContractStatus::Pass,
+                decision: RolloutContractDecision::Release,
+                lifecycle_state: RolloutContractLifecycleState::Terminal,
+                enforcement_mode: RolloutContractEnforcementMode::Enforce,
+                failure_reasons: vec![],
+                diagnostics: vec![],
+                waiver: None,
+                rollback_disposition: serde_json::json!({
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none",
+                    "steps": ["Move enforcement mode through an audited mutation."]
+                }),
+                projection_integrity: ProjectionIntegrity::Valid,
+                cutover_policy_revision: Some("p084-cutover-v1".into()),
+                redaction_state: "partial".into(),
+                retry_count: 0,
+                preflight_timeout_seconds: 45,
+            },
+            now,
+        )
+        .await
+        .unwrap();
     }
 
     fn make_workflow_conflict(run_id: RunId) -> WorkflowConflictRecord {
@@ -2970,6 +3016,7 @@ mod tests {
             .to_string(),
         );
         runs::insert(&pool, &run).await.unwrap();
+        persist_rollout_contract_readback(&pool, run_id).await;
 
         let schema = build_schema(
             pool.clone(),
@@ -2986,6 +3033,7 @@ mod tests {
                   run(id: "{run_id}") {{
                     id
                     deliveryPreflightJson
+                    rolloutContractReadbackJson
                   }}
                 }}
                 "#
@@ -3002,6 +3050,26 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("repo_root_exists"));
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["schemaVersion"],
+            serde_json::json!("operator_readback_v1")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["backendDecision"],
+            serde_json::json!("release")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["sourceLane"],
+            serde_json::json!("graphql")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["rollbackDisposition"]["dataLossRisk"],
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["adoptionMetric"]["name"],
+            serde_json::json!("new_applicable_proposals_with_passing_rollout_contract_percent")
+        );
     }
 
     #[tokio::test]

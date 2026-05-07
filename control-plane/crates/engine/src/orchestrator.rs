@@ -982,7 +982,8 @@ impl Orchestrator {
 
         // ── Worktree provisioning (Proposal 007) ────────────────────────
         // If any agent in this state needs a real git worktree (dedicated or
-        // shared — NOT meta_only), provision one before creating the stage.
+        // shared — NOT meta_only), provision one after the run-start rollout
+        // contract preflight has had a chance to fail closed.
         let needs_git_worktree = {
             let needs_wt = |a: &workflow::plan::ResolvedAgent| -> bool {
                 a.worktree_write_enabled && a.worktree_strategy.as_deref() != Some("meta_only")
@@ -991,8 +992,66 @@ impl Orchestrator {
                 || state.post_approval_tasks.iter().any(|t| needs_wt(&t.agent))
                 || needs_wt(&state.owner)
         };
+        let implementation_run_start_task = state
+            .tasks
+            .iter()
+            .chain(state.post_approval_tasks.iter())
+            .find(|task| is_code_writer_implementation_task(task));
         // Re-bind `run` as mutable reference so we can refresh it after provisioning.
         let mut run = run.clone();
+
+        // Regular compute state — start an existing pending retry attempt, or
+        // lazily create the first stage execution when no attempt exists.
+        let stage = if let Some(pending_stage) =
+            current_stage.filter(|s| !stage_is_stale && s.status == StageStatus::Pending)
+        {
+            info!(
+                run_id = %run_id,
+                state = %current_state_id,
+                stage_execution_id = %pending_stage.id,
+                attempt = pending_stage.attempt_number,
+                provider = %state.owner.provider,
+                "Entering compute state from pending retry stage"
+            );
+            pending_stage.clone()
+        } else {
+            info!(run_id = %run_id, state = %current_state_id, provider = %state.owner.provider, "Entering compute state");
+            self.create_stage_for_state(run_id, &current_state_id, state)
+                .await?
+        };
+
+        if let Some(task) = implementation_run_start_task {
+            if self
+                .block_implementation_run_start_if_rollout_contract_hold(
+                    run_id,
+                    &current_state_id,
+                    &stage,
+                    task,
+                    &plan,
+                    &run,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
+
+        stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
+
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Running,
+        });
+
+        if !matches!(run.status, RunStatus::Running) {
+            runs::update_status(&self.pool, run_id, RunStatus::Running).await?;
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Running,
+            });
+        }
+
         if needs_git_worktree && run.worktree_root.is_none() {
             let idea_opt_for_slug = ideas::find_by_id(&self.pool, run.idea_id)
                 .await
@@ -1056,41 +1115,6 @@ impl Orchestrator {
                     return Ok(());
                 }
             }
-        }
-
-        // Regular compute state — start an existing pending retry attempt, or
-        // lazily create the first stage execution when no attempt exists.
-        let stage = if let Some(pending_stage) =
-            current_stage.filter(|s| !stage_is_stale && s.status == StageStatus::Pending)
-        {
-            info!(
-                run_id = %run_id,
-                state = %current_state_id,
-                stage_execution_id = %pending_stage.id,
-                attempt = pending_stage.attempt_number,
-                provider = %state.owner.provider,
-                "Entering compute state from pending retry stage"
-            );
-            pending_stage.clone()
-        } else {
-            info!(run_id = %run_id, state = %current_state_id, provider = %state.owner.provider, "Entering compute state");
-            self.create_stage_for_state(run_id, &current_state_id, state)
-                .await?
-        };
-        stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
-
-        let _ = self.events.send(DomainEvent::StageStatusChanged {
-            run_id,
-            stage_execution_id: stage.id,
-            status: StageStatus::Running,
-        });
-
-        if !matches!(run.status, RunStatus::Running) {
-            runs::update_status(&self.pool, run_id, RunStatus::Running).await?;
-            let _ = self.events.send(DomainEvent::RunStatusChanged {
-                run_id,
-                status: RunStatus::Running,
-            });
         }
 
         if self
@@ -1607,6 +1631,111 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+
+    async fn block_implementation_run_start_if_rollout_contract_hold(
+        &self,
+        run_id: RunId,
+        current_state_id: &str,
+        stage: &StageExecution,
+        task: &workflow::plan::CompiledTask,
+        plan: &workflow::plan::RunPlan,
+        run: &domain::run::Run,
+    ) -> Result<bool> {
+        let persisted_artifacts = artifacts::list_by_run(&self.pool, run_id).await?;
+        let (approved_proposal_present, approved_proposal_artifact) = self
+            .ensure_implementation_handoff_artifact(
+                "approved_proposal",
+                run,
+                plan,
+                stage,
+                &persisted_artifacts,
+            )
+            .await?;
+
+        let preflight =
+            crate::rollout_contract_preflight::implementation_run_start_rollout_contract_preflight(
+                &self.pool,
+                run,
+                approved_proposal_artifact.as_ref(),
+            )
+            .await?;
+        if preflight.action
+            != crate::rollout_contract_preflight::RolloutContractPreflightAction::Hold
+        {
+            return Ok(false);
+        }
+
+        let required_artifacts: Vec<String> = task
+            .inputs
+            .iter()
+            .filter(|name| !is_inline_runtime_input(name))
+            .cloned()
+            .collect();
+        let available_artifacts = approved_proposal_present
+            .then(|| "approved_proposal".to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let missing_artifacts = if required_artifacts
+            .iter()
+            .any(|artifact| artifact == "approved_proposal")
+            && !approved_proposal_present
+        {
+            vec!["approved_proposal".to_string()]
+        } else {
+            Vec::new()
+        };
+        let now = Utc::now();
+        let handoff_status = ImplementationHandoffStatus {
+            schema_version: ImplementationHandoffStatus::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.to_string(),
+            task_name: task.task_name.clone(),
+            required_input_artifacts: required_artifacts,
+            available_input_artifacts: available_artifacts,
+            missing_input_artifacts: missing_artifacts.clone(),
+            approved_proposal_present,
+            approved_proposal_artifact_id: approved_proposal_artifact
+                .as_ref()
+                .map(|artifact| artifact.id.to_string()),
+            approved_proposal_digest: approved_proposal_artifact
+                .as_ref()
+                .and_then(|artifact| artifact.checksum_sha256.clone()),
+            worktree_root: run.worktree_root.clone(),
+            workspace_root: run.workspace_root.clone(),
+            artifact_root: run.artifact_root.clone(),
+            code_writer_start_status: "blocked_before_code".to_string(),
+            status: "blocked_before_code".to_string(),
+            missing_handoff_outputs: missing_artifacts,
+            last_handoff_agent_execution_id: None,
+            retryable_from: Some(format!("rollout_contract_preflight:{current_state_id}")),
+            blocked_before_code_reason: Some("rollout_contract_preflight_hold".to_string()),
+            updated_at: now,
+        };
+        workflow_conflicts::upsert_implementation_handoff_status(&self.pool, &handoff_status)
+            .await?;
+        stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+        if run.status != RunStatus::Blocked {
+            runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+        }
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Blocked,
+        });
+        let _ = self.events.send(DomainEvent::RunStatusChanged {
+            run_id,
+            status: RunStatus::Blocked,
+        });
+        warn!(
+            run_id = %run_id,
+            state = current_state_id,
+            task = %task.task_name,
+            rollout_contract_check_id = %preflight.check.id,
+            failure_reasons = ?preflight.check.failure_reasons,
+            "Rollout contract preflight held code_writer before enqueue"
+        );
+        Ok(true)
     }
 
     async fn block_code_writer_handoff_if_unavailable(
@@ -5905,7 +6034,11 @@ fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bo
     task.agent.agent_id == "code_writer"
         && matches!(
             task.task_name.as_str(),
-            "start_implementation" | "initial_implementation" | "continue_implementation"
+            "start_implementation"
+                | "initial_implementation"
+                | "continue_implementation"
+                | "refine_implementation"
+                | "refine_implementation_from_findings"
         )
 }
 
@@ -6429,6 +6562,12 @@ fn build_task_prompt(
              object using the canonical path keys below; the engine will \
              materialize canonical files after contract validation.",
         ));
+        parts.push(String::from(
+            "Tool stdout is not an output channel. Only the final assistant \
+             message is settled for `CHAINWORKS_OUTPUT`. Do not call shell \
+             `echo`, `printf`, or file-writing commands to return \
+             `CHAINWORKS_OUTPUT`.",
+        ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
             parts.push(format!("- `{output_name}` → `{normalized}`"));
@@ -6473,6 +6612,10 @@ fn build_task_prompt(
              top-level JSON object and nothing else.\n\
              - When returning outputs through `CHAINWORKS_OUTPUT`, the value \
                for each canonical path is treated as that output file content.\n\
+             - Tool stdout is not an output channel; only the final assistant \
+               message is settled.\n\
+             - Do not call shell `echo`, `printf`, or file-writing commands \
+               to return `CHAINWORKS_OUTPUT`.\n\
              - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
              - Do NOT emit markdown, prose, or companion files unless they \
                are explicitly listed as required outputs.\n\
@@ -6977,6 +7120,171 @@ mod tests {
         CompiledLoop, CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
         OutputSchema, ResolvedAgent, RunPlan,
     };
+
+    #[test]
+    fn approved_proposal_snapshot_path_is_workspace_relative() {
+        let stored = Orchestrator::workspace_relative_artifact_path(
+            std::path::Path::new(
+                "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md",
+            ),
+            "/workspace",
+        );
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(".chainworks/runs/run-1/proposals/approved/proposal.md")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approved_proposal_snapshot_requires_valid_rollout_contract() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let source_rel = format!(".chainworks/runs/{run_id}/proposals/current/proposal.json");
+        let source_path = tmp.path().join(&source_rel);
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            br#"{"proposal_id":"P999","title":"Missing rollout contract"}"#,
+        )
+        .unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_5_implementation_ready".into(),
+            label: "Implementation ready".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.json".into(),
+        );
+        let source_artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_4_proposal_reviewed".into(),
+            agent_id: "proposal_writer".into(),
+            name: "proposal_current".into(),
+            contract_id: "proposal_current".into(),
+            format: ArtifactFormat::Json,
+            file_path: source_rel,
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        };
+
+        let snapshot = orchestrator
+            .snapshot_approved_proposal_handoff_artifact(&run, &plan, &stage, &[source_artifact])
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.is_none(),
+            "approved_proposal must not be created without a valid rollout_contract_v1"
+        );
+        assert!(
+            !tmp.path()
+                .join(format!(
+                    ".chainworks/runs/{run_id}/proposals/approved/proposal.json"
+                ))
+                .exists(),
+            "invalid proposal_current must not be copied into approved_proposal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approved_proposal_registration_requires_valid_rollout_contract() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let target_path = tmp.path().join(format!(
+            ".chainworks/runs/{run_id}/proposals/approved/proposal.json"
+        ));
+        std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target_path,
+            br#"{"proposal_id":"P999","title":"Existing invalid approved proposal"}"#,
+        )
+        .unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_5_implementation_ready".into(),
+            label: "Implementation ready".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.json".into(),
+        );
+
+        let snapshot = orchestrator
+            .snapshot_approved_proposal_handoff_artifact(&run, &plan, &stage, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.is_none(),
+            "existing approved_proposal file must not be registered without a valid rollout_contract_v1"
+        );
+    }
 
     fn test_run(run_id: RunId) -> Run {
         Run {
@@ -7531,6 +7839,34 @@ mod tests {
         task
     }
 
+    fn code_writer_task(task_name: &str) -> CompiledTask {
+        let mut task = reviewer_task();
+        task.agent.agent_id = "code_writer".into();
+        task.agent.worktree_write_enabled = true;
+        task.agent.worktree_strategy = Some("shared_implementation_worktree".into());
+        task.task_name = task_name.into();
+        task.inputs = vec!["approved_proposal".into()];
+        task.outputs = vec!["implementation_summary".into()];
+        task.output_schemas.clear();
+        task
+    }
+
+    #[test]
+    fn p084_run_start_guard_covers_initial_and_refinement_code_writer_tasks() {
+        for task_name in [
+            "start_implementation",
+            "initial_implementation",
+            "continue_implementation",
+            "refine_implementation",
+            "refine_implementation_from_findings",
+        ] {
+            assert!(
+                is_code_writer_implementation_task(&code_writer_task(task_name)),
+                "P084 rollout preflight must cover code_writer task {task_name}"
+            );
+        }
+    }
+
     #[test]
     fn implementation_review_readonly_tasks_use_implementation_worktree_strategy() {
         let task = implementation_security_task();
@@ -7738,6 +8074,9 @@ mod tests {
             prompt.contains("Return each required output through the final `CHAINWORKS_OUTPUT`")
         );
         assert!(prompt.contains("the engine will materialize canonical files"));
+        assert!(prompt.contains("Tool stdout is not an output channel"));
+        assert!(prompt.contains("Only the final assistant message is settled"));
+        assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains("Do not write run artifact outputs directly"));
         assert!(prompt.contains("implementation_complete"));
         assert!(prompt.contains("remaining_code_tasks"));

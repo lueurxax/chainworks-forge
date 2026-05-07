@@ -1245,6 +1245,8 @@ struct RuntimeSessionBridgeTests {
         #expect(packet.taskDirective.contains("<<<CHAINWORKS_OUTPUT:output_name>>>"))
         #expect(packet.taskDirective.contains("verify that every required output name appears in the final response envelope"))
         #expect(packet.taskDirective.contains("If any required output block is missing or empty, continue working"))
+        #expect(packet.taskDirective.contains("Tool stdout is not an output channel"))
+        #expect(packet.taskDirective.contains("Do not call shell `echo`"))
         #expect(packet.systemPrompt.contains("The app persists artifacts"))
     }
 
@@ -1712,6 +1714,9 @@ struct RuntimeSessionBridgeTests {
         let packet = RuntimeSessionBridge.buildExecutionPacket(agent: agent, task: task, context: context)
         #expect(packet.systemPrompt.contains("Never use shell redirection, heredocs, `cat >`, or direct writes into the artifact root"))
         #expect(packet.systemPrompt.contains("return required outputs via the final CHAINWORKS_OUTPUT envelope"))
+        #expect(packet.systemPrompt.contains("Tool stdout is not an output channel"))
+        #expect(packet.systemPrompt.contains("Only the final assistant message is settled"))
+        #expect(packet.systemPrompt.contains("Do not call shell `echo`"))
     }
 
     // MARK: - LiveExecutionOverride Tests
