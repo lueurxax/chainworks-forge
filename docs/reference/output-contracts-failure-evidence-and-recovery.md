@@ -53,6 +53,23 @@ Agent-authored required outputs should enter the system through the final `CHAIN
 
 The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
 
+### Missing outputs get one same-session repair turn
+
+When an agent turn finishes without required outputs, the runtime must try one narrow repair turn in the same live ACP session before it invalidates that session or blocks the run for `missing_required_outputs`.
+
+The repair turn is not a task retry. It must:
+
+- reuse the same `session_generation_id`,
+- send a narrow output-repair prompt,
+- tell the agent not to revisit or redo the task,
+- request only the missing or invalid `CHAINWORKS_OUTPUT` payloads,
+- include contract-complete skeletons for the failed declared outputs,
+- and validate the repaired payloads through the same declared-output import path.
+
+If the repair turn produces contract-valid required outputs, the executor merges the repair result into the original execution result and the stage may continue without a new provider session. If the repair turn fails, cannot be settled, or still does not produce valid outputs, the runtime records the failed output settlement and then invalidates/closes the active session generation so the next operator retry starts from a fresh session.
+
+`AcpRuntimeManager` therefore keeps a requested live session alive after both `completed` and `failed` prompt statuses. A failed prompt is preserved only so the executor can make this bounded repair attempt; normal cross-invocation reuse still follows the session-lineage policy in [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md).
+
 ### One contract authority
 
 `AgentCatalog.contracts` remains the single contract authority for this slice.
@@ -195,6 +212,9 @@ implementation-loop decisions.
 to manual release or handoff. It evaluates proposal-specific readiness by combining self-assessment,
 implementation audit, proposal gates, and release evidence handoff.
 
+The canonical operational reference for this behavior is
+[`implementation-closeout-readiness.md`](implementation-closeout-readiness.md).
+
 #### Readiness Mode
 
 Closeout readiness is governed by a per-run **closeout readiness mode** frozen at run admission:
@@ -226,7 +246,18 @@ If the same set of code blockers recurs across repeated audit/refine cycles with
 
 To ensure decision consistency, the synthesizer consumes a **Closeout Fingerprint** that captures the state of the run at the time of evaluation. If the fingerprint computation exceeds the **5,000ms latency budget**, the synthesizer fails closed with `status: unknown` and `decision: block_with_evidence`, preventing a transition based on potentially stale or inconsistent state.
 
-After the state-9 closeout transaction commits the active gate/readiness pair, the orchestrator rebuilds run-state projections so transition evaluation, GraphQL `runs.get`, and MCP `runs.get` see current P077 truth in the same `AdvanceRun` cycle. A rebuild failure is logged and retried on the next cycle: active SQLite truth remains authoritative and projections are eventually consistent. The exported run-state projection includes a derived `fingerprint_hash` short hash for each P077 row (sourced from `fingerprint_json` via `CloseoutFingerprint::short_hash`); it is the operator-facing identifier used in tooltips, copy-to-clipboard, and VoiceOver announcements, while the full fingerprint payload remains available only through artifact readback. Rows without a fingerprint expose `fingerprint_hash: null`.
+After the state-9 closeout transaction commits the active gate/readiness pair,
+the orchestrator rebuilds run-state projections so transition evaluation,
+GraphQL `runs.get`, and MCP `runs.get` see current closeout readiness truth in
+the same `AdvanceRun` cycle. A rebuild failure is logged and retried on the
+next cycle: active SQLite truth remains authoritative and projections are
+eventually consistent. The exported run-state projection includes a derived
+`fingerprint_hash` short hash for each closeout readiness row, sourced from
+`fingerprint_json` via `CloseoutFingerprint::short_hash`; it is the
+operator-facing identifier used in tooltips, copy-to-clipboard, and VoiceOver
+announcements, while the full fingerprint payload remains available only
+through artifact readback. Rows without a fingerprint expose
+`fingerprint_hash: null`.
 
 #### Risk Lineage
 

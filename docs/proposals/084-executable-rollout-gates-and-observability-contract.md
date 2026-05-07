@@ -5,7 +5,7 @@
 | Date | 2026-05-01 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [077-bounded-implementation-closeout-readiness-gates.md](077-bounded-implementation-closeout-readiness-gates.md), [059-release-evidence-gates-and-approval-payload-contract.md](059-release-evidence-gates-and-approval-payload-contract.md), [test-gates.md](../reference/test-gates.md), [release-gate.md](../reference/release-gate.md) |
+| Depends on | [implementation-closeout-readiness.md](../reference/implementation-closeout-readiness.md), [059-release-evidence-gates-and-approval-payload-contract.md](059-release-evidence-gates-and-approval-payload-contract.md), [test-gates.md](../reference/test-gates.md), [release-gate.md](../reference/release-gate.md) |
 | Related | P017 audit follow-ups, `scripts/test-gate.sh`, release evidence and operator reports |
 | Scope | Define the rollout gate before merge: migrations, metrics, projection/readback, operator reports, hold conditions, and rollback disposition for each implementation proposal. |
 | Goal | Stop closeout drift where evidence, metrics, and gates are added after implementation rather than required before release. |
@@ -112,7 +112,7 @@ Required tests:
 
 ## 6. Non-Goals
 
-- Do not replace P077 closeout readiness.
+- Do not replace implementation closeout readiness.
 - Do not require all GitHub PR comments to be dispositioned by the orchestrator.
 - Do not require production deployment automation.
 - Do not define one universal gate for every proposal; each proposal owns its own executable contract.

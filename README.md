@@ -103,7 +103,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - provider toolchain cache mapping ensuring isolated writable roots for Xcode and Go
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
-- bounded implementation closeout readiness gates (Proposal 077) ensuring proposal-specific proof and audit coverage before release
+- bounded implementation closeout readiness gates ensuring proposal proof, audit coverage, evidence freshness, and handoff settlement before release
 - fail-closed server parity harness with generation-scoped storage and runtime publication
 - deterministic reviewer routing and expanded proposal reviewer catalog
 - stable reference documentation under [`docs/reference`](docs/reference)

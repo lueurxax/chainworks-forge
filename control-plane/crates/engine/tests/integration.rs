@@ -8236,6 +8236,22 @@ sys.exit(0)
         .unwrap()
         .expect("active generation should exist");
     assert_eq!(generation.turn_count, 2);
+    let repair_started_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_events WHERE generation_id = ?1 AND event_type = 'output_contract_repair_started'",
+    )
+    .bind(&generation.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repair_started_count, 1);
+    let repair_succeeded_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_events WHERE generation_id = ?1 AND event_type = 'output_contract_repair_succeeded'",
+    )
+    .bind(&generation.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repair_succeeded_count, 1);
     acp.close_session(&generation.id).await.unwrap();
 }
 

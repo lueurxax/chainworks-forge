@@ -1009,24 +1009,23 @@ Command:
 ./scripts/test-gate.sh proposal-049
 ```
 
-### `proposal-077|p077`
+### `proposal-077|p077` - retained historical alias
 
-Bounded implementation closeout readiness gate.
+Bounded implementation closeout readiness gate. The alias name is retained for
+historical compatibility with existing scripts, tests, and receipts.
 
 Scope (what this gate actually covers):
 
-- static presence and required-field checks for
-  `docs/reference/p077-rollout-dependency-evidence.md`
-- static presence and required-field checks for
-  `docs/reference/p077-closeout-readiness-ui-evidence.md`
+- static presence and required-field checks for retained historical alias evidence file `docs/reference/p077-rollout-dependency-evidence.md`
+- static presence and required-field checks for retained historical alias evidence file `docs/reference/p077-closeout-readiness-ui-evidence.md`
 - `implementation_closeout_readiness_v1` decision-matrix validation (Rust domain/db/engine)
 - proposal gate domain contracts and status normalization
 - audit verdict policy enforcement (synthesizer unit tests)
 - bounded code/refine loop and soft convergence checkpoints (memory-level)
 - closeout fingerprinting and latency budget validation
 - DB closeout transaction atomicity (db integration tests)
-- durable P077 rollout metric, go/no-go decision, and rollback-to-advisory
-  execution fixtures
+- durable rollout metric, go/no-go decision, and rollback-to-advisory execution
+  fixtures
 - accessor routing proof (in-memory, not against live orchestrator graph)
 - GraphQL readback parity through the canonical closeout-readiness accessor
 - MCP `runs.get`/`runs.list` readback parity through the same accessor and
@@ -1042,38 +1041,35 @@ Use when:
 - changing implementation closeout readiness logic, status normalization, or decision rules
 - changing proposal gate domain contracts or DB closeout transaction
 - validating bounded loop convergence or soft checkpoint behavior at the synthesizer level
-- reproving the Proposal 077 Phase-1 Rust domain/db/engine slice
+- reproving the closeout readiness Rust domain/db/engine slice
 
 Host policy:
 
 - local Rust target only; no Swift or UI build required
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-077
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-077`.
 
 Important:
 
 - this gate covers the Rust domain/db/engine slice and GraphQL/MCP readback
-  parity of Proposal 077; full R14 acceptance still requires additional
-  integrated transition and macOS fixture evidence
-- it fails fast when the P077 rollout/dependency evidence document is missing
-  required dependency checklist, metric ledger, durable rollout store, or
-  rollback fields
-- it fails fast when the P077 UI evidence document is missing token, contrast,
-  diagnostics, recovery, route, or accessibility mappings
+  parity of closeout readiness; remote macOS runtime proof is the companion UI
+  gate
+- it fails fast when the retained historical alias rollout/dependency evidence
+  document is missing required dependency checklist, metric ledger, durable
+  rollout store, or rollback fields
+- it fails fast when the retained historical alias UI evidence document is
+  missing token, contrast, diagnostics, recovery, route, or accessibility
+  mappings
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
 - it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
 
-### `proposal-077-ui|p077-ui`
+### `proposal-077-ui|p077-ui` - retained historical alias
 
-Remote macOS runtime proof for the P077 closeout readiness surface.
+Remote macOS runtime proof for the closeout readiness surface.
 
 Scope:
 
-- direct P077 closeout-readiness fixture launch
+- direct closeout-readiness fixture launch
 - compact signal activation into the full closeout card
 - primary unblock and secondary blocker focus/read order
 - diagnostics sheet open plus explicit return/backlink route
@@ -1085,11 +1081,7 @@ Host policy:
 - remote macOS UI host required
 - runs through the same signed XCUITest path as other repository UI gates
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-077-ui
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-077-ui`.
 
 ### `p051-scaffold`
 

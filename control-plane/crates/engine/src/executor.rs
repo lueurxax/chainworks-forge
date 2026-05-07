@@ -2442,6 +2442,38 @@ impl BackgroundExecutor {
         }
     }
 
+    async fn record_output_contract_repair_event(
+        &self,
+        policy_decision: Option<&SessionPolicyDecision>,
+        event_type: domain::session::SessionEventType,
+        details: serde_json::Value,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+    ) {
+        let Some(decision) = policy_decision else {
+            return;
+        };
+        let event = domain::session::SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            lineage_id: decision.lineage.id.clone(),
+            generation_id: decision.generation.id.clone(),
+            event_type,
+            recorded_at: chrono::Utc::now(),
+            details_json: Some(details.to_string()),
+        };
+        if let Err(error) = sessions::insert_event(&self.pool, &event).await {
+            warn!(
+                run_id = %run_id,
+                stage_id = %stage_id,
+                agent_id = %agent_id,
+                session_generation_id = %decision.generation.id,
+                error = %error,
+                "Failed to persist output contract repair session event"
+            );
+        }
+    }
+
     pub async fn persist_implementation_self_assessment_summary_if_applicable(
         &self,
         artifact: &domain::artifact::Artifact,
@@ -4266,6 +4298,32 @@ impl BackgroundExecutor {
                                 .provider_session_id
                                 .clone()
                                 .or_else(|| repair_req.provider_session_id.clone());
+                            let repair_prompt_bytes = repair_req.prompt.len();
+                            let failed_outputs = failed_output_validation_details(&validation);
+                            info!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                agent_execution_id = %agent_exec_id,
+                                session_generation_id = %session_generation_id,
+                                failed_output_count = failed_outputs.len(),
+                                repair_prompt_bytes,
+                                "Output contract repair turn starting"
+                            );
+                            self.record_output_contract_repair_event(
+                                policy_decision.as_ref(),
+                                domain::session::SessionEventType::OutputContractRepairStarted,
+                                serde_json::json!({
+                                    "agent_execution_id": agent_exec_id.to_string(),
+                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                    "failed_outputs": failed_outputs,
+                                    "repair_prompt_bytes": repair_prompt_bytes,
+                                }),
+                                run_id,
+                                &stage_id,
+                                &agent_id,
+                            )
+                            .await;
 
                             match self
                                 .acp
@@ -4287,6 +4345,14 @@ impl BackgroundExecutor {
                                                     &repair_settlement.decisions,
                                                     &repair_settlement.accepted_payloads,
                                                 );
+                                            let (
+                                                repair_found_count,
+                                                repair_missing_count,
+                                                repair_stale_count,
+                                                repair_rejected_count,
+                                            ) = output_discovery_decision_counts(
+                                                &repair_settlement.decisions,
+                                            );
                                             let repair_validation = self
                                                 .validate_task_outputs_with_conflict_resolution_context(
                                                     run_id,
@@ -4306,34 +4372,122 @@ impl BackgroundExecutor {
                                                     run_id = %run_id,
                                                     stage_id = %stage_id,
                                                     agent_id = %agent_id,
+                                                    agent_execution_id = %agent_exec_id,
+                                                    session_generation_id = %session_generation_id,
+                                                    repair_found_count,
+                                                    repair_missing_count,
+                                                    repair_stale_count,
+                                                    repair_rejected_count,
                                                     "Output contract repair turn produced valid declared outputs"
                                                 );
+                                                self.record_output_contract_repair_event(
+                                                    policy_decision.as_ref(),
+                                                    domain::session::SessionEventType::OutputContractRepairSucceeded,
+                                                    serde_json::json!({
+                                                        "agent_execution_id": agent_exec_id.to_string(),
+                                                        "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                        "repair_found_count": repair_found_count,
+                                                        "repair_missing_count": repair_missing_count,
+                                                        "repair_stale_count": repair_stale_count,
+                                                        "repair_rejected_count": repair_rejected_count,
+                                                    }),
+                                                    run_id,
+                                                    &stage_id,
+                                                    &agent_id,
+                                                )
+                                                .await;
                                             } else {
+                                                let repair_failed_outputs =
+                                                    failed_output_validation_details(
+                                                        &repair_validation,
+                                                    );
                                                 warn!(
                                                     run_id = %run_id,
                                                     stage_id = %stage_id,
                                                     agent_id = %agent_id,
+                                                    agent_execution_id = %agent_exec_id,
+                                                    session_generation_id = %session_generation_id,
+                                                    repair_found_count,
+                                                    repair_missing_count,
+                                                    repair_stale_count,
+                                                    repair_rejected_count,
+                                                    failed_output_count = repair_failed_outputs.len(),
                                                     failure = ?repair_validation.failure_summary,
                                                     "Output contract repair turn did not produce valid declared outputs"
                                                 );
+                                                self.record_output_contract_repair_event(
+                                                    policy_decision.as_ref(),
+                                                    domain::session::SessionEventType::OutputContractRepairFailed,
+                                                    serde_json::json!({
+                                                        "agent_execution_id": agent_exec_id.to_string(),
+                                                        "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                        "failure_kind": "validation_failed",
+                                                        "failure_summary": repair_validation.failure_summary,
+                                                        "repair_found_count": repair_found_count,
+                                                        "repair_missing_count": repair_missing_count,
+                                                        "repair_stale_count": repair_stale_count,
+                                                        "repair_rejected_count": repair_rejected_count,
+                                                        "failed_outputs": repair_failed_outputs,
+                                                    }),
+                                                    run_id,
+                                                    &stage_id,
+                                                    &agent_id,
+                                                )
+                                                .await;
                                             }
                                         }
-                                        Err(error) => warn!(
-                                            run_id = %run_id,
-                                            stage_id = %stage_id,
-                                            agent_id = %agent_id,
-                                            error = %error,
-                                            "Output contract repair settlement failed"
-                                        ),
+                                        Err(error) => {
+                                            warn!(
+                                                run_id = %run_id,
+                                                stage_id = %stage_id,
+                                                agent_id = %agent_id,
+                                                agent_execution_id = %agent_exec_id,
+                                                session_generation_id = %session_generation_id,
+                                                error = %error,
+                                                "Output contract repair settlement failed"
+                                            );
+                                            self.record_output_contract_repair_event(
+                                                policy_decision.as_ref(),
+                                                domain::session::SessionEventType::OutputContractRepairFailed,
+                                                serde_json::json!({
+                                                    "agent_execution_id": agent_exec_id.to_string(),
+                                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                    "failure_kind": "settlement_failed",
+                                                    "error": error.to_string(),
+                                                }),
+                                                run_id,
+                                                &stage_id,
+                                                &agent_id,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
-                                Err(error) => warn!(
-                                    run_id = %run_id,
-                                    stage_id = %stage_id,
-                                    agent_id = %agent_id,
-                                    error = %error,
-                                    "Output contract repair turn failed"
-                                ),
+                                Err(error) => {
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        session_generation_id = %session_generation_id,
+                                        error = %error,
+                                        "Output contract repair turn failed"
+                                    );
+                                    self.record_output_contract_repair_event(
+                                        policy_decision.as_ref(),
+                                        domain::session::SessionEventType::OutputContractRepairFailed,
+                                        serde_json::json!({
+                                            "agent_execution_id": agent_exec_id.to_string(),
+                                            "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                            "failure_kind": "prompt_failed",
+                                            "error": error.to_string(),
+                                        }),
+                                        run_id,
+                                        &stage_id,
+                                        &agent_id,
+                                    )
+                                    .await;
+                                }
                             }
                         } else {
                             warn!(
@@ -4342,6 +4496,19 @@ impl BackgroundExecutor {
                                 agent_id = %agent_id,
                                 "Output contract repair skipped because no live session generation is available"
                             );
+                            self.record_output_contract_repair_event(
+                                policy_decision.as_ref(),
+                                domain::session::SessionEventType::OutputContractRepairSkipped,
+                                serde_json::json!({
+                                    "agent_execution_id": agent_exec_id.to_string(),
+                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                    "failure_kind": "missing_session_generation",
+                                }),
+                                run_id,
+                                &stage_id,
+                                &agent_id,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -7030,6 +7197,46 @@ fn validation_summary_requires_output_contract_repair(summary: &TaskValidationSu
     )
 }
 
+fn output_discovery_decision_counts(
+    decisions: &[OutputDiscoveryDecision],
+) -> (usize, usize, usize, usize) {
+    let found = decisions
+        .iter()
+        .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
+        .count();
+    let missing = decisions
+        .iter()
+        .filter(|decision| decision.status == OutputDiscoveryStatus::Missing)
+        .count();
+    let stale = decisions
+        .iter()
+        .filter(|decision| decision.reason == OutputDiscoveryReason::StaleExpectedOutput)
+        .count();
+    let rejected = decisions
+        .iter()
+        .filter(|decision| decision.status == OutputDiscoveryStatus::Rejected)
+        .count();
+    (found, missing, stale, rejected)
+}
+
+fn failed_output_validation_details(validation: &TaskValidationSummary) -> Vec<serde_json::Value> {
+    validation
+        .output_results
+        .iter()
+        .filter(|result| result.status != domain::validation::ValidationStatus::Passed)
+        .map(|result| {
+            serde_json::json!({
+                "output_name": result.output_name.as_str(),
+                "contract_id": result.contract_id.as_deref(),
+                "status": &result.status,
+                "missing_fields": &result.missing_fields,
+                "validation_error": result.validation_error.as_deref(),
+                "raw_payload_size": result.raw_payload_size,
+            })
+        })
+        .collect()
+}
+
 fn output_contract_repair_prompt(
     validation: &TaskValidationSummary,
     declared_outputs: &[DeclaredOutput],
@@ -7037,7 +7244,11 @@ fn output_contract_repair_prompt(
     let mut prompt = String::new();
     prompt.push_str("### Output Contract Repair\n");
     prompt.push_str(
-        "The previous response did not satisfy the required output contract. Do not redo unrelated implementation work. Return only corrected `CHAINWORKS_OUTPUT` blocks for the outputs listed below.\n",
+        "The previous response did not satisfy the required output contract. Use the context from \
+         the immediately preceding turn and do only the minimal synthesis needed to populate these \
+         outputs. Do not redo unrelated implementation work. Return only corrected \
+         `CHAINWORKS_OUTPUT` payloads for the outputs listed below. Do not include Markdown, \
+         explanations, or extra text. Do not wrap the JSON in code fences.\n",
     );
     if let Some(summary) = validation.failure_summary.as_deref() {
         prompt.push_str(&format!("- Validation failure: {summary}\n"));
@@ -7324,6 +7535,10 @@ mod tests {
         ));
         assert!(!prompt.contains("<<<CHAINWORKS_OUTPUT:implementation_review_summary>>>"));
         assert!(prompt.contains("Do not redo unrelated implementation work"));
+        assert!(prompt.contains("Do not include Markdown"));
+        assert!(prompt.contains("Do not wrap the JSON in code fences"));
+        assert!(prompt.contains("Use the context from the immediately preceding turn"));
+        assert!(prompt.contains("minimal synthesis needed to populate these outputs"));
     }
 
     #[test]

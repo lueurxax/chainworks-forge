@@ -632,5 +632,9 @@ fn session_event_type_to_str(event_type: &SessionEventType) -> &'static str {
         SessionEventType::OperatorReset => "operator_reset",
         SessionEventType::BudgetExceeded => "budget_exceeded",
         SessionEventType::Compacted => "compacted",
+        SessionEventType::OutputContractRepairStarted => "output_contract_repair_started",
+        SessionEventType::OutputContractRepairSucceeded => "output_contract_repair_succeeded",
+        SessionEventType::OutputContractRepairFailed => "output_contract_repair_failed",
+        SessionEventType::OutputContractRepairSkipped => "output_contract_repair_skipped",
     }
 }
