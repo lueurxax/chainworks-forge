@@ -152,8 +152,8 @@ pub async fn implementation_run_start_rollout_contract_preflight(
         }
     };
 
-    drop(guard);
     cleanup_preflight_singleflight_lock(&singleflight_key, &singleflight_lock);
+    drop(guard);
     result
 }
 
@@ -4083,6 +4083,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(terminal_count, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_existing_projection_self_heals_from_authoritative_record() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+        let stored = upsert_linted_contract_check(
+            &pool,
+            &run,
+            &artifact,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let projection_path = rollout_contract_check_projection_path(&run);
+        assert!(!projection_path.exists());
+
+        let evaluation =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_eq!(evaluation.action, RolloutContractPreflightAction::Allow);
+        assert_eq!(evaluation.check.id, stored.id);
+        assert_eq!(evaluation.check.status, RolloutContractStatus::Pass);
+        assert_eq!(
+            evaluation.check.projection_integrity,
+            ProjectionIntegrity::Valid
+        );
+        let projection: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&projection_path).unwrap()).unwrap();
+        assert_eq!(
+            projection["authoritative_record_id"],
+            serde_json::json!(stored.id.to_string())
+        );
+        assert_eq!(projection["status"], serde_json::json!("pass"));
+        assert_eq!(
+            projection["projection_integrity"],
+            serde_json::json!("valid")
+        );
     }
 
     #[tokio::test]
