@@ -1719,6 +1719,8 @@ agents:
 
       Cover problem, goals, non-goals, UX/UI notes, architecture, rollout, metrics, risks, and open questions.
 
+      For every proposal where the rollout gate is applicable, include a strict inline rollout_contract_v1 that conforms to docs/reference/executable-rollout-gate-template.md before the proposal can be frozen for implementation.
+
       Resolve reviewer feedback explicitly; do not silently ignore disagreements.
 
       Optimize for a proposal that can reach an aggregate score above 9 without hiding trade-offs."

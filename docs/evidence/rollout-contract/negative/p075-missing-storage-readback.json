@@ -1,0 +1,38 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": [
+    "proposal-075",
+    "p075"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-075"
+    ]
+  },
+  "migrations": {
+    "not_applicable": false,
+    "description": "Storage write budget migration evidence is required."
+  },
+  "metrics": {
+    "adoption_metric": "storage_health_rollout_pass_rate"
+  },
+  "readback_lanes": [
+    "run_report"
+  ],
+  "readback_fields": [
+    "rollout_contract_status"
+  ],
+  "operator_report_fields": [
+    "rollout_contract_status"
+  ],
+  "hold_conditions": [],
+  "rollback_disposition": {
+    "mode": "disable_p075_storage_routing_keep_diagnostics",
+    "data_loss_risk": "low"
+  },
+  "decision_vocabulary": [
+    "pass",
+    "fail"
+  ]
+}

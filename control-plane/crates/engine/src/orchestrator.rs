@@ -1954,6 +1954,27 @@ impl Orchestrator {
                 return Ok(None);
             };
             let source_path = Self::absolute_artifact_path(&source.file_path, &run.workspace_root);
+            let source_data = std::fs::read(&source_path).with_context(|| {
+                format!(
+                    "read proposal_current before approved_proposal snapshot {}",
+                    source_path.display()
+                )
+            })?;
+            let rollout_contract_failures =
+                crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
+                    &source_data,
+                    &source_path,
+                    &run.workspace_root,
+                )?;
+            if !rollout_contract_failures.is_empty() {
+                warn!(
+                    run_id = %run.id,
+                    stage_id = %stage.stage_id,
+                    failure_reasons = ?rollout_contract_failures,
+                    "approved_proposal snapshot blocked by rollout_contract_v1 invariant"
+                );
+                return Ok(None);
+            }
             if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!(
@@ -1962,10 +1983,9 @@ impl Orchestrator {
                     )
                 })?;
             }
-            std::fs::copy(&source_path, &target_path).with_context(|| {
+            std::fs::write(&target_path, &source_data).with_context(|| {
                 format!(
-                    "snapshot proposal_current {} to approved_proposal {}",
-                    source_path.display(),
+                    "write approved_proposal handoff artifact {}",
                     target_path.display()
                 )
             })?;
@@ -1977,6 +1997,21 @@ impl Orchestrator {
                 target_path.display()
             )
         })?;
+        let rollout_contract_failures =
+            crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
+                &data,
+                &target_path,
+                &run.workspace_root,
+            )?;
+        if !rollout_contract_failures.is_empty() {
+            warn!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                failure_reasons = ?rollout_contract_failures,
+                "approved_proposal artifact registration blocked by rollout_contract_v1 invariant"
+            );
+            return Ok(None);
+        }
         let digest = Sha256::digest(&data);
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -6858,6 +6893,11 @@ fn append_task_specific_guidance(
              the frozen implementation source of truth.",
         ));
         parts.push(String::from(
+            "Do not fabricate or emit `approved_proposal` for an applicable proposal \
+             unless `proposal_current` already contains a valid strict `rollout_contract_v1`. \
+             If it is missing or invalid, surface that proposal refinement is required.",
+        ));
+        parts.push(String::from(
             "Use `proposal_review_summary` as the implementation gate verdict \
              and planning context.",
         ));
@@ -7093,6 +7133,156 @@ mod tests {
         assert_eq!(
             stored.as_deref(),
             Some(".chainworks/runs/run-1/proposals/approved/proposal.md")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approved_proposal_snapshot_requires_valid_rollout_contract() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let source_rel = format!(".chainworks/runs/{run_id}/proposals/current/proposal.json");
+        let source_path = tmp.path().join(&source_rel);
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            br#"{"proposal_id":"P999","title":"Missing rollout contract"}"#,
+        )
+        .unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_5_implementation_ready".into(),
+            label: "Implementation ready".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.json".into(),
+        );
+        let source_artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_4_proposal_reviewed".into(),
+            agent_id: "proposal_writer".into(),
+            name: "proposal_current".into(),
+            contract_id: "proposal_current".into(),
+            format: ArtifactFormat::Json,
+            file_path: source_rel,
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        };
+
+        let snapshot = orchestrator
+            .snapshot_approved_proposal_handoff_artifact(&run, &plan, &stage, &[source_artifact])
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.is_none(),
+            "approved_proposal must not be created without a valid rollout_contract_v1"
+        );
+        assert!(
+            !tmp.path()
+                .join(format!(
+                    ".chainworks/runs/{run_id}/proposals/approved/proposal.json"
+                ))
+                .exists(),
+            "invalid proposal_current must not be copied into approved_proposal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approved_proposal_registration_requires_valid_rollout_contract() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let target_path = tmp.path().join(format!(
+            ".chainworks/runs/{run_id}/proposals/approved/proposal.json"
+        ));
+        std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target_path,
+            br#"{"proposal_id":"P999","title":"Existing invalid approved proposal"}"#,
+        )
+        .unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_5_implementation_ready".into(),
+            label: "Implementation ready".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.json".into(),
+        );
+
+        let snapshot = orchestrator
+            .snapshot_approved_proposal_handoff_artifact(&run, &plan, &stage, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.is_none(),
+            "existing approved_proposal file must not be registered without a valid rollout_contract_v1"
         );
     }
 
