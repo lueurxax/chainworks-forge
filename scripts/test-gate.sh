@@ -5552,6 +5552,7 @@ linter_negative_fixtures = [
     "docs/evidence/rollout-contract/negative/invalid-cutover-applicable-to.json",
     "docs/evidence/rollout-contract/negative/missing-required-surfaces.json",
     "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json",
+    "docs/evidence/rollout-contract/negative/windows-traversal-path.json",
 ]
 for fixture_path in linter_negative_fixtures:
     full = root / fixture_path
@@ -5701,7 +5702,12 @@ if preflight_boundary_index > worktree_provision_index:
         "WorktreeProvisioner::provision"
     )
 
-migration_text = (root / "control-plane/crates/db/migrations/044_p084_rollout_contract.sql").read_text()
+rollout_migration = root / "control-plane/crates/db/migrations/044_p084_rollout_contract.sql"
+if not rollout_migration.exists():
+    raise SystemExit(
+        "proposal-084: missing control-plane/crates/db/migrations/044_p084_rollout_contract.sql"
+    )
+migration_text = rollout_migration.read_text()
 if "redaction_state IN ('none', 'partial', 'full')" not in migration_text:
     raise SystemExit("proposal-084: rollout_contract_checks.redaction_state must be CHECK-constrained")
 

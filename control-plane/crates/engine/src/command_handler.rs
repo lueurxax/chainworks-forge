@@ -743,6 +743,8 @@ impl CommandJournalEntry {
     }
 }
 
+const MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES: usize = 64 * 1024;
+
 fn merge_rollout_contract_preflight_policy(
     base_json: Option<String>,
     raw_policy: Option<&str>,
@@ -753,6 +755,12 @@ fn merge_rollout_contract_preflight_policy(
     let Some(raw_policy) = raw_policy else {
         return Ok(base_json);
     };
+    if raw_policy.len() > MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES {
+        anyhow::bail!(
+            "rollout_contract_preflight_policy_json exceeds maximum length of {} bytes",
+            MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES
+        );
+    }
     let policy: serde_json::Value = serde_json::from_str(raw_policy)
         .map_err(|e| anyhow!("rollout_contract_preflight_policy_json: {e}"))?;
     let policy_object = policy
@@ -4948,6 +4956,40 @@ reviewer_override:
         )
         .expect_err("spoofed principal_id must fail closed");
         assert!(err.to_string().contains("server-stamped"));
+    }
+
+    #[test]
+    fn p084_rollout_preflight_policy_rejects_oversized_payload() {
+        let now = Utc::now();
+        let journal = CommandJournalEntry {
+            id: "journal-1".into(),
+            command_type: "StartRun",
+            payload_json: "{}".into(),
+            run_id: None,
+            created_at: now,
+            caller_surface: Some("mcp".into()),
+            caller_principal_id: Some("operator-1".into()),
+            caller_principal_class: Some("operator".into()),
+            caller_tool: Some("runs.start".into()),
+            request_id: None,
+        };
+        let caller = CallerContext::mcp(
+            "operator-1",
+            &domain::PrincipalClass::Operator,
+            "runs.start",
+        );
+        let raw_policy = " ".repeat(MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES + 1);
+
+        let err = merge_rollout_contract_preflight_policy(
+            None,
+            Some(&raw_policy),
+            &journal,
+            &caller,
+            now,
+        )
+        .expect_err("oversized policy payload must fail closed");
+
+        assert!(err.to_string().contains("exceeds maximum length"));
     }
 
     #[test]

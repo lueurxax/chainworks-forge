@@ -32,10 +32,10 @@ struct Proposal084Tests {
           "disabled_reason_code": null,
           "action_id": "rollout_contract_check:test",
           "operator_message": "Rollout contract preflight held implementation scheduling.",
-          "source_lane": "run_start_preflight",
+          "source_lane": "run_report",
           "projection_integrity": "valid",
           "cutover_policy_revision": "p084-cutover-v1",
-          "diagnostic_redaction": "bounded",
+          "diagnostic_redaction": "partial",
           "next_steps": ["repair_rollout_contract_or_apply_privileged_waiver"],
           "updated_at": "2026-05-02T09:00:00Z"
         }
@@ -49,7 +49,8 @@ struct Proposal084Tests {
         #expect(summary.holdConditions == ["missing_metrics"])
         #expect(summary.rollbackDisposition.mode == "feature_flag_disable_or_enforcement_mode_permissive")
         #expect(summary.cutoverPolicyRevision == "p084-cutover-v1")
-        #expect(summary.diagnosticRedaction == "bounded")
+        #expect(summary.sourceLane == "run_report")
+        #expect(summary.diagnosticRedaction == "partial")
     }
 
     @Test("PreflightReport carries rollout decision summary for read-only SwiftUI presentation")
@@ -73,7 +74,7 @@ struct Proposal084Tests {
             disabledReasonCode: nil,
             actionID: "rollout_contract_check:test",
             operatorMessage: "Rollout contract preflight passed; implementation scheduling may continue.",
-            sourceLane: "run_start_preflight",
+            sourceLane: "mcp",
             projectionIntegrity: "valid",
             cutoverPolicyRevision: "p084-cutover-v1",
             diagnosticRedaction: "none",

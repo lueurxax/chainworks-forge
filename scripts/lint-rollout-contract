@@ -19,6 +19,7 @@ Safety contract:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -50,6 +51,7 @@ SHELL_METACHARACTERS = frozenset("|&;$`><(){}")
 ALLOWED_FIXTURE_ROOTS = (
     PurePosixPath("docs/evidence/rollout-contract"),
 )
+WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
 REQUIRED_WHEN_APPLICABLE = (
     "gate_aliases",
@@ -123,6 +125,12 @@ REQUIRED_OPERATOR_READBACK_FIELDS = (
 
 def _check_path_safety(value: str, context: str, *, allowed_roots: tuple[PurePosixPath, ...] = ()) -> list[str]:
     failures: list[str] = []
+    if "\\" in value:
+        failures.append(f"unsafe_path: backslash path separator in {context}: {value!r}")
+        return failures
+    if WINDOWS_DRIVE_PREFIX.match(value):
+        failures.append(f"unsafe_path: Windows drive-letter path in {context}: {value!r}")
+        return failures
     if value.startswith("/"):
         failures.append(f"unsafe_path: absolute path in {context}: {value!r}")
         return failures

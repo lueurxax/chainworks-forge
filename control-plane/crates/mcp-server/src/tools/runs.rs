@@ -38,7 +38,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "review_routing_json": { "type": "string", "description": "Review routing options JSON for P060 dynamic reviewer selection" },
                     "rollout_contract_preflight_policy_json": {
                         "type": "string",
-                        "description": "P084 rollout-contract run-start policy request JSON. Accepts waiver and/or enforcement_mode objects; server stamps authorization, principal, and audit event."
+                        "description": "P084 rollout-contract run-start policy request JSON, capped at 64 KiB by the engine. Accepts waiver and/or enforcement_mode objects; server stamps authorization, principal, and audit event."
                     }
                 }
             }),
