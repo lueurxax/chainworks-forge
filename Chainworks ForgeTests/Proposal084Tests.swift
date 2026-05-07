@@ -96,4 +96,61 @@ struct Proposal084Tests {
         #expect(decoded.rolloutDecisionSummary?.backendDecision == "release")
         #expect(decoded.rolloutDecisionSummary?.nextSteps == ["continue_implementation_scheduling"])
     }
+
+    @Test("Run detail read model decodes GraphQL rollout readback for production presentation")
+    func runDetailDecodesGraphQLRolloutReadback() throws {
+        let data = Data("""
+        {
+          "id": "run-test",
+          "status": "running",
+          "workflowTitle": "Proposal implementation",
+          "freshnessState": "live",
+          "totalStages": 2,
+          "completedStages": 1,
+          "failedStages": 0,
+          "pendingApprovals": 0,
+          "rolloutContractReadbackJson": {
+            "schemaVersion": "operator_readback_v1",
+            "authoritativeRecordId": "rollout-contract-check:test",
+            "runId": "run-test",
+            "proposalId": "proposal-084",
+            "proposalRevisionId": "p084-r5",
+            "status": "pass",
+            "backendDecision": "release",
+            "failureReasons": [],
+            "waiverState": "none",
+            "waiverExpiresAt": null,
+            "enforcementMode": "enforce",
+            "enforcementModeReason": "post-cutover-implementation-start",
+            "holdConditions": [],
+            "rollbackDisposition": {
+              "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+              "dataLossRisk": "none",
+              "steps": []
+            },
+            "enabledState": "enabled",
+            "disabledReasonCode": null,
+            "actionId": "rollout_contract_check:test",
+            "operatorMessage": "Rollout contract preflight passed; implementation scheduling may continue.",
+            "sourceLane": "graphql",
+            "projectionIntegrity": "valid",
+            "cutoverPolicyRevision": "p084-cutover-v1",
+            "diagnosticRedaction": "none",
+            "nextSteps": ["continue_implementation_scheduling"],
+            "updatedAt": "2026-05-02T09:00:00Z"
+          }
+        }
+        """.utf8)
+
+        let run = try JSONDecoder().decode(P031RunRowReadModel.self, from: data)
+        let detail = P031RunDetailReadModel(run: run, stages: [], artifacts: [])
+        let presentation = P031RunDetailPresenter.presentation(
+            for: detail,
+            currentFreshness: P031FreshnessSnapshot(state: .live),
+            checkedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        #expect(run.rolloutDecisionSummary?.sourceLane == "graphql")
+        #expect(presentation.rolloutDecisionSummary?.backendDecision == "release")
+    }
 }

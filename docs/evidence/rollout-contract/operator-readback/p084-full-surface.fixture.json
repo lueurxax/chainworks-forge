@@ -29,20 +29,71 @@
     "mcp": {
       "rollout_contract_status": "pass",
       "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
       "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_projection_integrity": "valid"
+      "rollout_contract_enforcement_mode_reason": "post-cutover-implementation-start",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p084-action-00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": null,
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p084-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
     },
     "release_receipt": {
       "rollout_contract_status": "pass",
       "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
       "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_projection_integrity": "valid"
+      "rollout_contract_enforcement_mode_reason": "post-cutover-implementation-start",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p084-action-00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": null,
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p084-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
     },
     "graphql": {
       "rolloutContractStatus": "pass",
       "rolloutContractDecision": "release",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
       "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractProjectionIntegrity": "valid"
+      "rolloutContractEnforcementModeReason": "post-cutover-implementation-start",
+      "rolloutContractHoldConditions": [],
+      "rolloutContractRollbackDisposition": {
+        "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+        "dataLossRisk": "none"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "enabled",
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "p084-action-00000000-0000-0000-0000-000000000001",
+      "rolloutContractOperatorMessage": null,
+      "rolloutContractProjectionIntegrity": "valid",
+      "rolloutContractCutoverPolicyRevision": "p084-cutover-v1",
+      "rolloutContractDiagnosticRedaction": "none",
+      "rolloutContractNextSteps": []
     }
   }
 }

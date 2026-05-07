@@ -13,6 +13,8 @@ pub struct DeliveryReceipt {
     pub worktree_root: String,
     pub base_revision: Option<String>,
     pub release_result: Option<ReleaseResultSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollout_contract_readback: Option<serde_json::Value>,
     pub implementation_review_status: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
@@ -35,6 +37,7 @@ impl DeliveryReceiptBuilder {
         run: &Run,
         delivery_config: &DeliveryConfiguration,
         release_result: Option<&ReleaseResult>,
+        rollout_contract_readback: Option<serde_json::Value>,
         idea_title: &str,
         review_status: Option<&str>,
     ) -> Option<DeliveryReceipt> {
@@ -71,6 +74,7 @@ impl DeliveryReceiptBuilder {
             worktree_root,
             base_revision: run.base_revision.clone(),
             release_result: release_summary,
+            rollout_contract_readback,
             implementation_review_status: review_status.map(String::from),
             timestamp: Utc::now(),
         })

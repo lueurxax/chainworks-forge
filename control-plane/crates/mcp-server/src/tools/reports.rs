@@ -727,7 +727,7 @@ pub(crate) async fn rollout_contract_readback_json(
     Ok(
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
             .await?
-            .map(|check| check.operator_readback_json())
+            .map(|check| check.operator_readback_json_for_lane("run_report"))
             .unwrap_or(serde_json::Value::Null),
     )
 }
@@ -1360,6 +1360,11 @@ mod tests {
                 failure_reasons: vec![],
                 diagnostics: vec![],
                 waiver: None,
+                rollback_disposition: serde_json::json!({
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none",
+                    "steps": ["Move enforcement mode through an audited mutation."]
+                }),
                 projection_integrity: ProjectionIntegrity::Valid,
                 cutover_policy_revision: Some("cutover-p084-test".to_string()),
                 redaction_state: "operator_safe".to_string(),

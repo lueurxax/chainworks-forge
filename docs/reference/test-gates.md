@@ -1869,9 +1869,12 @@ Scope:
   - `docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json` — fails `missing_hold_conditions` and `missing_rollback_disposition`
   - `docs/evidence/rollout-contract/negative/missing-metrics-p017-style.json` — fails `missing_metrics` (P017-style omission caught before closeout)
   - `docs/evidence/rollout-contract/negative/missing-operator-decision-fields.json` — fails `empty_readback_fields`
+  - `docs/evidence/rollout-contract/negative/invalid-cutover-applicable-to.json` — fails `invalid_cutover_policy.applicable_to`
   - `docs/evidence/rollout-contract/negative/unsafe-path-and-command.json` — fails `unsafe_command` and `unsafe_path`
-- Documentation-only negative fixtures exist as valid JSON (AC-005 scheduler behavior, AC-006 self-contract check)
-- `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields (AC-004, AC-006)
+- Documentation-only negative fixtures exist as valid JSON where they describe runtime behavior rather than linter input (AC-006 self-contract check)
+- Rust rollout-contract regressions run under the canonical gate: `cargo test -p engine rollout_contract_preflight --lib`, `cargo test -p db rollout_contract_checks --lib`, clean DB migration install, and schema-version parity. The Python phase also verifies the orchestrator keeps the rollout preflight hold path before code_writer enqueue and blocks the stage/run on `RolloutContractPreflightAction::Hold` (AC-005)
+- `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields and a `parity_lanes` object whose `mcp` and `release_receipt` payloads carry the same fields and whose `graphql` payload carries the matching camelCase projection fields (AC-004, AC-006)
+- `Chainworks ForgeTests/Proposal084Tests` runs as the Swift parity slice, proving `RolloutDecisionSummary` decodes `operator_readback_v1`, `PreflightReport` carries the read-only summary, and the GraphQL run-row read model decodes the camelCase rollout readback without recomputing authority (AC-004, AC-006)
 - This gate documentation section exists in `docs/reference/test-gates.md` and references `rollout_contract_v1`, `negative fixture`, and `lint-rollout-contract` (AC-002)
 
 Use when:
@@ -1882,8 +1885,8 @@ Use when:
 
 Host policy:
 
-- local Python 3 required; no Rust toolchain, Xcode, UI host, or network required
-- pure file-system + subprocess validation; no daemon process required
+- local Python 3, Rust toolchain, and Swift Testing host (Xcode toolchain) required for the `Proposal084Tests` slice; no UI host or network required after Swift package cache is warm
+- pure file-system + subprocess validation for the lint and fixture phase; no daemon process required
 
 Command:
 
@@ -1896,6 +1899,6 @@ Important:
 
 - `p084` is accepted as an alias
 - the gate runs `scripts/lint-rollout-contract` via subprocess; linter exit-0 on a negative fixture is a gate failure
-- documentation-only negative fixtures (scheduler behavior, self-contract check) are validated for JSON well-formedness only; they are not linter inputs
-- the gate does not validate Rust control-plane preflight wiring (Phases 3-4), readback lane implementations (Phase 5), or enforce-mode cutover (Phase 7); those phases require `cargo test` evidence and are tracked separately
-- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, or the p084-full-surface fixture omits a required readback field
+- documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
+- the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
+- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the p084-full-surface fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails

@@ -177,6 +177,8 @@ Release artifacts resolve through the compiled workflow/catalog artifact map so 
 | `connect_upload_receipt` | `.chainworks/release/connect-upload-receipt.json` |
 | `delivery_receipt` | `.chainworks/release/delivery-receipt.json` |
 
+When a rollout contract is in scope for the run, `delivery_receipt` carries an optional `rollout_contract_readback` payload (`operator_readback_v1`) so the release-receipt lane stays parity with run report, MCP, and GraphQL. See [executable-rollout-gate-template.md](executable-rollout-gate-template.md) for the canonical readback schema.
+
 ### Git release step
 
 The git release service:

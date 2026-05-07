@@ -8,7 +8,7 @@ Detailed context: [2026-05-06 main roadmap update](roadmap/2026-05-06-main-roadm
 ## Now
 
 - P073 freeze mode.
-- P084 minimal rollout-gate template.
+- P084 executable rollout-gate contract: template, linter, run-start preflight, authoritative storage, and four-lane operator readback.
 - UI action boundary closeout.
 - P075 local persistence write-budget / evidence-spooling infrastructure.
 

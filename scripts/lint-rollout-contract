@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 MAX_FILE_BYTES = 1_048_576  # 1 MiB
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 SCHEMA_VERSION = "rollout_contract_v1"
 ALLOWED_APPLICABILITY = {"required", "not_applicable"}
@@ -43,16 +44,26 @@ ALLOWED_DECISION_VOCABULARY = {
     "waive",
 }
 ALLOWED_ENFORCEMENT_MODES = {"enforce", "permissive", "disabled"}
+ALLOWED_CUTOVER_APPLICABLE_TO = {"post_cutover_implementation_starts"}
 ALLOWED_READBACK_LANES = {"run_report", "mcp", "release_receipt", "graphql"}
 SHELL_METACHARACTERS = frozenset("|&;$`><(){}")
+ALLOWED_FIXTURE_ROOTS = (
+    PurePosixPath("docs/evidence/rollout-contract"),
+)
 
 REQUIRED_WHEN_APPLICABLE = (
     "gate_aliases",
+    "commands",
+    "migrations",
     "metrics",
     "readback_lanes",
     "readback_fields",
+    "readback_fixture",
+    "operator_report_fields",
     "hold_conditions",
     "rollback_disposition",
+    "decision_vocabulary",
+    "negative_fixtures",
 )
 
 ROLLBACK_DISPOSITION_REQUIRED = ("mode", "data_loss_risk")
@@ -110,7 +121,7 @@ REQUIRED_OPERATOR_READBACK_FIELDS = (
 )
 
 
-def _check_path_safety(value: str, context: str) -> list[str]:
+def _check_path_safety(value: str, context: str, *, allowed_roots: tuple[PurePosixPath, ...] = ()) -> list[str]:
     failures: list[str] = []
     if value.startswith("/"):
         failures.append(f"unsafe_path: absolute path in {context}: {value!r}")
@@ -118,6 +129,32 @@ def _check_path_safety(value: str, context: str) -> list[str]:
     parts = PurePosixPath(value).parts
     if ".." in parts:
         failures.append(f"unsafe_path: parent traversal (..) in {context}: {value!r}")
+        return failures
+    if allowed_roots:
+        rel = PurePosixPath(value)
+        if not any(rel.is_relative_to(root) for root in allowed_roots):
+            failures.append(
+                f"unsafe_path: {context} must be under one of {[str(root) for root in allowed_roots]}: {value!r}"
+            )
+            return failures
+        candidate = REPO_ROOT / value
+        if not candidate.exists():
+            failures.append(f"unsafe_path: {context} path does not exist: {value!r}")
+            return failures
+        resolved = candidate.resolve()
+        allowed: list[Path] = []
+        for root in allowed_roots:
+            root_path = REPO_ROOT / str(root)
+            if not root_path.exists():
+                failures.append(
+                    f"unsafe_path: allowed root does not exist for {context}: {str(root)!r}"
+                )
+                return failures
+            allowed.append(root_path.resolve())
+        if not any(resolved == root or root in resolved.parents for root in allowed):
+            failures.append(
+                f"unsafe_path: symlink escape or disallowed canonical target in {context}: {value!r}"
+            )
     return failures
 
 
@@ -387,14 +424,24 @@ def lint(path: str) -> list[str]:
     # path safety: readback_fixture
     rf = data.get("readback_fixture")
     if isinstance(rf, str):
-        failures.extend(_check_path_safety(rf, "readback_fixture"))
+        failures.extend(
+            _check_path_safety(
+                rf, "readback_fixture", allowed_roots=ALLOWED_FIXTURE_ROOTS
+            )
+        )
 
     # path safety: negative_fixtures values
     neg = data.get("negative_fixtures")
     if isinstance(neg, dict):
         for k, v in neg.items():
             if isinstance(v, str):
-                failures.extend(_check_path_safety(v, f"negative_fixtures.{k}"))
+                failures.extend(
+                    _check_path_safety(
+                        v,
+                        f"negative_fixtures.{k}",
+                        allowed_roots=ALLOWED_FIXTURE_ROOTS,
+                    )
+                )
             else:
                 failures.append(f"invalid_negative_fixtures.{k}: value must be a string path")
     elif neg is not None:
@@ -425,6 +472,16 @@ def lint(path: str) -> list[str]:
         for field in ("revision", "applicable_to"):
             if not isinstance(cutover.get(field), str) or not cutover.get(field):
                 failures.append(f"missing_cutover_policy.{field}: must be a non-empty string")
+        applicable_to = cutover.get("applicable_to")
+        if (
+            isinstance(applicable_to, str)
+            and applicable_to
+            and applicable_to not in ALLOWED_CUTOVER_APPLICABLE_TO
+        ):
+            failures.append(
+                "invalid_cutover_policy.applicable_to: "
+                f"{applicable_to!r} not in {sorted(ALLOWED_CUTOVER_APPLICABLE_TO)}"
+            )
         mode = cutover.get("enforcement_mode_at_cutover")
         if mode is not None and mode not in ALLOWED_ENFORCEMENT_MODES:
             failures.append(

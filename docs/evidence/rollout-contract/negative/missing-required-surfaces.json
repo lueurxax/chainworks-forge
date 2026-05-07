@@ -1,0 +1,34 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": ["proposal-084", "p084"],
+  "metrics": {
+    "adoption_metric": "new_applicable_proposals_with_passing_rollout_contract_percent"
+  },
+  "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+  "readback_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "hold_conditions": ["missing_contract"],
+  "rollback_disposition": {
+    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+    "data_loss_risk": "none"
+  }
+}

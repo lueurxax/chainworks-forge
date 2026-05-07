@@ -40,6 +40,7 @@ At the current baseline, the product includes:
 - an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
 - idea archive/restore lifecycle,
 - workflow-topology rendering in run detail,
+- run-start rollout-contract preflight that blocks implementation work enqueue under enforce mode and exposes a four-lane operator readback (run report, MCP, release receipt, GraphQL),
 - repo-backed full delivery with dedicated worktrees and manual release,
 - worktree mutation barrier protecting concurrent read/write and orchestrated sync (Proposal 064),
 - run worktree main sync and cross-run knowledge capsules (Proposal 064 Phase 0 contract freeze),
@@ -77,6 +78,7 @@ Use these reference docs as the current source of truth:
 | Parity harness | [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md) |
 | Workflow map | [live-workflow-map.md](live-workflow-map.md) |
 | Repo-backed full delivery | [full-mvp-delivery.md](full-mvp-delivery.md) |
+| Run-start rollout-contract preflight | [executable-rollout-gate-template.md](executable-rollout-gate-template.md) |
 | MVP sign-off | [mvp-sign-off.md](mvp-sign-off.md) |
 | Steward | [forge-steward.md](forge-steward.md) |
 | Test strategy and gates | [test-suite-architecture.md](test-suite-architecture.md), [test-gates.md](test-gates.md), [agent-ui-test-execution.md](agent-ui-test-execution.md) |

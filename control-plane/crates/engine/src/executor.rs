@@ -22,7 +22,8 @@ use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
     agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, legacy_discovery_overrides,
-    projections, scheduler, sessions, stages, validation, work_items, workflow_conflicts,
+    projections, rollout_contract_checks, scheduler, sessions, stages, validation, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{
@@ -6549,10 +6550,18 @@ impl BackgroundExecutor {
         provider: &str,
         model: Option<String>,
     ) -> Result<Option<String>> {
+        let rollout_contract_readback =
+            rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+                &self.pool,
+                run.id.inner(),
+            )
+            .await?
+            .map(|check| check.operator_readback_json_for_lane("release_receipt"));
         let receipt = match DeliveryReceiptBuilder::build_receipt(
             run,
             delivery_config,
             Some(release_result),
+            rollout_contract_readback,
             idea_title,
             review_status,
         ) {

@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS rollout_contract_checks (
   projection_integrity       TEXT    NOT NULL DEFAULT 'valid',
   cutover_policy_revision    TEXT,
   -- redaction_state: none | partial | full
-  redaction_state            TEXT    NOT NULL DEFAULT 'none',
+  redaction_state            TEXT    NOT NULL DEFAULT 'none'
+                                CHECK (redaction_state IN ('none', 'partial', 'full')),
   retry_count                INTEGER NOT NULL DEFAULT 0,
   preflight_timeout_seconds  INTEGER NOT NULL DEFAULT 45,
   created_at                 TEXT    NOT NULL,

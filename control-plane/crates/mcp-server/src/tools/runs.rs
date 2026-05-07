@@ -819,7 +819,7 @@ async fn attach_implementation_self_assessment_summary(
             run_id.inner(),
         )
         .await?
-        .map(|check| check.operator_readback_json()),
+        .map(|check| check.operator_readback_json_for_lane("mcp")),
         None => None,
     };
 
@@ -1060,9 +1060,14 @@ mod tests {
                 failure_reasons: vec![],
                 diagnostics: vec![],
                 waiver: None,
+                rollback_disposition: serde_json::json!({
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none",
+                    "steps": ["Move enforcement mode through an audited mutation."]
+                }),
                 projection_integrity: ProjectionIntegrity::Valid,
                 cutover_policy_revision: Some("p084-cutover-v1".into()),
-                redaction_state: "bounded".into(),
+                redaction_state: "partial".into(),
                 retry_count: 0,
                 preflight_timeout_seconds: 45,
             },

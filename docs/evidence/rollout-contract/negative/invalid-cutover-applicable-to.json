@@ -3,25 +3,17 @@
   "applicability": "required",
   "gate_aliases": ["proposal-084", "p084"],
   "commands": {
-    "allowlist": [
-      "./scripts/test-gate.sh proposal-084",
-      "./scripts/test-gate.sh p084"
-    ],
-    "commentary": "Gate commands are declarative expectations only; the linter never executes them."
+    "allowlist": ["./scripts/test-gate.sh proposal-084"]
   },
   "migrations": {
-    "not_applicable": false,
-    "description": "Migration 044 adds rollout_contract_checks table. Additive, no data loss risk."
+    "not_applicable": true,
+    "justification": "No schema migration required for this negative fixture."
   },
   "metrics": {
     "adoption_metric": "new_applicable_proposals_with_passing_rollout_contract_percent",
     "operational_metrics": [
       "rollout_contract_lint_total{proposal_id,status,failure_reason}",
-      "rollout_contract_run_start_block_total{proposal_id,reason,enforcement_mode}",
-      "rollout_contract_waiver_total{proposal_id,reason,waiver_state}",
-      "rollout_contract_enforcement_mode_total{proposal_id,mode}",
-      "rollout_contract_permissive_dogfood_total{proposal_id,status,would_block}",
-      "rollout_contract_tamper_or_stale_projection_total{proposal_id,projection_integrity}"
+      "rollout_contract_run_start_block_total{proposal_id,reason,enforcement_mode}"
     ]
   },
   "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
@@ -69,23 +61,13 @@
   "hold_conditions": [],
   "rollback_disposition": {
     "mode": "feature_flag_disable_or_enforcement_mode_permissive",
-    "data_loss_risk": "none",
-    "steps": [
-      "Move enforcement mode only through privileged audited control-plane mutation with TTL.",
-      "Keep proposal-084 gate runnable for diagnosis.",
-      "Expose permissive/disabled state in operator_readback_v1.",
-      "Repair and attach re-enable evidence before TTL expiry."
-    ]
+    "data_loss_risk": "none"
   },
-  "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
-  "negative_fixtures": {
-    "missing_template": "docs/evidence/rollout-contract/negative/missing-template.json",
-    "missing_hold_and_rollback": "docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json",
-    "missing_metrics_p017_style": "docs/evidence/rollout-contract/negative/missing-metrics-p017-style.json",
-    "missing_operator_decision_fields": "docs/evidence/rollout-contract/negative/missing-operator-decision-fields.json",
-    "run_start_missing_contract_enqueues_work": "docs/evidence/rollout-contract/negative/run-start-missing-contract-enqueues-work.json",
-    "p084_self_contract_missing_readback_field": "docs/evidence/rollout-contract/negative/p084-self-contract-missing-readback-field.json",
-    "missing_required_surfaces": "docs/evidence/rollout-contract/negative/missing-required-surfaces.json",
-    "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json"
+  "cutover_policy": {
+    "revision": "p084-cutover-v1",
+    "enforcement_mode_at_cutover": "enforce",
+    "applicable_to": "post-cutover-implementation-starts",
+    "grandfathered_rendering": "not_applicable",
+    "effective_timestamp_iso8601": "2026-06-01T00:00:00Z"
   }
 }

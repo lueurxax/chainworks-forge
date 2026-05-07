@@ -30,23 +30,23 @@ inline+sidecar is rejected. The linter enforces `additionalProperties: false`.
 | `schema_version` | `"rollout_contract_v1"` | Must be this exact string. |
 | `applicability` | `"required"` \| `"not_applicable"` | `"not_applicable"` requires a `not_applicable_justification`. |
 | `gate_aliases` | non-empty `string[]` | All `scripts/test-gate.sh` aliases registered for this proposal. |
+| `commands.allowlist` | object | Declarative expected commands (never executed by linter). Shell metacharacters rejected. |
+| `migrations` | object | DB migration description. Use `not_applicable: true` plus `justification` if no migration. |
 | `metrics` | object | At minimum one of: `adoption_metric` (string) or `operational_metrics` (string[]). |
 | `readback_lanes` | non-empty `string[]` | Lanes where operators can read the rollout decision: `"run_report"`, `"mcp"`, `"release_receipt"`, `"graphql"`. |
 | `readback_fields` | non-empty `string[]` | Specific field names exposed on each lane. |
+| `readback_fixture` | string | Repo-relative path to parity fixture proving operator decision surface. |
+| `operator_report_fields` | non-empty `string[]` | Full list of operator report fields. |
 | `hold_conditions` | `string[]` | Conditions that trigger a hold. May be empty but must be present. |
 | `rollback_disposition` | object | Required fields: `mode` (string) and `data_loss_risk` (`"none"` \| `"low"` \| `"medium"` \| `"high"`). |
+| `decision_vocabulary` | non-empty `string[]` | Accepted decision strings for this proposal. |
+| `negative_fixtures` | object | Map of named negative fixture paths (repo-relative, no traversal). |
 
 ### Optional fields
 
 | Field | Description |
 |---|---|
-| `commands.allowlist` | Declarative expected commands (never executed by linter). Shell metacharacters rejected. |
-| `migrations` | DB migration description. Use `not_applicable: true` if no migration. |
-| `readback_fixture` | Repo-relative path to parity fixture proving operator decision surface. |
-| `operator_report_fields` | Full list of operator report fields. |
 | `hold_conditions_detail` | Extended descriptions for each hold condition. |
-| `decision_vocabulary` | Accepted decision strings for this proposal. |
-| `negative_fixtures` | Map of named negative fixture paths (repo-relative, no traversal). |
 | `not_applicable_justifications` | Per-section justifications when a section is not applicable. |
 | `cutover_policy` | Machine-readable cutover declaration (see below). |
 
@@ -79,9 +79,22 @@ inline+sidecar is rejected. The linter enforces `additionalProperties: false`.
   "readback_fields": [
     "rollout_contract_status",
     "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
     "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
     "rollout_contract_hold_conditions",
-    "rollout_contract_rollback_disposition"
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
   ],
   "readback_fixture": "docs/evidence/rollout-contract/operator-readback/pNNN-full-surface.fixture.json",
   "operator_report_fields": [
@@ -91,8 +104,18 @@ inline+sidecar is rejected. The linter enforces `additionalProperties: false`.
     "rollout_contract_waiver_state",
     "rollout_contract_waiver_expires_at",
     "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
     "rollout_contract_hold_conditions",
-    "rollout_contract_rollback_disposition"
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
   ],
   "hold_conditions": [
     "Unresolved projection-integrity violation detected at run start",
@@ -146,7 +169,7 @@ scheduling authority. The scheduler trusts the typed store, not this file.
 | `content_snapshot_id` | string | Opaque snapshot reference for audit. |
 | `checker_version` | string | Semantic version of the linter/checker binary. |
 | `authoritative_record_id` | string | Primary key in the control-plane readiness store. |
-| `status` | enum | `pass`, `fail`, `waived`, `not_applicable`, `timeout`, `missing_contract`, `tamper_detected`, `stale`. |
+| `status` | enum | `pass`, `fail`, `waived`, `not_applicable`, `timeout`, `cancelled`, `missing_contract`, `tamper_detected`, `stale`. |
 | `decision` | enum | `release`, `hold`, `waive`, `not_applicable`. |
 | `lifecycle_state` | enum | `running`, `terminal`, `partial`. |
 | `enforcement_mode` | enum | `enforce`, `permissive`, `disabled`. |
@@ -158,6 +181,10 @@ scheduling authority. The scheduler trusts the typed store, not this file.
 | `projection_integrity` | enum | `valid`, `tamper_detected`, `stale`. |
 | `cutover_policy_revision` | string \| null | Machine-readable cutover policy revision. |
 | `redaction_state` | enum | `none`, `partial`, `full`. |
+
+The control-plane store may attach additional audit fields (`run_id`, `created_at`,
+`updated_at`) to the projection for traceability. These are not part of the contract
+surface authors declare and are not used as scheduling authority.
 
 ### Valid example
 
@@ -194,8 +221,14 @@ scheduling authority. The scheduler trusts the typed store, not this file.
 ## Contract 3: `operator_readback_v1`
 
 The canonical operator decision surface. Emitted across run report, MCP, release
-receipt, and GraphQL projection. All field values are canonical strings; lossless enum
-mappings are required if GraphQL enum types are introduced.
+receipt, and GraphQL projection. The control-plane store derives the readback from the
+authoritative `rollout_contract_check` record per lane via a single
+`operator_readback_json_for_lane(...)` accessor, so every lane sees the same decision
+fields. The `run_report`, `mcp`, and `release_receipt` lanes use the canonical
+snake_case keys below; the `graphql` lane returns a lossless camelCase projection of
+the same payload (e.g. `backend_decision` → `backendDecision`,
+`rollback_disposition.data_loss_risk` → `rollbackDisposition.dataLossRisk`). Field
+values remain canonical strings on every lane.
 
 ### Fields
 
@@ -208,16 +241,23 @@ mappings are required if GraphQL enum types are introduced.
 | `waiver_state` | enum | `none`, `active`, `expired`, `revoked`. |
 | `waiver_expires_at` | ISO-8601 string \| null | When the waiver expires. |
 | `enforcement_mode` | enum | `enforce`, `permissive`, `disabled`. |
+| `enforcement_mode_reason` | string \| null | Reason code for permissive/disabled mode (e.g. waiver reason or operator override). |
 | `hold_conditions` | string[] | Active hold conditions. |
-| `rollback_disposition` | object | `mode` and `data_loss_risk`. |
+| `rollback_disposition` | object | `mode`, `data_loss_risk`, and optional `steps` carried from the contract. |
 | `enabled_state` | enum | `enabled`, `disabled`. |
 | `disabled_reason_code` | string \| null | Why the rollout gate is disabled. |
 | `action_id` | string | Idempotency key for the operator decision. |
 | `operator_message` | escaped plain text \| null | Operator-authored guidance. Never HTML or raw diagnostics. |
 | `source_lane` | enum | `run_report`, `mcp`, `release_receipt`, `graphql`. |
 | `projection_integrity` | enum | `valid`, `tamper_detected`, `stale`. |
+| `cutover_policy_revision` | string \| null | Machine-readable cutover policy revision tied to this decision. |
 | `diagnostic_redaction` | enum | `none`, `partial`, `full`. |
 | `next_steps` | string[] | Operator-actionable recovery guidance. |
+
+Lane payloads also carry traceability fields derived from the authoritative record
+(`authoritative_record_id`, `run_id`, `proposal_id`, `proposal_revision_id`,
+`waiver`, `adoption_metric`, `updated_at`). These are projection metadata, not
+operator decision inputs; the 18 fields above are the canonical decision surface.
 
 ### Valid example
 
@@ -230,21 +270,41 @@ mappings are required if GraphQL enum types are introduced.
   "waiver_state": "none",
   "waiver_expires_at": null,
   "enforcement_mode": "enforce",
+  "enforcement_mode_reason": null,
   "hold_conditions": [],
   "rollback_disposition": {
     "mode": "feature_flag_disable_or_enforcement_mode_permissive",
-    "data_loss_risk": "none"
+    "data_loss_risk": "none",
+    "steps": [
+      "Move enforcement mode to permissive via privileged audited control-plane mutation with TTL."
+    ]
   },
   "enabled_state": "enabled",
   "disabled_reason_code": null,
-  "action_id": "example-action-uuid",
-  "operator_message": null,
+  "action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+  "operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
   "source_lane": "run_report",
   "projection_integrity": "valid",
+  "cutover_policy_revision": "p084-cutover-v1",
   "diagnostic_redaction": "none",
-  "next_steps": []
+  "next_steps": ["continue_implementation_scheduling"]
 }
 ```
+
+### Parity-lane fixture
+
+`readback_fixture` references a single fixture that proves the same decision surface
+across every lane. The fixture **must** include a `parity_lanes` object whose
+`run_report`, `mcp`, and `release_receipt` payloads carry the canonical snake_case
+fields and whose `graphql` payload carries the matching camelCase projection. The
+`proposal-084|p084` gate validates parity-lane shape; the canonical fixture for P084
+itself lives at
+`docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json`.
+
+The Swift app decodes operator readback into a read-only `RolloutDecisionSummary`
+projection: `PreflightReportView` consumes the snake_case payload from run reports,
+and the GraphQL run-row read model decodes the camelCase projection. Swift never
+recomputes a decision; it presents the backend authority.
 
 ---
 
@@ -257,7 +317,7 @@ effective cutover timestamp and enforcement mode transition:
 "cutover_policy": {
   "revision": "p084-cutover-v1",
   "enforcement_mode_at_cutover": "enforce",
-  "applicable_to": "post-cutover-implementation-starts",
+  "applicable_to": "post_cutover_implementation_starts",
   "grandfathered_rendering": "not_applicable",
   "effective_timestamp_iso8601": "2026-06-01T00:00:00Z"
 }
@@ -277,6 +337,9 @@ informational; actual enforcement is controlled by the stored enforcement mode, 
 - Symlink escapes outside the repository root are rejected at scheduling time.
 - Paths that resolve outside `docs/`, `scripts/`, or declared `CHAINWORKS_META_ROOT`
   targets fail the unsafe-path check.
+- `readback_fixture` and every value under `negative_fixtures` must resolve under
+  `docs/evidence/rollout-contract/`. The linter rejects anything outside that root,
+  including symlinks whose canonical target escapes it.
 
 ### Safe commands
 

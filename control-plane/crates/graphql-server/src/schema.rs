@@ -10,8 +10,7 @@ use tracing::{debug, info, warn};
 
 use db::repos::{
     approvals, artifact_contracts, artifacts, closeout, ideas, projections,
-    rollout_contract_checks, runs,
-    steward as steward_repo, workflow_conflicts,
+    rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
 };
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
 use domain::events::DomainEvent;
@@ -115,7 +114,7 @@ async fn enrich_run_with_artifact_contracts(
     gql.rollout_contract_readback_json =
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
             .await?
-            .map(|check| Json(check.operator_readback_json()));
+            .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
     gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
@@ -1887,9 +1886,14 @@ mod tests {
                 failure_reasons: vec![],
                 diagnostics: vec![],
                 waiver: None,
+                rollback_disposition: serde_json::json!({
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none",
+                    "steps": ["Move enforcement mode through an audited mutation."]
+                }),
                 projection_integrity: ProjectionIntegrity::Valid,
                 cutover_policy_revision: Some("p084-cutover-v1".into()),
-                redaction_state: "bounded".into(),
+                redaction_state: "partial".into(),
                 retry_count: 0,
                 preflight_timeout_seconds: 45,
             },
@@ -3047,12 +3051,24 @@ mod tests {
             .unwrap()
             .contains("repo_root_exists"));
         assert_eq!(
-            json["run"]["rolloutContractReadbackJson"]["schema_version"],
+            json["run"]["rolloutContractReadbackJson"]["schemaVersion"],
             serde_json::json!("operator_readback_v1")
         );
         assert_eq!(
-            json["run"]["rolloutContractReadbackJson"]["backend_decision"],
+            json["run"]["rolloutContractReadbackJson"]["backendDecision"],
             serde_json::json!("release")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["sourceLane"],
+            serde_json::json!("graphql")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["rollbackDisposition"]["dataLossRisk"],
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            json["run"]["rolloutContractReadbackJson"]["adoptionMetric"]["name"],
+            serde_json::json!("new_applicable_proposals_with_passing_rollout_contract_percent")
         );
     }
 

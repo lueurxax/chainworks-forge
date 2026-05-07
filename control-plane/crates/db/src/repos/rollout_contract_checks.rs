@@ -189,6 +189,15 @@ impl std::str::FromStr for ProjectionIntegrity {
     }
 }
 
+fn validate_redaction_state(redaction_state: &str) -> Result<&str> {
+    match redaction_state {
+        "none" | "partial" | "full" => Ok(redaction_state),
+        other => anyhow::bail!(
+            "invalid rollout_contract_checks.redaction_state {other:?}; expected one of none, partial, full"
+        ),
+    }
+}
+
 /// A stored rollout contract check record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredRolloutContractCheck {
@@ -207,6 +216,7 @@ pub struct StoredRolloutContractCheck {
     pub failure_reasons: Vec<String>,
     pub diagnostics: Vec<String>,
     pub waiver: Option<serde_json::Value>,
+    pub rollback_disposition: serde_json::Value,
     pub projection_integrity: ProjectionIntegrity,
     pub cutover_policy_revision: Option<String>,
     pub redaction_state: String,
@@ -230,6 +240,14 @@ pub struct RolloutContractMetricEvent {
 
 impl StoredRolloutContractCheck {
     pub fn operator_readback_json(&self) -> serde_json::Value {
+        self.operator_readback_json_for_lane("run_report")
+    }
+
+    pub fn operator_readback_json_for_lane(&self, source_lane: &str) -> serde_json::Value {
+        let source_lane = match source_lane {
+            "run_report" | "mcp" | "release_receipt" | "graphql" => source_lane,
+            _ => "run_report",
+        };
         let waiver_state = self
             .waiver
             .as_ref()
@@ -303,7 +321,7 @@ impl StoredRolloutContractCheck {
             }
         };
 
-        serde_json::json!({
+        let readback = serde_json::json!({
             "schema_version": "operator_readback_v1",
             "authoritative_record_id": self.id.to_string(),
             "run_id": self.run_id.to_string(),
@@ -318,11 +336,7 @@ impl StoredRolloutContractCheck {
             "enforcement_mode": self.enforcement_mode,
             "enforcement_mode_reason": enforcement_mode_reason,
             "hold_conditions": hold_conditions,
-            "rollback_disposition": {
-                "mode": "not_applicable",
-                "data_loss_risk": "none",
-                "steps": []
-            },
+            "rollback_disposition": self.rollback_disposition,
             "enabled_state": if self.enforcement_mode == RolloutContractEnforcementMode::Disabled {
                 "disabled"
             } else {
@@ -331,14 +345,120 @@ impl StoredRolloutContractCheck {
             "disabled_reason_code": disabled_reason_code,
             "action_id": format!("rollout_contract_check:{}", self.id),
             "operator_message": operator_message,
-            "source_lane": "run_start_preflight",
+            "source_lane": source_lane,
             "projection_integrity": self.projection_integrity,
             "cutover_policy_revision": self.cutover_policy_revision,
             "diagnostic_redaction": self.redaction_state,
             "next_steps": next_steps,
+            "adoption_metric": self.adoption_metric_summary_json(),
             "updated_at": self.updated_at.to_rfc3339(),
+        });
+        if source_lane == "graphql" {
+            camel_case_operator_readback_json(&readback)
+        } else {
+            readback
+        }
+    }
+
+    fn adoption_metric_summary_json(&self) -> serde_json::Value {
+        let passed = matches!(
+            (&self.status, &self.decision),
+            (
+                RolloutContractStatus::Pass,
+                RolloutContractDecision::Release
+            ) | (
+                RolloutContractStatus::Waived,
+                RolloutContractDecision::Waive
+            )
+        );
+        serde_json::json!({
+            "name": "new_applicable_proposals_with_passing_rollout_contract_percent",
+            "applicable_proposals": 1,
+            "passing_rollout_contracts": if passed { 1 } else { 0 },
+            "percent": if passed { 100.0 } else { 0.0 },
+            "status": if passed { "pass" } else { "not_green" }
         })
     }
+}
+
+fn camel_case_operator_readback_json(value: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in object {
+        let mapped = match key.as_str() {
+            "schema_version" => "schemaVersion",
+            "authoritative_record_id" => "authoritativeRecordId",
+            "run_id" => "runId",
+            "proposal_id" => "proposalId",
+            "proposal_revision_id" => "proposalRevisionId",
+            "backend_decision" => "backendDecision",
+            "failure_reasons" => "failureReasons",
+            "waiver_state" => "waiverState",
+            "waiver_expires_at" => "waiverExpiresAt",
+            "enforcement_mode" => "enforcementMode",
+            "enforcement_mode_reason" => "enforcementModeReason",
+            "hold_conditions" => "holdConditions",
+            "rollback_disposition" => "rollbackDisposition",
+            "enabled_state" => "enabledState",
+            "disabled_reason_code" => "disabledReasonCode",
+            "action_id" => "actionId",
+            "operator_message" => "operatorMessage",
+            "source_lane" => "sourceLane",
+            "projection_integrity" => "projectionIntegrity",
+            "cutover_policy_revision" => "cutoverPolicyRevision",
+            "diagnostic_redaction" => "diagnosticRedaction",
+            "next_steps" => "nextSteps",
+            "adoption_metric" => "adoptionMetric",
+            "updated_at" => "updatedAt",
+            other => other,
+        };
+        let value = if key == "rollback_disposition" {
+            camel_case_rollback_disposition_json(value)
+        } else if key == "adoption_metric" {
+            camel_case_adoption_metric_json(value)
+        } else {
+            value.clone()
+        };
+        out.insert(mapped.to_string(), value);
+    }
+    serde_json::Value::Object(out)
+}
+
+fn camel_case_rollback_disposition_json(value: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in object {
+        out.insert(
+            match key.as_str() {
+                "data_loss_risk" => "dataLossRisk".to_string(),
+                other => other.to_string(),
+            },
+            value.clone(),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn camel_case_adoption_metric_json(value: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in object {
+        out.insert(
+            match key.as_str() {
+                "applicable_proposals" => "applicableProposals".to_string(),
+                "passing_rollout_contracts" => "passingRolloutContracts".to_string(),
+                other => other.to_string(),
+            },
+            value.clone(),
+        );
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Input for creating or upserting a rollout contract check.
@@ -359,6 +479,7 @@ pub struct UpsertRolloutContractCheck {
     pub failure_reasons: Vec<String>,
     pub diagnostics: Vec<String>,
     pub waiver: Option<serde_json::Value>,
+    pub rollback_disposition: serde_json::Value,
     pub projection_integrity: ProjectionIntegrity,
     pub cutover_policy_revision: Option<String>,
     pub redaction_state: String,
@@ -378,6 +499,7 @@ pub async fn upsert_rollout_contract_check(
     let lifecycle_str = input.lifecycle_state.to_string();
     let enforcement_str = input.enforcement_mode.to_string();
     let projection_str = input.projection_integrity.to_string();
+    let redaction_state = validate_redaction_state(&input.redaction_state)?;
     let failure_reasons_json =
         serde_json::to_string(&input.failure_reasons).context("serialize failure_reasons")?;
     let diagnostics_json =
@@ -387,6 +509,8 @@ pub async fn upsert_rollout_contract_check(
         .as_ref()
         .map(|w| serde_json::to_string(w).context("serialize waiver"))
         .transpose()?;
+    let rollback_disposition_json = serde_json::to_string(&input.rollback_disposition)
+        .context("serialize rollback_disposition")?;
     let now_str = now.to_rfc3339();
 
     sqlx::query(
@@ -395,12 +519,12 @@ pub async fn upsert_rollout_contract_check(
           id, run_id, proposal_id, proposal_revision_id,
           proposal_content_hash, contract_object_hash, content_snapshot_id,
           checker_version, status, decision, lifecycle_state, enforcement_mode,
-          failure_reasons_json, diagnostics_json, waiver_json,
+          failure_reasons_json, diagnostics_json, waiver_json, rollback_disposition_json,
           projection_integrity, cutover_policy_revision, redaction_state,
           retry_count, preflight_timeout_seconds, created_at, updated_at
         ) VALUES (
           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21
+          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22
         )
         ON CONFLICT(id) DO UPDATE SET
           status                  = excluded.status,
@@ -410,6 +534,7 @@ pub async fn upsert_rollout_contract_check(
           failure_reasons_json    = excluded.failure_reasons_json,
           diagnostics_json        = excluded.diagnostics_json,
           waiver_json             = excluded.waiver_json,
+          rollback_disposition_json = excluded.rollback_disposition_json,
           projection_integrity    = excluded.projection_integrity,
           cutover_policy_revision = excluded.cutover_policy_revision,
           redaction_state         = excluded.redaction_state,
@@ -432,9 +557,10 @@ pub async fn upsert_rollout_contract_check(
     .bind(&failure_reasons_json)
     .bind(&diagnostics_json)
     .bind(waiver_json.as_deref())
+    .bind(&rollback_disposition_json)
     .bind(&projection_str)
     .bind(input.cutover_policy_revision.as_deref())
-    .bind(&input.redaction_state)
+    .bind(redaction_state)
     .bind(input.retry_count)
     .bind(input.preflight_timeout_seconds)
     .bind(&now_str)
@@ -841,6 +967,9 @@ fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRolloutContractCheck
     let failure_reasons_json: String = row.get("failure_reasons_json");
     let diagnostics_json: String = row.get("diagnostics_json");
     let waiver_json: Option<String> = row.get("waiver_json");
+    let rollback_disposition_json: String = row
+        .try_get("rollback_disposition_json")
+        .unwrap_or_else(|_| default_rollback_disposition_json());
     let created_at_str: String = row.get("created_at");
     let updated_at_str: String = row.get("updated_at");
 
@@ -867,6 +996,8 @@ fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRolloutContractCheck
         waiver: waiver_json
             .map(|j| serde_json::from_str::<serde_json::Value>(&j).context("parse waiver_json"))
             .transpose()?,
+        rollback_disposition: serde_json::from_str(&rollback_disposition_json)
+            .context("parse rollback_disposition_json")?,
         projection_integrity: projection_str.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
         cutover_policy_revision: row.get("cutover_policy_revision"),
         redaction_state: row.get("redaction_state"),
@@ -879,6 +1010,15 @@ fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRolloutContractCheck
             .context("parse updated_at")?
             .with_timezone(&Utc),
     })
+}
+
+fn default_rollback_disposition_json() -> String {
+    serde_json::json!({
+        "mode": "not_applicable",
+        "data_loss_risk": "none",
+        "steps": []
+    })
+    .to_string()
 }
 
 fn parse_metric_event_row(row: &sqlx::sqlite::SqliteRow) -> Result<RolloutContractMetricEvent> {
@@ -928,6 +1068,11 @@ mod tests {
             failure_reasons: vec![],
             diagnostics: vec![],
             waiver: None,
+            rollback_disposition: serde_json::json!({
+                "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                "data_loss_risk": "none",
+                "steps": ["Move enforcement mode through an audited mutation."]
+            }),
             projection_integrity: ProjectionIntegrity::Valid,
             cutover_policy_revision: Some("p084-cutover-v1".to_string()),
             redaction_state: "none".to_string(),
@@ -1092,6 +1237,22 @@ mod tests {
             .any(|event| event.metric_name == "rollout_contract_run_start_block_total"));
     }
 
+    #[tokio::test]
+    async fn upsert_rejects_non_canonical_redaction_state() {
+        let (_dir, pool) = test_pool().await;
+        let mut input = make_input(Uuid::new_v4());
+        input.redaction_state = "bounded".to_string();
+
+        let error = upsert_rollout_contract_check(&pool, &input, Utc::now())
+            .await
+            .expect_err("non-canonical diagnostic redaction state must not persist");
+
+        assert!(
+            error.to_string().contains("redaction_state"),
+            "error should name the invalid redaction_state: {error:#}"
+        );
+    }
+
     #[test]
     fn operator_readback_json_exposes_required_decision_surface() {
         let run_id = Uuid::new_v4();
@@ -1104,7 +1265,7 @@ mod tests {
             "expires_at": "2026-05-03T00:00:00Z",
             "reason_code": "emergency_override"
         }));
-        check.redaction_state = "bounded".to_string();
+        check.redaction_state = "partial".to_string();
 
         let stored = StoredRolloutContractCheck {
             id: check.id,
@@ -1122,6 +1283,7 @@ mod tests {
             failure_reasons: check.failure_reasons,
             diagnostics: check.diagnostics,
             waiver: check.waiver,
+            rollback_disposition: check.rollback_disposition,
             projection_integrity: check.projection_integrity,
             cutover_policy_revision: check.cutover_policy_revision,
             redaction_state: check.redaction_state,
@@ -1142,7 +1304,29 @@ mod tests {
             serde_json::json!(["missing_rollout_contract_check"])
         );
         assert_eq!(readback["projection_integrity"], "valid");
-        assert_eq!(readback["diagnostic_redaction"], "bounded");
+        assert_eq!(
+            readback["rollback_disposition"]["mode"],
+            "feature_flag_disable_or_enforcement_mode_permissive"
+        );
+        assert_eq!(readback["source_lane"], "run_report");
+        assert_eq!(
+            stored.operator_readback_json_for_lane("release_receipt")["source_lane"],
+            "release_receipt"
+        );
+        let graphql = stored.operator_readback_json_for_lane("graphql");
+        assert_eq!(graphql["schemaVersion"], "operator_readback_v1");
+        assert_eq!(graphql["backendDecision"], "hold");
+        assert_eq!(graphql["sourceLane"], "graphql");
+        assert_eq!(
+            graphql["rollbackDisposition"]["dataLossRisk"],
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            graphql["adoptionMetric"]["name"],
+            "new_applicable_proposals_with_passing_rollout_contract_percent"
+        );
+        assert_eq!(readback["adoption_metric"]["applicable_proposals"], 1);
+        assert_eq!(readback["diagnostic_redaction"], "partial");
         assert!(readback["action_id"]
             .as_str()
             .unwrap()

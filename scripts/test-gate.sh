@@ -5482,6 +5482,22 @@ from pathlib import Path
 
 root = Path.cwd()
 
+# AC-005: Fresh DB init must have unique SQLx migration versions.
+migrations_dir = root / "control-plane/crates/db/migrations"
+if not migrations_dir.exists():
+    raise SystemExit("proposal-084: missing control-plane/crates/db/migrations")
+versions = {}
+for migration in sorted(migrations_dir.glob("*.sql")):
+    prefix = migration.name.split("_", 1)[0]
+    if prefix.isdigit():
+        versions.setdefault(prefix, []).append(migration.name)
+duplicates = {version: names for version, names in versions.items() if len(names) > 1}
+if duplicates:
+    details = "; ".join(
+        f"{version}: {', '.join(names)}" for version, names in sorted(duplicates.items())
+    )
+    raise SystemExit(f"proposal-084: duplicate migration version prefix: {details}")
+
 # AC-001: Template exists and contains required sections
 template = root / "docs/reference/executable-rollout-gate-template.md"
 if not template.exists():
@@ -5504,6 +5520,25 @@ for required in [
         raise SystemExit(
             f"proposal-084: template missing required section or term: {required!r}"
         )
+status_line = next(
+    (line for line in text.splitlines() if line.startswith("| `status` | enum |")),
+    "",
+)
+for status in [
+    "pass",
+    "fail",
+    "waived",
+    "not_applicable",
+    "timeout",
+    "cancelled",
+    "missing_contract",
+    "tamper_detected",
+    "stale",
+]:
+    if f"`{status}`" not in status_line:
+        raise SystemExit(
+            f"proposal-084: rollout_contract_check_v1 status enum missing {status!r}"
+        )
 
 # AC-002, AC-003, AC-007: Linter exists and correctly rejects negative fixtures
 linter = root / "scripts/lint-rollout-contract"
@@ -5514,6 +5549,8 @@ linter_negative_fixtures = [
     "docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json",
     "docs/evidence/rollout-contract/negative/missing-metrics-p017-style.json",
     "docs/evidence/rollout-contract/negative/missing-operator-decision-fields.json",
+    "docs/evidence/rollout-contract/negative/invalid-cutover-applicable-to.json",
+    "docs/evidence/rollout-contract/negative/missing-required-surfaces.json",
     "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json",
 ]
 for fixture_path in linter_negative_fixtures:
@@ -5586,6 +5623,88 @@ for field in required_fields:
             f"proposal-084: p084-full-surface.fixture.json missing required field: {field}"
         )
 
+graphql_field_map = {
+    "rollout_contract_status": "rolloutContractStatus",
+    "rollout_contract_decision": "rolloutContractDecision",
+    "rollout_contract_failure_reasons": "rolloutContractFailureReasons",
+    "rollout_contract_waiver_state": "rolloutContractWaiverState",
+    "rollout_contract_waiver_expires_at": "rolloutContractWaiverExpiresAt",
+    "rollout_contract_enforcement_mode": "rolloutContractEnforcementMode",
+    "rollout_contract_enforcement_mode_reason": "rolloutContractEnforcementModeReason",
+    "rollout_contract_hold_conditions": "rolloutContractHoldConditions",
+    "rollout_contract_rollback_disposition": "rolloutContractRollbackDisposition",
+    "rollout_contract_source_lane": "rolloutContractSourceLane",
+    "rollout_contract_enabled_state": "rolloutContractEnabledState",
+    "rollout_contract_disabled_reason_code": "rolloutContractDisabledReasonCode",
+    "rollout_contract_action_id": "rolloutContractActionId",
+    "rollout_contract_operator_message": "rolloutContractOperatorMessage",
+    "rollout_contract_projection_integrity": "rolloutContractProjectionIntegrity",
+    "rollout_contract_cutover_policy_revision": "rolloutContractCutoverPolicyRevision",
+    "rollout_contract_diagnostic_redaction": "rolloutContractDiagnosticRedaction",
+    "rollout_contract_next_steps": "rolloutContractNextSteps",
+}
+parity_lanes = fixture.get("parity_lanes")
+if not isinstance(parity_lanes, dict):
+    raise SystemExit("proposal-084: p084-full-surface.fixture.json missing parity_lanes object")
+for lane in ["mcp", "release_receipt"]:
+    lane_payload = parity_lanes.get(lane)
+    if not isinstance(lane_payload, dict):
+        raise SystemExit(f"proposal-084: parity_lanes.{lane} must be an object")
+    missing = [field for field in required_fields if field not in lane_payload]
+    if missing:
+        raise SystemExit(
+            f"proposal-084: parity_lanes.{lane} missing required fields: {', '.join(missing)}"
+        )
+graphql_payload = parity_lanes.get("graphql")
+if not isinstance(graphql_payload, dict):
+    raise SystemExit("proposal-084: parity_lanes.graphql must be an object")
+missing_graphql = [
+    mapped for field, mapped in graphql_field_map.items() if mapped not in graphql_payload
+]
+if missing_graphql:
+    raise SystemExit(
+        "proposal-084: parity_lanes.graphql missing required camelCase fields: "
+        + ", ".join(missing_graphql)
+    )
+
+# AC-005: Orchestrator must run rollout preflight before code_writer enqueue and
+# fail closed by blocking the stage/run when the preflight action is Hold.
+orchestrator = root / "control-plane/crates/engine/src/orchestrator.rs"
+if not orchestrator.exists():
+    raise SystemExit("proposal-084: missing control-plane/crates/engine/src/orchestrator.rs")
+orchestrator_text = orchestrator.read_text()
+for required in [
+    "implementation_run_start_rollout_contract_preflight",
+    "block_implementation_run_start_if_rollout_contract_hold",
+    "refine_implementation_from_findings",
+    "refine_implementation",
+    "RolloutContractPreflightAction::Hold",
+    "rollout_contract_preflight_hold",
+    "stages::update_status(&self.pool, stage.id, StageStatus::Blocked)",
+    "runs::update_status(&self.pool, run_id, RunStatus::Blocked)",
+    "Rollout contract preflight held code_writer before enqueue",
+    "return Ok(true);",
+]:
+    if required not in orchestrator_text:
+        raise SystemExit(
+            f"proposal-084: orchestrator missing AC-005 no-enqueue guard: {required!r}"
+        )
+preflight_boundary_index = orchestrator_text.find(
+    "block_implementation_run_start_if_rollout_contract_hold("
+)
+worktree_provision_index = orchestrator_text.find("WorktreeProvisioner::provision(")
+if preflight_boundary_index == -1 or worktree_provision_index == -1:
+    raise SystemExit("proposal-084: orchestrator missing preflight/provisioning boundary markers")
+if preflight_boundary_index > worktree_provision_index:
+    raise SystemExit(
+        "proposal-084: implementation run-start preflight must be reached before "
+        "WorktreeProvisioner::provision"
+    )
+
+migration_text = (root / "control-plane/crates/db/migrations/044_p084_rollout_contract.sql").read_text()
+if "redaction_state IN ('none', 'partial', 'full')" not in migration_text:
+    raise SystemExit("proposal-084: rollout_contract_checks.redaction_state must be CHECK-constrained")
+
 # AC-002: test-gates.md documents the gate
 gates_doc = root / "docs/reference/test-gates.md"
 if not gates_doc.exists():
@@ -5604,6 +5723,14 @@ for required in [
 
 print("proposal-084 all gate checks passed")
 PY
+    log "Proposal 084 gate: Rust rollout-contract preflight and migration regressions"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p engine rollout_contract_preflight --lib
+      cargo test -p db rollout_contract_checks --lib
+      cargo test -p db run_preflight_missing_db_clean_installs_and_applies_all
+      cargo test -p db binary_schema_version_matches_migrator_max
+    )
     run_targeted_tests "proposal-084" "${PROPOSAL_084_SWIFT_TESTS[@]}"
     log "Proposal 084 gate passed"
     ;;

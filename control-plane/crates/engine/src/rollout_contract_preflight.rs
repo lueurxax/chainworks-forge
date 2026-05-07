@@ -9,7 +9,7 @@ use domain::{artifact::Artifact, run::Run};
 use sha2::Digest;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout, Duration};
@@ -18,6 +18,7 @@ use uuid::Uuid;
 const CHECKER_VERSION: &str = "p084-engine-preflight-v1";
 const PREFLIGHT_TIMEOUT_SECONDS: i64 = 45;
 const PREFLIGHT_INFRA_RETRY_BACKOFF_MS: &[u64] = &[25, 75, 150];
+const MAX_ROLLOUT_CONTRACT_INPUT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PROPOSAL_ID: &str = "unknown";
 const DEFAULT_PROPOSAL_REVISION_ID: &str = "unknown";
 const DEFAULT_PROPOSAL_CONTENT_HASH: &str = "sha256:unknown";
@@ -27,11 +28,17 @@ const ROLLOUT_CONTRACT_SCHEMA_VERSION: &str = "rollout_contract_v1";
 const ROLLOUT_PREFLIGHT_POLICY_KEY: &str = "rollout_contract_preflight";
 const REQUIRED_WHEN_APPLICABLE: &[&str] = &[
     "gate_aliases",
+    "commands",
+    "migrations",
     "metrics",
     "readback_lanes",
     "readback_fields",
+    "readback_fixture",
+    "operator_report_fields",
     "hold_conditions",
     "rollback_disposition",
+    "decision_vocabulary",
+    "negative_fixtures",
 ];
 const ROLLBACK_DISPOSITION_REQUIRED: &[&str] = &["mode", "data_loss_risk"];
 const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -54,7 +61,6 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "not_applicable_justifications",
     "cutover_policy",
     "operator_message",
-    "p084_extraction_failures",
 ];
 const ALLOWED_COMMAND_FIELDS: &[&str] = &["allowlist", "commentary"];
 const ALLOWED_MIGRATION_FIELDS: &[&str] = &["not_applicable", "justification", "description"];
@@ -139,7 +145,7 @@ pub async fn implementation_run_start_rollout_contract_preflight(
     {
         Ok(result) => result,
         Err(_) => {
-            let mode = rollout_contract_enforcement_mode_from_env();
+            let mode = terminal_failure_enforcement_mode(pool, run).await;
             let check = upsert_timeout_contract_check(pool, run, approved_proposal, mode).await?;
             write_rollout_contract_check_projection(run, &check)?;
             Ok(evaluate_terminal_check(check))
@@ -171,7 +177,7 @@ async fn implementation_run_start_rollout_contract_preflight_with_retries(
             Err(error) if should_retry_preflight_error(&error) => {
                 let Some(backoff_ms) = PREFLIGHT_INFRA_RETRY_BACKOFF_MS.get(retry_count as usize)
                 else {
-                    let mode = rollout_contract_enforcement_mode_from_env();
+                    let mode = terminal_failure_enforcement_mode(pool, run).await;
                     let check = upsert_retry_exhausted_contract_check(
                         pool,
                         run,
@@ -199,7 +205,7 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
     retry_count: i64,
 ) -> Result<RolloutContractPreflightEvaluation> {
     if run.cancellation_requested_at.is_some() {
-        let mode = rollout_contract_enforcement_mode_from_env();
+        let mode = default_rollout_contract_enforcement_mode();
         let check =
             upsert_cancelled_contract_check(pool, run, approved_proposal, mode, retry_count)
                 .await?;
@@ -207,11 +213,17 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
         return Ok(evaluate_terminal_check(check));
     }
 
+    let current_identity = current_contract_identity(run, approved_proposal)?;
     if let Some(check) =
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run.id.inner())
             .await?
     {
-        let check = if let Some(integrity) = classify_existing_projection(run, &check)? {
+        let check = if let Some(drift) = current_identity
+            .as_ref()
+            .and_then(|identity| identity.drift_from(&check))
+        {
+            upsert_hash_drift_contract_check(pool, &check, &drift, retry_count).await?
+        } else if let Some(integrity) = classify_existing_projection(run, &check)? {
             upsert_projection_integrity_check(pool, &check, integrity, retry_count).await?
         } else {
             check
@@ -220,7 +232,7 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
         return Ok(evaluate_terminal_check(check));
     }
 
-    let policy = effective_preflight_policy(run, Utc::now())?;
+    let policy = effective_preflight_policy(pool, run, Utc::now()).await?;
     let mode = policy.enforcement_mode.clone();
     if !policy.failures.is_empty() {
         let check = upsert_policy_failure_contract_check(
@@ -252,7 +264,7 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
 
     let check = if let Some(artifact) = approved_proposal {
         if let Some(check) =
-            upsert_linted_contract_check(pool, run, artifact, mode.clone(), retry_count).await?
+            upsert_linted_contract_check(pool, run, artifact, &policy, retry_count).await?
         {
             check
         } else {
@@ -263,6 +275,47 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
     };
     write_rollout_contract_check_projection(run, &check)?;
     Ok(evaluate_terminal_check(check))
+}
+
+#[derive(Clone, Debug)]
+struct CurrentContractIdentity {
+    proposal_id: String,
+    proposal_revision_id: String,
+    proposal_content_hash: String,
+    contract_object_hash: String,
+    content_snapshot_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct ContractIdentityDrift {
+    identity: CurrentContractIdentity,
+    mismatches: Vec<String>,
+}
+
+impl CurrentContractIdentity {
+    fn drift_from(&self, check: &StoredRolloutContractCheck) -> Option<ContractIdentityDrift> {
+        let mut mismatches = Vec::new();
+        if self.proposal_revision_id != check.proposal_revision_id {
+            mismatches.push("proposal_revision_id".to_string());
+        }
+        if self.proposal_content_hash != check.proposal_content_hash {
+            mismatches.push("proposal_content_hash".to_string());
+        }
+        if self.contract_object_hash != check.contract_object_hash {
+            mismatches.push("contract_object_hash".to_string());
+        }
+        if self.content_snapshot_id != check.content_snapshot_id {
+            mismatches.push("content_snapshot_id".to_string());
+        }
+        if mismatches.is_empty() {
+            None
+        } else {
+            Some(ContractIdentityDrift {
+                identity: self.clone(),
+                mismatches,
+            })
+        }
+    }
 }
 
 fn should_retry_preflight_error(error: &anyhow::Error) -> bool {
@@ -333,14 +386,17 @@ fn preflight_timeout_duration() -> Duration {
     Duration::from_secs(PREFLIGHT_TIMEOUT_SECONDS as u64)
 }
 
-fn rollout_contract_enforcement_mode_from_env() -> RolloutContractEnforcementMode {
-    match std::env::var("CHAINWORKS_ROLLOUT_CONTRACT_ENFORCEMENT_MODE")
-        .unwrap_or_else(|_| "permissive".to_string())
-        .as_str()
-    {
-        "enforce" => RolloutContractEnforcementMode::Enforce,
-        "disabled" => RolloutContractEnforcementMode::Disabled,
-        _ => RolloutContractEnforcementMode::Permissive,
+fn default_rollout_contract_enforcement_mode() -> RolloutContractEnforcementMode {
+    RolloutContractEnforcementMode::Enforce
+}
+
+async fn terminal_failure_enforcement_mode(
+    pool: &SqlitePool,
+    run: &Run,
+) -> RolloutContractEnforcementMode {
+    match effective_preflight_policy(pool, run, Utc::now()).await {
+        Ok(policy) if policy.failures.is_empty() => policy.enforcement_mode,
+        Ok(_) | Err(_) => RolloutContractEnforcementMode::Enforce,
     }
 }
 
@@ -348,15 +404,21 @@ fn rollout_contract_enforcement_mode_from_env() -> RolloutContractEnforcementMod
 struct EffectivePreflightPolicy {
     enforcement_mode: RolloutContractEnforcementMode,
     enforcement_mode_reason_code: Option<String>,
+    enforcement_mode_supplied: bool,
     active_waiver: Option<serde_json::Value>,
     failures: Vec<String>,
     diagnostics: Vec<String>,
 }
 
-fn effective_preflight_policy(run: &Run, now: DateTime<Utc>) -> Result<EffectivePreflightPolicy> {
+async fn effective_preflight_policy(
+    pool: &SqlitePool,
+    run: &Run,
+    now: DateTime<Utc>,
+) -> Result<EffectivePreflightPolicy> {
     let mut policy = EffectivePreflightPolicy {
-        enforcement_mode: rollout_contract_enforcement_mode_from_env(),
+        enforcement_mode: default_rollout_contract_enforcement_mode(),
         enforcement_mode_reason_code: None,
+        enforcement_mode_supplied: false,
         active_waiver: None,
         failures: Vec::new(),
         diagnostics: Vec::new(),
@@ -373,7 +435,7 @@ fn effective_preflight_policy(run: &Run, now: DateTime<Utc>) -> Result<Effective
     };
 
     if let Some(mode_value) = object.get("enforcement_mode") {
-        match validated_policy_record(mode_value, "enforcement_mode", now)? {
+        match validated_policy_record(pool, mode_value, "enforcement_mode", now).await? {
             PolicyRecordValidation::Valid(record) => {
                 let Some(mode) = record.get("mode").and_then(|value| value.as_str()) else {
                     policy.failures.push(
@@ -392,6 +454,7 @@ fn effective_preflight_policy(run: &Run, now: DateTime<Utc>) -> Result<Effective
                         return Ok(policy);
                     }
                 };
+                policy.enforcement_mode_supplied = true;
                 policy.enforcement_mode_reason_code = record
                     .get("reason_code")
                     .and_then(|value| value.as_str())
@@ -406,7 +469,7 @@ fn effective_preflight_policy(run: &Run, now: DateTime<Utc>) -> Result<Effective
     }
 
     if let Some(waiver_value) = object.get("waiver") {
-        match validated_policy_record(waiver_value, "waiver", now)? {
+        match validated_policy_record(pool, waiver_value, "waiver", now).await? {
             PolicyRecordValidation::Valid(record) => {
                 if record.get("state").and_then(|value| value.as_str()) != Some("active") {
                     policy
@@ -452,7 +515,8 @@ fn rollout_preflight_policy_value(run: &Run) -> Result<Option<serde_json::Value>
         .cloned())
 }
 
-fn validated_policy_record(
+async fn validated_policy_record(
+    pool: &SqlitePool,
     value: &serde_json::Value,
     context: &str,
     now: DateTime<Utc>,
@@ -478,6 +542,51 @@ fn validated_policy_record(
             failures.push(format!(
                 "missing_{context}.{field}: must be a non-empty string"
             ));
+        }
+    }
+    let enforce_mode_record = context == "enforcement_mode"
+        && object.get("mode").and_then(|value| value.as_str()) == Some("enforce");
+    if !enforce_mode_record {
+        if let (Some(principal_id), Some(audit_event_id)) = (
+            object.get("principal_id").and_then(|value| value.as_str()),
+            object
+                .get("audit_event_id")
+                .and_then(|value| value.as_str()),
+        ) {
+            let row: Option<(String, Option<String>, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT command_type, caller_principal_id, caller_principal_class FROM command_journal WHERE id = ?1",
+                )
+                    .bind(audit_event_id)
+                    .fetch_optional(pool)
+                    .await
+                    .context("lookup rollout policy audit_event_id in command_journal")?;
+            match row {
+                Some((command_type, Some(caller_principal_id), Some(caller_principal_class))) => {
+                    if !matches!(command_type.as_str(), "StartRun" | "command.StartRun") {
+                        failures.push(format!(
+                            "invalid_{context}.audit_event_id: command journal entry must be a StartRun command"
+                        ));
+                    }
+                    if caller_principal_class != "operator" {
+                        failures.push(format!(
+                            "invalid_{context}.audit_event_id: command journal principal class must be operator"
+                        ));
+                    }
+                    if caller_principal_id.trim().is_empty() || caller_principal_id != principal_id
+                    {
+                        failures.push(format!(
+                            "invalid_{context}.audit_event_id: command journal principal does not match principal_id"
+                        ));
+                    }
+                }
+                Some(_) => failures.push(format!(
+                    "invalid_{context}.audit_event_id: command journal entry must include operator principal identity"
+                )),
+                None => failures.push(format!(
+                    "missing_{context}.audit_event_id: command journal entry not found"
+                )),
+            }
         }
     }
     match object.get("expires_at").and_then(|value| value.as_str()) {
@@ -662,37 +771,138 @@ fn sanitize_metric_label(value: &str) -> String {
         .collect()
 }
 
+fn bounded_diagnostic(message: String) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 768;
+    if message.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return message;
+    }
+    let mut bounded = message
+        .chars()
+        .take(MAX_DIAGNOSTIC_CHARS.saturating_sub(12))
+        .collect::<String>();
+    bounded.push_str("...<truncated>");
+    bounded
+}
+
+fn scrub_diagnostic_for_workspace(message: String, workspace_root: &str) -> (String, bool) {
+    let mut scrubbed = false;
+    let mut output = message;
+    let trimmed = workspace_root.trim_end_matches('/');
+    if !trimmed.is_empty() && output.contains(trimmed) {
+        output = output.replace(trimmed, "<workspace>");
+        scrubbed = true;
+    }
+    (bounded_diagnostic(output), scrubbed)
+}
+
+fn scrub_diagnostics_for_run(run: &Run, diagnostics: Vec<String>) -> (Vec<String>, String) {
+    let mut redacted = false;
+    let diagnostics = diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let (diagnostic, scrubbed) =
+                scrub_diagnostic_for_workspace(diagnostic, &run.workspace_root);
+            redacted |= scrubbed;
+            diagnostic
+        })
+        .collect();
+    let redaction_state = if redacted { "partial" } else { "none" }.to_string();
+    (diagnostics, redaction_state)
+}
+
 async fn upsert_linted_contract_check(
     pool: &SqlitePool,
     run: &Run,
     approved_proposal: &Artifact,
-    enforcement_mode: RolloutContractEnforcementMode,
+    policy: &EffectivePreflightPolicy,
     retry_count: i64,
 ) -> Result<Option<StoredRolloutContractCheck>> {
     let now = Utc::now();
     let metadata = proposal_metadata_from_artifact(run, approved_proposal)?
         .unwrap_or_else(ProposalMetadata::unknown);
-    let proposal_path = absolute_artifact_path(&approved_proposal.file_path, &run.workspace_root);
-    let data = match std::fs::read(&proposal_path) {
-        Ok(data) => data,
-        Err(_) => return Ok(None),
+    let proposal_path = match safe_artifact_path(&approved_proposal.file_path, &run.workspace_root)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return upsert_invalid_approved_proposal_contract_check(
+                pool,
+                run,
+                approved_proposal,
+                policy.enforcement_mode.clone(),
+                retry_count,
+                vec!["unsafe_approved_proposal_artifact_path".to_string()],
+                vec![bounded_diagnostic(format!(
+                    "approved proposal artifact path rejected: {error}"
+                ))],
+            )
+            .await
+            .map(Some)
+        }
     };
-    let proposal_value: serde_json::Value = serde_json::from_slice(&data).with_context(|| {
-        format!(
-            "parse approved proposal artifact {}",
-            proposal_path.display()
-        )
-    })?;
+    let data = match read_bounded_rollout_contract_input(&proposal_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return upsert_invalid_approved_proposal_contract_check(
+                pool,
+                run,
+                approved_proposal,
+                policy.enforcement_mode.clone(),
+                retry_count,
+                vec!["invalid_approved_proposal_artifact".to_string()],
+                vec![bounded_diagnostic(format!(
+                    "read approved proposal artifact {}: {error}",
+                    proposal_path.display()
+                ))],
+            )
+            .await
+            .map(Some)
+        }
+    };
+    let proposal_value: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(value) => value,
+        Err(error) => {
+            return upsert_invalid_approved_proposal_contract_check(
+                pool,
+                run,
+                approved_proposal,
+                policy.enforcement_mode.clone(),
+                retry_count,
+                vec!["invalid_approved_proposal_artifact".to_string()],
+                vec![bounded_diagnostic(format!(
+                    "parse approved proposal artifact {}: {error}",
+                    proposal_path.display()
+                ))],
+            )
+            .await
+            .map(Some)
+        }
+    };
 
     let Some(contract_source) =
         extract_rollout_contract_source(&proposal_value, &proposal_path, &run.workspace_root)?
     else {
         return Ok(None);
     };
-    let lint = lint_rollout_contract(&contract_source.contract);
+    let mut lint = lint_rollout_contract(&contract_source.contract, &run.workspace_root);
+    lint.failures.extend(contract_source.extraction_failures);
+    let cutover = effective_cutover_decision(run, &lint, policy);
+    let enforcement_mode = cutover.enforcement_mode;
     let (status, decision, failure_reasons, diagnostics) = if lint.failures.is_empty() {
-        match lint.applicability.as_deref() {
-            Some("not_applicable") => (
+        match (
+            cutover.grandfathered_not_applicable,
+            lint.applicability.as_deref(),
+        ) {
+            (true, _) => (
+                RolloutContractStatus::NotApplicable,
+                RolloutContractDecision::NotApplicable,
+                Vec::new(),
+                vec![format!(
+                    "rollout_contract_v1 grandfathered before cutover source={}",
+                    contract_source.source
+                )],
+            ),
+            (_, Some("not_applicable")) => (
                 RolloutContractStatus::NotApplicable,
                 RolloutContractDecision::NotApplicable,
                 Vec::new(),
@@ -701,7 +911,7 @@ async fn upsert_linted_contract_check(
                     contract_source.source
                 )],
             ),
-            _ => (
+            (_, _) => (
                 RolloutContractStatus::Pass,
                 RolloutContractDecision::Release,
                 Vec::new(),
@@ -725,6 +935,7 @@ async fn upsert_linted_contract_check(
     };
 
     let mut diagnostics = diagnostics;
+    diagnostics.extend(cutover.diagnostics);
     append_rollout_contract_operational_metric_diagnostics(
         &mut diagnostics,
         &metadata.proposal_id,
@@ -734,6 +945,7 @@ async fn upsert_linted_contract_check(
         &lint.operational_metrics,
     );
 
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -750,9 +962,10 @@ async fn upsert_linted_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: lint.rollback_disposition,
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: lint.cutover_policy_revision,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -785,6 +998,7 @@ async fn upsert_disabled_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -806,9 +1020,10 @@ async fn upsert_disabled_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -854,6 +1069,7 @@ async fn upsert_waived_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -875,9 +1091,10 @@ async fn upsert_waived_contract_check(
         failure_reasons,
         diagnostics,
         waiver: Some(waiver),
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -913,6 +1130,7 @@ async fn upsert_policy_failure_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -934,9 +1152,10 @@ async fn upsert_policy_failure_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -970,6 +1189,7 @@ async fn upsert_missing_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -991,9 +1211,64 @@ async fn upsert_missing_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Stale,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
+        retry_count,
+        preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
+    };
+    rollout_contract_checks::upsert_rollout_contract_check(pool, &input, now).await
+}
+
+async fn upsert_invalid_approved_proposal_contract_check(
+    pool: &SqlitePool,
+    run: &Run,
+    approved_proposal: &Artifact,
+    enforcement_mode: RolloutContractEnforcementMode,
+    retry_count: i64,
+    failure_reasons: Vec<String>,
+    diagnostics: Vec<String>,
+) -> Result<StoredRolloutContractCheck> {
+    let now = Utc::now();
+    let metadata = proposal_metadata_from_artifact(run, approved_proposal)?
+        .unwrap_or_else(ProposalMetadata::unknown);
+    let status = RolloutContractStatus::Fail;
+    let decision = RolloutContractDecision::Hold;
+    let mut diagnostics = diagnostics;
+    append_rollout_contract_operational_metric_diagnostics(
+        &mut diagnostics,
+        &metadata.proposal_id,
+        &status,
+        &enforcement_mode,
+        &failure_reasons,
+        &[],
+    );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
+    let input = UpsertRolloutContractCheck {
+        id: Uuid::new_v4(),
+        run_id: run.id.inner(),
+        proposal_id: metadata.proposal_id,
+        proposal_revision_id: metadata.proposal_revision_id,
+        proposal_content_hash: approved_proposal
+            .checksum_sha256
+            .clone()
+            .map(|hash| format!("sha256:{hash}"))
+            .unwrap_or_else(|| DEFAULT_PROPOSAL_CONTENT_HASH.to_string()),
+        contract_object_hash: metadata.contract_object_hash,
+        content_snapshot_id: approved_proposal.id.to_string(),
+        checker_version: CHECKER_VERSION.to_string(),
+        status,
+        decision,
+        lifecycle_state: RolloutContractLifecycleState::Terminal,
+        enforcement_mode,
+        failure_reasons,
+        diagnostics,
+        waiver: None,
+        rollback_disposition: default_rollback_disposition(),
+        projection_integrity: ProjectionIntegrity::Valid,
+        cutover_policy_revision: None,
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -1025,6 +1300,7 @@ async fn upsert_timeout_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -1046,9 +1322,10 @@ async fn upsert_timeout_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count: 0,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -1082,6 +1359,7 @@ async fn upsert_retry_exhausted_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -1103,9 +1381,10 @@ async fn upsert_retry_exhausted_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -1141,6 +1420,7 @@ async fn upsert_cancelled_contract_check(
         &failure_reasons,
         &[],
     );
+    let (diagnostics, redaction_state) = scrub_diagnostics_for_run(run, diagnostics);
     let input = UpsertRolloutContractCheck {
         id: Uuid::new_v4(),
         run_id: run.id.inner(),
@@ -1162,9 +1442,10 @@ async fn upsert_cancelled_contract_check(
         failure_reasons,
         diagnostics,
         waiver: None,
+        rollback_disposition: default_rollback_disposition(),
         projection_integrity: ProjectionIntegrity::Valid,
         cutover_policy_revision: None,
-        redaction_state: "none".to_string(),
+        redaction_state,
         retry_count,
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
@@ -1213,7 +1494,55 @@ async fn upsert_projection_integrity_check(
         failure_reasons,
         diagnostics,
         waiver: previous.waiver.clone(),
+        rollback_disposition: previous.rollback_disposition.clone(),
         projection_integrity: drift.projection_integrity,
+        cutover_policy_revision: previous.cutover_policy_revision.clone(),
+        redaction_state: previous.redaction_state.clone(),
+        retry_count: previous.retry_count.max(retry_count),
+        preflight_timeout_seconds: previous.preflight_timeout_seconds,
+    };
+    rollout_contract_checks::upsert_rollout_contract_check(pool, &input, now).await
+}
+
+async fn upsert_hash_drift_contract_check(
+    pool: &SqlitePool,
+    previous: &StoredRolloutContractCheck,
+    drift: &ContractIdentityDrift,
+    retry_count: i64,
+) -> Result<StoredRolloutContractCheck> {
+    let now = Utc::now();
+    let status = RolloutContractStatus::Stale;
+    let failure_reasons = vec!["stale_rollout_contract_check_hash_drift".to_string()];
+    let mut diagnostics = vec![format!(
+        "rollout_contract_check terminal record does not match current approved proposal artifact mismatches={}",
+        drift.mismatches.join(",")
+    )];
+    append_rollout_contract_operational_metric_diagnostics(
+        &mut diagnostics,
+        &drift.identity.proposal_id,
+        &status,
+        &previous.enforcement_mode,
+        &failure_reasons,
+        &[],
+    );
+    let input = UpsertRolloutContractCheck {
+        id: Uuid::new_v4(),
+        run_id: previous.run_id,
+        proposal_id: drift.identity.proposal_id.clone(),
+        proposal_revision_id: drift.identity.proposal_revision_id.clone(),
+        proposal_content_hash: drift.identity.proposal_content_hash.clone(),
+        contract_object_hash: drift.identity.contract_object_hash.clone(),
+        content_snapshot_id: drift.identity.content_snapshot_id.clone(),
+        checker_version: CHECKER_VERSION.to_string(),
+        status,
+        decision: RolloutContractDecision::Hold,
+        lifecycle_state: RolloutContractLifecycleState::Terminal,
+        enforcement_mode: previous.enforcement_mode.clone(),
+        failure_reasons,
+        diagnostics,
+        waiver: previous.waiver.clone(),
+        rollback_disposition: previous.rollback_disposition.clone(),
+        projection_integrity: ProjectionIntegrity::Stale,
         cutover_policy_revision: previous.cutover_policy_revision.clone(),
         redaction_state: previous.redaction_state.clone(),
         retry_count: previous.retry_count.max(retry_count),
@@ -1226,14 +1555,93 @@ async fn upsert_projection_integrity_check(
 struct RolloutContractSource {
     contract: serde_json::Value,
     source: String,
+    extraction_failures: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct RolloutContractLint {
     failures: Vec<String>,
     applicability: Option<String>,
     operational_metrics: Vec<String>,
     cutover_policy_revision: Option<String>,
+    cutover_enforcement_mode: Option<RolloutContractEnforcementMode>,
+    cutover_effective_at: Option<DateTime<Utc>>,
+    cutover_applicable_to: Option<String>,
+    cutover_grandfathered_rendering: Option<String>,
+    rollback_disposition: serde_json::Value,
+}
+
+impl Default for RolloutContractLint {
+    fn default() -> Self {
+        Self {
+            failures: Vec::new(),
+            applicability: None,
+            operational_metrics: Vec::new(),
+            cutover_policy_revision: None,
+            cutover_enforcement_mode: None,
+            cutover_effective_at: None,
+            cutover_applicable_to: None,
+            cutover_grandfathered_rendering: None,
+            rollback_disposition: default_rollback_disposition(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveCutoverDecision {
+    enforcement_mode: RolloutContractEnforcementMode,
+    grandfathered_not_applicable: bool,
+    diagnostics: Vec<String>,
+}
+
+fn effective_cutover_decision(
+    run: &Run,
+    lint: &RolloutContractLint,
+    policy: &EffectivePreflightPolicy,
+) -> EffectiveCutoverDecision {
+    if policy.enforcement_mode_supplied {
+        return EffectiveCutoverDecision {
+            enforcement_mode: policy.enforcement_mode.clone(),
+            grandfathered_not_applicable: false,
+            diagnostics: Vec::new(),
+        };
+    }
+
+    let Some(effective_at) = lint.cutover_effective_at else {
+        return EffectiveCutoverDecision {
+            enforcement_mode: policy.enforcement_mode.clone(),
+            grandfathered_not_applicable: false,
+            diagnostics: vec!["rollout_contract_default_enforcement_mode=enforce".to_string()],
+        };
+    };
+
+    let applies_to_post_cutover_starts =
+        lint.cutover_applicable_to.as_deref() == Some("post_cutover_implementation_starts");
+    if applies_to_post_cutover_starts && run.started_at < effective_at {
+        return EffectiveCutoverDecision {
+            enforcement_mode: policy.enforcement_mode.clone(),
+            grandfathered_not_applicable: lint.cutover_grandfathered_rendering.as_deref()
+                == Some("not_applicable"),
+            diagnostics: vec![format!(
+                "rollout_contract_cutover_grandfathered_until={}",
+                effective_at.to_rfc3339()
+            )],
+        };
+    }
+
+    let enforcement_mode = lint
+        .cutover_enforcement_mode
+        .clone()
+        .unwrap_or_else(|| policy.enforcement_mode.clone());
+    EffectiveCutoverDecision {
+        enforcement_mode: enforcement_mode.clone(),
+        grandfathered_not_applicable: false,
+        diagnostics: vec![format!(
+            "rollout_contract_cutover_applied revision={} mode={}",
+            lint.cutover_policy_revision.as_deref().unwrap_or("unknown"),
+            enforcement_mode
+        )],
+    }
 }
 
 fn extract_rollout_contract_source(
@@ -1252,16 +1660,13 @@ fn extract_rollout_contract_source(
             == Some(ROLLOUT_CONTRACT_SCHEMA_VERSION);
     let has_sidecar = object.contains_key("rollout_contract_sidecar");
     if has_inline && has_sidecar {
-        return Ok(Some(RolloutContractSource {
-            contract: serde_json::json!({
-                "schema_version": ROLLOUT_CONTRACT_SCHEMA_VERSION,
-                "applicability": "required",
-                "p084_extraction_failures": [
-                    "duplicate_source: inline rollout contract and rollout_contract_sidecar keys are both present"
-                ]
-            }),
-            source: "duplicate_source".to_string(),
-        }));
+        return Ok(Some(extraction_failure_contract(
+            vec![
+                "duplicate_source: inline rollout contract and rollout_contract_sidecar keys are both present"
+                    .to_string(),
+            ],
+            "duplicate_source",
+        )));
     }
 
     if object
@@ -1272,6 +1677,7 @@ fn extract_rollout_contract_source(
         return Ok(Some(RolloutContractSource {
             contract: proposal.clone(),
             source: proposal_path.display().to_string(),
+            extraction_failures: Vec::new(),
         }));
     }
 
@@ -1279,6 +1685,7 @@ fn extract_rollout_contract_source(
         return Ok(Some(RolloutContractSource {
             contract: inline.clone(),
             source: format!("{}#rollout_contract_v1", proposal_path.display()),
+            extraction_failures: Vec::new(),
         }));
     }
 
@@ -1286,6 +1693,7 @@ fn extract_rollout_contract_source(
         return Ok(Some(RolloutContractSource {
             contract: normalize_p084_self_contract(object, self_contract),
             source: format!("{}#p084_self_contract", proposal_path.display()),
+            extraction_failures: Vec::new(),
         }));
     }
 
@@ -1293,18 +1701,20 @@ fn extract_rollout_contract_source(
         return Ok(None);
     };
     let Some(sidecar_path) = sidecar.as_str() else {
-        return Ok(Some(RolloutContractSource {
-            contract: serde_json::json!({
-                "schema_version": ROLLOUT_CONTRACT_SCHEMA_VERSION,
-                "applicability": "required",
-                "p084_extraction_failures": [
-                    "invalid_rollout_contract_sidecar: rollout_contract_sidecar must be a string"
-                ]
-            }),
-            source: "invalid_sidecar".to_string(),
-        }));
+        return Ok(Some(extraction_failure_contract(
+            vec![
+                "invalid_rollout_contract_sidecar: rollout_contract_sidecar must be a string"
+                    .to_string(),
+            ],
+            "invalid_sidecar",
+        )));
     };
-    let path_failures = check_path_safety(sidecar_path, "rollout_contract_sidecar");
+    let path_failures = check_path_safety_under_root(
+        sidecar_path,
+        "rollout_contract_sidecar",
+        workspace_root,
+        &["docs/proposals", "docs/evidence/rollout-contract"],
+    );
     if !path_failures.is_empty() {
         return Ok(Some(extraction_failure_contract(
             path_failures,
@@ -1312,8 +1722,21 @@ fn extract_rollout_contract_source(
         )));
     }
 
-    let sidecar_abs = std::path::Path::new(workspace_root).join(sidecar_path);
-    let data = match std::fs::read(&sidecar_abs) {
+    let sidecar_abs = match canonical_repo_path(
+        sidecar_path,
+        "rollout_contract_sidecar",
+        workspace_root,
+        &["docs/proposals", "docs/evidence/rollout-contract"],
+    ) {
+        Ok(path) => path,
+        Err(failures) => {
+            return Ok(Some(extraction_failure_contract(
+                failures,
+                "unsafe_sidecar",
+            )))
+        }
+    };
+    let data = match read_bounded_rollout_contract_input(&sidecar_abs) {
         Ok(data) => data,
         Err(error) => {
             return Ok(Some(extraction_failure_contract(
@@ -1337,6 +1760,7 @@ fn extract_rollout_contract_source(
     Ok(Some(RolloutContractSource {
         contract,
         source: sidecar_path.to_string(),
+        extraction_failures: Vec::new(),
     }))
 }
 
@@ -1344,9 +1768,9 @@ fn extraction_failure_contract(failures: Vec<String>, source: &str) -> RolloutCo
     RolloutContractSource {
         contract: serde_json::json!({
             "schema_version": ROLLOUT_CONTRACT_SCHEMA_VERSION,
-            "applicability": "required",
-            "p084_extraction_failures": failures
+            "applicability": "required"
         }),
+        extraction_failures: failures,
         source: source.to_string(),
     }
 }
@@ -1390,6 +1814,17 @@ fn normalize_p084_self_contract(
         serde_json::json!({
             "allowlist": ["./scripts/test-gate.sh proposal-084"]
         }),
+    );
+    contract.insert(
+        "migrations".to_string(),
+        serde_json::json!({
+            "not_applicable": true,
+            "justification": "P084 self-contract normalization does not require an additional migration."
+        }),
+    );
+    contract.insert(
+        "decision_vocabulary".to_string(),
+        serde_json::json!(ALLOWED_DECISION_VOCABULARY),
     );
     if let Some(metrics) = normalized_p084_metrics(proposal) {
         contract.insert("metrics".to_string(), metrics);
@@ -1453,7 +1888,10 @@ fn normalized_p084_negative_fixtures(
     serde_json::Value::Object(fixtures)
 }
 
-fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
+fn lint_rollout_contract(
+    contract: &serde_json::Value,
+    workspace_root: &str,
+) -> RolloutContractLint {
     let Some(object) = contract.as_object() else {
         return RolloutContractLint {
             failures: vec!["invalid_json: top-level value must be a JSON object".to_string()],
@@ -1464,23 +1902,17 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
     let mut failures = Vec::new();
     let mut operational_metrics = Vec::new();
     let mut cutover_policy_revision = None;
+    let mut cutover_enforcement_mode = None;
+    let mut cutover_effective_at = None;
+    let mut cutover_applicable_to = None;
+    let mut cutover_grandfathered_rendering = None;
+    let mut rollback_disposition = default_rollback_disposition();
     failures.extend(check_unknown_fields(
         object,
         ALLOWED_TOP_LEVEL_FIELDS,
         "rollout_contract_v1",
     ));
     failures.extend(check_secret_like_values(contract, "rollout_contract_v1"));
-
-    if let Some(extraction_failures) = object
-        .get("p084_extraction_failures")
-        .and_then(|value| value.as_array())
-    {
-        failures.extend(
-            extraction_failures
-                .iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string)),
-        );
-    }
 
     match object
         .get("schema_version")
@@ -1588,6 +2020,7 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
 
     match object.get("rollback_disposition") {
         Some(value) if value.is_object() => {
+            rollback_disposition = value.clone();
             let rollback = value.as_object().expect("checked object");
             failures.extend(check_unknown_fields(
                 rollback,
@@ -1745,7 +2178,12 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
         .get("readback_fixture")
         .and_then(|value| value.as_str())
     {
-        failures.extend(check_path_safety(readback_fixture, "readback_fixture"));
+        failures.extend(check_fixture_path_safety_under_root(
+            readback_fixture,
+            "readback_fixture",
+            workspace_root,
+            &["docs/evidence/rollout-contract"],
+        ));
     }
     if let Some(negative_fixtures) = object
         .get("negative_fixtures")
@@ -1753,7 +2191,12 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
     {
         for (key, value) in negative_fixtures {
             if let Some(path) = value.as_str() {
-                failures.extend(check_path_safety(path, &format!("negative_fixtures.{key}")));
+                failures.extend(check_fixture_path_safety_under_root(
+                    path,
+                    &format!("negative_fixtures.{key}"),
+                    workspace_root,
+                    &["docs/evidence/rollout-contract"],
+                ));
             } else {
                 failures.push(format!(
                     "invalid_negative_fixtures.{key}: value must be a string path"
@@ -1806,6 +2249,10 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
                     .get("revision")
                     .and_then(|value| value.as_str())
                     .map(ToString::to_string);
+                cutover_applicable_to = cutover
+                    .get("applicable_to")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
                 if let Some(mode) = cutover
                     .get("enforcement_mode_at_cutover")
                     .and_then(|value| value.as_str())
@@ -1814,6 +2261,13 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
                         failures.push(format!(
                             "invalid_cutover_policy.enforcement_mode_at_cutover: {mode:?} not in {ALLOWED_ENFORCEMENT_MODES:?}"
                         ));
+                    } else {
+                        cutover_enforcement_mode = Some(match mode {
+                            "enforce" => RolloutContractEnforcementMode::Enforce,
+                            "permissive" => RolloutContractEnforcementMode::Permissive,
+                            "disabled" => RolloutContractEnforcementMode::Disabled,
+                            _ => unreachable!("validated enforcement mode"),
+                        });
                     }
                 }
                 if let Some(grandfathered) = cutover
@@ -1825,12 +2279,19 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
                             "invalid_cutover_policy.grandfathered_rendering: must be 'not_applicable'"
                                 .to_string(),
                         );
+                    } else {
+                        cutover_grandfathered_rendering = Some(grandfathered.to_string());
                     }
                 }
                 if let Some(effective_at) = cutover.get("effective_timestamp_iso8601") {
                     match effective_at.as_str() {
-                        Some(value)
-                            if chrono::DateTime::parse_from_rfc3339(value).is_ok() => {}
+                        Some(value) => match chrono::DateTime::parse_from_rfc3339(value) {
+                            Ok(parsed) => cutover_effective_at = Some(parsed.with_timezone(&Utc)),
+                            Err(_) => failures.push(
+                                "invalid_cutover_policy.effective_timestamp_iso8601: must be an ISO-8601 timestamp string"
+                                    .to_string(),
+                            ),
+                        },
                         _ => failures.push(
                             "invalid_cutover_policy.effective_timestamp_iso8601: must be an ISO-8601 timestamp string"
                                 .to_string(),
@@ -1854,6 +2315,11 @@ fn lint_rollout_contract(contract: &serde_json::Value) -> RolloutContractLint {
         applicability,
         operational_metrics,
         cutover_policy_revision,
+        cutover_enforcement_mode,
+        cutover_effective_at,
+        cutover_applicable_to,
+        cutover_grandfathered_rendering,
+        rollback_disposition,
     }
 }
 
@@ -1872,6 +2338,105 @@ fn check_path_safety(value: &str, context: &str) -> Vec<String> {
         )];
     }
     Vec::new()
+}
+
+fn check_path_safety_under_root(
+    value: &str,
+    context: &str,
+    workspace_root: &str,
+    allowed_roots: &[&str],
+) -> Vec<String> {
+    let mut failures = check_path_safety(value, context);
+    if !failures.is_empty() {
+        return failures;
+    }
+    let path = std::path::Path::new(value);
+    if !allowed_roots.iter().any(|root| path.starts_with(root)) {
+        failures.push(format!(
+            "unsafe_path: {context} must be under one of {allowed_roots:?}: {value:?}"
+        ));
+        return failures;
+    }
+    if let Err(path_failures) = canonical_repo_path(value, context, workspace_root, allowed_roots) {
+        failures.extend(path_failures);
+    }
+    failures
+}
+
+fn check_fixture_path_safety_under_root(
+    value: &str,
+    context: &str,
+    workspace_root: &str,
+    allowed_roots: &[&str],
+) -> Vec<String> {
+    let mut failures = check_path_safety(value, context);
+    if !failures.is_empty() {
+        return failures;
+    }
+    let path = std::path::Path::new(value);
+    if !allowed_roots.iter().any(|root| path.starts_with(root)) {
+        failures.push(format!(
+            "unsafe_path: {context} must be under one of {allowed_roots:?}: {value:?}"
+        ));
+        return failures;
+    }
+    let candidate = std::path::Path::new(workspace_root).join(path);
+    if !candidate.exists() {
+        failures.push(format!(
+            "missing_fixture_path: {context} does not exist under workspace root: {value:?}"
+        ));
+        return failures;
+    }
+    if let Err(path_failures) = canonical_repo_path(value, context, workspace_root, allowed_roots) {
+        failures.extend(path_failures);
+    }
+    failures
+}
+
+fn canonical_repo_path(
+    value: &str,
+    context: &str,
+    workspace_root: &str,
+    allowed_roots: &[&str],
+) -> std::result::Result<std::path::PathBuf, Vec<String>> {
+    let failures = check_path_safety(value, context);
+    if !failures.is_empty() {
+        return Err(failures);
+    }
+    let relative = std::path::Path::new(value);
+    if !allowed_roots.iter().any(|root| relative.starts_with(root)) {
+        return Err(vec![format!(
+            "unsafe_path: {context} must be under one of {allowed_roots:?}: {value:?}"
+        )]);
+    }
+    let workspace = std::path::Path::new(workspace_root);
+    let candidate = workspace.join(relative);
+    let canonical_candidate = candidate.canonicalize().map_err(|error| {
+        vec![format!(
+            "unsafe_path: {context} could not be canonicalized: {value:?}: {error}"
+        )]
+    })?;
+    let mut allowed = Vec::new();
+    for root in allowed_roots {
+        match workspace.join(root).canonicalize() {
+            Ok(canonical) => allowed.push(canonical),
+            Err(error) => {
+                return Err(vec![format!(
+                    "unsafe_path: allowed root {root:?} could not be canonicalized for {context}: {error}"
+                )])
+            }
+        }
+    }
+    if allowed
+        .iter()
+        .any(|allowed_root| canonical_candidate.starts_with(allowed_root))
+    {
+        Ok(canonical_candidate)
+    } else {
+        Err(vec![format!(
+            "unsafe_path: symlink escape or disallowed canonical target in {context}: {value:?}"
+        )])
+    }
 }
 
 fn check_unknown_fields(
@@ -1909,6 +2474,10 @@ fn check_string_array(value: &serde_json::Value, context: &str, non_empty: bool)
 
 fn check_command_safety(cmd: &str, context: &str) -> Vec<String> {
     const SHELL_METACHARACTERS: &[char] = &['|', '&', ';', '$', '`', '>', '<', '(', ')', '{', '}'];
+    let control_failures = check_control_chars(cmd, context);
+    if !control_failures.is_empty() {
+        return control_failures;
+    }
     if let Some(ch) = SHELL_METACHARACTERS.iter().find(|ch| cmd.contains(**ch)) {
         return vec![format!(
             "unsafe_command: shell metacharacter {ch:?} in {context}: {cmd:?}"
@@ -1940,43 +2509,58 @@ fn check_control_chars(value: &str, context: &str) -> Vec<String> {
 }
 
 fn check_secret_like_values(value: &serde_json::Value, context: &str) -> Vec<String> {
+    const MAX_JSON_DEPTH: usize = 64;
+    const MAX_JSON_NODES: usize = 10_000;
     let mut failures = Vec::new();
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, nested) in object {
-                let lowered = key.to_ascii_lowercase();
-                if ["password", "token", "api_key", "apikey", "secret"]
+    let mut stack = vec![(value, context.to_string(), 0usize)];
+    let mut nodes = 0usize;
+    while let Some((value, context, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_JSON_NODES {
+            failures.push(format!(
+                "json_too_large: {context} exceeds {MAX_JSON_NODES} JSON nodes"
+            ));
+            break;
+        }
+        if depth > MAX_JSON_DEPTH {
+            failures.push(format!(
+                "json_too_deep: {context} exceeds {MAX_JSON_DEPTH} levels"
+            ));
+            continue;
+        }
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, nested) in object {
+                    let nested_context = format!("{context}.{key}");
+                    stack.push((nested, nested_context, depth + 1));
+                    let lowered = key.to_ascii_lowercase();
+                    if ["password", "token", "api_key", "apikey", "secret"]
+                        .iter()
+                        .any(|marker| lowered.contains(marker))
+                    {
+                        failures.push(format!("secret_like_field: {context}.{key} is not allowed"));
+                    }
+                }
+            }
+            serde_json::Value::Array(entries) => {
+                for (idx, nested) in entries.iter().enumerate() {
+                    stack.push((nested, format!("{context}[{idx}]"), depth + 1));
+                }
+            }
+            serde_json::Value::String(value) => {
+                failures.extend(check_control_chars(value, &context));
+                let lowered = value.to_ascii_lowercase();
+                if ["password=", "token=", "api_key=", "apikey=", "secret="]
                     .iter()
                     .any(|marker| lowered.contains(marker))
                 {
-                    failures.push(format!("secret_like_field: {context}.{key} is not allowed"));
+                    failures.push(format!(
+                        "secret_like_value: {context} contains a secret-like assignment"
+                    ));
                 }
-                failures.extend(check_secret_like_values(
-                    nested,
-                    &format!("{context}.{key}"),
-                ));
             }
+            _ => {}
         }
-        serde_json::Value::Array(entries) => {
-            for (idx, nested) in entries.iter().enumerate() {
-                failures.extend(check_secret_like_values(
-                    nested,
-                    &format!("{context}[{idx}]"),
-                ));
-            }
-        }
-        serde_json::Value::String(value) => {
-            let lowered = value.to_ascii_lowercase();
-            if ["password=", "token=", "api_key=", "apikey=", "secret="]
-                .iter()
-                .any(|marker| lowered.contains(marker))
-            {
-                failures.push(format!(
-                    "secret_like_value: {context} contains a secret-like assignment"
-                ));
-            }
-        }
-        _ => {}
     }
     failures
 }
@@ -1998,18 +2582,30 @@ impl ProposalMetadata {
             content_snapshot_id: DEFAULT_CONTENT_SNAPSHOT_ID.to_string(),
         }
     }
+
+    fn unknown_for_artifact(artifact: &Artifact) -> Self {
+        Self {
+            content_snapshot_id: artifact.id.to_string(),
+            ..Self::unknown()
+        }
+    }
 }
 
 fn proposal_metadata_from_artifact(
     run: &Run,
     artifact: &Artifact,
 ) -> Result<Option<ProposalMetadata>> {
-    let path = absolute_artifact_path(&artifact.file_path, &run.workspace_root);
+    let path = match safe_artifact_path(&artifact.file_path, &run.workspace_root) {
+        Ok(path) => path,
+        Err(_) => return Ok(Some(ProposalMetadata::unknown_for_artifact(artifact))),
+    };
     if !path.exists() {
         return Ok(None);
     }
-    let data = std::fs::read(&path)
-        .with_context(|| format!("read approved proposal artifact {}", path.display()))?;
+    let data = match read_bounded_rollout_contract_input(&path) {
+        Ok(data) => data,
+        Err(_) => return Ok(Some(ProposalMetadata::unknown_for_artifact(artifact))),
+    };
     let value: serde_json::Value = serde_json::from_slice(&data).unwrap_or(serde_json::Value::Null);
     let proposal_revision_id = value
         .get("proposal_revision_id")
@@ -2034,24 +2630,143 @@ fn proposal_metadata_from_artifact(
     }))
 }
 
-fn proposal_content_hash(artifact: &Artifact, data: &[u8]) -> String {
-    artifact
-        .checksum_sha256
-        .clone()
-        .map(|hash| format!("sha256:{hash}"))
-        .unwrap_or_else(|| {
-            let digest = sha2::Sha256::digest(data);
-            format!("sha256:{digest:x}")
-        })
+fn current_contract_identity(
+    run: &Run,
+    artifact: Option<&Artifact>,
+) -> Result<Option<CurrentContractIdentity>> {
+    let Some(artifact) = artifact else {
+        return Ok(None);
+    };
+    let path = match safe_artifact_path(&artifact.file_path, &run.workspace_root) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = match read_bounded_rollout_contract_input(&path) {
+        Ok(data) => data,
+        Err(_) => return Ok(None),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let metadata = proposal_metadata_from_value(artifact, &value);
+    let contract_object_hash =
+        match extract_rollout_contract_source(&value, &path, &run.workspace_root)? {
+            Some(source) => hash_json_value(&source.contract),
+            None => DEFAULT_CONTRACT_OBJECT_HASH.to_string(),
+        };
+    Ok(Some(CurrentContractIdentity {
+        proposal_id: metadata.proposal_id,
+        proposal_revision_id: metadata.proposal_revision_id,
+        proposal_content_hash: proposal_content_hash(artifact, &data),
+        contract_object_hash,
+        content_snapshot_id: artifact.id.to_string(),
+    }))
 }
 
-fn absolute_artifact_path(file_path: &str, workspace_root: &str) -> std::path::PathBuf {
-    let path = std::path::PathBuf::from(file_path);
-    if path.is_absolute() {
-        path
-    } else {
-        std::path::Path::new(workspace_root).join(path)
+fn proposal_metadata_from_value(
+    artifact: &Artifact,
+    value: &serde_json::Value,
+) -> ProposalMetadata {
+    let proposal_revision_id = value
+        .get("proposal_revision_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_PROPOSAL_REVISION_ID)
+        .to_string();
+    let proposal_id = value
+        .get("source_proposal")
+        .and_then(|v| v.as_str())
+        .and_then(proposal_id_from_source_path)
+        .unwrap_or_else(|| DEFAULT_PROPOSAL_ID.to_string());
+    let contract_object_hash = value
+        .get("p084_self_contract")
+        .map(hash_json_value)
+        .unwrap_or_else(|| DEFAULT_CONTRACT_OBJECT_HASH.to_string());
+
+    ProposalMetadata {
+        proposal_id,
+        proposal_revision_id,
+        contract_object_hash,
+        content_snapshot_id: artifact.id.to_string(),
     }
+}
+
+fn proposal_content_hash(_artifact: &Artifact, data: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(data);
+    format!("sha256:{digest:x}")
+}
+
+fn safe_artifact_path(file_path: &str, workspace_root: &str) -> Result<std::path::PathBuf> {
+    let relative = std::path::Path::new(file_path);
+    if relative.is_absolute() {
+        anyhow::bail!("artifact path must be relative to workspace root: {file_path}");
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("artifact path must not contain parent traversal: {file_path}");
+    }
+    let workspace = std::path::Path::new(workspace_root);
+    let candidate = workspace.join(relative);
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace root {workspace_root}"))?;
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalize artifact path {}", candidate.display()))?;
+    if !canonical.starts_with(&workspace) {
+        anyhow::bail!(
+            "artifact path {} resolves outside workspace root {}",
+            canonical.display(),
+            workspace.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn read_bounded_rollout_contract_input(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_ROLLOUT_CONTRACT_INPUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "rollout contract input {} exceeds {} bytes",
+                path.display(),
+                MAX_ROLLOUT_CONTRACT_INPUT_BYTES
+            ),
+        ));
+    }
+    let mut bounded = file.take(MAX_ROLLOUT_CONTRACT_INPUT_BYTES + 1);
+    let mut data = Vec::new();
+    bounded.read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_ROLLOUT_CONTRACT_INPUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "rollout contract input {} exceeds {} bytes",
+                path.display(),
+                MAX_ROLLOUT_CONTRACT_INPUT_BYTES
+            ),
+        ));
+    }
+    Ok(data)
 }
 
 fn proposal_id_from_source_path(path: &str) -> Option<String> {
@@ -2068,6 +2783,14 @@ fn hash_json_value(value: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let digest = sha2::Sha256::digest(&bytes);
     format!("sha256:{digest:x}")
+}
+
+fn default_rollback_disposition() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "not_applicable",
+        "data_loss_risk": "none",
+        "steps": []
+    })
 }
 
 fn write_rollout_contract_check_projection(
@@ -2170,11 +2893,12 @@ fn projection_mismatches(
         "decision",
         "lifecycle_state",
         "enforcement_mode",
+        "rollback_disposition",
         "projection_integrity",
         "cutover_policy_revision",
         "redaction_state",
         "retry_count",
-        "preflight_timeout_seconds",
+        "timeouts",
     ]
     .iter()
     .filter(|field| projection.get(**field) != expected.get(**field))
@@ -2208,11 +2932,15 @@ fn rollout_contract_check_projection_value(
         "failure_reasons": check.failure_reasons,
         "diagnostics": check.diagnostics,
         "waiver": check.waiver,
+        "rollback_disposition": check.rollback_disposition,
         "projection_integrity": check.projection_integrity,
         "cutover_policy_revision": check.cutover_policy_revision,
         "redaction_state": check.redaction_state,
         "retry_count": check.retry_count,
-        "preflight_timeout_seconds": check.preflight_timeout_seconds,
+        "timeouts": {
+            "preflight_timeout_seconds": check.preflight_timeout_seconds,
+            "infrastructure_retry_max": PREFLIGHT_INFRA_RETRY_BACKOFF_MS.len(),
+        },
         "created_at": check.created_at.to_rfc3339(),
         "updated_at": check.updated_at.to_rfc3339(),
     }))
@@ -2222,6 +2950,12 @@ fn atomic_write_json(path: &std::path::Path, value: &serde_json::Value) -> Resul
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create projection directory {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod projection directory {}", parent.display()))?;
+        }
     }
     let parent = path
         .parent()
@@ -2254,11 +2988,11 @@ fn atomic_write_json(path: &std::path::Path, value: &serde_json::Value) -> Resul
             path.display()
         )
     })?;
-    if let Ok(parent_dir) = std::fs::File::open(parent) {
-        parent_dir
-            .sync_all()
-            .with_context(|| format!("fsync projection directory {}", parent.display()))?;
-    }
+    let parent_dir = std::fs::File::open(parent)
+        .with_context(|| format!("open projection directory {}", parent.display()))?;
+    parent_dir
+        .sync_all()
+        .with_context(|| format!("fsync projection directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -2297,6 +3031,7 @@ mod tests {
             failure_reasons: vec![],
             diagnostics: vec![],
             waiver: None,
+            rollback_disposition: default_rollback_disposition(),
             projection_integrity: ProjectionIntegrity::Valid,
             cutover_policy_revision: None,
             redaction_state: "none".to_string(),
@@ -2342,10 +3077,16 @@ mod tests {
             drift_details_json: None,
             chainworks_meta_root: None,
             review_routing_json: None,
+            closeout_readiness_mode: None,
         }
     }
 
     fn test_artifact(run: &Run, file_path: String) -> Artifact {
+        write_valid_rollout_contract_fixtures(std::path::Path::new(&run.workspace_root));
+        let file_path = std::path::Path::new(&file_path)
+            .strip_prefix(&run.workspace_root)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or(file_path);
         Artifact {
             id: ArtifactId::new(),
             run_id: run.id,
@@ -2367,6 +3108,39 @@ mod tests {
         }
     }
 
+    fn write_valid_rollout_contract_fixtures(workspace_root: &std::path::Path) {
+        let readback = workspace_root.join(
+            "docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json",
+        );
+        let negative = workspace_root
+            .join("docs/evidence/rollout-contract/negative/unsafe-path-and-command.json");
+        let self_contract_negative = workspace_root.join(
+            "docs/evidence/rollout-contract/negative/p084-self-contract-missing-readback-field.json",
+        );
+        if let Some(parent) = readback.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        if let Some(parent) = negative.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        if let Some(parent) = self_contract_negative.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        if !readback.exists() {
+            std::fs::write(&readback, br#"{"schema_version":"operator_readback_v1"}"#).unwrap();
+        }
+        if !negative.exists() {
+            std::fs::write(&negative, br#"{"schema_version":"rollout_contract_v1"}"#).unwrap();
+        }
+        if !self_contract_negative.exists() {
+            std::fs::write(
+                &self_contract_negative,
+                br#"{"schema_version":"rollout_contract_v1"}"#,
+            )
+            .unwrap();
+        }
+    }
+
     fn valid_rollout_contract() -> serde_json::Value {
         let required_readback_fields = REQUIRED_OPERATOR_READBACK_FIELDS.to_vec();
         serde_json::json!({
@@ -2375,6 +3149,10 @@ mod tests {
             "gate_aliases": ["proposal-084", "p084"],
             "commands": {
                 "allowlist": ["./scripts/test-gate.sh proposal-084"]
+            },
+            "migrations": {
+                "not_applicable": true,
+                "justification": "No migration required for this test contract."
             },
             "metrics": {
                 "adoption_metric": "new_applicable_proposals_with_passing_rollout_contract_percent",
@@ -2391,6 +3169,7 @@ mod tests {
                 "mode": "feature_flag_disable_or_enforcement_mode_permissive",
                 "data_loss_risk": "none"
             },
+            "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
             "negative_fixtures": {
                 "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json"
             }
@@ -2409,6 +3188,77 @@ mod tests {
             record["mode"] = serde_json::json!(mode);
         }
         record
+    }
+
+    fn test_effective_policy(
+        enforcement_mode: RolloutContractEnforcementMode,
+    ) -> EffectivePreflightPolicy {
+        EffectivePreflightPolicy {
+            enforcement_mode,
+            enforcement_mode_reason_code: None,
+            enforcement_mode_supplied: true,
+            active_waiver: None,
+            failures: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn apply_enforce_policy(run: &mut Run) {
+        run.delivery_preflight_json = Some(
+            serde_json::json!({
+                ROLLOUT_PREFLIGHT_POLICY_KEY: {
+                    "enforcement_mode": audited_policy_record(
+                        Some("enforce"),
+                        Utc::now() + chrono::Duration::hours(1)
+                    )
+                }
+            })
+            .to_string(),
+        );
+    }
+
+    async fn insert_test_command_journal(pool: &SqlitePool, id: &str, principal_id: &str) {
+        sqlx::query(
+            r#"INSERT INTO command_journal
+               (id, command_type, payload_json, result_status, run_id, created_at,
+                caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id)
+               VALUES (?1, 'StartRun', '{}', 'completed', NULL, ?2,
+                       'test', ?3, 'operator', 'test', NULL)"#,
+        )
+        .bind(id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(principal_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_mode_uses_run_stamped_enforce_policy() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        apply_enforce_policy(&mut run);
+
+        assert_eq!(
+            terminal_failure_enforcement_mode(&pool, &run).await,
+            RolloutContractEnforcementMode::Enforce
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_mode_fails_closed_when_policy_parse_fails() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.delivery_preflight_json = Some("not json".to_string());
+
+        assert_eq!(
+            terminal_failure_enforcement_mode(&pool, &run).await,
+            RolloutContractEnforcementMode::Enforce
+        );
     }
 
     #[test]
@@ -2486,6 +3336,39 @@ mod tests {
         );
         assert!(evaluation.check.diagnostics.iter().any(|diagnostic| diagnostic
             == "metric:rollout_contract_permissive_dogfood_total{proposal_id=\"unknown\",status=\"missing_contract\",would_block=\"true\"}=1"));
+    }
+
+    #[tokio::test]
+    async fn missing_contract_holds_under_stamped_enforce_policy() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let evaluation = implementation_run_start_rollout_contract_preflight(&pool, &run, None)
+            .await
+            .unwrap();
+
+        assert_eq!(evaluation.action, RolloutContractPreflightAction::Hold);
+        assert!(evaluation.would_block);
+        assert_eq!(
+            evaluation.check.status,
+            RolloutContractStatus::MissingContract
+        );
+        assert_eq!(
+            evaluation.check.enforcement_mode,
+            RolloutContractEnforcementMode::Enforce
+        );
+        assert_eq!(
+            evaluation.check.failure_reasons,
+            vec!["missing_rollout_contract_check"]
+        );
     }
 
     #[tokio::test]
@@ -2584,9 +3467,13 @@ mod tests {
             .join("run-artifacts")
             .to_string_lossy()
             .to_string();
+        apply_enforce_policy(&mut run);
         let mut waiver = audited_policy_record(None, Utc::now() + chrono::Duration::hours(1));
         waiver["state"] = serde_json::json!("active");
         waiver["decision"] = serde_json::json!("waive");
+        let waiver_audit_event_id = waiver["audit_event_id"].as_str().unwrap().to_string();
+        let waiver_principal_id = waiver["principal_id"].as_str().unwrap().to_string();
+        insert_test_command_journal(&pool, &waiver_audit_event_id, &waiver_principal_id).await;
         run.delivery_preflight_json = Some(
             serde_json::json!({
                 ROLLOUT_PREFLIGHT_POLICY_KEY: {
@@ -2632,6 +3519,7 @@ mod tests {
             .join("run-artifacts")
             .to_string_lossy()
             .to_string();
+        apply_enforce_policy(&mut run);
         let mut waiver = audited_policy_record(None, Utc::now() - chrono::Duration::hours(1));
         waiver["state"] = serde_json::json!("active");
         waiver["decision"] = serde_json::json!("waive");
@@ -2753,7 +3641,7 @@ mod tests {
             &pool,
             &run,
             &artifact,
-            RolloutContractEnforcementMode::Enforce,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
             0,
         )
         .await
@@ -2764,6 +3652,14 @@ mod tests {
         assert_eq!(evaluation.action, RolloutContractPreflightAction::Allow);
         assert_eq!(check.status, RolloutContractStatus::Pass);
         assert_eq!(check.decision, RolloutContractDecision::Release);
+        assert_eq!(
+            check.rollback_disposition["mode"],
+            serde_json::json!("feature_flag_disable_or_enforcement_mode_permissive")
+        );
+        assert_eq!(
+            check.rollback_disposition["steps"],
+            serde_json::json!(["Move enforcement mode through an audited mutation."])
+        );
         assert!(check.diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("rollout_contract_v1 passed")
                 && diagnostic.contains("#p084_self_contract")
@@ -2809,7 +3705,7 @@ mod tests {
             &pool,
             &run,
             &artifact,
-            RolloutContractEnforcementMode::Enforce,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
             0,
         )
         .await
@@ -2841,6 +3737,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        run.started_at = chrono::DateTime::parse_from_rfc3339("2026-05-01T23:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let mut contract = valid_rollout_contract();
+        contract["cutover_policy"] = serde_json::json!({
+            "revision": "p084-cutover-v1",
+            "enforcement_mode_at_cutover": "enforce",
+            "applicable_to": "post_cutover_implementation_starts",
+            "grandfathered_rendering": "not_applicable",
+            "effective_timestamp_iso8601": "2026-05-02T00:00:00Z"
+        });
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": contract
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let evaluation =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_eq!(evaluation.action, RolloutContractPreflightAction::Allow);
+        assert!(!evaluation.would_block);
+        assert_eq!(
+            evaluation.check.status,
+            RolloutContractStatus::NotApplicable
+        );
+        assert_eq!(
+            evaluation.check.decision,
+            RolloutContractDecision::NotApplicable
+        );
+        assert_eq!(
+            evaluation.check.enforcement_mode,
+            RolloutContractEnforcementMode::Enforce
+        );
+        assert!(evaluation.check.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "rollout_contract_cutover_grandfathered_until=2026-05-02T00:00:00+00:00"
+        }));
+    }
+
+    #[tokio::test]
     async fn invalid_inline_contract_creates_hold_record_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
@@ -2864,7 +3817,7 @@ mod tests {
             &pool,
             &run,
             &artifact,
-            RolloutContractEnforcementMode::Enforce,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
             0,
         )
         .await
@@ -2888,6 +3841,155 @@ mod tests {
             )));
     }
 
+    #[test]
+    fn lint_rejects_control_characters_in_any_contract_string() {
+        let dir = TempDir::new().unwrap();
+        write_valid_rollout_contract_fixtures(dir.path());
+        let mut contract = valid_rollout_contract();
+        contract["commands"]["allowlist"] =
+            serde_json::json!(["./scripts/test-gate.sh proposal-084\u{0007}"]);
+        contract["metrics"]["adoption_metric"] =
+            serde_json::json!("new_applicable_proposals\u{0008}_percent");
+
+        let workspace_root = dir.path().to_string_lossy();
+        let lint = lint_rollout_contract(&contract, &workspace_root);
+
+        assert!(lint.failures.iter().any(|failure| failure
+            .contains("control_characters: control character U+0007 in commands.allowlist[0]")));
+        assert!(lint.failures.iter().any(|failure| failure
+            .contains("control_characters: control character U+0008 in rollout_contract_v1.metrics.adoption_metric")));
+    }
+
+    #[test]
+    fn lint_rejects_public_extraction_failure_field() {
+        let dir = TempDir::new().unwrap();
+        write_valid_rollout_contract_fixtures(dir.path());
+        let mut contract = valid_rollout_contract();
+        contract["p084_extraction_failures"] = serde_json::json!(["operator supplied"]);
+
+        let workspace_root = dir.path().to_string_lossy();
+        let lint = lint_rollout_contract(&contract, &workspace_root);
+
+        assert!(lint.failures.iter().any(|failure| failure
+            == "unknown_field: rollout_contract_v1.p084_extraction_failures is not allowed"));
+    }
+
+    #[test]
+    fn lint_rejects_missing_readback_fixture_path() {
+        let dir = TempDir::new().unwrap();
+        write_valid_rollout_contract_fixtures(dir.path());
+        let mut contract = valid_rollout_contract();
+        contract["readback_fixture"] =
+            serde_json::json!("docs/evidence/rollout-contract/operator-readback/missing.json");
+
+        let workspace_root = dir.path().to_string_lossy();
+        let lint = lint_rollout_contract(&contract, &workspace_root);
+
+        assert!(lint
+            .failures
+            .iter()
+            .any(|failure| failure.starts_with("missing_fixture_path: readback_fixture")));
+    }
+
+    #[test]
+    fn lint_rejects_missing_negative_fixture_path() {
+        let dir = TempDir::new().unwrap();
+        write_valid_rollout_contract_fixtures(dir.path());
+        let mut contract = valid_rollout_contract();
+        contract["negative_fixtures"]["missing"] =
+            serde_json::json!("docs/evidence/rollout-contract/negative/missing.json");
+
+        let workspace_root = dir.path().to_string_lossy();
+        let lint = lint_rollout_contract(&contract, &workspace_root);
+
+        assert!(lint
+            .failures
+            .iter()
+            .any(|failure| failure.starts_with("missing_fixture_path: negative_fixtures.missing")));
+    }
+
+    #[tokio::test]
+    async fn policy_record_requires_operator_start_run_journal_entry() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let principal_id = "operator:test";
+        let audit_event_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"INSERT INTO command_journal
+               (id, command_type, payload_json, result_status, run_id, created_at,
+                caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id)
+               VALUES (?1, 'RetryStage', '{}', 'completed', NULL, ?2,
+                       'test', ?3, 'agent', 'test', NULL)"#,
+        )
+        .bind(&audit_event_id)
+        .bind(Utc::now().to_rfc3339())
+        .bind(principal_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut record =
+            audited_policy_record(Some("permissive"), Utc::now() + chrono::Duration::hours(1));
+        record["principal_id"] = serde_json::json!(principal_id);
+        record["audit_event_id"] = serde_json::json!(audit_event_id);
+
+        let validation = validated_policy_record(&pool, &record, "enforcement_mode", Utc::now())
+            .await
+            .unwrap();
+
+        match validation {
+            PolicyRecordValidation::Invalid(failures) => {
+                assert!(failures
+                    .iter()
+                    .any(|failure| { failure.contains("must be a StartRun command") }));
+                assert!(failures
+                    .iter()
+                    .any(|failure| { failure.contains("principal class must be operator") }));
+            }
+            PolicyRecordValidation::Valid(_) => panic!("non-operator non-StartRun policy passed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_approved_proposal_creates_bounded_hold_record_under_enforce() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        std::fs::write(
+            &proposal_path,
+            vec![b' '; (MAX_ROLLOUT_CONTRACT_INPUT_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let evaluation =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_eq!(evaluation.action, RolloutContractPreflightAction::Hold);
+        assert_eq!(evaluation.check.status, RolloutContractStatus::Fail);
+        assert_eq!(
+            evaluation.check.failure_reasons,
+            vec!["invalid_approved_proposal_artifact"]
+        );
+        assert!(evaluation.check.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("read approved proposal artifact")
+                && diagnostic.contains("exceeds")
+                && diagnostic.len() < 1024
+        }));
+    }
+
     #[tokio::test]
     async fn preflight_writes_rollout_contract_check_projection() {
         let dir = TempDir::new().unwrap();
@@ -2900,6 +4002,7 @@ mod tests {
             .join("run-artifacts")
             .to_string_lossy()
             .to_string();
+        apply_enforce_policy(&mut run);
 
         let proposal_path = dir.path().join("approved-proposal.json");
         let proposal = serde_json::json!({
@@ -2934,9 +4037,10 @@ mod tests {
             serde_json::json!("valid")
         );
         assert_eq!(
-            projection["preflight_timeout_seconds"],
+            projection["timeouts"]["preflight_timeout_seconds"],
             serde_json::json!(PREFLIGHT_TIMEOUT_SECONDS)
         );
+        assert!(projection.get("preflight_timeout_seconds").is_none());
     }
 
     #[tokio::test]
@@ -2982,6 +4086,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_check_is_not_reused_after_approved_proposal_hash_drift() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let first =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+        assert_eq!(first.action, RolloutContractPreflightAction::Allow);
+
+        let mut changed_contract = valid_rollout_contract();
+        changed_contract["commands"]["allowlist"] =
+            serde_json::json!(["./scripts/test-gate.sh proposal-084 && rm"]);
+        let changed_proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r6",
+            "rollout_contract_v1": changed_contract
+        });
+        std::fs::write(
+            &proposal_path,
+            serde_json::to_vec(&changed_proposal).unwrap(),
+        )
+        .unwrap();
+
+        let second =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_ne!(first.check.id, second.check.id);
+        assert_eq!(second.action, RolloutContractPreflightAction::Hold);
+        assert!(second.would_block);
+        assert_eq!(second.check.status, RolloutContractStatus::Stale);
+        assert_eq!(
+            second.check.failure_reasons,
+            vec!["stale_rollout_contract_check_hash_drift"]
+        );
+        assert!(second
+            .check
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("proposal_content_hash")));
+    }
+
+    #[tokio::test]
+    async fn proposal_content_hash_is_derived_from_current_artifact_bytes() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        let data = serde_json::to_vec(&proposal).unwrap();
+        std::fs::write(&proposal_path, &data).unwrap();
+        let mut artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+        artifact.checksum_sha256 = Some("deadbeef".to_string());
+
+        let check = upsert_linted_contract_check(
+            &pool,
+            &run,
+            &artifact,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let digest = sha2::Sha256::digest(&data);
+
+        assert_eq!(check.proposal_content_hash, format!("sha256:{digest:x}"));
+    }
+
+    #[tokio::test]
+    async fn absolute_approved_proposal_artifact_path_holds_and_scrubs_diagnostic() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        std::fs::write(&proposal_path, b"{}").unwrap();
+        let mut artifact = test_artifact(&run, "approved-proposal.json".to_string());
+        artifact.file_path = proposal_path.to_string_lossy().to_string();
+
+        let check = upsert_linted_contract_check(
+            &pool,
+            &run,
+            &artifact,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(check.status, RolloutContractStatus::Fail);
+        assert_eq!(
+            check.failure_reasons,
+            vec!["unsafe_approved_proposal_artifact_path"]
+        );
+        assert_eq!(check.redaction_state, "partial");
+        assert!(check
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("<workspace>")));
+    }
+
+    #[test]
+    fn default_enforcement_mode_fails_closed_without_operator_policy() {
+        assert_eq!(
+            default_rollout_contract_enforcement_mode(),
+            RolloutContractEnforcementMode::Enforce
+        );
+    }
+
+    #[test]
+    fn bounded_rollout_contract_input_rejects_oversized_files() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.json");
+        std::fs::write(
+            &path,
+            vec![b' '; (MAX_ROLLOUT_CONTRACT_INPUT_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let error = read_bounded_rollout_contract_input(&path).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_symlink_escape_creates_hold_record() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let fixture_dir = dir.path().join("docs/evidence/rollout-contract");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let outside = dir.path().join("outside-sidecar.json");
+        std::fs::write(
+            &outside,
+            serde_json::to_vec(&valid_rollout_contract()).unwrap(),
+        )
+        .unwrap();
+        let sidecar = fixture_dir.join("sidecar.json");
+        std::os::unix::fs::symlink(&outside, &sidecar).unwrap();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_sidecar": "docs/evidence/rollout-contract/sidecar.json"
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let evaluation =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_eq!(evaluation.action, RolloutContractPreflightAction::Hold);
+        assert_eq!(evaluation.check.status, RolloutContractStatus::Fail);
+        assert!(evaluation
+            .check
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("unsafe_path")));
+    }
+
+    #[tokio::test]
     async fn tampered_existing_projection_holds_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
@@ -3006,7 +4321,7 @@ mod tests {
             &pool,
             &run,
             &artifact,
-            RolloutContractEnforcementMode::Enforce,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
             0,
         )
         .await
@@ -3075,7 +4390,7 @@ mod tests {
             &pool,
             &run,
             &artifact,
-            RolloutContractEnforcementMode::Permissive,
+            &test_effective_policy(RolloutContractEnforcementMode::Permissive),
             0,
         )
         .await
@@ -3090,7 +4405,7 @@ mod tests {
             proposal_revision_id: first_check.proposal_revision_id.clone(),
             proposal_content_hash: first_check.proposal_content_hash.clone(),
             contract_object_hash: first_check.contract_object_hash.clone(),
-            content_snapshot_id: "newer-snapshot".to_string(),
+            content_snapshot_id: first_check.content_snapshot_id.clone(),
             checker_version: first_check.checker_version.clone(),
             status: RolloutContractStatus::Pass,
             decision: RolloutContractDecision::Release,
@@ -3099,6 +4414,7 @@ mod tests {
             failure_reasons: vec![],
             diagnostics: vec!["replacement authoritative record".to_string()],
             waiver: None,
+            rollback_disposition: first_check.rollback_disposition.clone(),
             projection_integrity: ProjectionIntegrity::Valid,
             cutover_policy_revision: None,
             redaction_state: "none".to_string(),

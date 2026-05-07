@@ -598,6 +598,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
             statusLabel: "Running",
             progressLabel: "3 visible stages, 48 artifacts",
             pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
             ideaContext: P031IdeaContextPresentation(
                 id: "idea-preview",
                 title: "Improve artifact navigation",
@@ -1141,12 +1142,18 @@ private struct P031RunDetailSummaryCard: View {
         [
             presentation.workflowLabel,
             presentation.statusLabel,
+            rolloutDecisionText,
             presentation.progressLabel,
             presentation.pendingApprovalsLabel,
             presentation.refreshFeedbackText,
         ]
         .compactMap { $0 }
         .joined(separator: " • ")
+    }
+
+    private var rolloutDecisionText: String? {
+        guard let rollout = presentation.rolloutDecisionSummary else { return nil }
+        return "Rollout \(rollout.backendDecision)"
     }
 }
 
