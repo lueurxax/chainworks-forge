@@ -2012,6 +2012,7 @@ async fn start_run_closes_journal_with_run_wake_and_scheduler_refresh() {
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
                 review_routing_json: None,
+                rollout_contract_preflight_policy_json: None,
                 closeout_readiness_mode: None,
             }),
             CallerContext::test_fixture(),

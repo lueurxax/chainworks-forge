@@ -15,6 +15,7 @@ pub mod legacy_discovery_overrides;
 pub mod p077_rollout;
 pub mod projections;
 pub mod retry_operator_instructions;
+pub mod rollout_contract_checks;
 pub mod routing_receipts;
 pub mod runs;
 pub mod scheduler;

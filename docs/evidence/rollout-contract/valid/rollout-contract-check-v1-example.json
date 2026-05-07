@@ -1,0 +1,25 @@
+{
+  "schema_version": "rollout_contract_check_v1",
+  "proposal_id": "proposal-084",
+  "proposal_revision_id": "p084-r5",
+  "proposal_content_hash": "sha256:placeholder-hash-of-proposal-content",
+  "contract_object_hash": "sha256:placeholder-hash-of-contract-object",
+  "content_snapshot_id": "snap-20260502-p084-r5",
+  "checker_version": "1.0.0",
+  "authoritative_record_id": "rc-check-00000000-0000-0000-0000-000000000001",
+  "status": "pass",
+  "decision": "release",
+  "lifecycle_state": "terminal",
+  "enforcement_mode": "enforce",
+  "waiver": null,
+  "diagnostics": [],
+  "failure_reasons": [],
+  "timeouts": {
+    "preflight_timeout_seconds": 45,
+    "infrastructure_retry_max": 3
+  },
+  "retry_count": 0,
+  "projection_integrity": "valid",
+  "cutover_policy_revision": "p084-cutover-v1",
+  "redaction_state": "none"
+}

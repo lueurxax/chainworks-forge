@@ -78,6 +78,11 @@ pub struct StartRunCmd {
     /// When present, controls how proposal reviewers are selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_routing_json: Option<String>,
+    /// P084: Optional rollout-contract run-start policy request.
+    /// The command handler validates and stamps this with caller identity plus
+    /// command journal id before freezing it into Run.delivery_preflight_json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_contract_preflight_policy_json: Option<String>,
     /// P077: Closeout readiness mode frozen at run admission from workflow snapshot metadata.
     /// Values: "advisory" | "enforcement". NULL → advisory (legacy fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -473,6 +478,7 @@ mod tests {
                 r#"{"repo_identifier":"repo-1","repo_root":"/repo"}"#.into(),
             ),
             review_routing_json: None,
+            rollout_contract_preflight_policy_json: None,
             closeout_readiness_mode: None,
         };
 

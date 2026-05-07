@@ -60,6 +60,7 @@ pub struct GqlRun {
     pub implementation_self_assessment_summary: Option<GqlImplementationSelfAssessmentSummary>,
     pub main_sync_readback_json: Option<Json<serde_json::Value>>,
     pub knowledge_capsule_readback_json: Option<Json<serde_json::Value>>,
+    pub rollout_contract_readback_json: Option<Json<serde_json::Value>>,
     /// P077: Active closeout readiness summary (via CloseoutReadinessSummaryAccessor).
     pub closeout_readiness_summary_json: Option<Json<serde_json::Value>>,
     /// P077: Documented alias for the implementation closeout readiness summary.
@@ -111,6 +112,7 @@ impl From<Run> for GqlRun {
             implementation_self_assessment_summary: None,
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
+            rollout_contract_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }
@@ -180,6 +182,7 @@ impl From<RunProjectionRow> for GqlRun {
             implementation_self_assessment_summary: None,
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
+            rollout_contract_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }

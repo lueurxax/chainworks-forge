@@ -1302,6 +1302,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let failedStages: Int?
   let pendingApprovals: Int?
   let closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel?
+  let rolloutDecisionSummary: RolloutDecisionSummary?
 
   nonisolated init(
     id: String,
@@ -1318,7 +1319,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     completedStages: Int?,
     failedStages: Int?,
     pendingApprovals: Int?,
-    closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel? = nil
+    closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel? = nil,
+    rolloutDecisionSummary: RolloutDecisionSummary? = nil
   ) {
     self.id = id
     self.status = status
@@ -1335,6 +1337,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     self.failedStages = failedStages
     self.pendingApprovals = pendingApprovals
     self.closeoutReadinessSummary = closeoutReadinessSummary
+    self.rolloutDecisionSummary = rolloutDecisionSummary
   }
 
   enum CodingKeys: String, CodingKey {
@@ -1354,6 +1357,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     case pendingApprovals
     case implementationCloseoutReadinessSummary
     case closeoutReadinessSummaryJson
+    case rolloutDecisionSummary = "rolloutContractReadbackJson"
   }
 
   init(from decoder: Decoder) throws {
@@ -1380,7 +1384,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
         ?? container.decodeIfPresent(
           P077CloseoutReadinessSummaryReadModel.self,
           forKey: .closeoutReadinessSummaryJson
-        )
+        ),
+      rolloutDecisionSummary: try container.decodeIfPresent(RolloutDecisionSummary.self, forKey: .rolloutDecisionSummary)
     )
   }
 
@@ -1400,7 +1405,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       completedStages: completedStages,
       failedStages: failedStages,
       pendingApprovals: pendingApprovals,
-      closeoutReadinessSummary: closeoutReadinessSummary
+      closeoutReadinessSummary: closeoutReadinessSummary,
+      rolloutDecisionSummary: rolloutDecisionSummary
     )
   }
 }
@@ -1954,6 +1960,7 @@ enum P031GraphQLDocuments {
         failedStages
         pendingApprovals
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
+        rolloutContractReadbackJson
       }
     }
     """
@@ -1975,6 +1982,7 @@ enum P031GraphQLDocuments {
         failedStages
         pendingApprovals
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
+        rolloutContractReadbackJson
       }
       stages(runId: $runId) {
         id
@@ -3799,6 +3807,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let statusLabel: String
   let progressLabel: String?
   let pendingApprovalsLabel: String?
+  let rolloutDecisionSummary: RolloutDecisionSummary?
   let ideaContext: P031IdeaContextPresentation?
   let stageRows: [P031StageSummaryPresentation]
   let stageTransitions: [P031StageTransitionPresentation]
@@ -3819,6 +3828,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     statusLabel: String,
     progressLabel: String?,
     pendingApprovalsLabel: String?,
+    rolloutDecisionSummary: RolloutDecisionSummary? = nil,
     ideaContext: P031IdeaContextPresentation?,
     stageRows: [P031StageSummaryPresentation],
     stageTransitions: [P031StageTransitionPresentation],
@@ -3846,6 +3856,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.artifactViewerRows = artifactViewerRows
     self.reportRows = reportRows
     self.catalogContext = catalogContext
+    self.rolloutDecisionSummary = rolloutDecisionSummary
     self.closeoutReadiness = closeoutReadiness
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
@@ -4567,6 +4578,7 @@ enum P031RunDetailPresenter {
       statusLabel: statusLabel,
       progressLabel: progressLabel,
       pendingApprovalsLabel: pendingApprovalsLabel,
+      rolloutDecisionSummary: run?.rolloutDecisionSummary,
       ideaContext: P031IdeaContextPresenter.presentation(for: detail.idea, fallbackRun: run),
       stageRows: stageRows,
       stageTransitions: stageTransitions,
@@ -4598,6 +4610,7 @@ enum P031RunDetailPresenter {
       statusLabel: "Unavailable",
       progressLabel: nil,
       pendingApprovalsLabel: nil,
+      rolloutDecisionSummary: nil,
       ideaContext: nil,
       stageRows: [],
       stageTransitions: [],
