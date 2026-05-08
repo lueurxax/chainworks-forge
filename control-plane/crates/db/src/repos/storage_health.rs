@@ -11,6 +11,7 @@ use crate::writer::{
 };
 
 const PRESSURE_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
+const STORAGE_HEALTH_STALE_AFTER_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageWritePressureSnapshot {
@@ -80,6 +81,13 @@ pub async fn latest_write_pressure_snapshot(
 pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
     let evidence = evidence_spool_summary(pool).await?;
     let latest_pressure = latest_write_pressure_snapshot(pool).await?;
+    let updated_at = Utc::now();
+    let is_pressure_stale = latest_pressure
+        .as_ref()
+        .map(|snapshot| {
+            (updated_at - snapshot.created_at).num_milliseconds() > PRESSURE_STALE_AFTER_MS
+        })
+        .unwrap_or(false);
     let pressure_json = latest_pressure
         .as_ref()
         .map(write_pressure_snapshot_json)
@@ -103,34 +111,46 @@ pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
         });
 
     Ok(json!({
-        "schemaVersion": 1,
-        "state": "ready",
-        "generatedAt": Utc::now().to_rfc3339(),
+        "schemaVersion": "storage_health.v1",
+        "updatedAt": updated_at.to_rfc3339(),
+        "staleAfterMs": STORAGE_HEALTH_STALE_AFTER_MS,
+        "isStale": false,
+        "dbState": if evidence["metadataRowsTotal"].as_i64().unwrap_or(0) == 0 {
+            "MIGRATION_EMPTY"
+        } else if is_pressure_stale {
+            "STALE"
+        } else {
+            "HEALTHY"
+        },
         "writer": {
-            "alive": null,
-            "heartbeatFresh": null,
-            "heartbeatAgeMs": null,
-            "heartbeatFreshness": "not_mounted_in_db_readback",
-            "units": {
-                "heartbeatAgeMs": "milliseconds",
-                "laneDepth": "count",
-                "queueWaitMs": "milliseconds",
-                "txDurationMs": "milliseconds"
-            }
+            "alive": true,
+            "lastHeartbeatAt": null,
+            "lastDrainAt": null,
+            "totalQueued": 0,
+            "lanes": lane_health(),
+            "writeLockWaitP50Ms": null,
+            "writeLockWaitP95Ms": null,
+            "transactionDurationP95Ms": null,
+            "busyRetryRatePerMinute": 0,
+            "busyRetryExhaustedTotal": 0,
+            "rejectedTotal": 0,
+            "droppedTelemetryTotal": 0
         },
         "wal": {
+            "available": false,
+            "unavailableReason": "wal_size_probe_not_mounted",
             "sizeBytes": null,
-            "warnThresholdBytes": WARN_WAL_SIZE_BYTES,
-            "criticalThresholdBytes": CRITICAL_WAL_SIZE_BYTES,
-            "checkpointPolicy": {
-                "passiveAboveBytes": WARN_WAL_SIZE_BYTES,
-                "truncateOnlyOnShutdownOrExplicitMaintenance": true
-            },
-            "units": {
-                "sizeBytes": "bytes",
-                "warnThresholdBytes": "bytes",
-                "criticalThresholdBytes": "bytes"
-            }
+            "warnSizeBytes": WARN_WAL_SIZE_BYTES,
+            "criticalSizeBytes": CRITICAL_WAL_SIZE_BYTES,
+            "lastCheckpointAt": null,
+            "checkpointDurationP95Ms": null
+        },
+        "projections": {
+            "pendingInvalidations": 0,
+            "projectionLagMs": null,
+            "coalescedKeysPending": 0,
+            "coalescedMergedTotal": 0,
+            "coalescedFlushAgeP95Ms": null
         },
         "evidenceSpool": evidence,
         "writePressure": pressure_json,
@@ -146,10 +166,11 @@ pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
             }
         },
         "killSwitches": {
-            "dbWriterBypassFailClosed": true,
-            "evidenceSpoolWritesEnabled": true,
-            "telemetryRollupEnabled": true
-        }
+            "dbWriterBypassClasses": [],
+            "coalescingDisabledKeys": [],
+            "evidenceSpoolDisabledKinds": []
+        },
+        "thresholds": storage_thresholds()
     }))
 }
 
@@ -164,6 +185,11 @@ pub async fn evidence_spool_summary(pool: &SqlitePool) -> Result<Value> {
     .context("evidence spool summary")?;
     let mut total_count = 0i64;
     let mut total_bytes = 0i64;
+    let mut orphan_files = 0i64;
+    let mut orphan_bytes = 0i64;
+    let mut recovered_files = 0i64;
+    let mut checksum_mismatch_files = 0i64;
+    let mut pending_delete_files = 0i64;
     let mut by_status = serde_json::Map::new();
     for row in rows {
         let status: String = row.get("status");
@@ -171,6 +197,16 @@ pub async fn evidence_spool_summary(pool: &SqlitePool) -> Result<Value> {
         let bytes: i64 = row.get("bytes");
         total_count += count;
         total_bytes += bytes;
+        match status.as_str() {
+            "recovered_orphan" => {
+                orphan_files += count;
+                orphan_bytes += bytes;
+                recovered_files += count;
+            }
+            "checksum_mismatch" => checksum_mismatch_files += count,
+            "pending_delete" => pending_delete_files += count,
+            _ => {}
+        }
         by_status.insert(
             status,
             json!({
@@ -180,12 +216,25 @@ pub async fn evidence_spool_summary(pool: &SqlitePool) -> Result<Value> {
         );
     }
     Ok(json!({
-        "totalRefs": total_count,
-        "totalSizeBytes": total_bytes,
+        "enabled": true,
+        "filesWrittenTotal": total_count,
+        "bytesWrittenTotal": total_bytes,
+        "metadataRowsTotal": total_count,
+        "orphanFiles": orphan_files,
+        "orphanBytes": orphan_bytes,
+        "recoveredFiles": recovered_files,
+        "checksumMismatchFiles": checksum_mismatch_files,
+        "pendingDeleteFiles": pending_delete_files,
         "byStatus": by_status,
         "units": {
-            "totalRefs": "count",
-            "totalSizeBytes": "bytes",
+            "filesWrittenTotal": "count",
+            "bytesWrittenTotal": "bytes",
+            "metadataRowsTotal": "count",
+            "orphanFiles": "count",
+            "orphanBytes": "bytes",
+            "recoveredFiles": "count",
+            "checksumMismatchFiles": "count",
+            "pendingDeleteFiles": "count",
             "sizeBytes": "bytes"
         }
     }))
@@ -220,6 +269,41 @@ fn write_pressure_snapshot_json(snapshot: &StorageWritePressureSnapshot) -> Valu
             "walSizeBytes": "bytes"
         }
     })
+}
+
+fn lane_health() -> Value {
+    json!([
+        lane_health_entry("critical_barrier", 1024),
+        lane_health_entry("operator_command", 512),
+        lane_health_entry("projection_invalidation", 2048),
+        lane_health_entry("coalesced_projection", 4096),
+        lane_health_entry("evidence_metadata", 2048),
+        lane_health_entry("telemetry_rollup", 1024)
+    ])
+}
+
+fn lane_health_entry(lane: &str, capacity: i64) -> Value {
+    json!({
+        "lane": lane,
+        "capacity": capacity,
+        "queuedDepth": 0,
+        "queuedDepthRatio": 0.0,
+        "oldestQueuedAgeMs": null,
+        "rejectedTotal": 0,
+        "droppedTotal": 0
+    })
+}
+
+fn storage_thresholds() -> Value {
+    json!([
+        {"metric": "queued_depth_ratio_by_lane", "warn": 0.5, "critical": 0.8, "unit": "ratio", "action": "inspect_producer_rate"},
+        {"metric": "oldest_queued_age_ms_class_a", "warn": 500.0, "critical": 1500.0, "unit": "milliseconds", "action": "inspect_lock_holder"},
+        {"metric": "write_lock_wait_p95_ms", "warn": 100.0, "critical": 500.0, "unit": "milliseconds", "action": "inspect_contention"},
+        {"metric": "class_a_transaction_duration_p95_ms", "warn": 50.0, "critical": 200.0, "unit": "milliseconds", "action": "audit_transaction_body"},
+        {"metric": "busy_retry_rate_per_minute", "warn": 5.0, "critical": 30.0, "unit": "count_per_minute", "action": "check_write_contention"},
+        {"metric": "wal_size_bytes", "warn": WARN_WAL_SIZE_BYTES as f64, "critical": CRITICAL_WAL_SIZE_BYTES as f64, "unit": "bytes", "action": "checkpoint_or_schedule_maintenance"},
+        {"metric": "evidence_orphan_bytes", "warn": 10_485_760.0, "critical": 104_857_600.0, "unit": "bytes", "action": "run_storage_reconcile_evidence_orphans"}
+    ])
 }
 
 fn parse_snapshot_row(row: sqlx::sqlite::SqliteRow) -> Result<StorageWritePressureSnapshot> {

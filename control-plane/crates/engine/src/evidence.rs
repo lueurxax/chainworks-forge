@@ -1,7 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
+use db::evidence_spool::write_spool_file;
+use db::repos::evidence_spool_refs::{
+    insert_idempotent_via_dbwriter, EvidenceKind, EvidenceSpoolRef, EvidenceSpoolRefStatus,
+};
 use db::repos::{agent_executions, artifacts, stages};
+use db::write_class::WriteResult;
+use db::writer::DbWriter;
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::ids::{AgentExecutionId, StageExecutionId};
 use domain::run::Run;
@@ -128,16 +134,75 @@ pub async fn build_and_persist_failed_stage_evidence(
         "recovery_snapshot": recovery_snapshot,
     });
     let encoded = serde_json::to_string_pretty(&packet)?;
-    stages::update_evidence_packet_json(pool, input.stage_execution_id, &encoded).await?;
-
-    let path = std::path::Path::new(&input.run.artifact_root)
-        .join("failure-evidence")
-        .join(input.stage_execution_id.to_string())
-        .join("failed-stage-evidence.json");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let artifact_root = std::path::Path::new(&input.run.artifact_root);
+    tokio::fs::create_dir_all(artifact_root).await?;
+    let relative_path = format!(
+        "evidence/runs/{}/stages/{}/agents/{}/runtime_event/failed-stage-evidence-{}.json",
+        input.run.id, input.stage_execution_id, input.agent_execution_id, packet_id
+    );
+    let spool_output = write_spool_file(
+        artifact_root,
+        &input.run.id.to_string(),
+        &relative_path,
+        encoded.as_bytes(),
+    )
+    .await?;
+    let spool_ref_id = format!("evsp_failed_stage_{}", packet_id.replace('-', ""));
+    let spool_ref = EvidenceSpoolRef {
+        id: spool_ref_id.clone(),
+        metadata_version: 1,
+        run_id: input.run.id.to_string(),
+        stage_execution_id: Some(input.stage_execution_id.to_string()),
+        stage_id: Some(input.stage_id.to_string()),
+        agent_execution_id: Some(input.agent_execution_id.to_string()),
+        agent_id: Some(input.agent_id.to_string()),
+        kind: EvidenceKind::RuntimeEvent,
+        relative_path: spool_output.relative_path.clone(),
+        size_bytes: spool_output.size_bytes as i64,
+        checksum_algorithm: spool_output.checksum_algorithm.to_string(),
+        checksum: spool_output.checksum.clone(),
+        producer_operation: "failed_stage_evidence_spool".to_string(),
+        content_type: Some("application/json".to_string()),
+        summary_json: Some(
+            serde_json::json!({
+                "byte_count": spool_output.size_bytes,
+                "producer_label": "failed_stage_evidence",
+                "started_at": packet_timestamp.to_rfc3339(),
+                "finished_at": packet_timestamp.to_rfc3339(),
+            })
+            .to_string(),
+        ),
+        created_at: packet_timestamp,
+        status: EvidenceSpoolRefStatus::Available,
+    };
+    let writer = DbWriter::new(pool.clone());
+    let metadata_result = insert_idempotent_via_dbwriter(&writer, spool_ref).await;
+    writer.shutdown().await;
+    if metadata_result != WriteResult::Committed {
+        anyhow::bail!(
+            "failed to persist failed-stage evidence spool metadata via DbWriter: {}",
+            metadata_result.as_str()
+        );
     }
-    std::fs::write(&path, &encoded)?;
+    let packet_pointer = serde_json::json!({
+        "schema_version": 2,
+        "report_kind": "failed_stage_evidence",
+        "storage": "evidence_spool",
+        "packet_id": packet_id,
+        "evidence_spool_ref_id": spool_ref_id,
+        "relative_path": spool_output.relative_path,
+        "checksum_algorithm": spool_output.checksum_algorithm,
+        "checksum": spool_output.checksum,
+        "size_bytes": spool_output.size_bytes,
+        "failure_summary": failure_summary,
+        "failure_class": failure_class,
+    });
+    stages::update_evidence_packet_json(
+        pool,
+        input.stage_execution_id,
+        &packet_pointer.to_string(),
+    )
+    .await?;
 
     let artifact = Artifact {
         id: domain::ids::ArtifactId::new(),
@@ -147,9 +212,9 @@ pub async fn build_and_persist_failed_stage_evidence(
         name: format!("failed_stage_evidence_{}", input.stage_execution_id),
         contract_id: "failed_stage_evidence".to_string(),
         format: ArtifactFormat::Json,
-        file_path: path.to_string_lossy().into_owned(),
+        file_path: spool_output.absolute_path.to_string_lossy().into_owned(),
         checksum_sha256: None,
-        size_bytes: Some(path.metadata().map(|meta| meta.len() as i64).unwrap_or(0)),
+        size_bytes: Some(spool_output.size_bytes as i64),
         provider: input.provider.to_string(),
         model: input.model,
         created_at: Utc::now(),
@@ -377,22 +442,42 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let packet: serde_json::Value =
+        let packet_pointer: serde_json::Value =
             serde_json::from_str(stage.evidence_packet_json.as_deref().unwrap()).unwrap();
+        let refs = db::repos::evidence_spool_refs::list_by_run_id(&pool, &run_id.to_string())
+            .await
+            .unwrap();
+        let full_packet: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&artifact.file_path).unwrap()).unwrap();
 
         assert_eq!(
             artifact.report_kind.as_deref(),
             Some("failed_stage_evidence")
         );
-        assert_eq!(packet["schema_version"], serde_json::json!(1));
-        assert!(packet["id"].as_str().is_some());
-        assert!(packet["timestamp"].as_str().is_some());
-        assert_eq!(packet["stage_label"], serde_json::json!("Stage 1"));
-        assert_eq!(packet["stage_attempt_number"], serde_json::json!(2));
-        assert_eq!(packet["raw_outputs_exist"], serde_json::json!(true));
-        assert_eq!(packet["receipt_exists"], serde_json::json!(false));
-        assert_eq!(packet["transcript_exists"], serde_json::json!(true));
-        assert_eq!(packet["output_envelopes"][0]["output_name"], "report");
-        assert!(packet["recovery_snapshot"].is_object());
+        assert_eq!(packet_pointer["schema_version"], serde_json::json!(2));
+        assert_eq!(
+            packet_pointer["storage"],
+            serde_json::json!("evidence_spool")
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, EvidenceKind::RuntimeEvent);
+        assert_eq!(refs[0].status, EvidenceSpoolRefStatus::Available);
+        assert_eq!(
+            refs[0].relative_path,
+            packet_pointer["relative_path"].as_str().unwrap()
+        );
+        assert!(refs[0]
+            .relative_path
+            .starts_with(&format!("evidence/runs/{run_id}/")));
+        assert_eq!(full_packet["schema_version"], serde_json::json!(1));
+        assert!(full_packet["id"].as_str().is_some());
+        assert!(full_packet["timestamp"].as_str().is_some());
+        assert_eq!(full_packet["stage_label"], serde_json::json!("Stage 1"));
+        assert_eq!(full_packet["stage_attempt_number"], serde_json::json!(2));
+        assert_eq!(full_packet["raw_outputs_exist"], serde_json::json!(true));
+        assert_eq!(full_packet["receipt_exists"], serde_json::json!(false));
+        assert_eq!(full_packet["transcript_exists"], serde_json::json!(true));
+        assert_eq!(full_packet["output_envelopes"][0]["output_name"], "report");
+        assert!(full_packet["recovery_snapshot"].is_object());
     }
 }

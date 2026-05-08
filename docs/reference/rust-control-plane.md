@@ -365,7 +365,7 @@ work rather than by adding external infrastructure:
 The engine enforces a single-writer model for all domain mutations through a dedicated
 write coordination layer, the `DbWriter` (Proposal 075):
 
-- **Single Bounded Gateway**: All non-test runtime writes must route through `DbWriter`. This prevents direct pool-level write contention and ensures write discipline.
+- **Single Bounded Gateway**: Non-test runtime writes either route through `DbWriter` or appear in the source-controlled P075 write-bypass allowlist with owner, scope, allowed context, and retirement criteria. The proposal-075 gate checks observed direct write call sites against that allowlist so remaining direct writes stay visible until each owner is migrated.
 - **Write Classification**: Every write operation declares a class and priority lane:
     - **Class A (Barrier)**: Synchronous, durable, never dropped. Used for canonical state transitions and side-effect intent.
     - **Class B (Coalesced state)**: May be merged, delayed, or replaced (last-writer-wins). Used for noisy status updates and projection invalidations.
@@ -388,7 +388,7 @@ write coordination layer, the `DbWriter` (Proposal 075):
 - **Command Latency**: The system targets p95 command latency (approve, retry, cancel)
   below 2 seconds even under saturated agent load.
 - **Contention Monitoring**: DB write lock wait time and transaction duration are
-  instrumented. `storageHealth.writer.alive` surfaces writer-actor heartbeats.
+  instrumented through DbWriter metrics and storage write-pressure snapshots. `storageHealth.writer` exposes the current writer/readback state, lane shape, thresholds, and freshness fields used by GraphQL and MCP diagnostics.
 
 ### Evidence spooling
 

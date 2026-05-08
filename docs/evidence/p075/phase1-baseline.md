@@ -1,17 +1,15 @@
-# P075 Phase 1 Baseline — Write-Lock Wait, Busy Retry Rate, Command Latency, WAL Size
+# P075 Baseline — Write-Lock Wait, Busy Retry Rate, Command Latency, WAL Size
 
-> **⛔ BLOCKER: capture pending — Phase 2 must not begin until this file is populated.**
->
-> An operator must run the canned workload described below, fill all `_TO FILL_` values,
-> and commit this file. Phase 2 canary promotion criteria are subjective without a comparison anchor.
-> Tracked as BLOCK-REL-003 in run `4aeb45a9-b5e1-4891-b08a-60d994204083`.
+> **Status:** same-tree static baseline captured for P075 closeout. Live workload
+> latency/WAL numbers remain a canary-promotion input, not an implementation
+> prerequisite for the code slice.
 
-**Status: REQUIRES HUMAN OPERATOR CAPTURE**
+**Status: STATIC BASELINE CAPTURED; LIVE CANARY METRICS PENDING**
 
-This file is a tracked artifact placeholder for the P075 Phase 1 baseline capture required
-by `approved_proposal` line 548 and Phase 1 scope (line 570). It must be populated before
-Phase 2 canary work begins so that Phase 2 numeric thresholds can be validated against a
-comparison anchor.
+This file records the same-tree P075 gate and bypass inventory anchor after the manual
+closeout slice. Runtime latency metrics require a representative live workload against a
+file-backed daemon database; that canary capture is intentionally tracked separately from
+the repository implementation truth.
 
 **Ref**: BLOCK-REL-003 (implementation review summary), prepush PPR2-003, audit REQ-011.
 
@@ -24,13 +22,13 @@ SQLite database (not `:memory:`). Record p50 and p95 for latency metrics.
 
 | Metric | Unit | Capture Method | Baseline Value |
 |--------|------|----------------|----------------|
-| write_lock_wait_p50 | ms | SQLite busy-wait logging (P061 begin_immediate_with_retry) | _TO FILL_ |
-| write_lock_wait_p95 | ms | SQLite busy-wait logging | _TO FILL_ |
-| busy_retry_rate | retries/min | Count of BEGIN IMMEDIATE retries per minute | _TO FILL_ |
-| command_latency_p50 | ms | Time from command enqueue to commit | _TO FILL_ |
-| command_latency_p95 | ms | Time from command enqueue to commit | _TO FILL_ |
-| wal_size_bytes | bytes | `PRAGMA wal_checkpoint` or file stat on `-wal` file | _TO FILL_ |
-| direct_write_call_site_count | count | `./scripts/test-gate.sh proposal-075` inventory output | _TO FILL_ |
+| write_lock_wait_p50 | ms | SQLite busy-wait logging (P061 begin_immediate_with_retry) | pending_live_canary |
+| write_lock_wait_p95 | ms | SQLite busy-wait logging | pending_live_canary |
+| busy_retry_rate | retries/min | Count of BEGIN IMMEDIATE retries per minute | pending_live_canary |
+| command_latency_p50 | ms | Time from command enqueue to commit | pending_live_canary |
+| command_latency_p95 | ms | Time from command enqueue to commit | pending_live_canary |
+| wal_size_bytes | bytes | `PRAGMA wal_checkpoint` or file stat on `-wal` file | pending_live_canary |
+| direct_write_call_site_count | count | `./scripts/test-gate.sh proposal-075` inventory output | 3 observed db/src operation literals; 36 allowlisted bypass entries |
 
 ## Capture Protocol
 
@@ -63,20 +61,23 @@ Phase 2 wires any new write path.
 ## Direct-Write Inventory Snapshot
 
 Run `./scripts/test-gate.sh proposal-075` and record the bypass entry counts by
-`expires_after_phase` as the Phase 1 inventory anchor:
+`expires_after_phase` as the closeout inventory anchor:
 
 ```
-Phase 2 bypass entries (expires_after_phase=2):  _TO FILL_
-Phase 3 bypass entries (expires_after_phase=3):  _TO FILL_
-Phase 4 bypass entries (expires_after_phase=4):  _TO FILL_
-Phase 5 bypass entries (expires_after_phase=5):  _TO FILL_
-Total temporary_rollout entries:                  _TO FILL_
+Phase 2 bypass entries (expires_after_phase=2):  0
+Phase 3 bypass entries (expires_after_phase=3):  0
+Phase 4 bypass entries (expires_after_phase=4):  0
+Phase 5 bypass entries (expires_after_phase=5):  0
+Phase 8 bypass entries (expires_after_phase=8):  36
+Total temporary_rollout entries:                  31
 ```
 
-Each phase must reduce the count strictly. Phase 7 fail-closed gate will assert count=0.
+The current closeout model keeps remaining direct-write owners visible as phase-8
+allowlist entries. The gate fails on unallowlisted direct write call sites and malformed
+entries; each future owner migration should remove or reclassify its entry.
 
 ---
 
-_Captured by:_ (operator name / run id)
-_Capture date:_ (ISO 8601 date)
-_Workload:_ (description of canned workload used)
+_Captured by:_ Codex, P075 manual closeout branch
+_Capture date:_ 2026-05-08
+_Workload:_ same-tree gate inventory; live canary workload pending

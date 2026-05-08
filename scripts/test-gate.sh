@@ -5464,14 +5464,14 @@ PLIST
   proposal-075|p075)
     log "Proposal 075 gate: local persistence write budget, evidence spooling, and fail-closed registry"
 
-    log "P075 Phase 1: db crate unit tests (write_class, writer, bypass_allowlist, operation_registry)"
+    log "P075: db crate persistence contract tests (write_class, writer, allowlist, registry, spool refs)"
     (
       cd "$ROOT_DIR/control-plane"
 
       log "P075: write_class types — WriteClass, WriteOperation, WriteResult, SpoolWriteOutcome"
       cargo test -p db write_class:: -- --nocapture
 
-      log "P075: writer — DbWriter constants, lane order, phase-1 pass-through"
+      log "P075: writer — DbWriter constants, lane order, bounded executor, coalescing, shutdown"
       cargo test -p db writer:: -- --nocapture
 
       log "P075: bypass_allowlist — parser, expiry, canonical file"
@@ -5485,6 +5485,9 @@ PLIST
 
       log "P075: db crate full regression (all db tests must pass)"
       cargo test -p db -- --nocapture
+
+      log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
+      cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
     )
 
     # Fail-closed contract check: allowlist and operation registry must be present,
@@ -5503,6 +5506,7 @@ import pathlib
 import re
 import sys
 import tomllib
+from fnmatch import fnmatch
 
 root = pathlib.Path(sys.argv[1])
 allowlist_path = pathlib.Path(sys.argv[2])
@@ -5579,9 +5583,48 @@ unregistered = sorted(observed - registered)
 if unregistered:
     raise SystemExit(f"P075 unregistered WriteOperation.operation_name literals: {unregistered}")
 
+allow_patterns = [
+    str(row["path_pattern"]).strip()
+    for row in allowlist.get("bypasses", [])
+    if str(row.get("path_pattern", "")).strip()
+]
+direct_write_re = re.compile(
+    r'(?:\bpool\.begin\(\)\.await\b|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
+)
+unallowlisted_write_sites = []
+repos_root = root / "control-plane/crates/db/src/repos"
+for path in repos_root.rglob("*.rs"):
+    text = path.read_text()
+    # Test modules and #[cfg(test)] helpers are covered by the permanent tests bypass.
+    text = text.split("\n#[cfg(test)]", 1)[0]
+    if not direct_write_re.search(text):
+        continue
+    rel = path.relative_to(root / "control-plane").as_posix()
+    if not any(fnmatch(rel, pattern) for pattern in allow_patterns):
+        unallowlisted_write_sites.append(rel)
+if unallowlisted_write_sites:
+    raise SystemExit(
+        "P075 unallowlisted direct write call sites: "
+        + ", ".join(sorted(unallowlisted_write_sites))
+    )
+
+raw_evidence_patterns = [
+    r'update_evidence_packet_json\([^;]+&encoded',
+    r'evidence_packet_json\s*=\s*\?\d+[^;]+encoded',
+]
+for path in (root / "control-plane/crates/engine/src").rglob("*.rs"):
+    text = path.read_text()
+    for pattern in raw_evidence_patterns:
+        if re.search(pattern, text, re.DOTALL):
+            rel = path.relative_to(root / "control-plane").as_posix()
+            raise SystemExit(
+                f"P075 raw high-volume evidence appears to be written directly to SQLite in {rel}"
+            )
+
 print(
     f"P075 fail-closed registry check passed: "
-    f"{len(seen_ids)} bypasses, {len(registered)} operations, {len(observed)} observed db/src operation literals"
+    f"{len(seen_ids)} bypasses, {len(registered)} operations, "
+    f"{len(observed)} observed db/src operation literals, direct write call sites allowlisted"
 )
 PY
 

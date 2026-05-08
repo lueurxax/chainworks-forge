@@ -1,11 +1,10 @@
-//! P075 Phase 2 DbWriter integration tests.
+//! P075 DbWriter, evidence spool, storage diagnostics, and gate integration tests.
 //!
 //! These tests exercise the real executor path: bounded MPSC channels, priority
 //! lane drain, deadline accounting, graceful shutdown, and heartbeat.
 //!
-//! Tests that require Phase 3+ (evidence spooling, coalescing flush, storageHealth
-//! GraphQL/MCP, fail-closed gate) are listed as doc comments and will be added when
-//! the corresponding phase lands.
+//! Later closeout slices extend this file with evidence spooling, coalescing flush,
+//! storageHealth/MCP parity, diagnostics, and fail-closed gate coverage.
 
 use db::evidence_spool::{
     sha256_hex, sweep_evidence_orphans, verify_spool_file, write_spool_file, VerifyResult,
@@ -972,14 +971,24 @@ async fn storagehealth_graphql_exposes_units_freshness_killswitches() {
     let health = db::repos::storage_health::storage_health(&pool)
         .await
         .expect("storage health readback must build");
-    assert_eq!(health["schemaVersion"], 1);
-    assert_eq!(health["wal"]["units"]["sizeBytes"], "bytes");
+    assert_eq!(health["schemaVersion"], "storage_health.v1");
+    assert!(health["updatedAt"].as_str().is_some());
+    assert_eq!(health["staleAfterMs"], 5000);
+    assert_eq!(health["isStale"], false);
+    assert!(health["dbState"].as_str().is_some());
+    assert_eq!(health["wal"]["warnSizeBytes"], 134_217_728);
+    assert_eq!(health["wal"]["criticalSizeBytes"], 536_870_912);
+    assert!(health["writer"]["lanes"].as_array().unwrap().len() >= 6);
     assert_eq!(
         health["writePressure"]["units"]["oldestQueuedMs"],
         "milliseconds"
     );
     assert_eq!(health["writePressure"]["freshness"]["state"], "fresh");
-    assert_eq!(health["killSwitches"]["dbWriterBypassFailClosed"], true);
+    assert!(health["killSwitches"]["dbWriterBypassClasses"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(health["thresholds"].as_array().unwrap().len() >= 7);
     assert_eq!(
         health["telemetryRollup"]["units"]["memoryCapBytes"],
         "bytes"
@@ -996,8 +1005,12 @@ async fn mcp_storage_diagnostics_match_graphql_units() {
         .await
         .expect("evidence spool summary must build");
 
-    assert_eq!(health["evidenceSpool"]["units"]["totalSizeBytes"], "bytes");
-    assert_eq!(summary["units"]["totalSizeBytes"], "bytes");
+    assert_eq!(
+        health["evidenceSpool"]["units"]["bytesWrittenTotal"],
+        "bytes"
+    );
+    assert_eq!(summary["units"]["bytesWrittenTotal"], "bytes");
+    assert_eq!(summary["enabled"], true);
     assert_eq!(
         health["writePressure"]["units"],
         serde_json::json!({

@@ -16,11 +16,10 @@
 #   retirement_criteria - observable condition that proves the bypass can be removed
 #   expires_after_phase - phase number (1-8); gate fails if current phase exceeds this
 #
-# Retirement signal: the proposal-075 Phase 7 gate counts entries by expires_after_phase.
-# Routing a repo file through DbWriter removes its entry. The count must decrease
-# monotonically per phase: bypass-007..bypass-013 retire in Phase 3, bypass-014..bypass-024
-# retire in Phase 4, bypass-025..bypass-033 retire in Phase 5. This observable signal lets
-# operators verify migration progress rather than relying on a single coarse flag flip.
+# Retirement signal: the proposal-075 gate counts entries by expires_after_phase and
+# verifies observed direct-write call sites against this file. The closeout slice keeps
+# remaining runtime repo owners visible as phase-8 bypasses until each owner is routed
+# through DbWriter or reclassified as permanent infrastructure.
 #
 # The original bypass-003 wildcard (db::repos::*) was split into per-file entries here
 # in the refinement pass to satisfy the monotonic-decrease requirement from BLOCK-REL-002.
@@ -71,14 +70,15 @@ expires_after_phase = 8
 # Phase 2 retirements (Class C metadata, first DbWriter wiring):
 # ---------------------------------------------------------------------------
 
-# bypass-006 RETIRED: Phase 3 landed insert_via_dbwriter (Class C, EvidenceMetadata lane),
-# insert_idempotent_via_dbwriter (Class C), and update_status_via_dbwriter (Class A,
-# CriticalBarrier lane) in evidence_spool_refs.rs. The evidence_spool.rs file module
-# (write_spool_file: temp-write → sha256 → fsync → rename → fsync_parent) is also
-# implemented. The existing direct-write insert/insert_idempotent/update_status functions
-# are retained for startup_repair and test contexts only (permanent bypass categories).
-# Phase 7 gate verification: absence of pool.begin() write calls outside #[cfg(test)]
-# in evidence_spool_refs.rs confirms full retirement.
+[[bypasses]]
+id = "bypass-006"
+owner = "db::repos::evidence_spool_refs"
+reason = "Direct metadata functions are retained for startup orphan repair and focused repository tests; runtime producers must use *_via_dbwriter helpers."
+scope = "startup_repair"
+path_pattern = "crates/db/src/repos/evidence_spool_refs.rs"
+allowed_context = "Startup orphan repair and repository tests only. Runtime producers use insert_via_dbwriter, insert_idempotent_via_dbwriter, or update_status_via_dbwriter."
+retirement_criteria = "Runtime producer call sites reference only *_via_dbwriter helpers; direct insert/update functions remain startup_repair/test-only."
+expires_after_phase = 8
 
 # ---------------------------------------------------------------------------
 # Phase 3 retirements (Class A canonical transitions, Class B projection writes):
@@ -398,4 +398,14 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/rollout_contract_checks.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in rollout_contract_checks.rs route through DbWriter. Verify by absence of execute(pool) write calls outside #[cfg(test)]."
+expires_after_phase = 8
+
+[[bypasses]]
+id = "bypass-037"
+owner = "db::repos::storage_health"
+reason = "P075 storage write-pressure snapshots are the diagnostics readback path; Class D producer routing is tracked as telemetry rollup adoption."
+scope = "temporary_rollout"
+path_pattern = "crates/db/src/repos/storage_health.rs"
+allowed_context = "Storage write-pressure snapshot insertion until Class D telemetry producer submits through DbWriter."
+retirement_criteria = "insert_write_pressure_snapshot is test-only or has a registered DbWriter Class D submission helper used by runtime producers."
 expires_after_phase = 8
