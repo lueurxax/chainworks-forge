@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-29 |
-| Status | Implemented (Phase 1) |
+| Status | Implemented (Phases 1–3; orphan sweep walk, telemetry rollup persistence, and storageHealth diagnostics deferred to Phases 4–8) |
 | Author | Engineer (single-engineer project) |
 | Depends on | Rust control plane, SQLite persistence, artifact store, P038 run compaction, P073 stabilization freeze |
 | Related | [Provider toolchain cache mapping](../reference/acp-runtime-transport.md#toolchain-cache-mapping), P078 durable side-effect ledger |

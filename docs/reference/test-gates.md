@@ -1852,15 +1852,16 @@ Important:
 
 ### `proposal-075|p075`
 
-Proposal 075 Phases 1–2 local persistence write budget gate.
+Proposal 075 Phases 1–3 local persistence write budget gate.
 
 Scope:
 
 - `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
-- `writer`: `DbWriter` constants, lane order, and Phase 2 bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, and graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`. Phase 3+ behaviors (Class B coalescing buffer, evidence file spool, orphan sweep, telemetry rollup persistence, `storageHealth` diagnostics) remain deferred.
+- `writer`: `DbWriter` constants, lane order, Phase 2 bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`, populated `SHUTDOWN_ADMITTED_OPERATIONS` allowlist (terminal canonical operations admitted; unlisted Class A writes denied), and Phase 3 Class B coalescing buffer (`COALESCE_FLUSH_INTERVAL_MS=500` with unconditional drain-all per tick, `COALESCE_FLUSH_MAX_MERGES=64`, last-writer-wins, `COALESCE_MAX_KEYS=1024` saturation reject with `coalescing_map_saturated`, force-drained on shutdown), per-lane oldest-enqueued tracking populating `WriteRejected.oldest_queued_ms`. The full startup orphan sweep walk, telemetry rollup persistence, and `storageHealth` diagnostics remain deferred.
+- `evidence_spool` (Phase 3): `write_spool_file` ordering proof (temp write → SHA-256 → `fsync(file)` → atomic rename → `fsync(parent_dir)`), `verify_spool_file` reader integrity, file-survives-without-metadata orphan-safety property, high-volume "one metadata row per logical object" proof against `evidence_spool_refs`, and security regressions: canonical-layout enforcement (`evidence/runs/...` required — P075-SEC-002 layout), no-clobber commit (identical bytes = idempotent retry; differing bytes = hard error — P075-SEC-002 no-clobber), symlink-escape rejection via canonicalized parent containment (P075-SEC-H001), Unix file mode `0o600` and directory mode `0o700` (P075-SEC-H002)
 - `bypass_allowlist`: parser, expiry, canonical file validation
 - `operation_registry`: parser, validation, canonical file validation
-- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints, `validate_relative_path` symmetry on read/write, `canonicalize_summary_json` allowlist, identity-string control-character rejection
+- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints, `validate_relative_path` symmetry on read/write, `validate_path_ownership` run-id binding (P075-SEC-001), `canonicalize_summary_json` allowlist, identity-string control-character rejection
 - `storage_write_pressure_snapshots` migration and validation
 - fails closed if `write-bypass-allowlist.toml` or `write-operation-registry.toml` are missing or invalid
 
@@ -1883,8 +1884,8 @@ Command:
 Important:
 
 - `p075` is accepted as an alias
-- this is currently a Phases 1–2 inventory/contract gate; Phase 7 promotes direct-write bypass detection to fail-closed enforcement
-- Phase 3+ behaviors must extend this gate before evidence file spooling, coalescing, telemetry rollup, storageHealth diagnostics, and fail-closed bypass enforcement are treated as shipped
+- this is currently a Phases 1–3 inventory/contract gate; Phase 7 promotes direct-write bypass detection to fail-closed enforcement
+- Phase 4+ behaviors must extend this gate before the full startup orphan sweep walk, telemetry rollup persistence, storageHealth diagnostics, and fail-closed bypass enforcement are treated as shipped
 
 ### `proposal-084|p084` retained historical alias
 

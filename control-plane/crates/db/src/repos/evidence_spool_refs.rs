@@ -155,8 +155,31 @@ pub struct EvidenceSpoolRef {
 ///
 /// P075-LOW-003: do not emit raw relative_path values in error messages — they may
 /// contain user-controlled data. Use this redacted form in all error message formats.
-fn redact_path(path: &str) -> String {
+pub fn redact_path(path: &str) -> String {
     format!("<path:{}_chars>", path.len())
+}
+
+/// Validate that `relative_path` is owned by the given `run_id`.
+///
+/// SEC-P075-001: a producer must not be able to write or register evidence under
+/// another run's path tree. The canonical path layout is:
+/// `evidence/runs/{run_id}/stages/{stage_id}/agents/{agent_id}/{kind}/...`
+///
+/// This function enforces that `relative_path` starts with
+/// `evidence/runs/{run_id}/`, binding the metadata row to its run at insert time.
+pub fn validate_path_ownership(relative_path: &str, run_id: &str) -> Result<()> {
+    // Build the expected prefix from the run_id so that a path for a different run
+    // (e.g. evidence/runs/other-run/...) is always rejected.
+    let expected_prefix = format!("evidence/runs/{}/", run_id);
+    if !relative_path.starts_with(expected_prefix.as_str()) {
+        bail!(
+            "relative_path must be under evidence/runs/{{run_id}}/... for this run \
+             (run_id_len={}, path={})",
+            run_id.len(),
+            redact_path(relative_path)
+        );
+    }
+    Ok(())
 }
 
 /// Reject NUL bytes and ASCII control characters in a metadata string field.
@@ -310,6 +333,12 @@ pub fn validate_spool_ref_fields(spool_ref: &EvidenceSpoolRef) -> Result<()> {
             );
         }
     }
+
+    // SEC-P075-001: bind relative_path to run_id at insert time to prevent cross-run
+    // evidence registration. Must be checked AFTER the basic validate_relative_path call
+    // that rejects empty/traversal/absolute paths.
+    validate_path_ownership(&spool_ref.relative_path, &spool_ref.run_id)
+        .context("validate relative_path ownership for run")?;
 
     // P075-SEC-MED-004: reject NUL and ASCII control characters in all metadata strings.
     validate_no_control_chars(&spool_ref.id, "id")?;

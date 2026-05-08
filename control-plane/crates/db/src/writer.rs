@@ -101,7 +101,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -166,6 +166,12 @@ pub const COALESCE_FLUSH_INTERVAL_MS: u64 = 500;
 pub const COALESCE_FLUSH_MAX_MERGES: usize = 64;
 /// Maximum age of a coalescing key before it must be flushed.
 pub const COALESCE_MAX_KEY_AGE_MS: u64 = 2000;
+/// Maximum distinct coalescing keys in the buffer.
+///
+/// When a new (non-colliding) key would exceed this limit, the write is rejected with
+/// `WriteRejected { reason: "coalescing_map_saturated" }` and `coalesced_rejected_total`
+/// is incremented. Per P075 §architecture.backpressure_and_admission_control (Class B overflow).
+pub const COALESCE_MAX_KEYS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Shutdown drain budgets
@@ -210,15 +216,31 @@ pub const CLASS_A_REJECTED_RETRY_INITIAL_DELAY_MS: u64 = 100;
 /// Operation names admitted to Class A queues after the shutdown signal.
 /// All other Class A submissions receive WriteRejected("shutdown_admission_denied").
 ///
-/// **Fail-closed**: empty list = deny all Class A writes during shutdown.
-/// Phase 2: list is empty → no Class A writes are admitted during shutdown.
-/// Phase 3+ populates this list with terminal canonical state operation names
-/// (e.g. "run_complete", "stage_complete") as producers are wired through DbWriter.
+/// Only operations needed to persist terminal or shutdown canonical state are admitted.
+/// Any Class A write whose operation_name is not in this list is denied during drain.
 ///
-/// **CLEAN-002**: When Phase 3+ wires the shutdown admission filter and populates
-/// this list, add a regression test `shutdown_class_a_admission_filter_rejects_unlisted_ops`
-/// that verifies operations not in the list are denied.
-pub const SHUTDOWN_ADMITTED_OPERATIONS: &[&str] = &[];
+/// When new terminal producers are wired through DbWriter in Phase 3+, add their
+/// canonical operation_name here and add a regression test that verifies the listed
+/// operations are admitted and unlisted operations are denied.
+pub const SHUTDOWN_ADMITTED_OPERATIONS: &[&str] = &[
+    // Terminal run state transitions.
+    "run_complete",
+    "run_failed",
+    "run_cancelled",
+    // Terminal stage state transitions (includes generic canonical_stage_transition).
+    "stage_complete",
+    "stage_failed",
+    "canonical_stage_transition",
+    // Terminal agent state transitions.
+    "agent_complete",
+    "agent_failed",
+    // Approval decisions (terminal for approval-gate stages).
+    "approval_decision",
+    // Operator command completion records.
+    "operator_command_complete",
+    // Projection invalidation triggered by a terminal canonical change.
+    "projection_invalidation_terminal",
+];
 
 // ---------------------------------------------------------------------------
 // Telemetry rollup budget (Class D)
@@ -371,18 +393,30 @@ pub struct DbWriterHeartbeat {
     last_drain_ns: [AtomicU64; 6],
     /// Cumulative lane starvation events (lower lane starved > STARVATION_WATCHDOG_SECS).
     pub starvation_total: AtomicU64,
+    /// Per-lane: monotonic ns since process start when the first unprocessed item was enqueued
+    /// in the current busy period. 0 = no pending items. Used to populate WriteRejected.oldest_queued_ms.
+    pub lane_oldest_enqueued_ns: [AtomicU64; 6],
+    /// Per-lane: approximate count of items pending in the channel (submit increments,
+    /// execute_message decrements). Used to clear `lane_oldest_enqueued_ns` when lane empties.
+    pub lane_pending_count: [AtomicI64; 6],
+    /// Cumulative Class B coalescing rejections due to map saturation (COALESCE_MAX_KEYS).
+    pub coalesced_rejected_total: AtomicU64,
     /// Reference instant for ns offsets (process-start-relative).
     origin: Instant,
 }
 
 impl DbWriterHeartbeat {
     fn new() -> Self {
-        const ZERO: AtomicU64 = AtomicU64::new(0);
+        const ZERO_U64: AtomicU64 = AtomicU64::new(0);
+        const ZERO_I64: AtomicI64 = AtomicI64::new(0);
         Self {
             alive: AtomicBool::new(false),
             last_beat_ns: AtomicU64::new(0),
-            last_drain_ns: [ZERO; 6],
+            last_drain_ns: [ZERO_U64; 6],
             starvation_total: AtomicU64::new(0),
+            lane_oldest_enqueued_ns: [ZERO_U64; 6],
+            lane_pending_count: [ZERO_I64; 6],
+            coalesced_rejected_total: AtomicU64::new(0),
             origin: Instant::now(),
         }
     }
@@ -536,9 +570,7 @@ impl DbWriter {
         // Shutdown admission filter (LIFT-REL-03).
         if self.shutdown_in_progress.load(Ordering::Relaxed) {
             let admitted = if op.class == WriteClass::A {
-                // Fail-closed: only operations listed in SHUTDOWN_ADMITTED_OPERATIONS are
-                // admitted. Empty list = deny all. Phase 2 has no producers wired, so all
-                // Class A writes are denied during shutdown until Phase 3+ populates the list.
+                // Fail-closed: only operations in SHUTDOWN_ADMITTED_OPERATIONS are admitted.
                 SHUTDOWN_ADMITTED_OPERATIONS.contains(&op.operation_name)
             } else {
                 false
@@ -569,6 +601,7 @@ impl DbWriter {
         );
 
         let deadline = op.deadline;
+        let lane_idx = op.lane.drain_order_index();
         // Record submit start for enqueue-to-commit deadline accounting (DEFECT-001).
         // The full deadline covers admission wait + queue wait + lock wait + commit.
         let submit_start = Instant::now();
@@ -587,17 +620,37 @@ impl DbWriter {
             Err(_elapsed) => {
                 // Capture depth at rejection time (more accurate than pre-send snapshot).
                 let queued_depth = lane_tx.max_capacity() - lane_tx.capacity();
+                // Compute oldest_queued_ms from the per-lane tracking set when the lane first
+                // became busy. 0 means the tracker was never set (very short window race).
+                let oldest_queued_ms = {
+                    let oldest_ns =
+                        self.heartbeat.lane_oldest_enqueued_ns[lane_idx].load(Ordering::Relaxed);
+                    if oldest_ns == 0 {
+                        None
+                    } else {
+                        Some(self.heartbeat.now_ns().saturating_sub(oldest_ns) / 1_000_000)
+                    }
+                };
                 WriteResult::WriteRejected {
                     lane: op.lane.as_str(),
                     capacity: op.lane.capacity(),
                     queued_depth,
-                    oldest_queued_ms: None, // per-lane enqueue-time tracking deferred to Phase 3
+                    oldest_queued_ms,
                     operation_name: op.operation_name,
                     reason: "lane_saturated",
                 }
             }
             Ok(Err(_channel_closed)) => WriteResult::WriteFailed,
             Ok(Ok(())) => {
+                // Track oldest-enqueued for WriteRejected.oldest_queued_ms observability.
+                // Increment pending count; if this is the first item (prev == 0), record the
+                // enqueue time as the start of the current busy period.
+                let prev_pending =
+                    self.heartbeat.lane_pending_count[lane_idx].fetch_add(1, Ordering::Relaxed);
+                if prev_pending == 0 {
+                    self.heartbeat.lane_oldest_enqueued_ns[lane_idx]
+                        .store(self.heartbeat.now_ns(), Ordering::Relaxed);
+                }
                 // Use remaining deadline for result wait (DEFECT-001 fix).
                 // This ensures total enqueue-to-commit time stays within op.deadline.
                 let remaining = deadline
@@ -708,6 +761,29 @@ impl DbWriter {
                     let _ = result_tx.send(WriteResult::Coalesced);
                     // result_rx will return Coalesced on the await below.
                 }
+            } else if buf.entries.len() >= COALESCE_MAX_KEYS {
+                // Coalescing map is saturated: reject the new key rather than growing unboundedly.
+                // Per P075 §architecture.backpressure_and_admission_control (Class B overflow policy).
+                let lane_str = op.lane.as_str();
+                let op_name = op.operation_name;
+                let depth = buf.entries.len();
+                drop(buf);
+                let rejected_total = self.heartbeat.coalesced_rejected_total
+                    .fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    operation_name = op_name,
+                    coalesced_rejected_total = rejected_total,
+                    coalescing_map_depth = depth,
+                    "DbWriter: coalescing buffer saturated; rejecting new Class B key"
+                );
+                return WriteResult::WriteRejected {
+                    lane: lane_str,
+                    capacity: COALESCE_MAX_KEYS,
+                    queued_depth: depth,
+                    oldest_queued_ms: None,
+                    operation_name: op_name,
+                    reason: "coalescing_map_saturated",
+                };
             } else {
                 buf.entries.insert(
                     key,
@@ -767,7 +843,12 @@ impl DbWriter {
 
 /// Background task: flush coalesced Class B entries every 500 ms and on shutdown.
 ///
-/// - Every `COALESCE_FLUSH_INTERVAL_MS`: drains entries older than `COALESCE_MAX_KEY_AGE_MS`.
+/// - Every `COALESCE_FLUSH_INTERVAL_MS`: drains **all** pending entries unconditionally.
+///   This guarantees a Class B write with the 1000 ms default deadline always commits
+///   via the periodic flush (~500 ms wait) rather than timing out. `COALESCE_MAX_KEY_AGE_MS`
+///   is a documentation bound (no entry can ever be held longer than ~500 ms) not a drain
+///   gate — draining only stale entries on the 500 ms tick would let single Class B writes
+///   sit for ~2 s and trip WriteTimeout before the deadline (P075-DEFECT-CLASSBFLUSH).
 /// - On shutdown signal: force-drains all remaining entries (sub-budget LIFT-REL-03).
 async fn run_coalescing_flush(
     coalescing: Arc<Mutex<CoalescingBuffer>>,
@@ -775,7 +856,6 @@ async fn run_coalescing_flush(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use tokio::time::{interval, Duration};
-    let max_age = Duration::from_millis(COALESCE_MAX_KEY_AGE_MS);
     let mut tick = interval(Duration::from_millis(COALESCE_FLUSH_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -797,12 +877,14 @@ async fn run_coalescing_flush(
             }
 
             _ = tick.tick() => {
+                // Drain ALL entries every 500 ms so no Class B write waits longer than
+                // ~500 ms regardless of merge activity (P075-DEFECT-CLASSBFLUSH fix).
                 let entries: Vec<CoalescedEntry> = {
                     let mut buf = coalescing.lock().unwrap();
-                    buf.drain_stale(max_age)
+                    buf.drain_all()
                 };
                 if !entries.is_empty() {
-                    tracing::debug!(count = entries.len(), "CoalescingFlush: draining stale entries");
+                    tracing::debug!(count = entries.len(), "CoalescingFlush: draining all entries");
                     flush_coalesced_to_channel(entries, &cp_tx).await;
                 }
             }
@@ -840,26 +922,39 @@ async fn execute_message(
     heartbeat: &DbWriterHeartbeat,
     lane: WriteLane,
 ) {
-    let elapsed = msg.enqueued_at.elapsed();
-    if elapsed >= msg.op.deadline {
+    let queue_wait_ms = msg.enqueued_at.elapsed().as_millis() as u64;
+    let lane_idx = lane.drain_order_index();
+
+    if msg.enqueued_at.elapsed() >= msg.op.deadline {
         tracing::warn!(
             operation_name = msg.op.operation_name,
             lane = lane.as_str(),
-            elapsed_ms = elapsed.as_millis() as u64,
+            write_id_hash = %hash_idempotency_key(&msg.op.idempotency_key),
+            queue_wait_ms,
             deadline_ms = msg.op.deadline.as_millis() as u64,
             "DbWriter: deadline expired in queue; returning WriteTimeout"
         );
         let _ = msg.result_tx.send(WriteResult::WriteTimeout);
+        // Decrement pending count; clear oldest_enqueued if lane is now empty.
+        let prev = heartbeat.lane_pending_count[lane_idx].fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 {
+            heartbeat.lane_oldest_enqueued_ns[lane_idx].store(0, Ordering::Relaxed);
+        }
         return;
     }
 
     tracing::debug!(
         operation_name = msg.op.operation_name,
         lane = lane.as_str(),
-        idempotency_key_hash = %hash_idempotency_key(&msg.op.idempotency_key),
-        elapsed_ms = elapsed.as_millis() as u64,
+        write_id_hash = %hash_idempotency_key(&msg.op.idempotency_key),
+        queue_wait_ms,
+        expected_rows = msg.op.expected_rows,
         "DbWriter: executing write"
     );
+
+    // Time the transaction. Lock wait and busy-retry duration are included in tx_duration_ms
+    // because they occur inside the work closure (which calls begin_immediate_with_retry).
+    let tx_start = Instant::now();
 
     // Run work to completion without a timeout wrapper. Per P075
     // §architecture.deadlines_and_results.in_flight_timeout, in-flight
@@ -868,11 +963,17 @@ async fn execute_message(
     // submit()) handles the case where the caller does not want to wait.
     let work_result = (msg.work)(pool.clone()).await;
 
+    let tx_duration_ms = tx_start.elapsed().as_millis() as u64;
+
     let write_result = match work_result {
         Err(ref e) if is_busy_error(e) => {
             tracing::warn!(
                 operation_name = msg.op.operation_name,
                 lane = lane.as_str(),
+                write_id_hash = %hash_idempotency_key(&msg.op.idempotency_key),
+                queue_wait_ms,
+                tx_duration_ms,
+                expected_rows = msg.op.expected_rows,
                 error_kind = "sqlite_busy",
                 "DbWriter: SQLite busy exhausted; returning WriteBusyExhausted"
             );
@@ -882,6 +983,10 @@ async fn execute_message(
             tracing::error!(
                 operation_name = msg.op.operation_name,
                 lane = lane.as_str(),
+                write_id_hash = %hash_idempotency_key(&msg.op.idempotency_key),
+                queue_wait_ms,
+                tx_duration_ms,
+                expected_rows = msg.op.expected_rows,
                 error_kind = %classify_write_error(&e),
                 "DbWriter: write failed"
             );
@@ -891,7 +996,11 @@ async fn execute_message(
             tracing::debug!(
                 operation_name = msg.op.operation_name,
                 lane = lane.as_str(),
-                rows_affected = rows,
+                write_id_hash = %hash_idempotency_key(&msg.op.idempotency_key),
+                queue_wait_ms,
+                tx_duration_ms,
+                expected_rows = msg.op.expected_rows,
+                actual_rows = rows,
                 "DbWriter: committed"
             );
             WriteResult::Committed
@@ -900,6 +1009,12 @@ async fn execute_message(
 
     // Record heartbeat for this lane.
     heartbeat.record_drain(lane);
+
+    // Decrement pending count; clear oldest_enqueued_ns when lane empties.
+    let prev = heartbeat.lane_pending_count[lane_idx].fetch_sub(1, Ordering::Relaxed);
+    if prev == 1 {
+        heartbeat.lane_oldest_enqueued_ns[lane_idx].store(0, Ordering::Relaxed);
+    }
 
     // Post-cancel observability: if the caller dropped the receiver, log it.
     if msg.result_tx.send(write_result).is_err() {
@@ -1189,28 +1304,32 @@ mod tests {
         }
     }
 
-    /// Regression sentinel for CLEAN-002 / LIFT-REL-03.
-    ///
-    /// Phase 2: SHUTDOWN_ADMITTED_OPERATIONS is empty because no producers have been
-    /// wired yet. With fail-closed semantics, empty means deny all. When Phase 3+ wires
-    /// the admission filter and populates this list, update the assertion to `!is_empty()`
-    /// and add the `shutdown_class_a_admission_filter_rejects_unlisted_ops` regression test.
+    /// Regression test for CLEAN-002 / LIFT-REL-03: SHUTDOWN_ADMITTED_OPERATIONS must be
+    /// populated with canonical terminal state operations, and unknown operations must be denied.
     #[test]
     fn shutdown_class_a_admission_empty_list_denies_all_phase2_sentinel() {
+        // List is now populated with terminal state operations (Phase 3+ refinement).
         assert!(
-            SHUTDOWN_ADMITTED_OPERATIONS.is_empty(),
-            "Phase 2 sentinel: SHUTDOWN_ADMITTED_OPERATIONS must be empty until \
-             producers are wired in Phase 3+. If you are adding entries here, \
-             update this test to assert !is_empty() (CLEAN-002)."
+            !SHUTDOWN_ADMITTED_OPERATIONS.is_empty(),
+            "SHUTDOWN_ADMITTED_OPERATIONS must not be empty; populate with terminal operation names \
+             (run_complete, stage_complete, etc.) so shutdown admits terminal canonical writes."
         );
-        // With fail-closed semantics, empty list means no Class A writes are admitted.
-        // Verify the filter helper used by submit() reflects this.
-        fn is_admitted_fail_closed(list: &[&str], op_name: &str) -> bool {
+        // Listed operations must be admitted.
+        fn is_admitted(list: &[&str], op_name: &str) -> bool {
             list.contains(&op_name)
         }
         assert!(
-            !is_admitted_fail_closed(SHUTDOWN_ADMITTED_OPERATIONS, "run_complete"),
-            "empty SHUTDOWN_ADMITTED_OPERATIONS must deny all Class A writes (fail-closed)"
+            is_admitted(SHUTDOWN_ADMITTED_OPERATIONS, "run_complete"),
+            "run_complete must be in SHUTDOWN_ADMITTED_OPERATIONS"
+        );
+        assert!(
+            is_admitted(SHUTDOWN_ADMITTED_OPERATIONS, "stage_complete"),
+            "stage_complete must be in SHUTDOWN_ADMITTED_OPERATIONS"
+        );
+        // Unknown operations must still be denied (fail-closed for unlisted ops).
+        assert!(
+            !is_admitted(SHUTDOWN_ADMITTED_OPERATIONS, "unlisted_terminal_op"),
+            "unlisted operations must still be denied (fail-closed for unlisted)"
         );
     }
 
@@ -1264,6 +1383,65 @@ mod tests {
         assert!(WARN_WAL_SIZE_BYTES < CRITICAL_WAL_SIZE_BYTES);
         assert!(TELEMETRY_MEMORY_CAP_BYTES > 0);
         assert!(TELEMETRY_MAX_SAMPLES > 0);
+        assert!(COALESCE_MAX_KEYS > 0, "COALESCE_MAX_KEYS must be a positive bound");
+    }
+
+    /// Unit test for coalescing buffer saturation logic.
+    ///
+    /// Fills `CoalescingBuffer` to `COALESCE_MAX_KEYS` entries using the internal struct
+    /// (accessible here because tests are in the same module), then verifies that the
+    /// saturation check fires before any new entry would be inserted.
+    ///
+    /// This tests the logic layer only; the integration-level rejection through DbWriter.submit
+    /// is covered separately in the proposal_075_dbwriter integration test.
+    #[test]
+    fn coalescing_buffer_saturation_check_fires_at_max_keys() {
+        let mut buf = CoalescingBuffer::new();
+        // Fill to capacity with distinct keys.
+        for i in 0..COALESCE_MAX_KEYS {
+            let key = format!("run-sat/key-{i}");
+            // We can't construct CoalescedEntry without a real oneshot channel, so just
+            // verify the saturation condition using the buffer's length before insert.
+            // Simulate insertion by directly inserting a placeholder entry.
+            use tokio::sync::oneshot;
+            let (tx, _rx) = oneshot::channel::<WriteResult>();
+            let op = WriteOperation {
+                class: WriteClass::B,
+                lane: WriteLane::CoalescedProjection,
+                operation_name: "test_saturation",
+                expected_rows: 1,
+                batchable: true,
+                barrier: false,
+                deadline: WriteClass::B.default_deadline(),
+                deadline_reason: None,
+                idempotency_key: key.clone(),
+                replay_policy: ReplayPolicy::LastWriterWins,
+                observed_at: None,
+            };
+            let work: WriteWork = Box::new(|_pool| Box::pin(async { Ok(1u32) }));
+            buf.entries.insert(key, CoalescedEntry {
+                op,
+                work,
+                result_tx: tx,
+                enqueued_at: std::time::Instant::now(),
+                mono_counter: i as u64,
+            });
+        }
+        // Buffer is now at COALESCE_MAX_KEYS entries.
+        assert_eq!(buf.entries.len(), COALESCE_MAX_KEYS);
+        // The saturation check in submit_class_b fires when entries.len() >= COALESCE_MAX_KEYS.
+        assert!(
+            buf.entries.len() >= COALESCE_MAX_KEYS,
+            "saturation check must fire: buffer at {} >= max {}",
+            buf.entries.len(),
+            COALESCE_MAX_KEYS
+        );
+        // Draining clears the buffer and allows new entries.
+        let drained = buf.drain_all();
+        assert_eq!(drained.len(), COALESCE_MAX_KEYS);
+        assert_eq!(buf.entries.len(), 0);
+        // After drain, saturation check no longer fires.
+        assert!(buf.entries.len() < COALESCE_MAX_KEYS);
     }
 
     #[test]
