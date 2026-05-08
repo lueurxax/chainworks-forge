@@ -8,6 +8,7 @@
 
 use db::evidence_spool::{
     sha256_hex, sweep_evidence_orphans, verify_spool_file, write_spool_file, VerifyResult,
+    SWEEP_DEFAULT_MAX_BYTES, SWEEP_DEFAULT_MAX_FILES,
 };
 use db::pool::{begin_immediate_with_retry, create_pool};
 use db::repos::evidence_spool_refs::{
@@ -556,9 +557,16 @@ async fn startup_orphan_sweep_recovers_intact_active_run_files() {
         "metadata row must be absent before sweep"
     );
 
-    let report = sweep_evidence_orphans(&pool, dir.path())
-        .await
-        .expect("orphan sweep must succeed");
+    let report = sweep_evidence_orphans(
+        &pool,
+        dir.path(),
+        None,
+        SWEEP_DEFAULT_MAX_FILES,
+        SWEEP_DEFAULT_MAX_BYTES,
+        false,
+    )
+    .await
+    .expect("orphan sweep must succeed");
     assert_eq!(report.scanned_files, 1);
     assert_eq!(report.recovered_orphans, 1);
     assert_eq!(report.already_indexed, 0);
@@ -571,9 +579,16 @@ async fn startup_orphan_sweep_recovers_intact_active_run_files() {
     assert_eq!(recovered.checksum, output.checksum);
     assert_eq!(recovered.size_bytes, output.size_bytes as i64);
 
-    let second_report = sweep_evidence_orphans(&pool, dir.path())
-        .await
-        .expect("second orphan sweep must be idempotent");
+    let second_report = sweep_evidence_orphans(
+        &pool,
+        dir.path(),
+        None,
+        SWEEP_DEFAULT_MAX_FILES,
+        SWEEP_DEFAULT_MAX_BYTES,
+        false,
+    )
+    .await
+    .expect("second orphan sweep must be idempotent");
     assert_eq!(second_report.scanned_files, 1);
     assert_eq!(second_report.recovered_orphans, 0);
     assert_eq!(second_report.already_indexed, 1);
@@ -1073,4 +1088,173 @@ async fn direct_write_bypass_detection_reports_unlisted_owners() {
         names.contains("p075_storage_write_pressure_snapshot_insert"),
         "telemetry snapshot operation must be registered"
     );
+}
+
+// ── SEC-001/SEC-002 sweep bounds and run_id filter regression tests ────────────
+
+/// SEC-002: sweep must stop after max_files and set truncated=true.
+#[tokio::test]
+async fn sweep_evidence_orphans_truncates_at_max_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    // Write 3 orphan files across the same run.
+    for i in 0..3u32 {
+        let path = format!("evidence/runs/run-trunc/stages/s-1/agents/a-1/transcripts/file{i}.bin");
+        write_spool_file(dir.path(), "run-trunc", &path, b"data")
+            .await
+            .unwrap();
+    }
+
+    // Sweep with max_files=2 — must truncate.
+    let report = sweep_evidence_orphans(&pool, dir.path(), None, 2, SWEEP_DEFAULT_MAX_BYTES, false)
+        .await
+        .expect("sweep must succeed");
+
+    assert!(
+        report.truncated,
+        "sweep must set truncated=true when max_files is reached"
+    );
+    assert!(
+        report.scanned_files + report.skipped_files <= 2,
+        "total processed files must not exceed max_files; got scanned={} skipped={}",
+        report.scanned_files,
+        report.skipped_files
+    );
+}
+
+/// SEC-002: sweep must stop after max_bytes and set truncated=true.
+#[tokio::test]
+async fn sweep_evidence_orphans_truncates_at_max_bytes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    // Write 3 orphan files with 100-byte content.
+    for i in 0..3u32 {
+        let path = format!("evidence/runs/run-bytes/stages/s-1/agents/a-1/transcripts/file{i}.bin");
+        write_spool_file(dir.path(), "run-bytes", &path, &[0u8; 100])
+            .await
+            .unwrap();
+    }
+
+    // Sweep with max_bytes=150 (enough for 1 file, not 2).
+    let report =
+        sweep_evidence_orphans(&pool, dir.path(), None, SWEEP_DEFAULT_MAX_FILES, 150, false)
+            .await
+            .expect("sweep must succeed");
+
+    assert!(
+        report.truncated,
+        "sweep must set truncated=true when max_bytes is reached"
+    );
+    assert!(
+        report.bytes_read <= 200,
+        "bytes_read must not greatly exceed max_bytes; got {}",
+        report.bytes_read
+    );
+}
+
+/// SEC-001: sweep with run_id filter must skip files belonging to other runs.
+#[tokio::test]
+async fn sweep_evidence_orphans_filters_by_run_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    // Write 1 file for run-a and 1 file for run-b (neither has metadata).
+    write_spool_file(
+        dir.path(),
+        "run-a",
+        "evidence/runs/run-a/stages/s-1/agents/a-1/transcripts/a.bin",
+        b"run-a-data",
+    )
+    .await
+    .unwrap();
+    write_spool_file(
+        dir.path(),
+        "run-b",
+        "evidence/runs/run-b/stages/s-1/agents/a-1/transcripts/b.bin",
+        b"run-b-data",
+    )
+    .await
+    .unwrap();
+
+    // Sweep scoped to run-a only.
+    let report = sweep_evidence_orphans(
+        &pool,
+        dir.path(),
+        Some("run-a"),
+        SWEEP_DEFAULT_MAX_FILES,
+        SWEEP_DEFAULT_MAX_BYTES,
+        false,
+    )
+    .await
+    .expect("run-id-filtered sweep must succeed");
+
+    // Only run-a's file should be recovered; run-b's file must be skipped.
+    assert_eq!(
+        report.recovered_orphans, 1,
+        "only run-a file should be recovered"
+    );
+    // run-b file is skipped (not matched by filter), not counted as an error.
+    let row_a = find_by_run_and_path(
+        &pool,
+        "run-a",
+        "evidence/runs/run-a/stages/s-1/agents/a-1/transcripts/a.bin",
+    )
+    .await
+    .unwrap();
+    assert!(row_a.is_some(), "run-a orphan must be backfilled");
+
+    let row_b = find_by_run_and_path(
+        &pool,
+        "run-b",
+        "evidence/runs/run-b/stages/s-1/agents/a-1/transcripts/b.bin",
+    )
+    .await
+    .unwrap();
+    assert!(
+        row_b.is_none(),
+        "run-b orphan must NOT be backfilled when filter is run-a"
+    );
+}
+
+/// dry_run: sweep must not insert metadata rows when dry_run=true.
+#[tokio::test]
+async fn sweep_evidence_orphans_dry_run_does_not_insert() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    write_spool_file(
+        dir.path(),
+        "run-dry",
+        "evidence/runs/run-dry/stages/s-1/agents/a-1/transcripts/dry.bin",
+        b"dry-run-data",
+    )
+    .await
+    .unwrap();
+
+    let report = sweep_evidence_orphans(
+        &pool,
+        dir.path(),
+        None,
+        SWEEP_DEFAULT_MAX_FILES,
+        SWEEP_DEFAULT_MAX_BYTES,
+        true, // dry_run
+    )
+    .await
+    .expect("dry-run sweep must succeed");
+
+    // Reports a would-be recovery but makes no DB write.
+    assert_eq!(
+        report.recovered_orphans, 1,
+        "dry-run must report would-be recovery"
+    );
+    let row = find_by_run_and_path(
+        &pool,
+        "run-dry",
+        "evidence/runs/run-dry/stages/s-1/agents/a-1/transcripts/dry.bin",
+    )
+    .await
+    .unwrap();
+    assert!(row.is_none(), "dry-run must not insert any metadata row");
 }

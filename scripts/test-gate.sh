@@ -5488,6 +5488,15 @@ PLIST
 
       log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
       cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
+
+      log "P075: daemon startup orphan sweep wiring"
+      cargo test -p daemon storage_startup -- --nocapture
+
+      log "P075: GraphQL typed storageHealth contract"
+      cargo test -p graphql-server proposal_075_storage_health_is_typed_graphql_contract -- --nocapture
+
+      log "P075: MCP storage diagnostics parameter semantics"
+      cargo test -p mcp-server storage::tests:: -- --nocapture
     )
 
     # Fail-closed contract check: allowlist and operation registry must be present,

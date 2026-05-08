@@ -9,9 +9,10 @@
 //     an Unavailable panel. Uses only `DaemonStatus` truth — never
 //     infers state from transport errors.
 //
-// Both helpers are pure view-layer code: no networking, no scheduling.
-// The one exception is `DaemonDiagnosticsExportCommand.run()`, which
-// opens an `NSSavePanel` and runs the zip export off the main actor.
+// Both helpers are pure view-layer code: no scheduling. The one exception is
+// `DaemonDiagnosticsExportCommand.run()`, which opens an `NSSavePanel`, performs
+// a best-effort storage diagnostics GraphQL read while the daemon is reachable,
+// then runs the zip export off the main actor.
 
 import Foundation
 import SwiftUI
@@ -34,8 +35,15 @@ enum DaemonDiagnosticsExportCommand {
             guard response == .OK, let url = panel.url else { return }
             Task.detached {
                 do {
+                    var inputs = DiagnosticsBundleInputs.defaults(status: status)
+                    if let snapshots = try? await DaemonLifecycleClient(
+                        endpoint: .operatorDefault()
+                    ).storageDiagnosticsSnapshots() {
+                        inputs.storageHealthSnapshotData = snapshots.storageHealthData
+                        inputs.evidenceSpoolSummaryData = snapshots.evidenceSpoolSummaryData
+                    }
                     _ = try DiagnosticsBundleBuilder.export(
-                        inputs: .defaults(status: status),
+                        inputs: inputs,
                         to: url
                     )
                 } catch {

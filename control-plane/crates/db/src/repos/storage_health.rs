@@ -175,14 +175,25 @@ pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
 }
 
 pub async fn evidence_spool_summary(pool: &SqlitePool) -> Result<Value> {
-    let rows = sqlx::query(
-        r#"SELECT status, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
-           FROM evidence_spool_refs
-           GROUP BY status"#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("evidence spool summary")?;
+    evidence_spool_summary_for_run(pool, None).await
+}
+
+pub async fn evidence_spool_summary_for_run(
+    pool: &SqlitePool,
+    run_id: Option<&str>,
+) -> Result<Value> {
+    let mut query = r#"SELECT status, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
+           FROM evidence_spool_refs"#
+        .to_string();
+    if run_id.is_some() {
+        query.push_str(" WHERE run_id = ?1");
+    }
+    query.push_str(" GROUP BY status");
+    let mut q = sqlx::query(&query);
+    if let Some(run_id) = run_id {
+        q = q.bind(run_id);
+    }
+    let rows = q.fetch_all(pool).await.context("evidence spool summary")?;
     let mut total_count = 0i64;
     let mut total_bytes = 0i64;
     let mut orphan_files = 0i64;

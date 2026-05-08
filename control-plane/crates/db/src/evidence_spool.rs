@@ -88,7 +88,16 @@ pub struct OrphanSweepReport {
     pub recovered_orphans: u64,
     /// Files skipped because they are temp files, invalid paths, oversized, or unknown kinds.
     pub skipped_files: u64,
+    /// Total bytes read during this sweep pass (for dry-run and budgeting diagnostics).
+    pub bytes_read: u64,
+    /// True if the sweep stopped early due to max_files or max_bytes budget exhaustion.
+    pub truncated: bool,
 }
+
+/// Default maximum files per orphan sweep pass (P075 §architecture.evidence_spooling).
+pub const SWEEP_DEFAULT_MAX_FILES: u64 = 1000;
+/// Default maximum bytes read per orphan sweep pass (64 MiB; P075 §architecture.evidence_spooling).
+pub const SWEEP_DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum file size that [`verify_spool_file`] will read into memory (SEC-P075-004).
 /// Files larger than this cap return `Err` rather than allocating unbounded RAM.
@@ -155,30 +164,15 @@ pub async fn write_spool_file(
         .ok_or_else(|| anyhow::anyhow!("spool path has no parent directory"))?
         .to_path_buf();
 
-    // Create parent directories with mode 0o700 — no group/world access regardless of umask (H-002).
-    #[cfg(unix)]
-    tokio::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&parent)
+    // Create parent directories using a per-segment symlink-safe walk (H-001).
+    // Each component is verified with symlink_metadata BEFORE mkdir — no directory is ever
+    // created through a symlink, so filesystem state outside canonical_root is never mutated.
+    create_spool_parent_safe(&canonical_root, &parent)
         .await
-        .context("create evidence spool parent directories")?;
-    #[cfg(not(unix))]
-    tokio::fs::create_dir_all(&parent)
-        .await
-        .context("create evidence spool parent directories")?;
-
-    // After creation: verify parent is within canonical_root (detects symlink escapes — H-001).
-    // A symlinked intermediate directory (e.g. evidence/ → /etc/) would have a canonical path
-    // that does not start with canonical_root, so this check catches it before any write.
-    let canonical_parent = tokio::fs::canonicalize(&parent)
-        .await
-        .context("canonicalize spool parent for containment check")?;
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Err(anyhow::anyhow!(
-            "evidence spool path escapes artifact root after symlink resolution (P075-SEC-H001)"
-        ));
-    }
+        .context("create evidence spool parent directories (symlink-safe)")?;
+    // After safe creation, parent is canonical: canonical_root is pre-resolved,
+    // relative_path is validated, and each component was verified as a real non-symlink directory.
+    let canonical_parent = parent;
 
     // Deterministic temp path: {parent}/{filename}.tmp.{uuid4}
     let file_name = absolute_path
@@ -221,13 +215,17 @@ pub async fn verify_spool_file(
     absolute_path: &Path,
     expected_checksum: &str,
 ) -> Result<VerifyResult> {
-    // SEC-P075-004: stat before read to enforce the size cap. Prevents unbounded RAM
-    // allocation if a large or attacker-controlled file path is passed by orphan sweep.
-    let meta = match tokio::fs::metadata(absolute_path).await {
+    // Use symlink_metadata (no-follow) to avoid following symlinks to outside-spool files
+    // and leaking content fingerprints (M-001/SEC-P075-004).
+    let meta = match tokio::fs::symlink_metadata(absolute_path).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(VerifyResult::Missing),
         Err(e) => return Err(anyhow::Error::from(e).context("stat spool file for verification")),
         Ok(m) => m,
     };
+    if meta.file_type().is_symlink() {
+        // A symlink at the spool path is not a valid evidence file — treat as missing.
+        return Ok(VerifyResult::Missing);
+    }
     if meta.len() > VERIFY_SIZE_CAP_BYTES {
         return Err(anyhow::anyhow!(
             "spool file exceeds verify size cap ({} bytes > {} MiB cap); \
@@ -257,18 +255,64 @@ pub async fn verify_spool_file(
 /// `evidence/runs/{run}/stages/{stage}/agents/{agent}/{kind}/...` files are
 /// eligible, temp files are ignored, files above [`VERIFY_SIZE_CAP_BYTES`] are
 /// skipped, and unknown evidence kind directories are not guessed.
+///
+/// # Budgets
+///
+/// The sweep stops as soon as either `max_files` files have been processed
+/// (counted as `scanned_files + skipped_files`) or `max_bytes` total bytes have
+/// been read from disk. When either budget is exhausted `report.truncated` is
+/// set to `true`.  Pass [`SWEEP_DEFAULT_MAX_FILES`] and
+/// [`SWEEP_DEFAULT_MAX_BYTES`] for the P075 canonical pass bounds (1 000 files,
+/// 64 MiB).
+///
+/// # run_id filter
+///
+/// If `run_id` is `Some`, only files under `evidence/runs/{run_id}/...` are
+/// eligible. Files belonging to other runs are skipped without counting toward
+/// the file/byte budget.
+///
+/// # dry_run
+///
+/// When `dry_run` is `true` the sweep scans and computes checksums but does
+/// not insert any metadata rows.  All counters are still updated so callers
+/// get a faithful inventory of what *would* be recovered.
 pub async fn sweep_evidence_orphans(
     pool: &SqlitePool,
     artifact_root: &Path,
+    run_id: Option<&str>,
+    max_files: u64,
+    max_bytes: u64,
+    dry_run: bool,
 ) -> Result<OrphanSweepReport> {
-    let root = artifact_root.join("evidence").join("runs");
-    if !root.exists() {
-        return Ok(OrphanSweepReport::default());
+    // Canonicalize artifact_root once to establish the trusted containment boundary (H-002).
+    let canonical_artifact_root = tokio::fs::canonicalize(artifact_root)
+        .await
+        .context("canonicalize artifact_root for orphan sweep")?;
+
+    let root = canonical_artifact_root.join("evidence").join("runs");
+
+    // Use symlink_metadata (no-follow) to check existence without following symlinks (H-002).
+    match std::fs::symlink_metadata(&root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OrphanSweepReport::default());
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("stat evidence/runs for sweep")),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(anyhow::anyhow!(
+                "evidence/runs is a symlink; refusing sweep traversal (P075-SEC-H002)"
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(anyhow::anyhow!(
+                "evidence/runs exists but is not a directory"
+            ));
+        }
+        Ok(_) => {}
     }
 
     let mut report = OrphanSweepReport::default();
     let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
+    'outer: while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(_) => {
@@ -277,6 +321,17 @@ pub async fn sweep_evidence_orphans(
             }
         };
         for entry in entries {
+            // Check budgets before processing each file.
+            let total_processed = report.scanned_files + report.skipped_files;
+            if total_processed >= max_files {
+                report.truncated = true;
+                break 'outer;
+            }
+            if report.bytes_read >= max_bytes {
+                report.truncated = true;
+                break 'outer;
+            }
+
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -292,6 +347,11 @@ pub async fn sweep_evidence_orphans(
                     continue;
                 }
             };
+            // Skip symlinks — do not follow them in the sweep (H-002).
+            if file_type.is_symlink() {
+                report.skipped_files += 1;
+                continue;
+            }
             if file_type.is_dir() {
                 stack.push(path);
                 continue;
@@ -301,7 +361,16 @@ pub async fn sweep_evidence_orphans(
                 continue;
             }
 
-            match recover_orphan_candidate(pool, artifact_root, &path).await {
+            match recover_orphan_candidate(
+                pool,
+                &canonical_artifact_root,
+                &path,
+                run_id,
+                dry_run,
+                &mut report.bytes_read,
+            )
+            .await
+            {
                 Ok(OrphanCandidateOutcome::AlreadyIndexed) => {
                     report.scanned_files += 1;
                     report.already_indexed += 1;
@@ -333,10 +402,24 @@ enum OrphanCandidateOutcome {
 
 async fn recover_orphan_candidate(
     pool: &SqlitePool,
-    artifact_root: &Path,
+    canonical_artifact_root: &Path,
     absolute_path: &Path,
+    run_id_filter: Option<&str>,
+    dry_run: bool,
+    bytes_read_acc: &mut u64,
 ) -> Result<OrphanCandidateOutcome> {
-    let relative_path = match absolute_path.strip_prefix(artifact_root) {
+    // Use symlink_metadata (no-follow) for stat — guards against a swap-after-readdir race (H-002).
+    let meta = match std::fs::symlink_metadata(absolute_path) {
+        Ok(m) if m.file_type().is_symlink() => return Ok(OrphanCandidateOutcome::Skipped),
+        Ok(m) if !m.is_file() => return Ok(OrphanCandidateOutcome::Skipped),
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OrphanCandidateOutcome::Skipped)
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("stat orphan evidence candidate")),
+    };
+
+    let relative_path = match absolute_path.strip_prefix(canonical_artifact_root) {
         Ok(path) => path.to_string_lossy().replace('\\', "/"),
         Err(_) => return Ok(OrphanCandidateOutcome::Skipped),
     };
@@ -350,6 +433,14 @@ async fn recover_orphan_candidate(
     let Some(layout) = parse_evidence_layout(&relative_path) else {
         return Ok(OrphanCandidateOutcome::Skipped);
     };
+
+    // Apply run_id filter before any DB or I/O work.
+    if let Some(required_run_id) = run_id_filter {
+        if layout.run_id != required_run_id {
+            return Ok(OrphanCandidateOutcome::Skipped);
+        }
+    }
+
     if find_by_run_and_path(pool, layout.run_id, &relative_path)
         .await?
         .is_some()
@@ -357,12 +448,18 @@ async fn recover_orphan_candidate(
         return Ok(OrphanCandidateOutcome::AlreadyIndexed);
     }
 
-    let meta = std::fs::metadata(absolute_path).context("stat orphan evidence candidate")?;
     if meta.len() > VERIFY_SIZE_CAP_BYTES {
         return Ok(OrphanCandidateOutcome::Skipped);
     }
     let bytes = std::fs::read(absolute_path).context("read orphan evidence candidate")?;
+    *bytes_read_acc += bytes.len() as u64;
     let checksum = sha256_hex(&bytes);
+
+    // In dry-run mode we compute the checksum but do not write to the DB.
+    if dry_run {
+        return Ok(OrphanCandidateOutcome::Recovered);
+    }
+
     let spool_ref = EvidenceSpoolRef {
         id: recovered_orphan_id(&relative_path, &checksum),
         metadata_version: 1,
@@ -444,6 +541,74 @@ fn recovered_orphan_id(relative_path: &str, checksum: &str) -> String {
     )
 }
 
+/// Creates parent directories using a per-segment symlink-safe walk.
+///
+/// Checks each path component with `symlink_metadata` (no-follow) **before** any
+/// `mkdir`. If any intermediate component is a symlink, the function returns an
+/// error immediately — no directory has been created at that point, so filesystem
+/// state outside `canonical_root` is never mutated (P075-SEC-H001).
+async fn create_spool_parent_safe(canonical_root: &Path, parent_path: &Path) -> Result<()> {
+    use std::path::Component;
+
+    let rel = parent_path.strip_prefix(canonical_root).with_context(|| {
+        format!(
+            "parent_path {} is not under canonical_root {}",
+            parent_path.display(),
+            canonical_root.display()
+        )
+    })?;
+
+    let mut current = canonical_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => current.push(name),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unexpected path component {:?} in spool parent path (P075-SEC-H001)",
+                    other
+                ));
+            }
+        }
+
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(anyhow::anyhow!(
+                    "spool path component is a symlink; not permitted in evidence tree \
+                     (P075-SEC-H001): {}",
+                    current.display()
+                ));
+            }
+            Ok(meta) if meta.is_dir() => {
+                // Existing real directory — continue.
+            }
+            Ok(_) => {
+                return Err(anyhow::anyhow!(
+                    "spool path component exists but is not a directory (P075-SEC-H001): {}",
+                    current.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                tokio::fs::DirBuilder::new()
+                    .recursive(false)
+                    .mode(0o700)
+                    .create(&current)
+                    .await
+                    .with_context(|| format!("create spool directory {}", current.display()))?;
+                #[cfg(not(unix))]
+                tokio::fs::create_dir(&current)
+                    .await
+                    .with_context(|| format!("create spool directory {}", current.display()))?;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("stat spool path component {}", current.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write, checksum, fsync(file), rename, fsync(parent_dir).
 /// Returns the SHA-256 hex digest on success.
 async fn write_and_commit(
@@ -452,20 +617,24 @@ async fn write_and_commit(
     final_path: &Path,
     parent_dir: &Path,
 ) -> Result<String> {
-    // Step 1 – write content to temp file with mode 0o600 (no group/world access — H-002).
+    // Step 1 – write content to temp file with mode 0o600 using create_new (O_CREAT|O_EXCL)
+    // rather than truncate (L-001): UUID in temp_name makes collisions negligible while
+    // create_new avoids silently overwriting any pre-existing path.
     #[cfg(unix)]
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(temp_path)
         .await
-        .context("create temp spool file")?;
+        .context("create temp spool file (create_new)")?;
     #[cfg(not(unix))]
-    let mut file = tokio::fs::File::create(temp_path)
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
         .await
-        .context("create temp spool file")?;
+        .context("create temp spool file (create_new)")?;
     file.write_all(content)
         .await
         .context("write content to temp spool file")?;
@@ -722,6 +891,17 @@ mod tests {
                 .join("runs/run-1/stages/s-1/agents/a-1/transcripts/secret.bin")
                 .exists(),
             "file must not be written to symlink target"
+        );
+
+        // H-001: verify that NO directories were created under the symlink target.
+        // With the per-segment check, no mkdir runs through the symlink before rejection.
+        let outside_entries: Vec<_> = std::fs::read_dir(outside_dir.path())
+            .expect("read outside_dir")
+            .collect();
+        assert_eq!(
+            outside_entries.len(),
+            0,
+            "no directories must be created under symlink target after rejection (H-001)"
         );
     }
 

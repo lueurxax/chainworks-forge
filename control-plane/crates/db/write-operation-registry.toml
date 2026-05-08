@@ -52,3 +52,10 @@ class = "D"
 replay_policy = "telemetry_merge"
 idempotency_key_kind = "window_start ISO timestamp"
 duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "p075_acp_transcript_spool_ref_insert"
+class = "C"
+replay_policy = "checksum_idempotent"
+idempotency_key_kind = "(run_id, relative_path) for ACP transcript artifact"
+duplicate_application_test_path = "crates/engine/src/executor.rs::tests::persisted_acp_transcript_uses_evidence_spool"

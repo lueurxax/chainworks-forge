@@ -528,10 +528,15 @@ impl QueryRoot {
 
     /// P075: Storage health readback for write pressure, evidence spooling,
     /// units, freshness, thresholds, and kill-switch state.
-    async fn storage_health(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
+    async fn storage_health(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::types::storage::GqlStorageHealth> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
-        Ok(Json(db::repos::storage_health::storage_health(pool).await?))
+        let json = db::repos::storage_health::storage_health(pool).await?;
+        crate::types::storage::GqlStorageHealth::from_storage_health_json(json)
+            .map_err(|e| Error::new(e.to_string()))
     }
 
     /// P066 T17: Latest startup recovery summary including toolchainCache fields.
@@ -3919,6 +3924,67 @@ mod tests {
                 "UNKNOWN",
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_health_is_typed_graphql_contract() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let sdl = schema.sdl();
+        assert!(sdl.contains("type StorageHealth"));
+        assert!(sdl.contains("type DbWriterHealth"));
+        assert!(sdl.contains("type EvidenceSpoolSummary"));
+        assert!(sdl.contains("enum StorageDbState"));
+        assert!(!sdl.contains("storageHealth: JSON"));
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P075StorageHealthTyped {
+                      storageHealth {
+                        updatedAt
+                        staleAfterMs
+                        isStale
+                        dbState
+                        writer {
+                          alive
+                          lanes { lane capacity queuedDepth queuedDepthRatio }
+                        }
+                        wal { available warnSizeBytes criticalSizeBytes }
+                        evidenceSpool {
+                          enabled
+                          filesWrittenTotal
+                          bytesWrittenTotal
+                          metadataRowsTotal
+                        }
+                        thresholds { metric warn critical unit action }
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P075 typed storageHealth query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["storageHealth"]["staleAfterMs"], 5000);
+        assert!(json["storageHealth"]["writer"]["lanes"]
+            .as_array()
+            .is_some_and(|lanes| lanes.len() >= 6));
+        assert!(json["storageHealth"]["thresholds"]
+            .as_array()
+            .is_some_and(|thresholds| !thresholds.is_empty()));
     }
 
     #[tokio::test]

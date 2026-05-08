@@ -286,6 +286,28 @@ async fn main() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
+    match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
+        Ok(summary) => {
+            info!(
+                roots_inspected = summary.roots_inspected,
+                roots_missing = summary.roots_missing,
+                scanned_files = summary.scanned_files,
+                already_indexed = summary.already_indexed,
+                recovered_orphans = summary.recovered_orphans,
+                skipped_files = summary.skipped_files,
+                bytes_read = summary.bytes_read,
+                truncated = summary.truncated,
+                errors = summary.errors,
+                "P075 startup evidence orphan sweep complete"
+            );
+        }
+        Err(err) => {
+            warn!(
+                err = %err,
+                "P075 startup evidence orphan sweep could not enumerate active runs"
+            );
+        }
+    }
     let host_interruption_service =
         HostInterruptionService::with_capacity_config_and_runtime_cleanup(
             pool.clone(),

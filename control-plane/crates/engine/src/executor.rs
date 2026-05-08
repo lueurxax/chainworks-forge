@@ -21,11 +21,13 @@ use crate::release::{
 use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, legacy_discovery_overrides,
-    projections, rollout_contract_checks, scheduler, sessions, stages, validation, work_items,
-    workflow_conflicts,
+    agent_retry_budget_ledger, artifact_contracts, artifacts, evidence_spool_refs, ideas,
+    legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
+    validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use db::write_class::WriteResult;
+use db::writer::DbWriter;
 use domain::agent::{
     AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
     OperatorActionHint,
@@ -6300,17 +6302,53 @@ impl BackgroundExecutor {
         }
 
         let artifact_id = domain::ids::ArtifactId::new();
-        let path = std::path::Path::new(&run.artifact_root)
-            .join("session_transcripts")
-            .join(stage_id)
-            .join(format!("{agent_id}-{agent_execution_id}.md"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create transcript artifact dir {}: {}", parent.display(), e)
-            })?;
+        let relative_path = format!(
+            "evidence/runs/{}/stages/{}/agents/{}/transcripts/{}-{}.md",
+            run.id, stage_id, agent_id, agent_id, agent_execution_id
+        );
+        let spool = db::evidence_spool::write_spool_file(
+            std::path::Path::new(&run.artifact_root),
+            &run.id.to_string(),
+            &relative_path,
+            transcript_text.as_bytes(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write transcript evidence spool: {e}"))?;
+        let summary_json = serde_json::json!({
+            "line_count": transcript_text.lines().count(),
+            "byte_count": spool.size_bytes,
+            "producer_label": agent_id
+        })
+        .to_string();
+        let spool_ref = evidence_spool_refs::EvidenceSpoolRef {
+            id: format!("evsp_transcript_{agent_execution_id}"),
+            metadata_version: 1,
+            run_id: run.id.to_string(),
+            stage_execution_id: None,
+            stage_id: Some(stage_id.to_string()),
+            agent_execution_id: Some(agent_execution_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            kind: evidence_spool_refs::EvidenceKind::Transcript,
+            relative_path: spool.relative_path.clone(),
+            size_bytes: spool.size_bytes as i64,
+            checksum_algorithm: "sha256".to_string(),
+            checksum: spool.checksum.clone(),
+            producer_operation: "p075_acp_transcript_spool_ref_insert".to_string(),
+            content_type: Some("text/markdown; charset=utf-8".to_string()),
+            summary_json: Some(summary_json),
+            created_at,
+            status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
+        };
+        let writer = DbWriter::new(self.pool.clone());
+        match evidence_spool_refs::insert_idempotent_via_dbwriter(&writer, spool_ref).await {
+            WriteResult::Committed { .. } | WriteResult::Coalesced { .. } => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "transcript evidence spool metadata was not committed: {other:?}"
+                ));
+            }
         }
-        std::fs::write(&path, transcript_text)
-            .map_err(|e| anyhow::anyhow!("write transcript artifact {}: {}", path.display(), e))?;
+        let path = std::path::Path::new(&run.artifact_root).join(&spool.relative_path);
 
         let artifact = domain::artifact::Artifact {
             id: artifact_id,
@@ -6321,8 +6359,8 @@ impl BackgroundExecutor {
             contract_id: "acp_transcript_v1".to_string(),
             format: ArtifactFormat::Markdown,
             file_path: path.to_string_lossy().into_owned(),
-            checksum_sha256: None,
-            size_bytes: Some(path.metadata().map(|meta| meta.len() as i64).unwrap_or(0)),
+            checksum_sha256: Some(spool.checksum),
+            size_bytes: Some(spool.size_bytes as i64),
             provider: provider.to_string(),
             model,
             created_at,
