@@ -34,9 +34,9 @@ duplicate_application_test_path = "crates/db/src/repos/evidence_spool_refs.rs::t
 
 [[operations]]
 operation_name = "p075_evidence_spool_ref_update_status"
-class = "C"
-replay_policy = "last_writer_wins"
-idempotency_key_kind = "evidence_spool_ref.id"
+class = "A"
+replay_policy = "natural_key"
+idempotency_key_kind = "evidence_spool_ref.id (primary key; same-status UPDATE is a no-op)"
 duplicate_application_test_path = "crates/db/src/repos/evidence_spool_refs.rs::tests::update_status_changes_value"
 
 [[operations]]

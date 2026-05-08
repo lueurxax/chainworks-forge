@@ -28,6 +28,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use crate::pool::begin_immediate_with_retry;
+use crate::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
+use crate::writer::DbWriter;
 
 // P075-LOW-005: field length caps applied at validate_spool_ref_fields.
 const MAX_ID_LEN: usize = 256;
@@ -822,6 +824,136 @@ pub async fn update_status(
         .await
         .context("commit update_status evidence_spool_ref")?;
     Ok(())
+}
+
+// ─── DbWriter routing (Phase 3, retires bypass-006) ─────────────────────────
+
+/// Submit a Class C evidence spool metadata insert through [`DbWriter`].
+///
+/// File-before-metadata ordering: callers must have completed
+/// `write_spool_file()` (fsync + rename) before calling this function.
+/// Failure here leaves an orphan-safe fsynced file; the startup sweep recovers it.
+///
+/// Returns [`WriteResult::Committed`] on success. Validation failures return
+/// [`WriteResult::WriteFailed`] without entering the DbWriter queue.
+pub async fn insert_via_dbwriter(writer: &DbWriter, spool_ref: EvidenceSpoolRef) -> WriteResult {
+    if validate_relative_path(&spool_ref.relative_path).is_err() {
+        return WriteResult::WriteFailed;
+    }
+    if validate_spool_ref_fields(&spool_ref).is_err() {
+        return WriteResult::WriteFailed;
+    }
+    let idempotency_key = format!("{}/{}", spool_ref.run_id, normalize_path(&spool_ref.relative_path));
+    let op = WriteOperation {
+        class: WriteClass::C,
+        lane: WriteLane::EvidenceMetadata,
+        operation_name: "p075_evidence_spool_ref_insert",
+        expected_rows: 1,
+        batchable: false,
+        barrier: false,
+        deadline: WriteClass::C.default_deadline(),
+        deadline_reason: None,
+        idempotency_key,
+        replay_policy: ReplayPolicy::ChecksumIdempotent,
+        observed_at: None,
+    };
+    writer
+        .submit(op, move |pool| async move {
+            let mut tx =
+                begin_immediate_with_retry(&pool, "p075_evidence_spool_ref_insert").await?;
+            insert_tx(&mut tx, &spool_ref).await?;
+            tx.commit().await?;
+            Ok(1u32)
+        })
+        .await
+}
+
+/// Submit an idempotent Class C evidence spool metadata insert through [`DbWriter`].
+///
+/// Uses INSERT OR IGNORE on (run_id, relative_path). Returns
+/// [`WriteResult::Committed`] regardless of whether the row was newly inserted
+/// or already existed with a matching checksum. Returns [`WriteResult::WriteFailed`]
+/// on checksum/size mismatch or validation error.
+pub async fn insert_idempotent_via_dbwriter(
+    writer: &DbWriter,
+    spool_ref: EvidenceSpoolRef,
+) -> WriteResult {
+    if validate_relative_path(&spool_ref.relative_path).is_err() {
+        return WriteResult::WriteFailed;
+    }
+    if validate_spool_ref_fields(&spool_ref).is_err() {
+        return WriteResult::WriteFailed;
+    }
+    let idempotency_key = format!("{}/{}", spool_ref.run_id, normalize_path(&spool_ref.relative_path));
+    let op = WriteOperation {
+        class: WriteClass::C,
+        lane: WriteLane::EvidenceMetadata,
+        operation_name: "p075_evidence_spool_ref_insert_idempotent",
+        expected_rows: 1,
+        batchable: false,
+        barrier: false,
+        deadline: WriteClass::C.default_deadline(),
+        deadline_reason: None,
+        idempotency_key,
+        replay_policy: ReplayPolicy::ChecksumIdempotent,
+        observed_at: None,
+    };
+    writer
+        .submit(op, move |pool| async move {
+            // Re-use existing insert_idempotent logic which handles conflict detection.
+            // Map bool result to rows_affected (1=new insert, 0=existing match).
+            match insert_idempotent(&pool, &spool_ref).await {
+                Ok(true) => Ok(1u32),
+                Ok(false) => Ok(0u32),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+}
+
+/// Submit a Class A status update for an evidence spool ref through [`DbWriter`].
+///
+/// Status transitions (e.g. `available → recovered_orphan`, `available → pending_delete`)
+/// are canonical decisions that must be barrier-committed. Uses the spool ref's `id`
+/// primary key as the natural idempotency key; applying the same status twice is a no-op.
+pub async fn update_status_via_dbwriter(
+    writer: &DbWriter,
+    id: &str,
+    status: EvidenceSpoolRefStatus,
+) -> WriteResult {
+    let id_owned = id.to_string();
+    let status_str = status.as_str();
+    let idempotency_key = format!("evsp_status/{}/{}", id, status_str);
+    let op = WriteOperation {
+        class: WriteClass::A,
+        lane: WriteLane::CriticalBarrier,
+        operation_name: "p075_evidence_spool_ref_update_status",
+        expected_rows: 1,
+        batchable: false,
+        barrier: true,
+        deadline: WriteClass::A.default_deadline(),
+        deadline_reason: None,
+        idempotency_key,
+        replay_policy: ReplayPolicy::NaturalKey,
+        observed_at: None,
+    };
+    writer
+        .submit(op, move |pool| async move {
+            let mut tx = begin_immediate_with_retry(
+                &pool,
+                "p075_evidence_spool_ref_update_status",
+            )
+            .await?;
+            sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
+                .bind(status.as_str())
+                .bind(&id_owned)
+                .execute(&mut *tx)
+                .await
+                .context("update evidence_spool_ref status")?;
+            tx.commit().await?;
+            Ok(1u32)
+        })
+        .await
 }
 
 fn parse_row(row: sqlx::sqlite::SqliteRow) -> Result<EvidenceSpoolRef> {

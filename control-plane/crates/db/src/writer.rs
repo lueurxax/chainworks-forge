@@ -285,6 +285,67 @@ impl CoalescingKey {
 }
 
 // ---------------------------------------------------------------------------
+// Class B coalescing buffer (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Single entry held in the Class B coalescing buffer pending flush.
+struct CoalescedEntry {
+    op: WriteOperation,
+    work: WriteWork,
+    result_tx: oneshot::Sender<WriteResult>,
+    enqueued_at: Instant,
+    /// Monotonic counter assigned at submit time when `op.observed_at` is `None`
+    /// (LIFT-REL-08). Used for last-writer-wins ordering.
+    mono_counter: u64,
+}
+
+/// Class B coalescing buffer: holds pending writes keyed by `idempotency_key`.
+///
+/// Flush is triggered by:
+/// - Merge count reaching `COALESCE_FLUSH_MAX_MERGES`.
+/// - Key age exceeding `COALESCE_MAX_KEY_AGE_MS` (checked by the 500 ms timer task).
+/// - Daemon graceful shutdown (force-flush all).
+struct CoalescingBuffer {
+    entries: std::collections::HashMap<String, CoalescedEntry>,
+    /// Cumulative merges since the last flush (triggers flush at 64).
+    merge_count: usize,
+    /// Total lifetime merges for metrics.
+    total_merged: u64,
+}
+
+impl CoalescingBuffer {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            merge_count: 0,
+            total_merged: 0,
+        }
+    }
+
+    fn needs_count_flush(&self) -> bool {
+        self.merge_count >= COALESCE_FLUSH_MAX_MERGES
+    }
+
+    /// Drain all entries, reset merge counter.
+    fn drain_all(&mut self) -> Vec<CoalescedEntry> {
+        self.merge_count = 0;
+        self.entries.drain().map(|(_, v)| v).collect()
+    }
+
+    /// Drain entries whose `enqueued_at` age exceeds `max_age`.
+    fn drain_stale(&mut self, max_age: Duration) -> Vec<CoalescedEntry> {
+        let now = Instant::now();
+        let stale: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.enqueued_at) >= max_age)
+            .map(|(k, _)| k.clone())
+            .collect();
+        stale.into_iter().filter_map(|k| self.entries.remove(&k)).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal lane message (private)
 // ---------------------------------------------------------------------------
 
@@ -383,6 +444,12 @@ pub struct DbWriter {
     pub heartbeat: Arc<DbWriterHeartbeat>,
     /// Executor task handle; taken by `shutdown()`.
     executor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Class B coalescing buffer: merges last-writer-wins updates before flushing to the lane.
+    coalescing: Arc<Mutex<CoalescingBuffer>>,
+    /// Monotonic counter for LIFT-REL-08: assigned when `observed_at` is None.
+    class_b_mono: Arc<AtomicU64>,
+    /// Coalescing flush task handle; taken by `shutdown()`.
+    flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DbWriter {
@@ -395,11 +462,14 @@ impl DbWriter {
         let (oc_tx, oc_rx) = mpsc::channel(WriteLane::OperatorCommand.capacity());
         let (pi_tx, pi_rx) = mpsc::channel(WriteLane::ProjectionInvalidation.capacity());
         let (cp_tx, cp_rx) = mpsc::channel(WriteLane::CoalescedProjection.capacity());
+        let cp_tx_flush = cp_tx.clone(); // cloned for the coalescing flush task
         let (em_tx, em_rx) = mpsc::channel(WriteLane::EvidenceMetadata.capacity());
         let (tr_tx, tr_rx) = mpsc::channel(WriteLane::TelemetryRollup.capacity());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let shutdown_in_progress = Arc::new(AtomicBool::new(false));
         let heartbeat = Arc::new(DbWriterHeartbeat::new());
+        let coalescing = Arc::new(Mutex::new(CoalescingBuffer::new()));
+        let class_b_mono = Arc::new(AtomicU64::new(0));
 
         let executor_heartbeat = heartbeat.clone();
         let executor_pool = pool.clone();
@@ -411,8 +481,14 @@ impl DbWriter {
             cp_rx,
             em_rx,
             tr_rx,
-            shutdown_rx,
+            shutdown_rx.clone(),
             executor_heartbeat,
+        ));
+
+        let flush_handle = tokio::spawn(run_coalescing_flush(
+            coalescing.clone(),
+            cp_tx_flush,
+            shutdown_rx,
         ));
 
         Self {
@@ -427,6 +503,9 @@ impl DbWriter {
             shutdown_in_progress,
             heartbeat,
             executor_handle: Mutex::new(Some(handle)),
+            coalescing,
+            class_b_mono,
+            flush_handle: Mutex::new(Some(flush_handle)),
         }
     }
 
@@ -469,11 +548,16 @@ impl DbWriter {
                     lane: op.lane.as_str(),
                     capacity: op.lane.capacity(),
                     queued_depth: 0,
-                    oldest_queued_ms: 0,
+                    oldest_queued_ms: None,
                     operation_name: op.operation_name,
                     reason: "shutdown_admission_denied",
                 };
             }
+        }
+
+        // Class B: route through coalescing buffer (last-writer-wins, LIFT-REL-08).
+        if op.class == WriteClass::B {
+            return self.submit_class_b(op, make_work(work)).await;
         }
 
         tracing::debug!(
@@ -507,7 +591,7 @@ impl DbWriter {
                     lane: op.lane.as_str(),
                     capacity: op.lane.capacity(),
                     queued_depth,
-                    oldest_queued_ms: 0,
+                    oldest_queued_ms: None, // per-lane enqueue-time tracking deferred to Phase 3
                     operation_name: op.operation_name,
                     reason: "lane_saturated",
                 }
@@ -538,6 +622,17 @@ impl DbWriter {
     pub async fn shutdown(&self) {
         self.shutdown_in_progress.store(true, Ordering::Relaxed);
         let _ = self.shutdown_tx.send(true);
+
+        // Await flush task first: it force-drains the coalescing buffer into cp_tx
+        // within SHUTDOWN_CLASS_B_FLUSH_BUDGET_MS before the executor shuts down.
+        let flush_handle = self.flush_handle.lock().unwrap().take();
+        if let Some(h) = flush_handle {
+            let flush_budget = tokio::time::Duration::from_millis(SHUTDOWN_CLASS_B_FLUSH_BUDGET_MS + 200);
+            match tokio::time::timeout(flush_budget, h).await {
+                Ok(_) => tracing::debug!("DbWriter coalescing flush task shut down cleanly"),
+                Err(_) => tracing::warn!("DbWriter coalescing flush task did not finish within budget"),
+            }
+        }
 
         let handle = self.executor_handle.lock().unwrap().take();
         if let Some(h) = handle {
@@ -576,6 +671,160 @@ impl DbWriter {
             WriteLane::CoalescedProjection => &self.coalesced_projection_tx,
             WriteLane::EvidenceMetadata => &self.evidence_metadata_tx,
             WriteLane::TelemetryRollup => &self.telemetry_rollup_tx,
+        }
+    }
+
+    /// Route a Class B write through the coalescing buffer (LIFT-REL-08, Phase 3).
+    ///
+    /// Last-writer-wins: if a buffered entry with the same `idempotency_key` exists,
+    /// the one with the later `observed_at` (or higher monotonic counter when
+    /// `observed_at` is absent) survives; the other receives `WriteResult::Coalesced`.
+    async fn submit_class_b(&self, op: WriteOperation, work: WriteWork) -> WriteResult {
+        let deadline = op.deadline;
+        let submit_start = Instant::now();
+        let mono_counter = self.class_b_mono.fetch_add(1, Ordering::Relaxed);
+        let (result_tx, result_rx) = oneshot::channel::<WriteResult>();
+        let key = op.idempotency_key.clone();
+
+        let flushed: Vec<CoalescedEntry> = {
+            let mut buf = self.coalescing.lock().unwrap();
+
+            if let Some(existing) = buf.entries.get(&key) {
+                let new_wins = match (op.observed_at, existing.op.observed_at) {
+                    (Some(new_obs), Some(old_obs)) => new_obs >= old_obs,
+                    _ => mono_counter > existing.mono_counter,
+                };
+                if new_wins {
+                    let old = buf.entries.remove(&key).unwrap();
+                    let _ = old.result_tx.send(WriteResult::Coalesced);
+                    buf.merge_count += 1;
+                    buf.total_merged += 1;
+                    buf.entries.insert(
+                        key,
+                        CoalescedEntry { op, work, result_tx, enqueued_at: submit_start, mono_counter },
+                    );
+                } else {
+                    // New entry is stale; evict it immediately.
+                    let _ = result_tx.send(WriteResult::Coalesced);
+                    // result_rx will return Coalesced on the await below.
+                }
+            } else {
+                buf.entries.insert(
+                    key,
+                    CoalescedEntry { op, work, result_tx, enqueued_at: submit_start, mono_counter },
+                );
+            }
+
+            if buf.needs_count_flush() {
+                buf.drain_all()
+            } else {
+                vec![]
+            }
+        };
+
+        self.flush_entries_to_lane(flushed).await;
+
+        let remaining = deadline
+            .checked_sub(submit_start.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining == Duration::ZERO {
+            return WriteResult::WriteTimeout;
+        }
+        match tokio::time::timeout(remaining, result_rx).await {
+            Err(_) => WriteResult::WriteTimeout,
+            Ok(Err(_)) => WriteResult::WriteFailed,
+            Ok(Ok(result)) => result,
+        }
+    }
+
+    /// Send a batch of coalesced entries to the CoalescedProjection lane.
+    ///
+    /// Each entry whose send fails (channel closed or full) receives
+    /// `WriteResult::WriteFailed` so the caller is notified rather than hung.
+    async fn flush_entries_to_lane(&self, entries: Vec<CoalescedEntry>) {
+        for entry in entries {
+            let msg = LaneMessage {
+                op: entry.op,
+                work: entry.work,
+                result_tx: entry.result_tx,
+                enqueued_at: entry.enqueued_at,
+            };
+            if let Err(e) = self.coalesced_projection_tx.try_send(msg) {
+                // Channel is either closed or temporarily full; send WriteFailed to the waiting caller.
+                let result_tx = match e {
+                    mpsc::error::TrySendError::Full(m) => m.result_tx,
+                    mpsc::error::TrySendError::Closed(m) => m.result_tx,
+                };
+                let _ = result_tx.send(WriteResult::WriteFailed);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Class B coalescing flush task (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Background task: flush coalesced Class B entries every 500 ms and on shutdown.
+///
+/// - Every `COALESCE_FLUSH_INTERVAL_MS`: drains entries older than `COALESCE_MAX_KEY_AGE_MS`.
+/// - On shutdown signal: force-drains all remaining entries (sub-budget LIFT-REL-03).
+async fn run_coalescing_flush(
+    coalescing: Arc<Mutex<CoalescingBuffer>>,
+    cp_tx: mpsc::Sender<LaneMessage>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    use tokio::time::{interval, Duration};
+    let max_age = Duration::from_millis(COALESCE_MAX_KEY_AGE_MS);
+    let mut tick = interval(Duration::from_millis(COALESCE_FLUSH_INTERVAL_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            result = shutdown_rx.changed() => {
+                if result.is_ok() && *shutdown_rx.borrow() {
+                    // Force-flush all remaining entries.
+                    let entries: Vec<CoalescedEntry> = {
+                        let mut buf = coalescing.lock().unwrap();
+                        buf.drain_all()
+                    };
+                    flush_coalesced_to_channel(entries, &cp_tx).await;
+                    tracing::debug!("CoalescingFlush: force-flushed all entries on shutdown");
+                    return;
+                }
+            }
+
+            _ = tick.tick() => {
+                let entries: Vec<CoalescedEntry> = {
+                    let mut buf = coalescing.lock().unwrap();
+                    buf.drain_stale(max_age)
+                };
+                if !entries.is_empty() {
+                    tracing::debug!(count = entries.len(), "CoalescingFlush: draining stale entries");
+                    flush_coalesced_to_channel(entries, &cp_tx).await;
+                }
+            }
+        }
+    }
+}
+
+/// Send coalesced entries to the channel, notifying callers of any send failures.
+async fn flush_coalesced_to_channel(entries: Vec<CoalescedEntry>, cp_tx: &mpsc::Sender<LaneMessage>) {
+    for entry in entries {
+        let msg = LaneMessage {
+            op: entry.op,
+            work: entry.work,
+            result_tx: entry.result_tx,
+            enqueued_at: entry.enqueued_at,
+        };
+        if let Err(e) = cp_tx.try_send(msg) {
+            let result_tx = match e {
+                mpsc::error::TrySendError::Full(m) => m.result_tx,
+                mpsc::error::TrySendError::Closed(m) => m.result_tx,
+            };
+            let _ = result_tx.send(WriteResult::WriteFailed);
         }
     }
 }

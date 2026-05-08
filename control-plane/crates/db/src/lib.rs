@@ -1,4 +1,5 @@
 pub mod bypass_allowlist;
+pub mod evidence_spool;
 pub mod migrate;
 pub mod operation_registry;
 pub mod pool;

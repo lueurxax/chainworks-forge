@@ -57,6 +57,27 @@ impl OperationEntry {
             true
         }
     }
+
+    /// Returns true if the class/replay_policy combination is compatible with
+    /// what `WriteOperation::validate()` accepts at runtime.
+    ///
+    /// Mirrors the replay_ok check in `write_class::WriteOperation::validate`:
+    ///   A → natural_key | caller_guarded
+    ///   B → last_writer_wins
+    ///   C → checksum_idempotent
+    ///   D → telemetry_merge
+    pub fn has_compatible_class_replay(&self) -> bool {
+        match self.class.as_str() {
+            "A" => matches!(
+                self.replay_policy.as_str(),
+                "natural_key" | "caller_guarded"
+            ),
+            "B" => self.replay_policy == "last_writer_wins",
+            "C" => self.replay_policy == "checksum_idempotent",
+            "D" => self.replay_policy == "telemetry_merge",
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +123,13 @@ impl OperationRegistry {
                 return Err(OperationRegistryError::MissingCallerGuardedTest(
                     entry.operation_name.clone(),
                 ));
+            }
+            if !entry.has_compatible_class_replay() {
+                return Err(OperationRegistryError::ClassReplayMismatch {
+                    operation_name: entry.operation_name.clone(),
+                    class: entry.class.clone(),
+                    replay_policy: entry.replay_policy.clone(),
+                });
             }
         }
 
@@ -158,6 +186,15 @@ pub enum OperationRegistryError {
     },
     #[error("Operation '{0}' is caller_guarded but missing duplicate_application_test_path")]
     MissingCallerGuardedTest(String),
+    #[error(
+        "Operation '{operation_name}' has class '{class}' with incompatible replay_policy '{replay_policy}' \
+        (class A accepts natural_key/caller_guarded; B: last_writer_wins; C: checksum_idempotent; D: telemetry_merge)"
+    )]
+    ClassReplayMismatch {
+        operation_name: String,
+        class: String,
+        replay_policy: String,
+    },
     #[error("I/O error reading registry: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -265,6 +302,76 @@ duplicate_application_test_path = ""
     }
 
     #[test]
+    fn parse_rejects_class_replay_mismatch_class_c_last_writer_wins() {
+        // Class C must use checksum_idempotent; last_writer_wins would be rejected
+        // by WriteOperation::validate() at runtime with replay_policy_class_mismatch.
+        let bad = r#"
+[[operations]]
+operation_name = "bad_class_c_op"
+class = "C"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "some key"
+duplicate_application_test_path = ""
+"#;
+        let result = OperationRegistry::parse(bad);
+        assert!(
+            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            "expected ClassReplayMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_class_replay_mismatch_class_a_last_writer_wins() {
+        let bad = r#"
+[[operations]]
+operation_name = "bad_class_a_op"
+class = "A"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "some key"
+duplicate_application_test_path = ""
+"#;
+        let result = OperationRegistry::parse(bad);
+        assert!(
+            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            "expected ClassReplayMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_class_replay_mismatch_class_b_checksum_idempotent() {
+        let bad = r#"
+[[operations]]
+operation_name = "bad_class_b_op"
+class = "B"
+replay_policy = "checksum_idempotent"
+idempotency_key_kind = "some key"
+duplicate_application_test_path = ""
+"#;
+        let result = OperationRegistry::parse(bad);
+        assert!(
+            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            "expected ClassReplayMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_class_replay_mismatch_class_d_natural_key() {
+        let bad = r#"
+[[operations]]
+operation_name = "bad_class_d_op"
+class = "D"
+replay_policy = "natural_key"
+idempotency_key_kind = "some key"
+duplicate_application_test_path = ""
+"#;
+        let result = OperationRegistry::parse(bad);
+        assert!(
+            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            "expected ClassReplayMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
     fn parse_rejects_caller_guarded_without_test_path() {
         let bad = r#"
 [[operations]]
@@ -328,6 +435,13 @@ duplicate_application_test_path = "crates/engine/tests/no_double_apply.rs"
                     entry.has_caller_guarded_test(),
                     "entry {:?} is caller_guarded without test path",
                     entry.operation_name
+                );
+                assert!(
+                    entry.has_compatible_class_replay(),
+                    "entry {:?} has class/replay_policy mismatch: class={} replay_policy={}",
+                    entry.operation_name,
+                    entry.class,
+                    entry.replay_policy
                 );
             }
         }

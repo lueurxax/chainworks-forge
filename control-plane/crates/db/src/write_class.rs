@@ -212,7 +212,7 @@ impl WriteOperation {
                 lane: self.lane.as_str(),
                 capacity: self.lane.capacity(),
                 queued_depth: 0,
-                oldest_queued_ms: 0,
+                oldest_queued_ms: None,
                 operation_name: self.operation_name,
                 reason: "class_lane_incompatible",
             });
@@ -224,7 +224,7 @@ impl WriteOperation {
                 lane: self.lane.as_str(),
                 capacity: self.lane.capacity(),
                 queued_depth: 0,
-                oldest_queued_ms: 0,
+                oldest_queued_ms: None,
                 operation_name: self.operation_name,
                 reason: "class_a_barrier_required",
             });
@@ -247,7 +247,7 @@ impl WriteOperation {
                 lane: self.lane.as_str(),
                 capacity: self.lane.capacity(),
                 queued_depth: 0,
-                oldest_queued_ms: 0,
+                oldest_queued_ms: None,
                 operation_name: self.operation_name,
                 reason: "replay_policy_class_mismatch",
             });
@@ -259,7 +259,7 @@ impl WriteOperation {
                     lane: self.lane.as_str(),
                     capacity: self.lane.capacity(),
                     queued_depth: 0,
-                    oldest_queued_ms: 0,
+                    oldest_queued_ms: None,
                     operation_name: self.operation_name,
                     reason: "deadline_exceeds_policy",
                 });
@@ -273,7 +273,7 @@ impl WriteOperation {
                 lane: self.lane.as_str(),
                 capacity: self.lane.capacity(),
                 queued_depth: 0,
-                oldest_queued_ms: 0,
+                oldest_queued_ms: None,
                 operation_name: self.operation_name,
                 reason: "idempotency_key_too_long",
             });
@@ -285,7 +285,7 @@ impl WriteOperation {
                 lane: self.lane.as_str(),
                 capacity: self.lane.capacity(),
                 queued_depth: 0,
-                oldest_queued_ms: 0,
+                oldest_queued_ms: None,
                 operation_name: self.operation_name,
                 reason: "idempotency_key_invalid",
             });
@@ -314,7 +314,8 @@ pub enum WriteResult {
         /// Number of items queued at rejection time.
         queued_depth: usize,
         /// Age of the oldest queued item in milliseconds at rejection time.
-        oldest_queued_ms: u64,
+        /// `None` when per-lane enqueue-time tracking is not yet available (Phase 3+).
+        oldest_queued_ms: Option<u64>,
         /// Operation name from the original WriteOperation.
         operation_name: &'static str,
         /// Short reason token (e.g. "deadline_exceeds_policy", "lane_saturated",
@@ -395,7 +396,7 @@ mod tests {
                 lane: "critical_barrier",
                 capacity: 1024,
                 queued_depth: 0,
-                oldest_queued_ms: 0,
+                oldest_queued_ms: None,
                 operation_name: "test_op",
                 reason: "lane_saturated",
             },
