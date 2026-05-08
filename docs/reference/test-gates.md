@@ -1852,18 +1852,19 @@ Important:
 
 ### `proposal-075|p075`
 
-Proposal 075 Phases 1–3 local persistence write budget gate.
+Proposal 075 local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate.
 
 Scope:
 
 - `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
-- `writer`: `DbWriter` constants, lane order, Phase 2 bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`, populated `SHUTDOWN_ADMITTED_OPERATIONS` allowlist (terminal canonical operations admitted; unlisted Class A writes denied), and Phase 3 Class B coalescing buffer (`COALESCE_FLUSH_INTERVAL_MS=500` with unconditional drain-all per tick, `COALESCE_FLUSH_MAX_MERGES=64`, last-writer-wins, `COALESCE_MAX_KEYS=1024` saturation reject with `coalescing_map_saturated`, force-drained on shutdown), per-lane oldest-enqueued tracking populating `WriteRejected.oldest_queued_ms`. The full startup orphan sweep walk, telemetry rollup persistence, and `storageHealth` diagnostics remain deferred.
-- `evidence_spool` (Phase 3): `write_spool_file` ordering proof (temp write → SHA-256 → `fsync(file)` → atomic rename → `fsync(parent_dir)`), `verify_spool_file` reader integrity, file-survives-without-metadata orphan-safety property, high-volume "one metadata row per logical object" proof against `evidence_spool_refs`, and security regressions: canonical-layout enforcement (`evidence/runs/...` required — P075-SEC-002 layout), no-clobber commit (identical bytes = idempotent retry; differing bytes = hard error — P075-SEC-002 no-clobber), symlink-escape rejection via canonicalized parent containment (P075-SEC-H001), Unix file mode `0o600` and directory mode `0o700` (P075-SEC-H002)
+- `writer`: `DbWriter` constants, lane order, bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`, populated `SHUTDOWN_ADMITTED_OPERATIONS` allowlist (terminal canonical operations admitted; unlisted Class A writes denied), Class B coalescing buffer (`COALESCE_FLUSH_INTERVAL_MS=500` with unconditional drain-all per tick, `COALESCE_FLUSH_MAX_MERGES=64`, last-writer-wins, `COALESCE_MAX_KEYS=1024` saturation reject with `coalescing_map_saturated`, force-drained on shutdown), per-lane oldest-enqueued tracking populating `WriteRejected.oldest_queued_ms`, and storage health readback units/freshness/kill-switches.
+- `evidence_spool` (Phase 3): `write_spool_file` ordering proof (temp write → SHA-256 → `fsync(file)` → atomic rename → `fsync(parent_dir)`), `verify_spool_file` reader integrity, `sweep_evidence_orphans` walk that backfills `recovered_orphan` metadata for crash-orphaned files and is idempotent on a second pass, high-volume "one metadata row per logical object" proof against `evidence_spool_refs`, and security regressions: canonical-layout enforcement (`evidence/runs/...` required — P075-SEC-002 layout), write-time `run_id` path-ownership binding (P075-SEC-001 / H-002), no-clobber commit (identical bytes = idempotent retry; differing bytes = hard error — P075-SEC-002 no-clobber), symlink-escape rejection via canonicalized parent containment (P075-SEC-H001), Unix file mode `0o600` and directory mode `0o700` (P075-SEC-H002)
 - `bypass_allowlist`: parser, expiry, canonical file validation
 - `operation_registry`: parser, validation, canonical file validation
 - `evidence_spool_refs`: migration and repository round-trips, CHECK constraints, `validate_relative_path` symmetry on read/write, `validate_path_ownership` run-id binding (P075-SEC-001), `canonicalize_summary_json` allowlist, identity-string control-character rejection
-- `storage_write_pressure_snapshots` migration and validation
-- fails closed if `write-bypass-allowlist.toml` or `write-operation-registry.toml` are missing or invalid
+- `storage_write_pressure_snapshots` migration, validation, repository readback, and storage health freshness classification
+- MCP/GraphQL storage diagnostics: `storageHealth`, `storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`, and `storage.reconcile_evidence_orphans`
+- fail-closed registry enforcement: `write-bypass-allowlist.toml` and `write-operation-registry.toml` must exist, be valid, include retirement metadata, and cover observed non-test `WriteOperation.operation_name` literals under `control-plane/crates/db/src`
 
 Use when:
 
@@ -1884,8 +1885,8 @@ Command:
 Important:
 
 - `p075` is accepted as an alias
-- this is currently a Phases 1–3 inventory/contract gate; Phase 7 promotes direct-write bypass detection to fail-closed enforcement
-- Phase 4+ behaviors must extend this gate before the full startup orphan sweep walk, telemetry rollup persistence, storageHealth diagnostics, and fail-closed bypass enforcement are treated as shipped
+- this is a fail-closed persistence contract gate, not an inventory-only check
+- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and future telemetry producer expansion must keep this gate green when extended
 
 ### `proposal-084|p084` retained historical alias
 

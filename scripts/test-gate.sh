@@ -5462,24 +5462,7 @@ PLIST
     log "Proposal 054 gate passed"
     ;;
   proposal-075|p075)
-    log "Proposal 075 Phase 1 gate: local persistence write budget scaffold (inventory mode)"
-    log "P075 NOTE: This gate is Phase 1 inventory mode. Fail-closed enforcement is Phase 7."
-    log "P075 NOTE: See audit report (audit/proposal-vs-implementation.json) for gap tracking."
-
-    # Phase 1 gate: inventory mode.
-    # Verifies that the foundational types, migrations, allowlist, and registry
-    # are present and parse correctly. Does NOT enforce fail-closed on unlisted
-    # write owners (that is Phase 7). Reports inventory findings only.
-    #
-    # TODO(2026-05-02 P075-GATE-FLIP): Flip to fail-closed mode in Phase 7 after Phase 6
-    # deliverables (GraphQL storageHealth, MCP diagnostics, DiagnosticsBundleBuilder
-    # integration) land and all temporary_rollout bypass entries are retired or have a
-    # retirement signal. Fail-closed means: reject unlisted runtime write owners, entries
-    # missing retirement data, entries whose expires_after_phase has passed, and
-    # row-per-chunk evidence writes. Also add a counter for remaining direct-write call
-    # sites (by expires_after_phase) so Phases 2-5 progress shows up as a strictly
-    # decreasing inventory.
-    # Tracked in audit report BLOCK-001/REQ-011 (prepush review MAJOR-001).
+    log "Proposal 075 gate: local persistence write budget, evidence spooling, and fail-closed registry"
 
     log "P075 Phase 1: db crate unit tests (write_class, writer, bypass_allowlist, operation_registry)"
     (
@@ -5504,19 +5487,105 @@ PLIST
       cargo test -p db -- --nocapture
     )
 
-    # Inventory-mode check: verify bypass allowlist and operation registry files exist.
+    # Fail-closed contract check: allowlist and operation registry must be present,
+    # parseable, complete, non-expired for the current P075 closeout phase, and
+    # every non-test db/src WriteOperation literal must be registered.
     P075_ALLOWLIST="$ROOT_DIR/control-plane/crates/db/write-bypass-allowlist.toml"
     P075_REGISTRY="$ROOT_DIR/control-plane/crates/db/write-operation-registry.toml"
     if [ ! -f "$P075_ALLOWLIST" ]; then
       fail "P075: write-bypass-allowlist.toml missing at $P075_ALLOWLIST"
     fi
-    log "P075 inventory: bypass allowlist present at $P075_ALLOWLIST"
     if [ ! -f "$P075_REGISTRY" ]; then
       fail "P075: write-operation-registry.toml missing at $P075_REGISTRY"
     fi
-    log "P075 inventory: operation registry present at $P075_REGISTRY"
+    python3 - "$ROOT_DIR" "$P075_ALLOWLIST" "$P075_REGISTRY" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
 
-    log "Proposal 075 Phase 1 gate passed (inventory mode; fail-closed deferred to Phase 7)"
+root = pathlib.Path(sys.argv[1])
+allowlist_path = pathlib.Path(sys.argv[2])
+registry_path = pathlib.Path(sys.argv[3])
+current_phase = 8
+
+allowlist = tomllib.loads(allowlist_path.read_text())
+registry = tomllib.loads(registry_path.read_text())
+
+required_bypass_fields = {
+    "id", "owner", "reason", "scope", "path_pattern",
+    "allowed_context", "retirement_criteria", "expires_after_phase",
+}
+allowed_scopes = {"migrations", "tests", "startup_repair", "temporary_rollout"}
+seen_ids = set()
+for idx, row in enumerate(allowlist.get("bypasses", []), start=1):
+    missing = sorted(required_bypass_fields - row.keys())
+    if missing:
+        raise SystemExit(f"P075 allowlist row {idx} missing fields: {missing}")
+    if row["id"] in seen_ids:
+        raise SystemExit(f"P075 duplicate bypass id: {row['id']}")
+    seen_ids.add(row["id"])
+    for field in required_bypass_fields - {"expires_after_phase"}:
+        if not str(row[field]).strip():
+            raise SystemExit(f"P075 bypass {row['id']} has empty {field}")
+    if row["scope"] not in allowed_scopes:
+        raise SystemExit(f"P075 bypass {row['id']} has invalid scope {row['scope']}")
+    if int(row["expires_after_phase"]) < current_phase:
+        raise SystemExit(
+            f"P075 bypass {row['id']} expired after phase {row['expires_after_phase']} "
+            f"(current phase {current_phase})"
+        )
+
+required_operation_fields = {
+    "operation_name", "class", "replay_policy",
+    "idempotency_key_kind", "duplicate_application_test_path",
+}
+allowed_classes = {"A", "B", "C", "D"}
+allowed_replay = {
+    "natural_key", "last_writer_wins", "checksum_idempotent",
+    "caller_guarded", "telemetry_merge",
+}
+registered = set()
+for idx, row in enumerate(registry.get("operations", []), start=1):
+    missing = sorted(required_operation_fields - row.keys())
+    if missing:
+        raise SystemExit(f"P075 operation row {idx} missing fields: {missing}")
+    name = str(row["operation_name"]).strip()
+    if not name:
+        raise SystemExit(f"P075 operation row {idx} has empty operation_name")
+    if name in registered:
+        raise SystemExit(f"P075 duplicate operation_name: {name}")
+    registered.add(name)
+    if row["class"] not in allowed_classes:
+        raise SystemExit(f"P075 operation {name} has invalid class {row['class']}")
+    if row["replay_policy"] not in allowed_replay:
+        raise SystemExit(f"P075 operation {name} has invalid replay_policy {row['replay_policy']}")
+    if not str(row["idempotency_key_kind"]).strip():
+        raise SystemExit(f"P075 operation {name} missing idempotency_key_kind")
+    if row["replay_policy"] == "caller_guarded" and not str(row["duplicate_application_test_path"]).strip():
+        raise SystemExit(f"P075 caller_guarded operation {name} missing duplicate test")
+
+observed = set()
+for path in (root / "control-plane/crates/db/src").rglob("*.rs"):
+    if "tests" in path.parts:
+        continue
+    text = path.read_text()
+    for match in re.finditer(r'operation_name:\s*"([^"]+)"', text):
+        name = match.group(1)
+        if name.startswith("test_"):
+            continue
+        observed.add(name)
+unregistered = sorted(observed - registered)
+if unregistered:
+    raise SystemExit(f"P075 unregistered WriteOperation.operation_name literals: {unregistered}")
+
+print(
+    f"P075 fail-closed registry check passed: "
+    f"{len(seen_ids)} bypasses, {len(registered)} operations, {len(observed)} observed db/src operation literals"
+)
+PY
+
+    log "Proposal 075 gate passed"
     ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then

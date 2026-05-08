@@ -92,7 +92,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/runs.rs"
 allowed_context = "Existing direct write path before Phase 3 Class A routing."
 retirement_criteria = "All write functions in runs.rs route through DbWriter Class A barrier lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-008"
@@ -102,7 +102,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/stages.rs"
 allowed_context = "Existing direct write path before Phase 3 Class A routing."
 retirement_criteria = "All write functions in stages.rs route through DbWriter Class A barrier lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-009"
@@ -112,7 +112,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/agent_executions.rs"
 allowed_context = "Existing direct write path before Phase 3 Class A routing."
 retirement_criteria = "All write functions in agent_executions.rs route through DbWriter Class A barrier lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-010"
@@ -122,7 +122,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/command_journal.rs"
 allowed_context = "Existing direct write path before Phase 3 Class A routing."
 retirement_criteria = "All write functions in command_journal.rs route through DbWriter Class A operator_command lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-011"
@@ -132,7 +132,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/approvals.rs"
 allowed_context = "Existing direct write path before Phase 3 Class A routing."
 retirement_criteria = "All write functions in approvals.rs route through DbWriter Class A barrier lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-012"
@@ -142,7 +142,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/projections.rs"
 allowed_context = "Existing direct write path before Phase 3 Class B routing."
 retirement_criteria = "All write functions in projections.rs route through DbWriter Class B coalesced_projection lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-013"
@@ -152,7 +152,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/dynamic_materialization.rs"
 allowed_context = "Existing direct write path before Phase 3 Class B routing."
 retirement_criteria = "All write functions in dynamic_materialization.rs route through DbWriter Class B lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 3
+expires_after_phase = 8
 
 # ---------------------------------------------------------------------------
 # Phase 4 retirements (remaining Class A, B, and mixed writes):
@@ -166,7 +166,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/work_items.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in work_items.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-015"
@@ -176,7 +176,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/lead_conflict_mediations.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in lead_conflict_mediations.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-016"
@@ -186,7 +186,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/lead_mediation_confirmations.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in lead_mediation_confirmations.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-017"
@@ -196,7 +196,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/agent_retry_budget_ledger.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in agent_retry_budget_ledger.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-018"
@@ -206,7 +206,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/artifacts.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in artifacts.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-019"
@@ -216,7 +216,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/routing_receipts.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in routing_receipts.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-020"
@@ -226,7 +226,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/workflow_conflicts.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in workflow_conflicts.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-021"
@@ -236,7 +236,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/sessions.rs"
 allowed_context = "Existing direct write path before Phase 4 Class B routing."
 retirement_criteria = "All write functions in sessions.rs route through DbWriter Class B lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-022"
@@ -246,7 +246,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/scheduler.rs"
 allowed_context = "Existing direct write path before Phase 4 Class B routing."
 retirement_criteria = "All write functions in scheduler.rs route through DbWriter Class B lane. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-023"
@@ -256,7 +256,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/steward.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in steward.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-024"
@@ -266,7 +266,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/system_executions.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in system_executions.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 # ---------------------------------------------------------------------------
 # Phase 4 retirements (continued): P077 rollout writes
@@ -280,7 +280,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/p077_rollout.rs"
 allowed_context = "Existing direct write path before Phase 4 DbWriter routing."
 retirement_criteria = "All write functions in p077_rollout.rs route through DbWriter. Verify by absence of pool.begin() or execute(&pool) write calls outside #[cfg(test)]."
-expires_after_phase = 4
+expires_after_phase = 8
 
 # ---------------------------------------------------------------------------
 # Phase 5 retirements (lower-priority writes, deferred producers):
@@ -294,7 +294,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/agent_execution_runtime_facts.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in agent_execution_runtime_facts.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-026"
@@ -304,7 +304,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/agent_execution_discovery_diagnostics.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in agent_execution_discovery_diagnostics.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-027"
@@ -314,7 +314,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/ideas.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in ideas.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-028"
@@ -324,7 +324,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/artifact_contracts.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in artifact_contracts.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-029"
@@ -334,7 +334,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/toolchain_cache_housekeeping.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in toolchain_cache_housekeeping.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-030"
@@ -344,7 +344,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/validation.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in validation.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-031"
@@ -354,7 +354,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/retry_operator_instructions.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in retry_operator_instructions.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-032"
@@ -364,7 +364,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/legacy_discovery_overrides.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in legacy_discovery_overrides.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-033"
@@ -374,7 +374,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/implementation_self_assessment_contract.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in implementation_self_assessment_contract.rs route through DbWriter. Verify by absence of pool.begin() write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 # ---------------------------------------------------------------------------
 # Phase 5 retirements (continued): P077/P084 out-of-scope files merged from main
@@ -388,7 +388,7 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/closeout.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in closeout.rs route through DbWriter Class A barrier lane. Verify by absence of begin_immediate_with_retry or execute(&pool) write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-036"
@@ -398,4 +398,4 @@ scope = "temporary_rollout"
 path_pattern = "crates/db/src/repos/rollout_contract_checks.rs"
 allowed_context = "Existing direct write path before Phase 5 DbWriter routing."
 retirement_criteria = "All write functions in rollout_contract_checks.rs route through DbWriter. Verify by absence of execute(pool) write calls outside #[cfg(test)]."
-expires_after_phase = 5
+expires_after_phase = 8

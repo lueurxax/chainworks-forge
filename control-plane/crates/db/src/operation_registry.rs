@@ -315,7 +315,10 @@ duplicate_application_test_path = ""
 "#;
         let result = OperationRegistry::parse(bad);
         assert!(
-            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            matches!(
+                result,
+                Err(OperationRegistryError::ClassReplayMismatch { .. })
+            ),
             "expected ClassReplayMismatch, got {result:?}"
         );
     }
@@ -332,7 +335,10 @@ duplicate_application_test_path = ""
 "#;
         let result = OperationRegistry::parse(bad);
         assert!(
-            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            matches!(
+                result,
+                Err(OperationRegistryError::ClassReplayMismatch { .. })
+            ),
             "expected ClassReplayMismatch, got {result:?}"
         );
     }
@@ -349,7 +355,10 @@ duplicate_application_test_path = ""
 "#;
         let result = OperationRegistry::parse(bad);
         assert!(
-            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            matches!(
+                result,
+                Err(OperationRegistryError::ClassReplayMismatch { .. })
+            ),
             "expected ClassReplayMismatch, got {result:?}"
         );
     }
@@ -366,7 +375,10 @@ duplicate_application_test_path = ""
 "#;
         let result = OperationRegistry::parse(bad);
         assert!(
-            matches!(result, Err(OperationRegistryError::ClassReplayMismatch { .. })),
+            matches!(
+                result,
+                Err(OperationRegistryError::ClassReplayMismatch { .. })
+            ),
             "expected ClassReplayMismatch, got {result:?}"
         );
     }

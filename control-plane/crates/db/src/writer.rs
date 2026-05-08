@@ -363,7 +363,10 @@ impl CoalescingBuffer {
             .filter(|(_, e)| now.duration_since(e.enqueued_at) >= max_age)
             .map(|(k, _)| k.clone())
             .collect();
-        stale.into_iter().filter_map(|k| self.entries.remove(&k)).collect()
+        stale
+            .into_iter()
+            .filter_map(|k| self.entries.remove(&k))
+            .collect()
     }
 }
 
@@ -680,10 +683,13 @@ impl DbWriter {
         // within SHUTDOWN_CLASS_B_FLUSH_BUDGET_MS before the executor shuts down.
         let flush_handle = self.flush_handle.lock().unwrap().take();
         if let Some(h) = flush_handle {
-            let flush_budget = tokio::time::Duration::from_millis(SHUTDOWN_CLASS_B_FLUSH_BUDGET_MS + 200);
+            let flush_budget =
+                tokio::time::Duration::from_millis(SHUTDOWN_CLASS_B_FLUSH_BUDGET_MS + 200);
             match tokio::time::timeout(flush_budget, h).await {
                 Ok(_) => tracing::debug!("DbWriter coalescing flush task shut down cleanly"),
-                Err(_) => tracing::warn!("DbWriter coalescing flush task did not finish within budget"),
+                Err(_) => {
+                    tracing::warn!("DbWriter coalescing flush task did not finish within budget")
+                }
             }
         }
 
@@ -754,7 +760,13 @@ impl DbWriter {
                     buf.total_merged += 1;
                     buf.entries.insert(
                         key,
-                        CoalescedEntry { op, work, result_tx, enqueued_at: submit_start, mono_counter },
+                        CoalescedEntry {
+                            op,
+                            work,
+                            result_tx,
+                            enqueued_at: submit_start,
+                            mono_counter,
+                        },
                     );
                 } else {
                     // New entry is stale; evict it immediately.
@@ -768,8 +780,11 @@ impl DbWriter {
                 let op_name = op.operation_name;
                 let depth = buf.entries.len();
                 drop(buf);
-                let rejected_total = self.heartbeat.coalesced_rejected_total
-                    .fetch_add(1, Ordering::Relaxed) + 1;
+                let rejected_total = self
+                    .heartbeat
+                    .coalesced_rejected_total
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 tracing::warn!(
                     operation_name = op_name,
                     coalesced_rejected_total = rejected_total,
@@ -787,7 +802,13 @@ impl DbWriter {
             } else {
                 buf.entries.insert(
                     key,
-                    CoalescedEntry { op, work, result_tx, enqueued_at: submit_start, mono_counter },
+                    CoalescedEntry {
+                        op,
+                        work,
+                        result_tx,
+                        enqueued_at: submit_start,
+                        mono_counter,
+                    },
                 );
             }
 
@@ -893,7 +914,10 @@ async fn run_coalescing_flush(
 }
 
 /// Send coalesced entries to the channel, notifying callers of any send failures.
-async fn flush_coalesced_to_channel(entries: Vec<CoalescedEntry>, cp_tx: &mpsc::Sender<LaneMessage>) {
+async fn flush_coalesced_to_channel(
+    entries: Vec<CoalescedEntry>,
+    cp_tx: &mpsc::Sender<LaneMessage>,
+) {
     for entry in entries {
         let msg = LaneMessage {
             op: entry.op,
@@ -1383,7 +1407,10 @@ mod tests {
         assert!(WARN_WAL_SIZE_BYTES < CRITICAL_WAL_SIZE_BYTES);
         assert!(TELEMETRY_MEMORY_CAP_BYTES > 0);
         assert!(TELEMETRY_MAX_SAMPLES > 0);
-        assert!(COALESCE_MAX_KEYS > 0, "COALESCE_MAX_KEYS must be a positive bound");
+        assert!(
+            COALESCE_MAX_KEYS > 0,
+            "COALESCE_MAX_KEYS must be a positive bound"
+        );
     }
 
     /// Unit test for coalescing buffer saturation logic.
@@ -1419,13 +1446,16 @@ mod tests {
                 observed_at: None,
             };
             let work: WriteWork = Box::new(|_pool| Box::pin(async { Ok(1u32) }));
-            buf.entries.insert(key, CoalescedEntry {
-                op,
-                work,
-                result_tx: tx,
-                enqueued_at: std::time::Instant::now(),
-                mono_counter: i as u64,
-            });
+            buf.entries.insert(
+                key,
+                CoalescedEntry {
+                    op,
+                    work,
+                    result_tx: tx,
+                    enqueued_at: std::time::Instant::now(),
+                    mono_counter: i as u64,
+                },
+            );
         }
         // Buffer is now at COALESCE_MAX_KEYS entries.
         assert_eq!(buf.entries.len(), COALESCE_MAX_KEYS);

@@ -491,7 +491,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 23] {
+fn all_tool_capabilities() -> [CapabilityToolId; 27] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -515,6 +515,10 @@ fn all_tool_capabilities() -> [CapabilityToolId; 23] {
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
+        CapabilityToolId::StorageHealth,
+        CapabilityToolId::StorageWritePressure,
+        CapabilityToolId::StorageEvidenceSpoolSummary,
+        CapabilityToolId::StorageReconcileEvidenceOrphans,
         CapabilityToolId::ProposalGateSettle,
     ]
 }
@@ -556,6 +560,18 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         }
         CapabilityToolId::StewardGetAnalysis => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::StorageHealth => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::StorageWritePressure => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::StorageEvidenceSpoolSummary => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::StorageReconcileEvidenceOrphans => {
+            matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::ProposalGateSettle => matches!(class, PrincipalClass::Operator),
     }
@@ -651,6 +667,12 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
+        "storage.health" => Some(CapabilityToolId::StorageHealth),
+        "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
+        "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
+        "storage.reconcile_evidence_orphans" => {
+            Some(CapabilityToolId::StorageReconcileEvidenceOrphans)
+        }
         _ => None,
     }
 }

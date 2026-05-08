@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-29 |
-| Status | Implemented (Phases 1–3; orphan sweep walk, telemetry rollup persistence, and storageHealth diagnostics deferred to Phases 4–8) |
+| Status | Implemented closeout slice: DbWriter gateway, evidence spooling, orphan reconciliation, storage health readback, MCP storage diagnostics, and fail-closed write registry gate |
 | Author | Engineer (single-engineer project) |
 | Depends on | Rust control plane, SQLite persistence, artifact store, P038 run compaction, P073 stabilization freeze |
 | Related | [Provider toolchain cache mapping](../reference/acp-runtime-transport.md#toolchain-cache-mapping), P078 durable side-effect ledger |

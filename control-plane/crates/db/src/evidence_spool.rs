@@ -21,21 +21,29 @@
 //! filesystem access. Absolute paths, `..` traversal, empty segments, and
 //! backslashes are all rejected (P075-SEC-001).
 //!
-//! # Temp-path collision safety
+//! # No-clobber commit
 //!
 //! The temp filename is `{filename}.tmp.{uuid4}`. UUID v4 makes collisions
-//! negligible. If the final path already exists (idempotent retry), the atomic
-//! rename overwrites it — the caller must re-verify the checksum via
-//! `insert_idempotent` or treat the overwrite as a producer error.
+//! negligible. If the final path already exists (idempotent retry), the
+//! content is compared without following symlinks and within a size cap:
+//! same checksum + same size → idempotent skip (temp cleaned up); differing
+//! bytes → hard error. A leaf symlink at `final_path` is always rejected,
+//! even if it points inside `canonical_root`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
+use serde::Serialize;
 use sha2::Digest;
+use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::repos::evidence_spool_refs::{redact_path, validate_relative_path};
+use crate::repos::evidence_spool_refs::{
+    find_by_run_and_path, insert_idempotent, redact_path, validate_path_ownership,
+    validate_relative_path, EvidenceKind, EvidenceSpoolRef, EvidenceSpoolRefStatus,
+};
 
 // ─── Output types ────────────────────────────────────────────────────────────
 
@@ -69,18 +77,36 @@ pub enum VerifyResult {
     },
 }
 
+/// Summary returned by [`sweep_evidence_orphans`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OrphanSweepReport {
+    /// Candidate files found under the canonical evidence spool tree.
+    pub scanned_files: u64,
+    /// Files that already had a compact metadata row.
+    pub already_indexed: u64,
+    /// Missing metadata rows backfilled as `recovered_orphan`.
+    pub recovered_orphans: u64,
+    /// Files skipped because they are temp files, invalid paths, oversized, or unknown kinds.
+    pub skipped_files: u64,
+}
+
 /// Maximum file size that [`verify_spool_file`] will read into memory (SEC-P075-004).
 /// Files larger than this cap return `Err` rather than allocating unbounded RAM.
-const VERIFY_SIZE_CAP_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+pub const VERIFY_SIZE_CAP_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Write evidence content to a spool file following the P075 ordering contract.
 ///
+/// `run_id` must match the run segment of `relative_path` —
+/// `evidence/runs/{run_id}/...` — so that ownership is validated before any
+/// filesystem work (H-002). A path belonging to a different run is rejected
+/// before the first directory is created.
+///
 /// # Ordering
 ///
 /// ```text
-/// write(temp) → sha256 → fsync(temp) → rename(temp→final) → fsync(parent_dir)
+/// validate_path_ownership → write(temp) → sha256 → fsync(temp) → rename(temp→final) → fsync(parent_dir)
 /// ```
 ///
 /// On any failure the temp file is cleaned up before returning `Err`.
@@ -92,6 +118,7 @@ const VERIFY_SIZE_CAP_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// this returns, using the returned `checksum` and `size_bytes`.
 pub async fn write_spool_file(
     artifact_root: &Path,
+    run_id: &str,
     relative_path: &str,
     content: &[u8],
 ) -> Result<SpoolFileOutput> {
@@ -109,6 +136,11 @@ pub async fn write_spool_file(
             redact_path(relative_path)
         ));
     }
+
+    // Bind path to run_id before any filesystem access (H-002).
+    // A producer with the wrong run_id cannot leave orphans under another run's tree.
+    validate_path_ownership(relative_path, run_id)
+        .context("validate run_id ownership of relative_path before spool write")?;
 
     // Canonicalize artifact_root so all subsequent path operations use resolved paths (H-001).
     // artifact_root must already exist; guaranteed by daemon startup.
@@ -155,8 +187,11 @@ pub async fn write_spool_file(
         .to_string_lossy();
     let temp_name = format!("{}.tmp.{}", file_name, Uuid::new_v4());
     let temp_path = canonical_parent.join(&temp_name);
-    let final_path = canonical_parent
-        .join(absolute_path.file_name().expect("validated above: file_name is Some"));
+    let final_path = canonical_parent.join(
+        absolute_path
+            .file_name()
+            .expect("validated above: file_name is Some"),
+    );
 
     // Perform write with cleanup on failure.
     match write_and_commit(content, &temp_path, &final_path, &canonical_parent).await {
@@ -215,7 +250,199 @@ pub async fn verify_spool_file(
     }
 }
 
+/// Walk `artifact_root/evidence/runs` and backfill metadata for intact evidence files
+/// that were durably written before a crash prevented the Class C metadata insert.
+///
+/// This is conservative by design: only canonical
+/// `evidence/runs/{run}/stages/{stage}/agents/{agent}/{kind}/...` files are
+/// eligible, temp files are ignored, files above [`VERIFY_SIZE_CAP_BYTES`] are
+/// skipped, and unknown evidence kind directories are not guessed.
+pub async fn sweep_evidence_orphans(
+    pool: &SqlitePool,
+    artifact_root: &Path,
+) -> Result<OrphanSweepReport> {
+    let root = artifact_root.join("evidence").join("runs");
+    if !root.exists() {
+        return Ok(OrphanSweepReport::default());
+    }
+
+    let mut report = OrphanSweepReport::default();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                report.skipped_files += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    report.skipped_files += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    report.skipped_files += 1;
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                report.skipped_files += 1;
+                continue;
+            }
+
+            match recover_orphan_candidate(pool, artifact_root, &path).await {
+                Ok(OrphanCandidateOutcome::AlreadyIndexed) => {
+                    report.scanned_files += 1;
+                    report.already_indexed += 1;
+                }
+                Ok(OrphanCandidateOutcome::Recovered) => {
+                    report.scanned_files += 1;
+                    report.recovered_orphans += 1;
+                }
+                Ok(OrphanCandidateOutcome::Skipped) => {
+                    report.skipped_files += 1;
+                }
+                Err(_) => {
+                    report.skipped_files += 1;
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+enum OrphanCandidateOutcome {
+    AlreadyIndexed,
+    Recovered,
+    Skipped,
+}
+
+async fn recover_orphan_candidate(
+    pool: &SqlitePool,
+    artifact_root: &Path,
+    absolute_path: &Path,
+) -> Result<OrphanCandidateOutcome> {
+    let relative_path = match absolute_path.strip_prefix(artifact_root) {
+        Ok(path) => path.to_string_lossy().replace('\\', "/"),
+        Err(_) => return Ok(OrphanCandidateOutcome::Skipped),
+    };
+    if relative_path.contains(".tmp.") {
+        return Ok(OrphanCandidateOutcome::Skipped);
+    }
+    if validate_relative_path(&relative_path).is_err() {
+        return Ok(OrphanCandidateOutcome::Skipped);
+    }
+
+    let Some(layout) = parse_evidence_layout(&relative_path) else {
+        return Ok(OrphanCandidateOutcome::Skipped);
+    };
+    if find_by_run_and_path(pool, layout.run_id, &relative_path)
+        .await?
+        .is_some()
+    {
+        return Ok(OrphanCandidateOutcome::AlreadyIndexed);
+    }
+
+    let meta = std::fs::metadata(absolute_path).context("stat orphan evidence candidate")?;
+    if meta.len() > VERIFY_SIZE_CAP_BYTES {
+        return Ok(OrphanCandidateOutcome::Skipped);
+    }
+    let bytes = std::fs::read(absolute_path).context("read orphan evidence candidate")?;
+    let checksum = sha256_hex(&bytes);
+    let spool_ref = EvidenceSpoolRef {
+        id: recovered_orphan_id(&relative_path, &checksum),
+        metadata_version: 1,
+        run_id: layout.run_id.to_string(),
+        stage_execution_id: None,
+        stage_id: Some(layout.stage_id.to_string()),
+        agent_execution_id: None,
+        agent_id: Some(layout.agent_id.to_string()),
+        kind: layout.kind,
+        relative_path,
+        size_bytes: meta.len() as i64,
+        checksum_algorithm: "sha256".to_string(),
+        checksum,
+        producer_operation: "p075_evidence_spool_ref_recovery_sweep".to_string(),
+        content_type: None,
+        summary_json: None,
+        created_at: Utc::now(),
+        status: EvidenceSpoolRefStatus::RecoveredOrphan,
+    };
+    insert_idempotent(pool, &spool_ref)
+        .await
+        .context("backfill recovered orphan evidence metadata")?;
+    Ok(OrphanCandidateOutcome::Recovered)
+}
+
+struct EvidenceLayout<'a> {
+    run_id: &'a str,
+    stage_id: &'a str,
+    agent_id: &'a str,
+    kind: EvidenceKind,
+}
+
+fn parse_evidence_layout(relative_path: &str) -> Option<EvidenceLayout<'_>> {
+    let mut segments = relative_path.split('/');
+    if segments.next()? != "evidence" || segments.next()? != "runs" {
+        return None;
+    }
+    let run_id = segments.next()?;
+    if segments.next()? != "stages" {
+        return None;
+    }
+    let stage_id = segments.next()?;
+    if segments.next()? != "agents" {
+        return None;
+    }
+    let agent_id = segments.next()?;
+    let kind = evidence_kind_from_dir(segments.next()?)?;
+    if segments.next().is_none() {
+        return None;
+    }
+    Some(EvidenceLayout {
+        run_id,
+        stage_id,
+        agent_id,
+        kind,
+    })
+}
+
+fn evidence_kind_from_dir(dir: &str) -> Option<EvidenceKind> {
+    match dir {
+        "transcripts" | "transcript" => Some(EvidenceKind::Transcript),
+        "tool_traces" | "tool_trace" => Some(EvidenceKind::ToolTrace),
+        "stdout" => Some(EvidenceKind::Stdout),
+        "stderr" => Some(EvidenceKind::Stderr),
+        "receipts" | "receipt" => Some(EvidenceKind::Receipt),
+        "runtime_events" | "runtime_event" => Some(EvidenceKind::RuntimeEvent),
+        "model_deltas" | "model_delta" => Some(EvidenceKind::ModelDelta),
+        "delivery_readbacks" | "delivery_readback" => Some(EvidenceKind::DeliveryReadback),
+        _ => None,
+    }
+}
+
+fn recovered_orphan_id(relative_path: &str, checksum: &str) -> String {
+    let path_hash = sha256_hex(relative_path.as_bytes());
+    format!(
+        "evsp_recovered_{}_{}",
+        &checksum[..checksum.len().min(32)],
+        &path_hash[..16]
+    )
+}
 
 /// Write, checksum, fsync(file), rename, fsync(parent_dir).
 /// Returns the SHA-256 hex digest on success.
@@ -255,23 +482,56 @@ async fn write_and_commit(
     // before touching it (SEC-P075-002). Overwriting committed evidence before the
     // metadata idempotency check runs can silently destroy durable content.
     //
+    // We use symlink_metadata so that a leaf symlink at final_path is detected
+    // without following it (H-001). A symlink is never a valid committed evidence
+    // file — reject it regardless of where it points.
+    //
+    // • Symlink at final_path → hard error; leaf-symlink attack is not an idempotent retry.
+    // • File larger than VERIFY_SIZE_CAP_BYTES → hard error; refuse unbounded RAM allocation.
     // • Same checksum + same size → idempotent retry; skip rename, clean up temp.
-    // • Content differs → hard error; the caller must reconcile via storage.reconcile_evidence_orphans.
-    if let Ok(existing_bytes) = tokio::fs::read(final_path).await {
-        let existing_checksum = sha256_hex(&existing_bytes);
-        // Clean up temp file before returning either way.
-        let _ = tokio::fs::remove_file(temp_path).await;
-        if existing_checksum == checksum && existing_bytes.len() as u64 == content.len() as u64 {
-            // Idempotent: the committed file already contains the same bytes.
-            return Ok(checksum);
+    // • Content differs → hard error; caller must reconcile via storage.reconcile_evidence_orphans.
+    match tokio::fs::symlink_metadata(final_path).await {
+        Ok(meta) => {
+            // Clean up temp before returning either way.
+            let _ = tokio::fs::remove_file(temp_path).await;
+            if meta.file_type().is_symlink() {
+                return Err(anyhow::anyhow!(
+                    "evidence_spool: final_path is a symlink; leaf-symlink is not a \
+                     valid committed evidence file (SEC-P075-H001)"
+                ));
+            }
+            if meta.len() > VERIFY_SIZE_CAP_BYTES {
+                return Err(anyhow::anyhow!(
+                    "evidence_spool: existing final_path exceeds size cap ({} bytes > {} MiB); \
+                     refusing no-clobber read to prevent unbounded RAM allocation (SEC-P075-004)",
+                    meta.len(),
+                    VERIFY_SIZE_CAP_BYTES / (1024 * 1024)
+                ));
+            }
+            let existing_bytes = tokio::fs::read(final_path)
+                .await
+                .context("no-clobber: read existing final_path for checksum comparison")?;
+            let existing_checksum = sha256_hex(&existing_bytes);
+            if existing_checksum == checksum && existing_bytes.len() as u64 == content.len() as u64
+            {
+                // Idempotent: the committed file already contains the same bytes.
+                return Ok(checksum);
+            }
+            return Err(anyhow::anyhow!(
+                "evidence_spool: final_path already exists with different content \
+                 (SEC-P075-002); use storage.reconcile_evidence_orphans to resolve. \
+                 existing_checksum_prefix={} new_checksum_prefix={}",
+                &existing_checksum[..existing_checksum.len().min(12)],
+                &checksum[..checksum.len().min(12)]
+            ));
         }
-        return Err(anyhow::anyhow!(
-            "evidence_spool: final_path already exists with different content \
-             (SEC-P075-002); use storage.reconcile_evidence_orphans to resolve. \
-             existing_checksum_prefix={} new_checksum_prefix={}",
-            &existing_checksum[..existing_checksum.len().min(12)],
-            &checksum[..checksum.len().min(12)]
-        ));
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Final path does not exist yet — proceed with the rename below.
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(temp_path).await;
+            return Err(anyhow::Error::from(e).context("no-clobber: stat final_path before commit"));
+        }
     }
 
     // atomic rename temp → final.
@@ -313,6 +573,7 @@ mod tests {
         let content = b"hello evidence spool";
         let output = write_spool_file(
             dir.path(),
+            "run-test",
             "evidence/runs/run-test/stages/s-1/agents/a-1/transcripts/test.bin",
             content,
         )
@@ -334,12 +595,14 @@ mod tests {
     async fn write_spool_file_leaves_no_temp_file_on_success() {
         let dir = TempDir::new().unwrap();
         let spool_path = "evidence/runs/run-test/stages/s-1/agents/a-1/transcripts/clean.bin";
-        write_spool_file(dir.path(), spool_path, b"data")
+        write_spool_file(dir.path(), "run-test", spool_path, b"data")
             .await
             .unwrap();
         // No .tmp.* files should remain after success.
         let mut tmp_count = 0usize;
-        let leaf_dir = dir.path().join("evidence/runs/run-test/stages/s-1/agents/a-1/transcripts");
+        let leaf_dir = dir
+            .path()
+            .join("evidence/runs/run-test/stages/s-1/agents/a-1/transcripts");
         let mut rd = tokio::fs::read_dir(&leaf_dir).await.unwrap();
         while let Some(entry) = rd.next_entry().await.unwrap() {
             if entry.file_name().to_string_lossy().contains(".tmp.") {
@@ -355,6 +618,7 @@ mod tests {
         let content = b"verify me";
         let output = write_spool_file(
             dir.path(),
+            "run-v",
             "evidence/runs/run-v/stages/s-1/agents/a-1/receipts/check.bin",
             content,
         )
@@ -379,13 +643,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let output = write_spool_file(
             dir.path(),
+            "run-t",
             "evidence/runs/run-t/stages/s-1/agents/a-1/stdout/tamper.bin",
             b"original",
         )
         .await
         .unwrap();
         // Overwrite with different content.
-        tokio::fs::write(&output.absolute_path, b"tampered").await.unwrap();
+        tokio::fs::write(&output.absolute_path, b"tampered")
+            .await
+            .unwrap();
         let result = verify_spool_file(&output.absolute_path, &output.checksum)
             .await
             .unwrap();
@@ -395,14 +662,14 @@ mod tests {
     #[tokio::test]
     async fn write_spool_file_rejects_path_traversal() {
         let dir = TempDir::new().unwrap();
-        let result = write_spool_file(dir.path(), "evidence/../secret.bin", b"data").await;
+        let result = write_spool_file(dir.path(), "run-x", "evidence/../secret.bin", b"data").await;
         assert!(result.is_err(), "path traversal must be rejected");
     }
 
     #[tokio::test]
     async fn write_spool_file_rejects_absolute_path() {
         let dir = TempDir::new().unwrap();
-        let result = write_spool_file(dir.path(), "/etc/passwd", b"data").await;
+        let result = write_spool_file(dir.path(), "run-x", "/etc/passwd", b"data").await;
         assert!(result.is_err(), "absolute path must be rejected");
     }
 
@@ -410,7 +677,7 @@ mod tests {
     async fn write_spool_file_creates_nested_directories() {
         let dir = TempDir::new().unwrap();
         let path = "evidence/runs/run-001/stages/s-01/agents/a-01/transcripts/chunk.bin";
-        let output = write_spool_file(dir.path(), path, b"nested")
+        let output = write_spool_file(dir.path(), "run-001", path, b"nested")
             .await
             .expect("nested path should succeed");
         assert!(output.absolute_path.exists());
@@ -437,6 +704,7 @@ mod tests {
         // escaping the artifact root → must be rejected by the containment check.
         let result = write_spool_file(
             artifact_dir.path(),
+            "run-1",
             "evidence/runs/run-1/stages/s-1/agents/a-1/transcripts/secret.bin",
             b"data",
         )
@@ -466,6 +734,7 @@ mod tests {
 
         let output = write_spool_file(
             dir.path(),
+            "run-p",
             "evidence/runs/run-p/stages/s-1/agents/a-1/transcripts/perm-test.bin",
             b"mode check",
         )
@@ -489,6 +758,7 @@ mod tests {
 
         write_spool_file(
             dir.path(),
+            "run-d",
             "evidence/runs/run-d/stages/s-1/agents/a-1/stdout/perm-test.bin",
             b"dir mode check",
         )
@@ -501,7 +771,11 @@ mod tests {
 
         let runs_dir = ev_dir.join("runs");
         let runs_mode = std::fs::metadata(&runs_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(runs_mode, 0o700, "evidence/runs/ must be 0700, got {:o}", runs_mode);
+        assert_eq!(
+            runs_mode, 0o700,
+            "evidence/runs/ must be 0700, got {:o}",
+            runs_mode
+        );
     }
 
     /// Layout enforcement regression: paths not under evidence/runs/ must be rejected.
@@ -509,16 +783,155 @@ mod tests {
     async fn write_spool_file_rejects_non_canonical_layout_path() {
         let dir = TempDir::new().unwrap();
         // A safe relative path but not under evidence/runs/ — must be rejected.
-        let result = write_spool_file(dir.path(), "evidence/test.bin", b"data").await;
+        let result = write_spool_file(dir.path(), "run-x", "evidence/test.bin", b"data").await;
         assert!(
             result.is_err(),
             "path outside evidence/runs/ must be rejected by layout enforcement (P075-SEC-002)"
         );
         // Flat non-evidence path.
-        let result2 = write_spool_file(dir.path(), "artifacts/run-1/output.bin", b"data").await;
+        let result2 =
+            write_spool_file(dir.path(), "run-1", "artifacts/run-1/output.bin", b"data").await;
         assert!(
             result2.is_err(),
             "path not under evidence/runs/ must be rejected"
+        );
+    }
+
+    /// H-001 regression: a leaf symlink at `final_path` inside `canonical_root` must be
+    /// rejected without following the link. This is the actual H-001 attack vector:
+    /// the intermediate directories are real, but the final filename is a symlink to an
+    /// arbitrary path (including paths outside artifact_root).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_spool_file_rejects_leaf_symlink_at_final_path() {
+        let artifact_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+
+        // Create the leaf directory tree so only the final file is a symlink.
+        let leaf_dir = artifact_dir
+            .path()
+            .join("evidence/runs/run-leaf/stages/s-1/agents/a-1/transcripts");
+        tokio::fs::create_dir_all(&leaf_dir).await.unwrap();
+
+        // Plant a symlink at final_path pointing to an outside file.
+        let outside_target = outside_dir.path().join("secret.txt");
+        tokio::fs::write(&outside_target, b"sensitive")
+            .await
+            .unwrap();
+        let leaf_symlink = leaf_dir.join("leaf.bin");
+        std::os::unix::fs::symlink(&outside_target, &leaf_symlink).unwrap();
+
+        // Attempt to write through the leaf symlink — must be rejected.
+        let result = write_spool_file(
+            artifact_dir.path(),
+            "run-leaf",
+            "evidence/runs/run-leaf/stages/s-1/agents/a-1/transcripts/leaf.bin",
+            b"attacker-content",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "leaf symlink at final_path must be rejected (H-001): got Ok({:?})",
+            result.ok()
+        );
+
+        // The outside target must not have been overwritten.
+        let on_disk = tokio::fs::read(&outside_target).await.unwrap();
+        assert_eq!(
+            on_disk, b"sensitive",
+            "outside target must not be written through leaf symlink"
+        );
+    }
+
+    /// SEC-P075-004 regression: an oversized existing file at `final_path` must not
+    /// trigger an unbounded `read()` in the no-clobber path. The call must return Err
+    /// with a size-cap diagnostic rather than allocating RAM proportional to the file.
+    ///
+    /// We cannot actually allocate 512 MiB in a unit test, so we lower the cap by
+    /// creating a file just larger than a synthetic cap. Instead we verify that the
+    /// production cap constant is checked via a smaller stand-in by injecting a mock:
+    /// instead, we verify the code path exists by writing a file that exceeds
+    /// `VERIFY_SIZE_CAP_BYTES` via a truncate (sparse file on most platforms), which
+    /// allows the stat to report large len without actual disk allocation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_spool_file_rejects_oversized_final_path_without_reading() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let artifact_dir = TempDir::new().unwrap();
+
+        // Create leaf directory.
+        let leaf_dir = artifact_dir
+            .path()
+            .join("evidence/runs/run-cap/stages/s-1/agents/a-1/transcripts");
+        std::fs::create_dir_all(&leaf_dir).unwrap();
+
+        // Create a sparse file whose stat.len() exceeds VERIFY_SIZE_CAP_BYTES.
+        let oversized = leaf_dir.join("huge.bin");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&oversized)
+            .unwrap();
+        // Seek past the cap and write one byte to create a sparse file.
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = f;
+        f.seek(SeekFrom::Start(VERIFY_SIZE_CAP_BYTES + 1)).unwrap();
+        f.write_all(b"\0").unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        assert!(
+            std::fs::metadata(&oversized).unwrap().len() > VERIFY_SIZE_CAP_BYTES,
+            "sparse file must report len > VERIFY_SIZE_CAP_BYTES"
+        );
+
+        let result = write_spool_file(
+            artifact_dir.path(),
+            "run-cap",
+            "evidence/runs/run-cap/stages/s-1/agents/a-1/transcripts/huge.bin",
+            b"new-content",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "oversized existing final_path must be rejected without reading (SEC-P075-004): got Ok({:?})",
+            result.ok()
+        );
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("size cap") || err_msg.contains("MiB"),
+            "error must mention size cap; got: {err_msg}"
+        );
+    }
+
+    /// H-002 regression: write_spool_file must reject a path whose run_id segment
+    /// differs from the caller-supplied run_id, BEFORE any filesystem work.
+    #[tokio::test]
+    async fn write_spool_file_rejects_wrong_run_id_before_filesystem_write() {
+        let dir = TempDir::new().unwrap();
+
+        // Supply run_id "run-a" but embed run_id "run-b" in the path.
+        let result = write_spool_file(
+            dir.path(),
+            "run-a",
+            "evidence/runs/run-b/stages/s-1/agents/a-1/transcripts/secret.bin",
+            b"data",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "path for a different run_id must be rejected before filesystem access (H-002)"
+        );
+
+        // Nothing must have been created under either run tree.
+        assert!(
+            !dir.path().join("evidence/runs/run-a").exists(),
+            "run-a directory must not be created"
+        );
+        assert!(
+            !dir.path().join("evidence/runs/run-b").exists(),
+            "run-b directory must not be created for wrong run_id"
         );
     }
 }

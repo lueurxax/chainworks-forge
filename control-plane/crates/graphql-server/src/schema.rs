@@ -526,6 +526,14 @@ impl QueryRoot {
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
     }
 
+    /// P075: Storage health readback for write pressure, evidence spooling,
+    /// units, freshness, thresholds, and kill-switch state.
+    async fn storage_health(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        Ok(Json(db::repos::storage_health::storage_health(pool).await?))
+    }
+
     /// P066 T17: Latest startup recovery summary including toolchainCache fields.
     /// Returns None when no startup recovery sweep has been recorded yet.
     async fn startup_recovery_summary(

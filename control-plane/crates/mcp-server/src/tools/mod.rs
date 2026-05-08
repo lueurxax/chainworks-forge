@@ -5,11 +5,12 @@ pub mod reports;
 pub mod runs;
 pub mod stages;
 pub mod steward;
+pub mod storage;
 
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 22] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 26] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -33,6 +34,10 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 22] {
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
+        CapabilityToolId::StorageHealth,
+        CapabilityToolId::StorageWritePressure,
+        CapabilityToolId::StorageEvidenceSpoolSummary,
+        CapabilityToolId::StorageReconcileEvidenceOrphans,
     ]
 }
 
@@ -76,6 +81,12 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
+        "storage.health" => Some(CapabilityToolId::StorageHealth),
+        "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
+        "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
+        "storage.reconcile_evidence_orphans" => {
+            Some(CapabilityToolId::StorageReconcileEvidenceOrphans)
+        }
         _ => None,
     }
 }
@@ -103,6 +114,10 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "steward_run_analysis" => "steward.run_analysis",
         "steward_list_analyses" => "steward.list_analyses",
         "steward_get_analysis" => "steward.get_analysis",
+        "storage_health" => "storage.health",
+        "storage_write_pressure" => "storage.write_pressure",
+        "storage_evidence_spool_summary" => "storage.evidence_spool_summary",
+        "storage_reconcile_evidence_orphans" => "storage.reconcile_evidence_orphans",
         _ => tool_name,
     }
 }
@@ -165,6 +180,18 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StewardGetAnalysis => {
             tool_spec_by_name(steward::tool_specs(), "steward.get_analysis")
         }
+        CapabilityToolId::StorageHealth => {
+            tool_spec_by_name(storage::tool_specs(), "storage.health")
+        }
+        CapabilityToolId::StorageWritePressure => {
+            tool_spec_by_name(storage::tool_specs(), "storage.write_pressure")
+        }
+        CapabilityToolId::StorageEvidenceSpoolSummary => {
+            tool_spec_by_name(storage::tool_specs(), "storage.evidence_spool_summary")
+        }
+        CapabilityToolId::StorageReconcileEvidenceOrphans => {
+            tool_spec_by_name(storage::tool_specs(), "storage.reconcile_evidence_orphans")
+        }
         CapabilityToolId::ProposalGateSettle => {
             tool_spec_by_name(runs::tool_specs(), "runs.settle_proposal_gate")
         }
@@ -180,6 +207,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(reports::tool_specs());
     specs.extend(artifacts::tool_specs());
     specs.extend(steward::tool_specs());
+    specs.extend(storage::tool_specs());
     specs
 }
 

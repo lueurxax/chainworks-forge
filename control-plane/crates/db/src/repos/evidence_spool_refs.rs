@@ -872,7 +872,11 @@ pub async fn insert_via_dbwriter(writer: &DbWriter, spool_ref: EvidenceSpoolRef)
     if validate_spool_ref_fields(&spool_ref).is_err() {
         return WriteResult::WriteFailed;
     }
-    let idempotency_key = format!("{}/{}", spool_ref.run_id, normalize_path(&spool_ref.relative_path));
+    let idempotency_key = format!(
+        "{}/{}",
+        spool_ref.run_id,
+        normalize_path(&spool_ref.relative_path)
+    );
     let op = WriteOperation {
         class: WriteClass::C,
         lane: WriteLane::EvidenceMetadata,
@@ -913,7 +917,11 @@ pub async fn insert_idempotent_via_dbwriter(
     if validate_spool_ref_fields(&spool_ref).is_err() {
         return WriteResult::WriteFailed;
     }
-    let idempotency_key = format!("{}/{}", spool_ref.run_id, normalize_path(&spool_ref.relative_path));
+    let idempotency_key = format!(
+        "{}/{}",
+        spool_ref.run_id,
+        normalize_path(&spool_ref.relative_path)
+    );
     let op = WriteOperation {
         class: WriteClass::C,
         lane: WriteLane::EvidenceMetadata,
@@ -968,11 +976,8 @@ pub async fn update_status_via_dbwriter(
     };
     writer
         .submit(op, move |pool| async move {
-            let mut tx = begin_immediate_with_retry(
-                &pool,
-                "p075_evidence_spool_ref_update_status",
-            )
-            .await?;
+            let mut tx =
+                begin_immediate_with_retry(&pool, "p075_evidence_spool_ref_update_status").await?;
             sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
                 .bind(status.as_str())
                 .bind(&id_owned)

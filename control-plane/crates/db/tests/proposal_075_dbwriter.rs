@@ -7,7 +7,9 @@
 //! GraphQL/MCP, fail-closed gate) are listed as doc comments and will be added when
 //! the corresponding phase lands.
 
-use db::evidence_spool::{sha256_hex, verify_spool_file, write_spool_file, VerifyResult};
+use db::evidence_spool::{
+    sha256_hex, sweep_evidence_orphans, verify_spool_file, write_spool_file, VerifyResult,
+};
 use db::pool::{begin_immediate_with_retry, create_pool};
 use db::repos::evidence_spool_refs::{
     find_by_run_and_path, insert_idempotent_via_dbwriter, list_by_run_id, EvidenceKind,
@@ -438,6 +440,7 @@ async fn evidence_spool_file_write_checksum_fsync_ordering() {
     // Step 1-5: write_spool_file executes the full ordering contract.
     let output = write_spool_file(
         dir.path(),
+        "run-001",
         "evidence/runs/run-001/stages/s-1/agents/a-1/transcripts/transcript.bin",
         content,
     )
@@ -499,29 +502,33 @@ async fn evidence_spool_file_write_checksum_fsync_ordering() {
         .await
         .expect("find_by_run_and_path must succeed")
         .expect("evidence_spool_refs row must exist after insert");
-    assert_eq!(found.checksum, output.checksum, "stored checksum must match file checksum");
-    assert_eq!(found.size_bytes, output.size_bytes as i64, "stored size must match file size");
+    assert_eq!(
+        found.checksum, output.checksum,
+        "stored checksum must match file checksum"
+    );
+    assert_eq!(
+        found.size_bytes, output.size_bytes as i64,
+        "stored size must match file size"
+    );
 
     writer.shutdown().await;
 }
 
-/// Phase 3: startup orphan sweep — file present but no metadata row.
+/// Phase 4: startup orphan sweep — file present but no metadata row.
 ///
-/// This test verifies the orphan-safety property: if write_spool_file succeeds
-/// but the Class C metadata enqueue never ran (crash-between-steps), the file
-/// is recoverable. The test proves the file survives independently of metadata.
-///
-/// Full sweep implementation (walk + cross-check + backfill) is tracked as a
-/// separate Phase 3 task (startup_repairs.rs). This test asserts the file-only
-/// invariant that makes orphan recovery possible.
+/// If write_spool_file succeeds but the Class C metadata enqueue never ran
+/// (crash-between-steps), startup sweep must discover the file and backfill a
+/// compact `recovered_orphan` metadata row.
 #[tokio::test]
 async fn startup_orphan_sweep_recovers_intact_active_run_files() {
     let dir = tempfile::TempDir::new().unwrap();
+    let pool = create_pool("sqlite::memory:").await.unwrap();
     let content = b"orphan evidence content";
 
     // Write the file (simulates: crash after fsync but before metadata enqueue).
     let output = write_spool_file(
         dir.path(),
+        "run-orphan",
         "evidence/runs/run-orphan/stages/s-1/agents/a-1/transcripts/transcript.bin",
         content,
     )
@@ -529,7 +536,10 @@ async fn startup_orphan_sweep_recovers_intact_active_run_files() {
     .expect("write_spool_file must succeed");
 
     // File is durable on disk — verify it is intact and checksum matches.
-    assert!(output.absolute_path.exists(), "orphaned file must be present on disk");
+    assert!(
+        output.absolute_path.exists(),
+        "orphaned file must be present on disk"
+    );
     let verify = verify_spool_file(&output.absolute_path, &output.checksum)
         .await
         .unwrap();
@@ -539,10 +549,42 @@ async fn startup_orphan_sweep_recovers_intact_active_run_files() {
         "orphaned file must be intact (checksum matches)"
     );
 
-    // No metadata row was ever written — a sweep would find this as a candidate.
-    // The test confirms the file is safe to recover: content is intact.
+    assert!(
+        find_by_run_and_path(&pool, "run-orphan", &output.relative_path)
+            .await
+            .unwrap()
+            .is_none(),
+        "metadata row must be absent before sweep"
+    );
+
+    let report = sweep_evidence_orphans(&pool, dir.path())
+        .await
+        .expect("orphan sweep must succeed");
+    assert_eq!(report.scanned_files, 1);
+    assert_eq!(report.recovered_orphans, 1);
+    assert_eq!(report.already_indexed, 0);
+
+    let recovered = find_by_run_and_path(&pool, "run-orphan", &output.relative_path)
+        .await
+        .unwrap()
+        .expect("orphan sweep must backfill metadata row");
+    assert_eq!(recovered.status, EvidenceSpoolRefStatus::RecoveredOrphan);
+    assert_eq!(recovered.checksum, output.checksum);
+    assert_eq!(recovered.size_bytes, output.size_bytes as i64);
+
+    let second_report = sweep_evidence_orphans(&pool, dir.path())
+        .await
+        .expect("second orphan sweep must be idempotent");
+    assert_eq!(second_report.scanned_files, 1);
+    assert_eq!(second_report.recovered_orphans, 0);
+    assert_eq!(second_report.already_indexed, 1);
+
     let on_disk = tokio::fs::read(&output.absolute_path).await.unwrap();
-    assert_eq!(sha256_hex(&on_disk), output.checksum, "orphan file checksum must be stable");
+    assert_eq!(
+        sha256_hex(&on_disk),
+        output.checksum,
+        "orphan file checksum must be stable"
+    );
 }
 
 /// Phase 3: high-volume producer — one metadata row per logical object, not per retry.
@@ -561,7 +603,7 @@ async fn high_volume_fake_stream_bounded_files_one_metadata_per_logical_object()
 
     // Write the object once.
     let content = b"logical-object-content";
-    let output = write_spool_file(dir.path(), relative_path, content)
+    let output = write_spool_file(dir.path(), "run-hv", relative_path, content)
         .await
         .expect("write_spool_file must succeed");
 
@@ -614,7 +656,10 @@ async fn high_volume_fake_stream_bounded_files_one_metadata_per_logical_object()
         "exactly one evidence_spool_refs row must exist for the logical object; got {} rows",
         all_rows.len()
     );
-    assert_eq!(all_rows[0].checksum, output.checksum, "row checksum must match final chunk");
+    assert_eq!(
+        all_rows[0].checksum, output.checksum,
+        "row checksum must match final chunk"
+    );
 
     writer.shutdown().await;
 }
@@ -749,14 +794,19 @@ async fn coalescing_buffer_saturation_counter_is_observable_via_heartbeat() {
 
     // Constant must be positive and reasonable.
     assert!(COALESCE_MAX_KEYS > 0, "COALESCE_MAX_KEYS must be positive");
-    assert!(COALESCE_MAX_KEYS <= 65536, "COALESCE_MAX_KEYS must be bounded");
+    assert!(
+        COALESCE_MAX_KEYS <= 65536,
+        "COALESCE_MAX_KEYS must be bounded"
+    );
 
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let writer = DbWriter::new(pool);
 
     // Counter starts at 0.
-    let initial =
-        writer.heartbeat.coalesced_rejected_total.load(std::sync::atomic::Ordering::Relaxed);
+    let initial = writer
+        .heartbeat
+        .coalesced_rejected_total
+        .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(initial, 0, "coalesced_rejected_total must start at 0");
 
     writer.shutdown().await;
@@ -783,8 +833,7 @@ async fn sec_p075_001_cross_run_path_rejected_at_insert() {
         agent_execution_id: None,
         agent_id: None,
         kind: EvidenceKind::Transcript,
-        relative_path: "evidence/runs/run-A/stages/s-1/agents/a-1/transcripts/leak.bin"
-            .to_string(), // but path is under run-A
+        relative_path: "evidence/runs/run-A/stages/s-1/agents/a-1/transcripts/leak.bin".to_string(), // but path is under run-A
         size_bytes: 4,
         checksum_algorithm: "sha256".to_string(),
         checksum: db::evidence_spool::sha256_hex(b"data"),
@@ -815,17 +864,25 @@ fn sec_p075_001_validate_path_ownership_rejects_wrong_run() {
     use db::repos::evidence_spool_refs::validate_path_ownership;
 
     // Path is under run-A, but we pass run-B as the owning run.
-    let result =
-        validate_path_ownership("evidence/runs/run-A/stages/s-1/agents/a-1/transcripts/f.bin", "run-B");
+    let result = validate_path_ownership(
+        "evidence/runs/run-A/stages/s-1/agents/a-1/transcripts/f.bin",
+        "run-B",
+    );
     assert!(
         result.is_err(),
         "path for run-A must be rejected when run_id=run-B (SEC-P075-001)"
     );
 
     // Same run: must pass.
-    let ok =
-        validate_path_ownership("evidence/runs/run-A/stages/s-1/agents/a-1/transcripts/f.bin", "run-A");
-    assert!(ok.is_ok(), "path for run-A must pass when run_id=run-A; got {:?}", ok);
+    let ok = validate_path_ownership(
+        "evidence/runs/run-A/stages/s-1/agents/a-1/transcripts/f.bin",
+        "run-A",
+    );
+    assert!(
+        ok.is_ok(),
+        "path for run-A must pass when run_id=run-A; got {:?}",
+        ok
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -841,12 +898,12 @@ async fn sec_p075_002_write_spool_file_rejects_overwrite_on_content_mismatch() {
     let path = "evidence/runs/run-clobber/stages/s-1/agents/a-1/transcripts/data.bin";
 
     // First write: commit the original content.
-    write_spool_file(dir.path(), path, b"original content v1")
+    write_spool_file(dir.path(), "run-clobber", path, b"original content v1")
         .await
         .expect("first write must succeed");
 
     // Second write with different content at the same path: must be rejected.
-    let result = write_spool_file(dir.path(), path, b"different content v2").await;
+    let result = write_spool_file(dir.path(), "run-clobber", path, b"different content v2").await;
     assert!(
         result.is_err(),
         "overwrite with different content must be rejected (SEC-P075-002); got Ok({:?})",
@@ -854,8 +911,9 @@ async fn sec_p075_002_write_spool_file_rejects_overwrite_on_content_mismatch() {
     );
 
     // The original file must be unchanged.
-    let on_disk =
-        tokio::fs::read(dir.path().join(path)).await.expect("file must still exist");
+    let on_disk = tokio::fs::read(dir.path().join(path))
+        .await
+        .expect("file must still exist");
     assert_eq!(
         on_disk, b"original content v1",
         "original evidence must not have been overwritten (SEC-P075-002)"
@@ -870,33 +928,136 @@ async fn sec_p075_002_write_spool_file_idempotent_on_same_content() {
     let path = "evidence/runs/run-idempotent/stages/s-1/agents/a-1/transcripts/retry.bin";
     let content = b"idempotent content";
 
-    let first = write_spool_file(dir.path(), path, content)
+    let first = write_spool_file(dir.path(), "run-idempotent", path, content)
         .await
         .expect("first write must succeed");
 
     // Second write with identical content must return the same checksum (idempotent).
-    let second = write_spool_file(dir.path(), path, content)
+    let second = write_spool_file(dir.path(), "run-idempotent", path, content)
         .await
         .expect("idempotent retry with same content must succeed (SEC-P075-002)");
 
-    assert_eq!(first.checksum, second.checksum, "checksum must be stable across idempotent retries");
+    assert_eq!(
+        first.checksum, second.checksum,
+        "checksum must be stable across idempotent retries"
+    );
     assert_eq!(first.size_bytes, second.size_bytes);
 }
 
-#[ignore = "Phase 6: storageHealth GraphQL not yet implemented"]
 #[tokio::test]
 async fn storagehealth_graphql_exposes_units_freshness_killswitches() {
-    todo!("Phase 6: implement GraphQL Query.storageHealth with typed units, freshness, thresholds, kill-switch state")
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let now = chrono::Utc::now();
+    db::repos::storage_health::insert_write_pressure_snapshot(
+        &pool,
+        &db::repos::storage_health::StorageWritePressureSnapshot {
+            id: "pressure-1".to_string(),
+            window_start: now - chrono::Duration::seconds(60),
+            window_end: now,
+            payload_json: serde_json::json!({
+                "lanes": {
+                    "critical_barrier": {
+                        "queueDepth": 0,
+                        "oldestQueuedMs": 0
+                    }
+                },
+                "dbWriterWaitP95Ms": 7
+            }),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("snapshot insert must succeed");
+
+    let health = db::repos::storage_health::storage_health(&pool)
+        .await
+        .expect("storage health readback must build");
+    assert_eq!(health["schemaVersion"], 1);
+    assert_eq!(health["wal"]["units"]["sizeBytes"], "bytes");
+    assert_eq!(
+        health["writePressure"]["units"]["oldestQueuedMs"],
+        "milliseconds"
+    );
+    assert_eq!(health["writePressure"]["freshness"]["state"], "fresh");
+    assert_eq!(health["killSwitches"]["dbWriterBypassFailClosed"], true);
+    assert_eq!(
+        health["telemetryRollup"]["units"]["memoryCapBytes"],
+        "bytes"
+    );
 }
 
-#[ignore = "Phase 6: MCP storage.* diagnostics not yet implemented"]
 #[tokio::test]
 async fn mcp_storage_diagnostics_match_graphql_units() {
-    todo!("Phase 6: implement MCP storage.health, storage.write_pressure, storage.evidence_spool_summary, storage.reconcile_evidence_orphans")
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let health = db::repos::storage_health::storage_health(&pool)
+        .await
+        .expect("storage health readback must build");
+    let summary = db::repos::storage_health::evidence_spool_summary(&pool)
+        .await
+        .expect("evidence spool summary must build");
+
+    assert_eq!(health["evidenceSpool"]["units"]["totalSizeBytes"], "bytes");
+    assert_eq!(summary["units"]["totalSizeBytes"], "bytes");
+    assert_eq!(
+        health["writePressure"]["units"],
+        serde_json::json!({
+            "queueDepth": "count",
+            "oldestQueuedMs": "milliseconds",
+            "dbWriterWaitP95Ms": "milliseconds",
+            "walSizeBytes": "bytes"
+        })
+    );
 }
 
-#[ignore = "Phase 7: proposal-075/p075 gate not yet in fail-closed mode"]
 #[tokio::test]
 async fn direct_write_bypass_detection_reports_unlisted_owners() {
-    todo!("Phase 7: flip proposal-075 gate to fail-closed; detect unregistered operation names and unapproved direct write bypasses")
+    let allowlist: toml::Value = toml::from_str(include_str!("../write-bypass-allowlist.toml"))
+        .expect("write-bypass-allowlist.toml must parse");
+    let registry: toml::Value = toml::from_str(include_str!("../write-operation-registry.toml"))
+        .expect("write-operation-registry.toml must parse");
+    let bypasses = allowlist["bypasses"]
+        .as_array()
+        .expect("allowlist must contain bypass rows");
+    assert!(!bypasses.is_empty(), "allowlist must not be empty");
+    for row in bypasses {
+        for field in [
+            "id",
+            "owner",
+            "reason",
+            "scope",
+            "path_pattern",
+            "allowed_context",
+            "retirement_criteria",
+        ] {
+            assert!(
+                row[field].as_str().is_some_and(|s| !s.trim().is_empty()),
+                "bypass row must provide non-empty {field}: {row:?}"
+            );
+        }
+        assert!(
+            row["expires_after_phase"].as_integer().unwrap_or_default() >= 8,
+            "P075 fail-closed closeout phase must not accept expired bypass rows: {row:?}"
+        );
+    }
+
+    let operations = registry["operations"]
+        .as_array()
+        .expect("operation registry must contain operation rows");
+    let names: std::collections::BTreeSet<_> = operations
+        .iter()
+        .map(|row| {
+            row["operation_name"]
+                .as_str()
+                .expect("operation_name required")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        names.contains("p075_evidence_spool_ref_recovery_sweep"),
+        "orphan recovery operation must be registered"
+    );
+    assert!(
+        names.contains("p075_storage_write_pressure_snapshot_insert"),
+        "telemetry snapshot operation must be registered"
+    );
 }
