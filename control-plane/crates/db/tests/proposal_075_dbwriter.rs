@@ -989,7 +989,10 @@ async fn storagehealth_graphql_exposes_units_freshness_killswitches() {
     assert_eq!(health["schemaVersion"], "storage_health.v1");
     assert!(health["updatedAt"].as_str().is_some());
     assert_eq!(health["staleAfterMs"], 5000);
-    assert_eq!(health["isStale"], false);
+    assert_eq!(
+        health["isStale"], true,
+        "storage health must fail closed when no live DbWriter heartbeat is wired into readback"
+    );
     assert!(health["dbState"].as_str().is_some());
     assert_eq!(health["wal"]["warnSizeBytes"], 134_217_728);
     assert_eq!(health["wal"]["criticalSizeBytes"], 536_870_912);
@@ -1148,8 +1151,8 @@ async fn sweep_evidence_orphans_truncates_at_max_bytes() {
         "sweep must set truncated=true when max_bytes is reached"
     );
     assert!(
-        report.bytes_read <= 200,
-        "bytes_read must not greatly exceed max_bytes; got {}",
+        report.bytes_read <= 150,
+        "bytes_read must not exceed max_bytes; got {}",
         report.bytes_read
     );
 }
@@ -1217,6 +1220,117 @@ async fn sweep_evidence_orphans_filters_by_run_id() {
         "run-b orphan must NOT be backfilled when filter is run-a"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SEC-002 regression: single candidate exceeding remaining budget is skipped
+// ---------------------------------------------------------------------------
+
+/// SEC-002: if a single candidate file is larger than the remaining byte budget,
+/// the sweep must skip it without reading and must NOT exceed max_bytes.
+///
+/// Before the fix, recover_orphan_candidate checked only VERIFY_SIZE_CAP_BYTES
+/// (512 MiB) before reading. A 60 MiB file would be read when the budget was 10 MiB,
+/// blowing the documented per-pass pressure bound.
+#[tokio::test]
+async fn sweep_evidence_orphans_skips_candidate_exceeding_remaining_budget() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    // Write two orphan files: one small (1 byte) and one larger (150 bytes).
+    // Set max_bytes=100 so the first file fits but the second is over budget.
+    write_spool_file(
+        dir.path(),
+        "run-budget",
+        "evidence/runs/run-budget/stages/s-1/agents/a-1/transcripts/small.bin",
+        &[0u8; 1],
+    )
+    .await
+    .unwrap();
+    write_spool_file(
+        dir.path(),
+        "run-budget",
+        "evidence/runs/run-budget/stages/s-1/agents/a-1/transcripts/large.bin",
+        &[0u8; 150],
+    )
+    .await
+    .unwrap();
+
+    // max_bytes=100 means the 150-byte file must be skipped.
+    let report = sweep_evidence_orphans(
+        &pool,
+        dir.path(),
+        None,
+        SWEEP_DEFAULT_MAX_FILES,
+        100, // max_bytes: smaller than the large candidate
+        false,
+    )
+    .await
+    .expect("sweep must succeed");
+
+    // bytes_read must not exceed max_bytes (the large file must have been skipped).
+    assert!(
+        report.bytes_read <= 100,
+        "bytes_read ({}) must not exceed max_bytes (100); \
+         large candidate must have been skipped (SEC-002)",
+        report.bytes_read
+    );
+    // Directory traversal order is filesystem-defined; the large candidate may be seen first.
+    // The contract is that the over-budget candidate is skipped without reading past max_bytes.
+    assert!(
+        report.truncated,
+        "over-budget candidate must truncate the bounded pass"
+    );
+    assert!(
+        report.skipped_files >= 1,
+        "over-budget candidate must be reported as skipped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SEC-003 regression: storage_health() fails closed (writer.alive, dbState)
+// ---------------------------------------------------------------------------
+
+/// SEC-003: storage_health() must report writer.alive=false when no live DbWriter
+/// heartbeat is available. The dbState must not be HEALTHY without a live writer.
+#[tokio::test]
+async fn storage_health_fails_closed_without_live_writer() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+
+    // Insert a fresh pressure snapshot so only the writer.alive gate matters.
+    let now = chrono::Utc::now();
+    db::repos::storage_health::insert_write_pressure_snapshot(
+        &pool,
+        &db::repos::storage_health::StorageWritePressureSnapshot {
+            id: "pressure-sec003".to_string(),
+            window_start: now - chrono::Duration::seconds(60),
+            window_end: now,
+            payload_json: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("snapshot insert must succeed");
+
+    let health = db::repos::storage_health::storage_health(&pool)
+        .await
+        .expect("storage_health must build");
+
+    // writer.alive must be false (no live heartbeat).
+    assert_eq!(
+        health["writer"]["alive"], false,
+        "writer.alive must be false when no live DbWriter heartbeat is available (SEC-003)"
+    );
+    // dbState must not be HEALTHY without a live writer.
+    let db_state = health["dbState"].as_str().unwrap_or("");
+    assert_ne!(
+        db_state, "HEALTHY",
+        "dbState must not be HEALTHY when writer.alive=false (SEC-003); got {db_state}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// dry_run: original test follows
+// ---------------------------------------------------------------------------
 
 /// dry_run: sweep must not insert metadata rows when dry_run=true.
 #[tokio::test]

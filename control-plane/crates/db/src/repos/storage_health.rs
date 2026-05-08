@@ -110,20 +110,30 @@ pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
             })
         });
 
+    // Fail-closed: no live DbWriter heartbeat is available from this static call.
+    // Report alive=false and degrade dbState so operators are not misled into
+    // believing storage is healthy when writer telemetry is placeholder (SEC-003).
+    let writer_alive = false;
+    let is_stale = !writer_alive || is_pressure_stale;
+    let db_state = if evidence["metadataRowsTotal"].as_i64().unwrap_or(0) == 0 {
+        "MIGRATION_EMPTY"
+    } else if !writer_alive {
+        // Cannot certify health without a real writer heartbeat.
+        "DEGRADED"
+    } else if is_pressure_stale {
+        "STALE"
+    } else {
+        "HEALTHY"
+    };
+
     Ok(json!({
         "schemaVersion": "storage_health.v1",
         "updatedAt": updated_at.to_rfc3339(),
         "staleAfterMs": STORAGE_HEALTH_STALE_AFTER_MS,
-        "isStale": false,
-        "dbState": if evidence["metadataRowsTotal"].as_i64().unwrap_or(0) == 0 {
-            "MIGRATION_EMPTY"
-        } else if is_pressure_stale {
-            "STALE"
-        } else {
-            "HEALTHY"
-        },
+        "isStale": is_stale,
+        "dbState": db_state,
         "writer": {
-            "alive": true,
+            "alive": writer_alive,
             "lastHeartbeatAt": null,
             "lastDrainAt": null,
             "totalQueued": 0,

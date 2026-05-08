@@ -296,7 +296,8 @@ impl GqlStorageHealth {
         Ok(GqlStorageHealth {
             updated_at: json["updatedAt"].as_str().unwrap_or("").to_string(),
             stale_after_ms: json["staleAfterMs"].as_i64().unwrap_or(5000),
-            is_stale: json["isStale"].as_bool().unwrap_or(false),
+            // Fail-closed: absent or malformed isStale defaults to true (SEC-003).
+            is_stale: json["isStale"].as_bool().unwrap_or(true),
             db_state,
             writer,
             wal,
@@ -305,5 +306,69 @@ impl GqlStorageHealth {
             kill_switches,
             thresholds,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_health_json(is_stale: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": "storage_health.v1",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "staleAfterMs": 5000,
+            "isStale": is_stale,
+            "dbState": "DEGRADED",
+            "writer": { "alive": false, "totalQueued": 0, "lanes": [],
+                        "busyRetryRatePerMinute": 0.0, "busyRetryExhaustedTotal": 0,
+                        "rejectedTotal": 0, "droppedTelemetryTotal": 0 },
+            "wal": { "available": false, "warnSizeBytes": 134217728,
+                     "criticalSizeBytes": 536870912 },
+            "projections": { "pendingInvalidations": 0, "coalescedKeysPending": 0,
+                             "coalescedMergedTotal": 0 },
+            "evidenceSpool": { "enabled": false, "filesWrittenTotal": 0, "bytesWrittenTotal": 0,
+                               "metadataRowsTotal": 0, "orphanFiles": 0, "orphanBytes": 0,
+                               "recoveredFiles": 0, "checksumMismatchFiles": 0,
+                               "pendingDeleteFiles": 0 },
+            "killSwitches": { "dbWriterBypassClasses": [], "coalescingDisabledKeys": [],
+                              "evidenceSpoolDisabledKinds": [] },
+            "thresholds": []
+        })
+    }
+
+    /// SEC-003: absent isStale must default to true (fail-closed).
+    #[test]
+    fn sec003_absent_is_stale_defaults_to_true() {
+        let mut json = minimal_health_json(serde_json::Value::Null);
+        // Remove isStale entirely.
+        json.as_object_mut().unwrap().remove("isStale");
+        let gql = GqlStorageHealth::from_storage_health_json(json)
+            .expect("from_storage_health_json must succeed");
+        assert!(
+            gql.is_stale,
+            "absent isStale must default to true (fail-closed, SEC-003)"
+        );
+    }
+
+    /// SEC-003: malformed isStale (wrong type) must default to true (fail-closed).
+    #[test]
+    fn sec003_malformed_is_stale_defaults_to_true() {
+        let json = minimal_health_json(serde_json::json!("not-a-bool"));
+        let gql = GqlStorageHealth::from_storage_health_json(json)
+            .expect("from_storage_health_json must succeed for malformed isStale");
+        assert!(
+            gql.is_stale,
+            "malformed isStale must default to true (fail-closed, SEC-003)"
+        );
+    }
+
+    /// SEC-003: explicit false isStale is preserved (not overridden by the default).
+    #[test]
+    fn sec003_explicit_false_is_stale_is_preserved() {
+        let json = minimal_health_json(serde_json::json!(false));
+        let gql = GqlStorageHealth::from_storage_health_json(json)
+            .expect("from_storage_health_json must succeed");
+        assert!(!gql.is_stale, "explicit isStale=false must be preserved");
     }
 }

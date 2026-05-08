@@ -368,6 +368,7 @@ pub async fn sweep_evidence_orphans(
                 run_id,
                 dry_run,
                 &mut report.bytes_read,
+                max_bytes,
             )
             .await
             {
@@ -381,6 +382,11 @@ pub async fn sweep_evidence_orphans(
                 }
                 Ok(OrphanCandidateOutcome::Skipped) => {
                     report.skipped_files += 1;
+                }
+                Ok(OrphanCandidateOutcome::BudgetExhausted) => {
+                    report.skipped_files += 1;
+                    report.truncated = true;
+                    break 'outer;
                 }
                 Err(_) => {
                     report.skipped_files += 1;
@@ -398,6 +404,7 @@ enum OrphanCandidateOutcome {
     AlreadyIndexed,
     Recovered,
     Skipped,
+    BudgetExhausted,
 }
 
 async fn recover_orphan_candidate(
@@ -407,6 +414,7 @@ async fn recover_orphan_candidate(
     run_id_filter: Option<&str>,
     dry_run: bool,
     bytes_read_acc: &mut u64,
+    max_bytes: u64,
 ) -> Result<OrphanCandidateOutcome> {
     // Use symlink_metadata (no-follow) for stat — guards against a swap-after-readdir race (H-002).
     let meta = match std::fs::symlink_metadata(absolute_path) {
@@ -448,12 +456,19 @@ async fn recover_orphan_candidate(
         return Ok(OrphanCandidateOutcome::AlreadyIndexed);
     }
 
+    // SEC-002: skip this candidate if its size exceeds the remaining byte budget,
+    // preventing a single large file from blowing the documented per-pass bound.
+    let remaining = max_bytes.saturating_sub(*bytes_read_acc);
+    if meta.len() > remaining {
+        return Ok(OrphanCandidateOutcome::BudgetExhausted);
+    }
     if meta.len() > VERIFY_SIZE_CAP_BYTES {
         return Ok(OrphanCandidateOutcome::Skipped);
     }
-    let bytes = std::fs::read(absolute_path).context("read orphan evidence candidate")?;
-    *bytes_read_acc += bytes.len() as u64;
-    let checksum = sha256_hex(&bytes);
+    // Stream SHA-256 in bounded chunks; avoids allocating meta.len() bytes at once (SEC-002).
+    let checksum =
+        sha256_file_streaming(absolute_path).context("stream SHA-256 orphan evidence candidate")?;
+    *bytes_read_acc += meta.len();
 
     // In dry-run mode we compute the checksum but do not write to the DB.
     if dry_run {
@@ -599,6 +614,29 @@ async fn create_spool_parent_safe(canonical_root: &Path, parent_path: &Path) -> 
                 tokio::fs::create_dir(&current)
                     .await
                     .with_context(|| format!("create spool directory {}", current.display()))?;
+                // Post-create verify: confirm we actually created a real directory.
+                // Guards against a race where another process created a symlink at this
+                // path between our symlink_metadata check and the mkdir (SEC-001).
+                match tokio::fs::symlink_metadata(&current).await {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        return Err(anyhow::anyhow!(
+                            "spool directory became a symlink after mkdir; \
+                             concurrent filesystem race detected (P075-SEC-001): {}",
+                            current.display()
+                        ));
+                    }
+                    Ok(m) if m.is_dir() => {} // confirmed real directory
+                    Ok(_) => {
+                        return Err(anyhow::anyhow!(
+                            "spool path is not a directory after mkdir (P075-SEC-001): {}",
+                            current.display()
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("post-mkdir stat of {}", current.display())));
+                    }
+                }
             }
             Err(e) => {
                 return Err(anyhow::Error::from(e)
@@ -609,8 +647,14 @@ async fn create_spool_parent_safe(canonical_root: &Path, parent_path: &Path) -> 
     Ok(())
 }
 
-/// Write, checksum, fsync(file), rename, fsync(parent_dir).
+/// Write, checksum, fsync(file), atomic no-replace hard_link commit, fsync(parent_dir).
 /// Returns the SHA-256 hex digest on success.
+///
+/// The commit uses `hard_link(temp → final)` instead of `rename` to eliminate the
+/// TOCTOU race window between the no-clobber check and the rename (SEC-001).
+/// `link()` is POSIX-atomic and fails with `AlreadyExists` when `final_path` already
+/// exists as any entry (file, symlink, or directory), preventing silent overwrite of
+/// concurrently committed evidence and symlink-swap attacks.
 async fn write_and_commit(
     content: &[u8],
     temp_path: &Path,
@@ -642,83 +686,117 @@ async fn write_and_commit(
     // Step 2 – compute SHA-256 checksum.
     let checksum = sha256_hex(content);
 
-    // Step 3 – fsync(file): flush data to durable storage before rename.
+    // Step 3 – fsync(file): flush data to durable storage before commit.
     file.flush().await.context("flush temp spool file")?;
     file.sync_all().await.context("fsync temp spool file")?;
     drop(file);
 
-    // Step 4 – no-clobber commit: if final_path already exists, compare checksums
-    // before touching it (SEC-P075-002). Overwriting committed evidence before the
-    // metadata idempotency check runs can silently destroy durable content.
+    // Step 4 – atomic no-replace commit via hard_link (SEC-001).
     //
-    // We use symlink_metadata so that a leaf symlink at final_path is detected
-    // without following it (H-001). A symlink is never a valid committed evidence
-    // file — reject it regardless of where it points.
-    //
-    // • Symlink at final_path → hard error; leaf-symlink attack is not an idempotent retry.
-    // • File larger than VERIFY_SIZE_CAP_BYTES → hard error; refuse unbounded RAM allocation.
-    // • Same checksum + same size → idempotent retry; skip rename, clean up temp.
-    // • Content differs → hard error; caller must reconcile via storage.reconcile_evidence_orphans.
-    match tokio::fs::symlink_metadata(final_path).await {
-        Ok(meta) => {
-            // Clean up temp before returning either way.
-            let _ = tokio::fs::remove_file(temp_path).await;
-            if meta.file_type().is_symlink() {
-                return Err(anyhow::anyhow!(
-                    "evidence_spool: final_path is a symlink; leaf-symlink is not a \
-                     valid committed evidence file (SEC-P075-H001)"
-                ));
-            }
-            if meta.len() > VERIFY_SIZE_CAP_BYTES {
-                return Err(anyhow::anyhow!(
-                    "evidence_spool: existing final_path exceeds size cap ({} bytes > {} MiB); \
-                     refusing no-clobber read to prevent unbounded RAM allocation (SEC-P075-004)",
-                    meta.len(),
-                    VERIFY_SIZE_CAP_BYTES / (1024 * 1024)
-                ));
-            }
-            let existing_bytes = tokio::fs::read(final_path)
-                .await
-                .context("no-clobber: read existing final_path for checksum comparison")?;
-            let existing_checksum = sha256_hex(&existing_bytes);
-            if existing_checksum == checksum && existing_bytes.len() as u64 == content.len() as u64
+    // `link(temp, final)` is POSIX-atomic and returns AlreadyExists when final_path
+    // exists as any entry, eliminating the check-then-rename TOCTOU window.
+    // On success both temp and final point to the same inode; we fsync the parent to
+    // make the new directory entry durable, then remove the temp link.
+    // On AlreadyExists we check for idempotent retry or content conflict.
+    match tokio::fs::hard_link(temp_path, final_path).await {
+        Ok(()) => {
+            // Step 5 – fsync(parent_dir): make the new directory entry durable.
             {
-                // Idempotent: the committed file already contains the same bytes.
-                return Ok(checksum);
+                let dir = tokio::fs::File::open(parent_dir)
+                    .await
+                    .context("open parent dir for fsync after hard_link")?;
+                dir.sync_all()
+                    .await
+                    .context("fsync parent directory after spool hard_link")?;
             }
-            return Err(anyhow::anyhow!(
-                "evidence_spool: final_path already exists with different content \
-                 (SEC-P075-002); use storage.reconcile_evidence_orphans to resolve. \
-                 existing_checksum_prefix={} new_checksum_prefix={}",
-                &existing_checksum[..existing_checksum.len().min(12)],
-                &checksum[..checksum.len().min(12)]
-            ));
+            // Step 6 – remove temp (data is durable at final_path via the committed link).
+            let _ = tokio::fs::remove_file(temp_path).await;
+            Ok(checksum)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Final path does not exist yet — proceed with the rename below.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // final_path was present at commit time — either a concurrent writer or an
+            // idempotent retry. Clean up temp and compare checksums.
+            let _ = tokio::fs::remove_file(temp_path).await;
+            check_existing_spool_file(final_path, &checksum, content.len() as u64).await
         }
         Err(e) => {
             let _ = tokio::fs::remove_file(temp_path).await;
-            return Err(anyhow::Error::from(e).context("no-clobber: stat final_path before commit"));
+            Err(anyhow::Error::from(e).context("atomic hard_link commit to final spool path"))
         }
     }
+}
 
-    // atomic rename temp → final.
-    tokio::fs::rename(temp_path, final_path)
-        .await
-        .context("atomic rename temp to final spool path")?;
-
-    // Step 5 – fsync(parent_dir): make the rename entry durable.
-    {
-        let dir = tokio::fs::File::open(parent_dir)
-            .await
-            .context("open parent dir for fsync")?;
-        dir.sync_all()
-            .await
-            .context("fsync parent directory after spool rename")?;
+/// Handle the case where `final_path` already exists when `hard_link` returns `AlreadyExists`.
+///
+/// Uses `symlink_metadata` (no-follow) to detect symlinks before any read.
+/// Returns `Ok(checksum)` for idempotent retries; `Err` for conflicts and symlinks.
+async fn check_existing_spool_file(
+    final_path: &Path,
+    new_checksum: &str,
+    new_size: u64,
+) -> Result<String> {
+    let meta = match tokio::fs::symlink_metadata(final_path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::anyhow!(
+                "evidence_spool: final_path disappeared during idempotent check (unexpected race)"
+            ));
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("idempotent check: stat final_path")),
+        Ok(m) => m,
+    };
+    // A symlink is never a valid committed evidence file (SEC-P075-H001).
+    if meta.file_type().is_symlink() {
+        return Err(anyhow::anyhow!(
+            "evidence_spool: final_path is a symlink; leaf-symlink is not a \
+             valid committed evidence file (SEC-P075-H001)"
+        ));
     }
+    if meta.len() > VERIFY_SIZE_CAP_BYTES {
+        return Err(anyhow::anyhow!(
+            "evidence_spool: existing final_path exceeds size cap ({} bytes > {} MiB); \
+             refusing no-clobber read to prevent unbounded RAM allocation (SEC-P075-004)",
+            meta.len(),
+            VERIFY_SIZE_CAP_BYTES / (1024 * 1024)
+        ));
+    }
+    let existing_bytes = tokio::fs::read(final_path)
+        .await
+        .context("idempotent check: read existing final_path for checksum comparison")?;
+    let existing_checksum = sha256_hex(&existing_bytes);
+    if existing_checksum == new_checksum && existing_bytes.len() as u64 == new_size {
+        // Idempotent: the committed file already contains the same bytes.
+        return Ok(existing_checksum.to_string());
+    }
+    Err(anyhow::anyhow!(
+        "evidence_spool: final_path already exists with different content \
+         (SEC-P075-002); use storage.reconcile_evidence_orphans to resolve. \
+         existing_checksum_prefix={} new_checksum_prefix={}",
+        &existing_checksum[..existing_checksum.len().min(12)],
+        &new_checksum[..new_checksum.len().min(12)]
+    ))
+}
 
-    Ok(checksum)
+/// Stream-hash a file in 64 KiB chunks, returning 64 lowercase hex characters.
+/// Avoids reading the entire file into memory (SEC-002).
+fn sha256_file_streaming(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Compute SHA-256 and return 64 lowercase hex characters.

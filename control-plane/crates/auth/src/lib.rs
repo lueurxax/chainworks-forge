@@ -561,14 +561,16 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::StewardGetAnalysis => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
+        // SEC-004: storage diagnostics expose WAL, queue pressure, orphan counts, and
+        // kill-switch state — restrict to Operator to match the GraphQL storageHealth boundary.
         CapabilityToolId::StorageHealth => {
-            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+            matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::StorageWritePressure => {
-            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+            matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::StorageEvidenceSpoolSummary => {
-            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+            matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::StorageReconcileEvidenceOrphans => {
             matches!(class, PrincipalClass::Operator)
@@ -1311,5 +1313,33 @@ mod tests {
             is_subscription_allowed_by_surface_policy(&table, "v1-operator"),
             None
         );
+    }
+
+    // ── SEC-004 regression ──────────────────────────────────────────────
+
+    /// SEC-004: Observer must not have storage diagnostic capabilities.
+    /// GraphQL storageHealth requires Operator; MCP storage tools must match.
+    #[test]
+    fn sec004_observer_cannot_access_mcp_storage_diagnostics() {
+        let observer = Principal::new("observer-sec004", PrincipalClass::Observer);
+        let operator = Principal::new("operator-sec004", PrincipalClass::Operator);
+
+        let operator_only_tools = [
+            CapabilityToolId::StorageHealth,
+            CapabilityToolId::StorageWritePressure,
+            CapabilityToolId::StorageEvidenceSpoolSummary,
+            CapabilityToolId::StorageReconcileEvidenceOrphans,
+        ];
+        for tool in operator_only_tools {
+            assert!(
+                !observer.tool_capabilities.contains(&tool),
+                "Observer must not have {tool:?} (SEC-004): \
+                 storage diagnostics must be Operator-only to match GraphQL policy"
+            );
+            assert!(
+                operator.tool_capabilities.contains(&tool),
+                "Operator must have {tool:?} (SEC-004)"
+            );
+        }
     }
 }
