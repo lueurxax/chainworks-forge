@@ -2217,6 +2217,7 @@ Available gates:
   proposal-064|p064  Proposal 064 Phase 0 main-sync and knowledge readback contract gate
   proposal-065|p065  Proposal 065 operator retry instruction contract gate
   proposal-066|p066  Proposal 066 Phase 0 toolchain cache mapping scaffold gate
+  proposal-075|p075  Proposal 075 Phase 1 local persistence write budget scaffold gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -5464,6 +5465,341 @@ PLIST
     )
     run_targeted_tests "proposal-054" "${PROPOSAL_054_SWIFT_TESTS[@]}"
     log "Proposal 054 gate passed"
+    ;;
+  proposal-075|p075)
+    log "Proposal 075 gate: local persistence write budget, evidence spooling, and fail-closed registry"
+
+    log "P075: db crate persistence contract tests (write_class, writer, allowlist, registry, spool refs)"
+    (
+      cd "$ROOT_DIR/control-plane"
+
+      log "P075: write_class types — WriteClass, WriteOperation, WriteResult, SpoolWriteOutcome"
+      cargo test -p db write_class:: -- --nocapture
+
+      log "P075: writer — DbWriter constants, lane order, bounded executor, coalescing, shutdown"
+      cargo test -p db writer:: -- --nocapture
+
+      log "P075: bypass_allowlist — parser, expiry, canonical file"
+      cargo test -p db bypass_allowlist:: -- --nocapture
+
+      log "P075: operation_registry — parser, validation, canonical file"
+      cargo test -p db operation_registry:: -- --nocapture
+
+      log "P075: evidence_spool_refs — migration + repo round-trips, CHECK constraints"
+      cargo test -p db repos::evidence_spool_refs:: -- --nocapture
+
+      log "P075: db crate full regression (all db tests must pass)"
+      cargo test -p db -- --nocapture
+
+      log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
+      cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
+
+      log "P075: daemon startup orphan sweep wiring"
+      cargo test -p daemon storage_startup -- --nocapture
+
+      log "P075: GraphQL typed storageHealth contract"
+      cargo test -p graphql-server proposal_075_storage_health_is_typed_graphql_contract -- --nocapture
+      cargo test -p graphql-server proposal_075_storage_health_reads_live_dbwriter_heartbeat -- --nocapture
+
+      log "P075: auth capability boundary for operator-only storage diagnostics"
+      cargo test -p auth sec004_observer_cannot_access_mcp_storage_diagnostics -- --nocapture
+
+      log "P075: MCP storage diagnostics parameter semantics"
+      cargo test -p mcp-server storage::tests:: -- --nocapture
+
+      log "P075: MCP storage typed error contract (invalid_input, stale, unavailable, maintenance_disabled, unauthorized)"
+      cargo test -p mcp-server storage::tests::reconcile_evidence_orphans_returns_invalid_input -- --nocapture
+      cargo test -p mcp-server storage::tests::storage_health_returns_typed_stale_error -- --nocapture
+      cargo test -p mcp-server storage::tests::reconcile_evidence_orphans_returns_maintenance_disabled -- --nocapture
+      cargo test -p mcp-server storage::tests::typed_error_helper_produces_correct_shape -- --nocapture
+      cargo test -p mcp-server proposal_075_storage_tool_dispatch -- --nocapture
+    )
+
+    # Fail-closed contract check: allowlist and operation registry must be present,
+    # parseable, complete, non-expired for the current P075 closeout phase, and
+    # every non-test db/src WriteOperation literal must be registered.
+    P075_ALLOWLIST="$ROOT_DIR/control-plane/crates/db/write-bypass-allowlist.toml"
+    P075_REGISTRY="$ROOT_DIR/control-plane/crates/db/write-operation-registry.toml"
+    if [ ! -f "$P075_ALLOWLIST" ]; then
+      fail "P075: write-bypass-allowlist.toml missing at $P075_ALLOWLIST"
+    fi
+    if [ ! -f "$P075_REGISTRY" ]; then
+      fail "P075: write-operation-registry.toml missing at $P075_REGISTRY"
+    fi
+    python3 - "$ROOT_DIR" "$P075_ALLOWLIST" "$P075_REGISTRY" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
+
+root = pathlib.Path(sys.argv[1])
+allowlist_path = pathlib.Path(sys.argv[2])
+registry_path = pathlib.Path(sys.argv[3])
+current_phase = 8
+
+allowlist = tomllib.loads(allowlist_path.read_text())
+registry = tomllib.loads(registry_path.read_text())
+
+required_bypass_fields = {
+    "id", "owner", "reason", "scope", "path_pattern",
+    "allowed_context", "retirement_criteria", "expires_after_phase",
+}
+allowed_scopes = {"migrations", "tests", "startup_repair"}
+seen_ids = set()
+for idx, row in enumerate(allowlist.get("bypasses", []), start=1):
+    missing = sorted(required_bypass_fields - row.keys())
+    if missing:
+        raise SystemExit(f"P075 allowlist row {idx} missing fields: {missing}")
+    if row["id"] in seen_ids:
+        raise SystemExit(f"P075 duplicate bypass id: {row['id']}")
+    seen_ids.add(row["id"])
+    for field in required_bypass_fields - {"expires_after_phase"}:
+        if not str(row[field]).strip():
+            raise SystemExit(f"P075 bypass {row['id']} has empty {field}")
+    if row["scope"] == "temporary_rollout":
+        raise SystemExit(
+            f"P075 bypass {row['id']} is a temporary_rollout entry; "
+            "Phase 8 requires retiring all temporary rollout bypasses"
+        )
+    if row["scope"] not in allowed_scopes:
+        raise SystemExit(f"P075 bypass {row['id']} has invalid scope {row['scope']}")
+    if int(row["expires_after_phase"]) < current_phase:
+        raise SystemExit(
+            f"P075 bypass {row['id']} expired after phase {row['expires_after_phase']} "
+            f"(current phase {current_phase})"
+        )
+
+required_operation_fields = {
+    "operation_name", "class", "replay_policy",
+    "idempotency_key_kind", "duplicate_application_test_path",
+}
+allowed_classes = {"A", "B", "C", "D"}
+allowed_replay = {
+    "natural_key", "last_writer_wins", "checksum_idempotent",
+    "caller_guarded", "telemetry_merge",
+}
+registered = set()
+class_by_operation = {}
+replay_by_operation = {}
+for idx, row in enumerate(registry.get("operations", []), start=1):
+    missing = sorted(required_operation_fields - row.keys())
+    if missing:
+        raise SystemExit(f"P075 operation row {idx} missing fields: {missing}")
+    name = str(row["operation_name"]).strip()
+    if not name:
+        raise SystemExit(f"P075 operation row {idx} has empty operation_name")
+    if name in registered:
+        raise SystemExit(f"P075 duplicate operation_name: {name}")
+    registered.add(name)
+    class_by_operation[name] = row["class"]
+    replay_by_operation[name] = row["replay_policy"]
+    if row["class"] not in allowed_classes:
+        raise SystemExit(f"P075 operation {name} has invalid class {row['class']}")
+    if row["replay_policy"] not in allowed_replay:
+        raise SystemExit(f"P075 operation {name} has invalid replay_policy {row['replay_policy']}")
+    if not str(row["idempotency_key_kind"]).strip():
+        raise SystemExit(f"P075 operation {name} missing idempotency_key_kind")
+    duplicate_path = str(row["duplicate_application_test_path"]).strip()
+    if row["replay_policy"] == "caller_guarded":
+        if not duplicate_path:
+            raise SystemExit(f"P075 caller_guarded operation {name} missing duplicate test")
+        if duplicate_path == "scripts/test-gate.sh::proposal-075_operation_registry_enforcement":
+            raise SystemExit(
+                f"P075 caller_guarded operation {name} uses generic duplicate proof path"
+            )
+        if (
+            "operation-duplicate-application-matrix.md#" in duplicate_path
+            and name.replace(".", "-").replace("_", "-") not in duplicate_path
+        ):
+            raise SystemExit(
+                f"P075 caller_guarded operation {name} has non-specific duplicate proof path"
+            )
+
+expected_class_replay = {
+    "projections.rebuild_approval_inbox": ("B", "last_writer_wins"),
+    "projections.rebuild_run_summary": ("B", "last_writer_wins"),
+    "projections.rebuild_stage_summaries": ("B", "last_writer_wins"),
+    "projections.upsert_artifact_index_entry": ("B", "last_writer_wins"),
+    "scheduler.record_db_writer_wait_observation": ("D", "telemetry_merge"),
+    "storage_health.insert_write_pressure_snapshot": ("D", "telemetry_merge"),
+}
+for name, (expected_class, expected_replay) in expected_class_replay.items():
+    if class_by_operation.get(name) != expected_class or replay_by_operation.get(name) != expected_replay:
+        raise SystemExit(
+            f"P075 operation {name} must be Class {expected_class}/{expected_replay}; "
+            f"got {class_by_operation.get(name)}/{replay_by_operation.get(name)}"
+        )
+
+observed = set()
+for rel_root in [
+    "control-plane/crates/db/src",
+    "control-plane/crates/engine/src",
+    "control-plane/crates/mcp-server/src",
+]:
+    for path in (root / rel_root).rglob("*.rs"):
+        if "tests" in path.parts:
+            continue
+        text = path.read_text().split("\n#[cfg(test)]", 1)[0]
+        for match in re.finditer(
+            r'(?:operation_name:\s*"([^"]+)"|class_a_operation\(\s*"([^"]+)"|begin_repository_transaction\(\s*pool\s*,\s*"([^"]+)"|execute_repository_write!\(\s*pool\s*,\s*"([^"]+)")',
+            text,
+        ):
+            name = match.group(1) or match.group(2) or match.group(3) or match.group(4)
+            if name.startswith("test_"):
+                continue
+            observed.add(name)
+unregistered = sorted(observed - registered)
+if unregistered:
+    raise SystemExit(f"P075 unregistered WriteOperation.operation_name literals: {unregistered}")
+
+runtime_direct_write_re = re.compile(
+    r'(?:\bpool\.begin\(\)\.await\b|pool\.begin_with\(\s*"BEGIN IMMEDIATE"\s*\)|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
+)
+db_repo_direct_write_re = re.compile(
+    r'(?:\bpool\.begin\(\)\.await\b|pool\.begin_with\(\s*"BEGIN IMMEDIATE"\s*\)|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
+)
+runtime_direct_write_sites = []
+for rel_root in [
+    "control-plane/crates/db/src/repos",
+    "control-plane/crates/engine/src",
+    "control-plane/crates/daemon/src",
+    "control-plane/crates/graphql-server/src",
+    "control-plane/crates/mcp-server/src",
+]:
+    for path in (root / rel_root).rglob("*.rs"):
+        text = path.read_text().split("\n#[cfg(test)]", 1)[0]
+        direct_write_re = db_repo_direct_write_re if rel_root == "control-plane/crates/db/src/repos" else runtime_direct_write_re
+        for match in direct_write_re.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            runtime_direct_write_sites.append(
+                f"{path.relative_to(root / 'control-plane').as_posix()}:{line}"
+            )
+if runtime_direct_write_sites:
+    raise SystemExit(
+        "P075 runtime direct SQL write sites must route through DbWriter: "
+        + ", ".join(sorted(runtime_direct_write_sites))
+    )
+
+daemon_main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
+for required in [
+    "db::writer::register_shared_writer(&pool, db_writer.clone()).await?",
+    "CommandHandler::new_with_acp_capacity_and_db_writer",
+    "Orchestrator::new_with_db_writer",
+    "BackgroundExecutor::new_with_steward_runtime_inputs_and_db_writer",
+    "RecoveryService::new_with_db_writer",
+    "HostInterruptionService::with_capacity_config_runtime_cleanup_and_db_writer",
+]:
+    if required not in daemon_main:
+        raise SystemExit(f"P075 daemon startup must register/inject shared DbWriter: missing {required}")
+
+writer_text = (root / "control-plane/crates/db/src/writer.rs").read_text()
+if "P075 shared DbWriter is not registered" not in writer_text:
+    raise SystemExit("P075 file-backed registered transaction path must fail closed without shared DbWriter")
+if "shared_writer_for(pool).await" not in writer_text:
+    raise SystemExit("P075 registered transaction path must consult shared DbWriter registry")
+if "insert_idempotent_via_dbwriter" in (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text():
+    evidence_refs_text = (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text().split("\n#[cfg(test)]", 1)[0]
+    via_plain_insert = evidence_refs_text.split("pub async fn insert_via_dbwriter", 1)[1].split("pub async fn", 1)[0]
+    via_insert = evidence_refs_text.split("pub async fn insert_idempotent_via_dbwriter", 1)[1].split("pub async fn", 1)[0]
+    via_update = evidence_refs_text.split("pub async fn update_status_via_dbwriter", 1)[1].split("pub async fn", 1)[0]
+    for fn_name, body in [
+        ("insert_via_dbwriter", via_plain_insert),
+        ("insert_idempotent_via_dbwriter", via_insert),
+        ("update_status_via_dbwriter", via_update),
+    ]:
+        if "begin_registered_immediate_transaction" in body or "insert_idempotent(&" in body:
+            raise SystemExit(
+                f"P075 {fn_name} must not re-enter registered transactions inside DbWriter work"
+            )
+
+local_writer_sites = []
+for rel_root in [
+    "control-plane/crates/engine/src",
+    "control-plane/crates/mcp-server/src",
+]:
+    for path in (root / rel_root).rglob("*.rs"):
+        text = path.read_text().split("\n#[cfg(test)]", 1)[0]
+        for pattern in [r"let\s+local_writer\s*=", r"let\s+writer\s*=\s*db::writer::DbWriter::new\(pool\.clone\(\)\)"]:
+            for match in re.finditer(pattern, text):
+                local_writer_sites.append(
+                    f"{path.relative_to(root / 'control-plane').as_posix()}:{text.count(chr(10), 0, match.start()) + 1}"
+                )
+if local_writer_sites:
+    raise SystemExit(
+        "P075 production runtime must not create per-call local DbWriter instances: "
+        + ", ".join(sorted(local_writer_sites))
+    )
+
+raw_evidence_patterns = [
+    r'update_evidence_packet_json\([^;]+&encoded',
+    r'evidence_packet_json\s*=\s*\?\d+[^;]+encoded',
+]
+for path in (root / "control-plane/crates/engine/src").rglob("*.rs"):
+    text = path.read_text()
+    for pattern in raw_evidence_patterns:
+        if re.search(pattern, text, re.DOTALL):
+            rel = path.relative_to(root / "control-plane").as_posix()
+            raise SystemExit(
+                f"P075 raw high-volume evidence appears to be written directly to SQLite in {rel}"
+            )
+
+baseline_path = root / "docs/evidence/p075/phase1-baseline.md"
+if not baseline_path.exists():
+    raise SystemExit("P075 baseline evidence missing: docs/evidence/p075/phase1-baseline.md")
+baseline_text = baseline_path.read_text()
+if "pending_live_canary" in baseline_text:
+    raise SystemExit("P075 baseline evidence still contains pending_live_canary")
+for required in [
+    "write_lock_wait_p50",
+    "write_lock_wait_p95",
+    "busy_retry_rate",
+    "command_latency_p50",
+    "command_latency_p95",
+    "wal_size_bytes",
+    "transactionDurationP50Ms",
+    "transactionDurationP95Ms",
+    "storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics",
+]:
+    if required not in baseline_text:
+        raise SystemExit(f"P075 baseline evidence missing required marker: {required}")
+baseline_numeric_markers = [
+    r"\|\s*write_lock_wait_p50\s*\|[^|]*\|[^|]*\|\s*0\s*\|",
+    r"\|\s*write_lock_wait_p95\s*\|[^|]*\|[^|]*\|\s*1\s*\|",
+    r"\|\s*busy_retry_rate\s*\|[^|]*\|[^|]*\|\s*0\.0\s*\|",
+    r"\|\s*command_latency_p50\s*\|[^|]*\|[^|]*\|\s*0\s*\|",
+    r"\|\s*command_latency_p95\s*\|[^|]*\|[^|]*\|\s*2\s*\|",
+    r"\|\s*wal_size_bytes\s*\|[^|]*\|[^|]*\|\s*45352\s*\|",
+]
+for marker in baseline_numeric_markers:
+    if not re.search(marker, baseline_text):
+        raise SystemExit(f"P075 baseline evidence missing numeric baseline matching {marker}")
+
+producer_inventory_path = root / "docs/evidence/p075/producer-inventory.md"
+if not producer_inventory_path.exists():
+    raise SystemExit("P075 high-volume evidence producer inventory is missing")
+producer_inventory = producer_inventory_path.read_text()
+for required in [
+    "Failed-stage diagnostic packet",
+    "ACP transcript capture",
+    "tool_trace",
+    "stdout",
+    "stderr",
+    "runtime_event",
+    "model_delta",
+    "delivery_readback",
+]:
+    if required not in producer_inventory:
+        raise SystemExit(f"P075 producer inventory missing required marker: {required}")
+
+print(
+    f"P075 fail-closed registry check passed: "
+    f"{len(seen_ids)} bypasses, {len(registered)} operations, "
+    f"{len(observed)} observed db/src operation literals, "
+    f"0 temporary rollout bypasses, runtime direct SQL scan clean"
+)
+PY
+
+    log "Proposal 075 gate passed"
     ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then

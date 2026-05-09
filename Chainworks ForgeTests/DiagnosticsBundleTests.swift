@@ -23,6 +23,8 @@ final class DiagnosticsBundleTests: XCTestCase {
         logs: URL,
         status: DaemonStatus?,
         principalsPath: URL? = nil,
+        storageHealth: Data? = nil,
+        evidenceSpoolSummary: Data? = nil,
         systemInfo: String = "system_info stub"
     ) -> DiagnosticsBundleInputs {
         DiagnosticsBundleInputs(
@@ -31,6 +33,8 @@ final class DiagnosticsBundleTests: XCTestCase {
             logsDirectory: logs,
             principalsPath: principalsPath
                 ?? appSupport.appendingPathComponent("_missing_principals.json"),
+            storageHealthSnapshotData: storageHealth,
+            evidenceSpoolSummaryData: evidenceSpoolSummary,
             systemInfoProducer: { systemInfo }
         )
     }
@@ -255,6 +259,34 @@ final class DiagnosticsBundleTests: XCTestCase {
             contentsOf: unzipped.appendingPathComponent("system_info.txt")
         )
         XCTAssertTrue(info.contains("macOS 15.5"))
+    }
+
+    func test_diagnostics_bundle_includes_p075_storage_snapshots_when_supplied() throws {
+        let stage = try stageTmp()
+        defer { stage.cleanup() }
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).zip")
+        defer { try? FileManager.default.removeItem(at: out) }
+        let result = try DiagnosticsBundleBuilder.export(
+            inputs: makeInputs(
+                appSupport: stage.appSupport,
+                logs: stage.logs,
+                status: sampleStatus(),
+                storageHealth: Data("{\"schemaVersion\":\"storage_health.v1\"}".utf8),
+                evidenceSpoolSummary: Data("{\"metadataRowsTotal\":1}".utf8)
+            ),
+            to: out
+        )
+        XCTAssertTrue(result.hasStorageHealth)
+        XCTAssertTrue(result.hasEvidenceSpoolSummary)
+        let unzipped = try unzipToScratch(bundle: out)
+        defer { try? FileManager.default.removeItem(at: unzipped) }
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: unzipped.appendingPathComponent("storage_health.json").path
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: unzipped.appendingPathComponent("evidence_spool_summary.json").path
+        ))
     }
 
     private func unzipToScratch(bundle: URL) throws -> URL {

@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 #[derive(Clone, Debug)]
 pub struct P077RolloutMetricEventInput {
@@ -53,25 +53,27 @@ pub async fn record_metric_event(
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
     let recorded_at = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"INSERT INTO p077_rollout_metric_events
+    crate::execute_repository_write!(
+        pool,
+        "p077_rollout.record_metric_event",
+        sqlx::query(
+            r#"INSERT INTO p077_rollout_metric_events
            (id, metric, run_id, numerator, denominator, threshold, owner, source,
             go_no_go_action, evidence_json, recorded_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+        )
+        .bind(&id)
+        .bind(&input.metric)
+        .bind(&input.run_id)
+        .bind(input.numerator)
+        .bind(input.denominator)
+        .bind(&input.threshold)
+        .bind(&input.owner)
+        .bind(&input.source)
+        .bind(&input.go_no_go_action)
+        .bind(serde_json::to_string(&input.evidence_json)?)
+        .bind(recorded_at)
     )
-    .bind(&id)
-    .bind(&input.metric)
-    .bind(&input.run_id)
-    .bind(input.numerator)
-    .bind(input.denominator)
-    .bind(&input.threshold)
-    .bind(&input.owner)
-    .bind(&input.source)
-    .bind(&input.go_no_go_action)
-    .bind(serde_json::to_string(&input.evidence_json)?)
-    .bind(recorded_at)
-    .execute(pool)
-    .await
     .context("record p077 rollout metric event")?;
     Ok(id)
 }
@@ -95,7 +97,16 @@ pub async fn record_decision(
         bail!("p077 affected_run_ids are only valid for rollback_to_advisory");
     }
 
-    let mut tx = begin_immediate_with_retry(pool, "p077_rollout.record_decision").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "p077_rollout.record_decision",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "p077_rollout.record_decision",
+        ),
+        "p077_rollout.record_decision",
+    )
+    .await?;
     let decision_id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
     sqlx::query(
@@ -131,7 +142,7 @@ pub async fn record_decision(
     .bind(&input.rollback_trigger)
     .bind(&input.rollback_action)
     .bind(&created_at)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("insert p077 rollout decision")?;
 
@@ -141,7 +152,7 @@ pub async fn record_decision(
             let previous_mode =
                 sqlx::query("SELECT closeout_readiness_mode FROM runs WHERE id = ?1")
                     .bind(run_id)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(&mut **tx)
                     .await
                     .context("load p077 rollback run mode")?
                     .map(|row| row.get::<Option<String>, _>("closeout_readiness_mode"))
@@ -149,7 +160,7 @@ pub async fn record_decision(
 
             sqlx::query("UPDATE runs SET closeout_readiness_mode = 'advisory' WHERE id = ?1")
                 .bind(run_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .context("rollback p077 run to advisory")?;
 
@@ -163,7 +174,7 @@ pub async fn record_decision(
             .bind(run_id)
             .bind(previous_mode)
             .bind(&created_at)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .context("insert p077 advisory migration")?;
             advisory_migration_count += 1;

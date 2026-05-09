@@ -7,7 +7,7 @@ use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{XcodeRuntimeObservation, XcodeRuntimeObservationUpdate};
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
                 owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
@@ -34,7 +34,8 @@ pub struct RunningAgentExecution {
 }
 
 pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "agent_executions.insert").await?;
     insert_tx(&mut tx, exec).await?;
     tx.commit().await?;
     Ok(())
@@ -116,7 +117,9 @@ pub async fn update_completed(
     status: AgentStatus,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "agent_executions.update_completed")
+            .await?;
     update_completed_tx(&mut tx, id, status, completed_at).await?;
     tx.commit().await?;
     Ok(())
@@ -147,8 +150,11 @@ pub async fn update_mcp_provenance(
     denied_mcp_extensions_json: Option<&str>,
     mcp_blocking_issues_json: Option<&str>,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE agent_executions
+    crate::execute_repository_write!(
+        pool,
+        "agent_executions.update_mcp_provenance",
+        sqlx::query(
+            "UPDATE agent_executions
          SET backend_profile_id = ?,
              requested_mcp_extensions_json = ?,
              predicted_mcp_extensions_json = ?,
@@ -156,16 +162,15 @@ pub async fn update_mcp_provenance(
              denied_mcp_extensions_json = ?,
              mcp_blocking_issues_json = ?
          WHERE id = ?",
-    )
-    .bind(backend_profile_id)
-    .bind(requested_mcp_extensions_json)
-    .bind(predicted_mcp_extensions_json)
-    .bind(predicted_mcp_runtime_ids_json)
-    .bind(denied_mcp_extensions_json)
-    .bind(mcp_blocking_issues_json)
-    .bind(id.to_string())
-    .execute(pool)
-    .await?;
+        )
+        .bind(backend_profile_id)
+        .bind(requested_mcp_extensions_json)
+        .bind(predicted_mcp_extensions_json)
+        .bind(predicted_mcp_runtime_ids_json)
+        .bind(denied_mcp_extensions_json)
+        .bind(mcp_blocking_issues_json)
+        .bind(id.to_string())
+    )?;
     Ok(())
 }
 
@@ -177,21 +182,23 @@ pub async fn update_mcp_actual(
     actual_mcp_observation_json: Option<&str>,
     mcp_session_startup_latency_ms: Option<i64>,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE agent_executions
+    crate::execute_repository_write!(
+        pool,
+        "agent_executions.update_mcp_actual",
+        sqlx::query(
+            "UPDATE agent_executions
          SET actual_mcp_extensions_json = ?,
              actual_mcp_runtime_ids_json = ?,
              actual_mcp_observation_json = ?,
              mcp_session_startup_latency_ms = ?
          WHERE id = ?",
-    )
-    .bind(actual_mcp_extensions_json)
-    .bind(actual_mcp_runtime_ids_json)
-    .bind(actual_mcp_observation_json)
-    .bind(mcp_session_startup_latency_ms)
-    .bind(id.to_string())
-    .execute(pool)
-    .await?;
+        )
+        .bind(actual_mcp_extensions_json)
+        .bind(actual_mcp_runtime_ids_json)
+        .bind(actual_mcp_observation_json)
+        .bind(mcp_session_startup_latency_ms)
+        .bind(id.to_string())
+    )?;
     Ok(())
 }
 
@@ -206,8 +213,11 @@ pub async fn update_session_policy(
     session_reuse_disposition: Option<&str>,
     session_reset_reason: Option<&str>,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE agent_executions
+    crate::execute_repository_write!(
+        pool,
+        "agent_executions.update_session_policy",
+        sqlx::query(
+            "UPDATE agent_executions
          SET session_lineage_id = ?1,
              session_generation_id = ?2,
              rehydrated_from_checkpoint_artifact_id = ?3,
@@ -215,16 +225,15 @@ pub async fn update_session_policy(
              session_reuse_disposition = ?5,
              session_reset_reason = ?6
          WHERE id = ?7",
-    )
-    .bind(session_lineage_id)
-    .bind(session_generation_id)
-    .bind(rehydrated_from_checkpoint_artifact_id)
-    .bind(invocation_owner_key)
-    .bind(session_reuse_disposition)
-    .bind(session_reset_reason)
-    .bind(id.to_string())
-    .execute(pool)
-    .await?;
+        )
+        .bind(session_lineage_id)
+        .bind(session_generation_id)
+        .bind(rehydrated_from_checkpoint_artifact_id)
+        .bind(invocation_owner_key)
+        .bind(session_reuse_disposition)
+        .bind(session_reset_reason)
+        .bind(id.to_string())
+    )?;
     Ok(())
 }
 
@@ -234,14 +243,21 @@ pub async fn append_xcode_runtime_observation(
     update: XcodeRuntimeObservationUpdate,
 ) -> Result<()> {
     for attempt in 0..3 {
-        let mut tx =
-            begin_immediate_with_retry(pool, "agent_executions.append_xcode_runtime_observation")
-                .await?;
+        let mut tx = begin_registered_immediate_transaction(
+            pool,
+            crate::writer::class_a_operation(
+                "agent_executions.append_xcode_runtime_observation",
+                crate::write_class::WriteLane::CriticalBarrier,
+                "agent_executions.append_xcode_runtime_observation",
+            ),
+            "agent_executions.append_xcode_runtime_observation",
+        )
+        .await?;
         let row = sqlx::query(
             "SELECT actual_xcode_runtime_observation_json FROM agent_executions WHERE id = ?",
         )
         .bind(id.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
 
         let Some(row) = row else {
@@ -278,7 +294,7 @@ pub async fn append_xcode_runtime_observation(
             .bind(&next_json)
             .bind(id.to_string())
             .bind(current_json)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
         } else {
             sqlx::query(
@@ -288,7 +304,7 @@ pub async fn append_xcode_runtime_observation(
             )
             .bind(&next_json)
             .bind(id.to_string())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
         };
 
@@ -428,8 +444,11 @@ pub async fn cancel_running_by_run(
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
     // BLK-003: Cancel both stage-owned and mediation-owned executions for the run.
-    sqlx::query(
-        "UPDATE agent_executions
+    crate::execute_repository_write!(
+        pool,
+        "agent_executions.cancel_running_by_run",
+        sqlx::query(
+            "UPDATE agent_executions
          SET status = ?, completed_at = ?
          WHERE status = ? AND (
              stage_execution_id IN (
@@ -442,14 +461,13 @@ pub async fn cancel_running_by_run(
                  )
              )
          )",
-    )
-    .bind(AgentStatus::Cancelled.to_string())
-    .bind(completed_at.to_rfc3339())
-    .bind(AgentStatus::Running.to_string())
-    .bind(run_id.to_string())
-    .bind(run_id.to_string())
-    .execute(pool)
-    .await?;
+        )
+        .bind(AgentStatus::Cancelled.to_string())
+        .bind(completed_at.to_rfc3339())
+        .bind(AgentStatus::Running.to_string())
+        .bind(run_id.to_string())
+        .bind(run_id.to_string())
+    )?;
     Ok(())
 }
 
@@ -508,7 +526,11 @@ pub async fn list_running_across_interval(
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
 ) -> Result<Vec<RunningAgentExecution>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_executions.list_running_across_interval",
+    )
+    .await?;
     let executions = list_running_across_interval_tx(&mut tx, started_at, ended_at).await?;
     tx.commit().await?;
     Ok(executions)
@@ -670,7 +692,11 @@ pub async fn update_attempt_attribution(
     cached_input_tokens: Option<i64>,
     transcript_artifact_id: Option<&str>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_executions.update_attempt_attribution",
+    )
+    .await?;
     update_attempt_attribution_tx(
         &mut tx,
         id,
@@ -693,14 +719,16 @@ pub async fn update_toolchain_mapping_diagnostics(
     id: AgentExecutionId,
     diagnostics_json: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE agent_executions
+    crate::execute_repository_write!(
+        pool,
+        "agent_executions.update_toolchain_mapping_diagnostics",
+        sqlx::query(
+            "UPDATE agent_executions
          SET actual_toolchain_mapping_diagnostics_json = ?
          WHERE id = ?",
-    )
-    .bind(diagnostics_json)
-    .bind(id.to_string())
-    .execute(pool)
-    .await?;
+        )
+        .bind(diagnostics_json)
+        .bind(id.to_string())
+    )?;
     Ok(())
 }
