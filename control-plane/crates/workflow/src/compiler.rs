@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use domain::provider::ProviderFamily;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::thread;
 use tracing::{info, warn};
 
 use crate::catalog;
@@ -19,12 +20,20 @@ use crate::definition;
 use crate::direct_command::DirectCommandScan;
 use crate::plan::*;
 
+const WORKFLOW_COMPILE_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Compile a workflow YAML + agent catalog YAML into a `RunPlan`.
 ///
 /// Both paths must be readable files. The compiler validates that every
 /// agent referenced by the workflow exists in the catalog and has a
 /// resolvable backend profile.
 pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
+    let workflow_path = workflow_path.to_string();
+    let catalog_path = catalog_path.to_string();
+    compile_on_dedicated_stack(move || compile_on_current_thread(&workflow_path, &catalog_path))
+}
+
+fn compile_on_current_thread(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
     let wf = definition::load(workflow_path).context("loading workflow definition")?;
     let cat = catalog::load(catalog_path).context("loading agent catalog")?;
     let workflow_raw =
@@ -42,6 +51,23 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
 /// Compile a run plan from the immutable workflow/catalog snapshots captured
 /// when the run was created.
 pub fn compile_from_snapshot_json(
+    workflow_snapshot_json: &str,
+    catalog_snapshot_json: &str,
+    catalog_path: &str,
+) -> Result<RunPlan> {
+    let workflow_snapshot_json = workflow_snapshot_json.to_string();
+    let catalog_snapshot_json = catalog_snapshot_json.to_string();
+    let catalog_path = catalog_path.to_string();
+    compile_on_dedicated_stack(move || {
+        compile_from_snapshot_json_on_current_thread(
+            &workflow_snapshot_json,
+            &catalog_snapshot_json,
+            &catalog_path,
+        )
+    })
+}
+
+fn compile_from_snapshot_json_on_current_thread(
     workflow_snapshot_json: &str,
     catalog_snapshot_json: &str,
     catalog_path: &str,
@@ -71,6 +97,27 @@ pub fn compile_from_snapshot_json(
         &catalog_base,
         Some(snapshots),
     )
+}
+
+fn compile_on_dedicated_stack<F>(compile: F) -> Result<RunPlan>
+where
+    F: FnOnce() -> Result<RunPlan> + Send + 'static,
+{
+    thread::Builder::new()
+        .name("workflow-compile".to_string())
+        .stack_size(WORKFLOW_COMPILE_STACK_BYTES)
+        .spawn(compile)
+        .context("spawning workflow compile thread")?
+        .join()
+        .map_err(|panic| {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                anyhow::anyhow!("workflow compile thread panicked: {message}")
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                anyhow::anyhow!("workflow compile thread panicked: {message}")
+            } else {
+                anyhow::anyhow!("workflow compile thread panicked")
+            }
+        })?
 }
 
 struct SnapshotJson {

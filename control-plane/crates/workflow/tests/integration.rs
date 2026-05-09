@@ -457,6 +457,26 @@ fn p060_canonical_workflow_uses_dynamic_reviewer_routing() {
 }
 
 #[test]
+fn compile_full_mvp_live_from_small_stack_caller() {
+    let examples = fixtures_dir();
+    let wf_path = format!("{examples}/workflows/full-mvp-live.yaml");
+    let cat_path = format!("{examples}/agents/agents.yaml");
+
+    let handle = std::thread::Builder::new()
+        .name("small-stack-workflow-compile-caller".to_string())
+        .stack_size(512 * 1024)
+        .spawn(move || compiler::compile(&wf_path, &cat_path))
+        .expect("should spawn small stack caller");
+
+    let plan = handle
+        .join()
+        .expect("compile caller should not panic")
+        .expect("full-mvp-live should compile from a small-stack caller");
+    assert_eq!(plan.initial_state, "state_1_idea_received");
+    assert!(plan.states.contains_key("state_12_workflow_complete"));
+}
+
+#[test]
 fn p060_full_mvp_dynamic_workflow_does_not_require_fixed_quartet_refinement_inputs() {
     for workflow_file in ["workflow.yaml", "full-mvp-live.yaml"] {
         let wf_path = format!("{}/workflows/{workflow_file}", fixtures_dir());
