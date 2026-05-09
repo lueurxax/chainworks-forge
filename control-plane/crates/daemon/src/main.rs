@@ -226,6 +226,9 @@ async fn main() -> Result<()> {
         "SQLite pool opened"
     );
 
+    let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
+
     // ── Steward runtime + control-plane wiring ─────────────────────────
     let steward_config_path = std::env::var("STEWARD_CONFIG_PATH")
         .ok()
@@ -259,8 +262,6 @@ async fn main() -> Result<()> {
 
     let work_queue = WorkQueue::new(pool.clone());
     let acp = Arc::new(AcpRuntimeManager::new());
-    let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
-    db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
     let _storage_rollup_handle =
         spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone());
     let cmd_handler = Arc::new(CommandHandler::new_with_acp_capacity_and_db_writer(
