@@ -4,6 +4,7 @@ pub mod agent_executions;
 pub mod agent_retry_budget_ledger;
 pub mod approvals;
 pub mod artifact_contracts;
+pub mod escalation;
 pub mod artifacts;
 pub mod closeout;
 pub mod command_journal;

@@ -1320,11 +1320,9 @@ Important:
 
 ### `proposal-058|p058`
 
-Implemented regression gate for ACP provider failure classification and session artifact ownership.
+Regression gate for ACP provider failure classification, session artifact ownership, and escalation schema (Phase 0-1 foundation).
 
-The original proposal document has been retired after implementation. The gate name
-remains `proposal-058` because the Rust test targets and historical proof lane use that
-identifier.
+The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains Phase 0-1 schema and readback layer.
 
 Scope:
 
@@ -1337,6 +1335,11 @@ Scope:
 - retry enqueue-to-claim late-output rejection and source-generation CAS behavior
 - GraphQL/MCP runtime-facts parity and artifact source provenance
 - no-secret redacted runtime failure readback
+- escalation_policy_v1 schema: `EscalationTierKind`, `EscalationPauseReason`, `EscalationTrigger` domain types
+- escalation ledger, execution metadata, and event journal insert/read round-trips
+- `redaction_version` required at insert time for every escalation event
+- pause reason vocabulary coverage (all 13 catalog entries) and unknown-value round-trip
+- malformed payload_json rejection at repository layer
 
 Use when:
 
@@ -1345,6 +1348,7 @@ Use when:
 - changing session reuse, retry supersession, or late-output handling
 - changing artifact active-index source provenance
 - changing GraphQL or MCP execution truth readback
+- changing escalation domain types, repository layer, or GraphQL escalation readback
 
 Host policy:
 
@@ -1371,7 +1375,8 @@ Important:
 - DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
 - `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
-- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
+- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, GraphQL/MCP runtime-facts parity, or escalation schema evidence is missing
+- escalation events must supply a `redaction_version` stamp; insert without one must fail
 
 ### `proposal-061|p061`
 
@@ -1722,11 +1727,9 @@ Important:
 
 ### `proposal-058|p058`
 
-Implemented regression gate for ACP provider failure classification and session artifact ownership.
+Regression gate for ACP provider failure classification, session artifact ownership, and escalation schema (Phase 0-1 foundation).
 
-The original proposal document has been retired after implementation. The gate name
-remains `proposal-058` because the Rust test targets and historical proof lane use that
-identifier.
+The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains Phase 0-1 schema and readback layer.
 
 Scope:
 
@@ -1739,6 +1742,11 @@ Scope:
 - retry enqueue-to-claim late-output rejection and source-generation CAS behavior
 - GraphQL/MCP runtime-facts parity and artifact source provenance
 - no-secret redacted runtime failure readback
+- escalation_policy_v1 schema: `EscalationTierKind`, `EscalationPauseReason`, `EscalationTrigger` domain types
+- escalation ledger, execution metadata, and event journal insert/read round-trips
+- `redaction_version` required at insert time for every escalation event
+- pause reason vocabulary coverage (all 13 catalog entries) and unknown-value round-trip
+- malformed payload_json rejection at repository layer
 
 Use when:
 
@@ -1747,6 +1755,7 @@ Use when:
 - changing session reuse, retry supersession, or late-output handling
 - changing artifact active-index source provenance
 - changing GraphQL or MCP execution truth readback
+- changing escalation domain types, repository layer, or GraphQL escalation readback
 
 Host policy:
 
@@ -1773,7 +1782,8 @@ Important:
 - DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
 - `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
-- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
+- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, GraphQL/MCP runtime-facts parity, or escalation schema evidence is missing
+- escalation events must supply a `redaction_version` stamp; insert without one must fail
 
 ### `proposal-061|p061`
 

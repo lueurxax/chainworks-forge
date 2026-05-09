@@ -266,6 +266,13 @@ fn make_agent_execution(
         cached_input_tokens: None,
         transcript_artifact_id: None,
         actual_toolchain_mapping_diagnostics_json: None,
+        escalation_policy_id: None,
+        escalation_policy_hash: None,
+        escalation_tier_id: None,
+        escalation_tier_kind_raw: None,
+        escalation_trigger_raw: None,
+        escalation_digest_version: None,
+        escalation_ledger_id: None,
     }
 }
 
@@ -9080,6 +9087,13 @@ sys.exit(0)
         cached_input_tokens: None,
         transcript_artifact_id: None,
         actual_toolchain_mapping_diagnostics_json: None,
+        escalation_policy_id: None,
+        escalation_policy_hash: None,
+        escalation_tier_id: None,
+        escalation_tier_kind_raw: None,
+        escalation_trigger_raw: None,
+        escalation_digest_version: None,
+        escalation_ledger_id: None,
     };
     agent_executions::insert(&pool, &running_exec)
         .await
@@ -12188,6 +12202,13 @@ async fn p017_mediation_cancel_run_cascade() {
         cached_input_tokens: None,
         transcript_artifact_id: None,
         actual_toolchain_mapping_diagnostics_json: None,
+        escalation_policy_id: None,
+        escalation_policy_hash: None,
+        escalation_tier_id: None,
+        escalation_tier_kind_raw: None,
+        escalation_trigger_raw: None,
+        escalation_digest_version: None,
+        escalation_ledger_id: None,
     };
     agent_executions::insert(&pool, &mediation_execution)
         .await

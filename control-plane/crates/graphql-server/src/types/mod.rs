@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod artifact;
+pub mod escalation;
 pub mod idea;
 pub mod p031;
 pub mod run;

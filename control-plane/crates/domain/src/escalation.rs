@@ -215,7 +215,10 @@ pub struct EscalationEvent {
     pub tier_kind_raw: Option<String>,
     pub trigger_raw: Option<String>,
     pub pause_reason_raw: Option<String>,
+    /// Optional JSON payload. Repository layer validates this is well-formed JSON when present.
     pub payload_json: Option<String>,
+    /// Redaction version stamp for this event's projection. Proposal requires this on every write.
+    pub redaction_version: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -271,5 +274,23 @@ mod tests {
             EscalationTrigger::OperatorForcedReservedRejected.to_string(),
             "operator_forced_reserved_rejected"
         );
+    }
+
+    #[test]
+    fn escalation_event_redaction_version_field_present() {
+        use chrono::Utc;
+        let event = EscalationEvent {
+            id: "evt-test".into(),
+            escalation_ledger_id: "ledger-test".into(),
+            event_kind_raw: "escalation.tier_selected".into(),
+            tier_id: None,
+            tier_kind_raw: None,
+            trigger_raw: None,
+            pause_reason_raw: None,
+            payload_json: None,
+            redaction_version: Some("redaction_v1".into()),
+            created_at: Utc::now(),
+        };
+        assert_eq!(event.redaction_version.as_deref(), Some("redaction_v1"));
     }
 }

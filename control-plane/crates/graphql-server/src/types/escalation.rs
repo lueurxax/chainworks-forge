@@ -31,6 +31,10 @@ pub struct GqlEscalationChainState {
     pub runbook_anchor: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Ordered event journal for this chain.
+    pub events: Vec<GqlEscalationEventEntry>,
+    /// Per-execution attribution rows for this chain.
+    pub execution_metas: Vec<GqlEscalationExecutionMeta>,
 }
 
 /// Per-execution escalation attribution.
@@ -61,7 +65,12 @@ pub struct GqlEscalationEventEntry {
     pub tier_kind_raw: Option<String>,
     pub trigger_raw: Option<String>,
     pub pause_reason_raw: Option<String>,
+    /// Redacted event payload. Writers must strip all raw evidence before populating;
+    /// only digest refs and tier metadata are permitted. Phase 2+ callers must hold
+    /// a valid redaction_version stamp before writing this field.
     pub payload_json: Option<String>,
+    /// Redaction version stamp. Required per proposal on every event write.
+    pub redaction_version: Option<String>,
     pub created_at: String,
 }
 
@@ -85,9 +94,59 @@ pub async fn run_escalation_readback(
         .await
         .map_err(|e| async_graphql::Error::new(format!("escalation readback failed: {e}")))?;
 
-    let chains: Vec<GqlEscalationChainState> = ledgers
-        .iter()
-        .map(|l| GqlEscalationChainState {
+    let mut chains: Vec<GqlEscalationChainState> = Vec::with_capacity(ledgers.len());
+
+    for l in &ledgers {
+        let events = escalation_repo::find_events_by_ledger(pool, &l.id)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!(
+                    "escalation events readback failed for ledger {}: {e}",
+                    l.id
+                ))
+            })?;
+        let exec_metas = escalation_repo::find_execution_metadata_by_ledger(pool, &l.id)
+            .await
+            .map_err(|e| {
+                async_graphql::Error::new(format!(
+                    "escalation execution metadata readback failed for ledger {}: {e}",
+                    l.id
+                ))
+            })?;
+
+        let gql_events: Vec<GqlEscalationEventEntry> = events
+            .iter()
+            .map(|ev| GqlEscalationEventEntry {
+                id: ID(ev.id.clone()),
+                escalation_ledger_id: ID(ev.escalation_ledger_id.clone()),
+                event_kind_raw: ev.event_kind_raw.clone(),
+                tier_id: ev.tier_id.clone(),
+                tier_kind_raw: ev.tier_kind_raw.clone(),
+                trigger_raw: ev.trigger_raw.clone(),
+                pause_reason_raw: ev.pause_reason_raw.clone(),
+                payload_json: ev.payload_json.clone(),
+                redaction_version: ev.redaction_version.clone(),
+                created_at: ev.created_at.to_rfc3339(),
+            })
+            .collect();
+
+        let gql_metas: Vec<GqlEscalationExecutionMeta> = exec_metas
+            .iter()
+            .map(|m| GqlEscalationExecutionMeta {
+                agent_execution_id: ID(m.agent_execution_id.to_string()),
+                escalation_ledger_id: ID(m.escalation_ledger_id.clone()),
+                tier_id: m.tier_id.clone(),
+                tier_kind_raw: m.tier_kind_raw.clone(),
+                tier_attempt_index: m.tier_attempt_index,
+                trigger_raw: m.trigger_raw.clone(),
+                digest_version: m.digest_version.clone(),
+                capacity_probe_counter: m.capacity_probe_counter,
+                created_at: m.created_at.to_rfc3339(),
+                updated_at: m.updated_at.to_rfc3339(),
+            })
+            .collect();
+
+        chains.push(GqlEscalationChainState {
             id: ID(l.id.clone()),
             run_id: ID(l.run_id.to_string()),
             stage_id: l.stage_id.clone(),
@@ -104,8 +163,10 @@ pub async fn run_escalation_readback(
             runbook_anchor: l.runbook_anchor.clone(),
             created_at: l.created_at.to_rfc3339(),
             updated_at: l.updated_at.to_rfc3339(),
-        })
-        .collect();
+            events: gql_events,
+            execution_metas: gql_metas,
+        });
+    }
 
     let paused = chains
         .iter()

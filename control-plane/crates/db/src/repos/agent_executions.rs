@@ -21,7 +21,10 @@ const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, 
                 owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id,
                 total_cost_cents, input_tokens, output_tokens, cached_input_tokens,
                 transcript_artifact_id,
-                actual_toolchain_mapping_diagnostics_json"#;
+                actual_toolchain_mapping_diagnostics_json,
+                escalation_policy_id, escalation_policy_hash,
+                escalation_tier_id, escalation_tier_kind_raw,
+                escalation_trigger_raw, escalation_digest_version, escalation_ledger_id"#;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningAgentExecution {
@@ -59,8 +62,11 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
           denied_mcp_extensions_json, mcp_blocking_issues_json, actual_mcp_observation_json,
           actual_xcode_runtime_observation_json,
           mcp_session_startup_latency_ms,
-          owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          owner_kind, owner_id, lead_mediation_record_id, origin_stage_execution_id,
+          escalation_policy_id, escalation_policy_hash,
+          escalation_tier_id, escalation_tier_kind_raw,
+          escalation_trigger_raw, escalation_digest_version, escalation_ledger_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(exec.id.to_string())
     .bind(&stage_execution_id)
@@ -95,6 +101,13 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
     .bind(&owner_id)
     .bind(&exec.lead_mediation_record_id)
     .bind(&exec.origin_stage_execution_id)
+    .bind(&exec.escalation_policy_id)
+    .bind(&exec.escalation_policy_hash)
+    .bind(&exec.escalation_tier_id)
+    .bind(&exec.escalation_tier_kind_raw)
+    .bind(&exec.escalation_trigger_raw)
+    .bind(&exec.escalation_digest_version)
+    .bind(&exec.escalation_ledger_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -621,6 +634,14 @@ fn parse_agent_execution_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecu
         actual_toolchain_mapping_diagnostics_json: row
             .try_get("actual_toolchain_mapping_diagnostics_json")
             .unwrap_or(None),
+        // P058: escalation attribution (nullable; NULL for non-escalated executions)
+        escalation_policy_id: row.try_get("escalation_policy_id").unwrap_or(None),
+        escalation_policy_hash: row.try_get("escalation_policy_hash").unwrap_or(None),
+        escalation_tier_id: row.try_get("escalation_tier_id").unwrap_or(None),
+        escalation_tier_kind_raw: row.try_get("escalation_tier_kind_raw").unwrap_or(None),
+        escalation_trigger_raw: row.try_get("escalation_trigger_raw").unwrap_or(None),
+        escalation_digest_version: row.try_get("escalation_digest_version").unwrap_or(None),
+        escalation_ledger_id: row.try_get("escalation_ledger_id").unwrap_or(None),
     })
 }
 

@@ -3,17 +3,24 @@ import Foundation
 
 /// EscalationReadAdapter is the governed UI source for escalation state.
 ///
-/// Authority boundary (per proposal p058-r14):
+/// Current implementation (Phase 0-1 foundation):
+/// - Accepts already-decoded chain arrays via `applyChains(_:)`.
+/// - Derives an `EscalationSnapshot` and publishes it on MainActor via @Published.
+/// - Shared per run_id through `EscalationReadAdapterRegistry`.
+///
+/// Authority boundary (per proposal p058-r14 — enforced in all phases):
 /// - Reads GraphQL/subscription DTOs only; never reconstructs truth from local state.
-/// - May request readback refreshes and copy redacted traces.
 /// - Must NOT call policy-drift acknowledgement, tier mutation, retry, resume, cancel,
 ///   or force-primary mutations.
 /// - DriftReviewSheet is read-only; drift acknowledgement routes through MCP/operator workflow.
 ///
-/// Concurrency contract:
-/// - Decode/normalization happens off-MainActor (nonisolated helpers + async context).
-/// - Snapshot publication occurs on MainActor via @Published.
-/// - All windows for the same run_id share one instance.
+/// Not yet implemented (Phase 1+):
+/// - GraphQL subscription and transport-stale handling.
+/// - Readback refresh requests.
+/// - Redacted trace copy to pasteboard.
+/// - Runbook URL opening.
+/// - AppKit attention requests and dock badge updates.
+/// - Notification presentation.
 @MainActor
 final class EscalationReadAdapter: ObservableObject {
     @Published private(set) var snapshot: EscalationSnapshot = .empty
@@ -25,7 +32,7 @@ final class EscalationReadAdapter: ObservableObject {
     }
 
     /// Apply a freshly decoded chain array and publish the derived snapshot.
-    /// Safe to call from any actor; switches to MainActor for publication.
+    /// Caller is responsible for decoding off-MainActor; this method publishes on MainActor.
     func applyChains(_ chains: [EscalationChainStateDTO]) {
         let snap = EscalationSnapshot.build(runId: runId, chains: chains)
         snapshot = snap
@@ -58,6 +65,7 @@ final class EscalationReadAdapterRegistry {
         return adapter
     }
 
+    // Retained for Phase 1+ subscription teardown when a run window closes.
     func removeAdapter(for runId: String) {
         adapters.removeValue(forKey: runId)
     }

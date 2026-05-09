@@ -196,6 +196,7 @@ async fn p058_escalation_event_journal_insert_and_read() {
         trigger_raw: Some("contract_output_failure".into()),
         pause_reason_raw: None,
         payload_json: None,
+        redaction_version: Some("redaction_v1".into()),
         created_at: now,
     };
     escalation::insert_event_tx(&mut tx, &event).await.unwrap();
@@ -210,6 +211,118 @@ async fn p058_escalation_event_journal_insert_and_read() {
     assert_eq!(
         events[0].trigger_raw.as_deref(),
         Some("contract_output_failure")
+    );
+    assert_eq!(
+        events[0].redaction_version.as_deref(),
+        Some("redaction_v1"),
+        "redaction_version must round-trip through escalation_events"
+    );
+}
+
+#[tokio::test]
+async fn p058_escalation_event_rejects_malformed_payload_json() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    let now = Utc::now();
+    let ledger = EscalationLedger {
+        id: "ledger-json-bad-001".into(),
+        run_id,
+        stage_id: "state_3".into(),
+        agent_id: "code_writer".into(),
+        policy_id: "policy-j".into(),
+        policy_hash: "sha256:j".into(),
+        status_raw: "active".into(),
+        current_tier_id: None,
+        current_tier_kind_raw: None,
+        chain_attempt_index: 0,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    escalation::insert_ledger_tx(&mut tx, &ledger).await.unwrap();
+
+    let bad_event = EscalationEvent {
+        id: "event-bad-json".into(),
+        escalation_ledger_id: "ledger-json-bad-001".into(),
+        event_kind_raw: "escalation.tier_selected".into(),
+        tier_id: None,
+        tier_kind_raw: None,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        payload_json: Some("{ not valid json ]]]".into()),
+        redaction_version: None,
+        created_at: now,
+    };
+    let result = escalation::insert_event_tx(&mut tx, &bad_event).await;
+    assert!(
+        result.is_err(),
+        "insert_event_tx must reject malformed payload_json"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("payload_json"),
+        "error must mention the field name; got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn p058_escalation_event_accepts_valid_payload_json() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    let now = Utc::now();
+    let ledger = EscalationLedger {
+        id: "ledger-json-good-001".into(),
+        run_id,
+        stage_id: "state_3".into(),
+        agent_id: "code_writer".into(),
+        policy_id: "policy-jg".into(),
+        policy_hash: "sha256:jg".into(),
+        status_raw: "active".into(),
+        current_tier_id: None,
+        current_tier_kind_raw: None,
+        chain_attempt_index: 0,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    // Commit ledger first.
+    escalation::insert_ledger(&pool, &ledger).await.unwrap();
+
+    let good_event = EscalationEvent {
+        id: "event-good-json".into(),
+        escalation_ledger_id: "ledger-json-good-001".into(),
+        event_kind_raw: "escalation.tier_advanced".into(),
+        tier_id: Some("frontier_profile".into()),
+        tier_kind_raw: Some("backend_profile".into()),
+        trigger_raw: Some("contract_output_failure".into()),
+        pause_reason_raw: None,
+        payload_json: Some(r#"{"from_tier":"primary_retry","to_tier":"frontier_profile"}"#.into()),
+        redaction_version: Some("redaction_v1".into()),
+        created_at: now,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    escalation::insert_event_tx(&mut tx, &good_event).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let events = escalation::find_events_by_ledger(&pool, "ledger-json-good-001")
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "event-good-json");
+    assert_eq!(
+        events[0].redaction_version.as_deref(),
+        Some("redaction_v1")
     );
 }
 
@@ -312,6 +425,13 @@ async fn p058_escalation_execution_metadata_insert_and_read() {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -398,6 +518,58 @@ async fn p058_escalation_tables_accept_unknown_future_raw_values() {
     );
 }
 
+#[tokio::test]
+async fn p058_escalation_event_rejects_missing_redaction_version() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    let now = Utc::now();
+    let ledger = EscalationLedger {
+        id: "ledger-no-redact-001".into(),
+        run_id,
+        stage_id: "state_3".into(),
+        agent_id: "code_writer".into(),
+        policy_id: "policy-nr".into(),
+        policy_hash: "sha256:nr".into(),
+        status_raw: "active".into(),
+        current_tier_id: None,
+        current_tier_kind_raw: None,
+        chain_attempt_index: 0,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    escalation::insert_ledger_tx(&mut tx, &ledger).await.unwrap();
+
+    let event_no_redaction = EscalationEvent {
+        id: "event-no-redact".into(),
+        escalation_ledger_id: "ledger-no-redact-001".into(),
+        event_kind_raw: "escalation.tier_selected".into(),
+        tier_id: Some("primary_retry".into()),
+        tier_kind_raw: Some("same_backend_retry".into()),
+        trigger_raw: Some("contract_output_failure".into()),
+        pause_reason_raw: None,
+        payload_json: Some(r#"{"key":"value"}"#.into()),
+        redaction_version: None,
+        created_at: now,
+    };
+    let result = escalation::insert_event_tx(&mut tx, &event_no_redaction).await;
+    assert!(
+        result.is_err(),
+        "insert_event_tx must reject missing redaction_version"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("redaction_version"),
+        "error must mention redaction_version; got: {err_msg}"
+    );
+}
+
 #[test]
 fn p058_pause_reason_vocabulary_covers_all_13_catalog_entries() {
     use EscalationPauseReason::*;
@@ -433,4 +605,317 @@ fn p058_tier_kind_vocabulary_covers_all_4_kinds() {
         let parsed: EscalationTierKind = s.parse().expect("tier kind must roundtrip");
         assert_eq!(kind, &parsed);
     }
+}
+
+// --- update_shadow_escalation_columns_tx tests ---
+
+async fn insert_runtime_facts_row(pool: &sqlx::SqlitePool, exec_id: AgentExecutionId) {
+    use db::repos::agent_execution_runtime_facts;
+    use domain::agent::AgentExecutionRuntimeFacts;
+    use chrono::Utc;
+    let now = Utc::now();
+    agent_execution_runtime_facts::upsert(
+        pool,
+        &AgentExecutionRuntimeFacts::defaults_for(exec_id, now),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn p058_shadow_update_rejects_malformed_decision_json() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    use db::repos::{agent_executions, stages};
+    use domain::agent::{AgentExecution, AgentStatus};
+    use domain::ids::StageExecutionId;
+    use domain::stage::{StageExecution, StageStatus};
+    use chrono::Utc;
+    let now = Utc::now();
+    let stage_id = StageExecutionId::new();
+    let exec_id = AgentExecutionId::new();
+    stages::insert(&pool, &StageExecution {
+        id: stage_id, run_id, stage_id: "state_3".into(), label: "Impl".into(),
+        status: StageStatus::Running, iteration: 1, attempt_number: 1,
+        settlement_kind: None, started_at: now, completed_at: None,
+        owner_agent: None, provider: None, model: None, stage_type: None,
+        validation_failure_json: None, evidence_packet_json: None,
+        recovery_snapshot_json: None, retry_reason: None,
+    }).await.unwrap();
+    agent_executions::insert(&pool, &AgentExecution {
+        id: exec_id, stage_execution_id: Some(stage_id),
+        agent_id: "code_writer".into(), provider: "claude".into(),
+        model: Some("sonnet".into()), status: AgentStatus::Running,
+        started_at: now, completed_at: None,
+        owner_execution_lineage_id: None, session_lineage_id: None,
+        session_generation_id: None, rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: Some("owner".into()), session_reuse_scope: None,
+        session_family_id: None, session_reuse_disposition: None,
+        session_reset_reason: None, backend_profile_id: None,
+        requested_mcp_extensions_json: None, predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None, actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None, denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None, actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None, mcp_session_startup_latency_ms: None,
+        owner_kind: None, owner_id: None, lead_mediation_record_id: None,
+        origin_stage_execution_id: None, total_cost_cents: None,
+        input_tokens: None, output_tokens: None, cached_input_tokens: None,
+        transcript_artifact_id: None, actual_toolchain_mapping_diagnostics_json: None,
+        escalation_policy_id: None,
+        escalation_policy_hash: None,
+        escalation_tier_id: None,
+        escalation_tier_kind_raw: None,
+        escalation_trigger_raw: None,
+        escalation_digest_version: None,
+        escalation_ledger_id: None,
+    }).await.unwrap();
+    insert_runtime_facts_row(&pool, exec_id).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let result = escalation::update_shadow_escalation_columns_tx(
+        &mut tx,
+        &exec_id.to_string(),
+        Some("primary_retry"),
+        Some("contract_output_failure"),
+        Some("{ not valid json ]]]"),
+    ).await;
+    assert!(result.is_err(), "must reject malformed would_select_decision_json");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("malformed JSON"), "error must say malformed JSON; got: {msg}");
+}
+
+#[tokio::test]
+async fn p058_shadow_update_fails_for_missing_runtime_facts_row() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    let nonexistent_id = AgentExecutionId::new();
+    let mut tx = pool.begin().await.unwrap();
+    let result = escalation::update_shadow_escalation_columns_tx(
+        &mut tx,
+        &nonexistent_id.to_string(),
+        Some("primary_retry"),
+        Some("contract_output_failure"),
+        None,
+    ).await;
+    assert!(result.is_err(), "must fail when no runtime_facts row exists");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("no agent_execution_runtime_facts"), "error must name the missing row; got: {msg}");
+}
+
+#[tokio::test]
+async fn p058_escalation_event_rejects_unknown_redaction_version() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    let now = chrono::Utc::now();
+    let ledger = EscalationLedger {
+        id: "ledger-bad-redact-001".into(),
+        run_id,
+        stage_id: "state_3".into(),
+        agent_id: "code_writer".into(),
+        policy_id: "policy-br".into(),
+        policy_hash: "sha256:br".into(),
+        status_raw: "active".into(),
+        current_tier_id: None,
+        current_tier_kind_raw: None,
+        chain_attempt_index: 0,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    escalation::insert_ledger_tx(&mut tx, &ledger).await.unwrap();
+
+    let event_unknown_redact = EscalationEvent {
+        id: "event-bad-redact".into(),
+        escalation_ledger_id: "ledger-bad-redact-001".into(),
+        event_kind_raw: "escalation.tier_selected".into(),
+        tier_id: Some("primary_retry".into()),
+        tier_kind_raw: Some("same_backend_retry".into()),
+        trigger_raw: None,
+        pause_reason_raw: None,
+        payload_json: None,
+        redaction_version: Some("arbitrary_unknown_stamp".into()),
+        created_at: now,
+    };
+    let result = escalation::insert_event_tx(&mut tx, &event_unknown_redact).await;
+    assert!(
+        result.is_err(),
+        "insert_event_tx must reject redaction_version not in the known allowlist"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("redaction_version") || err_msg.contains("allowlist"),
+        "error must reference redaction_version or allowlist; got: {err_msg}"
+    );
+}
+
+/// P058: escalation_* attribution columns on agent_executions must round-trip
+/// through insert_tx and find_by_id — the migrated columns are not dead schema.
+#[tokio::test]
+async fn p058_agent_execution_escalation_columns_roundtrip() {
+    use db::repos::{agent_executions, stages};
+    use domain::agent::{AgentExecution, AgentStatus};
+    use domain::ids::StageExecutionId;
+    use domain::stage::{StageExecution, StageStatus};
+
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let run_id = RunId::new();
+    insert_minimal_run(&pool, run_id).await;
+
+    let now = Utc::now();
+    let stage_id = StageExecutionId::new();
+    let exec_id = AgentExecutionId::new();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "state_3".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let exec = AgentExecution {
+        id: exec_id,
+        stage_execution_id: Some(stage_id),
+        agent_id: "code_writer".into(),
+        provider: "claude".into(),
+        model: Some("sonnet".into()),
+        status: AgentStatus::Running,
+        started_at: now,
+        completed_at: None,
+        owner_execution_lineage_id: None,
+        session_lineage_id: None,
+        session_generation_id: None,
+        rehydrated_from_checkpoint_artifact_id: None,
+        invocation_owner_key: Some("owner-key".into()),
+        session_reuse_scope: None,
+        session_family_id: None,
+        session_reuse_disposition: None,
+        session_reset_reason: None,
+        backend_profile_id: None,
+        requested_mcp_extensions_json: None,
+        predicted_mcp_extensions_json: None,
+        predicted_mcp_runtime_ids_json: None,
+        actual_mcp_extensions_json: None,
+        actual_mcp_runtime_ids_json: None,
+        denied_mcp_extensions_json: None,
+        mcp_blocking_issues_json: None,
+        actual_mcp_observation_json: None,
+        actual_xcode_runtime_observation_json: None,
+        mcp_session_startup_latency_ms: None,
+        owner_kind: None,
+        owner_id: None,
+        lead_mediation_record_id: None,
+        origin_stage_execution_id: None,
+        total_cost_cents: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        transcript_artifact_id: None,
+        actual_toolchain_mapping_diagnostics_json: None,
+        // P058 escalation attribution — populated to verify INSERT wires them correctly.
+        escalation_policy_id: Some("code_writer_default_escalation".into()),
+        escalation_policy_hash: Some("sha256:abc123".into()),
+        escalation_tier_id: Some("primary_retry".into()),
+        escalation_tier_kind_raw: Some("same_backend_retry".into()),
+        escalation_trigger_raw: Some("contract_output_failure".into()),
+        escalation_digest_version: Some("escalation_blocker_digest_v1".into()),
+        escalation_ledger_id: Some("ledger-test-esc-roundtrip".into()),
+    };
+
+    agent_executions::insert(&pool, &exec).await.unwrap();
+
+    let found = agent_executions::find_by_id(&pool, exec_id)
+        .await
+        .unwrap()
+        .expect("agent_execution must be found after insert");
+
+    assert_eq!(
+        found.escalation_policy_id.as_deref(),
+        Some("code_writer_default_escalation"),
+        "escalation_policy_id must round-trip through INSERT"
+    );
+    assert_eq!(
+        found.escalation_policy_hash.as_deref(),
+        Some("sha256:abc123"),
+        "escalation_policy_hash must round-trip"
+    );
+    assert_eq!(
+        found.escalation_tier_id.as_deref(),
+        Some("primary_retry"),
+        "escalation_tier_id must round-trip"
+    );
+    assert_eq!(
+        found.escalation_tier_kind_raw.as_deref(),
+        Some("same_backend_retry"),
+        "escalation_tier_kind_raw must round-trip"
+    );
+    assert_eq!(
+        found.escalation_trigger_raw.as_deref(),
+        Some("contract_output_failure"),
+        "escalation_trigger_raw must round-trip"
+    );
+    assert_eq!(
+        found.escalation_digest_version.as_deref(),
+        Some("escalation_blocker_digest_v1"),
+        "escalation_digest_version must round-trip"
+    );
+    assert_eq!(
+        found.escalation_ledger_id.as_deref(),
+        Some("ledger-test-esc-roundtrip"),
+        "escalation_ledger_id must round-trip"
+    );
+}
+
+#[tokio::test]
+async fn p058_escalation_event_fk_rejects_orphan_insert() {
+    // foreign_keys=ON is set by create_pool; inserting an event for a non-existent
+    // ledger_id must fail with a FK violation, proving the constraint is enforced.
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let now = chrono::Utc::now();
+
+    let orphan_event = domain::escalation::EscalationEvent {
+        id: "event-orphan".into(),
+        escalation_ledger_id: "nonexistent-ledger-id".into(),
+        event_kind_raw: "escalation.tier_selected".into(),
+        tier_id: None,
+        tier_kind_raw: None,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        payload_json: None,
+        redaction_version: Some("redaction_v1".into()),
+        created_at: now,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let result = escalation::insert_event_tx(&mut tx, &orphan_event).await;
+    assert!(
+        result.is_err(),
+        "insert_event_tx must fail for orphan escalation_ledger_id (FK constraint)"
+    );
 }

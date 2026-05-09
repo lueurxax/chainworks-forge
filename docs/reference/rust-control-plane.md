@@ -23,7 +23,7 @@ The Rust control-plane daemon is a server-side parity replica of the orchestrati
 - cancellation flow
 - projection updates for read models
 - ACP runtime adapter coordination
-- command journaling and startup repair
+- escalation ledger persistence (Phase 0-1: domain enums, three SQLite tables, repo-layer redaction enforcement, `run_escalation_readback` GraphQL query)
 
 The daemon runs alongside the desktop application on the same machine. During the current phase, the SwiftUI client remains the canonical user-facing owner. The daemon provides shadow truth through GraphQL and MCP, validated before any authority transfer.
 
@@ -82,8 +82,8 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
 
 | Crate | Path | Role |
 |---|---|---|
-| `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events. No I/O. |
-| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules, work item types. |
+| `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events, and escalation ledger models. No I/O. |
+| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules (including escalation), work item types. |
 | `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
 | `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus, mediation settlement, and run-start rollout-contract preflight. |
@@ -119,8 +119,8 @@ for the full authentication and capability filtering reference.
 
 Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
 
-**Implementation self-assessment summary extension:**
-The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
+**Escalation chain readback (Phase 0-1):**
+A dedicated `runEscalationReadback` query exposes ledger chains, events, and execution metadata. Full `Run`-type escalation fields (`featureFlagState`, `wouldSelectTierId`, `policyDriftState`, etc.) are planned for Phase 2+.
 
 Mutations: `approveApproval`, `rejectApproval`.
 
@@ -334,6 +334,12 @@ Each adapter reads its binary path from the environment at construction and spaw
 
 ## Persistence model
 
+### Escalation Ledger
+Escalation state is persisted in three main tables:
+1. `escalation_ledger`: Tracks the current state, active tier, and aggregate counters for a chain.
+2. `escalation_execution_metadata`: Stores per-attempt attribution (tier_id, trigger, digest_version).
+3. `escalation_events`: A journal of transitions (tier_advanced, chain_exhausted, pause_reason).
+
 ### SQLite configuration
 
 The `db` crate creates the pool at `crates/db/src/pool.rs`:
@@ -431,6 +437,9 @@ The database schema is evolved through migrations located at `control-plane/crat
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
+| `escalation_ledger` | Tracks the current state, active tier, and aggregate counters for an escalation chain |
+| `escalation_execution_metadata` | Stores per-attempt attribution (tier_id, trigger, digest_version) for escalation executions |
+| `escalation_events` | A journal of transitions (tier_advanced, chain_exhausted, pause_reason) for escalation chains |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
 | `agent_executions` | Per-agent invocation records (status, **actual_toolchain_mapping_diagnostics_json**, etc.) |
 | `workflow_conflicts` | Blocking graph-authority conflicts (run_id, fingerprint, status, reason, current_mediation_id) |
@@ -497,14 +506,9 @@ The control plane records rollout metrics as durable `workflow_conflict_metric_e
 rows so operator feedback and dogfood gates are auditable from repository-backed
 state, not only process logs.
 
-### Rollout Metrics
+### Escalation Metrics (Planned — Phase 2+)
 
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `workflow_conflict_time_to_resolution_seconds` | Histogram event | `conflict_reason`, `resolution_mode` | Time from conflict detection to resolution or terminal settlement. |
-| `conflict_reason_to_action_outcome_total` | Counter event | `conflict_reason`, `action_class`, `terminal_status` | Counts outcomes (resolved, terminal, superseded) per conflict reason. |
-| `recovery_action_chosen_total` | Counter event | `conflict_reason`, `action_class`, `source_surface`, `result` | Counts chosen recovery actions (retry, clone, manual_fallback). |
-| `phase_c_validation_outcome_total` | Counter | `outcome` | Phase C validation results: `static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`. |
+The escalation metrics listed in proposal p058-r14 (e.g. `escalation_chains_started_total`, `escalation_tier_success_rate`, `provider_session_kill_latency_seconds`) are not yet emitted. They will be wired when the scheduler-owned tier advancement, capacity probe, and force-detach behavior is implemented.
 
 ## Work queue
 

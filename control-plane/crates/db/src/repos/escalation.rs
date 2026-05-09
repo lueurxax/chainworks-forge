@@ -1,8 +1,18 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::escalation::{EscalationEvent, EscalationExecutionMetadata, EscalationLedger};
 use domain::ids::RunId;
+
+/// Validate that `value` is well-formed JSON if present.
+/// The proposal requires repository-layer JSON rejection even without sqlite json1.
+fn validate_json_field(field_name: &str, value: &Option<String>) -> Result<()> {
+    if let Some(json_str) = value {
+        serde_json::from_str::<serde_json::Value>(json_str)
+            .map_err(|e| anyhow!("field {field_name} contains malformed JSON: {e}"))?;
+    }
+    Ok(())
+}
 
 pub async fn insert_ledger(pool: &SqlitePool, ledger: &EscalationLedger) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -248,11 +258,25 @@ pub async fn insert_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
     event: &EscalationEvent,
 ) -> Result<()> {
+    // Reject malformed JSON before writing — required by proposal even without sqlite json1.
+    validate_json_field("payload_json", &event.payload_json)?;
+    // Reject missing or unrecognized redaction_version — proposal mandates a known stamp on every event write.
+    // Allowlist prevents arbitrary strings from satisfying the not-null contract.
+    const KNOWN_REDACTION_VERSIONS: &[&str] = &["redaction_v1"];
+    match event.redaction_version.as_deref() {
+        None => bail!("escalation_events.redaction_version is required; caller must supply a redaction stamp"),
+        Some(v) if !KNOWN_REDACTION_VERSIONS.contains(&v) => bail!(
+            "escalation_events.redaction_version '{}' is not in the known allowlist {:?}",
+            v, KNOWN_REDACTION_VERSIONS
+        ),
+        _ => {}
+    }
+
     sqlx::query(
         r#"INSERT INTO escalation_events
            (id, escalation_ledger_id, event_kind_raw, tier_id, tier_kind_raw,
-            trigger_raw, pause_reason_raw, payload_json, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            trigger_raw, pause_reason_raw, payload_json, redaction_version, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
     )
     .bind(&event.id)
     .bind(&event.escalation_ledger_id)
@@ -262,6 +286,7 @@ pub async fn insert_event_tx(
     .bind(&event.trigger_raw)
     .bind(&event.pause_reason_raw)
     .bind(&event.payload_json)
+    .bind(&event.redaction_version)
     .bind(event.created_at.to_rfc3339())
     .execute(&mut **tx)
     .await?;
@@ -274,7 +299,7 @@ pub async fn find_events_by_ledger(
 ) -> Result<Vec<EscalationEvent>> {
     let rows = sqlx::query(
         r#"SELECT id, escalation_ledger_id, event_kind_raw, tier_id, tier_kind_raw,
-                  trigger_raw, pause_reason_raw, payload_json, created_at
+                  trigger_raw, pause_reason_raw, payload_json, redaction_version, created_at
            FROM escalation_events
            WHERE escalation_ledger_id = ?
            ORDER BY created_at ASC"#,
@@ -295,10 +320,43 @@ pub async fn find_events_by_ledger(
                 trigger_raw: row.try_get("trigger_raw")?,
                 pause_reason_raw: row.try_get("pause_reason_raw")?,
                 payload_json: row.try_get("payload_json")?,
+                redaction_version: row.try_get("redaction_version")?,
                 created_at: created_at_str
                     .parse()
                     .map_err(|e| anyhow!("bad created_at: {e}"))?,
             })
         })
         .collect()
+}
+
+/// Validate and persist the shadow escalation columns on agent_execution_runtime_facts.
+/// `would_select_decision_json` must be well-formed JSON if present — proposal mandate.
+pub async fn update_shadow_escalation_columns_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_execution_id: &str,
+    would_select_tier_id: Option<&str>,
+    would_select_trigger_raw: Option<&str>,
+    would_select_decision_json: Option<&str>,
+) -> Result<()> {
+    validate_json_field("would_select_decision_json", &would_select_decision_json.map(str::to_owned))?;
+
+    let rows_affected = sqlx::query(
+        r#"UPDATE agent_execution_runtime_facts SET
+           would_select_tier_id     = ?1,
+           would_select_trigger_raw = ?2,
+           would_select_decision_json = ?3
+           WHERE agent_execution_id = ?4"#,
+    )
+    .bind(would_select_tier_id)
+    .bind(would_select_trigger_raw)
+    .bind(would_select_decision_json)
+    .bind(agent_execution_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        bail!("no agent_execution_runtime_facts row found for agent_execution_id={agent_execution_id}");
+    }
+    Ok(())
 }

@@ -441,6 +441,19 @@ impl QueryRoot {
         Ok(items.into_iter().map(GqlAgentExecution::from).collect())
     }
 
+    async fn run_escalation_readback(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<crate::types::escalation::GqlEscalationRunReadback> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        crate::types::escalation::run_escalation_readback(pool, run_id).await
+    }
+
     async fn steward_analyses(
         &self,
         ctx: &Context<'_>,
@@ -2157,6 +2170,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -2804,6 +2824,13 @@ mod tests {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)

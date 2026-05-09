@@ -512,6 +512,13 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -1729,6 +1736,13 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -1929,6 +1943,13 @@ async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -2201,6 +2222,13 @@ async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -2338,6 +2366,13 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await

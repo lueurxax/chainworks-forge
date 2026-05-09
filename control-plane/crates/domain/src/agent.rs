@@ -102,6 +102,28 @@ pub struct AgentExecution {
     /// mapping_state=legacy_row_unavailable northbound).
     #[serde(default)]
     pub actual_toolchain_mapping_diagnostics_json: Option<String>,
+    // ── P058: Escalation policy attribution columns ────────────────────────────
+    /// Escalation policy ID that governed this execution, if any.
+    #[serde(default)]
+    pub escalation_policy_id: Option<String>,
+    /// Policy content hash at the time this execution was scheduled.
+    #[serde(default)]
+    pub escalation_policy_hash: Option<String>,
+    /// Tier ID within the escalation chain that this execution belongs to.
+    #[serde(default)]
+    pub escalation_tier_id: Option<String>,
+    /// Raw tier kind (same_backend_retry | backend_profile | lead_mediation | pause).
+    #[serde(default)]
+    pub escalation_tier_kind_raw: Option<String>,
+    /// Raw trigger code that caused this tier to be selected.
+    #[serde(default)]
+    pub escalation_trigger_raw: Option<String>,
+    /// Digest version stamp for the blocker digest used at trigger classification.
+    #[serde(default)]
+    pub escalation_digest_version: Option<String>,
+    /// FK into escalation_ledger.id for the chain this execution belongs to.
+    #[serde(default)]
+    pub escalation_ledger_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -14,15 +14,21 @@ This document describes the SwiftData persistence layer of Chainworks Forge. All
                      ┌────▼─────┐          ┌─────▼───────┐
                      │ Approval │          │   Agent     │
                      │          │          │  Execution  │
-                     └──────────┘          └─────┬───────┘
-                          │                      │ *
-              ┌───────────▼───────────┐    ┌─────▼───────┐
-              │ Lead Mediation (Rust) │    │  Artifact   │
-              └───────────┬───────────┘    └─────────────┘
-                          │ 1
-              ┌───────────▼───────────┐
-              │  Confirmation (Rust)  │
-              └───────────────────────┘
+                     └──────────┘          └────┬──┬─────┘
+                          │                     │  │ *
+              ┌───────────▼───────────┐         │ ┌▼──────────┐
+              │ Lead Mediation (Rust) │◀────────┘ │ Artifact   │
+              └───────────┬───────────┘           └────────────┘
+                          │ 1                   * ┌────────────┐
+              ┌───────────▼───────────┐         ┌▶│ Escalation │
+              │  Confirmation (Rust)  │         │ │   Chain    │
+              └───────────────────────┘         │ └─────┬──────┘
+                                                │       │ 1
+                                                │ *     ▼
+                                          ┌─────┴──────────────┐
+                                          │ Escalation Exec    │
+                                          │     Metadata       │
+                                          └────────────────────┘
 ```
 
 ## Models
@@ -498,3 +504,45 @@ let schema = Schema([
     Artifact.self,
 ])
 ```
+
+## Escalation Models (Rust-owned Projections)
+
+Escalation state is owned by the Rust control plane. The macOS app reads these as DTOs via GraphQL. All enum-like fields use authoritative raw strings for forward compatibility; unknown future values must round-trip unchanged.
+
+### `EscalationChainStateDTO`
+
+Represents one active or historical escalation chain for a specific agent execution.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique ledger identifier |
+| `runId` | `String` | Target run ID |
+| `stageId` | `String` | Originating stage ID |
+| `agentId` | `String` | Originating agent ID |
+| `policyId` | `String` | Resolved `escalation_policy_v1` ID |
+| `policyHash` | `String` | Hash of the frozen policy used at chain start |
+| `statusRaw` | `String` | `active` · `paused` · `exhausted` · `cancelled` |
+| `currentTierId` | `String?` | ID of the currently active tier |
+| `currentTierKindRaw` | `String?` | `same_backend_retry` · `backend_profile` · `lead_mediation` · `pause` |
+| `chainAttemptIndex` | `Int` | 0-based index of the attempt in the overall chain |
+| `triggerRaw` | `String?` | Raw trigger code (e.g. `repeated_same_blocker_digest`, `transport_failure`) |
+| `pauseReasonRaw` | `String?` | Raw pause reason code (e.g. `capacity_probe_failed`, `escalation_policy_drift`) |
+| `operatorActionHint` | `String?` | Human-readable server-owned hint for the operator |
+| `runbookAnchor` | `String?` | Slug for runbook lookup in `docs/runbooks/escalation` |
+| `createdAt` | `String` | RFC3339 timestamp |
+| `updatedAt` | `String` | RFC3339 timestamp |
+
+### `EscalationSnapshot`
+
+An immutable presentation snapshot produced by `EscalationReadAdapter`. Consumed by SwiftUI views to render the escalation UI.
+
+| Field | Type | Notes |
+|---|---|---|
+| `runId` | `String` | Target run ID |
+| `activeChains` | `[EscalationChainStateDTO]` | All escalation chains for the run |
+| `pauseReasonRaw` | `String?` | Dominant pause reason from the first paused chain |
+| `isKillSwitchEngaged` | `Bool` | `true` if any chain is paused with `escalation_kill_switch_engaged` |
+| `isPolicyDrift` | `Bool` | `true` if any chain is paused with `escalation_policy_drift` |
+| `hasActiveEscalation` | `Bool` | `true` if there are any chains (active or paused) |
+| `pausedChainCount` | `Int` | Count of chains in `paused` or `exhausted` state |
+

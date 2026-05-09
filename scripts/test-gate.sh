@@ -2193,7 +2193,7 @@ Available gates:
   proposal-051|p051  Proposal 051 shared Xcode MCP bridge pool fixture/readback gate
   proposal-053    Proposal 053 bounded ACP artifact discovery gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
-  proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
+  proposal-058    Proposal 058 ACP failure classification, artifact ownership, and escalation schema gate
   proposal-060|p060  Proposal 060 Phase 0a/0b control artifact wrapper gate
   proposal-060-baseline|p060-baseline
                   Proposal 060 proposal-review baseline control artifact gate
@@ -4769,16 +4769,17 @@ PY
     log "Proposal 053 control-plane gate passed"
     ;;
   proposal-058|p058)
-    log "Proposal 058 control-plane gate: ACP provider failure classification and session artifact ownership"
+    log "Proposal 058 control-plane gate: ACP provider failure classification, artifact ownership, and escalation schema (Phase 0-1)"
     (
       cd "$ROOT_DIR/control-plane"
       cargo test -p domain --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p engine proposal_058 --lib -- --test-threads=1 --nocapture &&
       cargo test -p db --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
-      CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR="$TMP_BASE/proposal-058-db-claim-target" cargo test -p db --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
+      cargo test -p db --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
       cargo test -p graphql-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
-      CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR="$TMP_BASE/proposal-058-mcp-target" cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
+      cargo test -p engine --test proposal_058_escalation_schema -- --test-threads=1 --nocapture &&
       cargo check -p engine &&
       cargo check -p graphql-server &&
       cargo check -p mcp-server
@@ -4794,6 +4795,8 @@ required = [
     "artifact source-generation claims",
     "superseded_pending_retry",
     "GraphQL/MCP runtime-facts parity",
+    "escalation_policy_v1 schema",
+    "redaction_version",
 ]
 for item in required:
     if item not in text:

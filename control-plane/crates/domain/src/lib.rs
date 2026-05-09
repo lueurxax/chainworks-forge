@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod approval;
+pub mod escalation;
 pub mod artifact;
 pub mod artifact_contracts;
 pub mod capabilities;
