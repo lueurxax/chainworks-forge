@@ -96,6 +96,33 @@ pub fn tool_specs() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "effects.mark_conflict".to_string(),
+            description: concat!(
+                "Mark a side-effect as conflict when external state is ambiguous and manual ",
+                "resolution is required. Requires disposition_id for audit idempotency. ",
+                "Allowed source statuses: needs_reconciliation, executing, externally_observed."
+            )
+            .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["effect_id", "disposition_id", "decision_json"],
+                "properties": {
+                    "effect_id": {
+                        "type": "string",
+                        "description": "The side-effect ID"
+                    },
+                    "disposition_id": {
+                        "type": "string",
+                        "description": "Unique disposition ID for audit idempotency"
+                    },
+                    "decision_json": {
+                        "type": "string",
+                        "description": "JSON payload describing the conflict determination"
+                    }
+                }
+            }),
+        },
+        McpTool {
             name: "effects.clear_after_manual_verification".to_string(),
             description: concat!(
                 "Clear a side-effect after operator manual verification. ",
@@ -271,6 +298,94 @@ pub async fn handle_effects_reconcile(
         "retry_forbidden": true,
         "updated_at": effect.updated_at.to_rfc3339()
     }))
+}
+
+pub async fn handle_effects_mark_conflict(
+    pool: &SqlitePool,
+    params: &serde_json::Value,
+    applied_by: &str,
+) -> Result<serde_json::Value> {
+    let effect_id_str = params
+        .get("effect_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!(MCP_ERROR_EFFECT_NOT_FOUND))?;
+    let disposition_id = params
+        .get("disposition_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("disposition_id is required"))?;
+    let decision_json = params
+        .get("decision_json")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("decision_json is required"))?;
+
+    validate_uuid_format(effect_id_str, "effect_id")?;
+    validate_uuid_format(disposition_id, "disposition_id")?;
+
+    if decision_json.len() > DECISION_JSON_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "decision_json_too_large: decision_json exceeds {} byte limit",
+            DECISION_JSON_MAX_BYTES
+        ));
+    }
+
+    let decision_value: serde_json::Value = serde_json::from_str(decision_json)
+        .map_err(|e| anyhow::anyhow!("decision_json must be valid JSON: {e}"))?;
+
+    validate_decision_v1_schema(&decision_value)?;
+
+    let decision_hash = compute_hash(decision_json);
+    let effect_id = SideEffectId::from_str(effect_id_str);
+
+    let effect = side_effects::find_by_id(pool, &effect_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(MCP_ERROR_EFFECT_NOT_FOUND))?;
+
+    // Only allow transitioning to conflict from needs_reconciliation.
+    // Executor handles executing -> conflict via executor_settle_cas.
+    if effect.status != SideEffectStatus::NeedsReconciliation {
+        return Err(anyhow::anyhow!(
+            "{}: cannot mark_conflict from status {} — only needs_reconciliation is allowed",
+            MCP_ERROR_INVALID_STATUS_TRANSITION,
+            effect.status
+        ));
+    }
+
+    let outcome = apply_operator_disposition(
+        pool,
+        &effect_id,
+        SideEffectStatus::Conflict,
+        "mcp_operator",
+        disposition_id,
+        decision_json,
+        &decision_hash,
+        applied_by,
+        Utc::now(),
+    )
+    .await?;
+
+    match outcome {
+        DispositionOutcome::Applied => Ok(serde_json::json!({
+            "status": "applied",
+            "effect_id": effect_id_str,
+            "new_status": "conflict",
+            "disposition_id": disposition_id
+        })),
+        DispositionOutcome::AlreadyApplied => Ok(serde_json::json!({
+            "status": "already_applied",
+            "effect_id": effect_id_str,
+            "disposition_id": disposition_id
+        })),
+        DispositionOutcome::PayloadMismatch => Err(anyhow::anyhow!(
+            "{}: disposition_id {} already used with different payload",
+            MCP_ERROR_DISPOSITION_PAYLOAD_MISMATCH,
+            disposition_id
+        )),
+        DispositionOutcome::NotApplicable => Err(anyhow::anyhow!(
+            "{}: effect {} is not in a state that allows mark_conflict",
+            MCP_ERROR_INVALID_STATUS_TRANSITION,
+            effect_id_str
+        )),
+    }
 }
 
 pub async fn handle_effects_mark_unrecoverable(
@@ -454,8 +569,11 @@ pub async fn handle_effects_clear_after_manual_verification(
     }
 }
 
+const ALLOWED_DECISION_VALUES: &[&str] =
+    &["reconciled", "unrecoverable", "conflict", "cleared", "manual_verified"];
+
 /// Validate that a disposition payload conforms to the side_effect_decision_v1 schema.
-/// Required fields: schema_version="side_effect_decision_v1", decision (string), operator_notes.
+/// Per P078-SEC-MED-001: validates typed fields, allowed decision enum, non-empty operator_notes.
 fn validate_decision_v1_schema(value: &serde_json::Value) -> Result<()> {
     let obj = value.as_object().ok_or_else(|| {
         anyhow::anyhow!("insufficient_evidence: decision_json must be a JSON object")
@@ -477,15 +595,36 @@ fn validate_decision_v1_schema(value: &serde_json::Value) -> Result<()> {
         ));
     }
 
-    if !obj.contains_key("decision") {
+    // 'decision' must be a string with an allowed enum value.
+    let decision = obj
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "insufficient_evidence: decision_json 'decision' must be a non-null string"
+            )
+        })?;
+
+    if !ALLOWED_DECISION_VALUES.contains(&decision) {
         return Err(anyhow::anyhow!(
-            "insufficient_evidence: decision_json missing required field 'decision'"
+            "insufficient_evidence: decision_json 'decision' must be one of {:?}, got '{decision}'",
+            ALLOWED_DECISION_VALUES
         ));
     }
 
-    if !obj.contains_key("operator_notes") {
+    // 'operator_notes' must be a non-empty string.
+    let notes = obj
+        .get("operator_notes")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "insufficient_evidence: decision_json 'operator_notes' must be a non-null string"
+            )
+        })?;
+
+    if notes.trim().is_empty() {
         return Err(anyhow::anyhow!(
-            "insufficient_evidence: decision_json missing required field 'operator_notes'"
+            "insufficient_evidence: decision_json 'operator_notes' must not be empty"
         ));
     }
 
@@ -535,6 +674,9 @@ pub async fn execute(
         "effects.list" => handle_effects_list(pool, &params).await,
         "effects.inspect" => handle_effects_inspect(pool, &params).await,
         "effects.reconcile" => handle_effects_reconcile(pool, &params).await,
+        "effects.mark_conflict" => {
+            handle_effects_mark_conflict(pool, &params, &principal.id).await
+        }
         "effects.mark_unrecoverable" => {
             handle_effects_mark_unrecoverable(pool, &params, &principal.id).await
         }

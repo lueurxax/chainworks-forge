@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::side_effect::{
     SideEffect, SideEffectAttempt, SideEffectAttemptId, SideEffectId,
@@ -243,6 +243,41 @@ pub async fn list_unresolved_for_stage(
     rows.into_iter().map(parse_side_effect).collect()
 }
 
+/// Transaction-scoped variant of `list_unresolved_for_stage`. Callers that already
+/// hold an open `BEGIN IMMEDIATE` transaction on a single-connection pool must use
+/// this to avoid deadlocking against themselves on pool acquire.
+pub async fn list_unresolved_for_stage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    stage_execution_id: &str,
+) -> Result<Vec<SideEffect>> {
+    let rows = sqlx::query(
+        r#"SELECT id, run_id, stage_execution_id, agent_execution_id,
+                  effect_kind, target_key,
+                  idempotency_key, idempotency_key_version,
+                  request_fingerprint, request_fingerprint_version,
+                  status, owner_instance_id,
+                  lease_acquired_at, lease_renewed_at, lease_expires_at,
+                  deadline_at, external_write_started_at, external_write_attempted,
+                  attempt_budget_remaining, expected_evidence_json,
+                  observed_evidence_summary_json, evidence_root,
+                  last_error_kind, last_error, settlement_txn_id,
+                  created_at, updated_at
+           FROM side_effects
+           WHERE stage_execution_id = ?1
+             AND status IN (
+               'prepared','executing','externally_observed',
+               'needs_reconciliation','conflict','unrecoverable'
+             )
+           ORDER BY created_at ASC"#,
+    )
+    .bind(stage_execution_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("list unresolved side_effects for stage")?;
+
+    rows.into_iter().map(parse_side_effect).collect()
+}
+
 /// List unresolved effects for a run+target_key pair (cross-stage version-cutover check).
 /// Used to enforce that no two stages create concurrent intent for the same target_key.
 pub async fn list_unresolved_by_run_and_target_key(
@@ -449,6 +484,9 @@ pub async fn executor_settle_cas(
         crate::pool::begin_immediate_with_retry(pool, "side_effects.executor_settle_cas")
             .await?;
 
+    // Predicate is status-sensitive per proposal:
+    // - executing: require matching owner, live lease (>= now), and matching lease_renewed_at
+    // - externally_observed: require matching owner only (lease may have lapsed after external observation)
     let rows_updated: u64 = sqlx::query(
         r#"UPDATE side_effects
            SET status = ?1,
@@ -458,12 +496,16 @@ pub async fn executor_settle_cas(
                settlement_txn_id = ?5,
                updated_at = ?6
            WHERE id = ?7
-             AND status IN ('executing', 'externally_observed')
              AND owner_instance_id = ?8
-             AND lease_expires_at >= ?6
-             AND lease_renewed_at = ?9
              AND NOT EXISTS (
                SELECT 1 FROM side_effect_settlements WHERE side_effect_id = ?7
+             )
+             AND (
+               (status = 'executing'
+                AND lease_expires_at >= ?6
+                AND lease_renewed_at = ?9)
+               OR
+               (status = 'externally_observed')
              )"#,
     )
     .bind(&new_status_str)
@@ -485,7 +527,9 @@ pub async fn executor_settle_cas(
     }
 
     // Update attempt row completion — verify the attempt belongs to this effect.
-    sqlx::query(
+    // If zero rows are affected the attempt_id is wrong; roll back rather than
+    // leaving the effect settled with no matching attempt record.
+    let attempt_rows: u64 = sqlx::query(
         r#"UPDATE side_effect_attempts
            SET completed_at = ?1,
                exit_status = ?2,
@@ -508,7 +552,13 @@ pub async fn executor_settle_cas(
     .bind(params.effect_id.as_ref())
     .execute(&mut *tx)
     .await
-    .context("executor_settle_cas update attempt")?;
+    .context("executor_settle_cas update attempt")?
+    .rows_affected();
+
+    if attempt_rows != 1 {
+        // Attempt row does not match this effect — do not commit.
+        return Ok(false);
+    }
 
     // Insert settlement row
     sqlx::query(
@@ -699,6 +749,26 @@ pub async fn apply_operator_disposition(
         } else {
             return Ok(DispositionOutcome::PayloadMismatch);
         }
+    }
+
+    // Check if a settlement already exists for this effect (with a DIFFERENT disposition_id).
+    // The UNIQUE index on side_effect_id would cause an INSERT failure, so we detect this
+    // upfront and return NotApplicable rather than an opaque constraint error.
+    let existing_for_effect: Option<String> = sqlx::query_scalar(
+        r#"SELECT disposition_id FROM side_effect_settlements WHERE side_effect_id = ?1"#,
+    )
+    .bind(effect_id.as_ref())
+    .fetch_optional(pool)
+    .await
+    .context("check existing settlement for effect")?;
+
+    if let Some(existing_disp) = existing_for_effect {
+        if existing_disp == disposition_id {
+            // Same disposition_id — already handled by the check above; should not reach here.
+            return Ok(DispositionOutcome::AlreadyApplied);
+        }
+        // Settlement exists for this effect with a different disposition_id.
+        return Ok(DispositionOutcome::NotApplicable);
     }
 
     let settlement_id = SideEffectSettlementId::new();

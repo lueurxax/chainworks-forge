@@ -3,6 +3,10 @@
 -- Additive migration: creates side_effects, side_effect_attempts, and
 -- side_effect_settlements tables. Existing release receipts remain readable.
 -- No filesystem-dependent backfill is performed here.
+--
+-- P078-SEC-HIGH-001 fix: partial unique index on (run_id, target_key) for
+-- unresolved rows enforces DB-level atomicity so two concurrent callers
+-- cannot both prepare distinct idempotency keys for the same target.
 
 CREATE TABLE IF NOT EXISTS side_effects (
   id                              TEXT    PRIMARY KEY,
@@ -48,6 +52,16 @@ CREATE TABLE IF NOT EXISTS side_effects (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_side_effects_idempotency_key
   ON side_effects(idempotency_key);
+
+-- P078-SEC-HIGH-001: DB-enforced guard — at most one unresolved row per
+-- (run_id, target_key). Terminal statuses (settled, reconciled) are excluded
+-- so that a new intent for the same target can be prepared after closeout.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_side_effects_unresolved_run_target_key
+  ON side_effects(run_id, target_key)
+  WHERE status IN (
+    'prepared','executing','externally_observed',
+    'needs_reconciliation','conflict','unrecoverable'
+  );
 
 CREATE INDEX IF NOT EXISTS idx_side_effects_run_id
   ON side_effects(run_id);

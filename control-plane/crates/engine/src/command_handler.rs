@@ -41,7 +41,7 @@ use domain::PrincipalClass;
 use sha2::{Digest, Sha256};
 
 use crate::cancellation;
-use crate::side_effects::{run_cancel_preflight, DurableEffectCoordinator};
+use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight, DurableEffectCoordinator};
 use crate::closeout_fingerprint::{
     build_closeout_fingerprint, resolve_closeout_worktree_truth,
     CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
@@ -2381,14 +2381,10 @@ impl CommandHandler {
                     };
                 // Ledger-backed preflight: check actual unresolved side effects for this stage.
                 // Always enforced regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
-                let coord = DurableEffectCoordinator::new_with_enabled(
-                    self.pool.clone(),
-                    "command_handler".into(),
-                    false,
-                );
-                if let Err(ledger_err) = coord
-                    .retry_preflight(&c.run_id, &old_stage.id, None)
-                    .await
+                // Uses the open transaction to avoid deadlocking on pool acquire when
+                // max_connections=1 (in-memory SQLite in tests).
+                if let Err(ledger_err) =
+                    retry_preflight_within_tx(&mut retry_tx, &c.run_id, &old_stage.id, None).await
                 {
                     command_journal::fail_entry_tx(
                         &mut retry_tx,

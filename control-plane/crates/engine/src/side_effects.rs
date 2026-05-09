@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use chrono::{Duration, Utc};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use tracing::{info, warn};
 
 use db::repos::side_effects::{
-    self, executor_start_cas, reaper_transition_cas, DispositionOutcome,
-    ExecutorStartCasParams, ReaperTransitionCasParams,
+    self, executor_start_cas, list_unresolved_for_stage_tx, reaper_transition_cas,
+    DispositionOutcome, ExecutorStartCasParams, ReaperTransitionCasParams,
 };
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::side_effect::{
@@ -318,6 +318,57 @@ pub async fn run_cancel_preflight(pool: &SqlitePool, run_id: &RunId) -> Result<(
     warn!(
         run_id = %run_id,
         "requires_effect_reconciliation_denied: unresolved effects block cancel"
+    );
+
+    Err(anyhow!(
+        "requires_effect_reconciliation: {}",
+        serde_json::to_string(&envelope).unwrap_or_default()
+    ))
+}
+
+/// Transaction-scoped retry preflight. Equivalent to
+/// `DurableEffectCoordinator::retry_preflight` but reads through an already-open
+/// transaction rather than acquiring a new pool connection. Callers that hold a
+/// `BEGIN IMMEDIATE` transaction on a single-connection pool (in-memory SQLite in
+/// tests, or any heavily loaded single-connection pool) must use this variant to
+/// avoid deadlocking on pool acquire.
+pub async fn retry_preflight_within_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &RunId,
+    stage_execution_id: &StageExecutionId,
+    agent_execution_id: Option<&AgentExecutionId>,
+) -> Result<()> {
+    let unresolved = list_unresolved_for_stage_tx(tx, &stage_execution_id.to_string())
+        .await
+        .map_err(|e| {
+            warn!(
+                run_id = %run_id,
+                stage_execution_id = %stage_execution_id,
+                error = %e,
+                "side_effect_ledger_readback_error"
+            );
+            anyhow!("ledger_readback_error: {}", e)
+        })?;
+
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+
+    let effect_ids: Vec<String> = unresolved.iter().map(|e| e.id.to_string()).collect();
+    let reason = classify_unresolved_reason(&unresolved);
+
+    let envelope = RequiresEffectReconciliationEnvelope::new(
+        run_id,
+        stage_execution_id,
+        agent_execution_id,
+        effect_ids,
+        reason,
+    );
+
+    warn!(
+        run_id = %run_id,
+        stage_execution_id = %stage_execution_id,
+        "requires_effect_reconciliation_denied: unresolved effects block retry/cancel/recovery"
     );
 
     Err(anyhow!(
