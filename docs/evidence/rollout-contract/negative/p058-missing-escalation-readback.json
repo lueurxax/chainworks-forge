@@ -1,0 +1,24 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": ["proposal-058", "p058"],
+  "commands": {
+    "allowlist": ["./scripts/test-gate.sh proposal-058"]
+  },
+  "migrations": {
+    "not_applicable": false,
+    "description": "Escalation policy persistence and readback migration evidence is required."
+  },
+  "metrics": {
+    "adoption_metric": "escalation_chains_started_total"
+  },
+  "readback_lanes": ["run_report"],
+  "readback_fields": ["rollout_contract_status"],
+  "operator_report_fields": ["rollout_contract_status"],
+  "hold_conditions": [],
+  "rollback_disposition": {
+    "mode": "disable_escalation_policy_behavior_keep_readback",
+    "data_loss_risk": "low"
+  },
+  "decision_vocabulary": ["pass", "fail", "hold"]
+}

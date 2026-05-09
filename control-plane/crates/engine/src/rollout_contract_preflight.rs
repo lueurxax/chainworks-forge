@@ -1558,6 +1558,25 @@ struct RolloutContractSource {
     extraction_failures: Vec<String>,
 }
 
+pub(crate) fn approved_proposal_rollout_contract_lint_failures(
+    data: &[u8],
+    proposal_path: &std::path::Path,
+    workspace_root: &str,
+) -> Result<Vec<String>> {
+    let proposal_value: serde_json::Value = match serde_json::from_slice(data) {
+        Ok(value) => value,
+        Err(_) => return Ok(vec!["invalid_approved_proposal_artifact".to_string()]),
+    };
+    let Some(contract_source) =
+        extract_rollout_contract_source(&proposal_value, proposal_path, workspace_root)?
+    else {
+        return Ok(vec!["missing_rollout_contract_check".to_string()]);
+    };
+    let mut lint = lint_rollout_contract(&contract_source.contract, workspace_root);
+    lint.failures.extend(contract_source.extraction_failures);
+    Ok(lint.failures)
+}
+
 #[derive(Clone, Debug)]
 struct RolloutContractLint {
     failures: Vec<String>,

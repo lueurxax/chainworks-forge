@@ -258,25 +258,32 @@ async fn main() -> Result<()> {
 
     let work_queue = WorkQueue::new(pool.clone());
     let acp = Arc::new(AcpRuntimeManager::new());
-    let cmd_handler = Arc::new(CommandHandler::new_with_acp(
+    let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    let cmd_handler = Arc::new(CommandHandler::new_with_acp_capacity_and_db_writer(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
         acp.clone(),
+        domain::provider::InvokeAgentCapacityConfig::default(),
+        Some(db_writer.clone()),
     ));
-    let orchestrator = Arc::new(Orchestrator::new(
+    let orchestrator = Arc::new(Orchestrator::new_with_db_writer(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
+        db_writer.clone(),
     ));
-    let executor = Arc::new(BackgroundExecutor::new_with_steward_runtime_inputs(
-        pool.clone(),
-        work_queue.clone(),
-        orchestrator.clone(),
-        acp.clone(),
-        events.clone(),
-        steward_runtime_inputs.clone(),
-    ));
+    let executor = Arc::new(
+        BackgroundExecutor::new_with_steward_runtime_inputs_and_db_writer(
+            pool.clone(),
+            work_queue.clone(),
+            orchestrator.clone(),
+            acp.clone(),
+            events.clone(),
+            steward_runtime_inputs.clone(),
+            Some(db_writer.clone()),
+        ),
+    );
     // Startup recovery: repair any run left mid-flight by a previous crash.
     let recovery = RecoveryService::new(pool.clone(), work_queue.clone(), events.clone());
     let summary = recovery.run_startup_repair().await?;
@@ -286,6 +293,28 @@ async fn main() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
+    match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
+        Ok(summary) => {
+            info!(
+                roots_inspected = summary.roots_inspected,
+                roots_missing = summary.roots_missing,
+                scanned_files = summary.scanned_files,
+                already_indexed = summary.already_indexed,
+                recovered_orphans = summary.recovered_orphans,
+                skipped_files = summary.skipped_files,
+                bytes_read = summary.bytes_read,
+                truncated = summary.truncated,
+                errors = summary.errors,
+                "P075 startup evidence orphan sweep complete"
+            );
+        }
+        Err(err) => {
+            warn!(
+                err = %err,
+                "P075 startup evidence orphan sweep could not enumerate active runs"
+            );
+        }
+    }
     let host_interruption_service =
         HostInterruptionService::with_capacity_config_and_runtime_cleanup(
             pool.clone(),
@@ -315,29 +344,32 @@ async fn main() -> Result<()> {
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
-            let mcp = mcp_server::server::McpServer::new(
+            let mcp = mcp_server::server::McpServer::new_with_storage_writer(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table,
+                db_writer.heartbeat.clone(),
             );
             mcp.run_stdio().await?;
         }
         _ => {
             // Daemon mode: GraphQL + MCP HTTP on the same port.
-            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new(
+            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new_with_storage_writer(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table.clone(),
+                db_writer.heartbeat.clone(),
             ));
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
-            let schema = graphql_server::schema::build_schema(
+            let schema = graphql_server::schema::build_schema_with_storage_writer(
                 pool.clone(),
                 cmd_handler.clone(),
                 events.clone(),
                 principal_table.clone(),
                 reporter.clone(),
+                db_writer.heartbeat.clone(),
             );
 
             // §7.3 port fallback: bind the listener here so the

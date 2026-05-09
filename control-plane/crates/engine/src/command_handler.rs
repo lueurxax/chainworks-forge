@@ -16,6 +16,8 @@ use db::repos::{
     retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
@@ -57,6 +59,7 @@ pub struct CommandHandler {
     pool: SqlitePool,
     events: EventSender,
     work_queue: WorkQueue,
+    db_writer: Arc<DbWriter>,
     acp: Option<Arc<AcpRuntimeManager>>,
     capacity_config: Arc<InvokeAgentCapacityConfig>,
     retry_stage_failure_injection: Option<Arc<dyn Fn(&str) -> Result<()> + Send + Sync>>,
@@ -1431,10 +1434,12 @@ impl CommandHandler {
         work_queue: WorkQueue,
         capacity_config: InvokeAgentCapacityConfig,
     ) -> Self {
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
             events,
             work_queue,
+            db_writer,
             acp: None,
             capacity_config: Arc::new(capacity_config),
             retry_stage_failure_injection: None,
@@ -1463,14 +1468,47 @@ impl CommandHandler {
         acp: Arc<AcpRuntimeManager>,
         capacity_config: InvokeAgentCapacityConfig,
     ) -> Self {
+        Self::new_with_acp_capacity_and_db_writer(
+            pool,
+            events,
+            work_queue,
+            acp,
+            capacity_config,
+            None,
+        )
+    }
+
+    pub fn new_with_acp_capacity_and_db_writer(
+        pool: SqlitePool,
+        events: EventSender,
+        work_queue: WorkQueue,
+        acp: Arc<AcpRuntimeManager>,
+        capacity_config: InvokeAgentCapacityConfig,
+        db_writer: Option<Arc<DbWriter>>,
+    ) -> Self {
+        let db_writer = db_writer.unwrap_or_else(|| Arc::new(DbWriter::new(pool.clone())));
         Self {
             pool,
             events,
             work_queue,
+            db_writer,
             acp: Some(acp),
             capacity_config: Arc::new(capacity_config),
             retry_stage_failure_injection: None,
         }
+    }
+
+    async fn begin_command_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<db::writer::QueuedTransaction> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::OperatorCommand, idempotency_key),
+                operation_name,
+            )
+            .await
     }
 
     pub fn with_retry_stage_failure_injection(
@@ -1712,8 +1750,9 @@ impl CommandHandler {
                 let phase_b_dogfood_snapshot =
                     phase_b_dogfood_exit_metric_snapshot(&c.workspace_root);
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.StartRun").await?;
+                let mut tx = self
+                    .begin_command_transaction("command.StartRun", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -1963,9 +2002,9 @@ impl CommandHandler {
                     .check_has_post_approval_tasks(c.run_id, &c.stage_id)
                     .await;
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.ApproveStage")
-                        .await?;
+                let mut tx = self
+                    .begin_command_transaction("command.ApproveStage", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -2093,8 +2132,9 @@ impl CommandHandler {
             Command::RejectStage(c) => {
                 let now = Utc::now();
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.RejectStage").await?;
+                let mut tx = self
+                    .begin_command_transaction("command.RejectStage", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -2247,8 +2287,9 @@ impl CommandHandler {
 
                 let now = Utc::now();
                 let retry_tx_started = Instant::now();
-                let mut retry_tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
+                let mut retry_tx = self
+                    .begin_command_transaction("command.RetryStage", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut retry_tx,
                     &journal.id,
@@ -2438,7 +2479,7 @@ impl CommandHandler {
                     .bind(RunStatus::Running.to_string())
                     .bind(c.stage_id.clone())
                     .bind(c.run_id.to_string())
-                    .execute(&mut *retry_tx)
+                    .execute(&mut **retry_tx)
                     .await?;
                 self.maybe_inject_retry_stage_failure("update_run_for_retry")?;
                 supersede_current_workflow_conflict_for_stage_retry_tx(
@@ -2577,11 +2618,12 @@ impl CommandHandler {
 
                 let now = Utc::now();
                 let tx_started = Instant::now();
-                let mut tx = db::pool::begin_immediate_with_retry(
-                    &self.pool,
-                    "command.ResolveWorkflowConflictTransition",
-                )
-                .await?;
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.ResolveWorkflowConflictTransition",
+                        journal.id.clone(),
+                    )
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -2756,7 +2798,7 @@ impl CommandHandler {
                     .bind(RunStatus::Running.to_string())
                     .bind(&selected_next_state_id)
                     .bind(c.run_id.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
                 workflow_conflicts::upsert_transition_cursor_tx(
                     &mut tx,
@@ -2880,11 +2922,12 @@ impl CommandHandler {
                     journal_id: journal_id.to_string(),
                 };
                 let tx_started = Instant::now();
-                let mut tx = db::pool::begin_immediate_with_retry(
-                    &self.pool,
-                    "command.OverrideLegacyDiscoveryPolicy",
-                )
-                .await?;
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.OverrideLegacyDiscoveryPolicy",
+                        journal.id.clone(),
+                    )
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -2920,8 +2963,9 @@ impl CommandHandler {
             Command::CancelRun(c) => {
                 let now = Utc::now();
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.CancelRun").await?;
+                let mut tx = self
+                    .begin_command_transaction("command.CancelRun", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -3040,11 +3084,12 @@ impl CommandHandler {
 
                 let now = Utc::now();
                 let tx_started = Instant::now();
-                let mut tx = db::pool::begin_immediate_with_retry(
-                    &self.pool,
-                    "command.ResolveLeadMediationConfirmation",
-                )
-                .await?;
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.ResolveLeadMediationConfirmation",
+                        journal.id.clone(),
+                    )
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -3316,9 +3361,9 @@ impl CommandHandler {
             Command::ResetSession(c) => {
                 let now = Utc::now();
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.ResetSession")
-                        .await?;
+                let mut tx = self
+                    .begin_command_transaction("command.ResetSession", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -3444,9 +3489,9 @@ impl CommandHandler {
                 };
 
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.ResolveApproval")
-                        .await?;
+                let mut tx = self
+                    .begin_command_transaction("command.ResolveApproval", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -3583,7 +3628,7 @@ impl CommandHandler {
                                 .bind(RunStatus::Running.to_string())
                                 .bind("state_10_implementation_refined")
                                 .bind(authoritative_run_id.to_string())
-                                .execute(&mut *tx)
+                                .execute(&mut **tx)
                                 .await?;
                                 supersede_current_workflow_conflict_for_manual_release_rejection_tx(
                                     &mut tx,
@@ -3734,9 +3779,9 @@ impl CommandHandler {
                 )?;
 
                 let tx_started = Instant::now();
-                let mut tx =
-                    db::pool::begin_immediate_with_retry(&self.pool, "command.SettleProposalGate")
-                        .await?;
+                let mut tx = self
+                    .begin_command_transaction("command.SettleProposalGate", journal.id.clone())
+                    .await?;
                 command_journal::record_tx(
                     &mut tx,
                     &journal.id,
@@ -3914,8 +3959,9 @@ impl CommandHandler {
         let retry_advance_work_item_id = new_stage.id.to_string();
         let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
         let retry_tx_started = Instant::now();
-        let mut retry_tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "command.RetryStage").await?;
+        let mut retry_tx = self
+            .begin_command_transaction("command.RetryStage", journal.id.clone())
+            .await?;
         command_journal::record_tx(
             &mut retry_tx,
             &journal.id,
@@ -3959,7 +4005,7 @@ impl CommandHandler {
             .bind(RunStatus::Running.to_string())
             .bind(stage_id)
             .bind(run_id.to_string())
-            .execute(&mut *retry_tx)
+            .execute(&mut **retry_tx)
             .await?;
         supersede_current_workflow_conflict_for_stage_retry_tx(
             &mut retry_tx,
@@ -4295,8 +4341,9 @@ impl CommandHandler {
         }
 
         let retry_tx_started = Instant::now();
-        let mut retry_tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "command.RetryAgentExecution").await?;
+        let mut retry_tx = self
+            .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())
+            .await?;
         command_journal::record_tx(
             &mut retry_tx,
             &journal.id,
@@ -4332,7 +4379,7 @@ impl CommandHandler {
             .bind(RunStatus::Running.to_string())
             .bind(stage_id)
             .bind(run_id.to_string())
-            .execute(&mut *retry_tx)
+            .execute(&mut **retry_tx)
             .await?;
         // P065: create parent binding + child delivery for targeted retry
         let retry_instruction_binding_id = if let Some(instruction_text) = validated_instruction {
@@ -4429,7 +4476,9 @@ impl CommandHandler {
         context: &'static str,
     ) -> Result<()> {
         let tx_started = Instant::now();
-        let mut tx = db::pool::begin_immediate_with_retry(&self.pool, context).await?;
+        let mut tx = self
+            .begin_command_transaction(context, journal.id.clone())
+            .await?;
         command_journal::record_tx(
             &mut tx,
             &journal.id,
@@ -4458,7 +4507,9 @@ impl CommandHandler {
         error: &str,
     ) -> Result<()> {
         let tx_started = Instant::now();
-        let mut tx = db::pool::begin_immediate_with_retry(&self.pool, context).await?;
+        let mut tx = self
+            .begin_command_transaction(context, journal.id.clone())
+            .await?;
         command_journal::record_tx(
             &mut tx,
             &journal.id,
