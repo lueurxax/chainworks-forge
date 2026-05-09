@@ -76,6 +76,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
 - [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client
+- [reference/thin-client-read-model-affordance-contract.md](reference/thin-client-read-model-affordance-contract.md) — Thin-client affordance contract: GraphQL-driven UI state, actionability, and fallback copy
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Workflow topology and agent-activity surface
 - [reference/artifact-content-rendering.md](reference/artifact-content-rendering.md) — Unified read-only markdown/JSON rendering

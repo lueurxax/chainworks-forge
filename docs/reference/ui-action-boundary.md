@@ -73,5 +73,6 @@ SQLite is internal daemon storage, not an automation API.
 ## Owner References
 
 - GraphQL projection read shape: [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
+- Thin-client affordance contract: [thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md)
 - MCP command/control surface: [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
 - Operator shell behavior: [operator-experience.md](operator-experience.md)

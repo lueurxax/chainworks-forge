@@ -1,0 +1,30 @@
+{
+  "scenario": "p085-approval-actionability-mismatch",
+  "description": "Approve button rendered actionable even though availableActions is empty and writePathState is not available. Violates approval.resolve.approve contract row: actionable_state requires durable approval state pending, caller policy allows approve, availableActions contains 'approve', writePathState == available, and approveApproval is authorized.",
+  "contract_violation": "approval_parity_mismatch",
+  "hold_condition": "Approve/reject buttons may not render unless durable approval state, caller policy, typed action availability, and GraphQL mutation authorization agree.",
+  "simulated_read_model": {
+    "approval": {
+      "id": "appr-bad-1",
+      "runId": "run-1",
+      "stageId": "state_11_manual_release",
+      "decision": null,
+      "freshnessState": "live",
+      "disabledReasonCode": "WRITE_PATH_NOT_AVAILABLE",
+      "writePathState": "write_path_not_available",
+      "availableActions": [],
+      "diagnosticId": "diag-bad-1",
+      "serverDebugDetail": null
+    }
+  },
+  "simulated_presenter_output": {
+    "approveAvailability": "actionable",
+    "description": "BUG: presenter returned actionable despite writePathState=write_path_not_available and empty availableActions"
+  },
+  "expected_presenter_output": {
+    "approveAvailability": "disabled",
+    "reasonCode": "WRITE_PATH_NOT_AVAILABLE"
+  },
+  "p085_contract_row": "approval.resolve.approve",
+  "p085_revision": "p085-r2-2026-05-08"
+}

@@ -1,0 +1,28 @@
+{
+  "scenario": "p085-payload-deferred-marked-unavailable",
+  "description": "An artifact list row with payloadAvailabilityState=payload_deferred is rendered with 'Unavailable' label and no interactive open affordance. This collapses a previewable/deferred state into a terminal unavailable state, misleading the operator into thinking the artifact cannot be opened. Violates artifact.preview.listLabel contract row: payload_deferred means previewable/deferred, not unavailable.",
+  "contract_violation": "payload_state_mismatch",
+  "hold_condition": "Deferred list payloads and metadata-only report states must be represented honestly and not collapsed into generic unavailable copy.",
+  "simulated_read_model": {
+    "artifact": {
+      "id": "artifact-deferred-1",
+      "name": "proposal.md",
+      "payloadAvailabilityState": "payload_deferred",
+      "payloadUnavailableReasonCode": "PAYLOAD_DEFERRED_BY_P031",
+      "freshnessState": "live"
+    }
+  },
+  "simulated_presenter_output": {
+    "label": "proposal.md — Unavailable",
+    "payloadPresentation": "unavailable",
+    "supportedInteractions": [],
+    "description": "BUG: presenter collapsed payload_deferred to unavailable; label says 'Unavailable' and no keyboard open affordance"
+  },
+  "expected_presenter_output": {
+    "label": "proposal.md — Open to preview",
+    "payloadPresentation": "deferred",
+    "supportedInteractions": ["list_row", "context_menu", "keyboard_default_open"]
+  },
+  "p085_contract_row": "artifact.preview.listLabel",
+  "p085_revision": "p085-r2-2026-05-08"
+}

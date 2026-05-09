@@ -1,0 +1,23 @@
+{
+  "scenario": "p085-payload-deferred-no-deadline",
+  "description": "An artifact with payloadAvailabilityState=generating has been in that state for an extended period. The server has not provided a staleness deadline or a stuck diagnostic. The operator UI shows 'Generating...' indefinitely with no escalation path. Violates the server-owned deadline/stalled diagnostic policy for generating and payload_deferred states.",
+  "contract_violation": "payload_deadline_missing",
+  "hold_condition": "Server-owned generating and payload_deferred states need deadline or stuck diagnostic semantics so the operator UI cannot wait indefinitely with no escalation path.",
+  "simulated_read_model": {
+    "artifact": {
+      "id": "artifact-stuck-1",
+      "name": "implementation.md",
+      "payloadAvailabilityState": "generating",
+      "payloadUnavailableReasonCode": "GENERATING",
+      "freshnessState": "live",
+      "stalenessDeadlineAt": null,
+      "stalledReasonCode": null,
+      "diagnosticId": null,
+      "serverDebugDetail": null
+    }
+  },
+  "problem": "No stalenessDeadlineAt, no stalledReasonCode, no diagnosticId — operator cannot determine if the server is stuck or still making progress. UI shows 'Generating...' forever.",
+  "resolution": "Server must either provide stalenessDeadlineAt or transition payloadAvailabilityState to a typed stalled/timed-out state with diagnosticId. Backend fixture must prove this transition with a test.",
+  "p085_contract_row": "artifact.preview.listLabel",
+  "p085_revision": "p085-r2-2026-05-08"
+}

@@ -1,0 +1,38 @@
+{
+  "scenario": "p085-unsafe-local-truth-fallback",
+  "description": "GraphQL returns an unauthorized error for artifact detail readback. Instead of surfacing the unauthorized state, Swift falls back to reading the artifact payload from SwiftData local storage or the raw filesystem path, and renders the content as if it were authorized. Violates the unauthorized_behavior requirement: unauthorized reads must deny or redact through the server contract; Swift cannot recover by reading local storage or artifacts as truth.",
+  "contract_violation": "unauthorized_fallback_violation",
+  "hold_condition": "Unauthorized reads must deny or redact through the server contract; Swift cannot recover by reading local storage or artifacts as truth.",
+  "simulated_graphql_response": {
+    "errors": [
+      {
+        "message": "Not authorized to read artifact payload",
+        "extensions": {
+          "code": "UNAUTHORIZED",
+          "path": ["artifact", "payloadText"]
+        }
+      }
+    ],
+    "data": {
+      "artifact": {
+        "id": "artifact-auth-1",
+        "payloadText": null,
+        "payloadAvailabilityState": "unavailable",
+        "payloadUnavailableReasonCode": "NOT_AUTHORIZED"
+      }
+    }
+  },
+  "simulated_swift_behavior": {
+    "action": "Swift reads artifact payload from local SwiftData cache or filesystem path ~/.chainworks/artifacts/artifact-auth-1.md",
+    "result": "Artifact content rendered as if authorized",
+    "description": "BUG: unauthorized readback falls back to local storage; P081 auth boundary bypassed"
+  },
+  "expected_swift_behavior": {
+    "payloadPresentation": "unavailable(reasonCode: .notAuthorized)",
+    "label": "Artifact — Preview Unavailable",
+    "description": "Unauthorized GraphQL response maps to .unavailable(reasonCode: .notAuthorized); no local storage or filesystem fallback; diagnostic affordance shows diagnosticId if present"
+  },
+  "related": ["P081 boundary matrix", "docs/reference/ui-action-boundary.md"],
+  "p085_contract_rows": ["artifact.preview.detail", "artifact.preview.listLabel"],
+  "p085_revision": "p085-r2-2026-05-08"
+}

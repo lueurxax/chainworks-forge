@@ -208,6 +208,10 @@ PROPOSAL_084_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal084Tests"
 )
 
+PROPOSAL_085_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal085Tests"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -2217,6 +2221,7 @@ Available gates:
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -5789,6 +5794,123 @@ PY
     fi
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
+    ;;
+  proposal-085|p085)
+    log "Proposal 085 gate: thin-client read-model parity and affordance contract"
+    python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# 1. Contract document exists and contains required sections
+contract_doc = root / "docs/reference/thin-client-read-model-affordance-contract.md"
+if not contract_doc.exists():
+    raise SystemExit(
+        "proposal-085: missing docs/reference/thin-client-read-model-affordance-contract.md"
+    )
+contract_text = contract_doc.read_text()
+for required in [
+    "thin_client_affordance_contract_v1",
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+    "approveApproval",
+    "rejectApproval",
+    "payload_deferred",
+    "metadata_only",
+    "payloadAvailabilityState",
+    "freshnessState",
+    "disabledReasonCode",
+    "writePathState",
+    "diagnosticId",
+    "P085AffordancePresenter",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+]:
+    if required not in contract_text:
+        raise SystemExit(
+            f"proposal-085: contract doc missing required term: {required!r}"
+        )
+
+# 2. Negative fixtures exist as valid JSON
+p085_negative_fixtures = [
+    "docs/evidence/rollout-contract/negative/p085-approval-actionability-mismatch.json",
+    "docs/evidence/rollout-contract/negative/p085-approval-stale-double-submit-conflict.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-affordance-row.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-schema-symbol.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-marked-unavailable.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-no-deadline.json",
+    "docs/evidence/rollout-contract/negative/p085-unknown-enum-optimistic-action.json",
+    "docs/evidence/rollout-contract/negative/p085-unsafe-local-truth-fallback.json",
+]
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    if not full.exists():
+        raise SystemExit(f"proposal-085: missing negative fixture {fixture_path}")
+    try:
+        data = json.loads(full.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-085: invalid JSON in {fixture_path}: {exc}") from exc
+    if "contract_violation" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'contract_violation' field"
+        )
+
+# 3. test-gates.md documents the gate
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-085: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required in [
+    "### `proposal-085|p085`",
+    "thin_client_affordance_contract_v1",
+    "P085AffordancePresenter",
+    "negative fixture",
+]:
+    if required not in gates_text:
+        raise SystemExit(
+            f"proposal-085: docs/reference/test-gates.md missing required content: {required!r}"
+        )
+
+# 4. Swift presenter file exists
+presenter = root / "Chainworks Forge/Support/P085AffordancePresenter.swift"
+if not presenter.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P085AffordancePresenter.swift"
+    )
+presenter_text = presenter.read_text()
+for required in [
+    "P085AffordancePresenter",
+    "P085ArtifactAffordanceState",
+    "P085ApprovalAffordanceState",
+    "P085FreshnessAffordanceState",
+    "P085DiagnosticAffordanceState",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+    "mergedAffordance",
+    "payloadPresentation(fromRaw",
+    "static func fromRaw",
+    "case .unknown",
+]:
+    if required not in presenter_text:
+        raise SystemExit(
+            f"proposal-085: P085AffordancePresenter.swift missing required term: {required!r}"
+        )
+
+print("proposal-085 all gate checks passed")
+PY
+    run_targeted_tests "proposal-085" "${PROPOSAL_085_SWIFT_TESTS[@]}"
+    log "Proposal 085 gate passed"
     ;;
   *)
     print_usage >&2
