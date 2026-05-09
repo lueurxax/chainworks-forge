@@ -1083,6 +1083,48 @@ Host policy:
 
 Command: retained historical alias `./scripts/test-gate.sh proposal-077-ui`.
 
+### `proposal-078|p078`
+
+Proposal 078 durable side-effect ledger gate for migration, CAS races, preflight, and MCP tools.
+
+Scope:
+
+- P078 domain side-effect models and status transitions
+- Migration 046 round-trip and CHECK constraints
+- Side-effect repository operations and CAS predicates
+- DurableEffectCoordinator preflight blocking for unresolved effects
+- Executor start CAS (prepared -> executing) with race-condition verification
+- Reaper transition (stale executing -> needs_reconciliation)
+- MCP effects.* tools (list, inspect, reconcile, mark_unrecoverable, clear_after_manual_verification)
+- Authorization policy: all effects.* tools are operator-only (reads and mutations both gated to `PrincipalClass::Operator`, since `last_error` and evidence pointers may contain sensitive adapter output)
+- GraphQL read-only projections for side effects
+
+Use when:
+
+- changing side-effect persistence or status logic
+- changing durable-retry preflight or reconciliation logic
+- changing MCP effects.* tools or authorization
+- changing side-effect readback in GraphQL or reports
+
+Host policy:
+
+- local Rust toolchain required
+- no UI host or simulator needed
+- executes in-process against the control-plane/ workspace
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-078
+```
+
+Important:
+
+- `p078` is accepted as an alias
+- this is the canonical proof path for the P078 durable side-effect ledger slice
+- it validates that at most one external-write attempt is allowed per side_effect row
+- it verifies the fail-closed preflight that blocks retries when unresolved effects exist
+
 ### `p051-scaffold`
 
 Historical bridge-pool scaffold gate alias for the shared Xcode MCP bridge pool substrate.

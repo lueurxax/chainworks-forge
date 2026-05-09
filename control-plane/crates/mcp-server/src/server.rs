@@ -709,6 +709,8 @@ impl McpServer {
             tools::artifacts::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
+        } else if tool_name.starts_with("effects.") {
+            tools::effects::execute(tool_name, params, pool, principal).await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }

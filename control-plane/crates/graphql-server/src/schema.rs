@@ -549,6 +549,21 @@ impl QueryRoot {
         let readback = db::repos::toolchain_cache_housekeeping::latest(pool).await?;
         Ok(readback.map(GqlToolchainCacheHousekeepingSummary::from))
     }
+
+    /// P078: Bounded read-only projection of unresolved side-effect records.
+    /// Returns at most `first` records (1-100, default 50).
+    /// Read-only: no reconcile, retry, push, upload, or command mutations.
+    async fn unresolved_side_effects(
+        &self,
+        ctx: &Context<'_>,
+        first: Option<i32>,
+    ) -> Result<Vec<GqlSideEffectSummary>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let limit = first.unwrap_or(50).clamp(1, 100) as u32;
+        let effects = db::repos::side_effects::list_unresolved(pool, limit).await?;
+        Ok(effects.into_iter().map(GqlSideEffectSummary::from_domain).collect())
+    }
 }
 
 /// GraphQL wrapper around [`DaemonStatus`] (P042 §5.2). Every field of the
@@ -804,6 +819,54 @@ impl From<DaemonStatus> for GqlDaemonStatus {
                 .xcode_broker_health
                 .map(GqlXcodeBrokerHealthSnapshot::from),
             json,
+        }
+    }
+}
+
+/// P078: Read-only projection of a single unresolved side-effect record.
+/// Exposes raw kind/status strings for forward-compatible clients.
+/// No mutation fields.
+#[derive(SimpleObject, Clone)]
+pub struct GqlSideEffectSummary {
+    pub id: String,
+    pub run_id: String,
+    pub stage_execution_id: String,
+    /// Decoded effect kind (e.g. "git_commit"). Use effect_kind_raw for unknown values.
+    pub effect_kind: String,
+    /// Raw effect kind string for forward-compatible clients.
+    pub effect_kind_raw: String,
+    /// Decoded status string. Use status_raw for unknown values.
+    pub status: String,
+    /// Raw status string for forward-compatible clients.
+    pub status_raw: String,
+    pub target_key: String,
+    pub external_write_attempted: bool,
+    pub last_error_kind: Option<String>,
+    pub recommended_mcp_tool: String,
+    pub retry_forbidden: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl GqlSideEffectSummary {
+    pub fn from_domain(e: domain::side_effect::SideEffect) -> Self {
+        let kind_str = e.effect_kind.to_string();
+        let status_str = e.status.to_string();
+        Self {
+            id: e.id.to_string(),
+            run_id: e.run_id.to_string(),
+            stage_execution_id: e.stage_execution_id.to_string(),
+            effect_kind: kind_str.clone(),
+            effect_kind_raw: kind_str,
+            status: status_str.clone(),
+            status_raw: status_str,
+            target_key: e.target_key,
+            external_write_attempted: e.external_write_attempted,
+            last_error_kind: e.last_error_kind,
+            recommended_mcp_tool: "effects.inspect or effects.reconcile".into(),
+            retry_forbidden: true,
+            created_at: e.created_at.to_rfc3339(),
+            updated_at: e.updated_at.to_rfc3339(),
         }
     }
 }

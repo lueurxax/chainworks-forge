@@ -149,6 +149,7 @@ Tools are namespaced:
 | `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
 | `stages.*` | `stages.retry` |
+| `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
 | `reports.*` | `reports.get` |
 
 **Implementation self-assessment detail extension:**
@@ -198,6 +199,31 @@ The `WorktreeMutationBarrier` ensures that sensitive operations like `git merge`
 - **Knowledge Capsules**: Compact cross-run knowledge emitted from completed runs, matched and injected into future runs to prevent repeat mistakes.
 
 Note: Main sync and knowledge capsule logic is currently in **Phase 0 contract freeze**.
+
+## Durable side-effect ledger (P078)
+
+The daemon implements a durable side-effect ledger to handle irreversible or externally visible operations (e.g., `git_push`, `connect_upload`).
+
+### Durable intent and settlement
+- **Durable Intent**: A `SideEffect` record is persisted with status `prepared` before any external write attempt.
+- **Barrier Transaction**: Side-effect settlement is an atomic database transaction that updates the effect status, records evidence, and advances the workflow cursor.
+- **Fail-Closed Retry**: If a run or stage has unresolved side effects (`prepared`, `executing`, `externally_observed`, or `needs_reconciliation`), the engine blocks all retry attempts with `requires_effect_reconciliation`.
+- **At-Most-Once Write**: The system guarantees at most one external-write attempt per `side_effect` row. Ambiguous outcomes move the record to `needs_reconciliation` instead of auto-retrying.
+
+### Reconciliation
+- **Startup Repair**: The daemon reconciles stale `executing` side effects at launch. If they outlived their lease or deadline, they move to `needs_reconciliation`.
+- **MCP Tooling**: Operators use `effects.list`, `inspect`, and `reconcile` to review unresolved effects and apply a disposition (`mark_unrecoverable` or `clear_after_manual_verification`).
+
+### Wired operations
+The initial implementation supports:
+- `git_commit`
+- `git_push`
+- `build_archive`
+- `connect_upload`
+
+Deferred kinds (schema-supported but not yet wired):
+- `tag_create`
+- `artifact_publish`
 
 ## Workflow engine
 ...
@@ -443,6 +469,9 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |
 | `run_knowledge_capsule_match_keys` | P064: Search keys for capsule relevance matching (proposal id, artifact path, etc.) |
 | `run_knowledge_capsule_attachments` | P064: Links between matching capsules and an active run |
+| `side_effects` | P078: Durable record of irreversible side effects |
+| `side_effect_attempts` | P078: Individual attempt records for side effects |
+| `side_effect_settlements` | P078: Authoritative settlement/reconciliation records |
 | `retry_operator_instruction_bindings` | P065: Durable parent bindings for operator-guided retries (ARCH-065) |
 | `retry_operator_instruction_deliveries` | P065: Per-work-item delivery records for retry instructions (ARCH-065) |
 | `approvals` | Approval requests with decision, timestamps, expiry |

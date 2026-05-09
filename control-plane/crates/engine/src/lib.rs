@@ -25,6 +25,7 @@ pub mod recovery;
 pub mod release;
 pub mod rollout_contract_preflight;
 pub mod session;
+pub mod side_effects;
 pub mod steward;
 pub mod synthesizers;
 pub mod work_queue;

@@ -178,7 +178,8 @@ The following flows should be treated as implemented system behavior:
 9. implementation self-assessment and handoff routing,
 10. rejected implementation approval loopback to proposal refinement,
 11. evidence-pack export for repo-backed runs,
-12. benchmark/sign-off evaluation and export.
+12. benchmark/sign-off evaluation and export,
+13. durable side-effect ledger, release settlement, and reconciliation (P078).
 
 ## Current review posture
 

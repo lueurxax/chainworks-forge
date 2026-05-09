@@ -1,5 +1,6 @@
 pub mod approvals;
 pub mod artifacts;
+pub mod effects;
 pub mod ideas;
 pub mod reports;
 pub mod runs;
@@ -9,7 +10,7 @@ pub mod steward;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 22] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 27] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -33,6 +34,11 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 22] {
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
+        CapabilityToolId::EffectsList,
+        CapabilityToolId::EffectsInspect,
+        CapabilityToolId::EffectsReconcile,
+        CapabilityToolId::EffectsMarkUnrecoverable,
+        CapabilityToolId::EffectsClearAfterManualVerification,
     ]
 }
 
@@ -76,6 +82,13 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
+        "effects.list" => Some(CapabilityToolId::EffectsList),
+        "effects.inspect" => Some(CapabilityToolId::EffectsInspect),
+        "effects.reconcile" => Some(CapabilityToolId::EffectsReconcile),
+        "effects.mark_unrecoverable" => Some(CapabilityToolId::EffectsMarkUnrecoverable),
+        "effects.clear_after_manual_verification" => {
+            Some(CapabilityToolId::EffectsClearAfterManualVerification)
+        }
         _ => None,
     }
 }
@@ -103,6 +116,11 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "steward_run_analysis" => "steward.run_analysis",
         "steward_list_analyses" => "steward.list_analyses",
         "steward_get_analysis" => "steward.get_analysis",
+        "effects_list" => "effects.list",
+        "effects_inspect" => "effects.inspect",
+        "effects_reconcile" => "effects.reconcile",
+        "effects_mark_unrecoverable" => "effects.mark_unrecoverable",
+        "effects_clear_after_manual_verification" => "effects.clear_after_manual_verification",
         _ => tool_name,
     }
 }
@@ -168,6 +186,22 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::ProposalGateSettle => {
             tool_spec_by_name(runs::tool_specs(), "runs.settle_proposal_gate")
         }
+        CapabilityToolId::EffectsList => {
+            tool_spec_by_name(effects::tool_specs(), "effects.list")
+        }
+        CapabilityToolId::EffectsInspect => {
+            tool_spec_by_name(effects::tool_specs(), "effects.inspect")
+        }
+        CapabilityToolId::EffectsReconcile => {
+            tool_spec_by_name(effects::tool_specs(), "effects.reconcile")
+        }
+        CapabilityToolId::EffectsMarkUnrecoverable => {
+            tool_spec_by_name(effects::tool_specs(), "effects.mark_unrecoverable")
+        }
+        CapabilityToolId::EffectsClearAfterManualVerification => tool_spec_by_name(
+            effects::tool_specs(),
+            "effects.clear_after_manual_verification",
+        ),
     }
 }
 
@@ -180,6 +214,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(reports::tool_specs());
     specs.extend(artifacts::tool_specs());
     specs.extend(steward::tool_specs());
+    specs.extend(effects::tool_specs());
     specs
 }
 

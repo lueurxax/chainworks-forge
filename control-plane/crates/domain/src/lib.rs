@@ -22,6 +22,7 @@ pub mod risk_lineage;
 pub mod routing;
 pub mod run;
 pub mod session;
+pub mod side_effect;
 pub mod stage;
 pub mod steward;
 pub mod toolchain;

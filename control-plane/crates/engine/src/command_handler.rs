@@ -39,6 +39,7 @@ use domain::PrincipalClass;
 use sha2::{Digest, Sha256};
 
 use crate::cancellation;
+use crate::side_effects::{run_cancel_preflight, DurableEffectCoordinator};
 use crate::closeout_fingerprint::{
     build_closeout_fingerprint, resolve_closeout_worktree_truth,
     CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
@@ -2333,6 +2334,30 @@ impl CommandHandler {
                             false
                         }
                     };
+                // Ledger-backed preflight: check actual unresolved side effects for this stage.
+                // Always enforced regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
+                let coord = DurableEffectCoordinator::new_with_enabled(
+                    self.pool.clone(),
+                    "command_handler".into(),
+                    false,
+                );
+                if let Err(ledger_err) = coord
+                    .retry_preflight(&c.run_id, &old_stage.id, None)
+                    .await
+                {
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &ledger_err.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(ledger_err);
+                }
+
+                // Heuristic guard: still catch release stages not yet wired to the ledger.
                 if retry_requires_effect_reconciliation(
                     old_stage,
                     None,
@@ -2966,6 +2991,21 @@ impl CommandHandler {
                     tx.commit().await?;
                     db::pool::log_write_transaction("command.CancelRun", tx_started);
                     return Err(error);
+                }
+
+                // Ledger-backed preflight: block cancel when any unresolved side effects exist
+                // for this run, regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
+                if let Err(ledger_err) = run_cancel_preflight(&self.pool, &c.run_id).await {
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &ledger_err.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.CancelRun", tx_started);
+                    return Err(ledger_err);
                 }
 
                 let settlement = cancellation::begin_settlement_tx(

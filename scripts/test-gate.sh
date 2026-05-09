@@ -2174,6 +2174,7 @@ Available gates:
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
+  proposal-078,p078  Proposal 078 durable side-effect ledger gate (migration, CAS races, preflight, MCP tools)
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -5789,6 +5790,21 @@ PY
     fi
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
+    ;;
+  proposal-078|p078)
+    # P078 durable side-effect ledger gate.
+    # Uses local/fake effect adapters. Must not perform live git pushes,
+    # Connect uploads, notarization, production daemon startup, simulator runs,
+    # or UI smoke tests.
+    log "Proposal 078 durable side-effect ledger gate"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p domain proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p db proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p mcp-server proposal_078_ -- --nocapture
+    )
+    log "Proposal 078 durable side-effect ledger gate passed"
     ;;
   *)
     print_usage >&2
