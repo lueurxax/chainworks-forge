@@ -13,22 +13,24 @@ pub async fn insert(pool: &SqlitePool, idea: &Idea) -> Result<()> {
     let created_at = idea.created_at.to_rfc3339();
     let archived_at = idea.archived_at.map(|t| t.to_rfc3339());
 
-    sqlx::query(
+    crate::execute_repository_write!(
+        pool,
+        "ideas.insert",
+        sqlx::query(
         r#"
         INSERT INTO ideas (id, title, body, workspace_root_path, project_key, status, created_at, archived_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
     )
-    .bind(id)
-    .bind(&idea.title)
-    .bind(&idea.body)
-    .bind(&idea.workspace_root_path)
-    .bind(&idea.project_key)
-    .bind(status)
-    .bind(created_at)
-    .bind(archived_at)
-    .execute(pool)
-    .await
+        .bind(id)
+        .bind(&idea.title)
+        .bind(&idea.body)
+        .bind(&idea.workspace_root_path)
+        .bind(&idea.project_key)
+        .bind(status)
+        .bind(created_at)
+        .bind(archived_at)
+    )
     .context("insert idea")?;
     Ok(())
 }

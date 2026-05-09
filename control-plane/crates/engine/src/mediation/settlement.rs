@@ -113,7 +113,7 @@ impl MediationSettlementService {
         &self,
         operation_name: &'static str,
         mediation_record_id: &str,
-    ) -> Result<Transaction<'_, Sqlite>> {
+    ) -> Result<db::writer::QueuedTransaction> {
         self.db_writer
             .begin_immediate_transaction(
                 class_a_operation(

@@ -100,7 +100,7 @@ pub async fn execute_closeout_transaction(
     .bind(&inputs.gate_result.generation_id)
     .bind(&inputs.gate_result.diagnostic_reason)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("insert closeout gate generation")?;
 
@@ -145,7 +145,7 @@ pub async fn execute_closeout_transaction(
     .bind(inputs.blocker_digest)
     .bind(&accepted_risks_json)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("insert closeout readiness generation")?;
 

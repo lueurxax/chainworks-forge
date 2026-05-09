@@ -225,7 +225,7 @@ impl RecoveryService {
         &self,
         operation_name: &'static str,
         idempotency_key: impl Into<String>,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+    ) -> Result<db::writer::QueuedTransaction> {
         self.db_writer
             .begin_immediate_transaction(
                 class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),

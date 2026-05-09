@@ -429,8 +429,11 @@ pub async fn update_generation_usage(
     latest_model_context_window: Option<i64>,
     last_activity_at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_generations
+    crate::execute_repository_write!(
+        pool,
+        "sessions.update_generation_usage",
+        sqlx::query(
+            r#"UPDATE session_generations
            SET provider_session_id = ?1,
                turn_count = ?2,
                estimated_input_tokens = ?3,
@@ -441,19 +444,18 @@ pub async fn update_generation_usage(
                cumulative_cost_cents = cumulative_cost_cents + ?8,
                last_activity_at = ?9
            WHERE id = ?10"#,
+        )
+        .bind(provider_session_id)
+        .bind(turn_count)
+        .bind(estimated_input_tokens)
+        .bind(latest_cached_input_tokens)
+        .bind(latest_output_tokens)
+        .bind(latest_model_context_window)
+        .bind(prompt_tokens_increment)
+        .bind(cost_cents_increment)
+        .bind(last_activity_at.to_rfc3339())
+        .bind(generation_id)
     )
-    .bind(provider_session_id)
-    .bind(turn_count)
-    .bind(estimated_input_tokens)
-    .bind(latest_cached_input_tokens)
-    .bind(latest_output_tokens)
-    .bind(latest_model_context_window)
-    .bind(prompt_tokens_increment)
-    .bind(cost_cents_increment)
-    .bind(last_activity_at.to_rfc3339())
-    .bind(generation_id)
-    .execute(pool)
-    .await
     .context("update session generation usage")?;
     Ok(())
 }
@@ -463,16 +465,18 @@ pub async fn touch_generation_activity(
     generation_id: &str,
     last_activity_at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_generations
+    crate::execute_repository_write!(
+        pool,
+        "sessions.touch_generation_activity",
+        sqlx::query(
+            r#"UPDATE session_generations
            SET last_activity_at = ?1
            WHERE id = ?2
              AND status = 'active'"#,
+        )
+        .bind(last_activity_at.to_rfc3339())
+        .bind(generation_id)
     )
-    .bind(last_activity_at.to_rfc3339())
-    .bind(generation_id)
-    .execute(pool)
-    .await
     .context("touch session generation activity")?;
     Ok(())
 }
@@ -521,16 +525,18 @@ pub async fn update_generation_runtime_session(
     provider_session_id: &str,
     turn_count: i64,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_generations
+    crate::execute_repository_write!(
+        pool,
+        "sessions.update_generation_runtime_session",
+        sqlx::query(
+            r#"UPDATE session_generations
            SET provider_session_id = ?1, turn_count = ?2
            WHERE id = ?3"#,
+        )
+        .bind(provider_session_id)
+        .bind(turn_count)
+        .bind(generation_id)
     )
-    .bind(provider_session_id)
-    .bind(turn_count)
-    .bind(generation_id)
-    .execute(pool)
-    .await
     .context("update session generation runtime session")?;
     Ok(())
 }

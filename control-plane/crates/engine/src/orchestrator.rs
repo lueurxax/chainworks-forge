@@ -79,7 +79,7 @@ impl Orchestrator {
         &self,
         operation_name: &'static str,
         idempotency_key: impl Into<String>,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+    ) -> Result<db::writer::QueuedTransaction> {
         self.db_writer
             .begin_immediate_transaction(
                 class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
@@ -2709,7 +2709,7 @@ impl Orchestrator {
                 .bind(RunStatus::Running.to_string())
                 .bind(stage.stage_id.as_str())
                 .bind(run_id.to_string())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             work_items::enqueue_tx(
                 &mut tx,

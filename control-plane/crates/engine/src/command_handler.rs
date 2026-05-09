@@ -1502,7 +1502,7 @@ impl CommandHandler {
         &self,
         operation_name: &'static str,
         idempotency_key: impl Into<String>,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+    ) -> Result<db::writer::QueuedTransaction> {
         self.db_writer
             .begin_immediate_transaction(
                 class_a_operation(operation_name, WriteLane::OperatorCommand, idempotency_key),
@@ -2479,7 +2479,7 @@ impl CommandHandler {
                     .bind(RunStatus::Running.to_string())
                     .bind(c.stage_id.clone())
                     .bind(c.run_id.to_string())
-                    .execute(&mut *retry_tx)
+                    .execute(&mut **retry_tx)
                     .await?;
                 self.maybe_inject_retry_stage_failure("update_run_for_retry")?;
                 supersede_current_workflow_conflict_for_stage_retry_tx(
@@ -2798,7 +2798,7 @@ impl CommandHandler {
                     .bind(RunStatus::Running.to_string())
                     .bind(&selected_next_state_id)
                     .bind(c.run_id.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
                 workflow_conflicts::upsert_transition_cursor_tx(
                     &mut tx,
@@ -3628,7 +3628,7 @@ impl CommandHandler {
                                 .bind(RunStatus::Running.to_string())
                                 .bind("state_10_implementation_refined")
                                 .bind(authoritative_run_id.to_string())
-                                .execute(&mut *tx)
+                                .execute(&mut **tx)
                                 .await?;
                                 supersede_current_workflow_conflict_for_manual_release_rejection_tx(
                                     &mut tx,
@@ -4005,7 +4005,7 @@ impl CommandHandler {
             .bind(RunStatus::Running.to_string())
             .bind(stage_id)
             .bind(run_id.to_string())
-            .execute(&mut *retry_tx)
+            .execute(&mut **retry_tx)
             .await?;
         supersede_current_workflow_conflict_for_stage_retry_tx(
             &mut retry_tx,
@@ -4379,7 +4379,7 @@ impl CommandHandler {
             .bind(RunStatus::Running.to_string())
             .bind(stage_id)
             .bind(run_id.to_string())
-            .execute(&mut *retry_tx)
+            .execute(&mut **retry_tx)
             .await?;
         // P065: create parent binding + child delivery for targeted retry
         let retry_instruction_binding_id = if let Some(instruction_text) = validated_instruction {

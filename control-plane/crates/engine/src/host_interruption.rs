@@ -304,7 +304,7 @@ impl HostInterruptionService {
         &self,
         operation_name: &'static str,
         idempotency_key: impl Into<String>,
-    ) -> Result<Transaction<'_, Sqlite>> {
+    ) -> Result<db::writer::QueuedTransaction> {
         self.db_writer
             .begin_immediate_transaction(
                 class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),

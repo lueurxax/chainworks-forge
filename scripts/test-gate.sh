@@ -5590,8 +5590,21 @@ for idx, row in enumerate(registry.get("operations", []), start=1):
         raise SystemExit(f"P075 operation {name} has invalid replay_policy {row['replay_policy']}")
     if not str(row["idempotency_key_kind"]).strip():
         raise SystemExit(f"P075 operation {name} missing idempotency_key_kind")
-    if row["replay_policy"] == "caller_guarded" and not str(row["duplicate_application_test_path"]).strip():
-        raise SystemExit(f"P075 caller_guarded operation {name} missing duplicate test")
+    duplicate_path = str(row["duplicate_application_test_path"]).strip()
+    if row["replay_policy"] == "caller_guarded":
+        if not duplicate_path:
+            raise SystemExit(f"P075 caller_guarded operation {name} missing duplicate test")
+        if duplicate_path == "scripts/test-gate.sh::proposal-075_operation_registry_enforcement":
+            raise SystemExit(
+                f"P075 caller_guarded operation {name} uses generic duplicate proof path"
+            )
+        if (
+            "operation-duplicate-application-matrix.md#" in duplicate_path
+            and name.replace(".", "-").replace("_", "-") not in duplicate_path
+        ):
+            raise SystemExit(
+                f"P075 caller_guarded operation {name} has non-specific duplicate proof path"
+            )
 
 observed = set()
 for rel_root in [
@@ -5604,10 +5617,10 @@ for rel_root in [
             continue
         text = path.read_text().split("\n#[cfg(test)]", 1)[0]
         for match in re.finditer(
-            r'(?:operation_name:\s*"([^"]+)"|class_a_operation\(\s*"([^"]+)"|begin_repository_transaction\(\s*pool\s*,\s*"([^"]+)")',
+            r'(?:operation_name:\s*"([^"]+)"|class_a_operation\(\s*"([^"]+)"|begin_repository_transaction\(\s*pool\s*,\s*"([^"]+)"|execute_repository_write!\(\s*pool\s*,\s*"([^"]+)")',
             text,
         ):
-            name = match.group(1) or match.group(2) or match.group(3)
+            name = match.group(1) or match.group(2) or match.group(3) or match.group(4)
             if name.startswith("test_"):
                 continue
             observed.add(name)
@@ -5616,10 +5629,10 @@ if unregistered:
     raise SystemExit(f"P075 unregistered WriteOperation.operation_name literals: {unregistered}")
 
 runtime_direct_write_re = re.compile(
-    r'(?:\bpool\.begin\(\)\.await\b|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
+    r'(?:\bpool\.begin\(\)\.await\b|pool\.begin_with\(\s*"BEGIN IMMEDIATE"\s*\)|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
 )
-db_repo_direct_transaction_re = re.compile(
-    r'(?:\bpool\.begin\(\)\.await\b|begin_immediate_with_retry\()'
+db_repo_direct_write_re = re.compile(
+    r'(?:\bpool\.begin\(\)\.await\b|pool\.begin_with\(\s*"BEGIN IMMEDIATE"\s*\)|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
 )
 runtime_direct_write_sites = []
 for rel_root in [
@@ -5631,11 +5644,7 @@ for rel_root in [
 ]:
     for path in (root / rel_root).rglob("*.rs"):
         text = path.read_text().split("\n#[cfg(test)]", 1)[0]
-        direct_write_re = (
-            db_repo_direct_transaction_re
-            if rel_root == "control-plane/crates/db/src/repos"
-            else runtime_direct_write_re
-        )
+        direct_write_re = db_repo_direct_write_re if rel_root == "control-plane/crates/db/src/repos" else runtime_direct_write_re
         for match in direct_write_re.finditer(text):
             line = text.count("\n", 0, match.start()) + 1
             runtime_direct_write_sites.append(

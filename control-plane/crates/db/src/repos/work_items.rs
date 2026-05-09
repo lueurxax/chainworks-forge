@@ -103,7 +103,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     let row = sqlx::query(&query)
         .bind(&pending_status)
         .bind(&now)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .context("select next work item")?;
 
@@ -125,7 +125,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     .bind(&now)
     .bind(&item_id)
     .bind(&pending_status)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("mark work item running")?
     .rows_affected();
@@ -1463,7 +1463,7 @@ pub async fn complete_with_capacity(
     let existing =
         sqlx::query(r#"SELECT kind, run_id, status, payload_json FROM work_items WHERE id = ?1"#)
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .context("select work item before complete")?;
     if let Some(row) = existing {
@@ -1483,7 +1483,7 @@ pub async fn complete_with_capacity(
             .bind(id)
             .bind(WorkItemStatus::Pending.to_string())
             .bind(WorkItemStatus::Running.to_string())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .context("complete work item")?;
         if kind == WorkItemKind::InvokeAgent.to_string()
@@ -1505,7 +1505,7 @@ pub async fn complete_with_capacity(
                     .bind(&now)
                     .bind(agent_execution_id)
                     .bind(AgentStatus::Running.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .context("settle preclaimed InvokeAgent execution on work item complete")?;
                     sqlx::query(
@@ -1522,7 +1522,7 @@ pub async fn complete_with_capacity(
                     .bind(id)
                     .bind(agent_execution_id)
                     .bind("active")
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .context("close active source-generation claim on work item complete")?;
                 }
@@ -1550,7 +1550,7 @@ pub async fn complete_with_capacity(
                 .bind(pending_status)
                 .bind(run_id)
                 .bind(&now)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .context("enqueue post-completion AdvanceRun for InvokeAgent")?;
             }
@@ -1607,7 +1607,7 @@ pub async fn fail_with_capacity(
     let status = WorkItemStatus::Failed.to_string();
     let existing = sqlx::query(r#"SELECT kind, run_id, status FROM work_items WHERE id = ?1"#)
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .context("select work item before fail")?;
     let refresh = if let Some(row) = existing {
@@ -1630,7 +1630,7 @@ pub async fn fail_with_capacity(
         .bind(id)
         .bind(WorkItemStatus::Pending.to_string())
         .bind(WorkItemStatus::Running.to_string())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("fail work item")?;
         if kind == WorkItemKind::InvokeAgent.to_string()
@@ -1659,7 +1659,7 @@ pub async fn fail_with_capacity(
                 .bind(pending_status)
                 .bind(run_id)
                 .bind(&now)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .context("enqueue post-failure AdvanceRun for InvokeAgent")?;
             }
@@ -1726,7 +1726,7 @@ pub async fn requeue_running_after_transient_persistence_contention(
     let row = sqlx::query(r#"SELECT attempt_count FROM work_items WHERE id = ?1 AND status = ?2"#)
         .bind(id)
         .bind(WorkItemStatus::Running.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .context("load running work item for transient persistence requeue")?;
 
@@ -1759,7 +1759,7 @@ pub async fn requeue_running_after_transient_persistence_contention(
     .bind(last_error)
     .bind(id)
     .bind(WorkItemStatus::Running.to_string())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("requeue work item after transient persistence contention")?
     .rows_affected();

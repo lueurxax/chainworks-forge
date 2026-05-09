@@ -124,12 +124,14 @@ pub async fn update_status(
 ) -> Result<()> {
     let id_str = id.to_string();
     let status_str = status.to_string();
-    sqlx::query(r#"UPDATE stage_executions SET status = ?1 WHERE id = ?2"#)
-        .bind(status_str)
-        .bind(id_str)
-        .execute(pool)
-        .await
-        .context("update stage execution status")?;
+    crate::execute_repository_write!(
+        pool,
+        "stages.update_status",
+        sqlx::query(r#"UPDATE stage_executions SET status = ?1 WHERE id = ?2"#)
+            .bind(status_str)
+            .bind(id_str)
+    )
+    .context("update stage execution status")?;
     Ok(())
 }
 
@@ -194,12 +196,14 @@ pub async fn update_validation_failure_json(
     id: StageExecutionId,
     validation_failure_json: &str,
 ) -> Result<()> {
-    sqlx::query(r#"UPDATE stage_executions SET validation_failure_json = ?1 WHERE id = ?2"#)
-        .bind(validation_failure_json)
-        .bind(id.to_string())
-        .execute(pool)
-        .await
-        .context("update stage validation failure json")?;
+    crate::execute_repository_write!(
+        pool,
+        "stages.update_validation_failure_json",
+        sqlx::query(r#"UPDATE stage_executions SET validation_failure_json = ?1 WHERE id = ?2"#)
+            .bind(validation_failure_json)
+            .bind(id.to_string())
+    )
+    .context("update stage validation failure json")?;
     Ok(())
 }
 
@@ -208,12 +212,14 @@ pub async fn update_recovery_snapshot_json(
     id: StageExecutionId,
     recovery_snapshot_json: &str,
 ) -> Result<()> {
-    sqlx::query(r#"UPDATE stage_executions SET recovery_snapshot_json = ?1 WHERE id = ?2"#)
-        .bind(recovery_snapshot_json)
-        .bind(id.to_string())
-        .execute(pool)
-        .await
-        .context("update stage recovery snapshot json")?;
+    crate::execute_repository_write!(
+        pool,
+        "stages.update_recovery_snapshot_json",
+        sqlx::query(r#"UPDATE stage_executions SET recovery_snapshot_json = ?1 WHERE id = ?2"#)
+            .bind(recovery_snapshot_json)
+            .bind(id.to_string())
+    )
+    .context("update stage recovery snapshot json")?;
     Ok(())
 }
 
@@ -222,12 +228,14 @@ pub async fn update_evidence_packet_json(
     id: StageExecutionId,
     evidence_packet_json: &str,
 ) -> Result<()> {
-    sqlx::query(r#"UPDATE stage_executions SET evidence_packet_json = ?1 WHERE id = ?2"#)
-        .bind(evidence_packet_json)
-        .bind(id.to_string())
-        .execute(pool)
-        .await
-        .context("update stage evidence packet json")?;
+    crate::execute_repository_write!(
+        pool,
+        "stages.update_evidence_packet_json",
+        sqlx::query(r#"UPDATE stage_executions SET evidence_packet_json = ?1 WHERE id = ?2"#)
+            .bind(evidence_packet_json)
+            .bind(id.to_string())
+    )
+    .context("update stage evidence packet json")?;
     Ok(())
 }
 

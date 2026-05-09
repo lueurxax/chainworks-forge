@@ -101,6 +101,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -205,26 +206,135 @@ pub async fn begin_registered_immediate_transaction<'pool>(
     pool: &'pool SqlitePool,
     op: WriteOperation,
     context: &'static str,
-) -> anyhow::Result<Transaction<'pool, Sqlite>> {
+) -> anyhow::Result<QueuedTransaction> {
     if let Err(rejected) = op.validate() {
         anyhow::bail!(
             "DbWriter rejected {context} before transaction start: {}",
             rejected.as_str()
         );
     }
-    crate::pool::begin_immediate_with_retry(pool, context).await
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+    let mut tx = writer.begin_immediate_transaction(op, context).await?;
+    tx.attach_owner(writer);
+    Ok(tx)
 }
 
 pub async fn begin_repository_transaction<'pool>(
     pool: &'pool SqlitePool,
     operation_name: &'static str,
-) -> anyhow::Result<Transaction<'pool, Sqlite>> {
+) -> anyhow::Result<QueuedTransaction> {
     begin_registered_immediate_transaction(
         pool,
         repository_transaction_operation(operation_name),
         operation_name,
     )
     .await
+}
+
+#[macro_export]
+macro_rules! execute_repository_write {
+    ($pool:expr, $operation_name:expr, $query:expr) => {{
+        let mut __p075_tx =
+            $crate::writer::begin_repository_transaction($pool, $operation_name).await?;
+        let __p075_result = $query.execute(&mut **__p075_tx).await;
+        match __p075_result {
+            Ok(value) => {
+                __p075_tx.commit().await?;
+                Ok::<_, anyhow::Error>(value)
+            }
+            Err(error) => Err(anyhow::Error::new(error)),
+        }
+    }};
+}
+
+enum QueuedTransactionFinish {
+    Commit(Transaction<'static, Sqlite>),
+    Rollback(Transaction<'static, Sqlite>),
+}
+
+pub struct QueuedTransaction {
+    tx: Option<Transaction<'static, Sqlite>>,
+    finish_tx: Option<oneshot::Sender<QueuedTransactionFinish>>,
+    result_rx: Option<oneshot::Receiver<WriteResult>>,
+    owned_writer: Option<Arc<DbWriter>>,
+    context: &'static str,
+}
+
+impl QueuedTransaction {
+    fn attach_owner(&mut self, writer: Arc<DbWriter>) {
+        self.owned_writer = Some(writer);
+    }
+
+    pub async fn commit(mut self) -> anyhow::Result<()> {
+        let tx = self
+            .tx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("queued transaction already finished"))?;
+        let finish_tx = self
+            .finish_tx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("queued transaction finish channel missing"))?;
+        finish_tx
+            .send(QueuedTransactionFinish::Commit(tx))
+            .map_err(|_| anyhow::anyhow!("queued transaction worker dropped before commit"))?;
+        self.await_result().await
+    }
+
+    pub async fn rollback(mut self) -> anyhow::Result<()> {
+        let tx = self
+            .tx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("queued transaction already finished"))?;
+        let finish_tx = self
+            .finish_tx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("queued transaction finish channel missing"))?;
+        finish_tx
+            .send(QueuedTransactionFinish::Rollback(tx))
+            .map_err(|_| anyhow::anyhow!("queued transaction worker dropped before rollback"))?;
+        self.await_result().await
+    }
+
+    async fn await_result(mut self) -> anyhow::Result<()> {
+        let result_rx = self
+            .result_rx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("queued transaction result channel missing"))?;
+        let result = match result_rx.await {
+            Ok(WriteResult::Committed) => Ok(()),
+            Ok(WriteResult::WriteRejected { reason, .. }) => {
+                anyhow::bail!("DbWriter rejected {}: {reason}", self.context)
+            }
+            Ok(other) => anyhow::bail!(
+                "DbWriter queued transaction {} did not commit: {}",
+                self.context,
+                other.as_str()
+            ),
+            Err(_) => anyhow::bail!("DbWriter queued transaction worker dropped result"),
+        };
+        if let Some(writer) = self.owned_writer.take() {
+            writer.shutdown().await;
+        }
+        result
+    }
+}
+
+impl Deref for QueuedTransaction {
+    type Target = Transaction<'static, Sqlite>;
+
+    fn deref(&self) -> &Self::Target {
+        self.tx
+            .as_ref()
+            .expect("queued transaction used after finish")
+    }
+}
+
+impl DerefMut for QueuedTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.tx
+            .as_mut()
+            .expect("queued transaction used after finish")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +991,13 @@ impl DbWriter {
         &self,
         op: WriteOperation,
         context: &'static str,
-    ) -> anyhow::Result<Transaction<'_, Sqlite>> {
+    ) -> anyhow::Result<QueuedTransaction> {
+        if let Err(rejected) = op.validate() {
+            anyhow::bail!(
+                "DbWriter rejected {context} before transaction start: {}",
+                rejected.as_str()
+            );
+        }
         if self.shutdown_in_progress.load(Ordering::Relaxed) {
             let admitted = if op.class == WriteClass::A {
                 SHUTDOWN_ADMITTED_OPERATIONS.contains(&op.operation_name)
@@ -892,7 +1008,74 @@ impl DbWriter {
                 anyhow::bail!("DbWriter rejected {context}: shutdown_admission_denied");
             }
         }
-        begin_registered_immediate_transaction(&self.pool, op, context).await
+
+        let deadline = op.deadline;
+        let lane_idx = op.lane.drain_order_index();
+        let submit_start = Instant::now();
+        let (result_tx, result_rx) = oneshot::channel();
+        let (tx_ready_tx, tx_ready_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let msg = LaneMessage {
+            op: op.clone(),
+            work: make_work(move |pool| async move {
+                let tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
+                tx_ready_tx
+                    .send(tx)
+                    .map_err(|_| anyhow::anyhow!("queued transaction receiver dropped"))?;
+                match finish_rx.await {
+                    Ok(QueuedTransactionFinish::Commit(tx)) => {
+                        tx.commit().await?;
+                        Ok(1)
+                    }
+                    Ok(QueuedTransactionFinish::Rollback(tx)) => {
+                        tx.rollback().await?;
+                        Ok(0)
+                    }
+                    Err(_) => anyhow::bail!("queued transaction dropped before commit or rollback"),
+                }
+            }),
+            result_tx,
+            enqueued_at: submit_start,
+        };
+        let lane_tx = self.lane_sender(op.lane);
+        match tokio::time::timeout(deadline, lane_tx.send(msg)).await {
+            Err(_elapsed) => {
+                anyhow::bail!("DbWriter queued transaction {context} timed out during admission")
+            }
+            Ok(Err(_channel_closed)) => {
+                anyhow::bail!("DbWriter queued transaction {context} lane closed")
+            }
+            Ok(Ok(())) => {
+                let prev_pending =
+                    self.heartbeat.lane_pending_count[lane_idx].fetch_add(1, Ordering::Relaxed);
+                if prev_pending == 0 {
+                    self.heartbeat.lane_oldest_enqueued_ns[lane_idx]
+                        .store(self.heartbeat.now_ns(), Ordering::Relaxed);
+                }
+            }
+        }
+
+        let remaining = deadline
+            .checked_sub(submit_start.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining == Duration::ZERO {
+            anyhow::bail!("DbWriter queued transaction {context} timed out before begin");
+        }
+        let tx = tokio::time::timeout(remaining, tx_ready_rx)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("DbWriter queued transaction {context} timed out before begin")
+            })?
+            .map_err(|_| {
+                anyhow::anyhow!("DbWriter queued transaction {context} worker dropped before begin")
+            })?;
+        Ok(QueuedTransaction {
+            tx: Some(tx),
+            finish_tx: Some(finish_tx),
+            result_rx: Some(result_rx),
+            owned_writer: None,
+            context,
+        })
     }
 
     /// Submit a write that owns a full SQLite transaction inside the DbWriter lane.
@@ -1834,6 +2017,29 @@ mod tests {
             result
         );
         writer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn registered_repository_transaction_commits_through_queued_writer() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let mut tx = begin_repository_transaction(&pool, "test_registered_repository_transaction")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE p075_registered_tx_probe (id INTEGER PRIMARY KEY)")
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO p075_registered_tx_probe (id) VALUES (1)")
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM p075_registered_tx_probe")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     // -----------------------------------------------------------------------

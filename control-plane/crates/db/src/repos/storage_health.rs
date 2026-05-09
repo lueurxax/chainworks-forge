@@ -48,18 +48,20 @@ pub async fn insert_write_pressure_snapshot(
     if payload.len() > 65_536 {
         anyhow::bail!("storage write pressure payload exceeds 65536 bytes");
     }
-    sqlx::query(
-        r#"INSERT INTO storage_write_pressure_snapshots
+    crate::execute_repository_write!(
+        pool,
+        "storage_health.insert_write_pressure_snapshot",
+        sqlx::query(
+            r#"INSERT INTO storage_write_pressure_snapshots
            (id, window_start, window_end, payload_json, created_at)
            VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind(&snapshot.id)
+        .bind(snapshot.window_start.to_rfc3339())
+        .bind(snapshot.window_end.to_rfc3339())
+        .bind(payload)
+        .bind(snapshot.created_at.to_rfc3339())
     )
-    .bind(&snapshot.id)
-    .bind(snapshot.window_start.to_rfc3339())
-    .bind(snapshot.window_end.to_rfc3339())
-    .bind(payload)
-    .bind(snapshot.created_at.to_rfc3339())
-    .execute(pool)
-    .await
     .context("insert storage write pressure snapshot")?;
     Ok(())
 }

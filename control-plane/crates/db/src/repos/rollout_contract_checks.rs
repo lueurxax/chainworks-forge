@@ -513,8 +513,11 @@ pub async fn upsert_rollout_contract_check(
         .context("serialize rollback_disposition")?;
     let now_str = now.to_rfc3339();
 
-    sqlx::query(
-        r#"
+    crate::execute_repository_write!(
+        pool,
+        "rollout_contract_checks.upsert_rollout_contract_check",
+        sqlx::query(
+            r#"
         INSERT INTO rollout_contract_checks (
           id, run_id, proposal_id, proposal_revision_id,
           proposal_content_hash, contract_object_hash, content_snapshot_id,
@@ -541,31 +544,30 @@ pub async fn upsert_rollout_contract_check(
           retry_count             = excluded.retry_count,
           updated_at              = excluded.updated_at
         "#,
+        )
+        .bind(&id_str)
+        .bind(&run_id_str)
+        .bind(&input.proposal_id)
+        .bind(&input.proposal_revision_id)
+        .bind(&input.proposal_content_hash)
+        .bind(&input.contract_object_hash)
+        .bind(&input.content_snapshot_id)
+        .bind(&input.checker_version)
+        .bind(&status_str)
+        .bind(&decision_str)
+        .bind(&lifecycle_str)
+        .bind(&enforcement_str)
+        .bind(&failure_reasons_json)
+        .bind(&diagnostics_json)
+        .bind(waiver_json.as_deref())
+        .bind(&rollback_disposition_json)
+        .bind(&projection_str)
+        .bind(input.cutover_policy_revision.as_deref())
+        .bind(redaction_state)
+        .bind(input.retry_count)
+        .bind(input.preflight_timeout_seconds)
+        .bind(&now_str)
     )
-    .bind(&id_str)
-    .bind(&run_id_str)
-    .bind(&input.proposal_id)
-    .bind(&input.proposal_revision_id)
-    .bind(&input.proposal_content_hash)
-    .bind(&input.contract_object_hash)
-    .bind(&input.content_snapshot_id)
-    .bind(&input.checker_version)
-    .bind(&status_str)
-    .bind(&decision_str)
-    .bind(&lifecycle_str)
-    .bind(&enforcement_str)
-    .bind(&failure_reasons_json)
-    .bind(&diagnostics_json)
-    .bind(waiver_json.as_deref())
-    .bind(&rollback_disposition_json)
-    .bind(&projection_str)
-    .bind(input.cutover_policy_revision.as_deref())
-    .bind(redaction_state)
-    .bind(input.retry_count)
-    .bind(input.preflight_timeout_seconds)
-    .bind(&now_str)
-    .execute(pool)
-    .await
     .context("upsert rollout_contract_checks")?;
 
     let stored = find_rollout_contract_check(pool, input.id)
@@ -636,29 +638,35 @@ async fn record_rollout_contract_metric_events(
 
     let events = metric_events_for_check(check, occurred_at);
     let check_id = check.id.to_string();
-    sqlx::query("DELETE FROM rollout_contract_metric_events WHERE rollout_contract_check_id = ?1")
+    crate::execute_repository_write!(
+        pool,
+        "rollout_contract_checks.record_rollout_contract_metric_events",
+        sqlx::query(
+            "DELETE FROM rollout_contract_metric_events WHERE rollout_contract_check_id = ?1"
+        )
         .bind(&check_id)
-        .execute(pool)
-        .await
-        .context("delete stale rollout contract metric events")?;
+    )
+    .context("delete stale rollout contract metric events")?;
 
     for event in events {
-        sqlx::query(
-            r#"INSERT INTO rollout_contract_metric_events
+        crate::execute_repository_write!(
+            pool,
+            "rollout_contract_checks.record_rollout_contract_metric_events",
+            sqlx::query(
+                r#"INSERT INTO rollout_contract_metric_events
                (event_id, run_id, rollout_contract_check_id, metric_name, labels_json,
                 value, unit, occurred_at)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(&event.event_id)
+            .bind(&event.run_id)
+            .bind(&event.rollout_contract_check_id)
+            .bind(&event.metric_name)
+            .bind(serde_json::to_string(&event.labels_json)?)
+            .bind(event.value)
+            .bind(&event.unit)
+            .bind(event.occurred_at.to_rfc3339())
         )
-        .bind(&event.event_id)
-        .bind(&event.run_id)
-        .bind(&event.rollout_contract_check_id)
-        .bind(&event.metric_name)
-        .bind(serde_json::to_string(&event.labels_json)?)
-        .bind(event.value)
-        .bind(&event.unit)
-        .bind(event.occurred_at.to_rfc3339())
-        .execute(pool)
-        .await
         .context("insert rollout contract metric event")?;
     }
 

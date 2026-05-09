@@ -46,7 +46,9 @@ pub async fn upsert_generation_and_rebuild(
     input: ActiveArtifactGenerationInput,
 ) -> Result<()> {
     let run_id = input.run_id;
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "artifact_contracts.upsert_generation")
+            .await?;
     upsert_generation_and_rebuild_tx(&mut tx, input).await?;
     tx.commit().await?;
     export_projection_files(pool, run_id).await
@@ -137,7 +139,11 @@ pub async fn repair_contract_status_normalization_and_rebuild(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<u64> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.repair_contract_status_normalization",
+    )
+    .await?;
     let repaired = repair_contract_status_normalization_tx(&mut tx, run_id).await?;
     rebuild_run_state_projection_tx(&mut tx, run_id).await?;
     tx.commit().await?;
@@ -258,7 +264,11 @@ pub async fn insert_source_generation_claim(
     pool: &SqlitePool,
     claim: ArtifactSourceGenerationClaim,
 ) -> Result<()> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.insert_source_generation_claim",
+    )
+    .await?;
     insert_source_generation_claim_tx(&mut tx, claim).await?;
     tx.commit().await?;
     Ok(())
@@ -300,7 +310,11 @@ pub async fn load_source_generation_claim(
     pool: &SqlitePool,
     key: &ArtifactSourceGenerationClaimKey,
 ) -> Result<Option<ArtifactSourceGenerationClaim>> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.load_source_generation_claim",
+    )
+    .await?;
     let claim = load_source_generation_claim_tx(&mut tx, key).await?;
     tx.commit().await?;
     Ok(claim)
@@ -520,22 +534,24 @@ pub async fn update_source_generation_claim_session(
     current_session_generation_id: Option<&str>,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"UPDATE artifact_source_generation_claims
+    crate::execute_repository_write!(
+        pool,
+        "artifact_contracts.update_source_generation_claim_session",
+        sqlx::query(
+            r#"UPDATE artifact_source_generation_claims
            SET current_session_generation_id = ?1, updated_at = ?2
            WHERE run_id = ?3 AND owner_kind = ?4 AND owner_id = ?5 AND agent_execution_id = ?6
              AND source_work_item_id = ?7 AND claim_state = ?8"#,
-    )
-    .bind(current_session_generation_id)
-    .bind(&now)
-    .bind(key.run_id.to_string())
-    .bind(key.owner_kind.to_string())
-    .bind(&key.owner_id)
-    .bind(key.agent_execution_id.to_string())
-    .bind(&key.source_work_item_id)
-    .bind(ArtifactSourceClaimState::Active.to_string())
-    .execute(pool)
-    .await?;
+        )
+        .bind(current_session_generation_id)
+        .bind(&now)
+        .bind(key.run_id.to_string())
+        .bind(key.owner_kind.to_string())
+        .bind(&key.owner_id)
+        .bind(key.agent_execution_id.to_string())
+        .bind(&key.source_work_item_id)
+        .bind(ArtifactSourceClaimState::Active.to_string())
+    )?;
     Ok(())
 }
 
@@ -545,7 +561,11 @@ pub async fn import_generation_with_claim_cas(
     source_session_generation_id: &str,
     input: ActiveArtifactGenerationInput,
 ) -> Result<SourceGenerationImportDecision> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.import_generation_with_claim_cas",
+    )
+    .await?;
     let decision =
         import_generation_with_claim_cas_tx(&mut tx, key, source_session_generation_id, input)
             .await?;
@@ -738,7 +758,7 @@ pub async fn create_override_and_rebuild(
     .bind(&input.expires_at_stage)
     .bind(&input.journal_id)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     rebuild_run_state_projection_tx(&mut tx, input.run_id).await?;
     tx.commit().await?;
@@ -796,7 +816,7 @@ pub async fn expire_overrides_for_stage(
         .bind(&now)
         .bind(run_id.to_string())
         .bind(stage_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         rebuild_run_state_projection_tx(&mut tx, run_id).await?;
         tx.commit().await?;

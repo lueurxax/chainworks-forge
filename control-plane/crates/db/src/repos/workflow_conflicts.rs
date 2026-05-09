@@ -110,7 +110,7 @@ pub async fn insert_advisory_rejection(
     .bind(&record.graph_membership_result)
     .bind(record.created_at.to_rfc3339())
     .bind(serde_json::to_string(record)?)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("insert workflow advisory rejection")?;
     // OPS-003 (P017 R5): every durable advisory rejection record emits
@@ -222,8 +222,11 @@ pub async fn upsert_implementation_handoff_status(
     pool: &SqlitePool,
     status: &ImplementationHandoffStatus,
 ) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO implementation_handoff_statuses
+    crate::execute_repository_write!(
+        pool,
+        "workflow_conflicts.upsert_implementation_handoff_status",
+        sqlx::query(
+            r#"INSERT INTO implementation_handoff_statuses
            (run_id, current_state_id, task_name, code_writer_start_status,
             status, updated_at, record_json)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -234,16 +237,15 @@ pub async fn upsert_implementation_handoff_status(
              status = excluded.status,
              updated_at = excluded.updated_at,
              record_json = excluded.record_json"#,
+        )
+        .bind(&status.run_id)
+        .bind(&status.current_state_id)
+        .bind(&status.task_name)
+        .bind(&status.code_writer_start_status)
+        .bind(&status.status)
+        .bind(status.updated_at.to_rfc3339())
+        .bind(serde_json::to_string(status)?)
     )
-    .bind(&status.run_id)
-    .bind(&status.current_state_id)
-    .bind(&status.task_name)
-    .bind(&status.code_writer_start_status)
-    .bind(&status.status)
-    .bind(status.updated_at.to_rfc3339())
-    .bind(serde_json::to_string(status)?)
-    .execute(pool)
-    .await
     .context("upsert implementation handoff status")?;
     Ok(())
 }

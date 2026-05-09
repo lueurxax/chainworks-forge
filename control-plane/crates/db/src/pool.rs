@@ -144,7 +144,7 @@ pub async fn create_pool(database_url: &str) -> Result<SqlitePool> {
 pub async fn begin_immediate_with_retry<'a>(
     pool: &'a SqlitePool,
     operation: &str,
-) -> Result<Transaction<'a, Sqlite>> {
+) -> Result<Transaction<'static, Sqlite>> {
     let wait_started = Instant::now();
     let mut retries = 0usize;
 

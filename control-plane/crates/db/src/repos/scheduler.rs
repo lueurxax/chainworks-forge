@@ -238,25 +238,30 @@ pub async fn upsert_queue_summary(
     let provider_family = summary.provider_family.as_deref().unwrap_or("");
 
     if summary.queued_count <= 0 {
-        sqlx::query(
-            r#"DELETE FROM scheduler_queue_summaries
+        crate::execute_repository_write!(
+            pool,
+            "scheduler.upsert_queue_summary",
+            sqlx::query(
+                r#"DELETE FROM scheduler_queue_summaries
                WHERE scope = ?1
                  AND scope_id = ?2
                  AND provider_family = ?3
                  AND top_reason = ?4"#,
+            )
+            .bind(&summary.scope)
+            .bind(&summary.scope_id)
+            .bind(provider_family)
+            .bind(&summary.top_reason)
         )
-        .bind(&summary.scope)
-        .bind(&summary.scope_id)
-        .bind(provider_family)
-        .bind(&summary.top_reason)
-        .execute(pool)
-        .await
         .context("clear zero-count scheduler queue summary")?;
         return Ok(());
     }
 
-    sqlx::query(
-        r#"INSERT INTO scheduler_queue_summaries
+    crate::execute_repository_write!(
+        pool,
+        "scheduler.upsert_queue_summary",
+        sqlx::query(
+            r#"INSERT INTO scheduler_queue_summaries
            (scope, scope_id, run_id, stage_execution_id, provider_family, top_reason,
             queued_count, oldest_queued_age_ms, global_queue_depth, stale_after_ms, updated_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -268,20 +273,19 @@ pub async fn upsert_queue_summary(
              global_queue_depth = excluded.global_queue_depth,
              stale_after_ms = excluded.stale_after_ms,
              updated_at = excluded.updated_at"#,
+        )
+        .bind(&summary.scope)
+        .bind(&summary.scope_id)
+        .bind(&summary.run_id)
+        .bind(&summary.stage_execution_id)
+        .bind(provider_family)
+        .bind(&summary.top_reason)
+        .bind(summary.queued_count)
+        .bind(summary.oldest_queued_age_ms)
+        .bind(summary.global_queue_depth)
+        .bind(summary.stale_after_ms)
+        .bind(summary.updated_at.to_rfc3339())
     )
-    .bind(&summary.scope)
-    .bind(&summary.scope_id)
-    .bind(&summary.run_id)
-    .bind(&summary.stage_execution_id)
-    .bind(provider_family)
-    .bind(&summary.top_reason)
-    .bind(summary.queued_count)
-    .bind(summary.oldest_queued_age_ms)
-    .bind(summary.global_queue_depth)
-    .bind(summary.stale_after_ms)
-    .bind(summary.updated_at.to_rfc3339())
-    .execute(pool)
-    .await
     .context("upsert scheduler queue summary")?;
     Ok(())
 }
@@ -328,29 +332,31 @@ pub async fn insert_health_snapshot(
     pool: &SqlitePool,
     snapshot: &SchedulerHealthSnapshot,
 ) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO scheduler_health_snapshots
+    crate::execute_repository_write!(
+        pool,
+        "scheduler.insert_health_snapshot",
+        sqlx::query(
+            r#"INSERT INTO scheduler_health_snapshots
            (id, queued_count, oldest_queued_age_ms, global_queue_depth, active_agent_executions,
             db_writer_wait_p95_ms, command_latency_p95_ms_json, last_host_interruption_epoch_id,
             sustained_backpressure_state, fire_consecutive_snapshots, clear_consecutive_snapshots,
             stale_after_ms, updated_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        )
+        .bind(&snapshot.id)
+        .bind(snapshot.queued_count)
+        .bind(snapshot.oldest_queued_age_ms)
+        .bind(snapshot.global_queue_depth)
+        .bind(snapshot.active_agent_executions)
+        .bind(snapshot.db_writer_wait_p95_ms)
+        .bind(&snapshot.command_latency_p95_ms_json)
+        .bind(&snapshot.last_host_interruption_epoch_id)
+        .bind(&snapshot.sustained_backpressure_state)
+        .bind(snapshot.fire_consecutive_snapshots)
+        .bind(snapshot.clear_consecutive_snapshots)
+        .bind(snapshot.stale_after_ms)
+        .bind(snapshot.updated_at.to_rfc3339())
     )
-    .bind(&snapshot.id)
-    .bind(snapshot.queued_count)
-    .bind(snapshot.oldest_queued_age_ms)
-    .bind(snapshot.global_queue_depth)
-    .bind(snapshot.active_agent_executions)
-    .bind(snapshot.db_writer_wait_p95_ms)
-    .bind(&snapshot.command_latency_p95_ms_json)
-    .bind(&snapshot.last_host_interruption_epoch_id)
-    .bind(&snapshot.sustained_backpressure_state)
-    .bind(snapshot.fire_consecutive_snapshots)
-    .bind(snapshot.clear_consecutive_snapshots)
-    .bind(snapshot.stale_after_ms)
-    .bind(snapshot.updated_at.to_rfc3339())
-    .execute(pool)
-    .await
     .context("insert scheduler health snapshot")?;
     Ok(())
 }
@@ -392,17 +398,19 @@ pub async fn record_db_writer_wait_observation(
     wait_ms: i64,
     observed_at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO scheduler_db_writer_observations
+    crate::execute_repository_write!(
+        pool,
+        "scheduler.record_db_writer_wait_observation",
+        sqlx::query(
+            r#"INSERT INTO scheduler_db_writer_observations
            (id, operation, wait_ms, observed_at)
            VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(operation)
+        .bind(wait_ms.max(0))
+        .bind(observed_at.to_rfc3339())
     )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(operation)
-    .bind(wait_ms.max(0))
-    .bind(observed_at.to_rfc3339())
-    .execute(pool)
-    .await
     .context("record scheduler DB writer wait observation")?;
     Ok(())
 }

@@ -734,7 +734,7 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
     .bind(&canonical_summary)
     .bind(created_at)
     .bind(status)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("insert_idempotent execute")?;
 
@@ -750,7 +750,7 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
     )
     .bind(&spool_ref.run_id)
     .bind(&rel_path)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .context("fetch existing row after idempotent conflict")?;
 
@@ -870,7 +870,7 @@ pub async fn update_status(
     sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
         .bind(status_str)
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("update evidence_spool_ref status")?;
     tx.commit()
@@ -1021,7 +1021,7 @@ pub async fn update_status_via_dbwriter(
             sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
                 .bind(status.as_str())
                 .bind(&id_owned)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .context("update evidence_spool_ref status")?;
             tx.commit().await?;

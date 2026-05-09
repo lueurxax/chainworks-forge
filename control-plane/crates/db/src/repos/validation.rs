@@ -6,28 +6,30 @@ use domain::ids::{ArtifactId, RunId, StageExecutionId};
 use domain::validation::{ValidationFailureClass, ValidationFailureRecord};
 
 pub async fn insert(pool: &SqlitePool, record: &ValidationFailureRecord) -> Result<()> {
-    sqlx::query(
-        r#"
+    crate::execute_repository_write!(
+        pool,
+        "validation.insert",
+        sqlx::query(
+            r#"
         INSERT INTO validation_failure_records
             (id, artifact_id, run_id, stage_id, agent_id, stage_execution_id, agent_execution_id,
              timestamp, failure_class, failure_summary, record_json, recovery_action)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#,
+        )
+        .bind(&record.id)
+        .bind(record.artifact_id.to_string())
+        .bind(record.run_id.to_string())
+        .bind(&record.stage_id)
+        .bind(&record.agent_id)
+        .bind(record.stage_execution_id.to_string())
+        .bind(record.agent_execution_id.to_string())
+        .bind(record.timestamp.to_rfc3339())
+        .bind(validation_failure_class_to_str(&record.failure_class))
+        .bind(&record.failure_summary)
+        .bind(serde_json::to_string(record).context("serialize ValidationFailureRecord")?)
+        .bind(&record.recovery_recommendation.action)
     )
-    .bind(&record.id)
-    .bind(record.artifact_id.to_string())
-    .bind(record.run_id.to_string())
-    .bind(&record.stage_id)
-    .bind(&record.agent_id)
-    .bind(record.stage_execution_id.to_string())
-    .bind(record.agent_execution_id.to_string())
-    .bind(record.timestamp.to_rfc3339())
-    .bind(validation_failure_class_to_str(&record.failure_class))
-    .bind(&record.failure_summary)
-    .bind(serde_json::to_string(record).context("serialize ValidationFailureRecord")?)
-    .bind(&record.recovery_recommendation.action)
-    .execute(pool)
-    .await
     .context("insert validation_failure_record")?;
     Ok(())
 }

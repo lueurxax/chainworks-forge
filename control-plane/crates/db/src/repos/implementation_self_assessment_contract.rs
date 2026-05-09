@@ -54,7 +54,7 @@ pub async fn persist_implementation_self_assessment_summary(
     )
     .bind(&run_id_str)
     .bind(&summary.contract_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .context("find active artifact contract summary")?;
 
@@ -145,7 +145,7 @@ pub async fn persist_implementation_self_assessment_summary(
     .bind(to_json(&warnings)?)
     .bind(if summary.raw_artifact_available { 1 } else { 0 })
     .bind(created_at_str)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("upsert artifact contract summary")?;
 
@@ -165,7 +165,7 @@ pub async fn persist_implementation_self_assessment_summary(
         )
         .bind(&run_id_str)
         .bind(&summary.contract_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("deactivate prior artifact contract summaries")?;
 
@@ -175,7 +175,7 @@ pub async fn persist_implementation_self_assessment_summary(
                WHERE artifact_id = ?1"#,
         )
         .bind(&artifact_id_str)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("activate artifact contract summary")?;
     }

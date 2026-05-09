@@ -785,7 +785,7 @@ async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) ->
     .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if updated != 1 {
@@ -822,7 +822,7 @@ async fn update_invoke_work_item_claimed_payload_and_running(
     .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if updated != 1 {
@@ -2424,7 +2424,7 @@ impl BackgroundExecutor {
         &self,
         operation_name: &'static str,
         idempotency_key: impl Into<String>,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+    ) -> Result<db::writer::QueuedTransaction> {
         self.db_writer
             .begin_immediate_transaction(
                 class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
@@ -4921,7 +4921,7 @@ impl BackgroundExecutor {
                                    AND lead_mediation_record_id = ?",
                             )
                             .bind(med_id)
-                            .fetch_one(&mut *tx)
+                            .fetch_one(&mut **tx)
                             .await
                             .unwrap_or(1);
                             let attempt_result = match result.status {
