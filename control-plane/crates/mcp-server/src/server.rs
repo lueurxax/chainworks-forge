@@ -585,7 +585,7 @@ impl McpServer {
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
-                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
+                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, &self.cmd_handler, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),

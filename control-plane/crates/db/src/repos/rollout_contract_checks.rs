@@ -1050,12 +1050,17 @@ fn parse_metric_event_row(row: &sqlx::sqlite::SqliteRow) -> Result<RolloutContra
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn test_pool() -> (TempDir, SqlitePool) {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
         let pool = crate::pool::create_pool(&url).await.unwrap();
+        let writer = Arc::new(crate::writer::DbWriter::new(pool.clone()));
+        crate::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
         (dir, pool)
     }
 

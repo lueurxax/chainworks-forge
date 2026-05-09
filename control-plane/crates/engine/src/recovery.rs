@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -27,7 +28,7 @@ pub struct RecoveryService {
     work_queue: WorkQueue,
     #[allow(dead_code)]
     events: EventSender,
-    db_writer: DbWriter,
+    db_writer: Arc<DbWriter>,
 }
 
 #[cfg(test)]
@@ -197,6 +198,20 @@ impl RecoveryService {
             pool,
             work_queue,
             events,
+            db_writer: Arc::new(db_writer),
+        }
+    }
+
+    pub fn new_with_db_writer(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        events: EventSender,
+        db_writer: Arc<DbWriter>,
+    ) -> Self {
+        Self {
+            pool,
+            work_queue,
+            events,
             db_writer,
         }
     }
@@ -212,7 +227,7 @@ impl RecoveryService {
             events.clone(),
             invoke_agent_capacity,
         );
-        let db_writer = DbWriter::new(pool.clone());
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
             work_queue,

@@ -259,6 +259,7 @@ async fn main() -> Result<()> {
     let work_queue = WorkQueue::new(pool.clone());
     let acp = Arc::new(AcpRuntimeManager::new());
     let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
     let cmd_handler = Arc::new(CommandHandler::new_with_acp_capacity_and_db_writer(
         pool.clone(),
         events.clone(),
@@ -285,7 +286,12 @@ async fn main() -> Result<()> {
         ),
     );
     // Startup recovery: repair any run left mid-flight by a previous crash.
-    let recovery = RecoveryService::new(pool.clone(), work_queue.clone(), events.clone());
+    let recovery = RecoveryService::new_with_db_writer(
+        pool.clone(),
+        work_queue.clone(),
+        events.clone(),
+        db_writer.clone(),
+    );
     let summary = recovery.run_startup_repair().await?;
     info!(
         runs_inspected = summary.runs_inspected,
@@ -316,11 +322,12 @@ async fn main() -> Result<()> {
         }
     }
     let host_interruption_service =
-        HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+        HostInterruptionService::with_capacity_config_runtime_cleanup_and_db_writer(
             pool.clone(),
             work_queue.clone(),
             InvokeAgentCapacityConfig::default(),
             acp.clone(),
+            db_writer.clone(),
         );
     let _runtime_heartbeat_monitor =
         spawn_runtime_heartbeat_monitor(host_interruption_service.clone());

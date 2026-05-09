@@ -5574,6 +5574,8 @@ allowed_replay = {
     "caller_guarded", "telemetry_merge",
 }
 registered = set()
+class_by_operation = {}
+replay_by_operation = {}
 for idx, row in enumerate(registry.get("operations", []), start=1):
     missing = sorted(required_operation_fields - row.keys())
     if missing:
@@ -5584,6 +5586,8 @@ for idx, row in enumerate(registry.get("operations", []), start=1):
     if name in registered:
         raise SystemExit(f"P075 duplicate operation_name: {name}")
     registered.add(name)
+    class_by_operation[name] = row["class"]
+    replay_by_operation[name] = row["replay_policy"]
     if row["class"] not in allowed_classes:
         raise SystemExit(f"P075 operation {name} has invalid class {row['class']}")
     if row["replay_policy"] not in allowed_replay:
@@ -5605,6 +5609,21 @@ for idx, row in enumerate(registry.get("operations", []), start=1):
             raise SystemExit(
                 f"P075 caller_guarded operation {name} has non-specific duplicate proof path"
             )
+
+expected_class_replay = {
+    "projections.rebuild_approval_inbox": ("B", "last_writer_wins"),
+    "projections.rebuild_run_summary": ("B", "last_writer_wins"),
+    "projections.rebuild_stage_summaries": ("B", "last_writer_wins"),
+    "projections.upsert_artifact_index_entry": ("B", "last_writer_wins"),
+    "scheduler.record_db_writer_wait_observation": ("D", "telemetry_merge"),
+    "storage_health.insert_write_pressure_snapshot": ("D", "telemetry_merge"),
+}
+for name, (expected_class, expected_replay) in expected_class_replay.items():
+    if class_by_operation.get(name) != expected_class or replay_by_operation.get(name) != expected_replay:
+        raise SystemExit(
+            f"P075 operation {name} must be Class {expected_class}/{expected_replay}; "
+            f"got {class_by_operation.get(name)}/{replay_by_operation.get(name)}"
+        )
 
 observed = set()
 for rel_root in [
@@ -5654,6 +5673,56 @@ if runtime_direct_write_sites:
     raise SystemExit(
         "P075 runtime direct SQL write sites must route through DbWriter: "
         + ", ".join(sorted(runtime_direct_write_sites))
+    )
+
+daemon_main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
+for required in [
+    "db::writer::register_shared_writer(&pool, db_writer.clone()).await?",
+    "CommandHandler::new_with_acp_capacity_and_db_writer",
+    "Orchestrator::new_with_db_writer",
+    "BackgroundExecutor::new_with_steward_runtime_inputs_and_db_writer",
+    "RecoveryService::new_with_db_writer",
+    "HostInterruptionService::with_capacity_config_runtime_cleanup_and_db_writer",
+]:
+    if required not in daemon_main:
+        raise SystemExit(f"P075 daemon startup must register/inject shared DbWriter: missing {required}")
+
+writer_text = (root / "control-plane/crates/db/src/writer.rs").read_text()
+if "P075 shared DbWriter is not registered" not in writer_text:
+    raise SystemExit("P075 file-backed registered transaction path must fail closed without shared DbWriter")
+if "shared_writer_for(pool).await" not in writer_text:
+    raise SystemExit("P075 registered transaction path must consult shared DbWriter registry")
+if "insert_idempotent_via_dbwriter" in (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text():
+    evidence_refs_text = (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text().split("\n#[cfg(test)]", 1)[0]
+    via_plain_insert = evidence_refs_text.split("pub async fn insert_via_dbwriter", 1)[1].split("pub async fn", 1)[0]
+    via_insert = evidence_refs_text.split("pub async fn insert_idempotent_via_dbwriter", 1)[1].split("pub async fn", 1)[0]
+    via_update = evidence_refs_text.split("pub async fn update_status_via_dbwriter", 1)[1].split("pub async fn", 1)[0]
+    for fn_name, body in [
+        ("insert_via_dbwriter", via_plain_insert),
+        ("insert_idempotent_via_dbwriter", via_insert),
+        ("update_status_via_dbwriter", via_update),
+    ]:
+        if "begin_registered_immediate_transaction" in body or "insert_idempotent(&" in body:
+            raise SystemExit(
+                f"P075 {fn_name} must not re-enter registered transactions inside DbWriter work"
+            )
+
+local_writer_sites = []
+for rel_root in [
+    "control-plane/crates/engine/src",
+    "control-plane/crates/mcp-server/src",
+]:
+    for path in (root / rel_root).rglob("*.rs"):
+        text = path.read_text().split("\n#[cfg(test)]", 1)[0]
+        for pattern in [r"let\s+local_writer\s*=", r"let\s+writer\s*=\s*db::writer::DbWriter::new\(pool\.clone\(\)\)"]:
+            for match in re.finditer(pattern, text):
+                local_writer_sites.append(
+                    f"{path.relative_to(root / 'control-plane').as_posix()}:{text.count(chr(10), 0, match.start()) + 1}"
+                )
+if local_writer_sites:
+    raise SystemExit(
+        "P075 production runtime must not create per-call local DbWriter instances: "
+        + ", ".join(sorted(local_writer_sites))
     )
 
 raw_evidence_patterns = [

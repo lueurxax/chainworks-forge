@@ -672,6 +672,27 @@ pub async fn insert_tx(
 /// already existed (same checksum and size_bytes). Returns an error if a conflicting
 /// row exists with a different checksum or size, signalling `evidence_metadata_conflict`.
 pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) -> Result<bool> {
+    // Use the DbWriter-owned P061 immediate transaction path instead of BEGIN DEFERRED.
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "p075_evidence_spool_ref_insert_idempotent",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "p075_evidence_spool_ref_insert_idempotent",
+        ),
+        "p075_evidence_spool_ref_insert_idempotent",
+    )
+    .await
+    .context("begin insert_idempotent")?;
+    let inserted = insert_idempotent_tx(&mut tx, spool_ref).await?;
+    tx.commit().await.context("commit insert_idempotent")?;
+    Ok(inserted)
+}
+
+async fn insert_idempotent_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    spool_ref: &EvidenceSpoolRef,
+) -> Result<bool> {
     validate_relative_path(&spool_ref.relative_path).context("validate relative_path")?;
     validate_spool_ref_fields(spool_ref).context("validate spool_ref fields")?;
     let rel_path = normalize_path(&spool_ref.relative_path);
@@ -685,19 +706,6 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
         .map(canonicalize_summary_json)
         .transpose()
         .context("canonicalize summary_json for insert_idempotent")?;
-
-    // Use the DbWriter-owned P061 immediate transaction path instead of BEGIN DEFERRED.
-    let mut tx = begin_registered_immediate_transaction(
-        pool,
-        crate::writer::class_a_operation(
-            "p075_evidence_spool_ref_insert_idempotent",
-            crate::write_class::WriteLane::CriticalBarrier,
-            "p075_evidence_spool_ref_insert_idempotent",
-        ),
-        "p075_evidence_spool_ref_insert_idempotent",
-    )
-    .await
-    .context("begin insert_idempotent")?;
 
     // Single atomic statement: insert and skip silently on (run_id, relative_path) conflict.
     let result = sqlx::query(
@@ -739,7 +747,6 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
     .context("insert_idempotent execute")?;
 
     if result.rows_affected() == 1 {
-        tx.commit().await.context("commit insert_idempotent")?;
         return Ok(true);
     }
 
@@ -753,10 +760,6 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
     .fetch_one(&mut **tx)
     .await
     .context("fetch existing row after idempotent conflict")?;
-
-    tx.commit()
-        .await
-        .context("commit insert_idempotent check")?;
 
     let existing_checksum: String = existing.try_get("checksum").context("existing checksum")?;
     let existing_size: i64 = existing
@@ -914,23 +917,24 @@ pub async fn insert_via_dbwriter(writer: &DbWriter, spool_ref: EvidenceSpoolRef)
         replay_policy: ReplayPolicy::ChecksumIdempotent,
         observed_at: None,
     };
-    writer
-        .submit(op, move |pool| async move {
-            let mut tx = begin_registered_immediate_transaction(
-                &pool,
-                crate::writer::class_a_operation(
-                    "p075_evidence_spool_ref_insert",
-                    crate::write_class::WriteLane::CriticalBarrier,
-                    "p075_evidence_spool_ref_insert",
-                ),
-                "p075_evidence_spool_ref_insert",
-            )
-            .await?;
-            insert_tx(&mut tx, &spool_ref).await?;
-            tx.commit().await?;
-            Ok(1u32)
-        })
+    let mut tx = match writer
+        .begin_immediate_transaction(op, "p075_evidence_spool_ref_insert")
         .await
+    {
+        Ok(tx) => tx,
+        Err(_) => return WriteResult::WriteFailed,
+    };
+    let result = insert_tx(&mut tx, &spool_ref).await;
+    match result {
+        Ok(()) => match tx.commit().await {
+            Ok(()) => WriteResult::Committed,
+            Err(_) => WriteResult::WriteFailed,
+        },
+        Err(_) => {
+            let _ = tx.rollback().await;
+            WriteResult::WriteFailed
+        }
+    }
 }
 
 /// Submit an idempotent Class C evidence spool metadata insert through [`DbWriter`].
@@ -967,17 +971,24 @@ pub async fn insert_idempotent_via_dbwriter(
         replay_policy: ReplayPolicy::ChecksumIdempotent,
         observed_at: None,
     };
-    writer
-        .submit(op, move |pool| async move {
-            // Re-use existing insert_idempotent logic which handles conflict detection.
-            // Map bool result to rows_affected (1=new insert, 0=existing match).
-            match insert_idempotent(&pool, &spool_ref).await {
-                Ok(true) => Ok(1u32),
-                Ok(false) => Ok(0u32),
-                Err(e) => Err(e),
-            }
-        })
+    let mut tx = match writer
+        .begin_immediate_transaction(op, "p075_evidence_spool_ref_insert_idempotent")
         .await
+    {
+        Ok(tx) => tx,
+        Err(_) => return WriteResult::WriteFailed,
+    };
+    let result = insert_idempotent_tx(&mut tx, &spool_ref).await;
+    match result {
+        Ok(_) => match tx.commit().await {
+            Ok(()) => WriteResult::Committed,
+            Err(_) => WriteResult::WriteFailed,
+        },
+        Err(_) => {
+            let _ = tx.rollback().await;
+            WriteResult::WriteFailed
+        }
+    }
 }
 
 /// Submit a Class A status update for an evidence spool ref through [`DbWriter`].
@@ -1006,28 +1017,29 @@ pub async fn update_status_via_dbwriter(
         replay_policy: ReplayPolicy::NaturalKey,
         observed_at: None,
     };
-    writer
-        .submit(op, move |pool| async move {
-            let mut tx = begin_registered_immediate_transaction(
-                &pool,
-                crate::writer::class_a_operation(
-                    "p075_evidence_spool_ref_update_status",
-                    crate::write_class::WriteLane::CriticalBarrier,
-                    "p075_evidence_spool_ref_update_status",
-                ),
-                "p075_evidence_spool_ref_update_status",
-            )
-            .await?;
-            sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
-                .bind(status.as_str())
-                .bind(&id_owned)
-                .execute(&mut **tx)
-                .await
-                .context("update evidence_spool_ref status")?;
-            tx.commit().await?;
-            Ok(1u32)
-        })
+    let mut tx = match writer
+        .begin_immediate_transaction(op, "p075_evidence_spool_ref_update_status")
         .await
+    {
+        Ok(tx) => tx,
+        Err(_) => return WriteResult::WriteFailed,
+    };
+    let result = sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
+        .bind(status.as_str())
+        .bind(&id_owned)
+        .execute(&mut **tx)
+        .await
+        .context("update evidence_spool_ref status");
+    match result {
+        Ok(_) => match tx.commit().await {
+            Ok(()) => WriteResult::Committed,
+            Err(_) => WriteResult::WriteFailed,
+        },
+        Err(_) => {
+            let _ = tx.rollback().await;
+            WriteResult::WriteFailed
+        }
+    }
 }
 
 fn parse_row(row: sqlx::sqlite::SqliteRow) -> Result<EvidenceSpoolRef> {

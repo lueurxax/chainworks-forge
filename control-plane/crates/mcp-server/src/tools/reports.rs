@@ -8,7 +8,7 @@ use db::repos::{
     rollout_contract_checks, sessions, validation, workflow_conflicts,
 };
 use db::write_class::WriteLane;
-use db::writer::{class_a_operation, DbWriter};
+use db::writer::class_a_operation;
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
 use domain::ids::RunId;
@@ -52,7 +52,7 @@ pub async fn execute(
     tool_name: &str,
     params: serde_json::Value,
     pool: &SqlitePool,
-    _cmd_handler: &CommandHandler,
+    cmd_handler: &CommandHandler,
     principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     match tool_name {
@@ -97,7 +97,7 @@ pub async fn execute(
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
-                "workflow_conflict": workflow_conflict_json(pool, run_id).await?,
+                "workflow_conflict": workflow_conflict_json(pool, cmd_handler, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
@@ -141,6 +141,7 @@ pub async fn execute(
 
 pub(crate) async fn workflow_conflict_json(
     pool: &SqlitePool,
+    cmd_handler: &CommandHandler,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
     match workflow_conflicts::get_current_blocking_conflict(pool, run_id).await? {
@@ -192,8 +193,8 @@ pub(crate) async fn workflow_conflict_json(
                 .filter(|key| value.get(*key).map(|v| !v.is_null()).unwrap_or(false))
                 .collect();
             let now = chrono::Utc::now();
-            let local_writer = DbWriter::new(pool.clone());
-            let mut tx = local_writer
+            let db_writer = cmd_handler.db_writer();
+            let mut tx = db_writer
                 .begin_immediate_transaction(
                     class_a_operation(
                         "mcp.reports.record_workflow_conflict_readback_completeness",

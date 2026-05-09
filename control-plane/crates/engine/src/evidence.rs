@@ -176,17 +176,16 @@ pub async fn build_and_persist_failed_stage_evidence(
         created_at: packet_timestamp,
         status: EvidenceSpoolRefStatus::Available,
     };
-    let local_writer;
+    let shared_writer;
     let writer = if let Some(writer) = input.db_writer {
         writer
     } else {
-        local_writer = DbWriter::new(pool.clone());
-        &local_writer
+        shared_writer = db::writer::shared_writer_for(pool)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("P075 shared DbWriter is not registered"))?;
+        shared_writer.as_ref()
     };
     let metadata_result = insert_idempotent_via_dbwriter(writer, spool_ref).await;
-    if input.db_writer.is_none() {
-        writer.shutdown().await;
-    }
     if metadata_result != WriteResult::Committed {
         anyhow::bail!(
             "failed to persist failed-stage evidence spool metadata via DbWriter: {}",
@@ -280,6 +279,7 @@ mod tests {
     #[tokio::test]
     async fn failed_stage_evidence_packet_tests() {
         let pool = create_pool("sqlite::memory:").await.unwrap();
+        let db_writer = db::writer::DbWriter::new(pool.clone());
         let tmp = tempfile::tempdir().unwrap();
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
@@ -444,7 +444,7 @@ mod tests {
                 provider: "system",
                 model: None,
                 failed_at: now,
-                db_writer: None,
+                db_writer: Some(&db_writer),
             },
         )
         .await

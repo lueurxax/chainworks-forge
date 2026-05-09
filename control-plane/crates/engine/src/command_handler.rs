@@ -1511,6 +1511,10 @@ impl CommandHandler {
             .await
     }
 
+    pub fn db_writer(&self) -> Arc<DbWriter> {
+        self.db_writer.clone()
+    }
+
     pub fn with_retry_stage_failure_injection(
         mut self,
         injection: Arc<dyn Fn(&str) -> Result<()> + Send + Sync>,

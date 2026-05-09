@@ -650,31 +650,31 @@ duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-applic
 
 [[operations]]
 operation_name = "projections.rebuild_approval_inbox"
-class = "A"
-replay_policy = "caller_guarded"
-idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
-duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#projections-rebuild-approval-inbox"
+class = "B"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "projection name plus run/read model key; latest observed_at wins"
+duplicate_application_test_path = ""
 
 [[operations]]
 operation_name = "projections.rebuild_run_summary"
-class = "A"
-replay_policy = "caller_guarded"
-idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
-duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#projections-rebuild-run-summary"
+class = "B"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "projection name plus run/read model key; latest observed_at wins"
+duplicate_application_test_path = ""
 
 [[operations]]
 operation_name = "projections.rebuild_stage_summaries"
-class = "A"
-replay_policy = "caller_guarded"
-idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
-duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#projections-rebuild-stage-summaries"
+class = "B"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "projection name plus run/read model key; latest observed_at wins"
+duplicate_application_test_path = ""
 
 [[operations]]
 operation_name = "projections.upsert_artifact_index_entry"
-class = "A"
-replay_policy = "caller_guarded"
-idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
-duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#projections-upsert-artifact-index-entry"
+class = "B"
+replay_policy = "last_writer_wins"
+idempotency_key_kind = "projection name plus artifact index key; latest observed_at wins"
+duplicate_application_test_path = ""
 
 [[operations]]
 operation_name = "rollout_contract_checks.record_rollout_contract_metric_events"
@@ -748,10 +748,10 @@ duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-applic
 
 [[operations]]
 operation_name = "scheduler.record_db_writer_wait_observation"
-class = "A"
-replay_policy = "caller_guarded"
-idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
-duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#scheduler-record-db-writer-wait-observation"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "scheduler storage pressure observation window"
+duplicate_application_test_path = ""
 
 [[operations]]
 operation_name = "scheduler.upsert_queue_summary"
@@ -846,10 +846,10 @@ duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-applic
 
 [[operations]]
 operation_name = "storage_health.insert_write_pressure_snapshot"
-class = "A"
-replay_policy = "caller_guarded"
-idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
-duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#storage-health-insert-write-pressure-snapshot"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "storage pressure snapshot window_start"
+duplicate_application_test_path = ""
 
 [[operations]]
 operation_name = "toolchain_cache_housekeeping.insert"

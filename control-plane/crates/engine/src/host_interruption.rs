@@ -275,6 +275,15 @@ impl HostInterruptionService {
         capacity_config: InvokeAgentCapacityConfig,
     ) -> Self {
         let db_writer = Arc::new(DbWriter::new(pool.clone()));
+        Self::with_capacity_config_and_db_writer(pool, work_queue, capacity_config, db_writer)
+    }
+
+    pub fn with_capacity_config_and_db_writer(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        capacity_config: InvokeAgentCapacityConfig,
+        db_writer: Arc<DbWriter>,
+    ) -> Self {
         Self {
             pool,
             work_queue,
@@ -291,6 +300,22 @@ impl HostInterruptionService {
         runtime_cleanup: Arc<dyn HostInterruptionRuntimeCleanup>,
     ) -> Self {
         let db_writer = Arc::new(DbWriter::new(pool.clone()));
+        Self::with_capacity_config_runtime_cleanup_and_db_writer(
+            pool,
+            work_queue,
+            capacity_config,
+            runtime_cleanup,
+            db_writer,
+        )
+    }
+
+    pub fn with_capacity_config_runtime_cleanup_and_db_writer(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        capacity_config: InvokeAgentCapacityConfig,
+        runtime_cleanup: Arc<dyn HostInterruptionRuntimeCleanup>,
+        db_writer: Arc<DbWriter>,
+    ) -> Self {
         Self {
             pool,
             work_queue,

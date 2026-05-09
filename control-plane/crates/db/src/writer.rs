@@ -99,12 +99,12 @@
 //! The write returns `WriteFailed` and the file is flagged for manual reconcile via
 //! `storage.reconcile_evidence_orphans`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
@@ -199,7 +199,82 @@ pub fn class_a_operation(
 }
 
 pub fn repository_transaction_operation(operation_name: &'static str) -> WriteOperation {
+    if operation_name.starts_with("projections.") {
+        return WriteOperation {
+            class: WriteClass::B,
+            lane: WriteLane::CoalescedProjection,
+            operation_name,
+            expected_rows: 1,
+            batchable: true,
+            barrier: false,
+            deadline: WriteClass::B.default_deadline(),
+            deadline_reason: None,
+            idempotency_key: operation_name.to_string(),
+            replay_policy: ReplayPolicy::LastWriterWins,
+            observed_at: None,
+        };
+    }
+    if matches!(
+        operation_name,
+        "storage_health.insert_write_pressure_snapshot"
+            | "scheduler.record_db_writer_wait_observation"
+    ) {
+        return WriteOperation {
+            class: WriteClass::D,
+            lane: WriteLane::TelemetryRollup,
+            operation_name,
+            expected_rows: 1,
+            batchable: true,
+            barrier: false,
+            deadline: WriteClass::D.default_deadline(),
+            deadline_reason: None,
+            idempotency_key: operation_name.to_string(),
+            replay_policy: ReplayPolicy::TelemetryMerge,
+            observed_at: None,
+        };
+    }
     class_a_operation(operation_name, WriteLane::CriticalBarrier, operation_name)
+}
+
+static SHARED_WRITERS: OnceLock<Mutex<HashMap<String, Arc<DbWriter>>>> = OnceLock::new();
+
+async fn pool_registry_key(pool: &SqlitePool) -> Option<(String, bool)> {
+    let file: Option<String> =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let file = file.unwrap_or_default().trim().to_string();
+    if file.is_empty() {
+        Some((format!("in-memory:{:p}", pool), false))
+    } else {
+        Some((file, true))
+    }
+}
+
+pub async fn register_shared_writer(
+    pool: &SqlitePool,
+    writer: Arc<DbWriter>,
+) -> anyhow::Result<()> {
+    let Some((key, _file_backed)) = pool_registry_key(pool).await else {
+        return Ok(());
+    };
+    SHARED_WRITERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("shared DbWriter registry lock poisoned")
+        .insert(key, writer);
+    Ok(())
+}
+
+pub async fn shared_writer_for(pool: &SqlitePool) -> Option<Arc<DbWriter>> {
+    let (key, _file_backed) = pool_registry_key(pool).await?;
+    let registry = SHARED_WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = registry
+        .lock()
+        .expect("shared DbWriter registry lock poisoned");
+    guard.get(&key).cloned()
 }
 
 pub async fn begin_registered_immediate_transaction<'pool>(
@@ -212,6 +287,15 @@ pub async fn begin_registered_immediate_transaction<'pool>(
             "DbWriter rejected {context} before transaction start: {}",
             rejected.as_str()
         );
+    }
+    if let Some(writer) = shared_writer_for(pool).await {
+        return writer.begin_immediate_transaction(op, context).await;
+    }
+    let Some((_key, file_backed)) = pool_registry_key(pool).await else {
+        anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
+    };
+    if file_backed {
+        anyhow::bail!("P075 shared DbWriter is not registered for {context}");
     }
     let writer = Arc::new(DbWriter::new(pool.clone()));
     let mut tx = writer.begin_immediate_transaction(op, context).await?;
@@ -1774,6 +1858,44 @@ mod tests {
             replay_policy: ReplayPolicy::NaturalKey,
             observed_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn file_backed_registered_transaction_requires_shared_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("p075-shared-writer-required.sqlite");
+        let pool = crate::pool::create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+            .await
+            .unwrap();
+
+        let missing = match begin_registered_immediate_transaction(
+            &pool,
+            make_class_a_op(),
+            "p075_shared_writer_required",
+        )
+        .await
+        {
+            Ok(_) => panic!("file-backed transaction unexpectedly opened without shared writer"),
+            Err(error) => error,
+        };
+        assert!(
+            missing
+                .to_string()
+                .contains("P075 shared DbWriter is not registered"),
+            "file-backed runtime transactions must fail closed without the daemon shared writer; got {missing}"
+        );
+
+        let writer = Arc::new(DbWriter::new(pool.clone()));
+        register_shared_writer(&pool, writer.clone()).await.unwrap();
+        let tx = begin_registered_immediate_transaction(
+            &pool,
+            make_class_a_op(),
+            "p075_shared_writer_registered",
+        )
+        .await
+        .expect("registered shared writer must admit file-backed transaction");
+        tx.commit().await.unwrap();
+        writer.shutdown().await;
     }
 
     /// Regression test for CLEAN-002 / LIFT-REL-03: SHUTDOWN_ADMITTED_OPERATIONS must be

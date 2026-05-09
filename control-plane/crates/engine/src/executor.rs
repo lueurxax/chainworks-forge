@@ -273,20 +273,24 @@ fn invoke_agent_start_capacity_from_domain(
 pub async fn claim_next_invoke_agent_with_start(
     pool: &SqlitePool,
 ) -> Result<Option<ClaimedInvokeAgentStart>> {
-    Ok(
-        claim_next_invoke_agent_with_start_internal(pool, &InvokeAgentCapacityConfig::unbounded())
-            .await?
-            .map(|(claimed, _)| claimed),
+    Ok(claim_next_invoke_agent_with_start_internal(
+        pool,
+        &InvokeAgentCapacityConfig::unbounded(),
+        None,
     )
+    .await?
+    .map(|(claimed, _)| claimed))
 }
 
 pub async fn claim_next_invoke_agent_with_start_with_capacity(
     pool: &SqlitePool,
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<Option<ClaimedInvokeAgentStart>> {
-    Ok(claim_next_invoke_agent_with_start_internal(pool, capacity)
-        .await?
-        .map(|(claimed, _)| claimed))
+    Ok(
+        claim_next_invoke_agent_with_start_internal(pool, capacity, None)
+            .await?
+            .map(|(claimed, _)| claimed),
+    )
 }
 
 pub async fn has_capacity_eligible_pending_invoke_agent_for_start(
@@ -306,6 +310,7 @@ pub async fn has_capacity_eligible_pending_invoke_agent_for_start(
 async fn claim_next_invoke_agent_with_start_internal(
     pool: &SqlitePool,
     capacity: &InvokeAgentCapacityConfig,
+    db_writer: Option<&DbWriter>,
 ) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
     let candidates =
         work_items::select_pending_invoke_agents_for_start(pool, chrono::Utc::now(), 128).await?;
@@ -337,7 +342,9 @@ async fn claim_next_invoke_agent_with_start_internal(
         if !invoke_item_has_start_capacity(pool, &item, capacity).await? {
             continue;
         }
-        if let Some(claimed) = claim_invoke_agent_work_item_with_start(pool, item).await? {
+        if let Some(claimed) =
+            claim_invoke_agent_work_item_with_start(pool, item, db_writer).await?
+        {
             if let Some(run_id) = claimed.1.run_id {
                 let now = chrono::Utc::now();
                 scheduler::upsert_service_state(
@@ -496,7 +503,17 @@ fn scheduler_capacity_config_from_start_capacity(
 async fn claim_invoke_agent_work_item_with_start(
     pool: &SqlitePool,
     item: WorkItem,
+    db_writer: Option<&DbWriter>,
 ) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
+    let shared_writer;
+    let writer = if let Some(writer) = db_writer {
+        writer
+    } else {
+        shared_writer = db::writer::shared_writer_for(pool)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("P075 shared DbWriter is not registered"))?;
+        shared_writer.as_ref()
+    };
     let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
     if !payload
         .as_object()
@@ -542,7 +559,7 @@ async fn claim_invoke_agent_work_item_with_start(
             }
             let payload_json = serde_json::to_string(&payload)?;
             update_invoke_work_item_claimed_payload_and_running(
-                pool,
+                writer,
                 &running_item.id,
                 &payload_json,
             )
@@ -566,7 +583,7 @@ async fn claim_invoke_agent_work_item_with_start(
             .await?;
             running_item.payload_json = payload_json;
         } else {
-            mark_invoke_work_item_running(pool, &running_item.id).await?;
+            mark_invoke_work_item_running(writer, &running_item.id).await?;
         }
         return Ok(Some((claimed, running_item)));
     }
@@ -722,7 +739,7 @@ async fn claim_invoke_agent_work_item_with_start(
     }
     payload["p058_claimed"] = claimed_payload;
     let payload_json = serde_json::to_string(&payload)?;
-    update_invoke_work_item_claimed_payload_and_running(pool, &item.id, &payload_json).await?;
+    update_invoke_work_item_claimed_payload_and_running(writer, &item.id, &payload_json).await?;
     let mut running_item = item;
     running_item.status = WorkItemStatus::Running;
     running_item.payload_json = payload_json;
@@ -765,10 +782,9 @@ fn claimed_invoke_agent_start_from_payload(
     })
 }
 
-async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) -> Result<()> {
+async fn mark_invoke_work_item_running(db_writer: &DbWriter, work_item_id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let local_writer = DbWriter::new(pool.clone());
-    let mut tx = local_writer
+    let mut tx = db_writer
         .begin_immediate_transaction(
             class_a_operation(
                 "executor.mark_invoke_work_item_running",
@@ -796,13 +812,12 @@ async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) ->
 }
 
 async fn update_invoke_work_item_claimed_payload_and_running(
-    pool: &SqlitePool,
+    db_writer: &DbWriter,
     work_item_id: &str,
     payload_json: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let local_writer = DbWriter::new(pool.clone());
-    let mut tx = local_writer
+    let mut tx = db_writer
         .begin_immediate_transaction(
             class_a_operation(
                 "executor.update_invoke_work_item_claimed_payload_and_running",
@@ -2876,11 +2891,13 @@ impl BackgroundExecutor {
         let capacity = invoke_agent_start_capacity_from_domain(
             &self.work_queue.invoke_agent_capacity_config(),
         );
-        Ok(
-            claim_next_invoke_agent_with_start_internal(&self.pool, &capacity)
-                .await?
-                .map(|(_, item)| item),
+        Ok(claim_next_invoke_agent_with_start_internal(
+            &self.pool,
+            &capacity,
+            Some(self.db_writer.as_ref()),
         )
+        .await?
+        .map(|(_, item)| item))
     }
 
     async fn auto_requeue_active_prompt_close(
@@ -5347,10 +5364,11 @@ impl BackgroundExecutor {
             }
 
             WorkItemKind::StartupRepair => {
-                let recovery = RecoveryService::new(
+                let recovery = RecoveryService::new_with_db_writer(
                     self.pool.clone(),
                     self.work_queue.clone(),
                     self.events.clone(),
+                    self.db_writer.clone(),
                 );
                 recovery.run_startup_repair().await?;
             }
