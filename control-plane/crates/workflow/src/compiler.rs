@@ -173,6 +173,9 @@ fn compile_loaded(
     let dynamic_candidate_bindings =
         compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash);
 
+    // P058: Compile escalation policies before any partial moves on `cat`.
+    let escalation_policies = compile_escalation_policies(&cat)?;
+
     // Artifact name → path template from the catalog's `artifacts:` section.
     let artifact_paths: HashMap<String, String> =
         cat.artifacts.unwrap_or_default().into_iter().collect();
@@ -207,6 +210,7 @@ fn compile_loaded(
         dynamic_candidate_bindings,
         run_plan_snapshot_format_version,
         closeout_readiness_mode,
+        escalation_policies,
     })
 }
 
@@ -1209,6 +1213,73 @@ pub fn compile_dynamic_candidate_bindings_from_paths(
         &cat,
         &catalog_snapshot_hash,
     ))
+}
+
+// ── P058: Escalation policy compilation ───────────────────────────────────────
+
+/// Compile escalation policies from the agent catalog into frozen RunPlan snapshots.
+///
+/// Validates backend_profile references against the catalog and returns
+/// `Err` for any `escalation_policy_unknown_backend_profile` diagnostic.
+fn compile_escalation_policies(
+    cat: &catalog::AgentCatalogFile,
+) -> Result<Vec<EscalationPolicySnapshot>> {
+    use crate::escalation_policy::{compute_policy_hash, validate_policies_against_catalog};
+    use crate::plan::EscalationTierSnapshot;
+
+    // Validate all policies against the catalog's backend_profiles.
+    let diagnostics = validate_policies_against_catalog(cat);
+    if !diagnostics.is_empty() {
+        let msgs: Vec<String> = diagnostics
+            .iter()
+            .map(|d| format!("[{}] {}", d.pause_reason_code, d.detail))
+            .collect();
+        return Err(anyhow::anyhow!(
+            "escalation_policy compile failed:\n{}",
+            msgs.join("\n")
+        ));
+    }
+
+    let policies = match cat.escalation_policies.as_deref() {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+
+    policies
+        .iter()
+        .map(|policy| {
+            let policy_hash = compute_policy_hash(policy)
+                .map_err(|e| anyhow::anyhow!("policy '{}' hash failed: {e}", policy.policy_id))?;
+            let tiers = policy
+                .tiers
+                .iter()
+                .map(|t| EscalationTierSnapshot {
+                    tier_id: t.tier_id.clone(),
+                    kind: t.kind.clone(),
+                    backend_profile_id: t.backend_profile_id.clone(),
+                    max_attempts: t.max_attempts,
+                })
+                .collect();
+            let triggers = policy
+                .triggers
+                .iter()
+                .map(|t| t.as_raw_str().to_string())
+                .collect();
+            Ok(EscalationPolicySnapshot {
+                policy_id: policy.policy_id.clone(),
+                schema_version: policy.schema_version.clone(),
+                enabled_default: policy.enabled_default,
+                applies_to_agent_id: policy.applies_to.agent_id.clone(),
+                applies_to_backend_profile_id: policy.applies_to.backend_profile_id.clone(),
+                applies_to_stage_id: policy.applies_to.stage_id.clone(),
+                max_chain_attempts: policy.max_chain_attempts,
+                max_chain_wall_clock_seconds: policy.max_chain_wall_clock_seconds,
+                triggers,
+                tiers,
+                policy_hash,
+            })
+        })
+        .collect()
 }
 
 fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {

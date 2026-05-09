@@ -1340,6 +1340,7 @@ Scope:
 - `redaction_version` required at insert time for every escalation event
 - pause reason vocabulary coverage (all 13 catalog entries) and unknown-value round-trip
 - malformed payload_json rejection at repository layer
+- policy compile validation: `EscalationPolicyYaml` parser, deny_unknown_fields, backend_profile resolution, hash freezing into RunPlan
 
 Use when:
 
@@ -1349,6 +1350,7 @@ Use when:
 - changing artifact active-index source provenance
 - changing GraphQL or MCP execution truth readback
 - changing escalation domain types, repository layer, or GraphQL escalation readback
+- changing escalation_policy_v1 YAML parsing, compile validation, or RunPlan policy snapshot
 
 Host policy:
 
@@ -1747,6 +1749,7 @@ Scope:
 - `redaction_version` required at insert time for every escalation event
 - pause reason vocabulary coverage (all 13 catalog entries) and unknown-value round-trip
 - malformed payload_json rejection at repository layer
+- policy compile validation: `EscalationPolicyYaml` parser, deny_unknown_fields, backend_profile resolution, hash freezing into RunPlan
 
 Use when:
 
@@ -1756,6 +1759,7 @@ Use when:
 - changing artifact active-index source provenance
 - changing GraphQL or MCP execution truth readback
 - changing escalation domain types, repository layer, or GraphQL escalation readback
+- changing escalation_policy_v1 YAML parsing, compile validation, or RunPlan policy snapshot
 
 Host policy:
 

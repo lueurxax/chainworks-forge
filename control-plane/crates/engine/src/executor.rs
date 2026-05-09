@@ -273,10 +273,11 @@ fn invoke_agent_start_capacity_from_domain(
 pub async fn claim_next_invoke_agent_with_start(
     pool: &SqlitePool,
 ) -> Result<Option<ClaimedInvokeAgentStart>> {
+    let db_writer = DbWriter::new(pool.clone());
     Ok(claim_next_invoke_agent_with_start_internal(
         pool,
         &InvokeAgentCapacityConfig::unbounded(),
-        None,
+        Some(&db_writer),
     )
     .await?
     .map(|(claimed, _)| claimed))
@@ -286,8 +287,9 @@ pub async fn claim_next_invoke_agent_with_start_with_capacity(
     pool: &SqlitePool,
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<Option<ClaimedInvokeAgentStart>> {
+    let db_writer = DbWriter::new(pool.clone());
     Ok(
-        claim_next_invoke_agent_with_start_internal(pool, capacity, None)
+        claim_next_invoke_agent_with_start_internal(pool, capacity, Some(&db_writer))
             .await?
             .map(|(claimed, _)| claimed),
     )

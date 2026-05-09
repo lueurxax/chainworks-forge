@@ -260,6 +260,7 @@ mod tests {
             backend_profiles: profiles,
             permission_profiles: None,
             agents: None,
+            escalation_policies: None,
         };
         (agents, catalog)
     }

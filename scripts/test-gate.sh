@@ -4770,7 +4770,7 @@ PY
     log "Proposal 053 control-plane gate passed"
     ;;
   proposal-058|p058)
-    log "Proposal 058 control-plane gate: ACP provider failure classification, artifact ownership, and escalation schema (Phase 0-1)"
+    log "Proposal 058 control-plane gate: ACP provider failure classification, artifact ownership, escalation schema, and policy compile validation (Phase 0-1)"
     (
       cd "$ROOT_DIR/control-plane"
       cargo test -p domain --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
@@ -4781,6 +4781,7 @@ PY
       cargo test -p graphql-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_escalation_schema -- --test-threads=1 --nocapture &&
+      cargo test -p workflow --test proposal_058_escalation_policy_schema -- --test-threads=1 --nocapture &&
       cargo check -p engine &&
       cargo check -p graphql-server &&
       cargo check -p mcp-server
@@ -4798,6 +4799,7 @@ required = [
     "GraphQL/MCP runtime-facts parity",
     "escalation_policy_v1 schema",
     "redaction_version",
+    "policy compile validation",
 ]
 for item in required:
     if item not in text:

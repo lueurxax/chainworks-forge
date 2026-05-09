@@ -7387,6 +7387,7 @@ mod tests {
             dynamic_candidate_bindings: Vec::new(),
             run_plan_snapshot_format_version: None,
             closeout_readiness_mode: None,
+            escalation_policies: Vec::new(),
         }
     }
 

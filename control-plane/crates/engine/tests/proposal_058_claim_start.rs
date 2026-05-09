@@ -25,6 +25,13 @@ use engine::work_queue::WorkQueue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+async fn setup_file_backed_pool(path: &str) -> sqlx::SqlitePool {
+    let pool = create_pool(path).await.unwrap();
+    let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer).await.unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -1018,9 +1025,7 @@ async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_executio
 async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_creation() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-invoke.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = setup_file_backed_pool(&format!("sqlite://{}", db_path.to_string_lossy())).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1363,9 +1368,7 @@ async fn proposal_058_declared_output_claim_gets_durable_generation_without_reus
 async fn proposal_058_production_executor_fails_sessionless_invoke_before_processing() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-production-invoke.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = setup_file_backed_pool(&format!("sqlite://{}", db_path.to_string_lossy())).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1479,9 +1482,7 @@ async fn proposal_058_production_executor_fails_sessionless_invoke_before_proces
 async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("production-loop-invoke.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = setup_file_backed_pool(&format!("sqlite://{}", db_path.to_string_lossy())).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
