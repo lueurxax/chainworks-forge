@@ -5,7 +5,7 @@
 | Date | 2026-05-07 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | P075 Local Persistence Write Budget, P078 Durable Side-Effect Ledger for side-effect lanes, P081 Boundary Matrix / UI Action Boundary |
+| Depends on | [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), P078 Durable Side-Effect Ledger for side-effect lanes, P081 Boundary Matrix / UI Action Boundary |
 | Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, Session Lineage Reference, ACP Runtime Transport |
 | Scope | Add an in-band way to continue useful agent work through server-owned provider session continuity instead of forcing a fresh retry that re-discovers the proposal, repository, blockers, and current diff. Support live-handle continuation first, define provider-session resurrection by known provider `session_id` for adapters that can attach/resume that provider session, fail closed for adapters that cannot, and allow both operator-triggered continuation through MCP and lead-directed automatic continuation under strict eligibility and safety rules. |
 | Goal | Reduce wasted time and model/runtime burn on implementation work by preserving useful provider-session continuity while still recording Chainworks truth, evidence, provenance, and safety boundaries. |
@@ -88,7 +88,7 @@ This proposal must distinguish two transport paths.
 
 **Live-handle continuation** means Chainworks already owns a live ACP handle in `AcpRuntimeManager` for the target `session_generation_id`. The server validates that the live handle still matches the recorded provider session id, then sends another prompt into that handle.
 
-**Provider-session resurrection** means Chainworks no longer owns a live handle, but the operator or durable run truth has a known provider `session_id`, and the provider adapter can attach/resume that provider session by id. This is the behavior exercised manually during the P075 experiment. It must be represented as an explicit continuation mode, not as ordinary retry, output repair, or checkpoint rehydration.
+**Provider-session resurrection** means Chainworks no longer owns a live handle, but the operator or durable run truth has a known provider `session_id`, and the provider adapter can attach/resume that provider session by id. This is the behavior exercised manually during the continuation investigation. It must be represented as an explicit continuation mode, not as ordinary retry, output repair, or checkpoint rehydration.
 
 Provider-session resurrection is provider-session continuity, not process
 continuity. If daemon restart left an old ACP subprocess alive, RecoveryService
@@ -564,7 +564,7 @@ It creates evidence that the normal workflow can later validate, review, or retr
 
 ## 10. Persistence and write-budget rules
 
-Continuation must obey P075.
+Continuation must obey the implemented write-budget contract.
 
 Rules:
 

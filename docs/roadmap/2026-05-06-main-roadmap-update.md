@@ -81,9 +81,9 @@ It explicitly does not own:
 
 This is important as context for future work, but it should not be scheduled as a new run.
 
-#### P075 and P078 now address the root durability concern
+#### The write-budget contract and P078 now address the root durability concern
 
-[P075](../proposals/075-local-persistence-write-budget-and-evidence-spooling.md) correctly states that SQLite must remain a compact local control-plane DB, not a runtime event stream.
+The implemented [Rust control-plane write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter) keeps SQLite as a compact local control-plane DB, not a runtime event stream.
 
 [P078](../proposals/078-durable-side-effect-ledger-release-settlement-and-reconciliation.md) correctly states that external side effects require durable intent, idempotency, readback, reconciliation, and retry blocking.
 
@@ -95,7 +95,7 @@ This pair is now the most important safety foundation after the UI/action bounda
 
 [P080](../proposals/080-continuous-stale-execution-reconciliation.md) covers continuous stale execution reconciliation.
 
-Both are useful, but both must remain downstream of P075/P078 safety rails.
+Both are useful, but both must remain downstream of the implemented write-budget contract and P078 safety rails.
 
 ---
 
@@ -123,13 +123,13 @@ Related docs:
 
 The system already uses SQLite for many control-plane concerns.
 
-P075 is correct: adding more durability state without write discipline would make the database behave like an event stream.
+The implemented write-budget contract is the guardrail for adding more durability state without making the database behave like an event stream.
 
 This is now the most important technical risk before implementing P078 and P038.
 
 Related docs:
 
-- [P075 local persistence write budget](../proposals/075-local-persistence-write-budget-and-evidence-spooling.md)
+- [Local persistence write budget](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter)
 - [P038 run compaction and artifact governance](../proposals/038-run-compaction-artifact-governance-and-canonical-snapshot-maintenance.md)
 - [Rust control plane reference](../reference/rust-control-plane.md)
 
@@ -152,7 +152,7 @@ Related docs:
 
 [P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) should remain a stabilization operating mode, not a normal feature.
 
-[../ROADMAP.md](../ROADMAP.md) should now explicitly include P075/P078/P079/P080/P081/P082/P083 plus the executable rollout-gate template and should not only mention older P031/P038/P046/P068 style work.
+[../ROADMAP.md](../ROADMAP.md) should now explicitly include the implemented write-budget contract plus P078/P079/P080/P081/P082/P083 and the executable rollout-gate template, not only older P031/P038/P046/P068 style work.
 
 ---
 
@@ -168,10 +168,10 @@ Allowed work:
 
 - boundary cleanup,
 - provider toolchain cache mapping follow-up only when a regression is found,
-- P075 write budget,
+- write-budget gate maintenance,
 - P078 side-effect safety,
 - P031 closeout,
-- P038 compaction after P075,
+- P038 compaction after the write-budget contract,
 - P070/P083 consolidation after core safety rails.
 
 Frozen work:
@@ -188,7 +188,7 @@ Frozen work:
 #### Step 1 - executable rollout-gate template
 
 Use the [executable rollout-gate template](../reference/executable-rollout-gate-template.md)
-before major P075/P078 implementation.
+before major P078 and persistence/recovery implementation work.
 
 Minimum deliverables:
 
@@ -206,7 +206,7 @@ Do not expand the executable rollout-gate template into a large product feature.
 
 Purpose:
 
-> Make P075/P078 executable and measurable before they touch core persistence/recovery behavior.
+> Keep write-budget and P078 behavior executable and measurable before they touch core persistence/recovery behavior.
 
 ### 3.3 Boundary closeout
 
@@ -260,11 +260,11 @@ This should be a small executable contract and test slice, not a new feature sur
 
 ### 3.5 Persistence and side-effect safety foundation
 
-#### Step 5 - P075 local persistence write budget
+#### Step 5 - local persistence write budget
 
-This should happen before P078 and before P038.
+This foundation is implemented and remains a prerequisite for P078 and P038.
 
-First implementation slice:
+Implemented slice:
 
 - minimal `DbWriter` or controlled write lane for new subsystems,
 - write classes,
@@ -273,13 +273,13 @@ First implementation slice:
 - write-pressure metrics,
 - projection invalidation discipline.
 
-Do not try to rewrite all existing persistence at once.
+The current contract does not require rewriting all existing persistence at once.
 
-P075 should initially protect new P078/P038 paths.
+The write-budget gate protects new P078/P038 paths.
 
 #### Step 6 - P078 durable side-effect ledger
 
-After P075.
+After the write-budget contract.
 
 First implementation slice:
 
@@ -333,7 +333,7 @@ Never retry release/publish/git work while unresolved side effects exist.
 
 #### Step 9 - P079 output repair/fallback
 
-After P075/P078 and preferably after P082 coverage.
+After the write-budget contract and P078, preferably after P082 coverage.
 
 P079 is useful, but it introduces repair/fallback behavior.
 
@@ -357,7 +357,7 @@ Reset remains MCP-only.
 
 #### Step 11 - P038 MCP-only run compaction
 
-After P075.
+After the write-budget contract.
 
 Preferably after P078 so compaction can preserve side-effect reconciliation evidence.
 
@@ -366,7 +366,7 @@ Deliverables:
 - `runs.compact` MCP tool,
 - GraphQL readback for compaction status/report/snapshot,
 - no UI compact mutation,
-- archive/dedupe/projection rebuild through P075 write discipline.
+- archive/dedupe/projection rebuild through write-budget discipline.
 
 ### 3.8 Consolidation
 
@@ -433,8 +433,8 @@ The most important progress is:
 - UI action boundary is now reference-level truth.
 - P031 is corrected to approval-only mutation stop-state.
 - P066 provider toolchain cache mapping is implemented reference truth, not a next run.
-- P075/P078 now name the real local-control-plane durability problem.
-- P079/P080 are useful but must remain downstream of P075/P078.
+- The write-budget contract and P078 now name the real local-control-plane durability problem.
+- P079/P080 are useful but must remain downstream of the write-budget contract and P078.
 
 The plan should be updated, not replaced.
 
@@ -445,7 +445,7 @@ P073
 -> executable rollout-gate template
 -> P072 closeout
 -> P081
--> P075
+-> write-budget contract
 -> P078
 -> P082
 -> P076/P080

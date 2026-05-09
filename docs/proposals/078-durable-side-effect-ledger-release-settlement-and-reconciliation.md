@@ -5,7 +5,7 @@
 | Date | 2026-04-29 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | P075 Local Persistence Write Budget, [UI action boundary](../reference/ui-action-boundary.md), P038 Compaction, P045/P065 Recovery MCP Tools, Rust control plane |
+| Depends on | [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [UI action boundary](../reference/ui-action-boundary.md), P038 Compaction, P045/P065 Recovery MCP Tools, Rust control plane |
 | Related | [Provider toolchain cache mapping](../reference/acp-runtime-transport.md#toolchain-cache-mapping), P076 Auto-Retry Observation Ledger |
 | Scope | Introduce a durable side-effect lifecycle for irreversible or externally visible operations so release/recovery code can reconcile incomplete settlements without repeating side effects. |
 | Goal | Prevent duplicate git pushes, duplicate uploads, repeated release operations, and unsafe retries by recording side-effect intent before execution, settling verified effects atomically, and routing incomplete settlement states to MCP reconciliation instead of blind retry. |
@@ -233,7 +233,7 @@ CREATE TABLE side_effect_settlements (
 
 ## 7. Persistence rules
 
-P078 must obey P075.
+P078 must obey the implemented write-budget contract.
 
 ### 7.1 Barrier writes
 
@@ -567,7 +567,7 @@ P078 is complete when:
 5. unresolved effects are visible through GraphQL read projections;
 6. reconciliation is MCP-only;
 7. settlement updates canonical state in one barrier transaction;
-8. high-volume evidence is spooled according to P075.
+8. high-volume evidence is spooled according to the implemented write-budget contract.
 
 ---
 

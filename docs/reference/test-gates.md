@@ -1852,7 +1852,7 @@ Important:
 
 ### `proposal-075|p075`
 
-Proposal 075 local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate.
+Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.
 
 Scope:
 
@@ -1888,7 +1888,7 @@ Important:
 
 - `p075` is accepted as an alias
 - this is a fail-closed persistence contract gate, not an inventory-only check
-- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and future telemetry producer expansion must keep this gate green when extended
+- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and telemetry producer extensions must keep this gate green
 
 ### `proposal-084|p084` retained historical alias
 
