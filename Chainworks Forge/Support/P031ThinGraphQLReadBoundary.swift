@@ -1290,11 +1290,15 @@ struct P031ApprovalReadModel: Decodable, Equatable, Sendable {
   }
 
   nonisolated var canApprove: Bool {
-    decision == nil && availableActions.contains("approve") && writePathState == .available
+    isActionableDecision && availableActions.contains("approve") && writePathState == .available
   }
 
   nonisolated var canReject: Bool {
-    decision == nil && availableActions.contains("reject") && writePathState == .available
+    isActionableDecision && availableActions.contains("reject") && writePathState == .available
+  }
+
+  private nonisolated var isActionableDecision: Bool {
+    decision == nil || decision == "pending" || decision == "requested"
   }
 }
 
@@ -2167,6 +2171,7 @@ enum P031GraphQLDocuments {
           serverDebugDetail
         }
         journalId
+        conflictResultCode
       }
     }
     """
@@ -2188,6 +2193,7 @@ enum P031GraphQLDocuments {
           serverDebugDetail
         }
         journalId
+        conflictResultCode
       }
     }
     """
@@ -2445,7 +2451,7 @@ struct P031GraphQLWorkflowReadStore<
         throw P031GraphQLReadBoundaryError.missingData("P031ArtifactPayload")
       }
       ForgeLogger.ui.info(
-        "P031ArtifactPayload response artifactID=\(artifact.id) payloadState=\(artifact.payloadAvailabilityState.rawValue) hasPayload=\((artifact.payloadText?.isEmpty == false)) reason=\(artifact.payloadUnavailableReasonCode?.rawValue ?? "nil") debug=\(artifact.serverDebugDetail ?? "nil")"
+        "P031ArtifactPayload response artifactID=\(artifact.id) payloadState=\(artifact.payloadAvailabilityState.rawValue) hasPayload=\((artifact.payloadText?.isEmpty == false)) reason=\(artifact.payloadUnavailableReasonCode?.rawValue ?? "nil")"
       )
       return artifact
     } catch {

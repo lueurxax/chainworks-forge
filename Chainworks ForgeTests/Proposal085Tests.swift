@@ -105,7 +105,7 @@ struct Proposal085Tests {
   func approvalIsActionableWhenConditionsMet() {
     let approval = P031ApprovalReadModel(
       id: "appr-1", runID: "r-1", stageID: "s-1",
-      decision: nil, freshnessState: .live,
+      decision: "pending", freshnessState: .live,
       disabledReasonCode: nil, writePathState: .available,
       diagnosticID: nil, serverDebugDetail: nil,
       availableActions: ["approve", "reject"]
@@ -119,7 +119,7 @@ struct Proposal085Tests {
   func approvalDisabledWhenWritePathNotAvailable() {
     let approval = P031ApprovalReadModel(
       id: "appr-2", runID: "r-1", stageID: "s-1",
-      decision: nil, freshnessState: .live,
+      decision: "pending", freshnessState: .live,
       disabledReasonCode: .writePathNotAvailable,
       writePathState: .writePathNotAvailable,
       diagnosticID: nil, serverDebugDetail: nil,
@@ -138,7 +138,7 @@ struct Proposal085Tests {
   func approvalDisabledWhenActionNotInAvailableActions() {
     let approval = P031ApprovalReadModel(
       id: "appr-3", runID: "r-1", stageID: "s-1",
-      decision: nil, freshnessState: .live,
+      decision: "pending", freshnessState: .live,
       disabledReasonCode: .unsupportedAction,
       writePathState: .available,
       diagnosticID: nil, serverDebugDetail: nil,
@@ -337,7 +337,7 @@ struct Proposal085Tests {
   func disabledApprovalExposesHelpText() {
     let approval = P031ApprovalReadModel(
       id: "appr-10", runID: "r-1", stageID: "s-1",
-      decision: nil, freshnessState: .projectionLag,
+      decision: "pending", freshnessState: .projectionLag,
       disabledReasonCode: .projectionLag,
       writePathState: .available,
       diagnosticID: nil, serverDebugDetail: nil,
@@ -355,7 +355,7 @@ struct Proposal085Tests {
   func projectionLagConstraintDetectedCorrectly() {
     let lagApproval = P031ApprovalReadModel(
       id: "appr-11", runID: "r-1", stageID: "s-1",
-      decision: nil, freshnessState: .projectionLag,
+      decision: "pending", freshnessState: .projectionLag,
       disabledReasonCode: .projectionLag,
       writePathState: .available,
       diagnosticID: nil, serverDebugDetail: nil
@@ -546,5 +546,106 @@ struct Proposal085Tests {
     )
     #expect(row.canApprove == false)
     #expect(row.canReject == false)
+  }
+
+  // MARK: - Security: diagnostic field redaction
+
+  @Test("Unauthorized diagnostic state clears diagnosticID and serverDebugDetail")
+  func unauthorizedDiagnosticStateClearsSensitiveFields() {
+    let state = P085AffordancePresenter.diagnosticAffordance(
+        diagnosticID: "diag-xyz",
+        serverDebugDetail: "sensitive detail",
+        freshnessState: .unauthorized
+    )
+    #expect(state.isAvailable == false)
+    #expect(state.diagnosticID == nil)
+    #expect(state.serverDebugDetail == nil)
+  }
+
+  // MARK: - Fail-closed on caller-policy blockers
+
+  @Test("Approval is disabled when disabledReasonCode is .unauthorized, even with availableActions")
+  func approvalDisabledWhenUnauthorizedCallerPolicy() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-u1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .unauthorized,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .unauthorized)
+    } else {
+        Issue.record("Expected .disabled(.unauthorized) but got \(state.approveAvailability)")
+    }
+    if case .disabled(let code, _) = state.rejectAvailability {
+        #expect(code == .unauthorized)
+    } else {
+        Issue.record("Expected .disabled(.unauthorized) but got \(state.rejectAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled when disabledReasonCode is .staleRead, even with availableActions")
+  func approvalDisabledWhenStaleRead() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-u2", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .stale,
+        disabledReasonCode: .staleRead,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .staleRead)
+    } else {
+        Issue.record("Expected .disabled(.staleRead) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled when disabledReasonCode is .ambiguousApprovalIdentity")
+  func approvalDisabledWhenAmbiguousIdentity() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-u3", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .ambiguousApprovalIdentity,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .ambiguousApprovalIdentity)
+    } else {
+        Issue.record("Expected .disabled(.ambiguousApprovalIdentity) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("P031ApprovalReadModel.canApprove is true for decision=pending with availableActions")
+  func canApproveIsTrueForPendingDecision() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-p1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: nil, writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    #expect(approval.canApprove == true)
+    #expect(approval.canReject == true)
+  }
+
+  @Test("P031ApprovalReadModel.canApprove is true for decision=requested with availableActions")
+  func canApproveIsTrueForRequestedDecision() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-p2", runID: "r-1", stageID: "s-1",
+        decision: "requested", freshnessState: .live,
+        disabledReasonCode: nil, writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    #expect(approval.canApprove == true)
+    #expect(approval.canReject == true)
   }
 }

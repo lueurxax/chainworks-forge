@@ -241,11 +241,16 @@ contract rows, including:
 - `availableActions`
 - `approveApproval` mutation
 - `rejectApproval` mutation
+- `conflictResultCode` (typed `GqlMutationConflictResultCode` enum on
+  `ApproveApprovalPayload` / `RejectApprovalPayload`: `already_resolved`,
+  `state_conflict`, `transient_error_retryable`)
 - Artifact list/detail entrypoints
 - Report metadata/payload readback fields
 
-These are proved by existing P031/P043 SDL snapshots and P072 approval mutation fixtures,
-composed by the p085 gate slice.
+These are proved by existing P031/P043 SDL snapshots and P072 approval mutation fixtures
+plus the P085 backend slice (`cargo test -p graphql-server --lib proposal_085_`), which
+covers approval/report projection fields, authorization denial for diagnostic fields, and
+typed `conflictResultCode` readback with a real failed `command_journal` id.
 
 ---
 
@@ -281,12 +286,16 @@ detail affordance may upgrade `.deferred` to `.available(payloadText:)` for the 
   `.unknown`) rather than throwing. The presenter layer adds `P085FreshnessState.fromRaw(_:)`
   → `.unknown(rawValue:)` and `P085AffordancePresenter.payloadPresentation(fromRaw:)` →
   `.unknown(rawState:)`.
-- Approval actionability requires durable decision state to be unresolved:
-  `P031ApprovalReadModel.canApprove` and `canReject` evaluate `decision == nil` before
-  checking `availableActions` and `writePathState`. `P085AffordancePresenter.approvalAffordance`
-  short-circuits to `.disabled` when `decision != nil`, surfacing "Approval is already
-  resolved." help text. This guards against stale projection lag presenting an actionable
-  button after the durable state has already moved.
+- Approval actionability requires the durable decision state to be unresolved:
+  `P031ApprovalReadModel.canApprove` and `canReject` evaluate `isActionableDecision` —
+  true when `decision` is `nil`, `"pending"`, or `"requested"` — before checking
+  `availableActions` and `writePathState`. `P085AffordancePresenter.approvalAffordance`
+  fails closed first on the caller-policy denial codes `unauthorized`, `staleRead`, and
+  `ambiguousApprovalIdentity`; then short-circuits to `.disabled` for any other non-nil
+  decision (`granted`, `rejected`, `expired`, …), surfacing "Approval is already
+  resolved." help text; and only then consults `writePathState`/`availableActions`. This
+  guards against stale projection lag presenting an actionable button after the durable
+  state has already moved.
 - Typed mutation conflict codes are decoded from `P072ApprovalMutationResult.conflictResultCode`
   into `P085MutationConflictResultCode`: `.alreadyResolved`, `.stateConflict`,
   `.transientErrorRetryable`, or `.unknown(rawValue:)`. Unknown server codes are not

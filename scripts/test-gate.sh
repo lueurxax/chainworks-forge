@@ -6279,8 +6279,8 @@ for required in [
     "payloadPresentation(fromRaw",
     "static func fromRaw",
     "case .unknown",
-    # Decision-state gating: approval must check durable decision before allowing mutation
-    "approval.decision != nil",
+    # Decision-state gating: approval checks durable decision (pending/requested = actionable)
+    "d != \"pending\"",
     "Approval is already resolved",
     # Conflict codes: typed idempotency/conflict result vocabulary
     "alreadyResolved",
@@ -6310,8 +6310,8 @@ for required in [
     "P085AffordancePresenter.approvalAffordance",
     # P085 wired into production artifact path
     "P085AffordancePresenter.artifactListAffordance",
-    # P031 canApprove/canReject check decision
-    "decision == nil",
+    # P031 canApprove/canReject check durable decision state via isActionableDecision
+    "isActionableDecision",
     # Typed conflict result on mutation result
     "conflictResultCode",
 ]:
@@ -6320,8 +6320,38 @@ for required in [
             f"proposal-085: P031ThinGraphQLReadBoundary.swift missing required term: {required!r}"
         )
 
+# 6. Backend GraphQL path must use typed engine conflicts, not string-matched
+# error text or dummy journal IDs.
+graphql_schema = root / "control-plane/crates/graphql-server/src/schema.rs"
+command_handler = root / "control-plane/crates/engine/src/command_handler.rs"
+schema_text = graphql_schema.read_text()
+handler_text = command_handler.read_text()
+for required in [
+    "ApprovalResolutionConflict",
+    "approval_resolution_conflict_code",
+    "proposal_085_approval_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_graphql_backend_projection_and_authorization_contract",
+]:
+    if required not in schema_text + handler_text:
+        raise SystemExit(
+            f"proposal-085: backend proof missing required term: {required!r}"
+        )
+for forbidden in [
+    "msg.contains(\"not actionable\")",
+    "msg.contains(\"already resolved\")",
+    "ID::from(\"00000000-0000-0000-0000-000000000000\")",
+]:
+    if forbidden in schema_text:
+        raise SystemExit(
+            f"proposal-085: GraphQL backend still contains forbidden brittle conflict handling: {forbidden!r}"
+        )
+
 print("proposal-085 all gate checks passed")
 PY
+    (
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-085-gate cargo test -p graphql-server --lib proposal_085_ -- --test-threads=1 --nocapture
+    )
     run_targeted_tests "proposal-085" "${PROPOSAL_085_SWIFT_TESTS[@]}"
     log "Proposal 085 gate passed"
     ;;

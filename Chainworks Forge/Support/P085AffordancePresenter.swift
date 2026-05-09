@@ -235,8 +235,8 @@ enum P085AffordancePresenter {
   ) -> P085DiagnosticAffordanceState {
     let isAvailable = diagnosticID != nil && freshnessState != .unauthorized
     return P085DiagnosticAffordanceState(
-      diagnosticID: diagnosticID,
-      serverDebugDetail: serverDebugDetail,
+      diagnosticID: isAvailable ? diagnosticID : nil,
+      serverDebugDetail: isAvailable ? serverDebugDetail : nil,
       isAvailable: isAvailable
     )
   }
@@ -356,8 +356,13 @@ enum P085AffordancePresenter {
     action: String,
     approval: P031ApprovalReadModel
   ) -> P085ApprovalActionAvailability {
-    // Non-nil decision means the approval is already resolved; no mutation is valid.
-    if approval.decision != nil {
+    // Fail closed on caller-policy denial codes regardless of other fields.
+    if let code = approval.disabledReasonCode,
+       code == .unauthorized || code == .staleRead || code == .ambiguousApprovalIdentity {
+      return .disabled(reasonCode: code, helpText: disabledHelpText(for: code))
+    }
+    // pending/requested are actionable; any other non-nil decision (granted/rejected/expired) is resolved.
+    if let d = approval.decision, d != "pending", d != "requested" {
       let reason = approval.disabledReasonCode ?? .unsupportedAction
       return .disabled(reasonCode: reason, helpText: "Approval is already resolved.")
     }

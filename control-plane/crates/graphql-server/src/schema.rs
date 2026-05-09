@@ -17,14 +17,16 @@ use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, Resol
 use domain::events::DomainEvent;
 use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::lifecycle::DaemonStatus;
-use engine::command_handler::CommandHandler;
+use engine::command_handler::{ApprovalResolutionConflict, CommandHandler};
 use engine::event_bus::EventSender;
 use engine::lifecycle_reporter::LifecycleReporter;
 
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::GqlArtifact;
 use crate::types::idea::GqlIdea;
-use crate::types::p031::{GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode};
+use crate::types::p031::{
+    GqlMutationConflictResultCode, GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode,
+};
 use crate::types::run::GqlRun;
 use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
@@ -1371,6 +1373,7 @@ fn graphql_caller_with_request_id(
 pub struct ApproveApprovalPayload {
     pub approval: GqlApproval,
     pub journal_id: ID,
+    pub conflict_result_code: Option<GqlMutationConflictResultCode>,
 }
 
 /// P072: Payload for rejectApproval mutation.
@@ -1378,6 +1381,19 @@ pub struct ApproveApprovalPayload {
 pub struct RejectApprovalPayload {
     pub approval: GqlApproval,
     pub journal_id: ID,
+    pub conflict_result_code: Option<GqlMutationConflictResultCode>,
+}
+
+fn approval_resolution_conflict_code(
+    error: &anyhow::Error,
+) -> Option<(ID, GqlMutationConflictResultCode)> {
+    let conflict = error.downcast_ref::<ApprovalResolutionConflict>()?;
+    match conflict {
+        ApprovalResolutionConflict::AlreadyResolved { .. } => Some((
+            ID::from(conflict.journal_id().to_owned()),
+            GqlMutationConflictResultCode::AlreadyResolved,
+        )),
+    }
 }
 
 #[Object]
@@ -1422,18 +1438,37 @@ impl MutationRoot {
             stage_id: approval.stage_id.clone(),
         });
 
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let jid = ID::from(commanded.journal_id);
-
-        // Re-fetch for authoritative readback.
-        let updated = approvals::find_by_id(pool, aid)
-            .await?
-            .ok_or_else(|| Error::new("Approval not found after update"))?;
-
-        Ok(ApproveApprovalPayload {
-            approval: GqlApproval::from(updated),
-            journal_id: jid,
-        })
+        let result = cmd_handler.handle(cmd, caller).await;
+        match result {
+            Ok(commanded) => {
+                let jid = ID::from(commanded.journal_id);
+                // Re-fetch for authoritative readback.
+                let updated = approvals::find_by_id(pool, aid)
+                    .await?
+                    .ok_or_else(|| Error::new("Approval not found after update"))?;
+                Ok(ApproveApprovalPayload {
+                    approval: GqlApproval::from(updated),
+                    journal_id: jid,
+                    conflict_result_code: None,
+                })
+            }
+            Err(e) => {
+                if let Some((journal_id, conflict_result_code)) =
+                    approval_resolution_conflict_code(&e)
+                {
+                    let current = approvals::find_by_id(pool, aid)
+                        .await?
+                        .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+                    Ok(ApproveApprovalPayload {
+                        approval: GqlApproval::from(current),
+                        journal_id,
+                        conflict_result_code: Some(conflict_result_code),
+                    })
+                } else {
+                    Err(Error::new(e.to_string()))
+                }
+            }
+        }
     }
 
     /// P072: Reject a stage approval by approval_id with a required reason.
@@ -1474,18 +1509,36 @@ impl MutationRoot {
             stage_id: approval.stage_id.clone(),
         });
 
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        let jid = ID::from(commanded.journal_id);
-
-        // Re-fetch for authoritative readback.
-        let updated = approvals::find_by_id(pool, aid)
-            .await?
-            .ok_or_else(|| Error::new("Approval not found after update"))?;
-
-        Ok(RejectApprovalPayload {
-            approval: GqlApproval::from(updated),
-            journal_id: jid,
-        })
+        let result = cmd_handler.handle(cmd, caller).await;
+        match result {
+            Ok(commanded) => {
+                let jid = ID::from(commanded.journal_id);
+                let updated = approvals::find_by_id(pool, aid)
+                    .await?
+                    .ok_or_else(|| Error::new("Approval not found after update"))?;
+                Ok(RejectApprovalPayload {
+                    approval: GqlApproval::from(updated),
+                    journal_id: jid,
+                    conflict_result_code: None,
+                })
+            }
+            Err(e) => {
+                if let Some((journal_id, conflict_result_code)) =
+                    approval_resolution_conflict_code(&e)
+                {
+                    let current = approvals::find_by_id(pool, aid)
+                        .await?
+                        .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+                    Ok(RejectApprovalPayload {
+                        approval: GqlApproval::from(current),
+                        journal_id,
+                        conflict_result_code: Some(conflict_result_code),
+                    })
+                } else {
+                    Err(Error::new(e.to_string()))
+                }
+            }
+        }
     }
 }
 
@@ -6299,6 +6352,7 @@ mod tests {
                       approveApproval(approvalId: "{}") {{
                         approval {{ id decision }}
                         journalId
+                        conflictResultCode
                       }}
                     }}"#,
                     approval.id
@@ -6307,8 +6361,249 @@ mod tests {
             )
             .await;
         assert!(
-            !second.errors.is_empty(),
-            "already-resolved approval must return a GraphQL error"
+            second.errors.is_empty(),
+            "already-resolved approval must return a typed conflict code, not a GraphQL error: {second:?}"
+        );
+        assert_eq!(
+            second.data.into_json().unwrap()["approveApproval"]["conflictResultCode"],
+            serde_json::json!("already_resolved"),
+            "already-resolved approval must return already_resolved conflict code"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_085_approval_conflict_result_code_uses_real_failed_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let (principal_table, _, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let approve = |fields: &str| {
+            Request::new(format!(
+                r#"mutation {{
+                  approveApproval(approvalId: "{}") {{
+                    {fields}
+                  }}
+                }}"#,
+                approval.id
+            ))
+            .data(ui_operator.clone())
+        };
+
+        let first = schema
+            .execute(approve(
+                "approval { id decision } journalId conflictResultCode",
+            ))
+            .await;
+        assert!(
+            first.errors.is_empty(),
+            "first approveApproval must succeed: {first:?}"
+        );
+        let first_json = first.data.into_json().unwrap();
+        assert_eq!(
+            first_json["approveApproval"]["conflictResultCode"],
+            serde_json::Value::Null
+        );
+
+        let second = schema
+            .execute(approve(
+                "approval { id decision } journalId conflictResultCode",
+            ))
+            .await;
+        assert!(
+            second.errors.is_empty(),
+            "already-resolved approval must return typed conflict payload: {second:?}"
+        );
+        let second_json = second.data.into_json().unwrap();
+        let payload = &second_json["approveApproval"];
+        assert_eq!(
+            payload["conflictResultCode"],
+            serde_json::json!("already_resolved")
+        );
+        assert_eq!(
+            payload["approval"]["decision"],
+            serde_json::json!("granted")
+        );
+        let journal_id = payload["journalId"]
+            .as_str()
+            .expect("conflict payload must include journalId");
+        assert_ne!(
+            journal_id, "00000000-0000-0000-0000-000000000000",
+            "conflict journalId must be the real failed command journal row"
+        );
+        uuid::Uuid::parse_str(journal_id).expect("conflict journalId must be a UUID");
+
+        let row: (String, String) =
+            sqlx::query_as("SELECT result_status, command_type FROM command_journal WHERE id = ?1")
+                .bind(journal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1, "ResolveApproval");
+    }
+
+    #[tokio::test]
+    async fn proposal_085_graphql_backend_projection_and_authorization_contract() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let approval_id = ApprovalId::new();
+        let artifact_id = ArtifactId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        stages::insert(&pool, &make_manual_gate_stage(run_id, "stage_1"))
+            .await
+            .unwrap();
+        approvals::insert(
+            &pool,
+            &Approval {
+                id: approval_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                decision: ApprovalDecision::Pending,
+                requested_at: Utc::now(),
+                decided_at: None,
+                comment: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: "stage_1".into(),
+                agent_id: "release".into(),
+                name: "release-report".into(),
+                contract_id: "release_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/release-report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(128),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("release".into()),
+                report_version: Some(1),
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_approval_inbox(&pool, run_id)
+            .await
+            .unwrap();
+        projections::upsert_artifact_index_entry(&pool, run_id)
+            .await
+            .unwrap();
+
+        let (principal_table, _, ui_operator) = p072_principal_table();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table,
+            test_reporter(),
+        );
+
+        let query = format!(
+            r#"
+            query P085BackendAffordanceProof {{
+              approvalInbox(runId: "{run_id}") {{
+                id
+                decision
+                availableActions
+                disabledReasonCode
+                writePathState
+                freshnessState
+                diagnosticId
+                serverDebugDetail
+              }}
+              artifacts(runId: "{run_id}") {{
+                id
+                payloadAvailabilityState
+                payloadUnavailableReasonCode
+                freshnessState
+                diagnosticId
+                serverDebugDetail
+              }}
+            }}
+            "#
+        );
+        let allowed = schema
+            .execute(Request::new(query.clone()).data(ui_operator))
+            .await;
+        assert!(
+            allowed.errors.is_empty(),
+            "P085 backend projection query must succeed for UI operator: {allowed:?}"
+        );
+        let json = allowed.data.into_json().unwrap();
+        let approval = &json["approvalInbox"][0];
+        assert_eq!(approval["id"], serde_json::json!(approval_id.to_string()));
+        assert_eq!(approval["decision"], serde_json::json!("pending"));
+        assert_eq!(
+            approval["availableActions"],
+            serde_json::json!(["approve", "reject"])
+        );
+        assert_eq!(approval["writePathState"], serde_json::json!("available"));
+        assert_eq!(approval["freshnessState"], serde_json::json!("live"));
+        assert_eq!(
+            approval["diagnosticId"],
+            serde_json::json!(approval_id.to_string())
+        );
+        assert!(approval["serverDebugDetail"].is_null());
+
+        let artifact = &json["artifacts"][0];
+        assert_eq!(artifact["id"], serde_json::json!(artifact_id.to_string()));
+        assert_eq!(
+            artifact["payloadAvailabilityState"],
+            serde_json::json!("metadata_only")
+        );
+        assert_eq!(
+            artifact["payloadUnavailableReasonCode"],
+            serde_json::json!("PAYLOAD_DEFERRED_BY_P031")
+        );
+        assert_eq!(artifact["freshnessState"], serde_json::json!("live"));
+        assert_eq!(
+            artifact["diagnosticId"],
+            serde_json::json!(artifact_id.to_string())
+        );
+        assert!(
+            artifact["serverDebugDetail"].is_string(),
+            "server-owned diagnostic detail should explain deferred report payload"
+        );
+
+        let denied = schema
+            .execute(Request::new(query).data(observer_principal()))
+            .await;
+        assert!(
+            denied
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "P085 diagnostic fields must be denied to unauthorized observers: {denied:?}"
         );
     }
 
