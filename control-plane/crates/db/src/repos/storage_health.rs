@@ -44,7 +44,8 @@ pub async fn insert_write_pressure_snapshot(
     pool: &SqlitePool,
     snapshot: &StorageWritePressureSnapshot,
 ) -> Result<()> {
-    let payload = serde_json::to_string(&snapshot.payload_json)
+    let payload_value = snapshot.payload_json.clone();
+    let payload = serde_json::to_string(&payload_value)
         .context("serialize storage write pressure payload")?;
     if payload.len() > 65_536 {
         anyhow::bail!("storage write pressure payload exceeds 65536 bytes");
@@ -68,19 +69,55 @@ pub async fn insert_write_pressure_snapshot(
         "storage_health.insert_write_pressure_snapshot",
         Box::new(move |tx| {
             Box::pin(async move {
-                let rows = sqlx::query(
-                    r#"INSERT INTO storage_write_pressure_snapshots
-                   (id, window_start, window_end, payload_json, created_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+                let existing = sqlx::query(
+                    r#"SELECT id, payload_json
+                       FROM storage_write_pressure_snapshots
+                       WHERE window_start = ?1 AND window_end = ?2
+                       ORDER BY created_at ASC, id ASC
+                       LIMIT 1"#,
                 )
-                .bind(id)
-                .bind(window_start)
-                .bind(window_end)
-                .bind(payload)
-                .bind(created_at)
-                .execute(&mut **tx)
-                .await?
-                .rows_affected() as u32;
+                .bind(&window_start)
+                .bind(&window_end)
+                .fetch_optional(&mut **tx)
+                .await?;
+                let rows = if let Some(existing) = existing {
+                    let existing_id: String = existing.get("id");
+                    let existing_payload: String = existing.get("payload_json");
+                    let existing_payload: Value = serde_json::from_str(&existing_payload)
+                        .context("parse existing storage pressure payload for telemetry merge")?;
+                    let merged_payload =
+                        merge_write_pressure_payload(existing_payload, payload_value.clone());
+                    let merged_payload = serde_json::to_string(&merged_payload)
+                        .context("serialize merged storage pressure payload")?;
+                    if merged_payload.len() > 65_536 {
+                        anyhow::bail!("merged storage write pressure payload exceeds 65536 bytes");
+                    }
+                    sqlx::query(
+                        r#"UPDATE storage_write_pressure_snapshots
+                           SET payload_json = ?1, created_at = ?2
+                           WHERE id = ?3"#,
+                    )
+                    .bind(merged_payload)
+                    .bind(&created_at)
+                    .bind(existing_id)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected() as u32
+                } else {
+                    sqlx::query(
+                        r#"INSERT INTO storage_write_pressure_snapshots
+                           (id, window_start, window_end, payload_json, created_at)
+                           VALUES (?1, ?2, ?3, ?4, ?5)"#,
+                    )
+                    .bind(id)
+                    .bind(&window_start)
+                    .bind(&window_end)
+                    .bind(payload)
+                    .bind(&created_at)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected() as u32
+                };
                 let ttl_deleted = sqlx::query(
                     r#"DELETE FROM storage_write_pressure_snapshots
                        WHERE created_at < ?1"#,
@@ -122,6 +159,123 @@ pub async fn record_live_write_pressure_rollup(
         StorageWritePressureSnapshot::new(now - chrono::Duration::milliseconds(1), now, payload);
     insert_write_pressure_snapshot(pool, &snapshot).await?;
     Ok(snapshot)
+}
+
+fn merge_write_pressure_payload(existing: Value, incoming: Value) -> Value {
+    let (mut existing, incoming) = match (existing, incoming) {
+        (Value::Object(existing), Value::Object(incoming)) => (existing, incoming),
+        (_, incoming) => return incoming,
+    };
+
+    for (key, incoming_value) in incoming {
+        if key == "rollup" {
+            let existing_rollup = existing.remove("rollup").unwrap_or(Value::Null);
+            existing.insert(key, merge_rollup_payload(existing_rollup, incoming_value));
+        } else {
+            existing.insert(key, incoming_value);
+        }
+    }
+
+    Value::Object(existing)
+}
+
+fn merge_rollup_payload(existing: Value, incoming: Value) -> Value {
+    let (mut existing, incoming) = match (existing, incoming) {
+        (Value::Object(existing), Value::Object(incoming)) => (existing, incoming),
+        (_, incoming) => return incoming,
+    };
+
+    for (key, incoming_value) in incoming {
+        if key == "lanes" {
+            let existing_lanes = existing.remove("lanes").unwrap_or(Value::Null);
+            existing.insert(key, merge_lane_payloads(existing_lanes, incoming_value));
+        } else if is_additive_counter(&key) {
+            existing.insert(
+                key.clone(),
+                json!(number_as_u64(existing.get(&key)) + number_as_u64(Some(&incoming_value))),
+            );
+        } else if is_max_gauge(&key) {
+            existing.insert(
+                key.clone(),
+                json!(number_as_u64(existing.get(&key)).max(number_as_u64(Some(&incoming_value)))),
+            );
+        } else {
+            existing.insert(key, incoming_value);
+        }
+    }
+
+    Value::Object(existing)
+}
+
+fn merge_lane_payloads(existing: Value, incoming: Value) -> Value {
+    let (existing, incoming) = match (existing, incoming) {
+        (Value::Array(existing), Value::Array(incoming)) => (existing, incoming),
+        (_, incoming) => return incoming,
+    };
+    let mut by_lane = serde_json::Map::new();
+    for lane in existing {
+        let Some(lane_name) = lane.get("lane").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        by_lane.insert(lane_name, lane);
+    }
+    for lane in incoming {
+        let Some(lane_name) = lane.get("lane").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let merged = if let Some(existing_lane) = by_lane.remove(&lane_name) {
+            merge_lane_payload(existing_lane, lane)
+        } else {
+            lane
+        };
+        by_lane.insert(lane_name, merged);
+    }
+    Value::Array(by_lane.into_values().collect())
+}
+
+fn merge_lane_payload(existing: Value, incoming: Value) -> Value {
+    let (mut existing, incoming) = match (existing, incoming) {
+        (Value::Object(existing), Value::Object(incoming)) => (existing, incoming),
+        (_, incoming) => return incoming,
+    };
+    for (key, incoming_value) in incoming {
+        if is_additive_counter(&key) {
+            existing.insert(
+                key.clone(),
+                json!(number_as_u64(existing.get(&key)) + number_as_u64(Some(&incoming_value))),
+            );
+        } else if is_max_gauge(&key) {
+            existing.insert(
+                key.clone(),
+                json!(number_as_u64(existing.get(&key)).max(number_as_u64(Some(&incoming_value)))),
+            );
+        } else {
+            existing.insert(key, incoming_value);
+        }
+    }
+    Value::Object(existing)
+}
+
+fn is_additive_counter(key: &str) -> bool {
+    key.ends_with("Total")
+}
+
+fn is_max_gauge(key: &str) -> bool {
+    matches!(
+        key,
+        "totalQueued"
+            | "queuedDepth"
+            | "capacity"
+            | "oldestQueuedAgeMs"
+            | "transactionDurationP50Ms"
+            | "transactionDurationP95Ms"
+            | "transactionDurationSampleCount"
+            | "estimatedMemoryBytes"
+    )
+}
+
+fn number_as_u64(value: Option<&Value>) -> u64 {
+    value.and_then(Value::as_u64).unwrap_or(0)
 }
 
 pub async fn latest_write_pressure_snapshot(

@@ -5490,6 +5490,7 @@ PLIST
       cargo test -p db p075_projection_rebuild_uses_production_class_b_coalescing --test integration -- --nocapture
       cargo test -p db class_d_telemetry_drop_counter_is_observable_via_storage_health --test proposal_075_dbwriter -- --nocapture
       cargo test -p db class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention --test proposal_075_dbwriter -- --nocapture
+      cargo test -p db class_d_duplicate_window_rollups_merge_counters_and_max_gauges --test proposal_075_dbwriter -- --nocapture
 
       log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
       cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
@@ -5724,12 +5725,16 @@ if "droppedTelemetryTotal" not in storage_health_text or "telemetryDroppedTotal"
     raise SystemExit("P075 storageHealth must report real Class D telemetry drop counters")
 for required in [
     "record_live_write_pressure_rollup",
+    "merge_write_pressure_payload",
     "TELEMETRY_SNAPSHOT_RETAIN_LATEST",
     "latestWindowLimit",
     "DELETE FROM storage_write_pressure_snapshots",
 ]:
     if required not in storage_health_text and required not in writer_text:
         raise SystemExit(f"P075 Class D rollup lifecycle is not wired: missing {required}")
+storage_pressure_migration = (root / "control-plane/crates/db/migrations/049_p075_storage_write_pressure_window_key.sql").read_text()
+if "idx_storage_write_pressure_window_unique" not in storage_pressure_migration or "window_start, window_end" not in storage_pressure_migration:
+    raise SystemExit("P075 Class D telemetry_merge requires a unique write-pressure window key")
 daemon_main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
 if "spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone())" not in daemon_main:
     raise SystemExit("P075 daemon must start the production Class D write-pressure rollup producer")
