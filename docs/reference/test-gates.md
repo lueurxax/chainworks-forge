@@ -1850,6 +1850,43 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
+### `proposal-085|p085`
+
+Thin-client read-model parity and affordance contract gate.
+
+Scope:
+
+- `docs/reference/thin-client-read-model-affordance-contract.md` exists and contains `thin_client_affordance_contract_v1` with all required affordance rows (`artifact.preview.listLabel`, `artifact.preview.detail`, `report.payload.metadata`, `freshness.badge.run/stage/approval/artifact`, `approval.resolve.approve/reject`, `diagnostic.copy`, `external.command.placeholder`)
+- All eight p085 negative fixture files exist as valid JSON with a `contract_violation` field
+- `control-plane/crates/graphql-server` runs the P085 backend proof slice (`proposal_085_`) covering approval projection fields, report payload projection fields, authorization denial for diagnostic fields, and typed `conflictResultCode` readback with a real failed `command_journal` id
+- `Chainworks Forge/Support/P085AffordancePresenter.swift` exists with immutable Equatable Sendable DTOs: `P085ArtifactAffordanceState`, `P085ApprovalAffordanceState`, `P085FreshnessAffordanceState`, `P085DiagnosticAffordanceState`; `canDrivePayloadAvailability` and `canDriveApprovalActionability` are always `false`; `mergedAffordance` enforces stale-detail guard; `payloadPresentation(fromRaw:)` and `P085FreshnessState.fromRaw` map unknown enum strings to `.unknown`
+- `Chainworks ForgeTests/Proposal085Tests` runs as the Swift parity slice proving: `payload_deferred` → `.deferred` (not `.unavailable`); `metadata_only` → `.metadataOnly`; unknown enum strings → `.unknown`; stale async detail does not overwrite newer selection; approval actionability requires `writePathState == .available` and matching `availableActions`; freshness is diagnostic-only; diagnostic affordance invalidates on unauthorized freshness
+
+Use when:
+
+- Changing `P085AffordancePresenter` mapping logic or DTOs
+- Adding a new GraphQL-driven Swift affordance (must add a contract row first)
+- Verifying that `payload_deferred` and `metadata_only` are represented honestly
+
+Host policy:
+
+- local Swift toolchain (Xcode 26.3+), Rust toolchain, and Python 3 required; no UI host, daemon, or network required
+- the Rust slice is a backend GraphQL contract proof and must pass before the Swift presenter slice runs
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-085
+./scripts/test-gate.sh p085
+```
+
+Important:
+
+- `p085` is accepted as an alias; both run the same proof slice
+- the gate fails closed if the contract doc is missing a required row or term, any negative fixture is absent or lacks `contract_violation`, the backend GraphQL proof is missing/failing, the presenter file is missing a required symbol, or the `Proposal085Tests` Swift slice fails
+- `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
+- unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
+
 ### `proposal-075|p075`
 
 Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.

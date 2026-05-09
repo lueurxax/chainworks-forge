@@ -117,7 +117,7 @@ Active proposal work is currently concentrated in:
 - [`docs/proposals/036-ux-consolidation-and-navigation-simplification.md`](docs/proposals/036-ux-consolidation-and-navigation-simplification.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
-The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). New UI proposals should build on that reference rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
+The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). The specific contract for GraphQL-driven UI states, actionability, and fallback copy is [`docs/reference/thin-client-read-model-affordance-contract.md`](docs/reference/thin-client-read-model-affordance-contract.md). New UI proposals should build on these references rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
 
 ## Implemented Today
 

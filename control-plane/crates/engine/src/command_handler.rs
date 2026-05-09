@@ -8,6 +8,7 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use thiserror::Error as ThisError;
 use tracing::{info, warn};
 
 use db::repos::{
@@ -138,6 +139,23 @@ pub struct StartRunBlockedByDeliveryPreflight {
 pub struct Commanded {
     pub result: CommandResult,
     pub journal_id: String,
+}
+
+#[derive(Debug, ThisError)]
+pub enum ApprovalResolutionConflict {
+    #[error("Approval {approval_id} is not actionable (already resolved)")]
+    AlreadyResolved {
+        approval_id: ApprovalId,
+        journal_id: String,
+    },
+}
+
+impl ApprovalResolutionConflict {
+    pub fn journal_id(&self) -> &str {
+        match self {
+            Self::AlreadyResolved { journal_id, .. } => journal_id,
+        }
+    }
 }
 
 struct CommandJournalEntry {
@@ -3556,10 +3574,10 @@ impl CommandHandler {
                         a
                     }
                     Some(_) => {
-                        let error = anyhow!(
-                            "Approval {} is not actionable (already resolved)",
-                            c.approval_id
-                        );
+                        let error = ApprovalResolutionConflict::AlreadyResolved {
+                            approval_id: c.approval_id,
+                            journal_id: journal.id.clone(),
+                        };
                         command_journal::fail_entry_tx(
                             &mut tx,
                             &journal.id,
@@ -3569,7 +3587,7 @@ impl CommandHandler {
                         .await?;
                         tx.commit().await?;
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
-                        return Err(error);
+                        return Err(error.into());
                     }
                     None => {
                         let error = anyhow!("Approval {} not found", c.approval_id);

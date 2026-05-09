@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Date | 2026-05-01 |
-| Status | Draft |
+| Status | Implemented — see [reference/thin-client-read-model-affordance-contract.md](../reference/thin-client-read-model-affordance-contract.md) |
 | Author | Codex |
 | Depends on | [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [ui-action-boundary.md](../reference/ui-action-boundary.md) |
 | Related | P036 UI restoration, P068/P081 boundary matrix, Swift `P031ThinGraphQLReadBoundary.swift`, Swift `RunsHomeView.swift` |

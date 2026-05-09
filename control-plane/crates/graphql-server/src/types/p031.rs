@@ -68,3 +68,11 @@ pub fn freshness_from_projection_lag(projection_lag: bool) -> GqlFreshnessState 
 pub fn is_report_metadata(format: &str, report_kind: Option<&str>) -> bool {
     format == "report" || report_kind.is_some()
 }
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "MutationConflictResultCode", rename_items = "snake_case")]
+pub enum GqlMutationConflictResultCode {
+    AlreadyResolved,
+    StateConflict,
+    TransientErrorRetryable,
+}

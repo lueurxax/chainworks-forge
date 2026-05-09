@@ -208,6 +208,10 @@ PROPOSAL_084_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal084Tests"
 )
 
+PROPOSAL_085_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal085Tests"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -2218,6 +2222,7 @@ Available gates:
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -6171,6 +6176,189 @@ PY
     fi
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
+    ;;
+  proposal-085|p085)
+    log "Proposal 085 gate: thin-client read-model parity and affordance contract"
+    python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# 1. Contract document exists and contains required sections
+contract_doc = root / "docs/reference/thin-client-read-model-affordance-contract.md"
+if not contract_doc.exists():
+    raise SystemExit(
+        "proposal-085: missing docs/reference/thin-client-read-model-affordance-contract.md"
+    )
+contract_text = contract_doc.read_text()
+for required in [
+    "thin_client_affordance_contract_v1",
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+    "approveApproval",
+    "rejectApproval",
+    "payload_deferred",
+    "metadata_only",
+    "payloadAvailabilityState",
+    "freshnessState",
+    "disabledReasonCode",
+    "writePathState",
+    "diagnosticId",
+    "P085AffordancePresenter",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+]:
+    if required not in contract_text:
+        raise SystemExit(
+            f"proposal-085: contract doc missing required term: {required!r}"
+        )
+
+# 2. Negative fixtures exist as valid JSON
+p085_negative_fixtures = [
+    "docs/evidence/rollout-contract/negative/p085-approval-actionability-mismatch.json",
+    "docs/evidence/rollout-contract/negative/p085-approval-stale-double-submit-conflict.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-affordance-row.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-schema-symbol.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-marked-unavailable.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-no-deadline.json",
+    "docs/evidence/rollout-contract/negative/p085-unknown-enum-optimistic-action.json",
+    "docs/evidence/rollout-contract/negative/p085-unsafe-local-truth-fallback.json",
+]
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    if not full.exists():
+        raise SystemExit(f"proposal-085: missing negative fixture {fixture_path}")
+    try:
+        data = json.loads(full.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-085: invalid JSON in {fixture_path}: {exc}") from exc
+    if "contract_violation" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'contract_violation' field"
+        )
+
+# 3. test-gates.md documents the gate
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-085: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required in [
+    "### `proposal-085|p085`",
+    "thin_client_affordance_contract_v1",
+    "P085AffordancePresenter",
+    "negative fixture",
+]:
+    if required not in gates_text:
+        raise SystemExit(
+            f"proposal-085: docs/reference/test-gates.md missing required content: {required!r}"
+        )
+
+# 4. Swift presenter file exists and contains required P085 symbols
+presenter = root / "Chainworks Forge/Support/P085AffordancePresenter.swift"
+if not presenter.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P085AffordancePresenter.swift"
+    )
+presenter_text = presenter.read_text()
+for required in [
+    "P085AffordancePresenter",
+    "P085ArtifactAffordanceState",
+    "P085ApprovalAffordanceState",
+    "P085FreshnessAffordanceState",
+    "P085DiagnosticAffordanceState",
+    "P085MutationConflictResultCode",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+    "mergedAffordance",
+    "payloadPresentation(fromRaw",
+    "static func fromRaw",
+    "case .unknown",
+    # Decision-state gating: approval checks durable decision (pending/requested = actionable)
+    "d != \"pending\"",
+    "Approval is already resolved",
+    # Conflict codes: typed idempotency/conflict result vocabulary
+    "alreadyResolved",
+    "stateConflict",
+    "transientErrorRetryable",
+]:
+    if required not in presenter_text:
+        raise SystemExit(
+            f"proposal-085: P085AffordancePresenter.swift missing required term: {required!r}"
+        )
+
+# 5. P031 enums have fail-closed decoding (custom init(from decoder:) for unknown values)
+boundary_file = root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+if not boundary_file.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+    )
+boundary_text = boundary_file.read_text()
+for required in [
+    # Fail-closed init(from decoder:) must be present for all P031 enums
+    "P031FreshnessState",
+    "P031DisabledReasonCode",
+    "P031WritePathState",
+    "P031PayloadAvailabilityState",
+    "P031PayloadUnavailableReasonCode",
+    # P085 wired into production approval path
+    "P085AffordancePresenter.approvalAffordance",
+    # P085 wired into production artifact path
+    "P085AffordancePresenter.artifactListAffordance",
+    # P031 canApprove/canReject check durable decision state via isActionableDecision
+    "isActionableDecision",
+    # Typed conflict result on mutation result
+    "conflictResultCode",
+]:
+    if required not in boundary_text:
+        raise SystemExit(
+            f"proposal-085: P031ThinGraphQLReadBoundary.swift missing required term: {required!r}"
+        )
+
+# 6. Backend GraphQL path must use typed engine conflicts, not string-matched
+# error text or dummy journal IDs.
+graphql_schema = root / "control-plane/crates/graphql-server/src/schema.rs"
+command_handler = root / "control-plane/crates/engine/src/command_handler.rs"
+schema_text = graphql_schema.read_text()
+handler_text = command_handler.read_text()
+for required in [
+    "ApprovalResolutionConflict",
+    "approval_resolution_conflict_code",
+    "proposal_085_approval_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_graphql_backend_projection_and_authorization_contract",
+]:
+    if required not in schema_text + handler_text:
+        raise SystemExit(
+            f"proposal-085: backend proof missing required term: {required!r}"
+        )
+for forbidden in [
+    "msg.contains(\"not actionable\")",
+    "msg.contains(\"already resolved\")",
+    "ID::from(\"00000000-0000-0000-0000-000000000000\")",
+]:
+    if forbidden in schema_text:
+        raise SystemExit(
+            f"proposal-085: GraphQL backend still contains forbidden brittle conflict handling: {forbidden!r}"
+        )
+
+print("proposal-085 all gate checks passed")
+PY
+    (
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-085-gate cargo test -p graphql-server --lib proposal_085_ -- --test-threads=1 --nocapture
+    )
+    run_targeted_tests "proposal-085" "${PROPOSAL_085_SWIFT_TESTS[@]}"
+    log "Proposal 085 gate passed"
     ;;
   *)
     print_usage >&2
