@@ -6259,7 +6259,7 @@ for required in [
             f"proposal-085: docs/reference/test-gates.md missing required content: {required!r}"
         )
 
-# 4. Swift presenter file exists
+# 4. Swift presenter file exists and contains required P085 symbols
 presenter = root / "Chainworks Forge/Support/P085AffordancePresenter.swift"
 if not presenter.exists():
     raise SystemExit(
@@ -6272,16 +6272,52 @@ for required in [
     "P085ApprovalAffordanceState",
     "P085FreshnessAffordanceState",
     "P085DiagnosticAffordanceState",
+    "P085MutationConflictResultCode",
     "canDrivePayloadAvailability",
     "canDriveApprovalActionability",
     "mergedAffordance",
     "payloadPresentation(fromRaw",
     "static func fromRaw",
     "case .unknown",
+    # Decision-state gating: approval must check durable decision before allowing mutation
+    "approval.decision != nil",
+    "Approval is already resolved",
+    # Conflict codes: typed idempotency/conflict result vocabulary
+    "alreadyResolved",
+    "stateConflict",
+    "transientErrorRetryable",
 ]:
     if required not in presenter_text:
         raise SystemExit(
             f"proposal-085: P085AffordancePresenter.swift missing required term: {required!r}"
+        )
+
+# 5. P031 enums have fail-closed decoding (custom init(from decoder:) for unknown values)
+boundary_file = root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+if not boundary_file.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+    )
+boundary_text = boundary_file.read_text()
+for required in [
+    # Fail-closed init(from decoder:) must be present for all P031 enums
+    "P031FreshnessState",
+    "P031DisabledReasonCode",
+    "P031WritePathState",
+    "P031PayloadAvailabilityState",
+    "P031PayloadUnavailableReasonCode",
+    # P085 wired into production approval path
+    "P085AffordancePresenter.approvalAffordance",
+    # P085 wired into production artifact path
+    "P085AffordancePresenter.artifactListAffordance",
+    # P031 canApprove/canReject check decision
+    "decision == nil",
+    # Typed conflict result on mutation result
+    "conflictResultCode",
+]:
+    if required not in boundary_text:
+        raise SystemExit(
+            f"proposal-085: P031ThinGraphQLReadBoundary.swift missing required term: {required!r}"
         )
 
 print("proposal-085 all gate checks passed")

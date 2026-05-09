@@ -1,5 +1,25 @@
 import Foundation
 
+// MARK: - P085 typed mutation conflict result
+
+/// Typed result codes for approveApproval/rejectApproval mutations.
+/// Fail-closed: unknown server values decode to .unknown(rawValue:) rather than crashing.
+enum P085MutationConflictResultCode: Equatable, Sendable {
+  case alreadyResolved
+  case stateConflict
+  case transientErrorRetryable
+  case unknown(rawValue: String)
+
+  nonisolated static func fromRaw(_ rawValue: String) -> P085MutationConflictResultCode {
+    switch rawValue {
+    case "already_resolved": return .alreadyResolved
+    case "state_conflict": return .stateConflict
+    case "transient_error_retryable": return .transientErrorRetryable
+    default: return .unknown(rawValue: rawValue)
+    }
+  }
+}
+
 // MARK: - P085 fail-closed freshness wrapper
 
 enum P085FreshnessState: Equatable, Sendable {
@@ -336,6 +356,11 @@ enum P085AffordancePresenter {
     action: String,
     approval: P031ApprovalReadModel
   ) -> P085ApprovalActionAvailability {
+    // Non-nil decision means the approval is already resolved; no mutation is valid.
+    if approval.decision != nil {
+      let reason = approval.disabledReasonCode ?? .unsupportedAction
+      return .disabled(reasonCode: reason, helpText: "Approval is already resolved.")
+    }
     guard approval.writePathState == .available else {
       let reason = approval.disabledReasonCode ?? .writePathNotAvailable
       return .disabled(reasonCode: reason, helpText: disabledHelpText(for: reason))

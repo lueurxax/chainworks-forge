@@ -484,10 +484,24 @@ enum P072ApprovalDecisionAction: Equatable, Sendable {
 struct P072ApprovalMutationResult: Decodable, Equatable, Sendable {
   let approval: P031ApprovalReadModel
   let journalID: String
+  /// Typed conflict/idempotency result code when the server supports it; nil for success.
+  let conflictResultCode: P085MutationConflictResultCode?
 
   enum CodingKeys: String, CodingKey {
     case approval
     case journalID = "journalId"
+    case conflictResultCodeRaw = "conflictResultCode"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.approval = try container.decode(P031ApprovalReadModel.self, forKey: .approval)
+    self.journalID = try container.decode(String.self, forKey: .journalID)
+    if let rawCode = try container.decodeIfPresent(String.self, forKey: .conflictResultCodeRaw) {
+      self.conflictResultCode = P085MutationConflictResultCode.fromRaw(rawCode)
+    } else {
+      self.conflictResultCode = nil
+    }
   }
 }
 
@@ -881,6 +895,12 @@ enum P031FreshnessState: String, Codable, CaseIterable, Equatable, Sendable {
   case stale
   case unavailable
   case unauthorized
+
+  // Fail-closed: unknown server values decode to .unavailable, never to optimistic states.
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .unavailable
+  }
 }
 
 enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable {
@@ -891,6 +911,12 @@ enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable 
   case projectionLag = "PROJECTION_LAG"
   case unauthorized = "UNAUTHORIZED"
   case unsupportedAction = "UNSUPPORTED_ACTION"
+
+  // Fail-closed: unknown server values decode to .writePathNotAvailable (most restrictive).
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .writePathNotAvailable
+  }
 }
 
 enum P031WritePathState: String, Codable, CaseIterable, Equatable, Sendable {
@@ -899,6 +925,12 @@ enum P031WritePathState: String, Codable, CaseIterable, Equatable, Sendable {
   case writePathNotAvailable = "write_path_not_available"
   case externalTransportRequired = "external_transport_required"
   case hidden
+
+  // Fail-closed: unknown server values decode to .writePathNotAvailable (disables mutations).
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .writePathNotAvailable
+  }
 }
 
 enum P031PayloadAvailabilityState: String, Codable, CaseIterable, Equatable, Sendable {
@@ -907,6 +939,12 @@ enum P031PayloadAvailabilityState: String, Codable, CaseIterable, Equatable, Sen
   case payloadDeferred = "payload_deferred"
   case generating
   case unavailable
+
+  // Fail-closed: unknown server values decode to .unavailable, not to actionable states.
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .unavailable
+  }
 }
 
 enum P031PayloadUnavailableReasonCode: String, Codable, CaseIterable, Equatable, Sendable {
@@ -916,6 +954,12 @@ enum P031PayloadUnavailableReasonCode: String, Codable, CaseIterable, Equatable,
   case notAuthorized = "NOT_AUTHORIZED"
   case notAvailable = "NOT_AVAILABLE"
   case unknown = "UNKNOWN"
+
+  // Fail-closed: unknown server values decode to .unknown (already defined sentinel).
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .unknown
+  }
 }
 
 struct P031FreshnessSnapshot: Equatable, Sendable {
@@ -1246,11 +1290,11 @@ struct P031ApprovalReadModel: Decodable, Equatable, Sendable {
   }
 
   nonisolated var canApprove: Bool {
-    availableActions.contains("approve") && writePathState == .available
+    decision == nil && availableActions.contains("approve") && writePathState == .available
   }
 
   nonisolated var canReject: Bool {
-    availableActions.contains("reject") && writePathState == .available
+    decision == nil && availableActions.contains("reject") && writePathState == .available
   }
 }
 
@@ -4505,13 +4549,20 @@ enum P031ApprovalInboxPresenter {
       approval.runID,
       approval.stageID,
     ]
+    // P085: derive actionability through the canonical affordance presenter, which checks
+    // durable decision state, writePathState, and availableActions before granting actionable.
+    let p085Affordance = P085AffordancePresenter.approvalAffordance(for: approval)
+    let canApprove: Bool
+    if case .actionable = p085Affordance.approveAvailability { canApprove = true } else { canApprove = false }
+    let canReject: Bool
+    if case .actionable = p085Affordance.rejectAvailability { canReject = true } else { canReject = false }
 
     return P031ApprovalInboxRowPresentation(
       approvalID: approval.id,
       title: diagnostic.title,
       body: diagnostic.body,
-      canApprove: approval.canApprove,
-      canReject: approval.canReject,
+      canApprove: canApprove,
+      canReject: canReject,
       actionLabel: diagnostic.actionLabel,
       followUpID: diagnostic.followUpID,
       copyItems: diagnostic.copyItems,
@@ -5117,10 +5168,14 @@ enum P031ArtifactPresenter {
       value?.trimmingCharacters(in: .whitespacesAndNewlines)
     }.filter { !$0.isEmpty }
     let detailLabel = detailParts.joined(separator: " / ")
+    // P085: use the canonical affordance presenter for the list label so payload_deferred
+    // surfaces "Open to preview" rather than an Unavailable/generic fallback.
+    let p085Affordance = P085AffordancePresenter.artifactListAffordance(for: artifact)
+    let p085Label = p085Affordance.label
     let accessibilityParts = [
       artifact.name,
       detailLabel,
-      payload.title,
+      p085Label,
       P031ThinPresentationFormatting.freshnessAccessibilityLabel(artifact.freshnessState),
     ].compactMap { $0 }.filter { !$0.isEmpty }
 
@@ -5128,7 +5183,7 @@ enum P031ArtifactPresenter {
       artifactID: artifact.id,
       title: artifact.name,
       detailLabel: detailLabel,
-      payloadAvailabilityLabel: payload.title,
+      payloadAvailabilityLabel: p085Label,
       payloadAvailabilitySymbolName: payload.symbolName,
       canOpenPayload: payload.canOpenPayload,
       diagnosticCopyItems: payload.copyItems,

@@ -274,9 +274,23 @@ detail affordance may upgrade `.deferred` to `.available(payloadText:)` for the 
 
 - `P085AffordancePresenter` is the canonical Swift mapping layer.
 - All presenter outputs are immutable, Equatable, Sendable.
-- Unknown GraphQL enum values fail closed: `P085FreshnessState.fromRaw(_:)` returns
-  `.unknown(rawValue:)`; `P085AffordancePresenter.payloadPresentation(fromRaw:)` returns
+- Unknown GraphQL enum values fail closed at the boundary: `P031FreshnessState`,
+  `P031DisabledReasonCode`, `P031WritePathState`, `P031PayloadAvailabilityState`, and
+  `P031PayloadUnavailableReasonCode` define a custom `init(from decoder:)` that decodes
+  unknown raw strings to a safe sentinel (`.unavailable`, `.writePathNotAvailable`, or
+  `.unknown`) rather than throwing. The presenter layer adds `P085FreshnessState.fromRaw(_:)`
+  → `.unknown(rawValue:)` and `P085AffordancePresenter.payloadPresentation(fromRaw:)` →
   `.unknown(rawState:)`.
+- Approval actionability requires durable decision state to be unresolved:
+  `P031ApprovalReadModel.canApprove` and `canReject` evaluate `decision == nil` before
+  checking `availableActions` and `writePathState`. `P085AffordancePresenter.approvalAffordance`
+  short-circuits to `.disabled` when `decision != nil`, surfacing "Approval is already
+  resolved." help text. This guards against stale projection lag presenting an actionable
+  button after the durable state has already moved.
+- Typed mutation conflict codes are decoded from `P072ApprovalMutationResult.conflictResultCode`
+  into `P085MutationConflictResultCode`: `.alreadyResolved`, `.stateConflict`,
+  `.transientErrorRetryable`, or `.unknown(rawValue:)`. Unknown server codes are not
+  collapsed into success or silently retried.
 - Freshness never drives payload availability or approval actionability;
   `P085FreshnessAffordanceState.canDrivePayloadAvailability` and
   `canDriveApprovalActionability` are always `false`.
@@ -285,6 +299,11 @@ detail affordance may upgrade `.deferred` to `.available(payloadText:)` for the 
   list affordance when `detail.artifactID ≠ selectedArtifactID`.
 - Diagnostic affordance invalidates on `unauthorized` freshness transition:
   `P085DiagnosticAffordanceState.isAvailable = false` when `freshnessState == .unauthorized`.
+- Production thin-UI presenters delegate to P085: `P031ApprovalInboxPresenter.rowPresentation`
+  derives `canApprove`/`canReject` from `P085AffordancePresenter.approvalAffordance`, and
+  `P031ArtifactPresenter.presentation` uses `P085AffordancePresenter.artifactListAffordance`
+  for the row's payload-availability label so `payload_deferred` surfaces "Open to preview"
+  rather than a generic unavailable fallback.
 
 ---
 

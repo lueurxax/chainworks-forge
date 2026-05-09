@@ -363,4 +363,188 @@ struct Proposal085Tests {
     let state = P085AffordancePresenter.approvalAffordance(for: lagApproval)
     #expect(state.projectionLagIsOnlyConstraint == true)
   }
+
+  // MARK: - Decision-state gating (durable approval state check)
+
+  @Test("Approval with non-nil decision is .disabled regardless of writePathState/availableActions")
+  func alreadyResolvedApprovalIsDisabled() {
+    let resolvedApproval = P031ApprovalReadModel(
+      id: "appr-20", runID: "r-1", stageID: "s-1",
+      decision: "approved", freshnessState: .live,
+      disabledReasonCode: nil, writePathState: .available,
+      diagnosticID: nil, serverDebugDetail: nil,
+      availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: resolvedApproval)
+    if case .disabled = state.approveAvailability { } else {
+      Issue.record("Expected .disabled for resolved approval but got \(state.approveAvailability)")
+    }
+    if case .disabled = state.rejectAvailability { } else {
+      Issue.record("Expected .disabled for resolved approval but got \(state.rejectAvailability)")
+    }
+  }
+
+  @Test("P031ApprovalReadModel.canApprove is false when decision is already set")
+  func canApproveIsFalseWhenDecisionSet() {
+    let resolvedApproval = P031ApprovalReadModel(
+      id: "appr-21", runID: "r-1", stageID: "s-1",
+      decision: "rejected", freshnessState: .live,
+      disabledReasonCode: nil, writePathState: .available,
+      diagnosticID: nil, serverDebugDetail: nil,
+      availableActions: ["approve"]
+    )
+    #expect(resolvedApproval.canApprove == false)
+    #expect(resolvedApproval.canReject == false)
+  }
+
+  // MARK: - Fail-closed actual JSON decoding
+
+  @Test("Unknown freshnessState JSON value decodes to .unavailable (fail-closed, no crash)")
+  func unknownFreshnessStateJsonDecodesToUnavailable() throws {
+    let json = """
+      {
+        "id": "a-50", "runId": "r-1", "stageId": "s-1",
+        "freshnessState": "future_hypothetical_state",
+        "writePathState": "available",
+        "availableActions": []
+      }
+      """.data(using: .utf8)!
+    let model = try JSONDecoder().decode(P031ApprovalReadModel.self, from: json)
+    #expect(model.freshnessState == .unavailable)
+  }
+
+  @Test("Unknown writePathState JSON value decodes fail-closed, disabling mutations")
+  func unknownWritePathStateJsonDecodesToNotAvailable() throws {
+    let json = """
+      {
+        "id": "a-51", "runId": "r-1", "stageId": "s-1",
+        "freshnessState": "live",
+        "writePathState": "some_future_write_mode",
+        "availableActions": []
+      }
+      """.data(using: .utf8)!
+    let model = try JSONDecoder().decode(P031ApprovalReadModel.self, from: json)
+    #expect(model.writePathState == .writePathNotAvailable)
+    #expect(model.canApprove == false)
+  }
+
+  @Test("Unknown payloadAvailabilityState JSON value decodes to .unavailable (fail-closed)")
+  func unknownPayloadAvailabilityStateJsonDecodesToUnavailable() throws {
+    struct ArtifactShim: Decodable {
+      let payloadAvailabilityState: P031PayloadAvailabilityState
+    }
+    let json = """
+      {"payloadAvailabilityState": "exotic_payload_state_v9"}
+      """.data(using: .utf8)!
+    let shim = try JSONDecoder().decode(ArtifactShim.self, from: json)
+    #expect(shim.payloadAvailabilityState == .unavailable)
+  }
+
+  // MARK: - Mutation conflict result code
+
+  @Test("P085MutationConflictResultCode fromRaw maps known codes")
+  func conflictResultCodeMapsKnownValues() {
+    #expect(P085MutationConflictResultCode.fromRaw("already_resolved") == .alreadyResolved)
+    #expect(P085MutationConflictResultCode.fromRaw("state_conflict") == .stateConflict)
+    #expect(P085MutationConflictResultCode.fromRaw("transient_error_retryable") == .transientErrorRetryable)
+  }
+
+  @Test("P085MutationConflictResultCode fromRaw maps unknown codes to .unknown(rawValue:)")
+  func conflictResultCodeUnknownFailsClosed() {
+    let result = P085MutationConflictResultCode.fromRaw("future_conflict_code")
+    if case .unknown(let raw) = result {
+      #expect(raw == "future_conflict_code")
+    } else {
+      Issue.record("Expected .unknown but got \(result)")
+    }
+  }
+
+  @Test("P072ApprovalMutationResult decodes without conflictResultCode present (nil)")
+  func mutationResultDecodesWithoutConflictCode() throws {
+    let json = """
+      {
+        "approval": {
+          "id": "appr-30", "runId": "r-1", "stageId": "s-1",
+          "freshnessState": "live",
+          "writePathState": "available",
+          "availableActions": []
+        },
+        "journalId": "j-1"
+      }
+      """.data(using: .utf8)!
+    let result = try JSONDecoder().decode(P072ApprovalMutationResult.self, from: json)
+    #expect(result.conflictResultCode == nil)
+    #expect(result.journalID == "j-1")
+  }
+
+  @Test("P072ApprovalMutationResult decodes known conflictResultCode")
+  func mutationResultDecodesKnownConflictCode() throws {
+    let json = """
+      {
+        "approval": {
+          "id": "appr-31", "runId": "r-1", "stageId": "s-1",
+          "freshnessState": "live",
+          "writePathState": "available",
+          "availableActions": []
+        },
+        "journalId": "j-2",
+        "conflictResultCode": "already_resolved"
+      }
+      """.data(using: .utf8)!
+    let result = try JSONDecoder().decode(P072ApprovalMutationResult.self, from: json)
+    #expect(result.conflictResultCode == .alreadyResolved)
+  }
+
+  @Test("P072ApprovalMutationResult decodes unknown conflictResultCode fail-closed")
+  func mutationResultDecodesUnknownConflictCodeFailClosed() throws {
+    let json = """
+      {
+        "approval": {
+          "id": "appr-32", "runId": "r-1", "stageId": "s-1",
+          "freshnessState": "live",
+          "writePathState": "available",
+          "availableActions": []
+        },
+        "journalId": "j-3",
+        "conflictResultCode": "hypothetical_future_code"
+      }
+      """.data(using: .utf8)!
+    let result = try JSONDecoder().decode(P072ApprovalMutationResult.self, from: json)
+    if case .unknown(let raw) = result.conflictResultCode {
+      #expect(raw == "hypothetical_future_code")
+    } else {
+      Issue.record("Expected .unknown(rawValue:) but got \(String(describing: result.conflictResultCode))")
+    }
+  }
+
+  // MARK: - P085 wired into production presenter
+
+  @Test("P031ArtifactPresenter uses P085 label: payload_deferred shows Open to preview")
+  func artifactPresenterUsesp085LabelForDeferred() {
+    let artifact = P031ArtifactReadModel(
+      id: "a-60", runID: "r-1", stageID: "s-1",
+      name: "output", contractID: "output", format: "markdown",
+      freshnessState: .live, payloadAvailabilityState: .payloadDeferred
+    )
+    let presentation = P031ArtifactPresenter.presentation(for: artifact)
+    #expect(presentation.payloadAvailabilityLabel.contains("preview") || presentation.payloadAvailabilityLabel.contains("Open"))
+    #expect(!presentation.payloadAvailabilityLabel.lowercased().contains("unavailable"))
+  }
+
+  @Test("P031ApprovalInboxPresenter uses P085 for canApprove: resolved decision disables button")
+  func approvalPresenterUsesp085ForResolvedDecision() {
+    let resolvedApproval = P031ApprovalReadModel(
+      id: "appr-40", runID: "r-1", stageID: "s-1",
+      decision: "approved", freshnessState: .live,
+      disabledReasonCode: nil, writePathState: .available,
+      diagnosticID: nil, serverDebugDetail: nil,
+      availableActions: ["approve", "reject"]
+    )
+    let row = P031ApprovalInboxPresenter.rowPresentation(
+      for: resolvedApproval,
+      writePathGuideState: .unavailable
+    )
+    #expect(row.canApprove == false)
+    #expect(row.canReject == false)
+  }
 }
