@@ -5526,7 +5526,6 @@ import pathlib
 import re
 import sys
 import tomllib
-from fnmatch import fnmatch
 
 root = pathlib.Path(sys.argv[1])
 allowlist_path = pathlib.Path(sys.argv[2])
@@ -5540,7 +5539,7 @@ required_bypass_fields = {
     "id", "owner", "reason", "scope", "path_pattern",
     "allowed_context", "retirement_criteria", "expires_after_phase",
 }
-allowed_scopes = {"migrations", "tests", "startup_repair", "temporary_rollout"}
+allowed_scopes = {"migrations", "tests", "startup_repair"}
 seen_ids = set()
 for idx, row in enumerate(allowlist.get("bypasses", []), start=1):
     missing = sorted(required_bypass_fields - row.keys())
@@ -5552,6 +5551,11 @@ for idx, row in enumerate(allowlist.get("bypasses", []), start=1):
     for field in required_bypass_fields - {"expires_after_phase"}:
         if not str(row[field]).strip():
             raise SystemExit(f"P075 bypass {row['id']} has empty {field}")
+    if row["scope"] == "temporary_rollout":
+        raise SystemExit(
+            f"P075 bypass {row['id']} is a temporary_rollout entry; "
+            "Phase 8 requires retiring all temporary rollout bypasses"
+        )
     if row["scope"] not in allowed_scopes:
         raise SystemExit(f"P075 bypass {row['id']} has invalid scope {row['scope']}")
     if int(row["expires_after_phase"]) < current_phase:
@@ -5603,29 +5607,28 @@ unregistered = sorted(observed - registered)
 if unregistered:
     raise SystemExit(f"P075 unregistered WriteOperation.operation_name literals: {unregistered}")
 
-allow_patterns = [
-    str(row["path_pattern"]).strip()
-    for row in allowlist.get("bypasses", [])
-    if str(row.get("path_pattern", "")).strip()
-]
-direct_write_re = re.compile(
-    r'(?:\bpool\.begin\(\)\.await\b|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
+runtime_direct_write_re = re.compile(
+    r'(?:\bpool\.begin\(\)\.await\b|\.execute\((?:pool|&pool|&self\.pool)\))'
 )
-unallowlisted_write_sites = []
-repos_root = root / "control-plane/crates/db/src/repos"
-for path in repos_root.rglob("*.rs"):
-    text = path.read_text()
-    # Test modules and #[cfg(test)] helpers are covered by the permanent tests bypass.
-    text = text.split("\n#[cfg(test)]", 1)[0]
-    if not direct_write_re.search(text):
-        continue
-    rel = path.relative_to(root / "control-plane").as_posix()
-    if not any(fnmatch(rel, pattern) for pattern in allow_patterns):
-        unallowlisted_write_sites.append(rel)
-if unallowlisted_write_sites:
+runtime_direct_write_sites = []
+for rel_root in [
+    "control-plane/crates/engine/src",
+    "control-plane/crates/daemon/src",
+    "control-plane/crates/graphql-server/src",
+    "control-plane/crates/mcp-server/src",
+]:
+    for path in (root / rel_root).rglob("*.rs"):
+        text = path.read_text().split("\n#[cfg(test)]", 1)[0]
+        for match in runtime_direct_write_re.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            runtime_direct_write_sites.append(
+                f"{path.relative_to(root / 'control-plane').as_posix()}:{line}"
+            )
+if runtime_direct_write_sites:
     raise SystemExit(
-        "P075 unallowlisted direct write call sites: "
-        + ", ".join(sorted(unallowlisted_write_sites))
+        "P075 runtime direct SQL write sites must use DbWriter or "
+        "begin_immediate_with_retry: "
+        + ", ".join(sorted(runtime_direct_write_sites))
     )
 
 raw_evidence_patterns = [
@@ -5677,7 +5680,8 @@ for required in [
 print(
     f"P075 fail-closed registry check passed: "
     f"{len(seen_ids)} bypasses, {len(registered)} operations, "
-    f"{len(observed)} observed db/src operation literals, direct write call sites allowlisted"
+    f"{len(observed)} observed db/src operation literals, "
+    f"0 temporary rollout bypasses, runtime direct SQL scan clean"
 )
 PY
 

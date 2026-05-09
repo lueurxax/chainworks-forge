@@ -1069,6 +1069,11 @@ async fn direct_write_bypass_detection_reports_unlisted_owners() {
             row["expires_after_phase"].as_integer().unwrap_or_default() >= 8,
             "P075 fail-closed closeout phase must not accept expired bypass rows: {row:?}"
         );
+        assert_ne!(
+            row["scope"].as_str(),
+            Some("temporary_rollout"),
+            "P075 Phase 8 closeout must retire temporary rollout bypass rows: {row:?}"
+        );
     }
 
     let operations = registry["operations"]

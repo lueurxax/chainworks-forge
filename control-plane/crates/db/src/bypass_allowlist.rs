@@ -1,8 +1,8 @@
 //! P075 bypass allowlist loader and validator.
 //!
-//! Parses `write-bypass-allowlist.toml` for the proposal-075 gate. In Phase 1
-//! (inventory mode) the gate reports unlisted owners and expired entries. In Phase 7
-//! (fail-closed) the gate fails on any violation.
+//! Parses `write-bypass-allowlist.toml` for the proposal-075 gate. The Phase 8
+//! closeout contract permits only permanent infrastructure scopes; runtime
+//! rollout bypasses must be retired before the gate can pass.
 
 use serde::Deserialize;
 
@@ -15,7 +15,7 @@ pub struct BypassEntry {
     pub owner: String,
     /// Short rationale for the bypass.
     pub reason: String,
-    /// Bypass category: "migrations", "tests", "startup_repair", or "temporary_rollout".
+    /// Bypass category: "migrations", "tests", or "startup_repair".
     pub scope: String,
     /// Glob-style path fragment matching bypass call sites.
     pub path_pattern: String,
@@ -23,12 +23,20 @@ pub struct BypassEntry {
     pub allowed_context: String,
     /// Observable condition that proves the bypass can be removed.
     pub retirement_criteria: String,
-    /// Phase number (1–8). The gate fails when the current phase exceeds this value
-    /// for temporary_rollout scopes.
+    /// Phase number (1-8). Permanent infrastructure scopes are expected to use
+    /// the current closeout phase; older rows fail the gate.
     pub expires_after_phase: u32,
 }
 
 impl BypassEntry {
+    /// Returns true when the entry uses a permanent Phase 8 bypass scope.
+    pub fn has_allowed_scope(&self) -> bool {
+        matches!(
+            self.scope.as_str(),
+            "migrations" | "tests" | "startup_repair"
+        )
+    }
+
     /// Returns true if this entry is expired for the given current phase.
     /// Permanent bypass categories (migrations, tests, startup_repair) never expire.
     pub fn is_expired_at_phase(&self, current_phase: u32) -> bool {
@@ -74,6 +82,12 @@ impl BypassAllowlist {
             if !entry.is_complete() {
                 return Err(BypassAllowlistError::IncompleteEntry(entry.id.clone()));
             }
+            if !entry.has_allowed_scope() {
+                return Err(BypassAllowlistError::InvalidScope {
+                    id: entry.id.clone(),
+                    scope: entry.scope.clone(),
+                });
+            }
         }
 
         Ok(Self {
@@ -92,7 +106,7 @@ impl BypassAllowlist {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    /// Returns entries expired at the given phase (temporary_rollout scopes only).
+    /// Returns entries expired at the given phase.
     pub fn expired_at_phase(&self, current_phase: u32) -> Vec<&BypassEntry> {
         self.entries
             .iter()
@@ -113,6 +127,8 @@ pub enum BypassAllowlistError {
     ParseError(#[from] toml::de::Error),
     #[error("Bypass entry '{0}' is missing required fields")]
     IncompleteEntry(String),
+    #[error("Bypass entry '{id}' has invalid scope '{scope}'")]
+    InvalidScope { id: String, scope: String },
     #[error("I/O error reading allowlist: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -134,13 +150,13 @@ expires_after_phase = 8
 
 [[bypasses]]
 id = "bypass-002"
-owner = "engine::recovery"
-reason = "Temporary rollout path."
-scope = "temporary_rollout"
-path_pattern = "crates/engine/src/recovery.rs"
-allowed_context = "Pre-DbWriter routing."
-retirement_criteria = "Route through DbWriter."
-expires_after_phase = 3
+owner = "db::repos::startup_repairs"
+reason = "Startup recovery is infrastructure."
+scope = "startup_repair"
+path_pattern = "crates/db/src/repos/startup_repairs.rs"
+allowed_context = "Startup recovery only."
+retirement_criteria = "Never retire."
+expires_after_phase = 8
 "#;
 
     #[test]
@@ -167,19 +183,18 @@ expires_after_phase = 3
     }
 
     #[test]
-    fn temporary_rollout_expires_after_phase() {
+    fn startup_repair_scope_never_expires() {
         let list = BypassAllowlist::parse(VALID_TOML).unwrap();
-        let rollout = list.find_by_id("bypass-002").unwrap();
-        assert!(!rollout.is_expired_at_phase(3)); // at phase 3: not yet expired
-        assert!(rollout.is_expired_at_phase(4)); // phase 4 > expires_after_phase=3
+        let startup_repair = list.find_by_id("bypass-002").unwrap();
+        assert!(!startup_repair.is_expired_at_phase(8));
+        assert!(!startup_repair.is_expired_at_phase(100));
     }
 
     #[test]
-    fn expired_at_phase_filters_correctly() {
+    fn expired_at_phase_empty_for_permanent_scopes() {
         let list = BypassAllowlist::parse(VALID_TOML).unwrap();
         let expired = list.expired_at_phase(4);
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].id, "bypass-002");
+        assert!(expired.is_empty());
     }
 
     #[test]
@@ -209,6 +224,27 @@ expires_after_phase = 8
         } else {
             panic!("expected IncompleteEntry error");
         }
+    }
+
+    #[test]
+    fn parse_rejects_temporary_rollout_scope() {
+        let bad = r#"
+[[bypasses]]
+id = "bypass-temp"
+owner = "engine::recovery"
+reason = "Temporary rollout path."
+scope = "temporary_rollout"
+path_pattern = "crates/engine/src/recovery.rs"
+allowed_context = "Pre-DbWriter routing."
+retirement_criteria = "Route through DbWriter."
+expires_after_phase = 8
+"#;
+        let result = BypassAllowlist::parse(bad);
+        assert!(matches!(
+            result,
+            Err(BypassAllowlistError::InvalidScope { id, scope })
+                if id == "bypass-temp" && scope == "temporary_rollout"
+        ));
     }
 
     #[test]

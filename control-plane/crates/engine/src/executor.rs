@@ -767,6 +767,9 @@ fn claimed_invoke_agent_start_from_payload(
 
 async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx =
+        db::pool::begin_immediate_with_retry(pool, "executor.mark_invoke_work_item_running")
+            .await?;
     let updated = sqlx::query(
         "UPDATE work_items SET status = ?1, started_at = ?2, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?3 AND status = ?4",
     )
@@ -774,12 +777,13 @@ async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) ->
     .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if updated != 1 {
         anyhow::bail!("claim/start CAS failed for InvokeAgent work item {work_item_id}");
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -789,6 +793,11 @@ async fn update_invoke_work_item_claimed_payload_and_running(
     payload_json: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = db::pool::begin_immediate_with_retry(
+        pool,
+        "executor.update_invoke_work_item_claimed_payload_and_running",
+    )
+    .await?;
     let updated = sqlx::query(
         "UPDATE work_items SET payload_json = ?1, status = ?2, started_at = ?3, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?4 AND status = ?5",
     )
@@ -797,12 +806,13 @@ async fn update_invoke_work_item_claimed_payload_and_running(
     .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if updated != 1 {
         anyhow::bail!("claim/start CAS failed for InvokeAgent work item {work_item_id}");
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -4071,7 +4081,11 @@ impl BackgroundExecutor {
                     // unexpected provider lag against superseded/canceled
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
-                        let mut metric_tx = self.pool.begin().await?;
+                        let mut metric_tx = db::pool::begin_immediate_with_retry(
+                            &self.pool,
+                            "executor.record_mediation_late_output_ignored",
+                        )
+                        .await?;
                         let _ =
                             db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
                                 &mut metric_tx,
@@ -4150,7 +4164,11 @@ impl BackgroundExecutor {
                     // unexpected provider lag against superseded/canceled
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
-                        let mut metric_tx = self.pool.begin().await?;
+                        let mut metric_tx = db::pool::begin_immediate_with_retry(
+                            &self.pool,
+                            "executor.record_mediation_late_output_ignored",
+                        )
+                        .await?;
                         let _ =
                             db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
                                 &mut metric_tx,

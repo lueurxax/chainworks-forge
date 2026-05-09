@@ -190,7 +190,11 @@ pub(crate) async fn workflow_conflict_json(
                 .filter(|key| value.get(*key).map(|v| !v.is_null()).unwrap_or(false))
                 .collect();
             let now = chrono::Utc::now();
-            let mut tx = pool.begin().await?;
+            let mut tx = db::pool::begin_immediate_with_retry(
+                pool,
+                "mcp.reports.record_workflow_conflict_readback_completeness",
+            )
+            .await?;
             let _ = workflow_conflicts::record_report_readback_completeness_tx(
                 &mut tx,
                 &run_id.to_string(),

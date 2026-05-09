@@ -1,8 +1,9 @@
 //! P075 DbWriter: the single bounded write gateway for the Rust control plane.
 //!
-//! All non-test runtime writes must route through `DbWriter` or appear in the
-//! source-controlled bypass allowlist (`write-bypass-allowlist.toml`). The
-//! proposal-075 gate enforces this from Phase 7 onward (fail-closed mode).
+//! Non-test runtime writes must route through `DbWriter` or an explicit bounded
+//! transaction boundary. The source-controlled bypass allowlist
+//! (`write-bypass-allowlist.toml`) is limited to permanent infrastructure scopes
+//! such as migrations, tests, and startup repair.
 //!
 //! # Priority lanes
 //!

@@ -75,13 +75,15 @@ Phase 2 bypass entries (expires_after_phase=2):  0
 Phase 3 bypass entries (expires_after_phase=3):  0
 Phase 4 bypass entries (expires_after_phase=4):  0
 Phase 5 bypass entries (expires_after_phase=5):  0
-Phase 8 bypass entries (expires_after_phase=8):  36
-Total temporary_rollout entries:                  31
+Phase 8 bypass entries (expires_after_phase=8):  5
+Total temporary_rollout entries:                  0
 ```
 
-The current closeout model keeps remaining direct-write owners visible as phase-8
-allowlist entries. The gate fails on unallowlisted direct write call sites and malformed
-entries; each future owner migration should remove or reclassify its entry.
+The Phase 8 closeout model has retired all temporary rollout bypasses. The
+remaining allowlist entries are permanent infrastructure scopes only: migrations,
+tests, startup repair, and evidence-spool orphan repair. The gate now fails on any
+`temporary_rollout` row and on production runtime direct SQL writes that bypass
+DbWriter or the bounded `begin_immediate_with_retry` transaction primitive.
 
 ---
 
