@@ -231,6 +231,80 @@ async fn class_d_telemetry_drop_counter_is_observable_via_storage_health() {
     writer.shutdown().await;
 }
 
+#[tokio::test]
+async fn class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+
+    let committed = writer
+        .submit(class_a_op("rollup_probe"), |pool| async move {
+            let tx = begin_immediate_with_retry(&pool, "rollup_probe").await?;
+            tx.commit().await?;
+            Ok(1)
+        })
+        .await;
+    assert_eq!(committed, WriteResult::Committed);
+
+    for idx in 0..300 {
+        let old = chrono::Utc::now() - chrono::Duration::hours(25) + chrono::Duration::seconds(idx);
+        sqlx::query(
+            r#"INSERT INTO storage_write_pressure_snapshots
+               (id, window_start, window_end, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind(format!("old-pressure-{idx}"))
+        .bind((old - chrono::Duration::minutes(5)).to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(serde_json::json!({"legacy": idx}).to_string())
+        .bind(old.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let snapshot = storage_health::record_live_write_pressure_rollup(&pool, &writer.heartbeat)
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.payload_json["source"], "dbwriter_telemetry_rollup");
+    assert_eq!(
+        snapshot.payload_json["limits"]["memoryCapBytes"].as_u64(),
+        Some(db::writer::TELEMETRY_MEMORY_CAP_BYTES as u64)
+    );
+    assert_eq!(
+        snapshot.payload_json["limits"]["maxSamples"].as_u64(),
+        Some(db::writer::TELEMETRY_MAX_SAMPLES as u64)
+    );
+    assert!(
+        snapshot.payload_json["rollup"]["sampleCount"]
+            .as_u64()
+            .unwrap()
+            <= db::writer::TELEMETRY_MAX_SAMPLES as u64
+    );
+    assert_eq!(
+        snapshot.payload_json["retention"]["latestWindowLimit"].as_u64(),
+        Some(288)
+    );
+
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_write_pressure_snapshots")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        retained <= 288,
+        "Class D rollup retention must keep at most latest 288 windows, got {retained}"
+    );
+
+    let latest = storage_health::latest_write_pressure_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.id, snapshot.id);
+    assert_eq!(latest.payload_json["source"], "dbwriter_telemetry_rollup");
+
+    writer.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // P2-T02: Multiple concurrent Class A writes all commit
 // ---------------------------------------------------------------------------

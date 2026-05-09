@@ -5489,6 +5489,7 @@ PLIST
       log "P075: production Class B projections use coalescing and Class D telemetry exposes drop counters"
       cargo test -p db p075_projection_rebuild_uses_production_class_b_coalescing --test integration -- --nocapture
       cargo test -p db class_d_telemetry_drop_counter_is_observable_via_storage_health --test proposal_075_dbwriter -- --nocapture
+      cargo test -p db class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention --test proposal_075_dbwriter -- --nocapture
 
       log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
       cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
@@ -5721,6 +5722,17 @@ for path_label, text, operation in [
         raise SystemExit(f"P075 production Class D operation {operation} in {path_label} must use DbWriter transaction helper")
 if "droppedTelemetryTotal" not in storage_health_text or "telemetryDroppedTotal" not in storage_health_text:
     raise SystemExit("P075 storageHealth must report real Class D telemetry drop counters")
+for required in [
+    "record_live_write_pressure_rollup",
+    "TELEMETRY_SNAPSHOT_RETAIN_LATEST",
+    "latestWindowLimit",
+    "DELETE FROM storage_write_pressure_snapshots",
+]:
+    if required not in storage_health_text and required not in writer_text:
+        raise SystemExit(f"P075 Class D rollup lifecycle is not wired: missing {required}")
+daemon_main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
+if "spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone())" not in daemon_main:
+    raise SystemExit("P075 daemon must start the production Class D write-pressure rollup producer")
 if "insert_idempotent_via_dbwriter" in (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text():
     evidence_refs_text = (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text().split("\n#[cfg(test)]", 1)[0]
     via_plain_insert = evidence_refs_text.split("pub async fn insert_via_dbwriter", 1)[1].split("pub async fn", 1)[0]

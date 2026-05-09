@@ -60,6 +60,7 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+use sqlx::SqlitePool;
 
 /// Exit code returned when the PID-lock path reports the anomalous
 /// "flock held by someone, but the recorded PID is dead" case (§6.1).
@@ -225,6 +226,9 @@ async fn main() -> Result<()> {
         "SQLite pool opened"
     );
 
+    let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
+
     // ── Steward runtime + control-plane wiring ─────────────────────────
     let steward_config_path = std::env::var("STEWARD_CONFIG_PATH")
         .ok()
@@ -258,8 +262,8 @@ async fn main() -> Result<()> {
 
     let work_queue = WorkQueue::new(pool.clone());
     let acp = Arc::new(AcpRuntimeManager::new());
-    let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
-    db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
+    let _storage_rollup_handle =
+        spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone());
     let cmd_handler = Arc::new(CommandHandler::new_with_acp_capacity_and_db_writer(
         pool.clone(),
         events.clone(),
@@ -556,6 +560,27 @@ fn spawn_xcode_broker_health_publisher(reporter: LifecycleReporter, pool: Arc<Xc
             ));
         }
     });
+}
+
+fn spawn_storage_write_pressure_rollup(
+    pool: SqlitePool,
+    heartbeat: Arc<db::writer::DbWriterHeartbeat>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            db::writer::TELEMETRY_FLUSH_CADENCE_MS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(err) =
+                db::repos::storage_health::record_live_write_pressure_rollup(&pool, &heartbeat)
+                    .await
+            {
+                warn!(err = %err, "P075 storage write-pressure rollup failed");
+            }
+        }
+    })
 }
 
 fn new_daemon_xcode_broker_pool(
