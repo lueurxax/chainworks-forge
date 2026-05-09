@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::collections::VecDeque;
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -9,6 +11,81 @@ use tracing::{debug, info, warn};
 pub const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 4;
 const SQLITE_BUSY_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
+const WRITE_LOCK_METRIC_LIMIT: usize = 1024;
+const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteLockMetricsSnapshot {
+    pub wait_p50_ms: Option<u64>,
+    pub wait_p95_ms: Option<u64>,
+    pub busy_retry_rate_per_minute: f64,
+    pub busy_retry_exhausted_total: u64,
+}
+
+#[derive(Debug)]
+struct WriteLockMetricSample {
+    wait_ms: u64,
+    busy_retries: usize,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct WriteLockMetrics {
+    samples: VecDeque<WriteLockMetricSample>,
+    busy_retry_exhausted_total: u64,
+}
+
+static WRITE_LOCK_METRICS: OnceLock<Mutex<WriteLockMetrics>> = OnceLock::new();
+
+fn write_lock_metrics() -> &'static Mutex<WriteLockMetrics> {
+    WRITE_LOCK_METRICS.get_or_init(|| Mutex::new(WriteLockMetrics::default()))
+}
+
+fn record_write_lock_metrics(wait_ms: u64, busy_retries: usize, exhausted: bool) {
+    let mut metrics = write_lock_metrics().lock().unwrap();
+    if metrics.samples.len() >= WRITE_LOCK_METRIC_LIMIT {
+        metrics.samples.pop_front();
+    }
+    metrics.samples.push_back(WriteLockMetricSample {
+        wait_ms,
+        busy_retries,
+        observed_at: Instant::now(),
+    });
+    if exhausted {
+        metrics.busy_retry_exhausted_total += 1;
+    }
+}
+
+pub fn write_lock_metrics_snapshot() -> WriteLockMetricsSnapshot {
+    let metrics = write_lock_metrics().lock().unwrap();
+    let waits = metrics
+        .samples
+        .iter()
+        .map(|sample| sample.wait_ms)
+        .collect::<Vec<_>>();
+    let now = Instant::now();
+    let retries_in_window = metrics
+        .samples
+        .iter()
+        .filter(|sample| now.duration_since(sample.observed_at) <= BUSY_RETRY_WINDOW)
+        .map(|sample| sample.busy_retries as u64)
+        .sum::<u64>();
+    WriteLockMetricsSnapshot {
+        wait_p50_ms: percentile(waits.clone(), 50),
+        wait_p95_ms: percentile(waits, 95),
+        busy_retry_rate_per_minute: retries_in_window as f64,
+        busy_retry_exhausted_total: metrics.busy_retry_exhausted_total,
+    }
+}
+
+fn percentile(mut values: Vec<u64>, percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let idx = ((values.len() - 1) * percentile).div_ceil(100);
+    values.get(idx).copied()
+}
 
 /// Open a writable SQLite pool after running the P042 preflight
 /// (`db::migrate::run_preflight`). Existing callers that expect "migrations
@@ -75,6 +152,7 @@ pub async fn begin_immediate_with_retry<'a>(
         match pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => {
                 let wait_ms = wait_started.elapsed().as_millis() as u64;
+                record_write_lock_metrics(wait_ms, retries, false);
                 if retries > 0 || wait_ms >= 10 {
                     info!(
                         db_operation = operation,
@@ -104,7 +182,13 @@ pub async fn begin_immediate_with_retry<'a>(
                 );
                 sleep(delay).await;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                if is_sqlite_busy_error(&error) {
+                    let wait_ms = wait_started.elapsed().as_millis() as u64;
+                    record_write_lock_metrics(wait_ms, retries, true);
+                }
+                return Err(error.into());
+            }
         }
     }
 }

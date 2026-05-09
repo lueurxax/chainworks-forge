@@ -5502,10 +5502,12 @@ PLIST
       log "P075: MCP storage diagnostics parameter semantics"
       cargo test -p mcp-server storage::tests:: -- --nocapture
 
-      log "P075: MCP storage typed error contract (invalid_input, stale, unavailable, maintenance_disabled)"
+      log "P075: MCP storage typed error contract (invalid_input, stale, unavailable, maintenance_disabled, unauthorized)"
       cargo test -p mcp-server storage::tests::reconcile_evidence_orphans_returns_invalid_input -- --nocapture
-      cargo test -p mcp-server storage::tests::storage_health_annotates_error_code_stale -- --nocapture
+      cargo test -p mcp-server storage::tests::storage_health_returns_typed_stale_error -- --nocapture
+      cargo test -p mcp-server storage::tests::reconcile_evidence_orphans_returns_maintenance_disabled -- --nocapture
       cargo test -p mcp-server storage::tests::typed_error_helper_produces_correct_shape -- --nocapture
+      cargo test -p mcp-server proposal_075_storage_tool_dispatch -- --nocapture
     )
 
     # Fail-closed contract check: allowlist and operation registry must be present,
@@ -5591,7 +5593,7 @@ observed = set()
 for path in (root / "control-plane/crates/db/src").rglob("*.rs"):
     if "tests" in path.parts:
         continue
-    text = path.read_text()
+    text = path.read_text().split("\n#[cfg(test)]", 1)[0]
     for match in re.finditer(r'operation_name:\s*"([^"]+)"', text):
         name = match.group(1)
         if name.startswith("test_"):
@@ -5638,6 +5640,39 @@ for path in (root / "control-plane/crates/engine/src").rglob("*.rs"):
             raise SystemExit(
                 f"P075 raw high-volume evidence appears to be written directly to SQLite in {rel}"
             )
+
+baseline_path = root / "docs/evidence/p075/phase1-baseline.md"
+if not baseline_path.exists():
+    raise SystemExit("P075 baseline evidence missing: docs/evidence/p075/phase1-baseline.md")
+baseline_text = baseline_path.read_text()
+if "pending_live_canary" in baseline_text:
+    raise SystemExit("P075 baseline evidence still contains pending_live_canary")
+for required in [
+    "write_lock_wait_p50",
+    "write_lock_wait_p95",
+    "busy_retry_rate",
+    "wal_size_bytes",
+    "storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics",
+]:
+    if required not in baseline_text:
+        raise SystemExit(f"P075 baseline evidence missing required marker: {required}")
+
+producer_inventory_path = root / "docs/evidence/p075/producer-inventory.md"
+if not producer_inventory_path.exists():
+    raise SystemExit("P075 high-volume evidence producer inventory is missing")
+producer_inventory = producer_inventory_path.read_text()
+for required in [
+    "Failed-stage diagnostic packet",
+    "ACP transcript capture",
+    "tool_trace",
+    "stdout",
+    "stderr",
+    "runtime_event",
+    "model_delta",
+    "delivery_readback",
+]:
+    if required not in producer_inventory:
+        raise SystemExit(f"P075 producer inventory missing required marker: {required}")
 
 print(
     f"P075 fail-closed registry check passed: "

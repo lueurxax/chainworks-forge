@@ -1750,6 +1750,7 @@ mod tests {
         artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, stages,
         steward, workflow_conflicts,
     };
+    use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -4029,6 +4030,44 @@ mod tests {
     async fn proposal_075_storage_health_reads_live_dbwriter_heartbeat() {
         let pool = test_pool().await;
         let writer = db::writer::DbWriter::new(pool.clone());
+        let result = writer
+            .submit(
+                WriteOperation {
+                    class: WriteClass::A,
+                    lane: WriteLane::CriticalBarrier,
+                    operation_name: "graphql_storage_health_live_writer_test",
+                    expected_rows: 1,
+                    batchable: false,
+                    barrier: true,
+                    deadline: std::time::Duration::from_secs(5),
+                    deadline_reason: None,
+                    idempotency_key: "graphql-storage-health-live-writer".into(),
+                    replay_policy: ReplayPolicy::NaturalKey,
+                    observed_at: None,
+                },
+                |pool| async move {
+                    let mut tx = db::pool::begin_immediate_with_retry(
+                        &pool,
+                        "graphql_storage_health_live_writer_test",
+                    )
+                    .await?;
+                    sqlx::query(
+                        "CREATE TABLE IF NOT EXISTS p075_graphql_storage_health_probe (id TEXT PRIMARY KEY)",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO p075_graphql_storage_health_probe (id) VALUES ('probe')",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    Ok(1)
+                },
+            )
+            .await;
+        assert_eq!(result, WriteResult::Committed);
+
         for _ in 0..30 {
             if writer.is_alive() {
                 break;
@@ -4053,7 +4092,16 @@ mod tests {
                     query P075StorageHealthWriter {
                       storageHealth {
                         isStale
-                        writer { alive totalQueued lanes { lane queuedDepth } }
+                        writer {
+                          alive
+                          totalQueued
+                          lastHeartbeatAt
+                          lastDrainAt
+                          writeLockWaitP50Ms
+                          writeLockWaitP95Ms
+                          transactionDurationP95Ms
+                          lanes { lane queuedDepth }
+                        }
                       }
                     }
                     "#,
@@ -4069,6 +4117,21 @@ mod tests {
         let json = response.data.into_json().unwrap();
         assert_eq!(json["storageHealth"]["writer"]["alive"], true);
         assert_eq!(json["storageHealth"]["isStale"], false);
+        assert!(json["storageHealth"]["writer"]["lastHeartbeatAt"]
+            .as_str()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["lastDrainAt"]
+            .as_str()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["writeLockWaitP50Ms"]
+            .as_f64()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["writeLockWaitP95Ms"]
+            .as_f64()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["transactionDurationP95Ms"]
+            .as_f64()
+            .is_some());
         assert!(json["storageHealth"]["writer"]["lanes"]
             .as_array()
             .is_some_and(|lanes| lanes.len() == 6));

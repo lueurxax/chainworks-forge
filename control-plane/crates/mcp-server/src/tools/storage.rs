@@ -23,6 +23,7 @@ use crate::protocol::McpTool;
 
 pub const ERR_UNAVAILABLE: &str = "unavailable";
 pub const ERR_STALE: &str = "stale";
+pub const ERR_UNAUTHORIZED: &str = "unauthorized";
 pub const ERR_INVALID_INPUT: &str = "invalid_input";
 pub const ERR_MAINTENANCE_DISABLED: &str = "maintenance_disabled";
 
@@ -154,16 +155,16 @@ pub async fn execute_with_writer(
                     obj.remove("thresholds");
                 }
             }
-            // Annotate the response with errorCode when the health surface is stale
-            // so callers can detect the degraded state without parsing isStale.
             if health
                 .get("isStale")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
             {
-                if let Some(obj) = health.as_object_mut() {
-                    obj.insert("errorCode".to_string(), serde_json::json!(ERR_STALE));
-                }
+                return Ok(typed_error(
+                    "storage.health",
+                    ERR_STALE,
+                    "storage health is stale; no live DbWriter heartbeat is available",
+                ));
             }
             Ok(health)
         }
@@ -242,6 +243,18 @@ pub async fn execute_with_writer(
             Ok(summary)
         }
         "storage.reconcile_evidence_orphans" => {
+            if std::env::var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return Ok(typed_error(
+                    "storage.reconcile_evidence_orphans",
+                    ERR_MAINTENANCE_DISABLED,
+                    "storage maintenance is disabled by CHAINWORKS_STORAGE_MAINTENANCE_DISABLED",
+                ));
+            }
+
             let dry_run = params
                 .get("dryRun")
                 .and_then(serde_json::Value::as_bool)
@@ -340,6 +353,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+    use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
 
     #[tokio::test]
     async fn storage_write_pressure_honors_include_lanes_and_window() {
@@ -378,6 +392,42 @@ mod tests {
     async fn storage_health_reads_live_dbwriter_heartbeat_when_injected() {
         let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
         let writer = db::writer::DbWriter::new(pool.clone());
+        let result = writer
+            .submit(
+                WriteOperation {
+                    class: WriteClass::A,
+                    lane: WriteLane::CriticalBarrier,
+                    operation_name: "mcp_storage_health_live_writer_test",
+                    expected_rows: 1,
+                    batchable: false,
+                    barrier: true,
+                    deadline: std::time::Duration::from_secs(5),
+                    deadline_reason: None,
+                    idempotency_key: "mcp-storage-health-live-writer".into(),
+                    replay_policy: ReplayPolicy::NaturalKey,
+                    observed_at: None,
+                },
+                |pool| async move {
+                    let mut tx =
+                        db::pool::begin_immediate_with_retry(&pool, "mcp_storage_health_live_writer_test")
+                            .await?;
+                    sqlx::query(
+                        "CREATE TABLE IF NOT EXISTS p075_mcp_storage_health_probe (id TEXT PRIMARY KEY)",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO p075_mcp_storage_health_probe (id) VALUES ('probe')",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    Ok(1)
+                },
+            )
+            .await;
+        assert_eq!(result, WriteResult::Committed);
+
         for _ in 0..30 {
             if writer.is_alive() {
                 break;
@@ -397,6 +447,13 @@ mod tests {
 
         assert_eq!(payload["writer"]["alive"], true);
         assert_eq!(payload["isStale"], false);
+        assert!(payload["writer"]["lastHeartbeatAt"].as_str().is_some());
+        assert!(payload["writer"]["lastDrainAt"].as_str().is_some());
+        assert!(payload["writer"]["writeLockWaitP50Ms"].as_u64().is_some());
+        assert!(payload["writer"]["writeLockWaitP95Ms"].as_u64().is_some());
+        assert!(payload["writer"]["transactionDurationP95Ms"]
+            .as_u64()
+            .is_some());
     }
 
     // ── Typed error contract tests (API-001) ─────────────────────────────
@@ -458,22 +515,37 @@ mod tests {
     /// The fail-closed storage_health_with_writer always reports isStale=true
     /// when no live writer is injected, so the 'stale' code must appear.
     #[tokio::test]
-    async fn storage_health_annotates_error_code_stale_when_is_stale_true() {
+    async fn storage_health_returns_typed_stale_error_when_is_stale_true() {
         let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
         let result = execute("storage.health", serde_json::json!({}), &pool)
             .await
             .expect("storage.health must not error");
 
-        // Fail-closed health always returns isStale=true (no live writer injected).
-        assert_eq!(
-            result["isStale"], true,
-            "fail-closed health must report isStale=true"
-        );
+        assert_eq!(result["error"], true);
         assert_eq!(
             result["errorCode"],
             super::ERR_STALE,
-            "must annotate errorCode='stale' when isStale=true"
+            "must return errorCode='stale' when isStale=true"
         );
+        assert_eq!(result["tool"], "storage.health");
+    }
+
+    #[tokio::test]
+    async fn reconcile_evidence_orphans_returns_maintenance_disabled_when_kill_switch_set() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        std::env::set_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED", "1");
+        let result = execute(
+            "storage.reconcile_evidence_orphans",
+            serde_json::json!({"dryRun": true}),
+            &pool,
+        )
+        .await
+        .expect("maintenance-disabled is a domain-level typed response");
+        std::env::remove_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED");
+
+        assert_eq!(result["error"], true);
+        assert_eq!(result["errorCode"], super::ERR_MAINTENANCE_DISABLED);
+        assert_eq!(result["tool"], "storage.reconcile_evidence_orphans");
     }
 
     /// maintenance_disabled: reconcile_evidence_orphans with an unmatchable artifact
@@ -487,6 +559,9 @@ mod tests {
         assert_eq!(err["errorCode"], "unavailable");
         assert_eq!(err["tool"], "storage.health");
         assert!(err["message"].as_str().is_some());
+
+        let err0 = super::typed_error("storage.health", super::ERR_UNAUTHORIZED, "no capability");
+        assert_eq!(err0["errorCode"], "unauthorized");
 
         let err2 = super::typed_error(
             "storage.reconcile_evidence_orphans",

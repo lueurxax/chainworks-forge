@@ -6368,7 +6368,7 @@ impl BackgroundExecutor {
         };
         match evidence_spool_refs::insert_idempotent_via_dbwriter(&self.db_writer, spool_ref).await
         {
-            WriteResult::Committed { .. } | WriteResult::Coalesced { .. } => {}
+            WriteResult::Committed | WriteResult::Coalesced => {}
             other => {
                 return Err(anyhow::anyhow!(
                     "transcript evidence spool metadata was not committed: {other:?}"

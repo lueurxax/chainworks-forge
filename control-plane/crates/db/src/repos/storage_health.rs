@@ -88,9 +88,11 @@ pub async fn storage_health_with_writer(
     writer_heartbeat: Option<&DbWriterHeartbeat>,
 ) -> Result<Value> {
     let evidence = evidence_spool_summary(pool).await?;
+    let wal_json = wal_health(pool).await;
     let latest_pressure = latest_write_pressure_snapshot(pool).await?;
     let updated_at = Utc::now();
     let writer_snapshot = writer_heartbeat.map(DbWriterHeartbeat::snapshot);
+    let lock_metrics = crate::pool::write_lock_metrics_snapshot();
     let is_pressure_stale = latest_pressure
         .as_ref()
         .map(|snapshot| {
@@ -134,27 +136,19 @@ pub async fn storage_health_with_writer(
         "dbState": db_state,
         "writer": {
             "alive": writer_alive,
-            "lastHeartbeatAt": null,
-            "lastDrainAt": null,
+            "lastHeartbeatAt": writer_snapshot.as_ref().and_then(|snapshot| snapshot.last_heartbeat_at.clone()),
+            "lastDrainAt": writer_snapshot.as_ref().and_then(|snapshot| snapshot.last_drain_at.clone()),
             "totalQueued": writer_snapshot.as_ref().map(|snapshot| snapshot.total_queued).unwrap_or(0),
             "lanes": lane_health(writer_snapshot.as_ref()),
-            "writeLockWaitP50Ms": null,
-            "writeLockWaitP95Ms": null,
-            "transactionDurationP95Ms": null,
-            "busyRetryRatePerMinute": 0,
-            "busyRetryExhaustedTotal": 0,
+            "writeLockWaitP50Ms": lock_metrics.wait_p50_ms,
+            "writeLockWaitP95Ms": lock_metrics.wait_p95_ms,
+            "transactionDurationP95Ms": writer_snapshot.as_ref().and_then(|snapshot| snapshot.transaction_duration_p95_ms),
+            "busyRetryRatePerMinute": lock_metrics.busy_retry_rate_per_minute,
+            "busyRetryExhaustedTotal": lock_metrics.busy_retry_exhausted_total,
             "rejectedTotal": writer_snapshot.as_ref().map(|snapshot| snapshot.coalesced_rejected_total).unwrap_or(0),
             "droppedTelemetryTotal": 0
         },
-        "wal": {
-            "available": false,
-            "unavailableReason": "wal_size_probe_not_mounted",
-            "sizeBytes": null,
-            "warnSizeBytes": WARN_WAL_SIZE_BYTES,
-            "criticalSizeBytes": CRITICAL_WAL_SIZE_BYTES,
-            "lastCheckpointAt": null,
-            "checkpointDurationP95Ms": null
-        },
+        "wal": wal_json,
         "projections": {
             "pendingInvalidations": 0,
             "projectionLagMs": null,
@@ -289,6 +283,52 @@ fn write_pressure_snapshot_json(snapshot: &StorageWritePressureSnapshot) -> Valu
             "dbWriterWaitP95Ms": "milliseconds",
             "walSizeBytes": "bytes"
         }
+    })
+}
+
+async fn wal_health(pool: &SqlitePool) -> Value {
+    let unavailable = |reason: &str| {
+        json!({
+            "available": false,
+            "unavailableReason": reason,
+            "sizeBytes": null,
+            "warnSizeBytes": WARN_WAL_SIZE_BYTES,
+            "criticalSizeBytes": CRITICAL_WAL_SIZE_BYTES,
+            "lastCheckpointAt": null,
+            "checkpointDurationP95Ms": null
+        })
+    };
+
+    let rows = match sqlx::query("PRAGMA database_list").fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(_) => return unavailable("database_list_probe_failed"),
+    };
+    let Some(main_path) = rows.into_iter().find_map(|row| {
+        let name: String = row.try_get("name").ok()?;
+        if name != "main" {
+            return None;
+        }
+        let file: String = row.try_get("file").ok()?;
+        (!file.is_empty()).then_some(file)
+    }) else {
+        return unavailable("memory_or_ephemeral_database");
+    };
+
+    let wal_path = format!("{main_path}-wal");
+    let size_bytes = match tokio::fs::metadata(&wal_path).await {
+        Ok(metadata) => metadata.len() as i64,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return unavailable("wal_size_probe_failed"),
+    };
+
+    json!({
+        "available": true,
+        "unavailableReason": null,
+        "sizeBytes": size_bytes,
+        "warnSizeBytes": WARN_WAL_SIZE_BYTES,
+        "criticalSizeBytes": CRITICAL_WAL_SIZE_BYTES,
+        "lastCheckpointAt": null,
+        "checkpointDurationP95Ms": null
     })
 }
 
@@ -452,6 +492,39 @@ mod tests {
     async fn storage_health_uses_live_dbwriter_heartbeat_when_supplied() {
         let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
         let writer = crate::writer::DbWriter::new(pool.clone());
+        let result = writer
+            .submit(
+                crate::write_class::WriteOperation {
+                    class: crate::write_class::WriteClass::A,
+                    lane: crate::write_class::WriteLane::CriticalBarrier,
+                    operation_name: "storage_health_live_writer_test",
+                    expected_rows: 1,
+                    batchable: false,
+                    barrier: true,
+                    deadline: std::time::Duration::from_secs(2),
+                    deadline_reason: None,
+                    idempotency_key: "storage-health-live-writer-test".to_string(),
+                    replay_policy: crate::write_class::ReplayPolicy::NaturalKey,
+                    observed_at: None,
+                },
+                crate::writer::make_work(|pool| async move {
+                    let mut tx = crate::pool::begin_immediate_with_retry(
+                        &pool,
+                        "storage_health_live_writer_test",
+                    )
+                    .await?;
+                    sqlx::query("CREATE TABLE IF NOT EXISTS p075_storage_health_probe (id TEXT)")
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("INSERT INTO p075_storage_health_probe (id) VALUES ('probe')")
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                    Ok(1)
+                }),
+            )
+            .await;
+        assert_eq!(result, crate::write_class::WriteResult::Committed);
 
         for _ in 0..30 {
             if writer.is_alive() {
@@ -466,7 +539,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(health["writer"]["alive"], true);
+        assert!(health["writer"]["lastHeartbeatAt"].as_str().is_some());
+        assert!(health["writer"]["lastDrainAt"].as_str().is_some());
         assert_eq!(health["writer"]["totalQueued"], 0);
+        assert!(health["writer"]["writeLockWaitP50Ms"].as_u64().is_some());
+        assert!(health["writer"]["writeLockWaitP95Ms"].as_u64().is_some());
+        assert!(health["writer"]["transactionDurationP95Ms"]
+            .as_u64()
+            .is_some());
         assert!(health["writer"]["lanes"]
             .as_array()
             .is_some_and(|lanes| lanes.len() == 6));
@@ -480,6 +560,74 @@ mod tests {
             health["writePressure"]["latestSnapshot"]["payload"]["writerAlive"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("p075-storage-health-canary.sqlite");
+        let pool = crate::pool::create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+            .await
+            .unwrap();
+        let writer = crate::writer::DbWriter::new(pool.clone());
+
+        for idx in 0..8 {
+            let result = writer
+                .submit(
+                    crate::write_class::WriteOperation {
+                        class: crate::write_class::WriteClass::A,
+                        lane: crate::write_class::WriteLane::CriticalBarrier,
+                        operation_name: "storage_health_file_backed_canary",
+                        expected_rows: 1,
+                        batchable: false,
+                        barrier: true,
+                        deadline: std::time::Duration::from_secs(2),
+                        deadline_reason: None,
+                        idempotency_key: format!("storage-health-file-backed-canary-{idx}"),
+                        replay_policy: crate::write_class::ReplayPolicy::NaturalKey,
+                        observed_at: None,
+                    },
+                    crate::writer::make_work(move |pool| async move {
+                        let mut tx = crate::pool::begin_immediate_with_retry(
+                            &pool,
+                            "storage_health_file_backed_canary",
+                        )
+                        .await?;
+                        sqlx::query(
+                            "CREATE TABLE IF NOT EXISTS p075_storage_health_canary (id INTEGER PRIMARY KEY, value TEXT)",
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            "INSERT OR REPLACE INTO p075_storage_health_canary (id, value) VALUES (?1, ?2)",
+                        )
+                        .bind(idx as i64)
+                        .bind(format!("value-{idx}"))
+                        .execute(&mut *tx)
+                        .await?;
+                        tx.commit().await?;
+                        Ok(1)
+                    }),
+                )
+                .await;
+            assert_eq!(result, crate::write_class::WriteResult::Committed);
+        }
+
+        let health = storage_health_with_writer(&pool, Some(&writer.heartbeat))
+            .await
+            .unwrap();
+
+        assert_eq!(health["writer"]["alive"], true);
+        assert!(health["writer"]["lastHeartbeatAt"].as_str().is_some());
+        assert!(health["writer"]["lastDrainAt"].as_str().is_some());
+        assert!(health["writer"]["writeLockWaitP50Ms"].as_u64().is_some());
+        assert!(health["writer"]["writeLockWaitP95Ms"].as_u64().is_some());
+        assert!(health["writer"]["transactionDurationP95Ms"]
+            .as_u64()
+            .is_some());
+        assert_eq!(health["wal"]["available"], true);
+        assert!(health["wal"]["sizeBytes"].as_u64().is_some());
+        assert_eq!(health["writePressure"]["state"], "available");
     }
 
     #[tokio::test]

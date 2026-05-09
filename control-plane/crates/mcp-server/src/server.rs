@@ -348,8 +348,9 @@ impl McpServer {
                         format!("Method not found: {tool_name}"),
                     );
                 };
+                let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
-                if !tools::p064_operator_tool_enabled(&tool_name) {
+                if !tools::p064_operator_tool_enabled(canonical_tool_name) {
                     return JsonRpcResponse::error(
                         id,
                         -32601,
@@ -358,6 +359,22 @@ impl McpServer {
                 }
 
                 if !principal.tool_capabilities.contains(&tool_id) {
+                    if canonical_tool_name.starts_with("storage.") {
+                        let result = tools::storage::typed_error(
+                            canonical_tool_name,
+                            tools::storage::ERR_UNAUTHORIZED,
+                            "caller lacks storage diagnostics capability",
+                        );
+                        return JsonRpcResponse::success(
+                            id,
+                            serde_json::json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string(&result).unwrap_or_default()
+                                }]
+                            }),
+                        );
+                    }
                     return JsonRpcResponse::error(
                         id,
                         -32601,
@@ -366,7 +383,6 @@ impl McpServer {
                 }
 
                 let tool_params = params["arguments"].clone();
-                let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
                 match self
                     .dispatch_tool(canonical_tool_name, tool_params, principal)
@@ -2238,6 +2254,51 @@ mod tests {
 
     fn operator_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_tool_dispatch_returns_typed_unauthorized() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let observer = auth::Principal::new("storage-observer", auth::PrincipalClass::Observer);
+
+        let payload =
+            call_tool_and_parse(&server, &observer, "storage.health", serde_json::json!({})).await;
+
+        assert_eq!(payload["error"], true);
+        assert_eq!(payload["errorCode"], tools::storage::ERR_UNAUTHORIZED);
+        assert_eq!(payload["tool"], "storage.health");
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_tool_dispatch_returns_typed_maintenance_disabled() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        std::env::set_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED", "1");
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "storage.reconcile_evidence_orphans",
+            serde_json::json!({"dryRun": true}),
+        )
+        .await;
+        std::env::remove_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED");
+
+        assert_eq!(payload["error"], true);
+        assert_eq!(
+            payload["errorCode"],
+            tools::storage::ERR_MAINTENANCE_DISABLED
+        );
+        assert_eq!(payload["tool"], "storage.reconcile_evidence_orphans");
     }
 
     #[tokio::test]

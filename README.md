@@ -109,7 +109,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - stable reference documentation under [`docs/reference`](docs/reference)
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
-- Local Persistence Write Budget and Evidence Spooling — Proposal 075 closeout slice: DbWriter lanes/coalescing/shutdown primitives, evidence_spool_refs and storage_write_pressure_snapshots schemas, failed-stage evidence spooling, storageHealth/MCP diagnostics, diagnostics-bundle storage snapshots, and fail-closed write-bypass/raw-evidence gate coverage are implemented. Remaining direct write paths are tracked through the source-controlled P075 bypass allowlist until each owner is routed through DbWriter.
+- Local Persistence Write Budget and Evidence Spooling — Proposal 075 closeout slice: DbWriter lanes/coalescing/shutdown primitives, evidence_spool_refs and storage_write_pressure_snapshots schemas, failed-stage evidence spooling, transcript spooling, storageHealth/MCP diagnostics with live heartbeat/drain/lock/WAL readback, diagnostics-bundle storage snapshots, and fail-closed write-bypass/raw-evidence gate coverage are implemented. Remaining direct write paths are tracked through the source-controlled P075 bypass allowlist until each owner is routed through DbWriter.
 
 Active proposal work is currently concentrated in:
 

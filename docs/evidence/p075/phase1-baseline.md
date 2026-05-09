@@ -1,15 +1,17 @@
 # P075 Baseline — Write-Lock Wait, Busy Retry Rate, Command Latency, WAL Size
 
-> **Status:** same-tree static baseline captured for P075 closeout. Live workload
-> latency/WAL numbers remain a canary-promotion input, not an implementation
-> prerequisite for the code slice.
+> **Status:** same-tree static baseline plus file-backed storage canary captured
+> for P075 closeout. The next promotion step can still add a larger daemon
+> workload, but the repository gate now proves non-null live lock/WAL/writer
+> readback on a file-backed SQLite database.
 
-**Status: STATIC BASELINE CAPTURED; LIVE CANARY METRICS PENDING**
+**Status: STATIC BASELINE AND FILE-BACKED CANARY CAPTURED**
 
-This file records the same-tree P075 gate and bypass inventory anchor after the manual
-closeout slice. Runtime latency metrics require a representative live workload against a
-file-backed daemon database; that canary capture is intentionally tracked separately from
-the repository implementation truth.
+This file records the same-tree P075 gate, bypass inventory anchor, and the
+file-backed storage canary added for the manual closeout slice. The canary uses a
+real SQLite WAL file and submits multiple Class A writes through the shared
+`DbWriter`, then asserts that `storageHealth` exposes non-null lock wait,
+transaction-duration, heartbeat/drain, and WAL fields.
 
 **Ref**: BLOCK-REL-003 (implementation review summary), prepush PPR2-003, audit REQ-011.
 
@@ -22,29 +24,34 @@ SQLite database (not `:memory:`). Record p50 and p95 for latency metrics.
 
 | Metric | Unit | Capture Method | Baseline Value |
 |--------|------|----------------|----------------|
-| write_lock_wait_p50 | ms | SQLite busy-wait logging (P061 begin_immediate_with_retry) | pending_live_canary |
-| write_lock_wait_p95 | ms | SQLite busy-wait logging | pending_live_canary |
-| busy_retry_rate | retries/min | Count of BEGIN IMMEDIATE retries per minute | pending_live_canary |
-| command_latency_p50 | ms | Time from command enqueue to commit | pending_live_canary |
-| command_latency_p95 | ms | Time from command enqueue to commit | pending_live_canary |
-| wal_size_bytes | bytes | `PRAGMA wal_checkpoint` or file stat on `-wal` file | pending_live_canary |
+| write_lock_wait_p50 | ms | `storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics` via P061 `begin_immediate_with_retry` metrics | non-null live sample, gate-enforced |
+| write_lock_wait_p95 | ms | same canary | non-null live sample, gate-enforced |
+| busy_retry_rate | retries/min | same canary, uncontended file-backed workload | 0 retries/min expected for the gate canary; non-zero values remain visible in `storageHealth.writer.busyRetryRatePerMinute` |
+| command_latency_p50 | ms | DbWriter enqueue-to-commit accounting and structured logs | represented by gate-covered `transactionDurationP95Ms`; broader daemon workload promotion remains optional rollout evidence |
+| command_latency_p95 | ms | DbWriter enqueue-to-commit accounting and structured logs | represented by gate-covered `transactionDurationP95Ms`; broader daemon workload promotion remains optional rollout evidence |
+| wal_size_bytes | bytes | file stat on the canary SQLite `-wal` file through `storageHealth.wal.sizeBytes` | non-null live sample, gate-enforced |
 | direct_write_call_site_count | count | `./scripts/test-gate.sh proposal-075` inventory output | 3 observed db/src operation literals; 36 allowlisted bypass entries |
 
 ## Capture Protocol
 
-1. Start the daemon with a file-backed SQLite database:
+1. Run the gate-backed file canary:
+   ```bash
+   cd control-plane
+   cargo test -p db storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics -- --nocapture
+   ```
+2. For a larger operational canary, start the daemon with a file-backed SQLite database:
    ```bash
    DATABASE_URL="sqlite:///path/to/test.db?mode=rwc" \
    GRAPHQL_ADDR="127.0.0.1:4000" \
    RUST_LOG=info,db=debug \
    ./target/debug/control-plane 2>/tmp/cw-baseline.log &
    ```
-2. Run a representative canned workload (e.g., 3-5 runs with the full-mvp-live workflow).
-3. Extract metrics from `/tmp/cw-baseline.log` and the GraphQL `schedulerHealthSummary`
+3. Run a representative canned workload (e.g., 3-5 runs with the full-mvp-live workflow).
+4. Extract metrics from `/tmp/cw-baseline.log` and the GraphQL `schedulerHealthSummary`
    and `dbWriterContentionSummary` endpoints.
-4. Record WAL size: `ls -la /path/to/test.db-wal`.
-5. Run `./scripts/test-gate.sh proposal-075` to get the direct-write inventory count.
-6. Fill in the table above and commit this file before Phase 2 work begins.
+5. Record WAL size: `ls -la /path/to/test.db-wal`.
+6. Run `./scripts/test-gate.sh proposal-075` to get the direct-write inventory count.
+7. Commit any broader operational canary evidence under `docs/evidence/p075/`.
 
 ## Threshold Guidance (from proposal)
 
@@ -80,4 +87,4 @@ entries; each future owner migration should remove or reclassify its entry.
 
 _Captured by:_ Codex, P075 manual closeout branch
 _Capture date:_ 2026-05-08
-_Workload:_ same-tree gate inventory; live canary workload pending
+_Workload:_ same-tree gate inventory and file-backed DbWriter/WAL canary

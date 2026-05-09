@@ -99,12 +99,14 @@
 //! The write returns `WriteFailed` and the file is flagged for manual reconcile via
 //! `storage.reconcile_evidence_orphans`.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::{TimeZone, Utc};
 use sha2::Digest;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -119,6 +121,7 @@ pub const DB_WRITER_LANES: [WriteLane; 6] = [
     WriteLane::EvidenceMetadata,
     WriteLane::TelemetryRollup,
 ];
+const TX_DURATION_SAMPLE_LIMIT: usize = 1024;
 
 /// Return a 16-character hex fingerprint of the idempotency key for log correlation.
 ///
@@ -401,8 +404,12 @@ pub struct DbWriterHeartbeat {
     pub alive: AtomicBool,
     /// Monotonic ns since process start of last heartbeat beat.
     last_beat_ns: AtomicU64,
+    /// Unix epoch milliseconds for the last heartbeat beat.
+    last_beat_wall_ms: AtomicI64,
     /// Per-lane: monotonic ns since process start of last drain. Indexed by LANE_DRAIN_ORDER.
     last_drain_ns: [AtomicU64; 6],
+    /// Per-lane: Unix epoch milliseconds for the last drain.
+    last_drain_wall_ms: [AtomicI64; 6],
     /// Cumulative lane starvation events (lower lane starved > STARVATION_WATCHDOG_SECS).
     pub starvation_total: AtomicU64,
     /// Per-lane: monotonic ns since process start when the first unprocessed item was enqueued
@@ -413,6 +420,8 @@ pub struct DbWriterHeartbeat {
     pub lane_pending_count: [AtomicI64; 6],
     /// Cumulative Class B coalescing rejections due to map saturation (COALESCE_MAX_KEYS).
     pub coalesced_rejected_total: AtomicU64,
+    /// Rolling committed transaction duration samples in milliseconds.
+    transaction_duration_ms: Mutex<VecDeque<u64>>,
     /// Reference instant for ns offsets (process-start-relative).
     origin: Instant,
 }
@@ -428,8 +437,11 @@ pub struct DbWriterLaneSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DbWriterHealthSnapshot {
     pub alive: bool,
+    pub last_heartbeat_at: Option<String>,
     pub last_heartbeat_age_ms: Option<u64>,
+    pub last_drain_at: Option<String>,
     pub last_drain_age_ms: Option<u64>,
+    pub transaction_duration_p95_ms: Option<u64>,
     pub total_queued: i64,
     pub lanes: Vec<DbWriterLaneSnapshot>,
     pub coalesced_rejected_total: u64,
@@ -443,11 +455,14 @@ impl DbWriterHeartbeat {
         Self {
             alive: AtomicBool::new(false),
             last_beat_ns: AtomicU64::new(0),
+            last_beat_wall_ms: AtomicI64::new(0),
             last_drain_ns: [ZERO_U64; 6],
+            last_drain_wall_ms: [ZERO_I64; 6],
             starvation_total: AtomicU64::new(0),
             lane_oldest_enqueued_ns: [ZERO_U64; 6],
             lane_pending_count: [ZERO_I64; 6],
             coalesced_rejected_total: AtomicU64::new(0),
+            transaction_duration_ms: Mutex::new(VecDeque::new()),
             origin: Instant::now(),
         }
     }
@@ -460,12 +475,23 @@ impl DbWriterHeartbeat {
     fn beat(&self) {
         self.alive.store(true, Ordering::Relaxed);
         self.last_beat_ns.store(self.now_ns(), Ordering::Relaxed);
+        self.last_beat_wall_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
     }
 
     /// Record that a specific lane just drained a message.
     fn record_drain(&self, lane: WriteLane) {
         let idx = lane.drain_order_index();
         self.last_drain_ns[idx].store(self.now_ns(), Ordering::Relaxed);
+        self.last_drain_wall_ms[idx].store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    }
+
+    fn record_transaction_duration(&self, duration_ms: u64) {
+        let mut samples = self.transaction_duration_ms.lock().unwrap();
+        if samples.len() >= TX_DURATION_SAMPLE_LIMIT {
+            samples.pop_front();
+        }
+        samples.push_back(duration_ms);
     }
 
     /// Return elapsed milliseconds since the last drain of the given lane (0 if never drained).
@@ -485,7 +511,18 @@ impl DbWriterHeartbeat {
 
     pub fn snapshot(&self) -> DbWriterHealthSnapshot {
         let now = self.now_ns();
+        let last_heartbeat_at = unix_ms_to_rfc3339(self.last_beat_wall_ms.load(Ordering::Relaxed));
         let last_heartbeat_age_ms = age_ms(now, self.last_beat_ns.load(Ordering::Relaxed));
+        let last_drain_wall_ms = DB_WRITER_LANES
+            .iter()
+            .filter_map(|lane| {
+                let value =
+                    self.last_drain_wall_ms[lane.drain_order_index()].load(Ordering::Relaxed);
+                (value > 0).then_some(value)
+            })
+            .max()
+            .unwrap_or(0);
+        let last_drain_at = unix_ms_to_rfc3339(last_drain_wall_ms);
         let last_drain_age_ms = DB_WRITER_LANES
             .iter()
             .filter_map(|lane| {
@@ -514,10 +551,22 @@ impl DbWriterHeartbeat {
             })
             .collect::<Vec<_>>();
         let total_queued = lanes.iter().map(|lane| lane.queued_depth).sum();
+        let transaction_duration_p95_ms = percentile(
+            self.transaction_duration_ms
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect(),
+            95,
+        );
         DbWriterHealthSnapshot {
             alive: self.is_alive(),
+            last_heartbeat_at,
             last_heartbeat_age_ms,
+            last_drain_at,
             last_drain_age_ms,
+            transaction_duration_p95_ms,
             total_queued,
             lanes,
             coalesced_rejected_total: self.coalesced_rejected_total.load(Ordering::Relaxed),
@@ -532,6 +581,24 @@ fn age_ms(now_ns: u64, stored_ns: u64) -> Option<u64> {
     } else {
         Some(now_ns.saturating_sub(stored_ns) / 1_000_000)
     }
+}
+
+fn unix_ms_to_rfc3339(value: i64) -> Option<String> {
+    if value <= 0 {
+        return None;
+    }
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn percentile(mut values: Vec<u64>, percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let idx = ((values.len() - 1) * percentile).div_ceil(100);
+    values.get(idx).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1178,7 @@ async fn execute_message(
 
     // Record heartbeat for this lane.
     heartbeat.record_drain(lane);
+    heartbeat.record_transaction_duration(tx_duration_ms);
 
     // Decrement pending count; clear oldest_enqueued_ns when lane empties.
     let prev = heartbeat.lane_pending_count[lane_idx].fetch_sub(1, Ordering::Relaxed);
