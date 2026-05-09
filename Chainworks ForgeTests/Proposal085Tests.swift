@@ -442,11 +442,23 @@ struct Proposal085Tests {
 
   // MARK: - Mutation conflict result code
 
-  @Test("P085MutationConflictResultCode fromRaw maps known codes")
-  func conflictResultCodeMapsKnownValues() {
+  @Test("P085MutationConflictResultCode fromRaw maps current backend-emitted code")
+  func conflictResultCodeMapsCurrentBackendEmittedValue() {
     #expect(P085MutationConflictResultCode.fromRaw("already_resolved") == .alreadyResolved)
-    #expect(P085MutationConflictResultCode.fromRaw("state_conflict") == .stateConflict)
-    #expect(P085MutationConflictResultCode.fromRaw("transient_error_retryable") == .transientErrorRetryable)
+  }
+
+  @Test("Unemitted conflict codes fail closed until backend implements them")
+  func unemittedConflictCodesFailClosed() {
+    if case .unknown(let raw) = P085MutationConflictResultCode.fromRaw("state_conflict") {
+      #expect(raw == "state_conflict")
+    } else {
+      Issue.record("state_conflict must remain unknown until the backend emits it")
+    }
+    if case .unknown(let raw) = P085MutationConflictResultCode.fromRaw("transient_error_retryable") {
+      #expect(raw == "transient_error_retryable")
+    } else {
+      Issue.record("transient_error_retryable must remain unknown until the backend emits it")
+    }
   }
 
   @Test("P085MutationConflictResultCode fromRaw maps unknown codes to .unknown(rawValue:)")

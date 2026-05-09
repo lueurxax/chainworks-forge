@@ -73,6 +73,4 @@ pub fn is_report_metadata(format: &str, report_kind: Option<&str>) -> bool {
 #[graphql(name = "MutationConflictResultCode", rename_items = "snake_case")]
 pub enum GqlMutationConflictResultCode {
     AlreadyResolved,
-    StateConflict,
-    TransientErrorRetryable,
 }

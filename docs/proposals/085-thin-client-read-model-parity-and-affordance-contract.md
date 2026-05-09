@@ -30,7 +30,7 @@
       {
         "affordance_id": "artifact.preview.listLabel",
         "mutation_availability": "none",
-        "required_behavior": "List rows distinguish available, metadata_only, payload_deferred, generating, and unavailable. payload_deferred means previewable/deferred, not unavailable. generating and payload_deferred must include a server-owned deadline or explicit no-deadline justification, and must transition to a typed stalled/timed-out reason after deadline expiry.",
+        "required_behavior": "List rows distinguish available, metadata_only, payload_deferred, generating, and unavailable. payload_deferred means previewable/deferred, not unavailable. current backend-emitted payload_deferred states must include an explicit no-deadline justification; generating must not be emitted unless the server also emits a deadline or typed stalled/timed-out diagnostic.",
         "source_fields": [
           "artifacts(runId:)",
           "payloadAvailabilityState",
@@ -70,7 +70,7 @@
       {
         "affordance_id": "report.payload.metadata",
         "mutation_availability": "none",
-        "required_behavior": "Report rows show metadata-only status unless a dedicated server-owned payload query exists. Metadata-only, deferred, generating, and unavailable remain distinct. Any stuck generating/deferred state needs server-owned deadline proof.",
+        "required_behavior": "Report rows show metadata-only status unless a dedicated server-owned payload query exists. Metadata-only, deferred, generating, and unavailable remain distinct. Current backend-emitted deferred metadata states include explicit no-deadline justification; generating remains schema-reserved until server-owned deadline or stalled diagnostics exist.",
         "source_fields": [
           "report metadata through artifacts(runId:)",
           "payloadAvailabilityState",
@@ -121,8 +121,8 @@
       {
         "affordance_id": "approval.resolve.approve",
         "mutation_availability": "approveApproval",
-        "mutation_idempotency": "Duplicate same-result submit returns success or already_resolved with current durable decision. Conflicting or non-pending submit returns state_conflict/already_resolved. Transient transport/server failures are not silently retried by Swift; presenter surfaces transient_error_retryable and requires operator re-trigger.",
-        "required_behavior": "Approve renders actionable only when durable approval state is pending/requested, caller policy allows approve, typed action availability includes approve, and approveApproval is authorized. Stale or duplicate submits must be idempotent or return typed already_resolved/state_conflict without clobbering durable state.",
+        "mutation_idempotency": "Duplicate, stale, conflicting, or non-pending submit returns success or already_resolved with current durable decision when the backend can journal the attempt. Transient transport/server failures stay GraphQL errors and are not silently retried by Swift; unknown future conflict codes fail closed.",
+        "required_behavior": "Approve renders actionable only when durable approval state is pending/requested, caller policy allows approve, typed action availability includes approve, and approveApproval is authorized. Stale or duplicate submits must be idempotent or return typed already_resolved without clobbering durable state.",
         "source_fields": [
           "approvalInbox",
           "approval durable state",
@@ -202,9 +202,9 @@
       "P085 extends the existing P031/P043 read contract rather than replacing it. GraphQL remains the server-owned read plane, and MCP remains the non-approval command/control plane.",
       "GraphQL enums remain typed domains for freshness, disabled reason, write path state, payload availability, payload unavailable reason, diagnostics, typed action availability, and mutation conflict result codes.",
       "The p085 gate must assert SDL/schema or introspection snapshots for every field and enum domain named by contract rows, including approveApproval and rejectApproval mutations.",
-      "Approval actionability is derived from durable approval state plus caller policy plus typed mutation availability. Backend tests must prove read-model action availability, disabledReasonCode, writePathState, mutation authorization, already_resolved, state_conflict, stale-projection submit, duplicate-submit, and transient failure surfaces agree.",
+      "Approval actionability is derived from durable approval state plus caller policy plus typed mutation availability. Backend tests must prove read-model action availability, disabledReasonCode, writePathState, mutation authorization, already_resolved, stale-projection submit, duplicate-submit, and transient failure surfaces agree.",
       "Artifact/report preview state is derived from artifact index/projection metadata and authorized payload readback. List preview budget limits are represented as payload_deferred, not unavailable.",
-      "Generating and payload_deferred stalled/timed-out states are server-owned. Swift timers may cancel local requests, but cannot decide that a server state is stalled.",
+      "Payload-deferred no-deadline justifications and any future generating stalled/timed-out states are server-owned. Swift timers may cancel local requests, but cannot decide that a server state is stalled.",
       "Unauthorized reads return typed GraphQL auth errors or redacted fields according to P081. Swift never falls back to local storage, SwiftData, raw artifact scans, or filesystem report reads as truth."
     ],
     "documentation_and_gate": [
@@ -307,7 +307,7 @@
     "Require every row to name source GraphQL fields, field nullability and enum domains, Swift-local presentation state, actionable state, disabled reason code, fallback text, mutation availability, mutation idempotency/conflict behavior, staleness deadline, cancellation policy, stale list/detail behavior, unauthorized behavior, supported interactions, and proof tests.",
     "Require p085 gate SDL or introspection assertions for every GraphQL field, enum domain, and mutation named by contract rows.",
     "Define approveApproval and rejectApproval stale-submit, duplicate-submit, already-resolved, state-conflict, transient-error, and presenter-mapping behavior.",
-    "Add server-owned deadlines and stuck-state transitions for generating and payload_deferred artifact/report states.",
+    "Add server-owned no-deadline justifications for current deferred artifact/report states and require deadline/stuck-state transitions before generating can be emitted.",
     "Centralize Swift affordance mapping in immutable Equatable Sendable DTOs so SwiftUI views consume tested affordance states instead of raw strings.",
     "Preserve P036 as a consumer of P085; restored visual, navigation, context-menu, keyboard, tooltip, and Quick Look affordances must cite P085 rows or stay deferred."
   ],
@@ -320,7 +320,7 @@
       "p085_approval_actionability_parity_total{status,caller_class}: parity between read actionability and mutation authorization.",
       "p085_approval_mutation_conflict_total{operation,result_code}: duplicate/stale submit handling for approveApproval and rejectApproval.",
       "p085_payload_state_mapping_total{status,payload_availability_state}: payload/list/detail mapping coverage.",
-      "p085_payload_stalled_transition_total{surface,state,result_code}: server-owned stalled/deadline transitions for generating/deferred states.",
+      "p085_payload_stalled_transition_total{surface,state,result_code}: server-owned no-deadline justification and future stalled/deadline transitions for any future generating states; current deferred states report no-deadline justification.",
       "p085_unknown_enum_fail_closed_total{enum_domain,surface}: unknown enum cases rendered as diagnostic/unknown instead of optimistic actionability."
     ],
     "success_criteria": [
@@ -328,7 +328,7 @@
       "Both proposal-085 and p085 gates are registered and run the same proof slice.",
       "SDL/introspection proof covers all fields, enum domains, and mutations named by P085 rows.",
       "Approval duplicate/stale-submit and conflict behavior is typed and mapped by Swift to stable disabled/fallback output.",
-      "Generating and payload_deferred states have server-owned deadline or stuck-state diagnostics.",
+      "Backend-emitted payload_deferred states have server-owned no-deadline justifications; generating remains gated on deadline/stuck-state diagnostics.",
       "Future P036 affordance work can cite P085 rows instead of rediscovering boundary rules."
     ]
   },
@@ -359,7 +359,7 @@
       "Artifact and report rows can collapse partial list payloads into permanent unavailable labels even when detail readback can render richer state.",
       "Freshness states such as live, stale, projection_lag, and refreshing_disconnected describe recency and connectivity, but can be misused as payload availability, approval actionability, authorization, or mutation availability.",
       "Approval buttons can appear actionable from local row selection or display text while durable approval state, caller policy, mutation authorization, or stale projection state disagree.",
-      "Deferred and generating payload states can become operator stuck states if the server does not own a deadline and diagnostic transition.",
+      "Deferred and generating payload states can become operator stuck states if the server does not own a deadline/no-deadline justification and diagnostic transition.",
       "P036 visual/navigation restoration needs stable affordance semantics rather than per-view reinterpretation of GraphQL fields."
     ],
     "summary": "The governed macOS app is now a thin GraphQL read-side client plus the two approval mutations allowed by ui-action-boundary.md. That fixed local workflow truth drift, but Swift affordances can still make inconsistent promises when GraphQL fields, local presentation state, fallback labels, authorization, mutation availability, and stale projections are handled separately.",
@@ -401,7 +401,7 @@
       "risk": "Approval actionability duplicates P081 incorrectly."
     },
     {
-      "mitigation": "approveApproval/rejectApproval must be idempotent or return typed already_resolved/state_conflict, and Swift maps those results to stable disabled/fallback output.",
+      "mitigation": "approveApproval/rejectApproval must be idempotent or return typed already_resolved, and Swift maps those results to stable disabled/fallback output.",
       "risk": "Projection lag causes duplicate or stale approval submits."
     },
     {
@@ -409,7 +409,7 @@
       "risk": "Payload preview work expands into bulk payload loading."
     },
     {
-      "mitigation": "Relevant rows require server-owned staleness deadlines or explicit stalled diagnostics with backend proof fixtures.",
+      "mitigation": "Relevant rows require server-owned no-deadline justification for current deferred states, and staleness deadlines or explicit stalled diagnostics before generating is emitted.",
       "risk": "Generating or deferred payloads become indefinite operator stuck states."
     },
     {
@@ -449,17 +449,17 @@
       "approveApproval or rejectApproval lacks idempotent or typed conflict behavior for duplicate/stale submits",
       "Swift presenter maps mutation conflict to optimistic actionability or unstable fallback copy",
       "Swift presenter maps payload_deferred or metadata_only to an unavailable/no-preview state",
-      "Generating or payload_deferred state lacks server-owned deadline/stalled diagnostic policy",
+      "Generated payload state lacks server-owned no-deadline/deadline/stalled diagnostic policy",
       "Unknown GraphQL enum value crashes, maps to optimistic actionability, or collapses into generic unavailable",
       "Unauthorized or redacted readback falls back to local workflow truth or raw filesystem truth"
     ],
     "hold_conditions_detail": [
-      "approval_conflict_missing: Duplicate and stale approval submits must be idempotent or return typed already_resolved/state_conflict results without clobbering durable state.",
+      "approval_conflict_missing: Duplicate and stale approval submits must be idempotent or return typed already_resolved results without clobbering durable state.",
       "approval_parity_mismatch: Approve/reject buttons may not render unless durable approval state, caller policy, typed action availability, and GraphQL mutation authorization agree.",
       "missing_affordance_row: Every GraphQL-driven Swift affordance must have source fields, local presentation state, disabled/fallback copy, mutation availability, mutation idempotency when applicable, stale behavior, unauthorized behavior, supported interactions, and tests.",
       "missing_gate_alias: Both proposal-085 and p085 must run the same proof slice before implementation can freeze.",
       "missing_schema_proof: The p085 gate must snapshot or introspect every field and enum domain consumed by the row matrix so Swift presenters do not depend on undocumented vocabulary.",
-      "payload_deadline_missing: Server-owned generating and payload_deferred states need deadline or stuck diagnostic semantics so the operator UI cannot wait indefinitely with no escalation path.",
+      "payload_deadline_missing: Backend-emitted deferred states need no-deadline justification, and any generated states need deadline or stuck diagnostic semantics so the operator UI cannot wait indefinitely with no escalation path.",
       "payload_state_mismatch: Deferred list payloads and metadata-only report states must be represented honestly and not collapsed into generic unavailable copy.",
       "unauthorized_fallback_violation: Unauthorized reads must deny or redact through the server contract; Swift cannot recover by reading local storage or artifacts as truth.",
       "unknown_enum_unsafe: Unknown server enum values must fail closed to diagnostic/unknown presentation, not crash or enable actions."
@@ -478,7 +478,7 @@
       ]
     },
     "migrations": {
-      "justification": "P085 is expected to define documentation, GraphQL/Swift affordance contracts, tests, and gate registration. If implementation requires persisted projection fields for deadline/stalled-state or typed action availability, this migrations section must be revised before implementation freeze and cannot be treated as a discovery-time exception.",
+      "justification": "P085 is expected to define documentation, GraphQL/Swift affordance contracts, tests, and gate registration. If implementation later emits generating states or requires persisted projection fields for deadline/stalled-state or typed action availability, this migrations section must be revised before implementation freeze and cannot be treated as a discovery-time exception.",
       "not_applicable": true
     },
     "negative_fixtures": {
@@ -561,7 +561,7 @@
     },
     {
       "step": 3,
-      "task": "Add backend fixtures for artifact/report payload states, server-owned stalled/deadline transitions, freshness/action separation, approval actionability, duplicate-submit, stale-submit, already_resolved/state_conflict, transient errors, and unauthorized/redacted behavior."
+      "task": "Add backend fixtures for artifact/report payload states, server-owned no-deadline justification and future stalled/deadline transitions, freshness/action separation, approval actionability, duplicate-submit, stale-submit, already_resolved and transient error GraphQL surfaces, and unauthorized/redacted behavior."
     },
     {
       "step": 4,

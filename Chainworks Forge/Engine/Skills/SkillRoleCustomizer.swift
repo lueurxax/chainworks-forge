@@ -11,8 +11,8 @@ enum SkillRoleCustomizer {
             return (baseContent, nil)
         }
 
-        if skillID == "proposal_review_triad" {
-            guard let mapped = triadModeMap[role] else {
+        if skillID == "proposal_review_triad" || skillID == "proposal_review_router_skill" {
+            guard let mapped = proposalReviewModeMap[role] else {
                 throw SkillResolutionError.missingRequiredSpecialization(skillID: skillID, role: role)
             }
             let specialized = """
@@ -55,7 +55,7 @@ enum SkillRoleCustomizer {
         return (generic, "generic role block")
     }
 
-    private static let triadModeMap: [String: (mode: String, instructions: String)] = [
+    private static let proposalReviewModeMap: [String: (mode: String, instructions: String)] = [
         "product_owner": (
             "product-only",
             "As the product owner lens, focus on business value, user problem clarity, scope discipline, acceptance criteria, rollout risk, metrics, and dependency realism."

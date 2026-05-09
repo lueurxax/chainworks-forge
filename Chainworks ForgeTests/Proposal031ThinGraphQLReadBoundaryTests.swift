@@ -2057,19 +2057,13 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       currentFreshness: P031FreshnessSnapshot(state: .live),
       checkedAt: checked
     )
-    let stageList = await coordinator.loadStages(
-      runID: "run-1",
-      currentFreshness: P031FreshnessSnapshot(state: .live),
-      checkedAt: checked
-    )
-
     #expect(runDetail.title == "Implement Proposal 031")
     #expect(runDetail.workflowLabel == "Workflow: Full MVP")
     #expect(runDetail.statusLabel == "Running")
     #expect(runDetail.progressLabel == "1/2 stages")
     #expect(runDetail.pendingApprovalsLabel == "1 approvals pending")
-    #expect(
-      runDetail.stageRows.first?.badgeLabels == ["Approval pending", "Artifacts", "Projection lag"])
+    #expect(runDetail.stageTransitions.first?.stageExecutionID == "stage-exec-1")
+    #expect(runDetail.stageTransitions.first?.statusText == "Completed")
     #expect(runDetail.approvalRows.map(\.approvalID) == ["approval-1"])
     #expect(runDetail.approvalRows.first?.actionLabel == "Execute via CLI")
     #expect(runDetail.artifactRows.map(\.artifactID) == ["artifact-1"])
@@ -2084,11 +2078,6 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(stageDetail.stage?.statusLabel == "Projection Lag")
     #expect(stageDetail.freshness.state == .stale)
     #expect(stageDetail.refreshFeedbackText == "Updating stage")
-    #expect(stageList.rows.map { $0.stageExecutionID } == ["stage-exec-1"])
-    #expect(
-      stageList.rows.first?.badgeLabels == ["Approval pending", "Artifacts", "Projection lag"])
-    #expect(stageList.freshness.state == P031FreshnessState.stale)
-    #expect(stageList.refreshFeedbackText == "Updating stages")
   }
 
   @Test("Thin workflow screen coordinator restores run-centric idea, transition, artifact, and catalog context")
@@ -2251,6 +2240,49 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(detail.catalogContext?.workflowID == "full_mvp")
     #expect(detail.catalogContext?.workflowSnapshotHash == "workflow-sha")
     #expect(detail.catalogContext?.catalogSnapshotHash == "catalog-sha")
+  }
+
+  @Test("Stage presenter surfaces started completed and duration labels for completed stages")
+  func stagePresenterSurfacesTimingLabelsForCompletedStages() {
+    let stage = makeStage(
+      id: "stage-completed",
+      status: "completed",
+      startedAt: "2026-05-09T10:00:00Z",
+      completedAt: "2026-05-09T10:05:12Z"
+    )
+
+    let presentation = P031StagePresenter.presentation(for: stage)
+
+    #expect(presentation.startedLabel == "Started: 2026-05-09 10:00")
+    #expect(presentation.completedLabel == "Completed: 2026-05-09 10:05")
+    #expect(presentation.durationLabel == "Duration: 5m 12s")
+    #expect(
+      presentation.accessibilityLabel.contains("Started: 2026-05-09 10:00")
+    )
+    #expect(
+      presentation.accessibilityLabel.contains("Completed: 2026-05-09 10:05")
+    )
+    #expect(
+      presentation.accessibilityLabel.contains("Duration: 5m 12s")
+    )
+  }
+
+  @Test("Stage presenter surfaces live duration for running stages")
+  func stagePresenterSurfacesLiveDurationForRunningStages() {
+    let stage = makeStage(
+      id: "stage-running",
+      status: "running",
+      startedAt: "2026-05-09T10:00:00Z"
+    )
+
+    let presentation = P031StagePresenter.presentation(
+      for: stage,
+      now: Date(timeIntervalSince1970: 1_778_321_152)
+    )
+
+    #expect(presentation.startedLabel == "Started: 2026-05-09 10:00")
+    #expect(presentation.completedLabel == nil)
+    #expect(presentation.durationLabel == "Duration: 5m 52s")
   }
 
   @Test("Artifact viewer joins duplicate stage IDs through source stage execution ID")
@@ -2416,6 +2448,34 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
 
     #expect(detail.artifactViewerRows.map(\.iteration) == [7, 10])
     #expect(detail.artifactViewerRows.map(\.attemptNumber) == [4, 1])
+  }
+
+  @Test("Stage transition presenter surfaces started completed and duration labels")
+  func stageTransitionPresenterSurfacesTimingLabels() {
+    let completed = makeStage(
+      id: "stage-transition-completed",
+      status: "completed",
+      startedAt: "2026-05-09T10:00:00Z",
+      completedAt: "2026-05-09T10:05:12Z"
+    )
+    let running = makeStage(
+      id: "stage-transition-running",
+      status: "running",
+      startedAt: "2026-05-09T10:00:00Z"
+    )
+
+    let completedPresentation = P031StageTransitionPresenter.presentation(for: completed)
+    let runningPresentation = P031StageTransitionPresenter.presentation(
+      for: running,
+      now: Date(timeIntervalSince1970: 1_778_321_152)
+    )
+
+    #expect(completedPresentation.startedLabel == "Started: 2026-05-09 10:00")
+    #expect(completedPresentation.completedLabel == "Completed: 2026-05-09 10:05")
+    #expect(completedPresentation.durationLabel == "Duration: 5m 12s")
+    #expect(runningPresentation.startedLabel == "Started: 2026-05-09 10:00")
+    #expect(runningPresentation.completedLabel == nil)
+    #expect(runningPresentation.durationLabel == "Duration: 5m 52s")
   }
 
   @Test("Artifact viewer presentation prepares capped payload previews before SwiftUI rendering")
@@ -2635,11 +2695,6 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       currentFreshness: P031FreshnessSnapshot(state: .live),
       checkedAt: checked
     )
-    let stages = await coordinator.loadStages(
-      runID: "run-1",
-      currentFreshness: P031FreshnessSnapshot(state: .live),
-      checkedAt: checked
-    )
     let artifacts = await coordinator.loadArtifacts(
       runID: "run-1",
       currentFreshness: P031FreshnessSnapshot(state: .live),
@@ -2655,7 +2710,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       checkedAt: checked
     )
 
-    #expect(runDetail.stageRows.isEmpty)
+    #expect(runDetail.stageTransitions.isEmpty)
     #expect(runDetail.approvalRows.isEmpty)
     #expect(runDetail.artifactRows.isEmpty)
     #expect(runDetail.reportRows.isEmpty)
@@ -2664,9 +2719,6 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(stageDetail.stage == nil)
     #expect(stageDetail.freshness.state == .unavailable)
     #expect(stageDetail.errorDescription == presentation.errorDescription)
-    #expect(stages.rows.isEmpty)
-    #expect(stages.freshness.state == .unavailable)
-    #expect(stages.errorDescription == presentation.errorDescription)
     #expect(artifacts.rows.isEmpty)
     #expect(artifacts.freshness.state == .unavailable)
     #expect(artifacts.errorDescription == presentation.errorDescription)
@@ -2860,6 +2912,8 @@ private func makeDaemonStatus(
 private func makeStage(
   id: String,
   status: String = "running",
+  startedAt: String? = nil,
+  completedAt: String? = nil,
   hasPendingApproval: Bool = false,
   projectionLag: Bool = false,
   freshnessState: P031FreshnessState = .live
@@ -2872,6 +2926,8 @@ private func makeStage(
     status: status,
     iteration: 1,
     attemptNumber: 1,
+    startedAt: startedAt,
+    completedAt: completedAt,
     settlementKind: nil,
     hasArtifacts: true,
     hasPendingApproval: hasPendingApproval,

@@ -3646,6 +3646,9 @@ struct P031StageSummaryPresentation: Equatable, Sendable {
   let title: String
   let statusLabel: String
   let iterationLabel: String?
+  let startedLabel: String?
+  let completedLabel: String?
+  let durationLabel: String?
   let badgeLabels: [String]
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
@@ -3687,6 +3690,9 @@ struct P031StageTransitionPresentation: Equatable, Sendable {
   let stageTitle: String
   let statusText: String
   let attemptText: String?
+  let startedLabel: String?
+  let completedLabel: String?
+  let durationLabel: String?
   let connectorState: P031StageConnectorState
   let evidenceLabels: [String]
   let accessibilityLabel: String
@@ -3859,7 +3865,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let pendingApprovalsLabel: String?
   let rolloutDecisionSummary: RolloutDecisionSummary?
   let ideaContext: P031IdeaContextPresentation?
-  let stageRows: [P031StageSummaryPresentation]
   let stageTransitions: [P031StageTransitionPresentation]
   let approvalRows: [P031ApprovalInboxRowPresentation]
   let artifactRows: [P031ArtifactSummaryPresentation]
@@ -3880,7 +3885,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     pendingApprovalsLabel: String?,
     rolloutDecisionSummary: RolloutDecisionSummary? = nil,
     ideaContext: P031IdeaContextPresentation?,
-    stageRows: [P031StageSummaryPresentation],
     stageTransitions: [P031StageTransitionPresentation],
     approvalRows: [P031ApprovalInboxRowPresentation],
     artifactRows: [P031ArtifactSummaryPresentation],
@@ -3899,7 +3903,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.progressLabel = progressLabel
     self.pendingApprovalsLabel = pendingApprovalsLabel
     self.ideaContext = ideaContext
-    self.stageRows = stageRows
     self.stageTransitions = stageTransitions
     self.approvalRows = approvalRows
     self.artifactRows = artifactRows
@@ -4334,14 +4337,6 @@ struct P031StageDetailPresentation: Equatable, Sendable {
   let errorDescription: String?
 }
 
-struct P031StageListPresentation: Equatable, Sendable {
-  let rows: [P031StageSummaryPresentation]
-  let freshness: P031FreshnessSnapshot
-  let refreshFeedbackText: String
-  let emptyStateTitle: String?
-  let errorDescription: String?
-}
-
 struct P031ArtifactListPresentation: Equatable, Sendable {
   let rows: [P031ArtifactSummaryPresentation]
   let freshness: P031FreshnessSnapshot
@@ -4591,8 +4586,7 @@ enum P031RunDetailPresenter {
     let workflowLabel = runRow?.workflowLabel
     let statusLabel =
       run.map { P031ThinPresentationFormatting.titleCase($0.status) } ?? "Unavailable"
-    let stageRows = detail.stages.map(P031StagePresenter.presentation)
-    let stageTransitions = detail.stages.map(P031StageTransitionPresenter.presentation)
+    let stageTransitions = detail.stages.map { P031StageTransitionPresenter.presentation(for: $0) }
     let approvalRows = detail.approvalsForRun.map {
       P031ApprovalInboxPresenter.rowPresentation(
         for: $0,
@@ -4637,7 +4631,6 @@ enum P031RunDetailPresenter {
       pendingApprovalsLabel: pendingApprovalsLabel,
       rolloutDecisionSummary: run?.rolloutDecisionSummary,
       ideaContext: P031IdeaContextPresenter.presentation(for: detail.idea, fallbackRun: run),
-      stageRows: stageRows,
       stageTransitions: stageTransitions,
       approvalRows: approvalRows,
       artifactRows: artifactRows,
@@ -4669,7 +4662,6 @@ enum P031RunDetailPresenter {
       pendingApprovalsLabel: nil,
       rolloutDecisionSummary: nil,
       ideaContext: nil,
-      stageRows: [],
       stageTransitions: [],
       approvalRows: [],
       artifactRows: [],
@@ -4790,7 +4782,7 @@ enum P031StageDetailPresenter {
     }
 
     return P031StageDetailPresentation(
-      stage: detail.stage.map(P031StagePresenter.presentation),
+      stage: detail.stage.map { P031StagePresenter.presentation(for: $0) },
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -4821,7 +4813,10 @@ enum P031StageDetailPresenter {
 }
 
 enum P031StagePresenter {
-  nonisolated static func presentation(for stage: P031StageReadModel)
+  nonisolated static func presentation(
+    for stage: P031StageReadModel,
+    now: Date = Date()
+  )
     -> P031StageSummaryPresentation
   {
     let iterationLabel: String?
@@ -4839,10 +4834,22 @@ enum P031StagePresenter {
       stage.projectionLag ? "Projection lag" : nil,
     ].compactMap { $0 }
     let statusLabel = P031ThinPresentationFormatting.titleCase(stage.status)
+    let startedAt = P031ReadBoundaryDateParser.date(from: stage.startedAt)
+    let completedAt = P031ReadBoundaryDateParser.date(from: stage.completedAt)
+    let startedLabel = startedAt.map { "Started: \(P031ThinPresentationFormatting.timestamp($0))" }
+    let completedLabel = completedAt.map {
+      "Completed: \(P031ThinPresentationFormatting.timestamp($0))"
+    }
+    let durationLabel = P031ThinPresentationFormatting.durationLabel(
+      startedAt: startedAt,
+      completedAt: completedAt,
+      now: now
+    )
     var accessibilityParts = [stage.label, statusLabel]
     if let iterationLabel {
       accessibilityParts.append(iterationLabel)
     }
+    accessibilityParts.append(contentsOf: [startedLabel, completedLabel, durationLabel].compactMap { $0 })
     accessibilityParts.append(contentsOf: badgeLabels)
 
     return P031StageSummaryPresentation(
@@ -4850,6 +4857,9 @@ enum P031StagePresenter {
       title: stage.label,
       statusLabel: statusLabel,
       iterationLabel: iterationLabel,
+      startedLabel: startedLabel,
+      completedLabel: completedLabel,
+      durationLabel: durationLabel,
       badgeLabels: badgeLabels,
       freshnessState: stage.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
@@ -4890,7 +4900,10 @@ enum P031IdeaContextPresenter {
 }
 
 enum P031StageTransitionPresenter {
-  nonisolated static func presentation(for stage: P031StageReadModel)
+  nonisolated static func presentation(
+    for stage: P031StageReadModel,
+    now: Date = Date()
+  )
     -> P031StageTransitionPresentation
   {
     let statusText = P031ThinPresentationFormatting.titleCase(stage.status)
@@ -4902,19 +4915,40 @@ enum P031StageTransitionPresenter {
     } else {
       attemptText = nil
     }
+    let startedAt = P031ReadBoundaryDateParser.date(from: stage.startedAt)
+    let completedAt = P031ReadBoundaryDateParser.date(from: stage.completedAt)
+    let startedLabel = startedAt.map { "Started: \(P031ThinPresentationFormatting.timestamp($0))" }
+    let completedLabel = completedAt.map {
+      "Completed: \(P031ThinPresentationFormatting.timestamp($0))"
+    }
+    let durationLabel = P031ThinPresentationFormatting.durationLabel(
+      startedAt: startedAt,
+      completedAt: completedAt,
+      now: now
+    )
     let evidenceLabels = [
       stage.hasArtifacts == true ? "Artifacts" : nil,
       stage.hasPendingApproval == true ? "Approval" : nil,
       stage.hasValidationFailure == true ? "Validation" : nil,
       stage.settlementKind.map(P031ThinPresentationFormatting.titleCase),
     ].compactMap { $0 }
-    let accessibilityParts = [stage.label, statusText, attemptText].compactMap { $0 }
+    let accessibilityParts = [
+      stage.label,
+      statusText,
+      attemptText,
+      startedLabel,
+      completedLabel,
+      durationLabel,
+    ].compactMap { $0 }
       + evidenceLabels
     return P031StageTransitionPresentation(
       stageExecutionID: stage.id,
       stageTitle: stage.label,
       statusText: statusText,
       attemptText: attemptText,
+      startedLabel: startedLabel,
+      completedLabel: completedLabel,
+      durationLabel: durationLabel,
       connectorState: connectorState(for: stage),
       evidenceLabels: P031ThinPresentationFormatting.uniqueLabels(evidenceLabels),
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
@@ -5107,44 +5141,6 @@ enum P031CatalogContextPresenter {
       catalogSnapshotHash: run.catalogSnapshotHash,
       statusText: statusText,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
-    )
-  }
-}
-
-enum P031StageListPresenter {
-  nonisolated static func presentation(
-    for stages: [P031StageReadModel],
-    currentFreshness: P031FreshnessSnapshot,
-    checkedAt: Date
-  ) -> P031StageListPresentation {
-    let rows = stages.map(P031StagePresenter.presentation)
-    return P031StageListPresentation(
-      rows: rows,
-      freshness: P031ThinPresentationFormatting.freshnessSnapshot(
-        currentFreshness: currentFreshness,
-        checkedAt: checkedAt,
-        states: stages.map(\.freshnessState)
-      ),
-      refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .stages),
-      emptyStateTitle: rows.isEmpty ? "No stages" : nil,
-      errorDescription: nil
-    )
-  }
-
-  nonisolated static func errorPresentation(
-    error: Error,
-    currentFreshness: P031FreshnessSnapshot,
-    checkedAt: Date
-  ) -> P031StageListPresentation {
-    P031StageListPresentation(
-      rows: [],
-      freshness: WorkflowFreshnessReducer.reduce(
-        currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
-      ),
-      refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .stages),
-      emptyStateTitle: nil,
-      errorDescription: P031ReadErrorPresenter.description(for: error)
     )
   }
 }
@@ -5469,27 +5465,6 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
     }
   }
 
-  nonisolated func loadStages(
-    runID: String,
-    currentFreshness: P031FreshnessSnapshot,
-    checkedAt: Date = Date()
-  ) async -> P031StageListPresentation {
-    do {
-      let stages = try await store.fetchStages(runID: runID)
-      return P031StageListPresenter.presentation(
-        for: stages,
-        currentFreshness: currentFreshness,
-        checkedAt: checkedAt
-      )
-    } catch {
-      return P031StageListPresenter.errorPresentation(
-        error: error,
-        currentFreshness: currentFreshness,
-        checkedAt: checkedAt
-      )
-    }
-  }
-
   nonisolated func loadApprovalInbox(
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date = Date()
@@ -5625,6 +5600,15 @@ struct P031ThinWorkflowSubscriptionCoordinator<Store: P031WorkflowReadStore>: Se
 }
 
 private enum P031ThinPresentationFormatting {
+  nonisolated private static let timestampFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyy-MM-dd HH:mm"
+    return formatter
+  }()
+
   nonisolated static func freshnessSnapshot(
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date,
@@ -5677,5 +5661,39 @@ private enum P031ThinPresentationFormatting {
     return labels.filter { label in
       seen.insert(label).inserted
     }
+  }
+
+  nonisolated static func timestamp(_ date: Date) -> String {
+    timestampFormatter.string(from: date)
+  }
+
+  nonisolated static func durationLabel(
+    startedAt: Date?,
+    completedAt: Date?,
+    now: Date
+  ) -> String? {
+    guard let startedAt else {
+      return nil
+    }
+    let end = completedAt ?? now
+    guard end >= startedAt else {
+      return nil
+    }
+    return "Duration: \(duration(end.timeIntervalSince(startedAt)))"
+  }
+
+  nonisolated private static func duration(_ interval: TimeInterval) -> String {
+    let totalSeconds = Int(interval.rounded(.down))
+    let hours = totalSeconds / 3600
+    let minutes = (totalSeconds % 3600) / 60
+    let seconds = totalSeconds % 60
+
+    if hours > 0 {
+      return "\(hours)h \(minutes)m \(seconds)s"
+    }
+    if minutes > 0 {
+      return "\(minutes)m \(seconds)s"
+    }
+    return "\(seconds)s"
   }
 }

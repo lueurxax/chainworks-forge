@@ -1857,8 +1857,8 @@ Thin-client read-model parity and affordance contract gate.
 Scope:
 
 - `docs/reference/thin-client-read-model-affordance-contract.md` exists and contains `thin_client_affordance_contract_v1` with all required affordance rows (`artifact.preview.listLabel`, `artifact.preview.detail`, `report.payload.metadata`, `freshness.badge.run/stage/approval/artifact`, `approval.resolve.approve/reject`, `diagnostic.copy`, `external.command.placeholder`)
-- All eight p085 negative fixture files exist as valid JSON with a `contract_violation` field
-- `control-plane/crates/graphql-server` runs the P085 backend proof slice (`proposal_085_`) covering approval projection fields, report payload projection fields, authorization denial for diagnostic fields, and typed `conflictResultCode` readback with a real failed `command_journal` id
+- All eight p085 negative fixture files exist as valid JSON with a `contract_violation` field and scenario-specific semantic expectations
+- `control-plane/crates/graphql-server` runs the P085 backend proof slice (`proposal_085_`) covering approval projection fields, artifact/report payload projection states, authorization denial for diagnostic fields, P081 boundary row linkage, and typed `conflictResultCode` readback with a real failed `command_journal` id for both approval mutations
 - `Chainworks Forge/Support/P085AffordancePresenter.swift` exists with immutable Equatable Sendable DTOs: `P085ArtifactAffordanceState`, `P085ApprovalAffordanceState`, `P085FreshnessAffordanceState`, `P085DiagnosticAffordanceState`; `canDrivePayloadAvailability` and `canDriveApprovalActionability` are always `false`; `mergedAffordance` enforces stale-detail guard; `payloadPresentation(fromRaw:)` and `P085FreshnessState.fromRaw` map unknown enum strings to `.unknown`
 - `Chainworks ForgeTests/Proposal085Tests` runs as the Swift parity slice proving: `payload_deferred` → `.deferred` (not `.unavailable`); `metadata_only` → `.metadataOnly`; unknown enum strings → `.unknown`; stale async detail does not overwrite newer selection; approval actionability requires `writePathState == .available` and matching `availableActions`; freshness is diagnostic-only; diagnostic affordance invalidates on unauthorized freshness
 
@@ -1883,7 +1883,7 @@ Command:
 Important:
 
 - `p085` is accepted as an alias; both run the same proof slice
-- the gate fails closed if the contract doc is missing a required row or term, any negative fixture is absent or lacks `contract_violation`, the backend GraphQL proof is missing/failing, the presenter file is missing a required symbol, or the `Proposal085Tests` Swift slice fails
+- the gate fails closed if the contract doc is missing a required row, P081 boundary row, or term; any negative fixture is absent or fails its scenario-specific semantic expectation; the backend GraphQL proof is missing/failing; the presenter file is missing a required symbol; or the `Proposal085Tests` Swift slice fails
 - `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
 - unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
 

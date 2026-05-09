@@ -1,8 +1,8 @@
 {
   "scenario": "p085-approval-stale-double-submit-conflict",
-  "description": "Operator submits approveApproval after projection lag left the button visible from the last known actionable read model. The durable approval was already resolved (granted) by another session. The mutation returns state_conflict/already_resolved, but the Swift presenter maps this to actionable state instead of disabled/already_resolved. Violates mutation_idempotency for approval.resolve.approve.",
+  "description": "Operator submits approveApproval after projection lag left the button visible from the last known actionable read model. The durable approval was already resolved (granted) by another session. The mutation returns already_resolved, but the Swift presenter maps this to actionable state instead of disabled/already_resolved. Violates mutation_idempotency for approval.resolve.approve.",
   "contract_violation": "approval_conflict_missing",
-  "hold_condition": "Duplicate and stale approval submits must be idempotent or return typed already_resolved/state_conflict results without clobbering durable state.",
+  "hold_condition": "Duplicate and stale approval submits must be idempotent or return typed already_resolved results without clobbering durable state.",
   "mutation": "approveApproval",
   "simulated_mutation_response": {
     "approveApproval": {
@@ -14,7 +14,7 @@
         "writePathState": "write_path_not_available",
         "availableActions": []
       },
-      "resultCode": "already_resolved",
+      "conflictResultCode": "already_resolved",
       "journalId": "journal-conflict-1"
     }
   },

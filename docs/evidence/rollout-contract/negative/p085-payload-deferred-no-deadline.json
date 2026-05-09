@@ -16,6 +16,7 @@
       "serverDebugDetail": null
     }
   },
+  "expected_server_owned_evidence": "deadline_or_stalled_diagnostic",
   "problem": "No stalenessDeadlineAt, no stalledReasonCode, no diagnosticId — operator cannot determine if the server is stuck or still making progress. UI shows 'Generating...' forever.",
   "resolution": "Server must either provide stalenessDeadlineAt or transition payloadAvailabilityState to a typed stalled/timed-out state with diagnosticId. Backend fixture must prove this transition with a test.",
   "p085_contract_row": "artifact.preview.listLabel",

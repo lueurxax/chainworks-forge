@@ -569,6 +569,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 stageTitle: "Proposal reviewed",
                 statusText: "Skipped",
                 attemptText: "Iteration 11, attempt 1",
+                startedLabel: "Started: 2026-05-09 09:12",
+                completedLabel: "Completed: 2026-05-09 09:12",
+                durationLabel: "Duration: 8s",
                 connectorState: .pending,
                 evidenceLabels: ["Artifacts", "Skipped"],
                 accessibilityLabel: "Proposal reviewed, iteration 11 attempt 1, skipped"
@@ -578,6 +581,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 stageTitle: "Proposal reviewed",
                 statusText: "Completed",
                 attemptText: "Iteration 11, attempt 6",
+                startedLabel: "Started: 2026-05-09 09:30",
+                completedLabel: "Completed: 2026-05-09 09:34",
+                durationLabel: "Duration: 4m 18s",
                 connectorState: .completed,
                 evidenceLabels: ["Artifacts", "Validation", "Completed"],
                 accessibilityLabel: "Proposal reviewed, iteration 11 attempt 6, completed"
@@ -587,6 +593,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 stageTitle: "Proposal reviewed",
                 statusText: "Running",
                 attemptText: "Iteration 13, attempt 1",
+                startedLabel: "Started: 2026-05-09 10:02",
+                completedLabel: nil,
+                durationLabel: "Duration: 2m 41s",
                 connectorState: .running,
                 evidenceLabels: ["Artifacts"],
                 accessibilityLabel: "Proposal reviewed, iteration 13 attempt 1, running"
@@ -609,7 +618,6 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 archivedAt: nil,
                 accessibilityLabel: "Improve artifact navigation"
             ),
-            stageRows: [],
             stageTransitions: transitions,
             approvalRows: [],
             artifactRows: [],
@@ -1543,44 +1551,6 @@ private struct P077CloseoutReadinessDiagnosticsSheet: View {
     }
 }
 
-private struct P031StageListCard: View {
-    let rows: [P031StageSummaryPresentation]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Stages")
-                .font(.headline)
-            if rows.isEmpty {
-                P031EmptySectionRow(title: "No stages", detail: "No stage projections returned.")
-            } else {
-                ForEach(rows, id: \.stageExecutionID) { row in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(row.title)
-                                .font(.subheadline.weight(.semibold))
-                            Spacer()
-                            P031FreshnessBadge(state: row.freshnessState)
-                        }
-                        Text(row.statusLabel)
-                            .font(.caption.weight(.medium))
-                        if let iterationLabel = row.iterationLabel {
-                            Text(iterationLabel)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        if !row.badgeLabels.isEmpty {
-                            P031BadgeRow(labels: row.badgeLabels)
-                        }
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-                }
-            }
-        }
-    }
-}
-
 private struct P031IdeaContextCard: View {
     let presentation: P031IdeaContextPresentation?
 
@@ -1668,6 +1638,21 @@ private struct P031StageTransitionMapCard: View {
                                 }
                                 if let attemptText = row.attemptText {
                                     Text(attemptText)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let startedLabel = row.startedLabel {
+                                    Text(startedLabel)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let completedLabel = row.completedLabel {
+                                    Text(completedLabel)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let durationLabel = row.durationLabel {
+                                    Text(durationLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }

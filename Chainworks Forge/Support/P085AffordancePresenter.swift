@@ -6,15 +6,11 @@ import Foundation
 /// Fail-closed: unknown server values decode to .unknown(rawValue:) rather than crashing.
 enum P085MutationConflictResultCode: Equatable, Sendable {
   case alreadyResolved
-  case stateConflict
-  case transientErrorRetryable
   case unknown(rawValue: String)
 
   nonisolated static func fromRaw(_ rawValue: String) -> P085MutationConflictResultCode {
     switch rawValue {
     case "already_resolved": return .alreadyResolved
-    case "state_conflict": return .stateConflict
-    case "transient_error_retryable": return .transientErrorRetryable
     default: return .unknown(rawValue: rawValue)
     }
   }

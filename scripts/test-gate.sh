@@ -1833,7 +1833,7 @@ result = payload.get("result") or {}
 
 checks = [
     (result.get("proofAgentID") == "proposal_reviewer_product_owner", "proof agent id must be proposal_reviewer_product_owner"),
-    (result.get("reportSkillRef") == "proposal_review_triad", "report skill ref must be proposal_review_triad"),
+    (result.get("reportSkillRef") == "proposal_review_router_skill", "report skill ref must be proposal_review_router_skill"),
     (result.get("reportSkillRole") == "product_owner", "report skill role must be product_owner"),
     (result.get("comparisonSkillRole") == "architect", "comparison skill role must be architect"),
     (result.get("primaryArtifactName") == "proposal_current", "primary artifact must be proposal_current"),
@@ -6218,11 +6218,57 @@ for required in [
     "P085AffordancePresenter",
     "canDrivePayloadAvailability",
     "canDriveApprovalActionability",
+    "P081-UI-APPROVAL-APPROVE",
+    "P081-UI-APPROVAL-REJECT",
+    "P081-UI-READ-ONLY",
+    "P081-UI-EXTERNAL-COMMANDS",
 ]:
     if required not in contract_text:
         raise SystemExit(
             f"proposal-085: contract doc missing required term: {required!r}"
         )
+
+required_rows = [
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+]
+required_row_fields = [
+    "affordance_id",
+    "source_graphql_fields",
+    "local_presentation_state",
+    "actionable_state",
+    "disabled_reason_code",
+    "fallback_text",
+    "mutation_availability",
+    "mutation_idempotency",
+    "staleness_deadline",
+    "cancellation_policy",
+    "stale_list_detail_behavior",
+    "unauthorized_behavior",
+    "supported_interactions",
+    "proof_tests",
+]
+for row in required_rows:
+    marker = f"### `{row}`"
+    start = contract_text.find(marker)
+    if start < 0:
+        raise SystemExit(f"proposal-085: missing contract row {row!r}")
+    end = contract_text.find("\n---", start)
+    section = contract_text[start:] if end < 0 else contract_text[start:end]
+    for field in required_row_fields:
+        if f"**{field}**" not in section:
+            raise SystemExit(
+                f"proposal-085: contract row {row!r} missing required field {field!r}"
+            )
 
 # 2. Negative fixtures exist as valid JSON
 p085_negative_fixtures = [
@@ -6247,6 +6293,86 @@ for fixture_path in p085_negative_fixtures:
         raise SystemExit(
             f"proposal-085: negative fixture {fixture_path} missing 'contract_violation' field"
         )
+    if "hold_condition" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'hold_condition' field"
+        )
+    if "state_conflict" in json.dumps(data):
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} references removed conflict code 'state_conflict'"
+        )
+
+p085_semantic_expectations = {
+    "p085-approval-actionability-mismatch": {
+        "contract_violation": "approval_parity_mismatch",
+        "p085_contract_row": "approval.resolve.approve",
+        "expected_presenter_output.approveAvailability": "disabled",
+        "expected_presenter_output.reasonCode": "WRITE_PATH_NOT_AVAILABLE",
+    },
+    "p085-approval-stale-double-submit-conflict": {
+        "contract_violation": "approval_conflict_missing",
+        "p085_contract_row": "approval.resolve.approve",
+        "simulated_mutation_response.approveApproval.conflictResultCode": "already_resolved",
+        "expected_presenter_output.approveAvailability": "disabled",
+    },
+    "p085-missing-affordance-row": {
+        "contract_violation": "missing_affordance_row",
+        "expected_contract_row_status": "missing",
+    },
+    "p085-missing-schema-symbol": {
+        "contract_violation": "missing_schema_proof",
+        "missing_symbol.graphql_type": "PayloadUnavailableReasonCode",
+    },
+    "p085-payload-deferred-marked-unavailable": {
+        "contract_violation": "payload_state_mismatch",
+        "p085_contract_row": "artifact.preview.listLabel",
+        "expected_presenter_output.payloadPresentation": "deferred",
+    },
+    "p085-payload-deferred-no-deadline": {
+        "contract_violation": "payload_deadline_missing",
+        "p085_contract_row": "artifact.preview.listLabel",
+        "simulated_read_model.artifact.payloadAvailabilityState": "generating",
+        "expected_server_owned_evidence": "deadline_or_stalled_diagnostic",
+    },
+    "p085-unknown-enum-optimistic-action": {
+        "contract_violation": "unknown_enum_unsafe",
+        "p085_contract_rows": ["freshness.badge.approval", "freshness.badge.run"],
+        "expected_swift_behavior.p085_freshnessState": "P085FreshnessState.unknown(rawValue: 'projection_rebuilding')",
+    },
+    "p085-unsafe-local-truth-fallback": {
+        "contract_violation": "unauthorized_fallback_violation",
+        "p085_contract_rows": ["artifact.preview.detail", "artifact.preview.listLabel"],
+        "expected_swift_behavior.payloadPresentation": "unavailable(reasonCode: .notAuthorized)",
+    },
+}
+
+def p085_lookup(data, dotted):
+    value = data
+    for segment in dotted.split("."):
+        if not isinstance(value, dict) or segment not in value:
+            raise KeyError(dotted)
+        value = value[segment]
+    return value
+
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    data = json.loads(full.read_text())
+    scenario = data.get("scenario")
+    if scenario not in p085_semantic_expectations:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} has unexpected scenario {scenario!r}"
+        )
+    for dotted, expected in p085_semantic_expectations[scenario].items():
+        try:
+            actual = p085_lookup(data, dotted)
+        except KeyError as exc:
+            raise SystemExit(
+                f"proposal-085: negative fixture {fixture_path} missing semantic field {exc.args[0]!r}"
+            ) from exc
+        if actual != expected:
+            raise SystemExit(
+                f"proposal-085: negative fixture {fixture_path} expected {dotted}={expected!r}, got {actual!r}"
+            )
 
 # 3. test-gates.md documents the gate
 gates_doc = root / "docs/reference/test-gates.md"
@@ -6289,8 +6415,6 @@ for required in [
     "Approval is already resolved",
     # Conflict codes: typed idempotency/conflict result vocabulary
     "alreadyResolved",
-    "stateConflict",
-    "transientErrorRetryable",
 ]:
     if required not in presenter_text:
         raise SystemExit(
@@ -6335,6 +6459,9 @@ for required in [
     "ApprovalResolutionConflict",
     "approval_resolution_conflict_code",
     "proposal_085_approval_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_reject_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_backend_artifact_projection_state_matrix",
+    "proposal_085_conflict_enum_matches_backend_emitted_codes",
     "proposal_085_graphql_backend_projection_and_authorization_contract",
 ]:
     if required not in schema_text + handler_text:

@@ -9,6 +9,7 @@
     "ui_surface": "artifact list row context menu",
     "current_status": "no p085 contract row exists for this affordance"
   },
+  "expected_contract_row_status": "missing",
   "resolution": "Add a contract row to thin_client_affordance_contract_v1 before shipping the affordance. The row must name all source fields, local presentation state, disabled/fallback copy, and proof tests.",
   "p085_revision": "p085-r2-2026-05-08"
 }

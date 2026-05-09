@@ -77,6 +77,9 @@ use crate::session::policy::{
 use crate::work_queue::WorkQueue;
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
+const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
+const IMPLEMENTATION_STARTED_STAGE_ID: &str = "state_7_implementation_started";
+const FREEZE_PROPOSAL_TASK_NAME: &str = "freeze_proposal_and_provision_worktree";
 
 #[derive(Debug)]
 struct WorkItemRequeued {
@@ -3474,7 +3477,7 @@ impl BackgroundExecutor {
                     .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
                 // Use the prompt from the work item payload if provided
                 // (workflow-driven runs include the agent's system prompt from YAML).
-                let prompt = payload["prompt"]
+                let mut prompt = payload["prompt"]
                     .as_str()
                     .unwrap_or(&format!("Execute stage {} for run {}", stage_id, run_id))
                     .to_string();
@@ -3558,25 +3561,11 @@ impl BackgroundExecutor {
                     .unwrap_or(false);
                 let xcode_shim_required =
                     xcode_shim_injection_signal || requires_xcode_host_execution;
-                let declared_outputs: Vec<DeclaredOutput> =
+                let mut declared_outputs: Vec<DeclaredOutput> =
                     serde_json::from_value(payload["declared_outputs"].clone()).unwrap_or_default();
                 let stage_degraded_output_policy: workflow::plan::DegradedOutputPolicy =
                     serde_json::from_value(payload["stage_degraded_output_policy"].clone())
                         .unwrap_or_default();
-                let expected_output_paths: Vec<String> = declared_outputs
-                    .iter()
-                    .flat_map(|declared| {
-                        std::iter::once(declared.target_path.clone())
-                            .chain(declared.companion_path.clone().into_iter())
-                    })
-                    .collect();
-                let expected_outputs = build_expected_output_specs(
-                    &declared_outputs,
-                    &run.workspace_root,
-                    run.worktree_root.as_deref(),
-                    run.chainworks_meta_root.as_deref(),
-                    worktree_write_enabled,
-                );
 
                 let effective_working_directory = if worktree_write_enabled
                     || matches!(
@@ -4091,6 +4080,42 @@ impl BackgroundExecutor {
                     }
                     tx.commit().await?;
                 }
+
+                let has_existing_approved_proposal = artifacts::list_by_run(&self.pool, run_id)
+                    .await?
+                    .iter()
+                    .any(|artifact| artifact.name == APPROVED_PROPOSAL_OUTPUT_NAME);
+                let suppressed_approved_proposal = preserve_existing_approved_proposal_on_retry(
+                    &mut declared_outputs,
+                    &mut prompt,
+                    &stage_id,
+                    &task_name,
+                    stage_attempt_number,
+                    has_existing_approved_proposal,
+                );
+                if suppressed_approved_proposal {
+                    warn!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        task_name = %task_name,
+                        attempt = stage_attempt_number,
+                        "Suppressing agent-returned approved_proposal to preserve frozen implementation handoff"
+                    );
+                }
+                let expected_output_paths: Vec<String> = declared_outputs
+                    .iter()
+                    .flat_map(|declared| {
+                        std::iter::once(declared.target_path.clone())
+                            .chain(declared.companion_path.clone().into_iter())
+                    })
+                    .collect();
+                let expected_outputs = build_expected_output_specs(
+                    &declared_outputs,
+                    &run.workspace_root,
+                    run.worktree_root.as_deref(),
+                    run.chainworks_meta_root.as_deref(),
+                    worktree_write_enabled,
+                );
 
                 let execution_prompt = if policy_decision.is_some() || !declared_outputs.is_empty()
                 {
@@ -6610,6 +6635,15 @@ impl BackgroundExecutor {
             {
                 continue;
             }
+            if should_ignore_undeclared_envelope_artifact(&discovered.name) {
+                warn!(
+                    stage_id = %stage_id,
+                    agent_id = %agent_id,
+                    provider = %provider,
+                    "Ignoring undeclared approved_proposal envelope artifact to preserve frozen proposal immutability"
+                );
+                continue;
+            }
 
             let (format, extension) = infer_artifact_format_from_content(&discovered.content);
             let file_stem = sanitize_artifact_name_for_path(&discovered.name);
@@ -7388,8 +7422,60 @@ fn release_artifact_path(artifact_root: &str, name: &str) -> String {
         .into_owned()
 }
 
+fn preserve_existing_approved_proposal_on_retry(
+    declared_outputs: &mut Vec<DeclaredOutput>,
+    prompt: &mut String,
+    stage_id: &str,
+    task_name: &str,
+    stage_attempt_number: i64,
+    has_existing_approved_proposal: bool,
+) -> bool {
+    if !should_reuse_existing_approved_proposal(
+        stage_id,
+        task_name,
+        stage_attempt_number,
+        has_existing_approved_proposal,
+    ) {
+        return false;
+    }
+    let original_len = declared_outputs.len();
+    declared_outputs.retain(|output| {
+        output.output_name != APPROVED_PROPOSAL_OUTPUT_NAME
+            && output.companion_output_name.as_deref() != Some(APPROVED_PROPOSAL_OUTPUT_NAME)
+    });
+    if declared_outputs.len() == original_len {
+        return false;
+    }
+    prompt.push_str(
+        "\n\n### Approved Proposal Immutability\n\
+         A frozen `approved_proposal` artifact already exists for this run and is the sole \
+         implementation source of truth for this retry.\n\
+         Do not emit, rewrite, re-freeze, or modify `approved_proposal` in this turn.\n\
+         Reuse the existing frozen proposal exactly as-is. Return only the remaining declared \
+         implementation outputs such as `implementation_plan`, `implementation_backlog`, and \
+         `run_state`. Any proposal changes after freeze require an explicit amendment path.\n",
+    );
+    true
+}
+
+fn should_reuse_existing_approved_proposal(
+    stage_id: &str,
+    task_name: &str,
+    stage_attempt_number: i64,
+    has_existing_approved_proposal: bool,
+) -> bool {
+    has_existing_approved_proposal
+        && stage_attempt_number > 1
+        && stage_id == IMPLEMENTATION_STARTED_STAGE_ID
+        && task_name == FREEZE_PROPOSAL_TASK_NAME
+}
+
+fn should_ignore_undeclared_envelope_artifact(name: &str) -> bool {
+    name == APPROVED_PROPOSAL_OUTPUT_NAME
+}
+
 fn stored_artifact_file_path(name: &str, path: &str, workspace_root: &str) -> String {
-    if name != "approved_proposal" {
+    if name != APPROVED_PROPOSAL_OUTPUT_NAME {
         return path.to_string();
     }
     workspace_relative_artifact_file_path(path, workspace_root).unwrap_or_else(|| path.to_string())
@@ -7854,9 +7940,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_state_7_reuses_existing_approved_proposal_instead_of_reemitting_it() {
+        let mut declared_outputs = vec![
+            DeclaredOutput {
+                output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+                target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
+                    .to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_plan".to_string(),
+                target_path: "/workspace/.chainworks/runs/run-1/implementation-plan.md".to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let mut prompt = "Freeze proposal and provision worktree".to_string();
+
+        let suppressed = preserve_existing_approved_proposal_on_retry(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            FREEZE_PROPOSAL_TASK_NAME,
+            2,
+            true,
+        );
+
+        assert!(suppressed);
+        assert_eq!(declared_outputs.len(), 1);
+        assert_eq!(declared_outputs[0].output_name, "implementation_plan");
+        assert!(prompt.contains("Approved Proposal Immutability"));
+        assert!(prompt.contains("Do not emit, rewrite, re-freeze, or modify `approved_proposal`"));
+        assert!(prompt.contains("explicit amendment path"));
+    }
+
+    #[test]
+    fn initial_state_7_freeze_still_allows_first_approved_proposal_output() {
+        let mut declared_outputs = vec![DeclaredOutput {
+            output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
+                .to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let mut prompt = "Freeze proposal and provision worktree".to_string();
+
+        let suppressed = preserve_existing_approved_proposal_on_retry(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            FREEZE_PROPOSAL_TASK_NAME,
+            1,
+            true,
+        );
+
+        assert!(!suppressed);
+        assert_eq!(declared_outputs.len(), 1);
+        assert!(!prompt.contains("Approved Proposal Immutability"));
+    }
+
+    #[test]
+    fn undeclared_approved_proposal_envelope_artifact_is_rejected() {
+        assert!(should_ignore_undeclared_envelope_artifact(
+            APPROVED_PROPOSAL_OUTPUT_NAME
+        ));
+        assert!(!should_ignore_undeclared_envelope_artifact(
+            "implementation_plan"
+        ));
+    }
+
+    #[test]
     fn approved_proposal_artifact_path_is_stored_workspace_relative() {
         let stored = stored_artifact_file_path(
-            "approved_proposal",
+            APPROVED_PROPOSAL_OUTPUT_NAME,
             "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md",
             "/workspace",
         );

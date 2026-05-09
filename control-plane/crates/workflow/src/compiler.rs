@@ -1020,9 +1020,9 @@ fn apply_role_specialization(
         return base_content.to_string();
     };
 
-    // Special case: proposal_review_triad has a hardcoded role→mode map.
-    if skill_id == "proposal_review_triad" {
-        if let Some((mode, instructions)) = triad_role_mode(role) {
+    // Special case: proposal review skills have a hardcoded role→mode map.
+    if skill_id == "proposal_review_triad" || skill_id == "proposal_review_router_skill" {
+        if let Some((mode, instructions)) = proposal_review_role_mode(role) {
             return format!(
                 "{base_content}\n\n## Active Role: {role}\n\nMode: {mode}\n\n{instructions}"
             );
@@ -1053,9 +1053,9 @@ fn apply_role_specialization(
     )
 }
 
-/// Hardcoded role→mode map for `proposal_review_triad`.
-/// Matches Swift `SkillRoleCustomizer.triadModeMap`.
-fn triad_role_mode(role: &str) -> Option<(&'static str, &'static str)> {
+/// Hardcoded role→mode map for proposal review skills.
+/// Matches Swift `SkillRoleCustomizer.proposalReviewModeMap`.
+fn proposal_review_role_mode(role: &str) -> Option<(&'static str, &'static str)> {
     match role {
         "product_owner" => Some((
             "product-only",
