@@ -459,6 +459,31 @@ struct DaemonLifecycleClient {
         return try Self.decodeSchedulerReadback(respData)
     }
 
+    func storageDiagnosticsSnapshots() async throws -> DaemonStorageDiagnosticsSnapshots {
+        let body: [String: Any] = ["query": Self.storageDiagnosticsQuery]
+        let data = try JSONSerialization.data(withJSONObject: body)
+        var request = URLRequest(url: endpoint.graphqlURL)
+        request.httpMethod = "POST"
+        request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(endpoint.bearerToken)", forHTTPHeaderField: "Authorization")
+
+        let (respData, response): (Data, URLResponse)
+        do {
+            (respData, response) = try await urlSession.data(for: request)
+        } catch {
+            throw DaemonClientError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw DaemonClientError.httpFailure(status: -1, body: "no HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = String(data: respData, encoding: .utf8) ?? "<binary>"
+            throw DaemonClientError.httpFailure(status: http.statusCode, body: body)
+        }
+        return try Self.decodeStorageDiagnosticsSnapshots(respData)
+    }
+
     static func decodeSnapshot(_ data: Data) throws -> DaemonStatus {
         let envelope: SnapshotEnvelope
         do {
@@ -488,6 +513,44 @@ struct DaemonLifecycleClient {
         } catch {
             throw DaemonClientError.decoding(error)
         }
+    }
+
+    static func decodeStorageDiagnosticsSnapshots(
+        _ data: Data
+    ) throws -> DaemonStorageDiagnosticsSnapshots {
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let errors = object?["errors"] as? [[String: Any]], !errors.isEmpty {
+            throw DaemonClientError.graphqlErrors(
+                errors.compactMap { $0["message"] as? String }
+            )
+        }
+        guard let dataObject = object?["data"] as? [String: Any],
+              let storageHealth = dataObject["storageHealth"] as? [String: Any]
+        else {
+            throw DaemonClientError.decoding(
+                NSError(domain: "DaemonClient", code: -1, userInfo: [
+                    NSLocalizedDescriptionKey: "data.storageHealth missing"
+                ])
+            )
+        }
+
+        let storageData = try JSONSerialization.data(
+            withJSONObject: storageHealth,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        let evidenceData: Data?
+        if let evidence = storageHealth["evidenceSpool"] as? [String: Any] {
+            evidenceData = try JSONSerialization.data(
+                withJSONObject: evidence,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+        } else {
+            evidenceData = nil
+        }
+        return DaemonStorageDiagnosticsSnapshots(
+            storageHealthData: storageData,
+            evidenceSpoolSummaryData: evidenceData
+        )
     }
 
     static let snapshotQuery: String = "{ daemonStatus { json } }"
@@ -520,6 +583,78 @@ struct DaemonLifecycleClient {
         staleAfterMs
         updatedAt
         isStale
+      }
+    }
+    """
+
+    static let storageDiagnosticsQuery: String = """
+    {
+      storageHealth {
+        updatedAt
+        staleAfterMs
+        isStale
+        dbState
+        writer {
+          alive
+          lastHeartbeatAt
+          lastDrainAt
+          totalQueued
+          lanes {
+            lane
+            capacity
+            queuedDepth
+            queuedDepthRatio
+            oldestQueuedAgeMs
+            rejectedTotal
+            droppedTotal
+          }
+          writeLockWaitP50Ms
+          writeLockWaitP95Ms
+          transactionDurationP95Ms
+          busyRetryRatePerMinute
+          busyRetryExhaustedTotal
+          rejectedTotal
+          droppedTelemetryTotal
+        }
+        wal {
+          available
+          unavailableReason
+          sizeBytes
+          warnSizeBytes
+          criticalSizeBytes
+          lastCheckpointAt
+          checkpointDurationP95Ms
+        }
+        projections {
+          pendingInvalidations
+          projectionLagMs
+          coalescedKeysPending
+          coalescedMergedTotal
+          coalescedFlushAgeP95Ms
+        }
+        evidenceSpool {
+          enabled
+          filesWrittenTotal
+          bytesWrittenTotal
+          metadataRowsTotal
+          orphanFiles
+          orphanBytes
+          recoveredFiles
+          checksumMismatchFiles
+          pendingDeleteFiles
+        }
+        killSwitches {
+          dbWriterBypassClasses
+          coalescingDisabledKeys
+          evidenceSpoolDisabledKinds
+        }
+        thresholds {
+          metric
+          warn
+          critical
+          unit
+          action
+        }
       }
     }
     """
@@ -579,6 +714,11 @@ struct DaemonLifecycleClient {
         )
         return request
     }
+}
+
+struct DaemonStorageDiagnosticsSnapshots: Sendable, Equatable {
+    let storageHealthData: Data
+    let evidenceSpoolSummaryData: Data?
 }
 
 /// Live-feed subscription owned by the caller. Drop it to close the

@@ -7,8 +7,11 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::mediation::{LeadConflictMediationRecord, LeadMediationStatus};
 
 pub async fn insert(pool: &SqlitePool, record: &LeadConflictMediationRecord) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO lead_conflict_mediations
+    crate::execute_repository_write!(
+        pool,
+        "lead_conflict_mediations.insert",
+        sqlx::query(
+            r#"INSERT INTO lead_conflict_mediations
            (id, run_id, conflict_id, conflict_fingerprint, lead_agent_id, status,
             settlement_result, recovery_action, chosen_action, chosen_next_state_id,
             chosen_next_state_label, operator_rationale, sanitized_progress,
@@ -17,31 +20,30 @@ pub async fn insert(pool: &SqlitePool, record: &LeadConflictMediationRecord) -> 
             created_at, updated_at, settled_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"#,
+        )
+        .bind(&record.id)
+        .bind(&record.run_id)
+        .bind(&record.conflict_id)
+        .bind(&record.conflict_fingerprint)
+        .bind(&record.lead_agent_id)
+        .bind(record.status.to_string())
+        .bind(&record.settlement_result)
+        .bind(&record.recovery_action)
+        .bind(&record.chosen_action)
+        .bind(&record.chosen_next_state_id)
+        .bind(&record.chosen_next_state_label)
+        .bind(&record.operator_rationale)
+        .bind(&record.sanitized_progress)
+        .bind(&record.validation_errors_json)
+        .bind(&record.cost_summary_json)
+        .bind(&record.metric_event_id)
+        .bind(&record.superseded_by_event_ref)
+        .bind(&record.agent_execution_id)
+        .bind(&record.confirmation_subject_id)
+        .bind(record.created_at.to_rfc3339())
+        .bind(record.updated_at.to_rfc3339())
+        .bind(record.settled_at.map(|t| t.to_rfc3339()))
     )
-    .bind(&record.id)
-    .bind(&record.run_id)
-    .bind(&record.conflict_id)
-    .bind(&record.conflict_fingerprint)
-    .bind(&record.lead_agent_id)
-    .bind(record.status.to_string())
-    .bind(&record.settlement_result)
-    .bind(&record.recovery_action)
-    .bind(&record.chosen_action)
-    .bind(&record.chosen_next_state_id)
-    .bind(&record.chosen_next_state_label)
-    .bind(&record.operator_rationale)
-    .bind(&record.sanitized_progress)
-    .bind(&record.validation_errors_json)
-    .bind(&record.cost_summary_json)
-    .bind(&record.metric_event_id)
-    .bind(&record.superseded_by_event_ref)
-    .bind(&record.agent_execution_id)
-    .bind(&record.confirmation_subject_id)
-    .bind(record.created_at.to_rfc3339())
-    .bind(record.updated_at.to_rfc3339())
-    .bind(record.settled_at.map(|t| t.to_rfc3339()))
-    .execute(pool)
-    .await
     .context("insert lead_conflict_mediation")?;
     Ok(())
 }
