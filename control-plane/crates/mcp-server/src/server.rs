@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use db::repos::{agent_executions, projections, rollout_contract_checks, runs, stages};
+use db::writer::DbWriterHeartbeat;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
 
@@ -22,6 +23,7 @@ pub struct McpServer {
     cmd_handler: Arc<CommandHandler>,
     pub principal_table: auth::PrincipalTable,
     events: Option<EventSender>,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
 }
 
 async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
@@ -129,6 +131,22 @@ impl McpServer {
             cmd_handler,
             principal_table,
             events: None,
+            storage_writer_heartbeat: None,
+        }
+    }
+
+    pub fn new_with_storage_writer(
+        pool: SqlitePool,
+        cmd_handler: Arc<CommandHandler>,
+        principal_table: auth::PrincipalTable,
+        storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+    ) -> Self {
+        Self {
+            pool,
+            cmd_handler,
+            principal_table,
+            events: None,
+            storage_writer_heartbeat: Some(storage_writer_heartbeat),
         }
     }
 
@@ -143,6 +161,7 @@ impl McpServer {
             cmd_handler,
             principal_table,
             events: Some(events),
+            storage_writer_heartbeat: None,
         }
     }
 
@@ -710,7 +729,15 @@ impl McpServer {
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("storage.") {
-            tools::storage::execute(tool_name, params, pool).await
+            tools::storage::execute_with_writer(
+                tool_name,
+                params,
+                pool,
+                self.storage_writer_heartbeat
+                    .as_ref()
+                    .map(|heartbeat| heartbeat.as_ref()),
+            )
+            .await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }

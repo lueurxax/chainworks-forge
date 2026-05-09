@@ -12,6 +12,7 @@ use db::repos::{
     approvals, artifact_contracts, artifacts, closeout, ideas, projections,
     rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
 };
+use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
 use domain::events::DomainEvent;
 use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -40,13 +41,45 @@ pub fn build_schema(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
 ) -> AppSchema {
-    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+    build_schema_inner(pool, cmd_handler, events, principal_table, reporter, None)
+}
+
+pub fn build_schema_with_storage_writer(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+) -> AppSchema {
+    build_schema_inner(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        Some(storage_writer_heartbeat),
+    )
+}
+
+fn build_schema_inner(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+) -> AppSchema {
+    let mut builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(pool)
         .data(cmd_handler)
         .data(events)
         .data(principal_table)
-        .data(reporter)
-        .finish()
+        .data(reporter);
+    if let Some(heartbeat) = storage_writer_heartbeat {
+        builder = builder.data(heartbeat);
+    }
+    builder.finish()
 }
 
 pub struct QueryRoot;
@@ -534,7 +567,12 @@ impl QueryRoot {
     ) -> Result<crate::types::storage::GqlStorageHealth> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
-        let json = db::repos::storage_health::storage_health(pool).await?;
+        let heartbeat = ctx.data_opt::<Arc<DbWriterHeartbeat>>();
+        let json = db::repos::storage_health::storage_health_with_writer(
+            pool,
+            heartbeat.map(|heartbeat| heartbeat.as_ref()),
+        )
+        .await?;
         crate::types::storage::GqlStorageHealth::from_storage_health_json(json)
             .map_err(|e| Error::new(e.to_string()))
     }
@@ -3985,6 +4023,55 @@ mod tests {
         assert!(json["storageHealth"]["thresholds"]
             .as_array()
             .is_some_and(|thresholds| !thresholds.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_health_reads_live_dbwriter_heartbeat() {
+        let pool = test_pool().await;
+        let writer = db::writer::DbWriter::new(pool.clone());
+        for _ in 0..30 {
+            if writer.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(writer.is_alive(), "DbWriter heartbeat should become live");
+
+        let schema = build_schema_with_storage_writer(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            writer.heartbeat.clone(),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P075StorageHealthWriter {
+                      storageHealth {
+                        isStale
+                        writer { alive totalQueued lanes { lane queuedDepth } }
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P075 live storageHealth query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["storageHealth"]["writer"]["alive"], true);
+        assert_eq!(json["storageHealth"]["isStale"], false);
+        assert!(json["storageHealth"]["writer"]["lanes"]
+            .as_array()
+            .is_some_and(|lanes| lanes.len() == 6));
     }
 
     #[tokio::test]

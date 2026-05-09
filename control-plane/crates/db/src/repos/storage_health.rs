@@ -6,8 +6,9 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::writer::{
-    CRITICAL_WAL_SIZE_BYTES, TELEMETRY_FLUSH_CADENCE_MS, TELEMETRY_MAX_SAMPLES,
-    TELEMETRY_MEMORY_CAP_BYTES, TELEMETRY_SNAPSHOT_TTL_HOURS, WARN_WAL_SIZE_BYTES,
+    DbWriterHealthSnapshot, DbWriterHeartbeat, CRITICAL_WAL_SIZE_BYTES, TELEMETRY_FLUSH_CADENCE_MS,
+    TELEMETRY_MAX_SAMPLES, TELEMETRY_MEMORY_CAP_BYTES, TELEMETRY_SNAPSHOT_TTL_HOURS,
+    WARN_WAL_SIZE_BYTES,
 };
 
 const PRESSURE_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
@@ -79,6 +80,13 @@ pub async fn latest_write_pressure_snapshot(
 }
 
 pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
+    storage_health_with_writer(pool, None).await
+}
+
+pub async fn storage_health_with_writer(
+    pool: &SqlitePool,
+    writer_heartbeat: Option<&DbWriterHeartbeat>,
+) -> Result<Value> {
     let evidence = evidence_spool_summary(pool).await?;
     let latest_pressure = latest_write_pressure_snapshot(pool).await?;
     let updated_at = Utc::now();
@@ -110,10 +118,14 @@ pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
             })
         });
 
-    // Fail-closed: no live DbWriter heartbeat is available from this static call.
-    // Report alive=false and degrade dbState so operators are not misled into
-    // believing storage is healthy when writer telemetry is placeholder (SEC-003).
-    let writer_alive = false;
+    let writer_snapshot = writer_heartbeat.map(DbWriterHeartbeat::snapshot);
+    // Fail-closed when no live DbWriter heartbeat is supplied. Daemon-owned
+    // GraphQL/MCP paths inject the shared writer heartbeat; tests and static
+    // helpers that omit it must not claim storage is healthy from placeholders.
+    let writer_alive = writer_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.alive)
+        .unwrap_or(false);
     let is_stale = !writer_alive || is_pressure_stale;
     let db_state = if evidence["metadataRowsTotal"].as_i64().unwrap_or(0) == 0 {
         "MIGRATION_EMPTY"
@@ -136,14 +148,14 @@ pub async fn storage_health(pool: &SqlitePool) -> Result<Value> {
             "alive": writer_alive,
             "lastHeartbeatAt": null,
             "lastDrainAt": null,
-            "totalQueued": 0,
-            "lanes": lane_health(),
+            "totalQueued": writer_snapshot.as_ref().map(|snapshot| snapshot.total_queued).unwrap_or(0),
+            "lanes": lane_health(writer_snapshot.as_ref()),
             "writeLockWaitP50Ms": null,
             "writeLockWaitP95Ms": null,
             "transactionDurationP95Ms": null,
             "busyRetryRatePerMinute": 0,
             "busyRetryExhaustedTotal": 0,
-            "rejectedTotal": 0,
+            "rejectedTotal": writer_snapshot.as_ref().map(|snapshot| snapshot.coalesced_rejected_total).unwrap_or(0),
             "droppedTelemetryTotal": 0
         },
         "wal": {
@@ -292,7 +304,35 @@ fn write_pressure_snapshot_json(snapshot: &StorageWritePressureSnapshot) -> Valu
     })
 }
 
-fn lane_health() -> Value {
+fn lane_health(writer_snapshot: Option<&DbWriterHealthSnapshot>) -> Value {
+    if let Some(snapshot) = writer_snapshot {
+        return Value::Array(
+            snapshot
+                .lanes
+                .iter()
+                .map(|lane| {
+                    let ratio = if lane.capacity == 0 {
+                        0.0
+                    } else {
+                        lane.queued_depth as f64 / lane.capacity as f64
+                    };
+                    json!({
+                        "lane": lane.lane.as_str(),
+                        "capacity": lane.capacity as i64,
+                        "queuedDepth": lane.queued_depth,
+                        "queuedDepthRatio": ratio,
+                        "oldestQueuedAgeMs": lane.oldest_queued_age_ms,
+                        "rejectedTotal": if lane.lane.as_str() == "coalesced_projection" {
+                            snapshot.coalesced_rejected_total
+                        } else {
+                            0
+                        },
+                        "droppedTotal": 0
+                    })
+                })
+                .collect(),
+        );
+    }
     json!([
         lane_health_entry("critical_barrier", 1024),
         lane_health_entry("operator_command", 512),
@@ -342,4 +382,43 @@ fn parse_time(value: String) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&value)
         .context("parse storage write pressure timestamp")?
         .with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn storage_health_uses_live_dbwriter_heartbeat_when_supplied() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let writer = crate::writer::DbWriter::new(pool.clone());
+
+        for _ in 0..30 {
+            if writer.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(writer.is_alive(), "DbWriter heartbeat should become live");
+
+        let health = storage_health_with_writer(&pool, Some(&writer.heartbeat))
+            .await
+            .unwrap();
+
+        assert_eq!(health["writer"]["alive"], true);
+        assert_eq!(health["writer"]["totalQueued"], 0);
+        assert!(health["writer"]["lanes"]
+            .as_array()
+            .is_some_and(|lanes| lanes.len() == 6));
+        assert_eq!(health["isStale"], false);
+    }
+
+    #[tokio::test]
+    async fn storage_health_fails_closed_without_live_dbwriter_heartbeat() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let health = storage_health(&pool).await.unwrap();
+
+        assert_eq!(health["writer"]["alive"], false);
+        assert_eq!(health["isStale"], true);
+    }
 }

@@ -813,6 +813,7 @@ pub struct BackgroundExecutor {
     acp: Arc<AcpRuntimeManager>,
     events: EventSender,
     steward_runtime_inputs: Option<Arc<crate::steward::config::StewardRuntimeInputs>>,
+    db_writer: Arc<DbWriter>,
 }
 
 struct BackgroundStewardAgentExecutor {
@@ -2408,6 +2409,7 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
             work_queue,
@@ -2415,6 +2417,7 @@ impl BackgroundExecutor {
             acp,
             events,
             steward_runtime_inputs: None,
+            db_writer,
         }
     }
 
@@ -2426,6 +2429,26 @@ impl BackgroundExecutor {
         events: EventSender,
         steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
     ) -> Self {
+        Self::new_with_steward_runtime_inputs_and_db_writer(
+            pool,
+            work_queue,
+            orchestrator,
+            acp,
+            events,
+            steward_runtime_inputs,
+            None,
+        )
+    }
+
+    pub fn new_with_steward_runtime_inputs_and_db_writer(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        orchestrator: Arc<Orchestrator>,
+        acp: Arc<AcpRuntimeManager>,
+        events: EventSender,
+        steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
+        db_writer: Option<Arc<DbWriter>>,
+    ) -> Self {
         acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
             pool: pool.clone(),
             events: events.clone(),
@@ -2434,6 +2457,7 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        let db_writer = db_writer.unwrap_or_else(|| Arc::new(DbWriter::new(pool.clone())));
         Self {
             pool,
             work_queue,
@@ -2441,6 +2465,7 @@ impl BackgroundExecutor {
             acp,
             events,
             steward_runtime_inputs: Some(steward_runtime_inputs),
+            db_writer,
         }
     }
 
@@ -3640,6 +3665,7 @@ impl BackgroundExecutor {
                                 provider: &provider,
                                 model: model.clone(),
                                 failed_at: completed_at,
+                                db_writer: Some(self.db_writer.as_ref()),
                             },
                         )
                         .await?;
@@ -5167,6 +5193,7 @@ impl BackgroundExecutor {
                                 provider: &provider,
                                 model: model.clone(),
                                 failed_at: completed_at,
+                                db_writer: Some(self.db_writer.as_ref()),
                             },
                         )
                         .await?;
@@ -6339,8 +6366,8 @@ impl BackgroundExecutor {
             created_at,
             status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
         };
-        let writer = DbWriter::new(self.pool.clone());
-        match evidence_spool_refs::insert_idempotent_via_dbwriter(&writer, spool_ref).await {
+        match evidence_spool_refs::insert_idempotent_via_dbwriter(&self.db_writer, spool_ref).await
+        {
             WriteResult::Committed { .. } | WriteResult::Coalesced { .. } => {}
             other => {
                 return Err(anyhow::anyhow!(

@@ -22,6 +22,7 @@ pub struct FailedStageEvidenceInput<'a> {
     pub provider: &'a str,
     pub model: Option<String>,
     pub failed_at: DateTime<Utc>,
+    pub db_writer: Option<&'a DbWriter>,
 }
 
 pub async fn build_and_persist_failed_stage_evidence(
@@ -175,9 +176,17 @@ pub async fn build_and_persist_failed_stage_evidence(
         created_at: packet_timestamp,
         status: EvidenceSpoolRefStatus::Available,
     };
-    let writer = DbWriter::new(pool.clone());
-    let metadata_result = insert_idempotent_via_dbwriter(&writer, spool_ref).await;
-    writer.shutdown().await;
+    let local_writer;
+    let writer = if let Some(writer) = input.db_writer {
+        writer
+    } else {
+        local_writer = DbWriter::new(pool.clone());
+        &local_writer
+    };
+    let metadata_result = insert_idempotent_via_dbwriter(writer, spool_ref).await;
+    if input.db_writer.is_none() {
+        writer.shutdown().await;
+    }
     if metadata_result != WriteResult::Committed {
         anyhow::bail!(
             "failed to persist failed-stage evidence spool metadata via DbWriter: {}",
@@ -248,6 +257,7 @@ pub async fn build_failed_stage_evidence_for_latest_execution(
             provider: &execution.provider,
             model: execution.model.clone(),
             failed_at,
+            db_writer: None,
         },
     )
     .await
@@ -434,6 +444,7 @@ mod tests {
                 provider: "system",
                 model: None,
                 failed_at: now,
+                db_writer: None,
             },
         )
         .await

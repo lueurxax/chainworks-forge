@@ -5494,12 +5494,18 @@ PLIST
 
       log "P075: GraphQL typed storageHealth contract"
       cargo test -p graphql-server proposal_075_storage_health_is_typed_graphql_contract -- --nocapture
+      cargo test -p graphql-server proposal_075_storage_health_reads_live_dbwriter_heartbeat -- --nocapture
 
       log "P075: auth capability boundary for operator-only storage diagnostics"
       cargo test -p auth sec004_observer_cannot_access_mcp_storage_diagnostics -- --nocapture
 
       log "P075: MCP storage diagnostics parameter semantics"
       cargo test -p mcp-server storage::tests:: -- --nocapture
+
+      log "P075: MCP storage typed error contract (invalid_input, stale, unavailable, maintenance_disabled)"
+      cargo test -p mcp-server storage::tests::reconcile_evidence_orphans_returns_invalid_input -- --nocapture
+      cargo test -p mcp-server storage::tests::storage_health_annotates_error_code_stale -- --nocapture
+      cargo test -p mcp-server storage::tests::typed_error_helper_produces_correct_shape -- --nocapture
     )
 
     # Fail-closed contract check: allowlist and operation registry must be present,

@@ -111,6 +111,15 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::write_class::{WriteClass, WriteLane, WriteOperation, WriteResult};
 
+pub const DB_WRITER_LANES: [WriteLane; 6] = [
+    WriteLane::CriticalBarrier,
+    WriteLane::OperatorCommand,
+    WriteLane::ProjectionInvalidation,
+    WriteLane::CoalescedProjection,
+    WriteLane::EvidenceMetadata,
+    WriteLane::TelemetryRollup,
+];
+
 /// Return a 16-character hex fingerprint of the idempotency key for log correlation.
 ///
 /// P075-SEC-MED-001: callers may encode evidence paths, run IDs, or producer-specific
@@ -408,6 +417,25 @@ pub struct DbWriterHeartbeat {
     origin: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbWriterLaneSnapshot {
+    pub lane: WriteLane,
+    pub capacity: usize,
+    pub queued_depth: i64,
+    pub oldest_queued_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbWriterHealthSnapshot {
+    pub alive: bool,
+    pub last_heartbeat_age_ms: Option<u64>,
+    pub last_drain_age_ms: Option<u64>,
+    pub total_queued: i64,
+    pub lanes: Vec<DbWriterLaneSnapshot>,
+    pub coalesced_rejected_total: u64,
+    pub starvation_total: u64,
+}
+
 impl DbWriterHeartbeat {
     fn new() -> Self {
         const ZERO_U64: AtomicU64 = AtomicU64::new(0);
@@ -453,6 +481,56 @@ impl DbWriterHeartbeat {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> DbWriterHealthSnapshot {
+        let now = self.now_ns();
+        let last_heartbeat_age_ms = age_ms(now, self.last_beat_ns.load(Ordering::Relaxed));
+        let last_drain_age_ms = DB_WRITER_LANES
+            .iter()
+            .filter_map(|lane| {
+                age_ms(
+                    now,
+                    self.last_drain_ns[lane.drain_order_index()].load(Ordering::Relaxed),
+                )
+            })
+            .min();
+        let lanes = DB_WRITER_LANES
+            .iter()
+            .copied()
+            .map(|lane| {
+                let idx = lane.drain_order_index();
+                let queued_depth = self.lane_pending_count[idx].load(Ordering::Relaxed).max(0);
+                let oldest_queued_age_ms = age_ms(
+                    now,
+                    self.lane_oldest_enqueued_ns[idx].load(Ordering::Relaxed),
+                );
+                DbWriterLaneSnapshot {
+                    lane,
+                    capacity: lane.capacity(),
+                    queued_depth,
+                    oldest_queued_age_ms,
+                }
+            })
+            .collect::<Vec<_>>();
+        let total_queued = lanes.iter().map(|lane| lane.queued_depth).sum();
+        DbWriterHealthSnapshot {
+            alive: self.is_alive(),
+            last_heartbeat_age_ms,
+            last_drain_age_ms,
+            total_queued,
+            lanes,
+            coalesced_rejected_total: self.coalesced_rejected_total.load(Ordering::Relaxed),
+            starvation_total: self.starvation_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn age_ms(now_ns: u64, stored_ns: u64) -> Option<u64> {
+    if stored_ns == 0 {
+        None
+    } else {
+        Some(now_ns.saturating_sub(stored_ns) / 1_000_000)
     }
 }
 
