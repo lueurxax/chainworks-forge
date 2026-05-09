@@ -1135,7 +1135,7 @@ struct OrchestratorTests {
             sessionID: "session-1",
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "gemini-3.1-pro-preview",
+            resolvedModel: "gemini-2.5-flash",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .limitExhaustedBeforeOutput,
@@ -1144,7 +1144,7 @@ struct OrchestratorTests {
             providerStopReason: "model_capacity_exhausted",
             outputPresence: .none,
             runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
-            runtimeModel: "gemini-3.1-pro-preview"
+            runtimeModel: "gemini-2.5-flash"
         )
         let secondSuccess = AgentResult(
             outputs: ["proposal_review_ui": Data("ok".utf8)],
@@ -1155,14 +1155,14 @@ struct OrchestratorTests {
             sessionID: "session-2",
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "gemini-2.5-pro",
+            resolvedModel: "gemini-3.1-pro-preview",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .completed,
             sessionReuseDisposition: .fresh,
             outputPresence: .durableOutput,
             runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
-            runtimeModel: "gemini-2.5-pro"
+            runtimeModel: "gemini-3.1-pro-preview"
         )
         let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
 
@@ -1177,14 +1177,14 @@ struct OrchestratorTests {
         await orchestrator.start()
 
         #expect(run.status == .completed)
-        #expect(await box.models == ["gemini-3.1-pro-preview", "gemini-2.5-pro"])
+        #expect(await box.models == ["gemini-3.1-pro-preview", "gemini-2.5-flash"])
 
         let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
         let attempts = stage.agentExecutions.filter { $0.agentID == "proposal_reviewer_ui" }
         #expect(attempts.count == 1)
         let agentExec = try #require(attempts.first)
         #expect(agentExec.status == .completed)
-        #expect(agentExec.resolvedModel == "gemini-2.5-pro")
+        #expect(agentExec.resolvedModel == "gemini-2.5-flash")
     }
 
     @Test("Gemini capacity exhaustion reruns parallel execution with a stable fallback model")
@@ -1280,7 +1280,7 @@ struct OrchestratorTests {
             sessionID: "session-1",
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "gemini-3.1-pro-preview",
+            resolvedModel: "gemini-2.5-flash",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .limitExhaustedBeforeOutput,
@@ -1289,7 +1289,7 @@ struct OrchestratorTests {
             providerStopReason: "model_capacity_exhausted",
             outputPresence: .none,
             runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
-            runtimeModel: "gemini-3.1-pro-preview"
+            runtimeModel: "gemini-2.5-flash"
         )
         let secondSuccess = AgentResult(
             outputs: ["proposal_review_ux": Data("ok".utf8)],
@@ -1300,14 +1300,14 @@ struct OrchestratorTests {
             sessionID: "session-2",
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "gemini-2.5-pro",
+            resolvedModel: "gemini-3.1-pro-preview",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .completed,
             sessionReuseDisposition: .fresh,
             outputPresence: .durableOutput,
             runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
-            runtimeModel: "gemini-2.5-pro"
+            runtimeModel: "gemini-3.1-pro-preview"
         )
         let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
 
@@ -1322,14 +1322,14 @@ struct OrchestratorTests {
         await orchestrator.start()
 
         #expect(run.status == .completed)
-        #expect(await box.models == ["gemini-3.1-pro-preview", "gemini-2.5-pro"])
+        #expect(await box.models == ["gemini-3.1-pro-preview", "gemini-2.5-flash"])
 
         let stage = try #require(run.stageExecutions.first(where: { $0.stageID == "start" }))
         let attempts = stage.agentExecutions.filter { $0.agentID == "proposal_reviewer_ux" }
         #expect(attempts.count == 1)
         let agentExec = try #require(attempts.first)
         #expect(agentExec.status == .completed)
-        #expect(agentExec.resolvedModel == "gemini-2.5-pro")
+        #expect(agentExec.resolvedModel == "gemini-2.5-flash")
     }
 
     @Test("Sequential watchdog failures create durable same-stage retry lineage before succeeding")

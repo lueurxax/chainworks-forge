@@ -868,7 +868,7 @@ struct Proposal013Tests {
             backendProfiles: [
                 "gemini_acp_profile": BackendProfile(
                     provider: "unknown_provider",
-                    model: "gemini-2.5-pro",
+                    model: "gemini-3.1-pro-preview",
                     effort: "medium",
                     temperature: 0,
                     maxTurns: 8,

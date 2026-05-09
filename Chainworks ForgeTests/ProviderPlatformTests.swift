@@ -196,7 +196,7 @@ struct ProviderPlatformTests {
             mode: "tool_use",
             backendProfileID: "reviewer_profile",
             provider: "gemini",
-            model: "gemini-2.5-pro",
+            model: "gemini-3.1-pro-preview",
             effort: "high",
             maxTurns: 8,
             temperature: 0.0,
@@ -459,7 +459,7 @@ struct ProviderPlatformTests {
             transport: .httpAPI,
             endpoint: "https://generativelanguage.googleapis.com",
             authMode: .none,
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-3.1-pro-preview"
         )
         let store = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
@@ -699,7 +699,7 @@ struct ProviderPlatformTests {
             transport: .httpAPI,
             endpoint: "https://generativelanguage.googleapis.com",
             authMode: .apiKey,
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-3.1-pro-preview"
         )
         let package = ExportableSettingsPackage(
             transferSchemaVersion: SettingsTransferService.currentSchemaVersion,
@@ -922,7 +922,7 @@ struct ProviderPlatformTests {
             transport: .httpAPI,
             endpoint: "https://generativelanguage.googleapis.com",
             authMode: .apiKey,
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-3.1-pro-preview"
         )
         let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
@@ -1033,7 +1033,7 @@ struct ProviderPlatformTests {
             transport: .cli,
             endpoint: "https://127.0.0.1:51200",
             authMode: .none,
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-3.1-pro-preview"
         )
         let providerStore = retain(ProviderSettingsStore(
             fileURL: tempDirectory.appendingPathComponent("provider-settings.json"),
@@ -1392,7 +1392,7 @@ struct ProviderPlatformTests {
                         transport: .cli,
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
-                        defaultModel: "gemini-2.5-pro"
+                        defaultModel: "gemini-3.1-pro-preview"
                     )
                 ],
                 preferredProviderIDsByFamily: [:],
@@ -1666,7 +1666,7 @@ struct ProviderPlatformTests {
             displayName: "Gemini ACP",
             transport: .cli,
             authMode: .none,
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-3.1-pro-preview"
         )
 
         let snapshot = await GeminiACPProviderAdapter().verify(

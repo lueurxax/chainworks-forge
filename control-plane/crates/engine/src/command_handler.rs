@@ -153,6 +153,36 @@ struct CommandJournalEntry {
     request_id: Option<String>,
 }
 
+fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
+    let Some(meta_root) = run
+        .chainworks_meta_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let meta_root = Path::new(meta_root);
+    let absolute_meta_root = if meta_root.is_absolute() {
+        meta_root.to_path_buf()
+    } else {
+        Path::new(&run.workspace_root).join(meta_root)
+    };
+
+    for child in ["", "artifacts", "context", "state", "summaries"] {
+        let path = if child.is_empty() {
+            absolute_meta_root.clone()
+        } else {
+            absolute_meta_root.join(child)
+        };
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("create run meta-root directory {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
 const PROPOSAL_GATE_EXECUTOR_VERSION: &str = "proposal-gate-executor.v1";
 const PROPOSAL_GATE_RECEIPT_SCHEMA_VERSION: &str = "proposal_gate_receipt.v1";
 const PROPOSAL_GATE_EXECUTOR_DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -1858,6 +1888,7 @@ impl CommandHandler {
                         .clone()
                         .or_else(|| c.closeout_readiness_mode.clone()),
                 };
+                ensure_run_meta_root_exists(&run)?;
                 runs::insert_tx(&mut tx, &run).await?;
                 // OPS-001 (P017 R2 audit): the workflow compiler ran
                 // Phase C lead-validation as part of `compile()`. Reaching
@@ -2336,6 +2367,7 @@ impl CommandHandler {
                 let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                ensure_run_meta_root_exists(&run)?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
                         run.status == RunStatus::Blocked
@@ -3850,6 +3882,20 @@ impl CommandHandler {
                     );
                     false
                 });
+                let implementation_review_status =
+                    match artifact_contracts::canonical_contract_field_result(
+                        &self.pool,
+                        run.id,
+                        "implementation_review_summary",
+                        "status",
+                    )
+                    .await
+                    {
+                        Ok(artifact_contracts::CanonicalContractField::Resolved(value)) => {
+                            value.as_str().map(ToOwned::to_owned)
+                        }
+                        _ => None,
+                    };
 
                 // Synthesize closeout readiness.
                 let synth_result =
@@ -3858,6 +3904,7 @@ impl CommandHandler {
                         stage_id: &c.stage_id,
                         gate_result: &gate_result,
                         mode_result: &mode_result,
+                        implementation_review_status: implementation_review_status.as_deref(),
                         self_assessment: self_assessment_ref,
                         accepted_risks: &c.accepted_risks,
                         loop_budget_remaining,

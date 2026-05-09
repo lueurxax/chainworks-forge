@@ -15,6 +15,7 @@ use db::repos::evidence_spool_refs::{
     find_by_run_and_path, insert_idempotent_via_dbwriter, list_by_run_id, EvidenceKind,
     EvidenceSpoolRef, EvidenceSpoolRefStatus,
 };
+use db::repos::storage_health;
 use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
 use db::writer::{make_work, DbWriter, HIGH_PRIORITY_LANES, LANE_DRAIN_ORDER};
 use std::sync::{Arc, Mutex};
@@ -147,6 +148,86 @@ async fn dbwriter_class_a_processed_before_class_d_when_both_queued() {
     }
     // If Class D timed out, it won't appear in the order vec — that's acceptable.
 
+    writer.shutdown().await;
+}
+
+#[tokio::test]
+async fn class_d_telemetry_drop_counter_is_observable_via_storage_health() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+    let gate1 = gate.clone();
+    let w1 = writer.clone();
+    let gatekeeper = tokio::spawn(async move {
+        w1.submit(class_d_op("gatekeeper"), move |_pool| async move {
+            let _permit = gate1.acquire().await.unwrap();
+            Ok(1u32)
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let capacity = WriteLane::TelemetryRollup.capacity();
+    let mut handles = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+        let writer = writer.clone();
+        handles.push(tokio::spawn(async move {
+            writer
+                .submit(class_d_op("queued"), |_pool| async move { Ok(1u32) })
+                .await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let queued = writer
+                .heartbeat
+                .snapshot()
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == WriteLane::TelemetryRollup)
+                .map(|lane| lane.queued_depth)
+                .unwrap_or(0);
+            if queued >= capacity as i64 + 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("telemetry lane did not fill");
+
+    let overflow = writer
+        .submit(class_d_op("overflow"), |_pool| async move { Ok(1u32) })
+        .await;
+    assert!(
+        matches!(overflow, WriteResult::DroppedTelemetry),
+        "full Class D lane should drop telemetry instead of blocking; got {overflow:?}"
+    );
+
+    let health = storage_health::storage_health_with_writer(&pool, Some(&writer.heartbeat))
+        .await
+        .unwrap();
+    assert_eq!(health["writer"]["droppedTelemetryTotal"].as_u64(), Some(1));
+    let telemetry_lane = health["writer"]["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["lane"].as_str() == Some("telemetry_rollup"))
+        .expect("telemetry lane health missing");
+    assert_eq!(telemetry_lane["droppedTotal"].as_u64(), Some(1));
+    assert_eq!(
+        health["writePressure"]["latestSnapshot"]["payload"]["telemetryDroppedTotal"].as_u64(),
+        Some(1)
+    );
+
+    gate.add_permits(1);
+    let _ = gatekeeper.await.unwrap();
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
     writer.shutdown().await;
 }
 

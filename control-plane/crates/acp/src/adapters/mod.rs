@@ -784,6 +784,7 @@ pub trait AcpAdapter: Send + Sync {
     ) -> Result<AcpSessionHandle> {
         let mut command = Command::new(&launch_spec.binary_path);
         launch_spec.apply_chainworks_meta_root_env(req);
+        ensure_chainworks_meta_root_launch_dir(req)?;
         launch_spec.verify_capability_fingerprint()?;
         command
             .args(&launch_spec.args)
@@ -893,11 +894,33 @@ fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
     )
 }
 
+fn ensure_chainworks_meta_root_launch_dir(req: &ExecutionRequest) -> Result<()> {
+    let Some(meta_root) = chainworks_meta_root_env_value(req) else {
+        return Ok(());
+    };
+    let meta_root = Path::new(&meta_root);
+    for child in ["", "artifacts", "context", "state", "summaries"] {
+        let path = if child.is_empty() {
+            meta_root.to_path_buf()
+        } else {
+            meta_root.join(child)
+        };
+        std::fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "missing_chainworks_meta_root: create launch directory {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_provider_path_dirs, AcpAdapter, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
-        ProviderCapabilityCache, XcodeShimLaunchRuntime,
+        default_provider_path_dirs, ensure_chainworks_meta_root_launch_dir, AcpAdapter,
+        AcpLaunchSpec, ProbeKey, ProviderCapabilities, ProviderCapabilityCache,
+        XcodeShimLaunchRuntime,
     };
     use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
     use std::sync::{Arc, Mutex};
@@ -1124,6 +1147,62 @@ mod tests {
                 .contains("provider_launch_spec_capability_drift"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn launch_preflight_creates_missing_chainworks_meta_root_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = crate::ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_meta".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_meta".to_string(),
+            provider: "gemini".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+        let meta_root = tmp.path().join(".chainworks/run-meta");
+
+        assert!(!meta_root.exists());
+        ensure_chainworks_meta_root_launch_dir(&req).unwrap();
+
+        for child in ["", "artifacts", "context", "state", "summaries"] {
+            let path = if child.is_empty() {
+                meta_root.clone()
+            } else {
+                meta_root.join(child)
+            };
+            assert!(
+                path.is_dir(),
+                "ACP launch preflight must create {} before provider initialize",
+                path.display()
+            );
+        }
     }
 
     #[cfg(unix)]

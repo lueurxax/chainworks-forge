@@ -974,7 +974,7 @@ struct YAMLParserTests {
                 #expect(profile.runtimeProfile == "gemini_cli_acp", "Expected \(id) to use gemini_cli_acp in \(url.lastPathComponent)")
             }
 
-            #expect(catalog.backendProfiles["gemini_review_pro"]?.model == "gemini-2.5-pro")
+            #expect(catalog.backendProfiles["gemini_review_pro"]?.model == "gemini-3.1-pro-preview")
             #expect(catalog.backendProfiles["gemini_review_flash"] == nil)
 
             let uxReviewer = try #require(catalog.agents.first(where: { $0.id == "proposal_reviewer_ux" }))

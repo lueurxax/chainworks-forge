@@ -412,7 +412,7 @@ struct AgentSessionTests {
             workingDirectory: "/tmp/review",
             workspaceMode: "ro",
             runtimeProvider: "gemini",
-            runtimeModel: "gemini-2.5-pro"
+            runtimeModel: "gemini-3.1-pro-preview"
         )
 
         let conflicts = try await manager.providerSessionConflicts(
@@ -424,7 +424,7 @@ struct AgentSessionTests {
         #expect(conflicts.count == 1)
         #expect(conflicts.first?.agentID == "proposal_reviewer_ui")
         #expect(conflicts.first?.runtimeProvider == "gemini")
-        #expect(conflicts.first?.runtimeModel == "gemini-2.5-pro")
+        #expect(conflicts.first?.runtimeModel == "gemini-3.1-pro-preview")
     }
 
     @Test("AgentSessionManager ignores closed generations when checking provider session collisions")

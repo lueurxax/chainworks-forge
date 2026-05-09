@@ -1,0 +1,127 @@
+{
+  "schema_version": "operator_readback_v1",
+  "fixture_purpose": "P085 rollout contract operator decision surface placeholder. Implementation must replace this placeholder with concrete P085 readback evidence before treating the p085 gate as release evidence.",
+  "proposal_id": "P085",
+  "proposal_revision_id": "p085-r2-2026-05-08",
+  "source_lane": "run_report",
+  "placeholder": {
+    "materialized_by": "operator_repair",
+    "status": "pending_implementation_evidence"
+  },
+  "rollout_contract_status": "fail",
+  "rollout_contract_decision": "hold",
+  "rollout_contract_failure_reasons": [
+    "placeholder_pending_implementation_evidence"
+  ],
+  "rollout_contract_waiver_state": "none",
+  "rollout_contract_waiver_expires_at": null,
+  "rollout_contract_enforcement_mode": "enforce",
+  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+  "rollout_contract_hold_conditions": [
+    "Replace placeholder with concrete P085 operator readback evidence."
+  ],
+  "rollout_contract_rollback_disposition": {
+    "mode": "disable_p085_affordance_changes_or_revert_to_existing_read_only_rendering",
+    "data_loss_risk": "none"
+  },
+  "rollout_contract_source_lane": "run_report",
+  "rollout_contract_enabled_state": "disabled",
+  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+  "rollout_contract_action_id": null,
+  "rollout_contract_operator_message": "P085 fixture placeholder created so implementation can start; this is not release evidence.",
+  "rollout_contract_projection_integrity": "stale",
+  "rollout_contract_cutover_policy_revision": null,
+  "rollout_contract_diagnostic_redaction": "none",
+  "rollout_contract_next_steps": [
+    "Replace placeholder with concrete P085 run_report, MCP, release receipt, and GraphQL evidence."
+  ],
+  "parity_lanes": {
+    "mcp": {
+      "rollout_contract_status": "fail",
+      "rollout_contract_decision": "hold",
+      "rollout_contract_failure_reasons": [
+        "placeholder_pending_implementation_evidence"
+      ],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+      "rollout_contract_hold_conditions": [
+        "Replace placeholder with concrete P085 MCP readback evidence."
+      ],
+      "rollout_contract_rollback_disposition": {
+        "mode": "disable_p085_affordance_changes_or_revert_to_existing_read_only_rendering",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_enabled_state": "disabled",
+      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+      "rollout_contract_action_id": null,
+      "rollout_contract_operator_message": "P085 fixture placeholder created so implementation can start; this is not release evidence.",
+      "rollout_contract_projection_integrity": "stale",
+      "rollout_contract_cutover_policy_revision": null,
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": [
+        "Replace placeholder with concrete P085 MCP readback evidence."
+      ]
+    },
+    "release_receipt": {
+      "rollout_contract_status": "fail",
+      "rollout_contract_decision": "hold",
+      "rollout_contract_failure_reasons": [
+        "placeholder_pending_implementation_evidence"
+      ],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+      "rollout_contract_hold_conditions": [
+        "Replace placeholder with concrete P085 release receipt evidence."
+      ],
+      "rollout_contract_rollback_disposition": {
+        "mode": "disable_p085_affordance_changes_or_revert_to_existing_read_only_rendering",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_enabled_state": "disabled",
+      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+      "rollout_contract_action_id": null,
+      "rollout_contract_operator_message": "P085 fixture placeholder created so implementation can start; this is not release evidence.",
+      "rollout_contract_projection_integrity": "stale",
+      "rollout_contract_cutover_policy_revision": null,
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": [
+        "Replace placeholder with concrete P085 release receipt evidence."
+      ]
+    },
+    "graphql": {
+      "rolloutContractStatus": "fail",
+      "rolloutContractDecision": "hold",
+      "rolloutContractFailureReasons": [
+        "placeholder_pending_implementation_evidence"
+      ],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractEnforcementMode": "enforce",
+      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
+      "rolloutContractHoldConditions": [
+        "Replace placeholder with concrete P085 GraphQL readback evidence."
+      ],
+      "rolloutContractRollbackDisposition": {
+        "mode": "disable_p085_affordance_changes_or_revert_to_existing_read_only_rendering",
+        "dataLossRisk": "none"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "disabled",
+      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
+      "rolloutContractActionId": null,
+      "rolloutContractOperatorMessage": "P085 fixture placeholder created so implementation can start; this is not release evidence.",
+      "rolloutContractProjectionIntegrity": "stale",
+      "rolloutContractCutoverPolicyRevision": null,
+      "rolloutContractDiagnosticRedaction": "none",
+      "rolloutContractNextSteps": [
+        "Replace placeholder with concrete P085 GraphQL readback evidence."
+      ]
+    }
+  }
+}
